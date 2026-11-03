@@ -2097,6 +2097,46 @@ def test_session_preview_picker_limits_recent_sessions(
     assert previews[0].session_id == sessions[-1]
 
 
+def test_resume_picker_render_shows_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    original = create_app(_args())
+    resumed = None
+    try:
+        original.loop.store.append_message(with_message_origin(
+            Message(MessageRole.USER, [TextContent("visible picker preview")]),
+            MessageOrigin.USER,
+        ))
+        original_store = ConversationStore
+
+        def reject_read_only_store(*args, **kwargs):
+            if kwargs.get("_read_only"):
+                raise AssertionError("resume preview opened a conversation store")
+            return original_store(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "zeta.core.session.ConversationStore", reject_read_only_store
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt: "1")
+        resumed = create_app(
+            build_parser().parse_args(["--resume", "--provider", "codex"])
+        )
+
+        assert "visible picker preview" in capsys.readouterr().out
+    finally:
+        async def close_apps() -> None:
+            for app in (resumed, original):
+                if app is not None:
+                    await app.close()
+
+        asyncio.run(close_apps())
+
+
 def test_resume_picker_rejects_zero_and_negative_choices(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

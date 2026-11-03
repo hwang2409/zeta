@@ -5,7 +5,13 @@ import pytest
 
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.protocol.types import MessageOrigin, with_message_origin
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 
 @pytest.mark.parametrize("damage", ["missing", "json", "encoding", "directory"])
@@ -37,9 +43,12 @@ def test_previews_skip_unreadable_sessions(tmp_path: Path, damage: str) -> None:
     else:
         bad.store.path.write_text("broken\n")
 
-    assert [item.session_id for item in manager.list_session_previews()] == [
-        good.metadata.session_id
-    ]
+    previews = manager.list_session_previews()
+    expected = [good.metadata.session_id]
+    if damage != "metadata":
+        expected.insert(0, bad.metadata.session_id)
+        assert previews[0].preview == ""
+    assert [item.session_id for item in previews] == expected
 
 
 @pytest.mark.parametrize("fail_write", [False, True])
@@ -91,17 +100,17 @@ def test_listing_skips_deeply_nested_metadata(tmp_path: Path) -> None:
     assert manager.list_sessions() == [good.metadata]
 
 
-def test_preview_limit_counts_healthy_sessions(tmp_path: Path) -> None:
+def test_preview_limit_counts_catalog_rows(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="codex", model="offline")
+    manager.create(provider="codex", model="offline")
     bad = manager.create(provider="codex", model="offline")
     bad.metadata.updated_at = "2099-01-01T00:00:00+00:00"
     manager._write(bad.metadata)
     bad.store.path.write_text("broken\n")
 
-    assert [item.session_id for item in manager.list_session_previews(limit=1)] == [
-        good.metadata.session_id
-    ]
+    previews = manager.list_session_previews(limit=1)
+    assert [item.session_id for item in previews] == [bad.metadata.session_id]
+    assert previews[0].preview == ""
     assert manager.list_session_previews(limit=0) == []
 
 
@@ -111,7 +120,10 @@ def test_listing_skips_missing_conversation(tmp_path: Path) -> None:
     bad = manager.create(provider="codex", model="offline")
     bad.store.path.unlink()
 
-    assert manager.list_sessions() == [good.metadata]
+    assert {item.session_id for item in manager.list_sessions()} == {
+        good.metadata.session_id,
+        bad.metadata.session_id,
+    }
 
 
 def test_create_preserves_empty_directory_created_during_staging(
@@ -142,7 +154,7 @@ def test_create_preserves_empty_directory_created_during_staging(
 
 
 @pytest.mark.parametrize("filename", ["session_state.json", "agent_lifecycle.json"])
-def test_previews_skip_deeply_nested_state(tmp_path: Path, filename: str) -> None:
+def test_previews_do_not_load_deeply_nested_state(tmp_path: Path, filename: str) -> None:
     manager = SessionManager(tmp_path)
     good = manager.create(provider="codex", model="offline")
     bad = manager.create(provider="codex", model="offline")
@@ -152,9 +164,9 @@ def test_previews_skip_deeply_nested_state(tmp_path: Path, filename: str) -> Non
         ConversationStore(manager.sessions_dir, session_id=bad.metadata.session_id)
     with pytest.raises(SessionError, match="could not be opened"):
         manager.open(bad.metadata.session_id)
-    assert [item.session_id for item in manager.list_session_previews()] == [
-        good.metadata.session_id
-    ]
+    assert {
+        item.session_id for item in manager.list_session_previews()
+    } == {good.metadata.session_id, bad.metadata.session_id}
 
 
 def test_create_preserves_directory_created_at_publication(
@@ -281,8 +293,15 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
         payload = path.read_text() + payload + "\n"
     path.write_text(payload)
 
-    assert manager.list_sessions() == [good.metadata]
-    previews = manager.list_session_previews(limit=1)
+    listed = manager.list_sessions()
+    if filename == "meta.json":
+        assert [item.session_id for item in listed] == [good.metadata.session_id]
+    else:
+        assert {item.session_id for item in listed} == {
+            good.metadata.session_id,
+            bad.metadata.session_id,
+        }
+    previews = manager.list_session_previews(limit=1, sessions=[good.metadata])
     assert [(item.session_id, item.preview) for item in previews] == [
         (good.metadata.session_id, "healthy preview")
     ]
@@ -317,8 +336,8 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     no_state.store.agent_lifecycle_path.write_text("[]")
     before = {p: p.read_bytes() for p in manager.sessions_dir.rglob("*") if p.is_file()}
 
-    assert manager.list_sessions() == [good.metadata]
-    assert [p.session_id for p in manager.list_session_previews()] == [
+    assert manager.list_sessions()
+    assert [p.session_id for p in manager.list_session_previews(sessions=[good.metadata])] == [
         good.metadata.session_id
     ]
     assert {
@@ -326,23 +345,80 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     } == before
 
 
-def test_preview_boundary_includes_replay(
+def test_list_sessions_reads_only_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
-    good = manager.create(provider="codex", model="offline")
-    bad = manager.create(provider="codex", model="offline")
-    replay = ConversationStore.replay
+    opened = manager.create(provider="codex", model="offline")
 
-    def fail_replay(self):
-        if self.session_id == bad.metadata.session_id:
-            raise ConversationIntegrityError("damaged replay")
-        return replay(self)
+    def fail(*args, **kwargs):
+        raise AssertionError("conversation store opened")
 
-    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
-    assert [p.session_id for p in manager.list_session_previews(limit=1)] == [
-        good.metadata.session_id
-    ]
+    monkeypatch.setattr("zeta.core.session.ConversationStore", fail)
+    assert manager.list_sessions_read_only() == [opened.metadata]
+
+
+def test_preview_reads_bounded_prefix(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    store = opened.store
+    store.append_checkpoint("root")
+    store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("first log message")]),
+        MessageOrigin.USER,
+    ))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    store.append_fork("root")
+    store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("active branch message")]),
+        MessageOrigin.USER,
+    ))
+    assert store.messages()[0].content[0].text == "active branch message"
+    with store.path.open("ab") as conversation:
+        conversation.write(b"not json\n" * 5_000)
+
+    previews = manager.list_session_previews(sessions=[opened.metadata])
+
+    assert [item.preview for item in previews] == ["first log message"]
+
+
+@pytest.mark.parametrize("shape", ["huge_row", "unterminated", "no_user_message"])
+def test_preview_prefix_reader_stops_at_its_caps(tmp_path: Path, shape: str) -> None:
+    import time
+    import tracemalloc
+
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    opened.store.append_message(Message(MessageRole.ASSISTANT, [TextContent("note")]))
+    opened.store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("late user message")]),
+        MessageOrigin.USER,
+    ))
+    opened.store.close()
+    header, other_row, user_row = opened.store.path.read_bytes().splitlines(
+        keepends=True
+    )[:3]
+    bodies = {
+        # one 32 MiB row before the user message
+        "huge_row": header + b"x" * (32 << 20) + b"\n" + user_row,
+        # an unterminated log: no newline for 32 MiB
+        "unterminated": header + b"y" * (32 << 20),
+        # the user message only after 100,000 non-user rows: past the row cap
+        "no_user_message": header + other_row * 100_000 + user_row,
+    }
+    opened.store.path.write_bytes(bodies[shape])
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        previews = manager.list_session_previews(sessions=[opened.metadata])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert [item.preview for item in previews] == [""]
+    assert peak < 2 << 20, f"preview read allocated {peak} bytes"
+    assert time.perf_counter() - started < 5
 
 
 @pytest.mark.parametrize("surface", ["tool", "card"])
@@ -359,25 +435,18 @@ def test_child_lifecycle_readers_reject_decoder_surviving_depth(
 
 
 @pytest.mark.parametrize("fault", [RecursionError, OSError, KeyError])
-@pytest.mark.parametrize("surface", ["listing", "preview"])
 def test_listing_boundaries_propagate_programming_faults(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault, surface: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault
 ) -> None:
     manager = SessionManager(tmp_path)
-    opened = manager.create(provider="codex", model="offline")
+    manager.create(provider="codex", model="offline")
 
     def fail(*args, **kwargs):
         raise fault("programming fault")
 
-    if surface == "listing":
-        monkeypatch.setattr(manager, "open", fail)
-        reader = manager.list_sessions
-    else:
-        monkeypatch.setattr(manager, "list_sessions", lambda: [opened.metadata])
-        monkeypatch.setattr(ConversationStore, "replay", fail)
-        reader = manager.list_session_previews
+    monkeypatch.setattr(manager, "read_metadata", fail)
     with pytest.raises(fault, match="programming fault"):
-        reader()
+        manager.list_sessions_read_only()
 
 
 @pytest.mark.parametrize(

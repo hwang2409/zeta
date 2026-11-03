@@ -54,6 +54,7 @@ from ..session_display import (
     normalize_session_name,
     preview_text as _preview_text,
 )
+from .store.preview import first_user_message
 from .session_links import (
     _PROJECT_ROLES,
     persist_pending_root_link,
@@ -488,6 +489,9 @@ class SessionMetadata:
             ),
         }
 
+    def to_catalog_dict(self) -> dict[str, Any]:
+        return {**self.to_dict(), "system_prompt": self.system_prompt[:512]}
+
     def to_storage_dict(self) -> dict[str, Any]:
         return {
             **self.to_dict(),
@@ -779,7 +783,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return sessions
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
-        """List valid sessions without repairing or changing durable state."""
+        """List valid sessions from metadata without opening conversation stores."""
         try:
             with session_root(self.sessions_dir) as root_fd:
                 names = os.listdir(root_fd)
@@ -788,9 +792,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         sessions: list[SessionMetadata] = []
         for name in names:
             try:
-                opened = self.open(name, _read_only=True)
-                opened.store.close()
-                sessions.append(opened.metadata)
+                sessions.append(self.read_metadata(name))
             except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
@@ -800,48 +802,29 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     ) -> list[SessionPreview]:
         """Return recent sessions with safe, single-line first-message previews."""
 
+        if limit <= 0:
+            return []
         if sessions is None:
             sessions = self.list_sessions()
         previews: list[SessionPreview] = []
-        for metadata in sessions:
-            if len(previews) >= limit:
-                break
+        for metadata in sessions[:limit]:
             try:
-                opened = self.open(metadata.session_id, _read_only=True)
-                with opened.store:
-                    entries = opened.store.replay()
+                first_message = first_user_message(
+                    self.sessions_dir, metadata.session_id
+                )
+            except (OSError, SessionError, ConversationIntegrityError) as exc:
                 first_message = ""
-                for entry in entries:
-                    if entry.type != "message":
-                        continue
-                    message = entry.data.get("message")
-                    if not isinstance(message, dict):
-                        continue
-                    if message.get("role") != "user":
-                        continue
-                    parts = []
-                    for block in message.get("content", []):
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") in {
-                            "text",
-                            "thinking",
-                        } and isinstance(block.get("text"), str):
-                            parts.append(block["text"])
-                    first_message = "".join(parts)
-                    break
-                previews.append(
-                    SessionPreview(
-                        session_id=metadata.session_id,
-                        updated_at=metadata.updated_at,
-                        preview=_preview_text(first_message),
-                        name=metadata.name,
-                    )
-                )
-            except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning(
-                    "Skipping session preview %s: %s", metadata.session_id, exc
+                    "Empty session preview for %s: %s", metadata.session_id, exc
                 )
+            previews.append(
+                SessionPreview(
+                    session_id=metadata.session_id,
+                    updated_at=metadata.updated_at,
+                    preview=_preview_text(first_message),
+                    name=metadata.name,
+                )
+            )
         return previews
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:

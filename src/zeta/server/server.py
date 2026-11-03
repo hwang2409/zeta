@@ -429,7 +429,13 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            return self._list_sessions(request_id, params)
+            result, page_ids = await self.connections.run_read(
+                self, lambda: self._list_sessions(request_id, params)
+            )
+            if self.role != "observer":
+                # project-link repair writes, so it stays off the read-only worker
+                await asyncio.to_thread(self._reconcile_project_links, page_ids)
+            return result
         if method == "new_session":
             await self.server.control.require_idle()
             cwd = None
@@ -663,9 +669,13 @@ class _Client:
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
 
+    def _reconcile_project_links(self, session_ids: list[str]) -> None:
+        for session_id in session_ids:
+            self.server.runtime.manager._reconcile_project_link(session_id)
+
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
-    ) -> dict[str, object]:
+    ) -> tuple[dict[str, object], list[str]]:
         paging = "list_sessions_paging" in self.features
         for name in ("offset", "limit"):
             if name in params:
@@ -677,11 +687,7 @@ class _Client:
             assert self.projects is not None
             available = self.projects.project_sessions(params["project_id"])
         else:
-            available = (
-                self.server.runtime.list_sessions_read_only()
-                if self.role == "observer"
-                else self.server.runtime.list_sessions()
-            )
+            available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
@@ -691,7 +697,7 @@ class _Client:
         }
         sessions = [
             {
-                **item.to_dict(),
+                **item.to_catalog_dict(),
                 "first_message_preview": previews.get(item.session_id, ""),
             }
             for item in metadata
@@ -710,12 +716,16 @@ class _Client:
                     "sessions": page,
                     "truncated": True,
                     "next_offset": offset + index,
-                }
+                }, [item["session_id"] for item in page]
             page = candidate
+        page_ids = [item["session_id"] for item in page]
         if not paging:
-            return {"sessions": page}
+            return {"sessions": page}, page_ids
         end = offset + len(page)
-        return {"sessions": page, "next_offset": end if end < len(available) else None}
+        return {
+            "sessions": page,
+            "next_offset": end if end < len(available) else None,
+        }, page_ids
 
     async def _write(self, payload: bytes) -> bool:
         return await self.connections.send(self, payload)

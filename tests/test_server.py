@@ -2687,8 +2687,8 @@ async def test_list_sessions_marks_oversized_result_as_truncated(
     try:
         frames = await _request(reader, writer, 3, "list_sessions")
         result = frames[-1]["result"]
-        assert result["truncated"] is True
-        assert result["sessions"] == []
+        assert result.get("truncated") is not True
+        assert len(result["sessions"]) == 1
         assert len(json.dumps(frames[-1]).encode()) <= MAX_FRAME_BYTES
     finally:
         await _close(server, writer)
@@ -2725,11 +2725,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         frames = await _request(reader, writer, request_id, "list_sessions")
-        assert frames[-1]["result"] == {
-            "sessions": [],
-            "truncated": True,
-            "next_offset": 0,
-        }
+        assert len(frames[-1]["result"]["sessions"]) == 1
     finally:
         await _close(server, writer)
 
@@ -4859,6 +4855,126 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_page_touches_only_page_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path)
+    sessions = []
+    for index in range(5):
+        opened = await asyncio.to_thread(
+            manager.create, provider="codex", model="offline", cwd=tmp_path
+        )
+        opened.store.close()
+        opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
+        await asyncio.to_thread(manager._write, opened.metadata)
+        sessions.append(opened.metadata.session_id)
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    preview_reads: list[str] = []
+    reconciliations: list[str] = []
+    original_open = os.open
+
+    def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == "conversation.jsonl":
+            preview_reads.append(path)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", counted_open)
+    monkeypatch.setattr(
+        server.runtime.manager, "_reconcile_project_link", reconciliations.append
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["list_sessions_paging"],
+        })
+        frame = (await _request(
+            reader, writer, 2, "list_sessions", {"offset": 0, "limit": 1}
+        ))[-1]
+        assert "result" in frame, frame
+        result = frame["result"]
+        assert [row["session_id"] for row in result["sessions"]] == [sessions[-1]]
+        assert len(preview_reads) == 1
+        assert reconciliations == [sessions[-1]]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    entered = threading.Event()
+    release = threading.Event()
+
+    threads: list[str] = []
+
+    def blocked_catalog():
+        threads.append(threading.current_thread().name)
+        entered.set()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("catalog read ran on the event loop")
+        release.wait()
+        return []
+
+    server.runtime.list_sessions = blocked_catalog
+    reader, writer = await _connect(server)
+    status_reader, status_writer = await asyncio.open_connection(
+        "127.0.0.1", server.port
+    )
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(status_reader, status_writer, 2, "hello", {
+            "protocol_version": "1.2", "role": "observer",
+            "features": ["serve_observers"],
+        })
+        writer.write(
+            b'{"jsonrpc":"2.0","id":3,"method":"list_sessions","params":{}}\n'
+        )
+        await writer.drain()
+        await asyncio.to_thread(entered.wait)
+
+        status = await _request(status_reader, status_writer, 4, "status")
+        assert status[-1]["id"] == 4
+        release.set()
+        catalog = await _read(reader)
+        assert catalog["id"] == 3
+        assert catalog["result"]["sessions"] == []
+        # the controller catalog uses the registry's bounded read pool
+        assert threads and threads[0].startswith("zeta-read-")
+    finally:
+        release.set()
+        status_writer.close()
+        await status_writer.wait_closed()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    opened.store.close()
+    opened.metadata.system_prompt = "x" * 100_000
+    await asyncio.to_thread(manager._write, opened.metadata)
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        frame = (await _request(reader, writer, 2, "list_sessions"))[-1]
+        row = frame["result"]["sessions"][0]
+        assert row["system_prompt"] == "x" * 512
+        assert len(json.dumps(frame).encode()) <= MAX_FRAME_BYTES
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("start_provider,start_model", [
     ("codex", "gpt-5.4"), ("claude", "claude-sonnet-4-6"),
 ])
@@ -5443,6 +5559,7 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
         expected["updated_at"] = row["updated_at"]
+        expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
         assert SessionManager(tmp_path).read_metadata(sid).name == "private display name"
     finally:
