@@ -276,7 +276,9 @@ class ConversationLogMixin:
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
         """Install validated state on the owner thread using pointer swaps only."""
-        previous = self._detach_log_state()
+        previous = (
+            self._detach_log_state() if hasattr(self, "_entry_ids") else state
+        )
         self._before_incremental_state_install()
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
@@ -447,6 +449,10 @@ class ConversationLogMixin:
             raw, first_row=len(self._entries) + 2
         )
         if torn_at is not None:
+            if getattr(self, "_strict_snapshot_sync", False):
+                self._strict_snapshot_sync = False
+                self._load_full()
+                return
             if self._read_only:
                 raise ConversationIntegrityError(
                     f"invalid conversation row {len(self._entries) + len(entries) + 2}: {self.path}"
