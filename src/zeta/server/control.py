@@ -21,7 +21,12 @@ from ..protocol.types import (
     ToolCall,
 )
 from . import abort_scope, event_contract, model_selection
-from .approval_lifecycle import ApprovalKey, ApprovalLifecycle, approval_display_fields
+from .approval_lifecycle import (
+    ApprovalKey,
+    ApprovalLifecycle,
+    SessionHealth,
+    approval_display_fields,
+)
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .protocol import FrameWriteCancelled, ProtocolError, bounded
 
@@ -54,7 +59,6 @@ class _ApprovalRecord:
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
-
 
 class NotificationPresentation:
     """Publish each durable notification at most once per serve session."""
@@ -95,7 +99,6 @@ class NotificationPresentation:
         if not written and key is not None:
             self._presented.discard(key)
 
-
 class ServeControl:
     """Own the active semantic lifetime independently of physical clients."""
 
@@ -129,6 +132,25 @@ class ServeControl:
                 persist_user_message=persist_user_message,
             )
         )
+
+    def unhealthy(self) -> bool:
+        return self._approvals.state.health is not None
+
+    def _reject_if_unhealthy(self) -> None:
+        health = self._approvals.state.health
+        if health is not None:
+            raise ProtocolError(-32000, "approval persistence failed", {
+                "code": health.code,
+            })
+
+    def request_turn_failure(self) -> None:
+        """Request whole-session cancellation without joining teardown."""
+        loop = self.server.runtime.loop
+        if loop is not None:
+            loop.abort(steering_drop_reason=None)
+        task = self._turn_task
+        if task is not None and not task.done():
+            self._turn_cancel_outcome = TurnOutcome.SESSION_CANCELED
 
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
@@ -223,6 +245,7 @@ class ServeControl:
     def session_replaced(self) -> None:
         self._approval_generation += 1
         self.clear_approvals()
+        asyncio.create_task(self._approvals.transition("replace"))
 
     async def wait_for_approval_settlement(self) -> None:
         while tasks := [
@@ -514,7 +537,13 @@ class ServeControl:
         )
         if resolution is None:
             if owns_record:
-                record.state = "failed"
+                await self._approvals.transition(
+                    "fail",
+                    health=SessionHealth(
+                        "approval_persistence_failed",
+                        "approval decision could not be persisted",
+                    ),
+                )
                 with contextlib.suppress(ConnectionError, OSError):
                     await self._notify(
                         event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
@@ -527,9 +556,8 @@ class ServeControl:
                         },
                         data={"request_id": record.wire_id},
                     )
-                loop = self.server.runtime.loop
-                if loop is not None:
-                    loop.abort(steering_drop_reason=None)
+                self.request_turn_failure()
+                self._approval_records.pop(target.key, None)
             raise OSError("approval decision could not be persisted")
         if not owns_record:
             return resolution
@@ -612,10 +640,8 @@ class ServeControl:
         try:
             if payload is not None and record.history_published:
                 assert record.target.history_store is not None
-                await self._run_blocking(
-                    lambda: record.target.history_store.append_approval_history(
-                        {"event": "approval_end", **payload}
-                    )
+                await record.target.history_store.append_approval_history_async(
+                    {"event": "approval_end", **payload}
                 )
             if payload is not None and record.published:
                 await self._notify(
@@ -1060,10 +1086,8 @@ class ServeControl:
         if not isinstance(target.key, tuple) or target.history_store is None:
             return True
         try:
-            await self._run_blocking(
-                lambda: target.history_store.append_approval_history(
-                    {"event": "approval_request", **payload}
-                )
+            await target.history_store.append_approval_history_async(
+                {"event": "approval_request", **payload}
             )
         except OSError:
             await self._settle_failed_start(record)

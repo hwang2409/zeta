@@ -58,6 +58,12 @@ class ApprovalHistoryStoreMixin:
             entry = self._append_row_unlocked("approval_history", dict(payload))
             return self._snapshot_entry(entry)
 
+    async def append_approval_history_async(
+        self, payload: Mapping[str, Any]
+    ) -> ConversationEntry:
+        """Append delegated history through the store's durable writer."""
+        return await self._to_thread_durable(self.append_approval_history, payload)
+
     def approval_resolution_data(self, request_id: str) -> dict[str, str] | None:
         with self._append_lock():
             for entry in reversed(self.replay()):

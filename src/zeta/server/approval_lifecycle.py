@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from uuid import uuid4
 
 from ..core.approval import ApprovalRequest
 
 ApprovalKey = str | tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionHealth:
+    code: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalMachineState:
+    """Immutable live approval projection for one loaded serve session."""
+
+    generation: int = 0
+    records: Mapping[ApprovalKey, object] = MappingProxyType({})
+    health: SessionHealth | None = None
 
 
 def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
@@ -56,9 +73,34 @@ class ApprovalLifecycle:
     """Own stable approval IDs and make terminal events exactly once."""
 
     def __init__(self) -> None:
+        self._state = ApprovalMachineState()
         self._by_key: dict[ApprovalKey, _TrackedApproval] = {}
         self._wires_by_key: dict[ApprovalKey, str] = {}
         self._keys_by_wire: dict[str, ApprovalKey] = {}
+
+    @property
+    def state(self) -> ApprovalMachineState:
+        return self._state
+
+    async def transition(self, event: str, **data: object) -> ApprovalMachineState:
+        """Apply one guarded lifecycle event and publish one immutable state."""
+        if event == "fail":
+            health = data.get("health")
+            if not isinstance(health, SessionHealth):
+                raise TypeError("fail requires SessionHealth")
+            self._state = ApprovalMachineState(
+                self._state.generation, self._state.records, health
+            )
+        elif event == "replace":
+            self._state = ApprovalMachineState(self._state.generation + 1)
+            self.clear()
+        elif event == "close":
+            self._state = ApprovalMachineState(
+                self._state.generation, self._state.records, self._state.health
+            )
+        else:
+            raise ValueError(f"unknown approval lifecycle event: {event}")
+        return self._state
 
     def observe(
         self,
