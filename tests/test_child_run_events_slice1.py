@@ -6,15 +6,25 @@ import multiprocessing
 import os
 import shutil
 import threading
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
+from tests.support.fake_backend import FakeBackend
+from zeta.context_eviction import recall_history
+from zeta.core.context import ContextAssembler
+from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.core.store._child_runs import parse_child_run_id
-from zeta.protocol.types import StreamEvent, StreamEventType
-from zeta.tui.render import render_event
+from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from zeta.server.ergonomics import history
+from zeta.skills import SkillCatalog
+from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
+from zeta.tui.app import TUIApp
 
 
 @pytest.mark.parametrize("run_id", ["session:4", "session:4:2", "session:4:2:9"])
@@ -145,21 +155,116 @@ def test_pre_feature_session_loads_unchanged(tmp_path: Path) -> None:
         reopened.close()
 
 
+def _message(role: MessageRole, text: str) -> Message:
+    metadata = (
+        {"zeta.origin": MessageOrigin.USER.value}
+        if role is MessageRole.USER
+        else {"response_state": "completed"}
+    )
+    return Message(role, [TextContent(text)], metadata=metadata)
+
+
+def test_store_full_and_incremental_validation_accept_start_row(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="session")
+    store.append_message(_message(MessageRole.USER, "before"))
+    store.append_child_run_started("session:1", None, "worker", "task", "now")
+    store.append_message(_message(MessageRole.ASSISTANT, "after"))
+    store.close()
+
+    reopened = ConversationStore(tmp_path, session_id="session", _read_only=True)
+    try:
+        assert [entry.type for entry in reopened.replay()] == [
+            "message",
+            "child_run_started",
+            "message",
+        ]
+    finally:
+        reopened.close()
+
+
+def test_context_and_eviction_ignore_start_row(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="session")
+    first = store.append_message(_message(MessageRole.USER, "before"))
+    store.append_child_run_started("session:1", None, "worker", "hidden task", "now")
+    last = store.append_message(_message(MessageRole.ASSISTANT, "after"))
+    store.append_compaction_marker("summary", first.seq, last.seq)
+    try:
+        assembled = asyncio.run(
+            ContextAssembler(
+                store,
+                token_budget=10_000,
+                retained_tail=8,
+                system_prompt="system",
+            ).assemble_context()
+        )
+        assert all(
+            "hidden task" not in str(message.to_dict())
+            for message in assembled.messages
+        )
+        recalled = recall_history(store, seq_start=first.seq, seq_end=last.seq)
+        assert "before" in recalled
+        assert "after" in recalled
+        assert "hidden task" not in recalled
+    finally:
+        store.close()
+
+
+def test_transcript_search_ignores_start_row_payload(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="session")
+    store.append_message(_message(MessageRole.USER, "searchable before"))
+    store.append_child_run_started(
+        "session:1", None, "worker", "private child task", "now"
+    )
+    store.append_message(_message(MessageRole.ASSISTANT, "searchable after"))
+    index = TranscriptIndex(tmp_path / "project", "p_" + "a" * 32)
+    try:
+        index.append(TranscriptSource("session", store.session_dir))
+        assert index.search("searchable before")
+        assert index.search("searchable after")
+        assert index.search("private child task") == ()
+    finally:
+        store.close()
+
+
 def test_tui_replays_start_row_through_real_renderer(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="session")
-    store.append_child_run_started("session:1", None, "worker", "task", "now")
+    store.append_message(_message(MessageRole.USER, "before"))
+    store.append_child_run_started(
+        "session:1", None, "worker", "must stay hidden", "now"
+    )
+    store.append_message(_message(MessageRole.ASSISTANT, "after"))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
     try:
-        # Replay is the production transcript path; the renderer must still accept
-        # the surrounding lifecycle event without producing a broken renderable.
-        event = StreamEvent(
-            StreamEventType.CHILD_MESSAGE_DELIVERED,
-            data={"child_label": "session:1", "preview": "replayed"},
-        )
-        rendered = render_event(event)
-        assert rendered is not None
-        output = Console(record=True, width=100)
-        output.print(rendered)
-        assert "replayed" in output.export_text()
-        assert [entry.type for entry in store.replay()] == ["child_run_started"]
+        app._rebuild_transcript()
+        rendered = Text.from_ansi(output.getvalue()).plain
+        assert "before" in rendered
+        assert "after" in rendered
+        assert "must stay hidden" not in rendered
+        assert "unknown" not in rendered.casefold()
+    finally:
+        asyncio.run(app.loop.close())
+        store.close()
+
+
+def test_serve_session_history_ignores_start_row(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="session")
+    store.append_message(_message(MessageRole.USER, "before"))
+    store.append_child_run_started(
+        "session:1", None, "worker", "must stay hidden", "now"
+    )
+    store.append_message(_message(MessageRole.ASSISTANT, "after"))
+    try:
+        result = history(SimpleNamespace(opened=SimpleNamespace(store=store)), {})
+        rendered = json.dumps(result)
+        assert "before" in rendered
+        assert "after" in rendered
+        assert "must stay hidden" not in rendered
     finally:
         store.close()

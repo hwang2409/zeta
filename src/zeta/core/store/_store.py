@@ -516,7 +516,8 @@ class ConversationStore(
                         raise ValueError(
                             "approval request must match an anchored tool call"
                         )
-            elif entry.type == "child_run_started": validate_child_run_started_data(entry.data)
+            elif entry.type == "child_run_started":
+                validate_child_run_started_data(entry.data)
             elif entry.type == "compaction":
                 validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
