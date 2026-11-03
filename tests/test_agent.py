@@ -7285,7 +7285,7 @@ async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
 
 
 @pytest.mark.asyncio
-async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
+async def test_step_delivery_send_copies_bounded_snapshots_over_50k_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     initial = ConversationStore(tmp_path)

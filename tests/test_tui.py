@@ -9707,11 +9707,14 @@ skill_catalog=SkillCatalog.empty(),
 
     await asyncio.wait_for(tool_started.wait(), timeout=2.0)
     assert app._spinner_active
+    # A sentinel the ticker cannot reach from zero: only a reset at the second
+    # completion's TURN_START brings the frame back below it.
+    app._spinner_frame = 1000
     release_tool.set()
 
     await asyncio.wait_for(backend.second_started.wait(), timeout=2.0)
     assert app._spinner_active
-    assert app._spinner_frame == 0
+    assert app._spinner_frame < 1000
 
     backend.release_second.set()
     await turn
