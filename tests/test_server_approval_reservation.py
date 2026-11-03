@@ -547,7 +547,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         assert aborted == [True]
         with pytest.raises(ProtocolError) as later:
             await server.control.resolve_approval("approve", call.id)
-        assert later.value.code == -32006
+        assert later.value.code == -32000
 
         call2 = ToolCall("call-committed", "read", {"path": "/tmp/committed"})
         store.append_message_with_approval_requests(

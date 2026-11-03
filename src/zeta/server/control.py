@@ -559,22 +559,26 @@ class ServeControl:
             key: value for key, value in resolution.items() if key != "request_id"
         }
         payload = self._approvals.end(record.target.key, data=data)
-        if payload is not None and record.history_published:
-            assert record.target.history_store is not None
-            await self._run_blocking(
-                lambda: record.target.history_store.append_approval_history(
-                    {"event": "approval_end", **payload}
+        try:
+            if payload is not None and record.history_published:
+                assert record.target.history_store is not None
+                await self._run_blocking(
+                    lambda: record.target.history_store.append_approval_history(
+                        {"event": "approval_end", **payload}
+                    )
                 )
-            )
-        if payload is not None and record.published:
-            await self._notify(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[
-                    StreamEventType.TOOL_APPROVAL_END
-                ],
-                self.server.runtime.session_id if self.server.runtime.opened else None,
-                **payload,
-            )
-        self._approval_records.pop(record.target.key, None)
+            if payload is not None and record.published:
+                await self._notify(
+                    event_contract.STREAM_EVENT_WIRE_EVENTS[
+                        StreamEventType.TOOL_APPROVAL_END
+                    ],
+                    self.server.runtime.session_id
+                    if self.server.runtime.opened
+                    else None,
+                    **payload,
+                )
+        finally:
+            self._approval_records.pop(record.target.key, None)
 
     async def abort(
         self, scope: abort_scope.AbortScope = "session"
@@ -1074,7 +1078,7 @@ class ServeControl:
             if record.disposition == "active":
                 record.disposition = "external"
             return
-        if record.state not in {"pending", "reserved"}:
+        if record.state != "pending":
             return
         resolution = await self._run_blocking(
             lambda: record.target.store.approval_resolution_data(
