@@ -1243,6 +1243,118 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
 
 
 @pytest.mark.asyncio
+async def test_persistent_approval_failure_aborts_session_owned_children(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, _foreground = await _approval_server(tmp_path)
+    child = ConversationStore(tmp_path / "session-child")
+    call = ToolCall("session-child-call", "read", {"path": "input"})
+    child.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    policy.register_delegated(request, child, child_instance_id="child")
+    try:
+        await server.control._event(
+            StreamEvent(
+                StreamEventType.TOOL_APPROVAL_START,
+                tool_call=call,
+                data={"agent_instance_id": "child"},
+            ),
+            session_id="parent",
+            background=True,
+        )
+        await server.control.controller_released()
+        resolution = child.approval_resolution_data(call.id)
+        assert resolution is not None
+        assert resolution["decision"] == "abort"
+        assert resolution["reason"] in {
+            "child_cleanup",
+            "controller_disconnected",
+        }
+        assert not server.control._approval_records
+        assert not server.control.has_pending_approvals()
+    finally:
+        await _close(server, writer)
+        child.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_delegated_history_uses_store_durable_writer(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "concurrent-history")
+    tool_call = ToolCall("concurrent-call", "read", {"path": "input"})
+    async def write_pair(request_id: str) -> None:
+        request = {
+            "event": "approval_request",
+            "request_id": request_id,
+            "tool_call": tool_call.to_dict(),
+            "delegated": True,
+            "agent_instance_id": request_id,
+        }
+        end = {
+            "event": "approval_end",
+            "request_id": request_id,
+            "tool_call": tool_call.to_dict(),
+            "data": {"decision": "abort", "reason": "child_cleanup"},
+            "reason": "child_cleanup",
+        }
+        await store.append_approval_history_async(request)
+        await store.append_approval_history_async(end)
+
+    try:
+        await asyncio.gather(write_pair("wire-a"), write_pair("wire-b"))
+        history = [
+            entry.data for entry in store.entries if entry.type == "approval_history"
+        ]
+        assert len(history) == 4
+        for request_id in ("wire-a", "wire-b"):
+            rows = [row for row in history if row["request_id"] == request_id]
+            assert [row["event"] for row in rows] == [
+                "approval_request",
+                "approval_end",
+            ]
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_lifecycle_has_no_records_after_release(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        await server.control.controller_released()
+        await server.control.wait_for_approval_settlement()
+        assert server.control._approval_records == {}
+        assert server.control._approvals.active_keys() == ()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_requests_turn_cancel_without_awaiting_reentrant_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, _call = await _approval_server(tmp_path)
+    try:
+        called: list[bool] = []
+        monkeypatch.setattr(
+            server.control,
+            "request_turn_failure",
+            lambda: called.append(True),
+        )
+        server.control.request_turn_failure()
+        await asyncio.sleep(0)
+        assert called == [True]
+    finally:
+        await _close(server, writer)
+
+
 async def test_failed_delegated_request_write_settles_cleanup_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
