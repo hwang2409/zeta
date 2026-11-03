@@ -371,7 +371,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
 
     def abort(self, request_id: str) -> bool:
         self._pending_bindings.pop(request_id, None)
-        return self.child_store.resolve_approval(request_id, "abort")
+        return self.child_store.resolve_approval(request_id, "abort", reason="child_cleanup")
 
     def abort_or_winner(
         self,
@@ -382,7 +382,9 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     ) -> ApprovalDecision | None:
         # Resolve first.  If ALLOW won concurrently, the pending binding still
         # belongs to that approval and must be transferred to this execution.
-        self.child_store.resolve_approval(request_id, "abort")
+        self.child_store.resolve_approval(
+            request_id, "abort", reason="child_cleanup"
+        )
         state = self.child_store.approval_states().get(request_id)
         decision = _approval_decision(state[1] if state is not None else None)
         if decision is ApprovalDecision.ALLOW and state is not None:
