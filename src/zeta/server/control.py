@@ -53,7 +53,7 @@ class _ApprovalRecord:
     wire_id: str
     generation: int
     token: int
-    state: Literal["starting", "pending", "reserved", "failed"] = "starting"
+    state: Literal["starting", "pending", "reserved"] = "starting"
     disposition: str = "active"
     request: ApprovalRequest | None = None
     history_published: bool = False
@@ -394,6 +394,7 @@ class ServeControl:
         loop = self.server.runtime.loop
         if policy is None or loop is None:
             raise ProtocolError(-32003, "no active session")
+        self._reject_if_unhealthy()
         core_key = self._approvals.core_key(request_id)
         record = await self._record_for_decision(core_key, policy)
         if record is None or record.state != "pending" or record.request is None:
@@ -557,7 +558,9 @@ class ServeControl:
                         data={"request_id": record.wire_id},
                     )
                 self.request_turn_failure()
-                self._approval_records.pop(target.key, None)
+                record.state = "reserved"
+                record.disposition = reason or "turn_canceled"
+                record.settlement = None
             raise OSError("approval decision could not be persisted")
         if not owns_record:
             return resolution
@@ -589,10 +592,11 @@ class ServeControl:
         record = self._approval_records.get(key)
         if record is None:
             return None
-        if record.state == "failed":
-            self._approval_token += 1
-            record.token = self._approval_token
-            record.state = "reserved"
+        if (
+            record.state == "reserved"
+            and self._approvals.state.health is not None
+            and (record.settlement is None or record.settlement.done())
+        ):
             record.disposition = reason
         elif not self._reserve(record, reason):
             settlement = record.settlement

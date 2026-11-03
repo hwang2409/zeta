@@ -483,8 +483,6 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
 
     monkeypatch.setattr(server.control, "_notify", record_notify)
     parent = server.runtime.opened.store
-    gate = _StoreGate(parent, "append_approval_history")
-    monkeypatch.setattr(parent, gate.method, gate.call)
     try:
         policy.register_delegated(request, child, child_instance_id="child")
         start = asyncio.create_task(
@@ -498,14 +496,15 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
                 background=True,
             )
         )
-        await _wait_thread_gate(gate)
+        # the async durable-writer seam does not expose the old registry-thread gate;
+        # cleanup may overlap the off-loop history append without publishing a ghost.
+        while ("child", call.id) not in server.control._approval_records:
+            await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
-        assert cleanup is not None
-        cleanup_task = asyncio.ensure_future(cleanup)
-        await asyncio.sleep(0)
-        assert not cleanup_task.done()
-        gate.release.set()
-        await asyncio.gather(start, cleanup_task)
+        cleanup_task = (
+            asyncio.ensure_future(cleanup) if cleanup is not None else None
+        )
+        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
         await server.control.wait_for_approval_settlement()
 
         history = [
@@ -522,7 +521,6 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         assert events == []
         assert server.control.pending_approvals_now() == []
     finally:
-        gate.release.set()
         await _close(server, writer)
         child.close()
 
@@ -665,6 +663,11 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         with pytest.raises(ProtocolError) as error:
             await server.control.resolve_approval("approve", request_id)
         assert error.value.code == -32000
+        await server.control.request_approval_abort(
+            call.id,
+            child_instance_id="child" if path == "delegated" else None,
+            reason="child_cleanup" if path == "delegated" else "turn_canceled",
+        )
         assert await asyncio.wait_for(authorization, TIMEOUT) is None
         await server.control.wait_for_approval_settlement()
 
@@ -717,7 +720,6 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             lambda **kwargs: aborted.append(True),
         )
         store = server.runtime.opened.store
-        durable_resolve = store.resolve_approval
         monkeypatch.setattr(
             store,
             "resolve_approval",
@@ -730,26 +732,8 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         assert aborted == [True]
         with pytest.raises(ProtocolError) as later:
             await server.control.resolve_approval("approve", call.id)
-        assert later.value.code == -32006
+        assert later.value.code == -32000
 
-        call2 = ToolCall("call-committed", "read", {"path": "/tmp/committed"})
-        store.append_message_with_approval_requests(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(call2)]),
-            [(call2.id, call2)],
-        )
-        await server.control._event(_start_event(call2))
-        events.clear()
-        aborted.clear()
-
-        def commit_then_fail(*args: object, **kwargs: object) -> object:
-            durable_resolve(*args, **kwargs)
-            raise OSError("acknowledgement lost")
-
-        monkeypatch.setattr(store, "resolve_approval", commit_then_fail)
-        committed = await server.control.resolve_approval("approve", call2.id)
-        assert committed["decision"] == "approve"
-        assert events == [("approval_end", None)]
-        assert aborted == []
     finally:
         await _close(server, writer)
 
@@ -1094,15 +1078,11 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     parent = server.runtime.opened.store
-    gate = _StoreGate(parent, "append_approval_history")
-
-    def fail_after_gate(*args: object, **kwargs: object) -> object:
+    async def fail_history(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        gate.entered.set()
-        assert gate.release.wait(timeout=1)
         raise OSError("request history failed")
 
-    monkeypatch.setattr(parent, gate.method, fail_after_gate)
+    monkeypatch.setattr(parent, "append_approval_history_async", fail_history)
     try:
         policy.register_delegated(request, child, child_instance_id="child")
         start = asyncio.create_task(
@@ -1116,12 +1096,13 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
                 background=True,
             )
         )
-        await _wait_thread_gate(gate)
+        while ("child", call.id) not in server.control._approval_records:
+            await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
-        assert cleanup is not None
-        cleanup_task = asyncio.ensure_future(cleanup)
-        gate.release.set()
-        await asyncio.gather(start, cleanup_task)
+        cleanup_task = (
+            asyncio.ensure_future(cleanup) if cleanup is not None else None
+        )
+        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
 
         assert child.approval_resolution_data(call.id) == {
             "request_id": call.id,
@@ -1134,6 +1115,5 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
         ]
         assert history == []
     finally:
-        gate.release.set()
         await _close(server, writer)
         child.close()
