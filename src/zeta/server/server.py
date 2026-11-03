@@ -40,7 +40,6 @@ from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
-
 LOADED_SESSION_MUTATIONS = frozenset(
     {
         "abort",
