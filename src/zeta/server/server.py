@@ -29,7 +29,13 @@ from . import (
     slash_commands,
 )
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .connections import OBSERVER_READ_ONLY_CODE, OBSERVER_REQUESTS, ConnectionRegistry, capture_observer_read, read_observer
+from .connections import (
+    OBSERVER_READ_ONLY_CODE,
+    OBSERVER_REQUESTS,
+    ConnectionRegistry,
+    capture_observer_read,
+    read_observer,
+)
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .notification_presentation import NotificationPresentation
 from .project_requests import (
@@ -882,7 +888,6 @@ class _Client:
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
             self._schedule_background_wake(session_id)
-
     async def _event(
         self,
         event: StreamEvent,
@@ -1044,10 +1049,8 @@ class _Client:
         await self._notify(
             wire_event, session_id, data=dict(event.data)
         )
-
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
-
         if not self._closed:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
