@@ -44,30 +44,30 @@ class DeliveryRequests:
     def __init__(self, control: ServeControl) -> None:
         self._control = control
 
-    async def send(self, params: dict[str, Any]) -> dict[str, object]:
+    async def send(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
         control = self._control
         runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
-        delivery_id = self._delivery_id(params)
+        delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        if control._turn_busy():
+        if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         value = control._model_inputs.resolve(
             runtime.session_id,
             params,
-            enabled="model_input_ids" in control.features,
+            enabled="model_input_ids" in features,
         )
-        await control._user_message(value.display_text, "send")
+        await control.user_message(value.display_text, "send", features)
         if delivery_id is None:
-            control._turn_task = asyncio.create_task(
-                control._run_turn(
-                    value.text,
-                    origin=value.origin,
-                    user_message=value.message,
-                )
+            control.start_turn(
+                value.text,
+                origin=value.origin,
+                user_message=value.message,
             )
             return {"accepted": True, "session_id": runtime.session_id}
 
@@ -85,13 +85,11 @@ class DeliveryRequests:
         }
 
         def start_turn() -> None:
-            control._turn_task = asyncio.create_task(
-                control._run_turn(
-                    value.text,
-                    origin=value.origin,
-                    user_message=message,
-                    persist_user_message=False,
-                )
+            control.start_turn(
+                value.text,
+                origin=value.origin,
+                user_message=message,
+                persist_user_message=False,
             )
 
         await runtime.opened.store.append_client_delivery_async(
@@ -104,23 +102,25 @@ class DeliveryRequests:
         )
         return outcome
 
-    async def steer(self, params: dict[str, Any]) -> dict[str, object]:
+    async def steer(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
         control = self._control
         runtime = control.server.runtime
         loop = runtime.loop
         if loop is None or runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
-        delivery_id = self._delivery_id(params)
+        delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
-        if not control._turn_busy():
+        if not control.turn_busy():
             raise ProtocolError(-32005, "no turn is running")
         text = _required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        await control._user_message(text, "steer")
+        await control.user_message(text, "steer", features)
         if delivery_id is None:
             loop.steer(message)
             return {"accepted": True}
@@ -169,9 +169,11 @@ class DeliveryRequests:
         ):
             control._schedule_background_wake(session_id)
 
-    def status(self, params: dict[str, Any]) -> dict[str, object]:
+    def status(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
         control = self._control
-        control._require_feature("delivery_id", "delivery_status")
+        _require_feature(features, "delivery_id", "delivery_status")
         delivery_id = _required_delivery_id(params)
         runtime = control.server.runtime
         if runtime.opened is None:
@@ -189,10 +191,12 @@ class DeliveryRequests:
             }
         return {"delivery_id": delivery_id, "status": "unknown"}
 
-    def _delivery_id(self, params: dict[str, Any]) -> str | None:
+    def _delivery_id(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> str | None:
         if "delivery_id" not in params:
             return None
-        self._control._require_feature("delivery_id", "delivery_id")
+        _require_feature(features, "delivery_id", "delivery_id")
         return _required_delivery_id(params)
 
     def _duplicate(self, delivery_id: str | None) -> dict[str, object] | None:
@@ -213,6 +217,13 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
+
+
+def _require_feature(
+    features: frozenset[str], feature: str, param: str
+) -> None:
+    if feature not in features:
+        raise ProtocolError(-32602, f"{param} requires negotiated feature '{feature}'")
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
