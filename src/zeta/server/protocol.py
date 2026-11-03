@@ -24,11 +24,26 @@ FEATURES = (
     "abort_scope",
     "turn_context",
     "delivery_id",
+    "serve_observers",
+    "child_run_events",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
+
+
+def hello_result(
+    protocol_version: str, capabilities: dict[str, object], warning: str | None
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "protocol_version": protocol_version,
+        "server": "zeta",
+        "capabilities": capabilities,
+    }
+    if warning is not None:
+        result["notices"] = [warning]
+    return result
 
 
 class _OversizedInteger:

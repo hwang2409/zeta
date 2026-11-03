@@ -20,6 +20,7 @@ from ...accounts import (
     AccountUsage,
     account_provider,
 )
+from ...accounts.login import login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
@@ -201,16 +202,33 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
         return ""
 
+    async def _login_account(self, requested: list[str]) -> str:
+        context = getattr(self.loop, "account_context", None)
+        if context is None:
+            return "accounts unavailable for this session"
+        if len(requested) != 3 or requested[1] not in {"anthropic", "codex"}:
+            return "usage: /accounts login <anthropic|codex> <label>"
+        try:
+            await asyncio.to_thread(
+                login_named_account, context.home, requested[1], requested[2]
+            )
+        except (AccountError, OSError, RuntimeError, ValueError):
+            return "account login failed"
+        return f"logged in as {requested[1]}:{requested[2].lower()}"
+
     async def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
-        if args.split():
-            return await asyncio.to_thread(
-                rename_account_command, self.loop.account_context.store, args
-            )
+        context = getattr(self.loop, "account_context", None)
+        requested = args.split()
+        if requested and requested[0] == "login":
+            return await self._login_account(requested)
+        if requested:
+            if context is None:
+                return "accounts unavailable for this session"
+            return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
             return "accounts unavailable: cannot switch while a turn or approval is active"
-        context = getattr(self.loop, "account_context", None)
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
@@ -311,6 +329,48 @@ class SlashHandlerMixin:
             self._repaint_accounts_picker()
 
         return asyncio.create_task(set_default())
+
+    def accounts_picker_login(self) -> None:
+        picker = self._accounts_picker
+        session = self._active_session
+        if picker is None or session is None:
+            return
+        provider = picker.highlighted.provider
+        self._dismiss_accounts_picker()
+        session.default_buffer.reset()
+        session.default_buffer.insert_text(f"/accounts login {provider} ")
+        self._invalidate_prompt()
+
+    def accounts_picker_logout(self) -> asyncio.Task[None] | None:
+        picker = self._accounts_picker
+        if picker is None:
+            return None
+        account = picker.highlighted
+        if picker.logout_confirmation != account:
+            picker.logout_confirmation = account
+            self._repaint_accounts_picker()
+            return None
+
+        async def logout() -> None:
+            try:
+                message = await asyncio.to_thread(
+                    self.loop.account_context.store.logout,
+                    account,
+                    sessions_root=self.loop.account_context.home / "sessions",
+                )
+            except (AccountError, OSError, ValueError) as exc:
+                picker.logout_confirmation = None
+                self._repaint_accounts_picker()
+                self._print_system(f"account unchanged: {exc}")
+                return
+            snapshot = await self.loop.account_context.list_snapshot()
+            if snapshot.displays:
+                self._show_accounts_picker(snapshot)
+            else:
+                self._dismiss_accounts_picker()
+            self._print_system(message)
+
+        return asyncio.create_task(logout())
 
     def accounts_picker_rename(self) -> None:
         picker = self._accounts_picker

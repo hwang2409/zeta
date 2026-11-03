@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from ..protocol.types import (
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
+from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
@@ -42,6 +44,8 @@ SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
+_SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
+logger = logging.getLogger(__name__)
 
 
 class _TestScriptedBackend(CompletionBackend):
@@ -190,11 +194,13 @@ class ServerRuntime:
         self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
+        self._project_registry_probed = False
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
+        self._setup_reapers: set[asyncio.Task[None]] = set()
 
     def backend_for_model(
         self,
@@ -274,11 +280,32 @@ class ServerRuntime:
     def session_id(self) -> str:
         return self.metadata.session_id
 
+    async def initialize_project_registry(self) -> None:
+        """Probe registry availability once outside the event loop."""
+
+        if self._project_registry_probed:
+            return
+        state = await asyncio.to_thread(load_project_registry, self.home / "projects")
+        self.manager.project_registry_state = state
+        self.manager.project_registry = state.registry
+        self.manager.project_registry_unavailable = state.unavailable
+        self._project_registry_probed = True
+
     def list_sessions(self) -> list[SessionMetadata]:
         return self.manager.list_sessions()
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
         return self.manager.list_sessions_read_only()
+
+    def available_project_features(self, features: list[str]) -> list[str]:
+        if self.manager.project_registry is not None:
+            return features
+        return [item for item in features if not item.startswith("projects")]
+
+    @property
+    def project_registry_warning(self) -> str | None:
+        unavailable = self.manager.project_registry_unavailable
+        return unavailable.warning if unavailable is not None else None
 
     def set_post_stream_provider_retry(self, enabled: bool) -> None:
         """Apply the serve client's negotiated retry display capability."""
@@ -322,16 +349,32 @@ class ServerRuntime:
         """
 
         session_cwd = cwd if cwd is not None else self.cwd
+        composition = await self._run_setup(
+            session_cwd,
+            provider=provider,
+            model=model,
+        )
+        await self._replace(composition)
+        return self.metadata
+
+    def _prepare_new_session(
+        self, session_cwd: Path, provider: str | None, model: str | None
+    ) -> tuple[object, object, object, object, object]:
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(provider, model, project_root=repo_root)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
-        associated = associate_project_discovery(
-            discovery, self.manager.project_registry, create=False
+        registry = self.manager.project_registry
+        associated = (
+            associate_project_discovery(discovery, registry, create=False)
+            if registry is not None
+            else discovery
         )
-        session_project = associated.project
-        cwd_project = resolve_project_context(discovery, self.manager.project_registry)
+        session_project = associated.project if registry is not None else None
+        cwd_project = (
+            resolve_project_context(discovery, registry) if registry is not None else None
+        )
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
@@ -341,20 +384,40 @@ class ServerRuntime:
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
         )
-        composition = await asyncio.to_thread(
-            self._compose,
-            cwd=session_cwd,
-            config=config,
-            provider=config.provider,
-            model=config.model,
-            project_context=context,
-            skill_catalog=skill_catalog,
-            agent_catalog=agent_catalog,
-            project_id=session_project.project_id if session_project is not None else None,
-            max_turns=self._max_turns,
+        return config, skill_catalog, agent_catalog, context, session_project
+
+    def _prepare_resumed_session(
+        self, opened: OpenedSession, session_cwd: Path
+    ) -> tuple[object, object]:
+        discovery = discover_project(session_cwd, user_home=self.home.parent)
+        repo_root = discovery.primary_root or discovery.cwd
+        config = self._config(
+            opened.metadata.provider,
+            opened.metadata.model,
+            project_root=repo_root,
         )
-        await self._replace(composition)
-        return self.metadata
+        registry = self.manager.project_registry
+        session_project = None
+        if opened.metadata.project_id is not None and registry is not None:
+            try:
+                session_project = registry.show_project(opened.metadata.project_id)
+            except (OSError, ValueError):
+                pass
+        cwd_project = (
+            resolve_project_context(discovery, registry) if registry is not None else None
+        )
+        resumed_prompt = resume_prompt(
+            opened.metadata,
+            manager=self.manager,
+            store=opened.store,
+            home=self.home,
+            repo_root=repo_root,
+            inbox_enabled=config.inbox_enabled,
+            session_project=session_project,
+            cwd_project=cwd_project,
+            project_features_enabled=registry is not None,
+        )
+        return config, resumed_prompt
 
     async def resume_session(self, session_id: str) -> SessionMetadata:
         if self._state is not None and self._state.session_id == session_id:
@@ -363,60 +426,12 @@ class ServerRuntime:
         if metadata.provider == "fake":
             raise ValueError(REMOVED_PROVIDER_ERROR)
         session_cwd = Path(metadata.cwd)
-        if not session_cwd.is_dir():
+        if not await asyncio.to_thread(session_cwd.is_dir):
             raise ValueError(
                 f"session working directory no longer exists: {metadata.cwd}"
             )
-        opened = await asyncio.to_thread(self.manager.open, session_id)
-        try:
-            discovery = discover_project(session_cwd, user_home=self.home.parent)
-            repo_root = discovery.primary_root or discovery.cwd
-            config = self._config(
-                opened.metadata.provider,
-                opened.metadata.model,
-                project_root=repo_root,
-            )
-            session_project = None
-            if opened.metadata.project_id is not None:
-                try:
-                    session_project = self.manager.project_registry.show_project(
-                        opened.metadata.project_id
-                    )
-                except (OSError, ValueError):
-                    pass
-            cwd_project = resolve_project_context(
-                discovery, self.manager.project_registry
-            )
-            resumed_prompt = await asyncio.to_thread(
-                resume_prompt,
-                opened.metadata,
-                manager=self.manager,
-                store=opened.store,
-                home=self.home,
-                repo_root=repo_root,
-                inbox_enabled=config.inbox_enabled,
-                session_project=session_project,
-                cwd_project=cwd_project,
-            )
-            context = resumed_prompt.context
-            skill_catalog = resumed_prompt.skill_catalog
-            agent_catalog = resumed_prompt.agent_catalog
-            composition = await asyncio.to_thread(
-                self._compose,
-                cwd=session_cwd,
-                config=config,
-                provider=opened.metadata.provider,
-                model=opened.metadata.model,
-                project_context=context,
-                skill_catalog=skill_catalog,
-                agent_catalog=agent_catalog,
-                opened=opened,
-                project_id=opened.metadata.project_id,
-                max_turns=self._max_turns,
-            )
-        except BaseException:
-            await asyncio.to_thread(opened.store.close)
-            raise
+
+        composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
         return self.metadata
 
@@ -424,10 +439,101 @@ class ServerRuntime:
     async def _close_state(state: SessionState) -> None:
         await close_session(state.loop)
 
+    async def _run_setup(
+        self,
+        session_cwd: Path,
+        *,
+        session_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> RuntimeComposition:
+        async def setup() -> RuntimeComposition:
+            opened = None
+            try:
+                if session_id is not None:
+                    opened = await asyncio.to_thread(self.manager.open, session_id)
+                    prepared = await asyncio.to_thread(
+                        self._prepare_resumed_session, opened, session_cwd
+                    )
+                    config, resumed_prompt = prepared
+                    kwargs = {
+                        "config": config,
+                        "provider": opened.metadata.provider,
+                        "model": opened.metadata.model,
+                        "project_context": resumed_prompt.context,
+                        "skill_catalog": resumed_prompt.skill_catalog,
+                        "agent_catalog": resumed_prompt.agent_catalog,
+                        "opened": opened,
+                        "project_id": opened.metadata.project_id,
+                    }
+                else:
+                    prepared = await asyncio.to_thread(
+                        self._prepare_new_session, session_cwd, provider, model
+                    )
+                    config, skill_catalog, agent_catalog, context, session_project = prepared
+                    kwargs = {
+                        "config": config,
+                        "provider": config.provider,
+                        "model": config.model,
+                        "project_context": context,
+                        "skill_catalog": skill_catalog,
+                        "agent_catalog": agent_catalog,
+                        "project_id": (
+                            session_project.project_id
+                            if session_project is not None
+                            else None
+                        ),
+                    }
+                return await asyncio.to_thread(
+                    self._compose,
+                    cwd=session_cwd,
+                    max_turns=self._max_turns,
+                    **kwargs,
+                )
+            except BaseException:
+                if opened is not None:
+                    await asyncio.to_thread(opened.store.close)
+                raise
+
+        setup_task = asyncio.create_task(setup())
+        try:
+            return await asyncio.shield(setup_task)
+        except asyncio.CancelledError:
+            # The reaper owns the setup from here; it closes the store once
+            # setup ends, so this cancel returns without waiting on it.
+            reaper = asyncio.create_task(self._reap_setup(setup_task))
+            self._setup_reapers.add(reaper)
+            reaper.add_done_callback(self._setup_reapers.discard)
+            raise
+
+    async def _reap_setup(self, setup_task: asyncio.Task[RuntimeComposition]) -> None:
+        try:
+            composition = await setup_task
+        except BaseException as exc:  # noqa: BLE001
+            logger.warning("abandoned session setup failed: %s", exc)
+        else:
+            try:
+                await self._close_state(SessionState.from_composition(composition))
+            except BaseException:
+                logger.exception("abandoned session setup cleanup failed")
+            else:
+                logger.info("canceled session setup was cleaned up")
+
     async def close(self) -> None:
         state, self._state = self._state, None
         if state is not None:
             await self._close_state(state)
+        if self._setup_reapers:
+            pending = asyncio.gather(*self._setup_reapers)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
+                )
+            except TimeoutError:
+                logger.error(
+                    "%d abandoned session setup task(s) still running at shutdown",
+                    len(self._setup_reapers),
+                )
 
     async def _replace(self, composition: RuntimeComposition) -> None:
         state = SessionState.from_composition(composition)

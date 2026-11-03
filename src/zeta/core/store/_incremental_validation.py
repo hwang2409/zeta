@@ -12,6 +12,12 @@ from ._validation import (
     TASK_EXITED_NOTIFICATION_KIND,
 )
 
+# Abort reasons a stored approval resolution may carry. `grace_expired` is
+# reserved for the approval reconnect grace (not emitted yet).
+APPROVAL_RESOLUTION_REASONS = frozenset(
+    {"controller_disconnected", "turn_canceled", "child_cleanup", "grace_expired"}
+)
+
 
 class IncrementalValidationMixin:
     """Validate linear appended entries without rescanning the full log."""
@@ -234,6 +240,13 @@ class IncrementalValidationMixin:
                 raise ConversationIntegrityError(
                     f"approval resolution is not linked to request: {request_id}"
                 )
+            reason = entry.data.get("reason")
+            if reason is not None and (
+                type(reason) is not str
+                or entry.data.get("decision") != "abort"
+                or reason not in APPROVAL_RESOLUTION_REASONS
+            ):
+                raise ConversationIntegrityError("invalid approval resolution reason")
             if request_id in self._active_approval_resolutions:
                 raise ConversationIntegrityError(
                     f"duplicate approval resolution: {request_id}"

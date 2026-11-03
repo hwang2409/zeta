@@ -33,7 +33,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.factory import build_backend
 from zeta.runtime.composition import RuntimeComposition, compose_runtime
-from zeta.server.server import _Client
+from zeta.server.control import ServeControl
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.transcript_search.index import TranscriptIndex
@@ -353,9 +353,12 @@ async def test_login_required_notice_is_delivered_to_serve_client(
     tmp_path: Path,
 ) -> None:
     composition, memory_backend = await _login_required_composition(tmp_path)
-    client = object.__new__(_Client)
-    client._closed = False
-    client.features = frozenset({"memory_updated"})
+    control = object.__new__(ServeControl)
+    control.closing = False
+    controller = SimpleNamespace(features=frozenset({"memory_updated"}))
+    control.server = SimpleNamespace(
+        connections=SimpleNamespace(current_controller=lambda: controller)
+    )
     events: list[tuple[str, str | None, dict[str, object]]] = []
 
     async def notify(
@@ -363,10 +366,10 @@ async def test_login_required_notice_is_delivered_to_serve_client(
     ) -> None:
         events.append((event, session_id, fields))
 
-    client._notify = notify
+    control._notify = notify
     reconciler = composition.memory_reconciler
     assert reconciler is not None
-    reconciler.notice = lambda message: client._publish_memory_notice(
+    reconciler.notice = lambda message: control._publish_memory_notice(
         composition.opened.metadata.session_id, message
     )
     try:
@@ -393,9 +396,12 @@ async def test_login_required_notice_is_delivered_to_serve_client(
 
 
 async def test_serve_memory_event_requires_negotiated_feature() -> None:
-    client = object.__new__(_Client)
-    client._closed = False
-    client.features = frozenset({"memory_updated"})
+    control = object.__new__(ServeControl)
+    control.closing = False
+    controller = SimpleNamespace(features=frozenset({"memory_updated"}))
+    control.server = SimpleNamespace(
+        connections=SimpleNamespace(current_controller=lambda: controller)
+    )
     events: list[tuple[str, str | None, dict[str, object]]] = []
 
     async def notify(
@@ -403,8 +409,8 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
     ) -> None:
         events.append((event, session_id, fields))
 
-    client._notify = notify
-    client._publish_memory_notice("session", "memory update failed: validation error")
+    control._notify = notify
+    control._publish_memory_notice("session", "memory update failed: validation error")
     await asyncio.sleep(0)
     assert events == [
         (
@@ -414,8 +420,8 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
         )
     ]
 
-    client.features = frozenset()
-    client._publish_memory_notice("session", "hidden")
+    controller.features = frozenset()
+    control._publish_memory_notice("session", "hidden")
     await asyncio.sleep(0)
     assert len(events) == 1
 

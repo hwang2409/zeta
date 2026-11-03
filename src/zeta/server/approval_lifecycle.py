@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from uuid import uuid4
 
-from ..core.approval import ApprovalRequest
+from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.store import ConversationStore
 
 ApprovalKey = str | tuple[str, str]
+
+
+def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
+    """Return immutable trusted display facts for an approval request."""
+
+    fields: dict[str, object] = {}
+    if request.action is not None:
+        fields["approval_action"] = request.action
+    display = request.audit_display()
+    if display:
+        fields["approval_display"] = display
+    return fields
 
 
 @dataclass(slots=True)
@@ -36,6 +50,7 @@ class _TrackedApproval:
             "request_id": self.request_id,
             "tool_call": self.tool_call,
             "data": data,
+            **({"reason": data["reason"]} if "reason" in data else {}),
         }
 
 
@@ -47,11 +62,18 @@ class ApprovalLifecycle:
         self._wires_by_key: dict[ApprovalKey, str] = {}
         self._keys_by_wire: dict[str, ApprovalKey] = {}
 
-    def observe(self, request: ApprovalRequest) -> dict[str, object]:
-        """Track a visible request and return its pending wire payload."""
+    def observe(
+        self,
+        request: ApprovalRequest,
+        *,
+        store: ConversationStore | None = None,
+        fields: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Track a visible request and durably record delegated wire identity."""
 
         tracked = self._by_key.get(request.key)
-        if tracked is None or tracked.ended:
+        created = tracked is None or tracked.ended
+        if created:
             request_id = self.wire_id(request.key)
             tracked = _TrackedApproval(
                 key=request.key,
@@ -61,7 +83,10 @@ class ApprovalLifecycle:
                 agent_instance_id=request.child_instance_id,
             )
             self._by_key[request.key] = tracked
-        return tracked.pending_payload()
+        payload = {**tracked.pending_payload(), **(fields or {})}
+        if created and tracked.delegated and store is not None:
+            store.append_approval_history({"event": "approval_request", **payload})
+        return payload
 
     def core_key(self, request_id: str) -> ApprovalKey:
         """Resolve an opaque wire ID, or preserve a foreground raw ID."""
@@ -79,7 +104,11 @@ class ApprovalLifecycle:
         return wire
 
     def end(
-        self, key: ApprovalKey, *, data: dict[str, object] | None = None
+        self,
+        key: ApprovalKey,
+        *,
+        data: dict[str, object] | None = None,
+        store: ConversationStore | None = None,
     ) -> dict[str, object] | None:
         """Return one terminal payload, or None after it was already emitted."""
 
@@ -87,7 +116,10 @@ class ApprovalLifecycle:
         if tracked is None or tracked.ended:
             return None
         tracked.ended = True
-        return tracked.end_payload(data or {})
+        payload = tracked.end_payload(data or {})
+        if tracked.delegated and store is not None:
+            store.append_approval_history({"event": "approval_end", **payload})
+        return payload
 
     def active_keys(self) -> tuple[ApprovalKey, ...]:
         """Return visible approvals that do not have a terminal event."""
@@ -112,3 +144,45 @@ class ApprovalLifecycle:
         self._by_key.clear()
         self._wires_by_key.clear()
         self._keys_by_wire.clear()
+
+
+def durable_end_data(
+    policy: ApprovalPolicy | None, key: object, data: dict[str, object] | None
+) -> dict[str, object]:
+    """Add the durable decision (and the abort reason) to an approval end."""
+    data = dict(data or {})
+    if policy is not None and isinstance(key, (str, tuple)):
+        resolution = policy.durable_resolution(key)
+        if resolution is not None:
+            state = resolution["decision"]
+            data.setdefault("decision", state)
+            if state == "abort" and "reason" not in data:
+                data["reason"] = resolution.get("reason", "turn_canceled")
+    return data
+
+
+def end_durably(
+    lifecycle: ApprovalLifecycle,
+    policy: ApprovalPolicy | None,
+    key: ApprovalKey,
+    store: ConversationStore | None,
+    data: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Build one live end from durable state and record delegated identity."""
+
+    return lifecycle.end(
+        key, data=durable_end_data(policy, key, data), store=store
+    )
+
+
+def abort_pending(
+    policy: ApprovalPolicy | None, foreground_only: bool, reason: str
+) -> None:
+    """Abort the policy's pending approvals with one durable reason."""
+    if policy is None:
+        return
+    for request in policy.pending_requests():
+        if foreground_only and request.child_instance_id is not None:
+            continue
+        with contextlib.suppress(ValueError, RuntimeError):
+            policy.abort(request.key, reason=reason)

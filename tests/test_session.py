@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import fcntl
 import hashlib
 import inspect
 import json
 import multiprocessing
+import os
 import subprocess
 import threading
 import time
@@ -71,6 +73,26 @@ def _private_project(home: Path, root: Path, marker: str) -> tuple[str, Path]:
     path = home / "projects" / project.project_id / "AGENTS.md"
     path.write_text(marker, encoding="utf-8")
     return project.project_id, path
+
+
+def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, threading.Thread]:
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        fd = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            acquired.set()
+            release.wait(2)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert acquired.wait(2)
+    return acquired, release, thread
 
 
 def _system_prompt(app: TUIApp) -> str:
@@ -470,6 +492,43 @@ def test_repo_agents_ignore_warns_with_custom_system_prompt_on_resume(
     resumed = create_app(_args("--resume", session_id))
 
     assert any("repository AGENTS.md" in notice for notice in resumed._startup_notices)
+
+
+@pytest.mark.asyncio
+async def test_project_instructions_does_not_block_status_on_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _private_project(home, root, "")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = await asyncio.to_thread(create_app, _args())
+    app.open_project_instructions_editor = lambda path: f"opened {path}"  # type: ignore[attr-defined]
+    release = None
+    holder = None
+    try:
+        _acquired, release, holder = _hold_registry_lock(home / "projects" / ".lock")
+        operation = asyncio.create_task(
+            app._slash_commands.dispatch_async(app, "/project-instructions")
+        )
+        status = await app._slash_commands.dispatch_async(app, "/status")
+        assert status
+        progress = asyncio.create_task(asyncio.sleep(0))
+        await progress
+        assert not operation.done()
+        release.set()
+        holder.join(2)
+        result = await operation
+        assert result.startswith(f"opened {home / 'projects'}")
+        assert result.endswith("/AGENTS.md")
+    finally:
+        if release is not None:
+            release.set()
+        if holder is not None:
+            holder.join(2)
+        app.loop.store.close()
 
 
 @pytest.mark.asyncio

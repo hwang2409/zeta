@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import threading
 import time
+from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,7 @@ from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
+from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import (
     discover_session_skills,
@@ -259,7 +261,7 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
-    AccountStore(account_home(home)).migrate()
+    account_warnings = AccountStore(account_home(home)).migrate()
     ephemeral = bool(getattr(args, "no_session", False))
     ephemeral_root: Path | None = None
     if ephemeral:
@@ -268,7 +270,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         ephemeral_root = Path(tempfile.mkdtemp(prefix="zeta-ephemeral-"))
     try:
         with ExitStack() as cleanup:
-            app = _create_app_with_root(args, home, ephemeral_root, cleanup)
+            app = _create_app_with_root(
+                args, home, ephemeral_root, cleanup, account_warnings
+            )
             cleanup.pop_all()
             return app
     except BaseException:
@@ -284,13 +288,17 @@ def _create_app_with_root(
     home: Path,
     ephemeral_root: Path | None,
     cleanup: ExitStack,
+    account_warnings: Sequence[str] = (),
 ) -> TUIApp:
     # Resolve monkey-patch surface at call time so tests that patch
     # ``zeta.tui.app.<name>`` continue to intercept these lookups.
     from . import app as _app
 
     ephemeral = ephemeral_root is not None
-    manager = SessionManager(ephemeral_root if ephemeral else home)
+    runtime_home = ephemeral_root if ephemeral else home
+    assert runtime_home is not None
+    registry_state = load_project_registry(runtime_home / "projects")
+    manager = SessionManager(runtime_home, project_registry_state=registry_state)
     opened = None
     try:
         system_prompt_override = resolve_prompt_argument(
@@ -362,13 +370,16 @@ def _create_app_with_root(
         )
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
-    if config.auto_project and not ephemeral and not resuming:
-        discovery = associate_project_discovery(discovery, manager.project_registry)
-    cwd_project = resolve_project_context(discovery, manager.project_registry)
-    session_project = discovery.project
-    if resuming and metadata.project_id is not None:
+    registry = manager.project_registry
+    if config.auto_project and not ephemeral and not resuming and registry is not None:
+        discovery = associate_project_discovery(discovery, registry)
+    cwd_project = (
+        resolve_project_context(discovery, registry) if registry is not None else None
+    )
+    session_project = discovery.project if registry is not None else None
+    if resuming and metadata.project_id is not None and registry is not None:
         try:
-            session_project = manager.project_registry.show_project(metadata.project_id)
+            session_project = registry.show_project(metadata.project_id)
         except ProjectRegistryError:
             session_project = None
     override_on_resume = False
@@ -413,6 +424,7 @@ def _create_app_with_root(
             system_override=system_prompt_override,
             system_append=system_prompt_append,
             context_loader=_app.load_project_context,
+            project_features_enabled=registry is not None,
         )
         project_context = resumed_prompt.context
         skill_catalog = resumed_prompt.skill_catalog
@@ -594,7 +606,14 @@ def _create_app_with_root(
         + external_tools.notices
         + theme_notices
     )
-    startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
+    startup_warnings = (
+        tuple(loaded_settings.warnings) + external_tools.warnings + account_warnings
+    )
+    if manager.project_registry_unavailable is not None:
+        startup_warnings = (
+            manager.project_registry_unavailable.warning,
+            *startup_warnings,
+        )
     if ephemeral:
         startup_warnings = (
             "ephemeral session: nothing will be persisted",

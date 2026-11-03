@@ -7,7 +7,8 @@ import copy
 import logging
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -166,9 +167,10 @@ class SessionAccountContext:
             )
         selected = self.store.resolve_account(provider)
         if self.store.contains(selected):
-            self._pins[canonical] = selected
-            assert self.manager is not None
-            self.manager.record_account_selection(self.metadata, selected, boundary=0)
+            with self.store.pin_guard({canonical: selected}):
+                self._pins[canonical] = selected
+                assert self.manager is not None
+                self.manager.record_account_selection(self.metadata, selected, boundary=0)
         return selected
 
     def backend_kwargs(self, provider: str) -> dict[str, object]:
@@ -312,7 +314,9 @@ class SessionAccountContext:
                 return metadata, lambda: self._mark_unknown(build_backend)
             return metadata, lambda: None
 
-        return await self._run_locked_apply(build_backend, commit)
+        return await self._run_locked_apply(
+            build_backend, commit, pins=new.pins
+        )
 
     def _mark_unknown(
         self, build_backend: Callable[[SessionMetadata], Any]
@@ -399,6 +403,8 @@ class SessionAccountContext:
         self,
         build_backend: Callable[[SessionMetadata], Any],
         operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        *,
+        pins: Mapping[str, AccountId] | None = None,
     ) -> Any:
         event_loop = asyncio.get_running_loop()
         session_id = self.metadata.session_id
@@ -410,6 +416,7 @@ class SessionAccountContext:
                 session_id,
                 cancelled,
                 operation,
+                pins,
             )
         )
         try:
@@ -435,11 +442,17 @@ class SessionAccountContext:
         session_id: str,
         cancelled: threading.Event,
         operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        pins: Mapping[str, AccountId] | None,
     ) -> tuple[Any, bool]:
         assert self.manager is not None
-        with self.manager._metadata_lock(
-            session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
-        ) as directory_fd:
+        with ExitStack() as stack:
+            if pins is not None:
+                stack.enter_context(self.store.pin_guard(pins))
+            directory_fd = stack.enter_context(
+                self.manager._metadata_lock(
+                    session_id, timeout=ACCOUNT_SWITCH_LOCK_TIMEOUT_SECONDS
+                )
+            )
             assert directory_fd is not None
             result, apply = operation(directory_fd)
             applied = self._apply_on_loop(event_loop, cancelled, apply)

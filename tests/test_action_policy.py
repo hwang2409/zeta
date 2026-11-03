@@ -31,7 +31,7 @@ from zeta.providers.anthropic import build_request_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.providers.ollama import _tools as ollama_tools
 from zeta.runtime.loop import AgentLoop
-from zeta.server.server import _approval_display_fields
+from zeta.server.approval_lifecycle import approval_display_fields
 from zeta.skills import SkillCatalog
 from zeta.tools._action_metadata import ResolvedCapability
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -350,7 +350,7 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     assert request.audit_facts() == {"action": "start"}
     assert request.audit_display() == {}
     assert request.always_allow_rule() == ApprovalRule("task", action="start")
-    assert _approval_display_fields(request) == {"approval_action": "start"}
+    assert approval_display_fields(request) == {"approval_action": "start"}
 
 
 @pytest.mark.asyncio

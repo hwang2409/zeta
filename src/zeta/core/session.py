@@ -40,7 +40,11 @@ from .session_files import (
     child_directory,
     write_session_json,
 )
-from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..project_registry import ProjectRegistryError
+from ..runtime.project_registry_state import (
+    ProjectRegistryState,
+    available_project_registry,
+)
 from .store.session_preferences import SessionPreferenceMixin
 from ..config.tool_policy import validate_tool_patterns
 from ..transcript_search.index import delete_indexed_session
@@ -501,11 +505,15 @@ class OpenedSession:
 
 class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
-    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
+    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None, project_registry_state: ProjectRegistryState | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
         self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
-        self.project_registry = ProjectRegistry(self.home / "projects")
+        state = project_registry_state or available_project_registry(self.home / "projects")
+        self.project_registry_state = state
+        self.project_registry = state.registry
+        self.project_registry_unavailable = state.unavailable
+
     def create(
         self,
         *,
@@ -537,7 +545,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
             raise SessionError("invalid project role")
-        if project_id is None and auto_project:
+        if project_id is None and auto_project and self.project_registry is not None:
             try:
                 project = discover_or_find_project(
                     self.project_registry, resolved_cwd, self.user_home
@@ -642,7 +650,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
         """Associate an existing session with a project."""
         previous_project_id = metadata.project_id
-        self.project_registry.show_project(project_id)
+        registry = self.project_registry
+        if registry is None:
+            raise ProjectRegistryError("project registry capability is unavailable")
+        registry.show_project(project_id)
         bind = lambda item: setattr(item, "project_id", project_id) or item
         current = self._mutate(metadata.session_id, bind)
         self._copy_metadata(metadata, current)
@@ -655,7 +666,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self._reconcile_project_link(current.session_id)
         if previous_project_id is not None and previous_project_id != project_id:
             delete_indexed_session(
-                self.project_registry.root, previous_project_id, current.session_id
+                registry.root, previous_project_id, current.session_id
             )
         return current
 
@@ -672,7 +683,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
-        if not _read_only and metadata.project_id is not None:
+        if (
+            not _read_only
+            and metadata.project_id is not None
+            and self.project_registry is not None
+        ):
             # Reconcile durable linkage intent before publishing a live store;
             # this also repairs links after a process restart.
             self._reconcile_project_link(session_id)
@@ -695,6 +710,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return OpenedSession(metadata, store)
 
     def _reconcile_project_link(self, session_id: str) -> None:
+        registry = self.project_registry
+        if registry is None:
+            return
         try:
             with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
                 pending: dict[str, object] | None = None
@@ -726,7 +744,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         "parent_session_id": metadata.parent_session_id,
                         "transcript_path": str(self.sessions_dir / session_id),
                     }
-                self.project_registry.record_session(
+                registry.record_session(
                     pending["project_id"],
                     session_id=session_id,
                     transcript_path=pending["transcript_path"],
@@ -751,7 +769,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             )
 
     def _reconcile_child_links(self, session_id: str) -> None:
-        reconcile_child_links(self.project_registry, self.sessions_dir, session_id)
+        if self.project_registry is not None:
+            reconcile_child_links(self.project_registry, self.sessions_dir, session_id)
 
     def list_sessions(self) -> list[SessionMetadata]:
         sessions = self.list_sessions_read_only()
@@ -1035,7 +1054,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     shutil.rmtree(full_id, dir_fd=root_fd)
                 finally:
                     os.close(lock_fd)
-            if project_id is not None:
+            if project_id is not None and self.project_registry is not None:
                 delete_indexed_session(self.project_registry.root, project_id, full_id)
         except SessionInUseError:
             raise

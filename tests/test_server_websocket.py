@@ -11,13 +11,16 @@ import os
 import secrets
 import stat
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
+from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES
+from zeta.server.transport import _parse_subprotocol_auth
 
 TIMEOUT = 3
 
@@ -42,7 +45,9 @@ async def _connect(
     *,
     token: str | None,
     origin: str | None = None,
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, int]:
+    protocol_token: str | None = None,
+    protocol_fields: list[str] | None = None,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, int, dict[str, str]]:
     assert server._websocket is not None
     reader, writer = await asyncio.open_connection("127.0.0.1", server._websocket.port)
     query = "" if token is None else "?" + urlencode({"token": token})
@@ -57,6 +62,10 @@ async def _connect(
     ]
     if origin is not None:
         lines.append(f"Origin: {origin}")
+    if protocol_fields is not None:
+        lines.extend(f"Sec-WebSocket-Protocol: {field}" for field in protocol_fields)
+    elif protocol_token is not None:
+        lines.append(f"Sec-WebSocket-Protocol: zeta.v1, zeta.bearer.{protocol_token}")
     writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
     await writer.drain()
     status, headers = await _read_http_headers(reader)
@@ -67,7 +76,25 @@ async def _connect(
             ).digest()
         ).decode("ascii")
         assert headers["sec-websocket-accept"] == expected
-    return reader, writer, status
+    return reader, writer, status, headers
+
+
+def test_parse_subprotocol_auth() -> None:
+    assert _parse_subprotocol_auth([]) == ("none", None)
+    assert _parse_subprotocol_auth(["zeta.v1"]) == ("none", None)
+    assert _parse_subprotocol_auth(["zeta.v1, zeta.bearer.secret"]) == (
+        "bearer",
+        "secret",
+    )
+    assert _parse_subprotocol_auth(["zeta.bearer.secret"]) == ("invalid", None)
+    assert _parse_subprotocol_auth(["zeta.v1, zeta.bearer."]) == ("invalid", None)
+    assert _parse_subprotocol_auth(
+        ["zeta.v1, zeta.bearer.one", "zeta.bearer.two"]
+    ) == ("invalid", None)
+    assert _parse_subprotocol_auth(["zeta.v1, zeta.bearer.one, zeta.bearer.two"]) == (
+        "invalid",
+        None,
+    )
 
 
 def _masked_frame(
@@ -124,9 +151,12 @@ async def _close(
 async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
     await server.start()
-    reader, writer, status = await _connect(server, token=server._websocket.token)
+    reader, writer, status, headers = await _connect(
+        server, token=None, protocol_token=server._websocket.token
+    )
     try:
         assert status == 101
+        assert headers["sec-websocket-protocol"] == "zeta.v1"
         await _send_json(
             writer,
             {
@@ -151,6 +181,96 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_websocket_drop_during_approval_finishes_cleanly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    with caplog.at_level(logging.ERROR):
+        await server.start()
+        connection = await _connect(server, token=server._websocket.token)
+        reader, writer, status = connection[:3]
+        assert status == 101
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 1
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "new_session",
+                "params": {"provider": "codex"},
+            },
+        )
+        assert (await _read_json(reader))["id"] == 2
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "send",
+                "params": {"text": "read it"},
+            },
+        )
+        while True:
+            frame = await _read_json(reader)
+            if frame.get("params", {}).get("event") == "approval_request":
+                break
+
+        writer.write(_masked_frame((1000).to_bytes(2, "big"), opcode=8))
+        await writer.drain()
+        opcode, _payload = await _read_frame(reader)
+        assert opcode == 8
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            opened = server.runtime.opened
+            if (
+                opened is not None
+                and server._client is None
+                and any(
+                    entry.type == "approval_resolution"
+                    and entry.data.get("decision") == "abort"
+                    for entry in opened.store.entries
+                )
+            ):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        await server.close()
+
+    assert opened is not None
+    assert any(
+        entry.type == "approval_resolution"
+        and entry.data.get("decision") == "abort"
+        for entry in opened.store.entries
+    )
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        or "exception was never retrieved" in record.getMessage().lower()
+    ] == []
+
+
+@pytest.mark.asyncio
 async def test_websocket_upgrade_requires_token_and_allowed_origin(
     tmp_path: Path,
 ) -> None:
@@ -170,7 +290,9 @@ async def test_websocket_upgrade_requires_token_and_allowed_origin(
             (server._websocket.token, "http://127.0.0.1:5173", 101),
             (server._websocket.token, None, 101),
         ):
-            _reader, writer, status = await _connect(server, token=token, origin=origin)
+            _reader, writer, status, _headers = await _connect(
+                server, token=token, origin=origin
+            )
             assert status == expected
             writer.close()
             await writer.wait_closed()
@@ -181,6 +303,91 @@ async def test_websocket_upgrade_requires_token_and_allowed_origin(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query_token", "protocol_token", "expected"),
+    [
+        (None, "wrong", 401),
+        (None, None, 401),
+        ("__server_token__", "wrong", 401),
+        ("__server_token__", None, 101),
+    ],
+)
+async def test_websocket_subprotocol_auth_rejects_bad_tokens(
+    tmp_path: Path,
+    query_token: str | None,
+    protocol_token: str | None,
+    expected: int,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    assert server._websocket is not None
+    if query_token == "__server_token__":
+        query_token = server._websocket.token
+    try:
+        _reader, writer, status, _headers = await _connect(
+            server, token=query_token, protocol_token=protocol_token
+        )
+        assert status == expected
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await _close(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "query", "expected"),
+    [
+        (["zeta.bearer.{token}"], "{token}", 401),
+        (["zeta.v1, zeta.bearer.{token}", "zeta.bearer.wrong"], "{token}", 401),
+        (["zeta.v1, zeta.bearer.{token}, zeta.bearer.wrong"], "{token}", 401),
+        (["zeta.v1"], "{token}", 101),
+        (["zeta.v1"], None, 401),
+    ],
+)
+async def test_websocket_subprotocol_auth_shape(
+    tmp_path: Path,
+    fields: list[str],
+    query: str | None,
+    expected: int,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    assert server._websocket is not None
+    token = server._websocket.token
+    assert token is not None
+    try:
+        fields = [field.format(token=token) for field in fields]
+        query = None if query is None else query.format(token=token)
+        _reader, writer, status, _headers = await _connect(
+            server, token=query, protocol_fields=fields
+        )
+        assert status == expected
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_websocket_valid_bearer_echoes_only_v1(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    assert server._websocket is not None
+    try:
+        _reader, writer, status, headers = await _connect(
+            server,
+            token=None,
+            protocol_fields=[f"zeta.bearer.{server._websocket.token}, zeta.v1"],
+        )
+        assert status == 101
+        assert headers["sec-websocket-protocol"] == "zeta.v1"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await _close(server)
+
+
 async def test_websocket_and_unix_socket_share_single_client_limit(
     tmp_path: Path,
 ) -> None:
@@ -189,7 +396,9 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
         home=tmp_path, socket_path=socket_path, ws_port=0, provider="codex"
     )
     await server.start()
-    ws_reader, ws_writer, status = await _connect(server, token=server._websocket.token)
+    ws_reader, ws_writer, status, _headers = await _connect(
+        server, token=server._websocket.token
+    )
     try:
         assert status == 101
         await _send_json(
@@ -201,10 +410,34 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
                 "params": {"protocol_version": "1.0"},
             },
         )
-        await _read_json(ws_reader)
+        hello = await _read_json(ws_reader)
+        assert hello["id"] == 1
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-        error = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hello",
+                "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]},
+            }) + "\n").encode()
+        )
+        await writer.drain()
+        observer_hello = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+        assert observer_hello["id"] == 2
+        occupied_reader, occupied_writer = await asyncio.open_unix_connection(str(server.socket_path))
+        occupied_writer.write(
+            (json.dumps({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            }) + "\n").encode()
+        )
+        await occupied_writer.drain()
+        error = json.loads(await asyncio.wait_for(occupied_reader.readline(), TIMEOUT))
         assert error["error"]["code"] == -32001
+        occupied_writer.close()
+        await occupied_writer.wait_closed()
         writer.close()
         await writer.wait_closed()
     finally:
@@ -215,7 +448,9 @@ async def test_websocket_and_unix_socket_share_single_client_limit(
 async def test_websocket_reassembles_fragmented_text(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
     await server.start()
-    reader, writer, status = await _connect(server, token=server._websocket.token)
+    reader, writer, status, _headers = await _connect(
+        server, token=server._websocket.token
+    )
     try:
         assert status == 101
         payload = json.dumps(
@@ -253,7 +488,9 @@ async def test_websocket_rejects_invalid_message_types(
 ) -> None:
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
     await server.start()
-    reader, writer, status = await _connect(server, token=server._websocket.token)
+    reader, writer, status, _headers = await _connect(
+        server, token=server._websocket.token
+    )
     try:
         assert status == 101
         writer.write(frame)
@@ -283,6 +520,7 @@ async def test_websocket_token_file_lifecycle_and_loopback_bind(tmp_path: Path) 
             "token": server._websocket.token,
             "pid": os.getpid(),
             "origins": ["http://127.0.0.1:5173"],
+            "ws_auth": ["subprotocol", "query"],
         }
         assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
         assert server._websocket.server is not None
@@ -307,10 +545,16 @@ async def test_websocket_prints_connect_url_once_without_logging_token(
         await _close(server)
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == (
-        f"zeta serve: websocket ready: ws://127.0.0.1:{port}/?token={token}\n"
-    )
     assert token is not None
+    expected = f"zeta serve: websocket ready: ws://127.0.0.1:{port}/?token={token}\n"
+    assert captured.err == expected
+    startup_url = captured.err.removeprefix("zeta serve: websocket ready: ").removesuffix("\n")
+    parsed = urlsplit(startup_url)
+    assert parsed.scheme == "ws"
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.port == port
+    assert parsed.path == "/"
+    assert parse_qs(parsed.query) == {"token": [token]}
     assert all(token not in record.getMessage() for record in caplog.records)
 
 

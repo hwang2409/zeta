@@ -26,6 +26,7 @@ from ..protocol.types import (
     is_passive_harness_message,
     with_message_origin,
 )
+from . import event_contract
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
@@ -44,6 +45,7 @@ EXTENSION_REQUESTS = [
     "slash_list",
     "slash_run",
     "account_list",
+    "account_logout",
     "account_refresh",
     "account_switch",
 ]
@@ -152,106 +154,186 @@ def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | N
     }
 
 
-def history(runtime: ServerRuntime, params: dict) -> dict:
-    offset = params.get("offset", 0)
-    if type(offset) is not int or offset < 0:
-        raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    entries = [
-        entry
-        for entry in runtime.opened.store.replay()
-        if entry.type in {"message", "notification"}
-        and not (
-            entry.type == "message"
-            and is_passive_harness_message(entry.data["message"])
+HISTORY_PAGE_ENTRIES = 8
+
+
+def _history_entry_rows(
+    entry: object, approval_calls: Mapping[str, object]
+) -> list[dict[str, object]]:
+    """Project one durable entry to one atomic group of history rows."""
+
+    entry_type = entry.type
+    if entry_type == "approval_history":
+        return [{"id": entry.id, "role": "system", **entry.data}]
+    if entry_type == "approval_resolution":
+        data = {
+            "decision": entry.data["decision"],
+            **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
+        }
+        payload = event_contract.approval_end(
+            {
+                "request_id": entry.data["request_id"],
+                "tool_call": approval_calls.get(entry.data["request_id"]),
+                "data": data,
+                **({"reason": entry.data["reason"]} if "reason" in entry.data else {}),
+            }
         )
-    ]
-    rows = []
-    codec = FrameCodec()
-    # Reserve the largest legal JSON-escaped request id, including the envelope.
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    for entry in entries[offset : offset + 8]:
-        if entry.type == "notification":
-            data = entry.data
-            kind = data.get("kind", "agent_completion")
-            if kind == "task_exited":
-                text = (
-                    f"background task {data.get('task_id', '?')} exited "
-                    f"({data.get('exit_code')}); {data.get('headline', '')}"
-                )
-            else:
-                text = data.get("text", "background agent notification")
-            row = {
+        return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
+    if entry_type == "notification":
+        data = entry.data
+        kind = data.get("kind", "agent_completion")
+        if kind == "task_exited":
+            text = (
+                f"background task {data.get('task_id', '?')} exited "
+                f"({data.get('exit_code')}); {data.get('headline', '')}"
+            )
+        else:
+            text = data.get("text", "background agent notification")
+        return [
+            {
                 "id": entry.id,
                 "role": "system",
                 "content": [{"type": "text", "text": bounded(text, 8000)}],
                 "tool_result": None,
                 "notification": dict(data),
             }
-        else:
-            message = entry.data["message"]
-            content = []
-            for block in message.get("content", []):
-                if block.get("type") == "image":
-                    content.append(
-                        {
-                            "type": "attachment",
-                            "name": Path(block.get("path") or "image").name,
-                            "size": block.get("size") or 0,
-                        }
-                    )
-                elif block.get("type") == "text":
-                    content.append({"type": "text", "text": bounded(block["text"], 8000)})
-                elif block.get("type") == "tool_use":
-                    call = block["tool_call"]
-                    content.append({
-                        "type": "tool_use",
-                        "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
-                    })
-                elif block.get("type") == "thinking":
-                    body = block.get("body")
-                    if type(body) is str and body:
-                        body = bounded(body, 8000)
-                        content.append({"type": "thinking", "text": body, "body": body})
-                    else:
-                        # Preserve the old header-only row without copying the
-                        # legacy block's potentially private text.
-                        content.append({"type": "thinking", "text": ""})
-            result = message.get("tool_result")
-            if result:
-                result = {
-                    **result,
-                    "content": bounded(result.get("content", ""), 8000),
-                    "content_blocks": [],
-                    "structured_content": None,
+        ]
+
+    message = entry.data["message"]
+    content = []
+    for block in message.get("content", []):
+        if block.get("type") == "image":
+            content.append(
+                {
+                    "type": "attachment",
+                    "name": Path(block.get("path") or "image").name,
+                    "size": block.get("size") or 0,
                 }
-            row = {
-                "id": entry.id,
-                "role": message["role"],
-                "content": content,
-                "tool_result": result,
-            }
-            failed_turn = _failed_turn_history(message)
-            if failed_turn is not None:
-                row["failed_turn"] = failed_turn
-        next_offset = offset + len(rows) + 1
-        candidate = {
-            "messages": [*rows, row],
-            "next_offset": next_offset if next_offset < len(entries) else None,
+            )
+        elif block.get("type") == "text":
+            content.append({"type": "text", "text": bounded(block["text"], 8000)})
+        elif block.get("type") == "tool_use":
+            call = block["tool_call"]
+            content.append(
+                {
+                    "type": "tool_use",
+                    "tool_call": {
+                        "id": call["id"],
+                        "name": call["name"],
+                        "arguments": {},
+                    },
+                }
+            )
+        elif block.get("type") == "thinking":
+            body = block.get("body")
+            if type(body) is str and body:
+                body = bounded(body, 8000)
+                content.append({"type": "thinking", "text": body, "body": body})
+            else:
+                content.append({"type": "thinking", "text": ""})
+    result = message.get("tool_result")
+    if result:
+        result = {
+            **result,
+            "content": bounded(result.get("content", ""), 8000),
+            "content_blocks": [],
+            "structured_content": None,
         }
+    row = {
+        "id": entry.id,
+        "role": message["role"],
+        "content": content,
+        "tool_result": result,
+    }
+    failed_turn = _failed_turn_history(message)
+    if failed_turn is not None:
+        row["failed_turn"] = failed_turn
+    rows = [row]
+    for approval in entry.data.get("approval_requests", []):
+        payload = {
+            "request_id": approval["request_id"],
+            "tool_call": approval["tool_call"],
+            "delegated": False,
+        }
+        approval_facts = approval.get("approval_facts", {})
+        if approval_facts.get("action") is not None:
+            payload["approval_action"] = approval_facts["action"]
+        if approval.get("approval_display"):
+            payload["approval_display"] = approval["approval_display"]
+        rows.append(
+            {
+                "id": entry.id,
+                "role": "system",
+                "event": "approval_request",
+                **event_contract.approval_request(payload),
+            }
+        )
+    return rows
+
+
+def history(runtime: ServerRuntime, params: dict) -> dict:
+    offset = params.get("offset", 0)
+    if type(offset) is not int or offset < 0:
+        raise ProtocolError(-32602, "offset must be a nonnegative integer")
+    replay = runtime.opened.store.replay()
+    approval_calls = {
+        request["request_id"]: request["tool_call"]
+        for entry in replay
+        if entry.type == "message"
+        for request in entry.data.get("approval_requests", [])
+    }
+    # Cursor-bearing entries are exactly origin/main's message/notification set.
+    # New lifecycle entries occupy the gap before the next old-space cursor.
+    groups: list[list[object]] = [[]]
+    for entry in replay:
+        if entry.type == "message" and is_passive_harness_message(
+            entry.data["message"]
+        ):
+            continue
+        if entry.type in {"message", "notification"}:
+            groups[-1].append(entry)
+            groups.append([])
+        elif entry.type in {"approval_resolution", "approval_history"}:
+            groups[-1].append(entry)
+    entry_count = len(groups) - 1
+    if offset > entry_count:
+        return {"messages": [], "next_offset": None}
+
+    rows: list[dict[str, object]] = []
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    stop = min(offset + HISTORY_PAGE_ENTRIES, entry_count)
+    group_indexes = list(range(offset, stop))
+    if stop == entry_count:
+        group_indexes.append(entry_count)
+    next_offset = offset
+    for group_index in group_indexes:
+        group = [
+            row
+            for entry in groups[group_index]
+            for row in _history_entry_rows(entry, approval_calls)
+        ]
+        candidate_offset = min(group_index + 1, entry_count)
+        candidate = {
+            "messages": [*rows, *group],
+            "next_offset": candidate_offset if candidate_offset < entry_count else None,
+        }
+        if not codec.response_fits(request_id, candidate) and rows:
+            break
         if not codec.response_fits(request_id, candidate):
-            if rows:
-                break
-            # Persisted messages can exceed a frame even after per-block bounds.
-            # Keep their identity and advance the cursor instead of wedging refresh.
-            row["content"] = [{"type": "text", "text": "[history row too large; truncated]"}]
-            row["tool_result"] = None
-            if entry.type == "notification":
-                row["notification"] = None
-        rows.append(row)
-    next_offset = offset + len(rows)
+            for row in group:
+                if "content" in row:
+                    row["content"] = [
+                        {"type": "text", "text": "[history row too large; truncated]"}
+                    ]
+                    row["tool_result"] = None
+                if "notification" in row:
+                    row["notification"] = None
+        rows.extend(group)
+        next_offset = candidate_offset
     return {
         "messages": rows,
-        "next_offset": next_offset if next_offset < len(entries) else None,
+        "next_offset": next_offset if next_offset < entry_count else None,
     }
 
 

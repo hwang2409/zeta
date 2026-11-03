@@ -33,6 +33,7 @@ from ..memory.entry_views import GENERATED_MIRROR_HEADER
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
+from ..runtime.project_registry_state import project_registry
 from .errors import RemoteSyncError
 from .project_publish import (
     MAX_SYNC_STATE_SIZE,
@@ -456,7 +457,7 @@ def _import_merged_memory(
     changed_entry_ids: tuple[str, ...] = (),
     provenance: dict[str, str],
 ) -> None:
-    registry = ProjectRegistry(target.parent)
+    registry = project_registry(target.parent)
     if isinstance(merged, EntryMemoryExport):
         current = registry._export_entry_memory(project_id)
         registry._import_entry_memory(
@@ -492,7 +493,7 @@ def _publish_memory_snapshot(
     except ProjectPublicationError as exc:
         raise RemoteSyncError(str(exc)) from exc
     merged = _materialize_memory_export(snapshot, project_id)
-    registry = ProjectRegistry(project.parent)
+    registry = project_registry(project.parent)
     try:
         with registry._locked(write=True) as root_fd:
             if not project.is_dir():
@@ -553,7 +554,7 @@ def _publish_memory_snapshot(
 
 def _materialize_memory_export(snapshot: Path, project_id: str) -> MemorySyncExport:
     try:
-        registry = ProjectRegistry(snapshot.parent)
+        registry = project_registry(snapshot.parent)
         if registry.memory_format(project_id) == 2:
             return registry._export_entry_memory(project_id)
         exported = registry.export_memory(project_id)
@@ -579,7 +580,7 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
     if snapshot.name != project_id:
         raise RemoteSyncError("project snapshot path does not match its project ID")
     try:
-        registry = ProjectRegistry(snapshot.parent)
+        registry = project_registry(snapshot.parent)
         registry.show_project(project_id)
         for name in MEMORY_FILES:
             path = snapshot / "memory" / name

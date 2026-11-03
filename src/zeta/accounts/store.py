@@ -29,6 +29,7 @@ from ..core.session_files import (
     SessionFileReplaced,
     child_directory,
     open_session_file,
+    read_session_file,
     require_off_loop_lock,
 )
 from ..oauth import (
@@ -40,6 +41,7 @@ from ..oauth import (
 )
 
 _PROVIDERS = {"anthropic", "codex"}
+_MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
 
@@ -306,6 +308,46 @@ class AccountStore:
             self._write_registry(home_fd, value)
         return f"renamed {account} to {account.provider}:{label}"
 
+    def logout(self, account: AccountId, *, sessions_root: Path) -> str:
+        """Remove one local account while no live session pins it."""
+
+        from .logout import (
+            remove_account_directory,
+            remove_account_lock_directory,
+            validate_account_directory,
+        )
+
+        with self._home() as home_fd, self._registry_guard(home_fd):
+            value = self._read_registry(home_fd)
+            key = str(account)
+            if key not in value["accounts"]:
+                raise AccountError(f"account {account} does not exist")
+            with self._lifecycle_guard(home_fd, account):
+                if _live_session_pins(sessions_root, account):
+                    raise AccountError(
+                        f"account {account} is pinned by a live session; close it first"
+                    )
+                remove_account_lock_directory(home_fd, account, remove=False)
+                validate_account_directory(
+                    home_fd,
+                    "accounts",
+                    account,
+                    allowed={"oauth.json", "usage.json", "publish-pending.json"},
+                )
+                cleared_default = value["defaults"].pop(account.provider, None) == key
+                value["accounts"].pop(key)
+                value["labels"].pop(key, None)
+                self._write_registry(home_fd, value)
+                remove_account_directory(
+                    home_fd,
+                    "accounts",
+                    account,
+                    allowed={"oauth.json", "usage.json", "publish-pending.json"},
+                )
+                remove_account_lock_directory(home_fd, account, remove=True)
+        suffix = f"; cleared {account.provider} default" if cleared_default else ""
+        return f"logged out {account}{suffix}"
+
     def resolve_qualified_reference(self, value: str) -> AccountId:
         try:
             provider, reference = value.split(":", 1)
@@ -375,6 +417,19 @@ class AccountStore:
             self._lifecycle_guard(home_fd, account, wait=wait),
         ):
             yield home_fd
+
+    @contextmanager
+    def pin_guard(self, accounts: Mapping[str, AccountId]) -> Iterator[None]:
+        """Hold registry then account locks while durable pins are published."""
+
+        ordered = sorted(set(accounts.values()), key=lambda item: (item.provider, item.name))
+        with self._home() as home_fd, self._registry_guard(home_fd), ExitStack() as stack:
+            for account in ordered:
+                stack.enter_context(self._lifecycle_guard(home_fd, account))
+            registered = self._read_registry(home_fd)["accounts"]
+            if any(str(account) not in registered for account in ordered):
+                raise AccountError("account no longer exists; use /accounts")
+            yield
 
     @contextmanager
     def credential_guard(
@@ -447,7 +502,8 @@ class AccountStore:
         value["defaults"].setdefault(account.provider, key)
         self._write_registry(home_fd, value)
 
-    def migrate(self) -> None:
+    def migrate(self) -> tuple[str, ...]:
+        warnings: list[str] = []
         with self._home() as home_fd:
             if not any(
                 _exists(home_fd, name)
@@ -456,12 +512,86 @@ class AccountStore:
                     "codex-oauth.json",
                     "accounts.json",
                     "accounts",
+                    "account-locks",
                 )
             ):
-                return
+                return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
+                with self._registry_guard(home_fd):
+                    self._sweep_orphan_directories(home_fd, warnings)
                 for provider in ("anthropic", "codex"):
                     self._migrate_provider(home_fd, provider)
+        return tuple(warnings)
+
+    def _list_orphan_directories(self, home_fd: int, registered: set[str]) -> list[tuple[str, str, str, set[str]]]:
+        orphans: list[tuple[str, str, str, set[str]]] = []
+        for root, allowed in (
+            ("accounts", {"oauth.json", "usage.json", "publish-pending.json"}),
+            ("account-locks", {"lifecycle.lock", "usage.lock"}),
+        ):
+            try:
+                with child_directory(home_fd, root) as root_fd:
+                    for provider in _PROVIDERS:
+                        try:
+                            with child_directory(root_fd, provider) as provider_fd:
+                                names = [
+                                    (name, stat.S_ISDIR(os.stat(name, dir_fd=provider_fd, follow_symlinks=False).st_mode))
+                                    for name in sorted(os.listdir(provider_fd))
+                                ]
+                        except FileNotFoundError:
+                            continue
+                        orphans.extend(
+                            (root, provider, name, allowed)
+                            for name, is_directory in names
+                            if is_directory and f"{provider}:{name}" not in registered
+                        )
+            except FileNotFoundError:
+                continue
+        return orphans
+
+    def _orphan_is_pending_publication(self, home_fd: int, root: str, provider: str, name: str) -> bool:
+        if root != "accounts":
+            return False
+        account = AccountId(provider, name)
+        try:
+            with (
+                child_directory(home_fd, root) as root_fd,
+                child_directory(root_fd, provider) as provider_fd,
+                child_directory(provider_fd, name) as account_fd,
+            ):
+                pending = _read_publication_pending(account_fd)
+                credential = _read_optional_bytes(account_fd, "oauth.json")
+        except FileNotFoundError:
+            return True
+        return (
+            pending is not None
+            and credential is not None
+            and pending == _publication_record(account, credential)
+        )
+
+    def _remove_orphan_directory(self, home_fd: int, root: str, provider: str, name: str, allowed: set[str]) -> str | None:
+        from .logout import remove_account_directory, sweep_warning_path
+
+        try:
+            remove_account_directory(home_fd, root, (provider, name), allowed=allowed)
+        except (AccountError, OSError, ValueError):
+            return sweep_warning_path(self.home / root / provider / name)
+        return None
+
+    def _sweep_orphan_directories(self, home_fd: int, warnings: list[str]) -> None:
+        registered, refused = set(self._read_registry(home_fd)["accounts"]), []
+        for root, provider, name, allowed in self._list_orphan_directories(home_fd, registered):
+            try:
+                if self._orphan_is_pending_publication(home_fd, root, provider, name):
+                    continue
+            except ValueError:
+                pass
+            path = self._remove_orphan_directory(home_fd, root, provider, name, allowed)
+            if path is not None:
+                refused.append(path)
+        warnings.extend(f"could not clean up account directory {path}; check its mode or ownership, then delete it or fix it" for path in refused[:_MAX_SWEEP_WARNING_PATHS])
+        if len(refused) > _MAX_SWEEP_WARNING_PATHS:
+            warnings.append(f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up")
 
     def _migrate_provider(self, home_fd: int, provider: str) -> None:
         account = AccountId(provider, "default")
@@ -790,6 +920,68 @@ def _bounded_guard(
         yield home_fd
     finally:
         stack.close()
+
+
+def _read_child_account_pins(path: Path) -> Mapping[str, Any]:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        lifecycle = json.loads(read_session_file(directory_fd, "agent_lifecycle.json"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AccountError("could not verify live child account pins") from exc
+    finally:
+        os.close(directory_fd)
+    if not isinstance(lifecycle, Mapping) or not isinstance(
+        lifecycle.get("selected_accounts"), Mapping
+    ):
+        raise AccountError("could not verify live child account pins")
+    return lifecycle["selected_accounts"]
+
+
+def _live_child_pins(session_path: Path, account: AccountId) -> bool:
+    from ..session_liveness import session_is_live
+
+    agents = session_path / "agents"
+    try:
+        agents_info = agents.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(agents_info.st_mode):
+        return False
+    for root, directories, files in os.walk(agents, followlinks=False):
+        directories[:] = [
+            name for name in directories if not (Path(root) / name).is_symlink()
+        ]
+        if "agent_lifecycle.json" not in files or not session_is_live(Path(root)):
+            continue
+        pins = _read_child_account_pins(Path(root))
+        if pins.get(account.provider) == str(account):
+            return True
+    return False
+
+
+def _live_session_pins(sessions_root: Path, account: AccountId) -> bool:
+    from ..core.session import SessionError, SessionManager
+    from ..session_liveness import session_is_live
+
+    try:
+        entries = list(os.scandir(sessions_root))
+    except FileNotFoundError:
+        return False
+    manager = SessionManager(sessions_root.parent)
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        path = sessions_root / entry.name
+        if session_is_live(path):
+            try:
+                metadata = manager.read_metadata(entry.name)
+            except (OSError, SessionError, ValueError) as exc:
+                raise AccountError("could not verify live session account pins") from exc
+            if metadata.selected_accounts.get(account.provider) == str(account):
+                return True
+        if _live_child_pins(path, account):
+            return True
+    return False
 
 
 @contextmanager

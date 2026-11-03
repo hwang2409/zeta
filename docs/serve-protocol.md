@@ -30,10 +30,14 @@ messages, fragmentation, ping, pong, and the close handshake. It does not
 negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
 
-Every serve start creates a new random bearer token. A WebSocket upgrade must
-supply it as the `token` URL query parameter. After startup, Zeta prints the
-exact connect URL once to stderr; it does not print it to stdout or write the
-token to logs. It atomically writes this discovery file with mode `0600` and
+Every serve start creates a new random bearer token. New clients should supply
+it in `Sec-WebSocket-Protocol` as `zeta.bearer.<token>`, alongside
+`zeta.v1`. The server echoes only `zeta.v1`. The legacy `token` URL query
+parameter remains supported for existing clients, but is deprecated and will be
+removed after Gamma and Fulcrum switch to the subprotocol. Until then, the
+startup WebSocket URL still includes the query token for existing manual
+connect clients. Zeta does not print the token to logs. It atomically writes this
+discovery file with mode `0600` and
 removes it on clean shutdown:
 
 ```text
@@ -41,11 +45,12 @@ $ZETA_HOME/run/serve.ws.json
 ```
 
 ```json
-{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"]}
+{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"],"ws_auth":["subprotocol","query"]}
 ```
 
 A native launcher can read this file and deliver the connection details to its
-trusted frontend. Treat the token as a secret.
+trusted frontend. `ws_auth` advertises the supported authentication methods;
+clients should prefer `subprotocol`. Treat the token as a secret.
 
 Browser upgrades also require an exact allowed `Origin`. Add each origin with a
 repeatable `--ws-origin scheme://host:port` flag. Wildcards, omitted ports,
@@ -59,7 +64,8 @@ discovery file:
 
 ```js
 const socket = new WebSocket(
-  `ws://127.0.0.1:${connection.port}/?token=${encodeURIComponent(connection.token)}`,
+  `ws://127.0.0.1:${connection.port}/`,
+  [`zeta.v1`, `zeta.bearer.${connection.token}`],
 );
 socket.addEventListener("open", () => {
   socket.send(JSON.stringify({
@@ -82,7 +88,11 @@ The first request must be `hello`. `protocol_version` is required and must be
 `client_version: "1.2"` so old servers accept the handshake. A 1.2 server returns
 `1.2` for that request, or the requested version for an explicit `1.1` or `1.2`.
 A legacy hello without the extra field receives `1.0` and only the legacy
-capabilities.
+capabilities. The result can also contain an optional `notices` array of startup
+warnings. Account cleanup warnings name the affected paths and advise checking
+their mode or ownership, then deleting or fixing them; paths are bounded and the
+array never contains file contents. These notices are included in every successful
+handshake while the warning remains current.
 The frontend client gates all extensions on the returned version; it never sends extension
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
@@ -96,6 +106,12 @@ Old servers ignore `features` and do not return the key, so a client that
 receives no echo uses no feature. A `features` value that is not an array of
 strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
 `features`.
+
+When the project registry exists but cannot be read safely, `hello` returns one
+human-readable warning in `notices`. The warning names the registry path and
+reason. Project features are disabled for the server process, so `projects` and
+`projects-memory-v2` are not echoed in `capabilities.features`. A missing
+registry is a normal fresh-install state and does not add a notice.
 
 Example request:
 
@@ -625,9 +641,14 @@ on the wire.
 `approval_request` carries `request_id` and `tool_call`. It also carries
 `delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
-and empty or loop-provided `data`. For delegated approvals, the request ID is an
-opaque server-issued key, even when the parent and child use the same raw tool
-call ID.
+and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`,
+or `abort`, and an abort also sets `data.reason`. `data` can carry other
+loop-provided fields, and it is `{}` when there are none and no outcome is
+stored. Emitted reasons
+are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
+format also accepts `grace_expired`, reserved for the approval reconnect
+grace; no current path emits it. For delegated approvals, the request ID is an opaque
+server-issued key, even when the parent and child use the same raw tool call ID.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","delegated":false,"tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
@@ -972,8 +993,18 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
-  `messages` and `next_offset` (null at the end), eight messages per page. Each
-  message has `id`, `role`, `content`, and optional `tool_result`. Text and tool
+  `messages` and `next_offset` (null at the end). The cursor and page limit count
+  the same durable message and notification entries as before; one page covers
+  eight such entries. Approval lifecycle entries between them do not change the
+  cursor value, so an offset issued by an older server resumes without a gap or
+  duplicate. All rows projected from one entry are atomic on a page. An
+  assistant approval anchor emits its message row and then its
+  `approval_request`; a resolution emits its `approval_end`. These lifecycle
+  rows use the same fields as the live events. The parent history includes only
+  lifecycle data stored in the parent session, including delegated identity.
+  Child-session transcript rows are not copied into parent history; they belong
+  to the planned `child_run_events` protocol. Each ordinary message has `id`,
+  `role`, `content`, and optional `tool_result`. Text and tool
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.
@@ -986,6 +1017,13 @@ error code and message. Provider status and origin remain internal.
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
   `windows` fields documented in `accounts.md`. This request is lock-free and
   never calls a provider endpoint.
+- `account_logout`: takes `session_id` and `account` (`provider:name`) and
+  requires an idle session. It removes only Zeta's local credentials and catalog
+  entry; it does not revoke the provider subscription or token. The response
+  contains the removed `account` and a safe `message`. A pinned live session or
+  child, an unknown account, or unsafe account files return `-32005`. The disk
+  operation runs off the server event loop; after cancellation, `account_list`
+  reports its final persisted result.
 - `account_refresh`: takes `session_id`, requires an idle session, and performs
   the same explicit refresh as `r` in `/accounts`: all stale accounts,
   sequentially, with the persisted 60-second per-account cooldown. Provider
@@ -1109,3 +1147,11 @@ session. It contains a bounded, control-stripped, single-line preview of the
 first user message. It does not change the persisted session name. Older clients
 ignore it; newer clients fall back when an older server omits it. Provider-mode
 filtering and response-size limits apply before the response is sent.
+
+## read-only observers
+
+protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
+
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+
+this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. requests are read and dispatched sequentially.

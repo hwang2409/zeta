@@ -263,7 +263,10 @@ saved selection at load (see the session-load rule above). `switch` is reserved 
 an attached tui or serve session and always targets that session. there is no
 legacy `--provider` alias. one login flow per provider is allowed at a time;
 adding another account is sequential. an existing account requires `--replace`.
-logout is local only in v1; remote revocation is later work.
+logout is local only in v1; remote revocation is later work. logout refuses an
+account pinned by a live session or child. it removes the local credentials,
+registry row, and account lock directory; logging out the global default clears
+that provider's default rather than selecting another account.
 
 ## usage sources and verification gate
 
@@ -354,9 +357,11 @@ shows a safe per-account failure.
 all known windows, reset times, freshness, and safe failure state. `r` refreshes
 **all stale accounts sequentially**, bounded to one request per account, and
 renders successes and partial failures. it does not refresh only the highlighted
-row. `enter` switches the current session account. `l` starts a named login, `x`
-performs confirmed local logout, and `d` changes the global default. text and
-screen-reader output include percent values and absolute local reset times; color
+row. `enter` switches the current session account. `l` opens `/accounts login`
+for the highlighted provider and requires a user-supplied label. `x` performs
+local logout only after a second `x` confirms it, and `d` changes the global
+default. text and screen-reader output include percent values and absolute local
+reset times; color
 is not required.
 
 there are two selections: `accounts.json` owns the global default per provider,

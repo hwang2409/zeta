@@ -51,10 +51,14 @@ from ._approval_display import (
     normalize_approval_requests,
     validated_approval_display,
 )
+from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
 from ._async_writes import AsyncDurableWritesMixin
 from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
-from ._incremental_validation import IncrementalValidationMixin
+from ._incremental_validation import (
+    APPROVAL_RESOLUTION_REASONS,
+    IncrementalValidationMixin,
+)
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
@@ -71,6 +75,7 @@ from ._validation import (
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     NOTIFICATION_KINDS,
     TASK_EXITED_NOTIFICATION_KIND,
+    validate_compaction_data,
     validate_notification_data,
     validate_terminal_transition_data,
 )
@@ -81,10 +86,29 @@ from .runtime_lease import (
 )
 
 
+def _validate_approval_reason(decision: str, reason: str | None) -> None:
+    if reason is not None and (
+        type(reason) is not str
+        or decision != "abort"
+        or reason not in APPROVAL_RESOLUTION_REASONS
+    ):
+        raise ValueError("invalid approval resolution reason")
+
+
 class ConversationStore(
-    AsyncDurableWritesMixin, PendingPromptStoreMixin, ClientDeliveryMixin, ConversationLogMixin,
-    IncrementalValidationMixin, NotificationStateMixin, StoreRuntimeLeaseMixin, AgentStateMixin,
-    CheckpointForkMixin, StepDeliveryStoreMixin, StoreLifecycleMixin, ChildRunStoreMixin,
+    ApprovalHistoryStoreMixin,
+    AsyncDurableWritesMixin,
+    PendingPromptStoreMixin,
+    ClientDeliveryMixin,
+    ConversationLogMixin,
+    IncrementalValidationMixin,
+    NotificationStateMixin,
+    StoreRuntimeLeaseMixin,
+    AgentStateMixin,
+    CheckpointForkMixin,
+    StepDeliveryStoreMixin,
+    StoreLifecycleMixin,
+    ChildRunStoreMixin,
 ):
     def __init__(
         self,
@@ -494,58 +518,7 @@ class ConversationStore(
                         )
             elif entry.type == "child_run_started": validate_child_run_started_data(entry.data)
             elif entry.type == "compaction":
-                summary = entry.data.get("summary")
-                source_start = entry.data.get("source_seq_start")
-                source_end = entry.data.get("source_seq_end")
-                replaces = entry.data.get("replaces", [])
-                pinned_message = entry.data.get("pinned_message")
-                kind = entry.data.get("kind", "summary")
-                view = entry.data.get("view")
-                telemetry = entry.data.get("telemetry")
-                if type(summary) is not str or not summary.strip():
-                    raise ValueError("compaction summary must be a nonempty string")
-                if (
-                    type(source_start) is not int
-                    or type(source_end) is not int
-                    or source_start <= 0
-                    or source_end < source_start
-                ):
-                    raise ValueError("compaction source sequence must be integers")
-                if (
-                    type(replaces) is not list
-                    or any(
-                        type(entry_id) is not str or not entry_id
-                        for entry_id in replaces
-                    )
-                    or len(replaces) != len(set(replaces))
-                ):
-                    raise ValueError("compaction replaces must be unique string IDs")
-                if pinned_message is not None:
-                    if type(pinned_message) is not dict:
-                        raise ValueError("compaction pinned message must be an object")
-                    pinned = Message.from_dict(pinned_message)
-                    if pinned.role is not MessageRole.USER:
-                        raise ValueError(
-                            "compaction pinned message must be a user message"
-                        )
-                if kind not in {"summary", "evict"}:
-                    raise ValueError("unknown compaction kind")
-                if kind == "evict":
-                    if type(view) is not list or not view:
-                        raise ValueError("eviction view must be a nonempty array")
-                    for item in view:
-                        if type(item) is not dict or type(item.get("seq")) is not int:
-                            raise ValueError("invalid eviction view item")
-                        message = item.get("message")
-                        if type(message) is not dict:
-                            raise ValueError("invalid eviction view message")
-                        Message.from_dict(message)
-                    if telemetry is not None and type(telemetry) is not dict:
-                        raise ValueError("eviction telemetry must be an object")
-                elif view is not None or telemetry is not None:
-                    raise ValueError(
-                        "summary compaction cannot contain an eviction view"
-                    )
+                validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
             elif entry.type == "warning":
@@ -560,6 +533,9 @@ class ConversationStore(
                     raise ValueError("approval resolution id must be a nonempty string")
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
+                _validate_approval_reason(decision, entry.data.get("reason"))
+            elif entry.type == "approval_history":
+                validate_approval_history_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
@@ -820,6 +796,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
         data = self._compaction_marker_data(
             summary,
@@ -830,6 +807,7 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
@@ -858,6 +836,7 @@ class ConversationStore(
         kind: str = "summary",
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
+        fact_floor: Mapping[str, Any] | None = None,
     ) -> None:
         """Commit an unshared marker without copying its large payload."""
 
@@ -870,6 +849,7 @@ class ConversationStore(
             kind=kind,
             view=view,
             telemetry=telemetry,
+            fact_floor=fact_floor,
         )
         with self._append_lock():
             if self.active_branch_head_id() != expected_parent_id:
@@ -891,6 +871,7 @@ class ConversationStore(
         kind: str,
         view: list[dict[str, Any]] | None,
         telemetry: Mapping[str, Any] | None,
+        fact_floor: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "summary": summary,
@@ -904,6 +885,11 @@ class ConversationStore(
             data["view"] = view
         if telemetry is not None:
             data["telemetry"] = dict(telemetry)
+        if fact_floor is not None:
+            from ...context_eviction._fact_floor import validate_fact_floor
+            if not validate_fact_floor(fact_floor):
+                raise ValueError("invalid eviction fact floor")
+            data["fact_floor"] = dict(fact_floor)
         if pinned_message is not None:
             if pinned_message.role is not MessageRole.USER:
                 raise ValueError("compaction pinned message must be a user message")
@@ -1037,17 +1023,20 @@ class ConversationStore(
         request_id: str,
         decision: str,
         *,
+        reason: str | None = None,
         parent_id: str | None = None,
     ) -> ConversationEntry:
         if type(request_id) is not str or not request_id:
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
+        _validate_approval_reason(decision, reason)
         with self._append_lock():
             entry = self._resolve_approval_unlocked(
                 request_id,
                 decision,
                 parent_id,
+                reason,
             )
             if entry is None:
                 raise ConversationIntegrityError(
@@ -1055,7 +1044,9 @@ class ConversationStore(
                 )
             return self._snapshot_entry(entry)
 
-    def resolve_approval(self, request_id: str, decision: str) -> bool:
+    def resolve_approval(
+        self, request_id: str, decision: str, *, reason: str | None = None
+    ) -> bool:
         """Resolve one pending request atomically.
 
         The state check and resolution append share one file lock.
@@ -1065,14 +1056,16 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
+        _validate_approval_reason(decision, reason)
         with self._append_lock():
-            return self._resolve_approval_unlocked(request_id, decision) is not None
+            return self._resolve_approval_unlocked(request_id, decision, reason=reason) is not None
 
     def _resolve_approval_unlocked(
         self,
         request_id: str,
         decision: str,
         parent_id: str | None = None,
+        reason: str | None = None,
     ) -> ConversationEntry | None:
         branch = self.replay()
         states = self._approval_states_from_branch(branch)
@@ -1097,11 +1090,10 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"approval resolution parent is not descended from request: {request_id}"
             )
-        return self._append_row_unlocked(
-            "approval_resolution",
-            {"request_id": request_id, "decision": decision},
-            parent_id,
-        )
+        data = {"request_id": request_id, "decision": decision}
+        if reason is not None:
+            data["reason"] = reason
+        return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
         """Return strict approval state after waiting for concurrent writers."""

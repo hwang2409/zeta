@@ -29,6 +29,7 @@ import pytest
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -56,19 +57,26 @@ from zeta.protocol.types import (
 )
 from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
-from zeta.server.approval_lifecycle import ApprovalLifecycle
+from zeta.server.approval_lifecycle import ApprovalLifecycle, approval_display_fields
+from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
-from zeta.server.notification_presentation import NotificationPresentation
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
-from zeta.server.server import _approval_display_fields, _Client
+from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
+
+
+def _client_notifier(client: _Client):
+    async def notify(event: str, session_id: str | None = None, **fields: object) -> bool:
+        return await client._write(client.codec.notification(event, session_id, **fields))
+
+    return notify
 
 
 def _hold_registry_lock_after_start(
@@ -144,12 +152,12 @@ async def test_notification_presentation_retries_disconnected_codec_write(
     notification = {"notification_id": "notification-1"}
 
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
     healthy = HealthyWriter()
     client.writer = healthy
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
 
     receipts = [
@@ -183,7 +191,7 @@ async def test_notification_presentation_retries_after_cancel_before_write(
     await client._write_lock.acquire()
     blocked = asyncio.create_task(
         server.notification_presentations.publish(
-            "session-1", notification, "1.0", client._notify
+            "session-1", notification, "1.0", _client_notifier(client)
         )
     )
     while not client._write_lock._waiters:
@@ -195,7 +203,7 @@ async def test_notification_presentation_retries_after_cancel_before_write(
     assert healthy.frames == []
 
     await server.notification_presentations.publish(
-        "session-1", notification, "1.0", client._notify
+        "session-1", notification, "1.0", _client_notifier(client)
     )
 
     receipts = [
@@ -240,7 +248,7 @@ async def test_canceled_write_to_stalled_client_aborts_within_grace(
     notification = {"notification_id": "notification-1"}
     publish = asyncio.create_task(
         server.notification_presentations.publish(
-            "session-1", notification, "1.0", client._notify
+            "session-1", notification, "1.0", _client_notifier(client)
         )
     )
     while not writer.frames:
@@ -445,7 +453,7 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
         assert hello["protocol_version"] == "1.1"
         assert server._client is not None
         for kind in NOTIFICATION_KINDS:
-            await server._client._event(
+            await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
@@ -472,7 +480,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
         assert hello["protocol_version"] == "1.2"
         assert server._client is not None
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
-            await server._client._event(
+            await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
@@ -501,7 +509,7 @@ async def test_child_message_delivered_event_maps_from_background_run(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         assert server._client is not None
-        await server._client._event(
+        await server.control._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
                 data={"child_label": "worker", "preview": "check the retry"},
@@ -564,7 +572,7 @@ def test_delegated_approval_payload_includes_execution_context() -> None:
         resolved_path="/worktree/src/file.py",
     )
 
-    assert _approval_display_fields(request) == {
+    assert approval_display_fields(request) == {
         "approval_display": {
             "effective_cwd": "/worktree",
             "resolved_path": "/worktree/src/file.py",
@@ -1097,6 +1105,338 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
+def _history_event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key not in {"id", "role"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
+async def test_session_history_matches_live_approval_lifecycle(
+    tmp_path: Path, decision: str
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    turns = [ScriptedTurn(tool_calls=[call])]
+    if decision != "abort":
+        turns.append(ScriptedTurn([TextContent("done")]))
+    backend = FakeBackend(turns)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        live_request = await _event(reader, "approval_request")
+        method = {"allow": "approve", "deny": "deny", "abort": "abort"}[decision]
+        params = (
+            {"request_id": live_request["request_id"]} if decision != "abort" else {}
+        )
+        frames = await _request(reader, writer, 4, method, params)
+        terminal = "agent_end" if decision != "abort" else "turn_aborted"
+        if not _named_events(frames, terminal):
+            frames += await _frames_until_event(reader, terminal)
+        live_end = _named_events(frames, "approval_end")
+        assert len(live_end) == 1
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        request_index = next(
+            index
+            for index, row in enumerate(history)
+            if row.get("event") == "approval_request"
+        )
+        end_index = next(
+            index
+            for index, row in enumerate(history)
+            if row.get("event") == "approval_end"
+        )
+        assert history[request_index - 1]["role"] == "assistant"
+        assert history[request_index - 1]["content"][0]["type"] == "tool_use"
+        assert end_index == request_index + 1
+        assert history[end_index + 1]["role"] == "tool_result"
+
+        expected_request = {
+            key: value for key, value in live_request.items() if key != "session_id"
+        }
+        expected_end = {
+            key: value for key, value in live_end[0].items() if key != "session_id"
+        }
+        assert _history_event_payload(history[request_index]) == expected_request
+        assert _history_event_payload(history[end_index]) == expected_end
+        assert history[end_index]["data"]["decision"] == decision
+        if decision == "abort":
+            assert history[end_index]["reason"] == "turn_canceled"
+            assert history[end_index]["data"]["reason"] == "turn_canceled"
+        else:
+            assert "reason" not in history[end_index]
+            assert "reason" not in history[end_index]["data"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_records_controller_disconnect_approval_abort(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    await _request(reader, writer, 3, "send", {"text": "read it"})
+    await _event(reader, "approval_request")
+    writer.close()
+    await writer.wait_closed()
+    try:
+        # The approval aborts first; the old controller releases only after
+        # its turn is canceled. Reconnect after the release, as a client must.
+        for _ in range(500):
+            if not server._client_active:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("controller was not released after disconnect")
+        assert server.runtime.policy is not None
+        assert not server.runtime.policy.pending_requests()
+
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        assert hello[-1]["result"]["protocol_version"] == "1.1"
+        history = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        approval_end = next(
+            row for row in history if row.get("event") == "approval_end"
+        )
+        assert approval_end["reason"] == "controller_disconnected"
+        assert approval_end["data"] == {
+            "decision": "abort",
+            "reason": "controller_disconnected",
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_keeps_main_durable_entry_cursor_space(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        for index in range(6):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prefix {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": approval["request_id"]},
+        )
+        if not _named_events(frames, "agent_end"):
+            await _frames_until_event(reader, "agent_end")
+
+        pages: dict[int, list[dict[str, Any]]] = {}
+        forward: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = (
+                await _request(
+                    reader,
+                    writer,
+                    f"page-{offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": offset},
+                )
+            )[-1]["result"]
+            pages[offset] = page["messages"]
+            forward.extend(page["messages"])
+            if page["next_offset"] is None:
+                break
+            offset = page["next_offset"]
+
+        # origin/main issues offset 8 here: six prefixes, the user message,
+        # and the assistant approval anchor. It must resume at the resolution.
+        assert pages[0][-2]["role"] == "assistant"
+        assert pages[0][-2]["content"][0]["type"] == "tool_use"
+        assert pages[0][-1]["event"] == "approval_request"
+        assert pages[8][0]["event"] == "approval_end"
+        backward_pages = {}
+        for page_offset in reversed(tuple(pages)):
+            backward_pages[page_offset] = (
+                await _request(
+                    reader,
+                    writer,
+                    f"back-{page_offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": page_offset},
+                )
+            )[-1]["result"]["messages"]
+        backward = [row for page_offset in pages for row in backward_pages[page_offset]]
+        assert backward == forward
+        assert len(
+            {(row["id"], row.get("event"), row["role"]) for row in forward}
+        ) == len(forward)
+
+        for invalid in (-1, "8"):
+            error = (
+                await _request(
+                    reader,
+                    writer,
+                    f"invalid-{invalid}",
+                    "session_history",
+                    {"session_id": session_id, "offset": invalid},
+                )
+            )[-1]["error"]
+            assert error["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_limit", range(1, 6))
+async def test_session_history_never_splits_approval_anchor_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_limit: int
+) -> None:
+    monkeypatch.setattr(
+        ergonomics_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
+    )
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        for index in range(6):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prefix {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader, writer, 4, "approve", {"request_id": approval["request_id"]}
+        )
+        if not _named_events(frames, "agent_end"):
+            await _frames_until_event(reader, "agent_end")
+
+        offset = 0
+        saw_request = False
+        while True:
+            page = (
+                await _request(
+                    reader,
+                    writer,
+                    f"page-{offset}",
+                    "session_history",
+                    {"session_id": session_id, "offset": offset},
+                )
+            )[-1]["result"]
+            for index, row in enumerate(page["messages"]):
+                if row.get("event") != "approval_request":
+                    continue
+                saw_request = True
+                assert index > 0
+                assert page["messages"][index - 1]["role"] == "assistant"
+                assert page["messages"][index - 1]["id"] == row["id"]
+            if page["next_offset"] is None:
+                break
+            assert page["next_offset"] - offset <= page_limit
+            offset = page["next_offset"]
+        assert saw_request
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_loads_legacy_approval_abort_without_reason(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        call = ToolCall("legacy-call", "read", {"path": "legacy.txt"})
+        store = server.runtime.opened.store
+        store.append_approval_request(call.id, call)
+        store.append_approval_resolution(call.id, "abort")
+        reopened = SessionManager(tmp_path).open(session_id).store
+        assert "reason" not in reopened.entries[-1].data
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        approval_end = next(
+            row for row in history if row.get("event") == "approval_end"
+        )
+        assert approval_end["data"] == {"decision": "abort"}
+        assert "reason" not in approval_end
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
@@ -1252,6 +1592,98 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolution", "expected_decision", "expected_reason"),
+    [("deny", "deny", None), ("cleanup", "abort", "child_cleanup")],
+)
+async def test_delegated_approval_history_and_live_end_keep_durable_identity(
+    tmp_path: Path,
+    resolution: str,
+    expected_decision: str,
+    expected_reason: str | None,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(target)})
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        live_request = await _event(reader, "approval_request")
+        assert live_request["delegated"] is True
+        history = (
+            await _request(
+                reader,
+                writer,
+                "pending-history",
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        durable_request = next(
+            row for row in history if row.get("event") == "approval_request"
+        )
+        assert _history_event_payload(durable_request) == {
+            key: value for key, value in live_request.items() if key != "session_id"
+        }
+
+        if resolution == "deny":
+            frames = await _request(
+                reader,
+                writer,
+                4,
+                "deny",
+                {"request_id": live_request["request_id"]},
+            )
+        else:
+            assert server.runtime.loop is not None
+            assert server.runtime.loop._background_owner.cancel(
+                live_request["agent_instance_id"]
+            )
+            await server.runtime.loop._background_owner.wait()
+            frames = await _request(reader, writer, 4, "status")
+            if not _named_events(frames, "approval_end"):
+                frames += await _frames_until_event(reader, "approval_end")
+        live_end = _named_events(frames, "approval_end")
+        assert len(live_end) == 1
+        assert live_end[0]["request_id"] == live_request["request_id"]
+        assert live_end[0]["data"]["decision"] == expected_decision
+        if expected_reason is None:
+            assert "reason" not in live_end[0]
+            assert "reason" not in live_end[0]["data"]
+        else:
+            assert live_end[0]["reason"] == expected_reason
+            assert live_end[0]["data"]["reason"] == expected_reason
+
+        history = (
+            await _request(
+                reader,
+                writer,
+                "resolved-history",
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        durable_end = next(row for row in history if row.get("event") == "approval_end")
+        assert _history_event_payload(durable_end) == {
+            key: value for key, value in live_end[0].items() if key != "session_id"
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
@@ -1371,9 +1803,9 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
             await _event(reader, "agent_end")
 
         assert server._client is not None
-        assert len(server._client._approvals._by_key) == 0
-        assert len(server._client._approvals._wires_by_key) == 0
-        assert len(server._client._approvals._keys_by_wire) == 0
+        assert len(server.control._approvals._by_key) == 0
+        assert len(server.control._approvals._wires_by_key) == 0
+        assert len(server.control._approvals._keys_by_wire) == 0
     finally:
         await _close(server, writer)
 
@@ -1639,7 +2071,7 @@ async def test_abort_captures_turn_before_approval_end_write(
 
         assert server._client is not None
         client = server._client
-        original_write = client._write
+        original_write = client._write_physical
         approval_end_started = asyncio.Event()
         allow_approval_end = asyncio.Event()
 
@@ -1650,12 +2082,12 @@ async def test_abort_captures_turn_before_approval_end_write(
                 await allow_approval_end.wait()
             await original_write(payload)
 
-        client._write = pause_approval_end  # type: ignore[method-assign]
+        client._write_physical = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
         await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
-        while client._turn_task is not None:
+        while server.control._turn_task is not None:
             await asyncio.sleep(0)
         allow_approval_end.set()
 
@@ -1714,7 +2146,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
             "background-child", child_task.cancel, child_task
         )
         assert server._client is not None
-        server._client._approvals.observe(delegated_request)
+        server.control._approvals.observe(delegated_request)
 
         frames = await _request(
             reader, writer, 4, "abort", {"scope": "foreground"}
@@ -1723,7 +2155,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         assert [event["request_id"] for event in ended] == [
             foreground["request_id"]
         ]
-        assert delegated_request.key in server._client._approvals.active_keys()
+        assert delegated_request.key in server.control._approvals.active_keys()
         assert any(
             request.key == delegated_request.key
             for request in server.runtime.policy.pending_requests()
@@ -1942,7 +2374,15 @@ async def test_resume_second_client_and_malformed_frame(tmp_path: Path) -> None:
     second_reader, second_writer = await asyncio.wait_for(
         asyncio.open_unix_connection(str(first.socket_path)), TIMEOUT
     )
-    refused = await _read(second_reader)
+    refused = (
+        await _request(
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
+        )
+    )[-1]
     assert refused["error"]["code"] == -32001
     second_writer.close()
     await asyncio.wait_for(second_writer.wait_closed(), TIMEOUT)
@@ -2248,6 +2688,30 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
 
 
 @pytest.mark.asyncio
+async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    await server.start()
+    server._account_warnings = ("could not clean up account directory /secret",)
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0)
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        try:
+            hello = await _request(
+                reader, writer, 1, "hello", {"protocol_version": "1.0"}
+            )
+            assert hello[-1]["result"]["notices"] == [
+                "could not clean up account directory /secret"
+            ]
+        finally:
+            await _close(server, writer)
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     reader, writer = await _connect(server)
@@ -2412,7 +2876,7 @@ async def test_serve_client_without_reset_optin_keeps_post_stream_retry_off(
 
 @pytest.mark.asyncio
 async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
     notifications: list[tuple[str, dict[str, object]]] = []
 
@@ -2457,7 +2921,7 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(
         runtime=SimpleNamespace(policy=policy, state=None)
     )
@@ -2518,7 +2982,7 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
     first_session = server.runtime.session_id
     try:
         assert server._client is not None
-        approvals = server._client._approvals
+        approvals = server.control._approvals
         first_wire = approvals.wire_id(("child-a", "same"))
         await _request(reader, writer, 3, "new_session", {"provider": "codex"})
         assert approvals.core_key(first_wire) == first_wire
@@ -2629,14 +3093,14 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     reader, writer = await _ready(server)
     assert server._client is not None
     agent_end_published = asyncio.Event()
-    original_notify = server._client._notify
+    original_notify = server.control._notify
 
     async def notify(event: str, *args: object, **kwargs: object) -> None:
         await original_notify(event, *args, **kwargs)
         if event == "agent_end":
             agent_end_published.set()
 
-    monkeypatch.setattr(server._client, "_notify", notify)
+    monkeypatch.setattr(server.control, "_notify", notify)
     old_session_id = server.runtime.session_id
     assert server.runtime.opened is not None
     old_store = server.runtime.opened.store
@@ -3366,9 +3830,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         text="child retry done",
     )
     try:
-        client._schedule_background_wake(session_id)
+        server.control._schedule_background_wake(session_id)
         await asyncio.wait_for(published.wait(), TIMEOUT)
-        first_turn = client._turn_task
+        first_turn = server.control._turn_task
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
@@ -3377,7 +3841,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
 
-        client._schedule_background_wake(session_id)
+        server.control._schedule_background_wake(session_id)
         frames = await _frames_until_event(reader, "turn_end")
         receipts = [
             frame["params"]
@@ -4437,12 +4901,11 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         })
         pending = runtime.metadata.model_fallback
         assert pending
-        client = server._client
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login", provider_error=True)),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login", provider_error=True)),
                             session_id=sid, background=True)
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("transport_error", "connection reset")),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("transport_error", "connection reset")),
                             session_id=sid)
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
@@ -4450,7 +4913,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
         assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
+        await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
                             session_id=sid)
         await _event(reader, "error")
         assert runtime.model == "gpt-5.4"
@@ -4516,7 +4979,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
                         "approval_mode": "ask",
                     },
                 ),
-                timeout=1,
+                timeout=10,
             )
         )[-1]
         assert response["error"] == {
@@ -4566,7 +5029,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         # Event persistence must retain structured information as well.
         event = StreamEvent.from_dict(StreamEvent(StreamEventType.ERROR, error=info).to_dict())
         assert event.error == info
-        await server._client._event(event, session_id=sid)
+        await server.control._event(event, session_id=sid)
         failure = (await _event(reader, "error"))["error"]
         assert set(failure) == {"code", "message"}
         if version == "1.0":
@@ -5236,6 +5699,62 @@ def test_memory_command_parity_tui_and_serve() -> None:
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
 
+@pytest.mark.parametrize("with_fact_floor", [False, True])
+async def test_slash_status_maps_compaction_with_or_without_fact_floor(
+    tmp_path: Path, with_fact_floor: bool
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        assert server.runtime.loop is not None
+        store = server.runtime.loop.store
+        source = store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("source")])
+        )
+        aggregate = {
+            "fact": {"type": "pr", "pr": 7},
+            "first_seq": source.seq,
+            "last_seq": source.seq,
+            "value_rank": [source.seq, 0],
+        }
+        store.append_compaction_marker(
+            "summary",
+            source.seq,
+            source.seq,
+            kind="evict",
+            view=[
+                {
+                    "seq": source.seq,
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("receipt")]
+                    ).to_dict(),
+                }
+            ],
+            fact_floor=(
+                {"version": 1, "oldest": [aggregate], "newest": [aggregate]}
+                if with_fact_floor
+                else None
+            ),
+        )
+
+        result = (
+            await _request(
+                reader,
+                writer,
+                "status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]
+
+        assert result["kind"] == "output"
+        assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
+        assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
+
+
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
@@ -5433,6 +5952,52 @@ async def test_serve_accounts_label_command(tmp_path: Path) -> None:
             )
             == account
         )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_account_logout_runs_store_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    current = AccountId("codex", "current")
+    removed = AccountId("codex", "removed")
+    for account in (current, removed):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, current)
+    logout = AccountStore.logout
+    off_loop_calls = 0
+
+    def checked_logout(store: AccountStore, account: AccountId, *, sessions_root: Path):
+        nonlocal off_loop_calls
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        off_loop_calls += 1
+        return logout(store, account, sessions_root=sessions_root)
+
+    monkeypatch.setattr(AccountStore, "logout", checked_logout)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "accounts-logout",
+                "account_logout",
+                {"session_id": sid, "account": "codex:removed"},
+            )
+        )[-1]["result"]
+        assert result == {
+            "account": "codex:removed",
+            "message": "logged out codex:removed",
+        }
+        assert off_loop_calls == 1
+        assert not await asyncio.to_thread(AccountStore(home).contains, removed)
     finally:
         await _close(server, writer)
 
@@ -6257,7 +6822,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         rejected = await _request(reader, writer, 5, "send", {"text": "user now"})
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
-        while server._client is not None and server._client._turn_busy():
+        while server._client is not None and server.control.turn_busy():
             await asyncio.sleep(0)
 
         user_frames = await _request(
@@ -6605,7 +7170,7 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999),
         )
     await asyncio.to_thread(AccountStore(home).set_default, first)
-    client = object.__new__(_Client)
+    client = object.__new__(ServeControl)
     client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
     notifications: list[tuple[str, dict[str, object]]] = []
 

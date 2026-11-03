@@ -7285,54 +7285,49 @@ async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
 
 
 @pytest.mark.asyncio
-async def test_step_delivery_writer_handles_50k_rows_within_send_deadline(
-    tmp_path: Path,
+async def test_step_delivery_send_copies_bounded_snapshots_over_50k_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     initial = ConversationStore(tmp_path)
     session_id = initial.session_id
     _write_large_linear_store(initial, 50_000)
     store = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    snapshot_calls = 0
+    original_snapshot_entry = ConversationStore._snapshot_entry
+
+    def count_snapshot_calls(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot_entry(entry)
+
+    monkeypatch.setattr(
+        ConversationStore, "_snapshot_entry", staticmethod(count_snapshot_calls)
+    )
     flow = pending_delivery_module.StepDeliveryFlow(store)
     await flow.prepare_request("terminal_fallback", [], None)
 
-    timings: dict[str, float] = {}
-
-    async def timed(name: str, operation):
-        started = asyncio.get_running_loop().time()
-        result = await operation
-        timings[name] = asyncio.get_running_loop().time() - started
-        return result
-
-    first = await timed(
-        "prompt",
-        flow.produce(
-            pending_delivery_module.PromptInput(
-                "first", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
-            )
-        ),
+    first = await flow.produce(
+        pending_delivery_module.PromptInput(
+            "first", MessageOrigin.AGENT_SEND, None
+        )
     )
-    await timed("notification", flow.produce(_task_exit_input("large-store")))
-    staged = await timed(
-        "stage", flow.prepare_request("terminal_fallback", [], None)
-    )
+    await flow.produce(_task_exit_input("large-store"))
+    staged = await flow.prepare_request("terminal_fallback", [], None)
     assert staged.prompt_id == first.entries[0].id
-    await timed("acknowledge", flow.acknowledge_active())
-    await timed(
-        "second_prompt",
-        flow.produce(
-            pending_delivery_module.PromptInput(
-                "second", MessageOrigin.AGENT_SEND, asyncio.get_running_loop().time() + 1
-            )
-        ),
+    await flow.acknowledge_active()
+    await flow.produce(
+        pending_delivery_module.PromptInput(
+            "second", MessageOrigin.AGENT_SEND, None
+        )
     )
 
-    assert max(timings.values()) < 1
+    assert snapshot_calls <= 10
     store.close()
 
 
 @pytest.mark.asyncio
 async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
     flow = pending_delivery_module.StepDeliveryFlow(store)
@@ -7355,11 +7350,19 @@ async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
     reopened = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
     assert len(reopened._active_notifications) == 0
     assert len(reopened._active_pending_prompt_entries) == 0
+    snapshot_calls = 0
+    original_snapshot_entry = reopened._snapshot_entry
+
+    def count_snapshot_calls(entry):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot_entry(entry)
+
+    monkeypatch.setattr(reopened, "_snapshot_entry", count_snapshot_calls)
     flow = pending_delivery_module.StepDeliveryFlow(reopened)
-    started = asyncio.get_running_loop().time()
     for _ in range(25):
         await flow.prepare_request("terminal_fallback", [], None)
-    assert asyncio.get_running_loop().time() - started < 0.5
+    assert snapshot_calls == 0
     await asyncio.to_thread(reopened.close)
 
 
@@ -11014,6 +11017,7 @@ def test_child_startup_runs_one_git_discovery_in_repo_subdirectory(
         active_home=str(home),
         tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
         root_project_id=project.project_id,
+        project_registry=registry,
     )
 
     _child_base_system_prompt(loop, str(child_cwd))
@@ -11156,6 +11160,7 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         active_home=str(home),
         tool_registry=parent_tools,
         root_project_id=project_a.project_id,
+        project_registry=registry,
     )
 
     prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)

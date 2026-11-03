@@ -190,26 +190,31 @@ def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) ->
     assert open_decisions(tmp_path, first.store.session_id) == ()
 
 
-def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "git")
-    current = _session(tmp_path, project.project_id)
-    other = _session(tmp_path, project.project_id)
-    _request(current, project.project_id, "Current", "This one.")
-    _request(other, project.project_id, "Other", "Not this one.")
+    current = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    other = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    await asyncio.to_thread(
+        _request, current, project.project_id, "Current", "This one."
+    )
+    await asyncio.to_thread(
+        _request, other, project.project_id, "Other", "Not this one."
+    )
 
     app = SimpleNamespace(
         _home=tmp_path,
         _decisions_session_id=current.store.session_id,
         loop=current,
     )
-    output = DecisionsMixin.slash_decisions(app, "")
+    output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
     assert "Other" not in output
     assert current.store.session_id[:8] not in output
 
-    current.store.close()
-    other.store.close()
+    await asyncio.to_thread(current.store.close)
+    await asyncio.to_thread(other.store.close)
 
 
 def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
