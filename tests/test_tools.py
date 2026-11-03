@@ -1498,15 +1498,30 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
 async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    launcher_ready = tmp_path / "launcher-ready"
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import time; time.sleep(2.2)\n" + tool_spawn_module._LAUNCHER,
+        "import pathlib,time; time.sleep(0.3); "
+        f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
+        + tool_spawn_module._LAUNCHER,
     )
-    started = tmp_path / "timeout-command-started"
+    command_started = tmp_path / "timeout-command-started"
     command = (
         "import pathlib,time; "
-        f"pathlib.Path({str(started)!r}).touch(); time.sleep(30)"
+        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(30)"
+    )
+    original_spawn = bash_module.create_tool_subprocess_shell
+
+    async def spawn_after_command_started(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        assert launcher_ready.exists()
+        while not command_started.exists():
+            await asyncio.sleep(0.01)
+        return process
+
+    monkeypatch.setattr(
+        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
@@ -1514,12 +1529,12 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
         ToolCall(
             "bash-launcher-timeout",
             "bash",
-            {"command": _python_command(command), "timeout": 2.0},
+            {"command": _python_command(command), "timeout": 0.2},
         )
     )
 
+    assert launcher_ready.exists()
     assert result["structuredContent"]["timed_out"] is True
-    assert started.exists()
 
 
 @pytest.mark.asyncio
