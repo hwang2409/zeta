@@ -69,6 +69,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -100,6 +101,7 @@ class ConversationStore(
     AsyncDurableWritesMixin,
     PendingPromptStoreMixin,
     ClientDeliveryMixin,
+    StartupFactsMixin,
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
@@ -178,6 +180,7 @@ class ConversationStore(
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
+        self._sent_message_receipts: list[tuple[str, str]] = []
         self._todo_items: list[TodoItem] = []
         self._todo_dismissed = False
         self._agent_counter = 0
@@ -692,6 +695,7 @@ class ConversationStore(
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
+            self._sent_message_receipts.extend(sent_message_receipts(entry))
             if (
                 entry.type == "notification"
                 and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
@@ -747,6 +751,7 @@ class ConversationStore(
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
+        self._sent_message_receipts.extend(sent_message_receipts(entry))
         if linear:
             self._record_active_entry(entry)
         else:

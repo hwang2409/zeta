@@ -831,6 +831,47 @@ async def test_removed_automation_session_fixture_evicts(tmp_path: Path) -> None
     )
 
 
+def test_context_assembler_init_does_not_replay_branch(
+    context_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(context_root)
+    replay_calls = 0
+    original_replay = ConversationStore.replay
+
+    def counted_replay(self: ConversationStore):
+        nonlocal replay_calls
+        replay_calls += 1
+        return original_replay(self)
+
+    monkeypatch.setattr(ConversationStore, "replay", counted_replay)
+
+    ContextAssembler(store)
+
+    assert replay_calls == 0
+
+
+def test_context_calibration_matches_previous_budgets(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    for index in range(200):
+        ratio = 1.0 + (index % 5) / 10
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"calibration {index}")],
+                metadata={"context_calibration_ratio": ratio},
+            )
+        )
+    assembler = ContextAssembler(store, token_counter=lambda _message: 1)
+
+    assert assembler.calibration_ratio == pytest.approx(1.4)
+    assert assembler.trigger_token_budget == 180_000
+    assert assembler.estimator_token_budget == 142_857
+    assembler.update_token_budget(100_000)
+    assert assembler.calibration_ratio == pytest.approx(1.4)
+    assert assembler.trigger_token_budget == 90_000
+    assert assembler.estimator_token_budget == 71_428
+
+
 @pytest.mark.asyncio
 async def test_eviction_triggers_with_safety_margin_and_calibration(
     context_root: Path,

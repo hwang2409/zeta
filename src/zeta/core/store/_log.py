@@ -30,6 +30,7 @@ from ..checkpoints import (
     load_session_json,
 )
 from ..session_files import open_session_file, read_session_file
+from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
@@ -84,6 +85,7 @@ class _DetachedLogState:
     active_notification_delivery_message: Message | None
     active_last_message: Message | None
     task_notification_ids: set[str]
+    sent_message_receipts: list[tuple[str, str]]
     client_deliveries: OrderedDict[str, ClientDelivery]
     client_delivery_outcomes: dict[bytes, bytes]
     log_identity: tuple[int, int, int]
@@ -128,6 +130,7 @@ class ConversationLogMixin:
             ),
             active_last_message=self._active_last_message,
             task_notification_ids=self._task_notification_ids,
+            sent_message_receipts=self._sent_message_receipts,
             client_deliveries=self._client_deliveries,
             client_delivery_outcomes=self._client_delivery_outcomes,
             log_identity=self._log_identity,
@@ -162,6 +165,7 @@ class ConversationLogMixin:
                 state.active_pending_prompt_messages
             ),
             task_notification_ids=set(state.task_notification_ids),
+            sent_message_receipts=list(state.sent_message_receipts),
             client_deliveries=state.client_deliveries.copy(),
             client_delivery_outcomes=dict(state.client_delivery_outcomes),
         )
@@ -298,6 +302,7 @@ class ConversationLogMixin:
         )
         self._active_last_message = state.active_last_message
         self._task_notification_ids = state.task_notification_ids
+        self._sent_message_receipts = state.sent_message_receipts
         self._client_deliveries = state.client_deliveries
         self._client_delivery_outcomes = state.client_delivery_outcomes
         self._log_identity = state.log_identity
@@ -398,6 +403,7 @@ class ConversationLogMixin:
                 )
             self._entries = []
             self._entry_prefix_digest = b""
+            self._sent_message_receipts = []
             self._reset_incremental_validation_state()
             self._rebuild_client_deliveries(self._entries)
             header = {
@@ -527,12 +533,14 @@ class ConversationLogMixin:
         for entry in self._entries:
             self._record_entry_prefix(entry)
         self._task_notification_ids = set()
+        self._sent_message_receipts = []
         for index, entry in enumerate(self._entries):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
             self._validate_entry_payload(entry)
             if entry.type == "fork":
                 self._validate_fork_entry(entry)
+            self._sent_message_receipts.extend(sent_message_receipts(entry))
             if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:

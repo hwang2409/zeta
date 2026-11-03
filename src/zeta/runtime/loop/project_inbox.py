@@ -56,7 +56,7 @@ class ProjectInboxNotificationMixin:
                 projects.root.parent / "sessions", self.store.session_id
             )
             self.tool_registry.sent_message_tracker = tracker
-        tracker.reconcile(self.store.entries)
+        tracker.reconcile(self.store.sent_message_receipts())
         return ProjectInboxScanner(
             projects,
             project_id,

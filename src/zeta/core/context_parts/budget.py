@@ -8,6 +8,7 @@ from typing import Any
 
 from ...context_calibration import ContextCalibration
 from ...protocol.types import Message, MessageRole, TextContent
+from ..store._startup_facts import ContextCalibrationRecord
 
 
 class ContextRequestBudget:
@@ -15,7 +16,7 @@ class ContextRequestBudget:
 
     def __init__(
         self,
-        entries: Sequence[object],
+        records: Sequence[ContextCalibrationRecord],
         *,
         provider_limit: int,
         safety_margin: float,
@@ -24,7 +25,7 @@ class ContextRequestBudget:
         token_counter: Callable[[Message], int],
     ) -> None:
         self.calibration = ContextCalibration(
-            entries,
+            records,
             provider_limit=provider_limit,
             safety_margin=safety_margin,
             normal_target_ratio=normal_target_ratio,
