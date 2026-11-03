@@ -467,7 +467,7 @@ class _Client:
                         str(exc),
                         {"code": "session_not_found", "session_id": session_id},
                     ) from exc
-                except Exception as exc:  # noqa: BLE001 - preserve unhealthy state
+                except Exception as exc:
                     raise ProtocolError(-32000, "approval persistence failed") from exc
                 self.server.control.session_replaced()
             else:
