@@ -1495,14 +1495,37 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
+async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import time; time.sleep(0.3)\n" + tool_spawn_module._LAUNCHER,
+        "import time; time.sleep(2.2)\n" + tool_spawn_module._LAUNCHER,
     )
+    started = tmp_path / "timeout-command-started"
+    command = (
+        "import pathlib,time; "
+        f"pathlib.Path({str(started)!r}).touch(); time.sleep(30)"
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-launcher-timeout",
+            "bash",
+            {"command": _python_command(command), "timeout": 2.0},
+        )
+    )
+
+    assert result["structuredContent"]["timed_out"] is True
+    assert started.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pid_file = tmp_path / "timeout-grandchild.pid"
     child = (
         "import os,pathlib,time; "
