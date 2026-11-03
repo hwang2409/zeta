@@ -19,7 +19,10 @@ from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.core.store._child_runs import parse_child_run_id
+from zeta.core.store._child_runs import (
+    parse_child_run_id,
+    validate_child_run_started_data,
+)
 from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent
 from zeta.server.ergonomics import history
 from zeta.skills import SkillCatalog
@@ -51,6 +54,38 @@ def _append_in_spawn(path: str) -> None:
     store = ConversationStore(Path(path), session_id="session")
     store.append_child_run_started("session:1", None, "worker", "task", "now")
     os.kill(os.getpid(), 9)
+
+
+def test_child_run_started_truncates_long_task_and_name_to_utf8_bytes(tmp_path: Path) -> None:
+    name = "名" * 400
+    task = "作業" * 10_000
+    store = ConversationStore(tmp_path, session_id="session")
+    try:
+        store.append_child_run_started("session:1", None, name, task, "now")
+        row = store.entries[-1].data
+        assert len(row["name"].encode()) <= 1024
+        assert len(row["task"].encode()) <= 1024
+        row["name"].encode().decode()
+        row["task"].encode().decode()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"task": "x" * 1025},
+        {"name": "x" * 1025},
+        {"started_at": "x" * 65},
+        {"run_id": "session:" + ":".join("1" for _ in range(65))},
+    ],
+    ids=["task", "name", "timestamp", "depth"],
+)
+def test_child_run_started_reader_rejects_out_of_bound_rows(change: dict[str, str]) -> None:
+    data = {"run_id": "session:1", "parent_run_id": None, "task": "task", "started_at": "now"}
+    data.update(change)
+    with pytest.raises(ValueError):
+        validate_child_run_started_data(data)
 
 
 def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Path) -> None:

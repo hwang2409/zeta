@@ -3962,6 +3962,57 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
 
 
 @pytest.mark.asyncio
+async def test_run_agent_tool_writes_child_run_started_before_child_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall(
+        "agent-1",
+        "agent",
+        {"prompt": "inspect the task", "description": "作業" * 10_000},
+    )
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("child output")])]
+    )
+    milestones: list[str] = []
+    original_lifecycle = ConversationStore.start_agent_lifecycle
+
+    def start_lifecycle(self, *args, **kwargs):
+        assert any(entry.type == "child_run_started" for entry in store.entries)
+        milestones.append("lifecycle")
+        return original_lifecycle(self, *args, **kwargs)
+
+    original_build = agent_runner_module._build_child_loop
+
+    async def build_child(*args, **kwargs):
+        assert any(entry.type == "child_run_started" for entry in store.entries)
+        milestones.append("build")
+        return await original_build(*args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "start_agent_lifecycle", start_lifecycle)
+    monkeypatch.setattr(agent_runner_module, "_build_child_loop", build_child)
+    original_complete = backend.complete
+
+    async def complete(messages, tool_schemas):
+        if len(backend.calls) == 1:
+            assert any(entry.type == "child_run_started" for entry in store.entries)
+            milestones.append("output")
+        async for event in original_complete(messages, tool_schemas):
+            yield event
+
+    backend.complete = complete
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        assert milestones == ["lifecycle", "build", "output"]
+        row = next(entry for entry in store.entries if entry.type == "child_run_started")
+        assert len(row.data["task"].encode()) <= 1024
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_returns_child_text_and_persists_child_session(
     tmp_path: Path,
 ) -> None:

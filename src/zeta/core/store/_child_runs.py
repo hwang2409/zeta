@@ -13,6 +13,12 @@ if TYPE_CHECKING:
 _MAX_RUN_ID_BYTES = 256
 _MAX_RUN_DEPTH = 64
 _RUN_SEGMENT = re.compile(r"[1-9][0-9]*\Z")
+_MAX_STORED_TEXT_BYTES = 1024
+_MAX_TIMESTAMP_BYTES = 64
+
+
+def _bounded_utf8(value: str, limit: int) -> str:
+    return value.encode("utf-8")[:limit].decode("utf-8", "ignore")
 
 
 def parse_child_run_id(parent_session_id: str, run_id: str) -> tuple[int, str | None]:
@@ -48,18 +54,22 @@ def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
         or parent_run_id == ""
         or type(task) is not str
         or not task
-        or len(task) > 10_000
+        or len(task.encode("utf-8")) > _MAX_STORED_TEXT_BYTES
         or type(started_at) is not str
         or not started_at
-        or len(started_at) > 128
+        or len(started_at.encode("utf-8")) > _MAX_TIMESTAMP_BYTES
         or (
             name is not None
-            and (type(name) is not str or not name or len(name) > 1_000)
+            and (
+                type(name) is not str
+                or not name
+                or len(name.encode("utf-8")) > _MAX_STORED_TEXT_BYTES
+            )
         )
     ):
         raise ValueError("invalid child run started payload")
     parts = run_id.split(":")
-    if len(parts) < 2 or any(
+    if len(parts) < 2 or len(parts) - 1 > _MAX_RUN_DEPTH or any(
         _RUN_SEGMENT.fullmatch(part) is None for part in parts[1:]
     ):
         raise ValueError("invalid child run id")
@@ -80,11 +90,11 @@ class ChildRunStoreMixin:
         data: dict[str, Any] = {
             "run_id": run_id,
             "parent_run_id": parent_run_id,
-            "task": task,
+            "task": _bounded_utf8(task, _MAX_STORED_TEXT_BYTES),
             "started_at": started_at,
         }
         if name is not None:
-            data["name"] = name
+            data["name"] = _bounded_utf8(name, _MAX_STORED_TEXT_BYTES)
         return self._append_row("child_run_started", data)
 
     async def append_child_run_started_async(
