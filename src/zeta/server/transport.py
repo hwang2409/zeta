@@ -93,6 +93,10 @@ class WebSocketServer:
             "127.0.0.1",
             self.port,
             process_request=self._authorize,
+            subprotocols=["zeta.v1"],
+            select_subprotocol=lambda _connection, protocols: (
+                "zeta.v1" if "zeta.v1" in protocols else None
+            ),
             compression=None,
             open_timeout=_UPGRADE_TIMEOUT,
             close_timeout=1,
@@ -111,16 +115,27 @@ class WebSocketServer:
         await asyncio.to_thread(
             print,
             "zeta serve: websocket ready: "
-            f"ws://127.0.0.1:{self.port}/?token={self.token}",
+            f"ws://127.0.0.1:{self.port}/ (auth: subprotocol, query)",
             file=sys.stderr,
         )
 
     def _authorize(
         self, connection: ServerConnection, request: Request
     ) -> Response | None:
-        supplied = parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
-            "token", []
-        )
+        try:
+            protocols = [
+                item.strip()
+                for item in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+            ]
+        except MultipleValuesError:
+            protocols = []
+        bearer = [item[12:] for item in protocols if item.startswith("zeta.bearer.")]
+        if bearer:
+            supplied = bearer if len(bearer) == 1 else []
+        else:
+            supplied = parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
+                "token", []
+            )
         if (
             self.token is None
             or len(supplied) != 1
@@ -274,7 +289,13 @@ def write_connection_file(
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
     payload = json.dumps(
-        {"port": port, "token": token, "pid": os.getpid(), "origins": list(origins)},
+        {
+            "port": port,
+            "token": token,
+            "pid": os.getpid(),
+            "origins": list(origins),
+            "ws_auth": ["subprotocol", "query"],
+        },
         separators=(",", ":"),
     ).encode()
     fd = -1
