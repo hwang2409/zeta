@@ -4833,7 +4833,7 @@ async def test_child_approval_cleanup_removes_pending_requests(tmp_path: Path) -
     while not policy.pending_requests():
         await asyncio.sleep(0)
 
-    child_policy.cleanup()
+    await child_policy.cleanup()
     assert await task == ApprovalDecision.DENY
     assert policy.pending_requests() == []
     signal.abort()

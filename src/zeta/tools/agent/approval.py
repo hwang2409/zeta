@@ -398,11 +398,13 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self._pending_bindings.pop(request_id, None)
         return decision
 
-    def cleanup(self) -> Awaitable[object] | None:
+    async def cleanup(self) -> None:
         self._execution_bindings.clear()
         self._pending_bindings.clear()
         self._denial_reasons.clear()
-        return self.parent.cleanup_delegated(self.child_instance_id)
+        cleanup = self.parent.cleanup_delegated(self.child_instance_id)
+        if cleanup is not None:
+            await cleanup
 
 
 def _approval_decision(value: str | None) -> ApprovalDecision | None:
