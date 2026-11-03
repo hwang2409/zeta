@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 import shutil
 from pathlib import Path
@@ -14,6 +15,7 @@ from tests.test_server import (
     _close,
     _connect,
     _event,
+    _read,
     _request,
     _socket_path,
 )
@@ -265,11 +267,21 @@ async def test_send_and_steer_emit_user_message_events(tmp_path: Path) -> None:
     server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
-        await _hello(reader, writer, ["user_message_event"])
+        await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
         session_id = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"][
             "session"
         ]["session_id"]
-        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        frames = await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "hello", "delivery_id": "send-3"},
+        )
         assert [frame.get("params", {}).get("event") for frame in frames[:-1]] == [
             "user_message"
         ]
@@ -279,8 +291,15 @@ async def test_send_and_steer_emit_user_message_events(tmp_path: Path) -> None:
             "text": "hello",
             "mode": "send",
             "attachments": [],
+            "delivery_id": "send-3",
         }
-        frames = await _request(reader, writer, 4, "steer", {"text": "also this"})
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "also this", "delivery_id": "steer-4"},
+        )
         steer = next(
             frame["params"]
             for frame in frames
@@ -289,7 +308,279 @@ async def test_send_and_steer_emit_user_message_events(tmp_path: Path) -> None:
         assert steer["mode"] == "steer"
         assert steer["text"] == "also this"
         assert steer["attachments"] == []
+        assert steer["delivery_id"] == "steer-4"
         await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_user_message_delivery_id_is_opt_in(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("one"), TextContent("two")], delay=0.2)]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["user_message_event", "delivery_id"])
+        await _request(reader, writer, 2, "new_session", {})
+        frames = await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "hello", "delivery_id": "legacy-send"},
+        )
+        assert frames[0]["params"] == {
+            "event": "user_message",
+            "session_id": server.runtime.session_id,
+            "text": "hello",
+            "mode": "send",
+            "attachments": [],
+        }
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "later", "delivery_id": "legacy-steer"},
+        )
+        event = next(
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "user_message"
+        )
+        assert "delivery_id" not in event
+        await _event(reader, "agent_end")
+        history = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "session_history",
+                {"session_id": server.runtime.session_id},
+            )
+        )[-1]["result"]["messages"]
+        assert all("delivery_id" not in row for row in history)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_user_message_delivery_id_is_omitted_without_a_request_id(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("one"), TextContent("two")], delay=0.2)]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
+        await _request(reader, writer, 2, "new_session", {})
+        send_frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        steer_frames = await _request(reader, writer, 4, "steer", {"text": "later"})
+        for frames in (send_frames, steer_frames):
+            event = next(
+                frame["params"]
+                for frame in frames
+                if frame.get("params", {}).get("event") == "user_message"
+            )
+            assert "delivery_id" not in event
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_queued_steer_keeps_its_delivery_id_when_another_request_is_pending(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("queued-step", "bash", {"command": "printf ok"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
+        await _request(reader, writer, 2, "new_session", {})
+        await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "start", "delivery_id": "send-start"},
+        )
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "queued", "delivery_id": "steer-queued"},
+        )
+        echo = next(
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "user_message"
+        )
+        assert echo["delivery_id"] == "steer-queued"
+
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "approve",
+                    "params": {"request_id": approval["request_id"]},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        later_echoes = []
+        saw_pending_reply = False
+        while True:
+            frame = await _read(reader)
+            saw_pending_reply |= frame.get("id") == 5
+            params = frame.get("params", {})
+            if params.get("event") == "user_message":
+                later_echoes.append(params)
+            if params.get("event") == "agent_end":
+                break
+        assert saw_pending_reply
+        assert later_echoes == []
+        assert len(backend.calls) == 2
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_user_message_delivery_id_survives_restart_in_history(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("history-step", "bash", {"command": "printf ok"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "start", "delivery_id": "history-send"},
+        )
+        approval = await _event(reader, "approval_request")
+        await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "queued", "delivery_id": "history-steer"},
+        )
+        await _request(
+            reader,
+            writer,
+            5,
+            "approve",
+            {"request_id": approval["request_id"]},
+        )
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+    restarted = _server(tmp_path, FakeBackend([]), _launch(tmp_path))
+    reader, writer = await _connect(restarted)
+    try:
+        await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
+        await _request(reader, writer, 6, "resume", {"session_id": session_id})
+        history = (
+            await _request(
+                reader,
+                writer,
+                7,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        user_rows = [row for row in history if row["role"] == "user"]
+        assert [row["delivery_id"] for row in user_rows] == [
+            "history-send",
+            "history-steer",
+        ]
+    finally:
+        await _close(restarted, writer)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        hello = await _hello(
+            reader,
+            writer,
+            ["user_message_event", "delivery_id", "user_message_delivery_id"],
+        )
+        assert hello["capabilities"]["features"] == [
+            "user_message_event",
+            "user_message_delivery_id",
+            "delivery_id",
+        ]
+        await _request(reader, writer, 2, "new_session", {})
+        await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "once", "delivery_id": "duplicate-send"},
+        )
+        await _event(reader, "agent_end")
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "send",
+            {"text": "once", "delivery_id": "duplicate-send"},
+        )
+        assert frames[-1]["result"]["duplicate"] is True
+        assert all(
+            frame.get("params", {}).get("event") != "user_message"
+            for frame in frames[:-1]
+        )
     finally:
         await _close(server, writer)
 

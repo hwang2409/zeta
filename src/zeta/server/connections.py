@@ -223,9 +223,20 @@ class ConnectionRegistry:
         self, connection: Any, method: str, params: dict[str, Any]
     ) -> object:
         target = capture_read(connection, method, params)
+        features = self._connections[connection].features
+        include_delivery_id = {
+            "delivery_id",
+            "user_message_event",
+            "user_message_delivery_id",
+        } <= features
         return await self.run_read(
             connection,
-            lambda: perform_read(method, target, params),
+            lambda: perform_read(
+                method,
+                target,
+                params,
+                include_delivery_id=include_delivery_id,
+            ),
             session_id=target[0],
         )
 
@@ -362,7 +373,13 @@ def project_status(target: object) -> dict[str, Any]:
     return status
 
 
-def perform_read(method: str, target: tuple[str | None, object], params: dict[str, Any]) -> object:
+def perform_read(
+    method: str,
+    target: tuple[str | None, object],
+    params: dict[str, Any],
+    *,
+    include_delivery_id: bool = False,
+) -> object:
     if method == "status":
         return project_status(target[1])
     if method == "list_sessions":
@@ -374,5 +391,7 @@ def perform_read(method: str, target: tuple[str | None, object], params: dict[st
     if method == "session_tree":
         return ergonomics.tree(runtime)
     if method == "session_history":
+        if include_delivery_id:
+            return ergonomics.history(runtime, params, include_delivery_id=True)
         return ergonomics.history(runtime, params)
     raise ProtocolError(-32601, "method not found")

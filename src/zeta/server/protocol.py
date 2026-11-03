@@ -14,6 +14,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 FEATURES = (
     "session_cwd",
     "user_message_event",
+    "user_message_delivery_id",
     "list_sessions_paging",
     "memory_updated",
     "ping",

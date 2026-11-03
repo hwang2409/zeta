@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import ZetaServer
+from zeta.server.delivery import DeliveryRequests, ResolvedModelInput
 
 TIMEOUT = 3
 
@@ -131,6 +133,200 @@ async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
         }
         assert (await _event(reader, "agent_end"))["event"] == "agent_end"
         assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_delivery_id_cancel_after_append_finishes_effects(
+    tmp_path: Path, method: str
+) -> None:
+    store = ConversationStore(tmp_path / method, session_id="session-1")
+    effects: list[str] = []
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+    request_task: asyncio.Task[dict[str, object]] | None = None
+    original_append = store.append_client_delivery_async
+
+    async def append(*args: Any, **kwargs: Any):
+        append_started.set()
+        await release_append.wait()
+        result = await original_append(*args, **kwargs)
+        assert request_task is not None
+        request_task.cancel()
+        await asyncio.sleep(0)
+        return result
+
+    store.append_client_delivery_async = append
+    loop = type("Loop", (), {"steer": lambda self, message: effects.append("steer")})()
+    control = type("Control", (), {})()
+    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+        "loop": loop, "opened": type("Opened", (), {"store": store})(),
+        "session_id": "session-1",
+    })()})()
+    control._model_inputs = type("Inputs", (), {
+        "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
+            params["text"], params["text"], MessageOrigin.USER, None
+        )
+    })()
+    control.turn_busy = lambda: method == "steer"
+
+    async def user_message(*args: Any, **kwargs: Any) -> None:
+        effects.append("echo")
+
+    control.user_message = user_message
+    control.start_turn = lambda *args, **kwargs: effects.append("start")
+
+    requests = DeliveryRequests(control)
+    features = frozenset({"delivery_id"})
+    request_task = asyncio.create_task(
+        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-1"}, features)
+    )
+    await append_started.wait()
+    release_append.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    assert store.client_delivery("cancel-1") is not None
+    # canceled at commit: no echo, the work still runs once
+    assert effects == (["start"] if method == "send" else ["steer"])
+    duplicate = await getattr(
+        requests, method
+    )({"text": "hello", "delivery_id": "cancel-1"}, features)
+    assert duplicate["duplicate"] is True
+    assert effects == (["start"] if method == "send" else ["steer"])
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_delivery_id_cancel_before_append_commits_does_nothing(
+    tmp_path: Path, method: str
+) -> None:
+    store = ConversationStore(tmp_path / method, session_id="session-1")
+    append_started = asyncio.Event()
+    original_append = store.append_client_delivery_async
+
+    async def append(*args: Any, **kwargs: Any):
+        append_started.set()
+        await asyncio.Event().wait()
+        return await original_append(*args, **kwargs)
+
+    store.append_client_delivery_async = append
+    loop = type("Loop", (), {"steer": lambda self, message: None})()
+    control = type("Control", (), {})()
+    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+        "loop": loop, "opened": type("Opened", (), {"store": store})(),
+        "session_id": "session-1",
+    })()})()
+    control._model_inputs = type("Inputs", (), {
+        "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
+            params["text"], params["text"], MessageOrigin.USER, None
+        )
+    })()
+    control.turn_busy = lambda: method == "steer"
+    effects: list[str] = []
+
+    async def user_message(*args: Any, **kwargs: Any) -> None:
+        effects.append("echo")
+
+    control.user_message = user_message
+    control.start_turn = lambda *args, **kwargs: effects.append("start")
+    requests = DeliveryRequests(control)
+    task = asyncio.create_task(
+        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
+    )
+    await append_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.client_delivery("cancel-2") is None
+    assert effects == []
+    store.close()
+
+
+async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None:
+    backend = BlockingBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-echo-order"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": [
+                    "delivery_id",
+                    "user_message_event",
+                    "user_message_delivery_id",
+                ],
+            },
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        original_append = server.runtime.opened.store.append_client_delivery_async
+
+        async def fail_append(*args, **kwargs):
+            raise OSError("injected durable-write failure")
+
+        server.runtime.opened.store.append_client_delivery_async = fail_append
+        failed_send = await _request(
+            reader, writer, 3, "send", {"text": "ghost", "delivery_id": "ghost-1"}
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "user_message"
+            for frame in failed_send
+        )
+        assert failed_send[-1]["error"]["code"] == -32000
+        assert server.runtime.opened.store.client_delivery("ghost-1") is None
+
+        await _request(reader, writer, 4, "send", {"text": "active"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        failed_steer = await _request(
+            reader,
+            writer,
+            5,
+            "steer",
+            {"text": "ghost steer", "delivery_id": "ghost-steer"},
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "user_message"
+            for frame in failed_steer
+        )
+        assert failed_steer[-1]["error"]["code"] == -32000
+        assert server.runtime.opened.store.client_delivery("ghost-steer") is None
+        backend.release.set()
+        await _event(reader, "agent_end")
+
+        server.runtime.opened.store.append_client_delivery_async = original_append
+        normal = await _request(
+            reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
+        )
+        echoes = [
+            frame["params"]
+            for frame in normal
+            if frame.get("params", {}).get("event") == "user_message"
+        ]
+        assert echoes == [
+            {
+                "event": "user_message",
+                "session_id": server.runtime.session_id,
+                "text": "real",
+                "mode": "send",
+                "attachments": [],
+                "delivery_id": "real-1",
+            }
+        ]
+        assert server.runtime.opened.store.client_delivery("real-1") is not None
+        backend.release.set()
+        await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
 
@@ -1006,3 +1202,133 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         )
     finally:
         await _close(resumed, writer)
+class _Store:
+    def __init__(self) -> None:
+        self.rows: dict[str, SimpleNamespace] = {}
+
+    async def append_client_delivery_async(
+        self, delivery_id, operation, status, outcome, **kwargs
+    ) -> None:
+        del kwargs
+        self.rows[delivery_id] = SimpleNamespace(
+            status=status, outcome=outcome, operation=operation
+        )
+
+    def client_delivery(self, delivery_id):
+        return self.rows.get(delivery_id)
+
+    def client_delivery_outcome(self, delivery_id):
+        del delivery_id
+
+
+class _Control:
+    def __init__(self, *, steer: bool = False) -> None:
+        self.store = _Store()
+        self.steer_calls = 0
+        self.start_calls = 0
+        self.echo_started = asyncio.Event()
+        self.echo_error = False
+        self.echo_stalls = False
+        self.release_echo = asyncio.Event()
+        self.loop = SimpleNamespace(steer=self._steer)
+        self.server = SimpleNamespace(
+            runtime=SimpleNamespace(
+                loop=self.loop,
+                opened=SimpleNamespace(store=self.store),
+                session_id="session",
+            )
+        )
+        self._model_inputs = SimpleNamespace(
+            resolve=lambda *args, **kwargs: SimpleNamespace(
+                text="hello",
+                display_text="hello",
+                origin=MessageOrigin.USER,
+                message=None,
+            )
+        )
+        self._steer = steer
+
+    def turn_busy(self) -> bool:
+        return self._steer
+
+    async def user_message(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.echo_started.set()
+        if self.echo_stalls:
+            await self.release_echo.wait()
+        if self.echo_error:
+            raise ConnectionError("echo failed")
+
+    def start_turn(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.start_calls += 1
+
+    def _steer(self, message) -> None:
+        del message
+        self.steer_calls += 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_committed_delivery_runs_work_when_echo_fails(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_error = True
+    requests = DeliveryRequests(control)
+    params = {"text": "hello", "delivery_id": f"{method}-error"}
+
+    with pytest.raises(ConnectionError):
+        await getattr(requests, method)(params, frozenset({"delivery_id"}))
+
+    assert control.start_calls + control.steer_calls == 1
+    retry = await getattr(requests, method)(params, frozenset({"delivery_id"}))
+    assert retry["duplicate"] is True
+    assert control.start_calls + control.steer_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_stalls = True
+    requests = DeliveryRequests(control)
+    request = asyncio.create_task(
+        getattr(requests, method)(
+            {"text": "hello", "delivery_id": f"{method}-cancel"},
+            frozenset({"delivery_id", "user_message_event"}),
+        )
+    )
+    await control.echo_started.wait()
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request, 1)
+    assert control.start_calls + control.steer_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "steer"])
+async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: str) -> None:
+    control = _Control(steer=method == "steer")
+    control.echo_stalls = True
+    requests = DeliveryRequests(control)
+    request: asyncio.Task[dict[str, object]] | None = None
+    commit = control.store.append_client_delivery_async
+
+    async def append_then_cancel(*args, **kwargs) -> None:
+        await commit(*args, **kwargs)
+        assert request is not None
+        request.cancel()  # the first cancel lands after the row is durable
+        await asyncio.sleep(0)
+
+    control.store.append_client_delivery_async = append_then_cancel
+    request = asyncio.create_task(
+        getattr(requests, method)(
+            {"text": "hello", "delivery_id": f"{method}-commit-cancel"},
+            frozenset({"delivery_id", "user_message_event"}),
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(request), 1)
+    assert control.start_calls + control.steer_calls == 1
+    assert not control.echo_started.is_set()
