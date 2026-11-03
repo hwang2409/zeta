@@ -34,7 +34,10 @@ from ...agent.plan_mode import (
     plan_mode_tool_schemas,
 )
 from ...agent.receipt import finalize_agent_results
-from ...agent.recovery_lease import recover_agent_children_off_loop
+from ...agent.recovery_lease import (
+    recover_agent_children_off_loop,
+    recover_agent_children_on_opened_store,
+)
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
@@ -219,6 +222,7 @@ class AgentLoop(
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         self._children_recovered = False
+        self._pending_child_recovery: tuple[NotificationInput, ...] = ()
         self._closed = False
         self._turn_active = False
         self._delivery_wake_pending = False
@@ -554,6 +558,27 @@ class AgentLoop(
             NotificationInput("task_exit", data, dedupe_key=item.task_id)
         )
 
+    def bootstrap_resume_recovery(self) -> None:
+        """Repair restart state while the opened store is still worker-owned."""
+
+        if self._activated:
+            raise RuntimeError("resume recovery must run before activation")
+        self._pending_child_recovery = recover_agent_children_on_opened_store(self)
+        self._children_recovered = True
+
+    async def _publish_recovered_children(self) -> None:
+        async def publish() -> None:
+            for item in self._pending_child_recovery:
+                await self._background_owner.conversation_channel.produce_to(None, item)
+            self._pending_child_recovery = ()
+
+        publication = asyncio.create_task(publish())
+        try:
+            await asyncio.shield(publication)
+        except asyncio.CancelledError:
+            await publication
+            raise
+
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
 
@@ -567,6 +592,8 @@ class AgentLoop(
         if not self._children_recovered:
             await recover_agent_children_off_loop(self)
             self._children_recovered = True
+        if self._pending_child_recovery:
+            await self._publish_recovered_children()
         self.session_start()
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()

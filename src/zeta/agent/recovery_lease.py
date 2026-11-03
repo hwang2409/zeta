@@ -90,6 +90,19 @@ def acquire_recovery_subtree(
     )
 
 
+def recover_agent_children_on_opened_store(
+    loop: AgentLoopForRecovery,
+) -> tuple[NotificationInput, ...]:
+    """Repair restart state before the opened store reaches the event loop."""
+
+    from .background import recover_agent_children
+
+    deliveries = recover_agent_children(loop)
+    for item in deliveries:
+        loop.store._commit_delivery_input(item)
+    return deliveries
+
+
 async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     """Repair orphaned child trees without lease or close work on the loop."""
 

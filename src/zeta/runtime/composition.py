@@ -290,6 +290,8 @@ def compose_runtime(
         loop.manager = manager
         loop.session_metadata = metadata
         loop.account_context = account_context
+        if resuming:
+            loop.bootstrap_resume_recovery()
         memory_reconciler = None
         if memory_enabled:
             memory_backend: CompletionBackend | None = None
