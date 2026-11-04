@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from ..protocol.types import ToolResult
 from ..tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
-from .receipt import TerminalState, terminal_state
+from .receipt import TerminalState, agent_stats, terminal_state
 from .tool_results import validated_tool_result
 
 
@@ -83,6 +83,15 @@ class ChildResultPayloadMixin:
                 status=status,
             )
         )
+        resolved_stats = agent_stats(
+            stats
+            if stats is not None
+            else child_store.agent_lifecycle()
+            if child_store is not None
+            else {},
+            status=result_status,
+            turns_used=turns,
+        )
         return agent_result(
             content,
             tool_call_id=tool_call_id,
@@ -94,7 +103,7 @@ class ChildResultPayloadMixin:
             child_instance_id=child_instance_id,
             description=description,
             depth=depth,
-            stats=stats,
+            stats=resolved_stats,
             include_stats=include_stats,
             canceled=result_status == "canceled",
             notice=notice,

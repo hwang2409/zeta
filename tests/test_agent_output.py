@@ -16,7 +16,7 @@ from zeta.agent.receipt import (
     receipt_tool_result,
 )
 from zeta.agent.tool_results import validated_tool_result
-from zeta.core import agent_progress
+from zeta.core import agent_progress, tool_dispatch
 from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
@@ -173,14 +173,14 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
 
     loop_thread = threading.get_ident()
     read_threads: list[int] = []
-    lifecycle_read = agent_tools._read_agent_lifecycle
+    lifecycle_read = tool_dispatch.read_agent_lifecycle
 
-    def tracked_lifecycle_read(path: str) -> dict[str, object]:
+    def tracked_lifecycle_read(path: str | Path) -> object:
         read_threads.append(threading.get_ident())
         return lifecycle_read(path)
 
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
-    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", tracked_lifecycle_read)
+    monkeypatch.setattr(tool_dispatch, "read_agent_lifecycle", tracked_lifecycle_read)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _result(store, call.id)
@@ -493,6 +493,7 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
         child_session_path=str(child.session_dir),
         status="completed",
         child_instance_id=handle,
+        stats=child.agent_lifecycle() or {},
     )
     receipt_text = receipt["content"][0]["text"]
     assert "2 turns" in receipt_text
@@ -718,8 +719,6 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
     read_threads: list[int] = []
     core_load = agent_progress.load_session_json
     tool_load = agent_tools.load_session_json
-    tool_read = agent_tools._read_agent_lifecycle
-
     def tracked_core_load(*args: object, **kwargs: object) -> object:
         read_threads.append(threading.get_ident())
         return core_load(*args, **kwargs)
@@ -728,13 +727,8 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
         read_threads.append(threading.get_ident())
         return tool_load(*args, **kwargs)
 
-    def tracked_tool_read(path: str) -> dict[str, object]:
-        read_threads.append(threading.get_ident())
-        return tool_read(path)
-
     monkeypatch.setattr(agent_progress, "load_session_json", tracked_core_load)
     monkeypatch.setattr(agent_tools, "load_session_json", tracked_tool_load)
-    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", tracked_tool_read)
     loop, _ = await _terminal_agent_event(tmp_path, child)
     assert read_threads and loop_thread not in read_threads
     await loop.close()
@@ -745,19 +739,19 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
 async def test_full_child_runs_never_read_lifecycle_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    lifecycle_read = agent_tools._read_agent_lifecycle
+    lifecycle_read = tool_dispatch.read_agent_lifecycle
     loop_reads: list[str] = []
 
-    def guarded_lifecycle_read(path: str) -> dict[str, object]:
+    def guarded_lifecycle_read(path: str | Path) -> object:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             pass
         else:
-            loop_reads.append(path)
+            loop_reads.append(str(path))
         return lifecycle_read(path)
 
-    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", guarded_lifecycle_read)
+    monkeypatch.setattr(tool_dispatch, "read_agent_lifecycle", guarded_lifecycle_read)
 
     async def run_child(case: str) -> None:
         call = ToolCall(
@@ -1112,6 +1106,7 @@ def test_terminal_receipt_keeps_legacy_status_flags_compatible(tmp_path: Path) -
         "turns_used": 1,
         "child_session_path": str(tmp_path / "child"),
         "child_instance_id": "parent:1",
+        "stats": {"turns_used": 1, "elapsed": 0.0, "tool_calls": 0},
     }
     completed = agent_result("done", error=False, status="completed", **common)
     failed = agent_result("broken", error=True, status="error", **common)

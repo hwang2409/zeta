@@ -30,7 +30,7 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
-from ...core.agent_progress import live_agent_lifecycle, read_agent_lifecycle
+from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -77,20 +77,6 @@ _STATUS_ROW_STRING_FIELDS = (
     "cwd",
 )
 _MISSING = object()
-
-
-def _read_agent_lifecycle(path: str) -> dict[str, object]:
-    if not path:
-        return {}
-    lifecycle_path = Path(path) / "agent_lifecycle.json"
-    live = live_agent_lifecycle(lifecycle_path)
-    if live is not None:
-        return live
-    try:
-        value = read_agent_lifecycle(lifecycle_path)
-    except ConversationIntegrityError:
-        return {}
-    return value if type(value) is dict else {}
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -902,7 +888,7 @@ def agent_result(
     child_instance_id: str | None = None,
     description: str | None = None,
     depth: int | None = None,
-    stats: dict[str, object] | None = None,
+    stats: dict[str, object],
     include_stats: bool = True,
     canceled: bool = False,
     notice: str | None = None,
@@ -924,14 +910,6 @@ def agent_result(
     # Keep depth-one result payloads byte-compatible with the pre-nesting shape.
     if depth is not None and depth != 1:
         structured_content["depth"] = depth
-    if stats is None:
-        lifecycle = _read_agent_lifecycle(child_session_path)
-        stats = agent_stats(
-            lifecycle,
-            status=status
-            or ("canceled" if canceled else "failed" if error else "completed"),
-            turns_used=turns_used,
-        )
     if status == "running":
         return build_agent_progress(
             text,
@@ -970,6 +948,7 @@ async def _agent(
             error=True,
             turns_used=0,
             child_session_path="",
+            stats=agent_stats({}, status="failed", turns_used=0),
         )
     return await runner(
         call,

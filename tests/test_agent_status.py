@@ -432,6 +432,7 @@ async def test_terminal_durable_record_wins_over_stale_live_progress_in_status_a
             turns_used=1,
             child_session_path=str(child.session_dir),
             status="completed",
+            stats={},
         ),
     )
     render_loop = AgentLoop(
