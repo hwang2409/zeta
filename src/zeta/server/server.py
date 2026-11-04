@@ -499,8 +499,7 @@ class _Client:
                     cwd=cwd,
                 )
                 self.server.control._active_host_commands = candidate
-                self.server.control._active_host_commands = candidate
-            self.server.control.session_replaced()
+                self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
                 return {"session": self._session_snapshot()}
@@ -531,8 +530,7 @@ class _Client:
                     except SessionNotFoundError as exc:
                         raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
                 self.server.control._active_host_commands = candidate
-                self.server.control._active_host_commands = candidate
-            self.server.control.session_replaced()
+                self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
                 return {"session": self._session_snapshot()}
