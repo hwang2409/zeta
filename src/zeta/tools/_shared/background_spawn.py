@@ -70,6 +70,8 @@ def _snapshot_descendants_sync(root_pids: Sequence[int]) -> dict[int, dict[int, 
         )
     except (OSError, subprocess.TimeoutExpired):
         return {pid: {} for pid in root_pids}
+    if result.returncode != 0:
+        return {pid: {} for pid in root_pids}
     children = _parse_process_table(result.stdout)
     return {pid: _descendant_pids_from_table(children, pid) for pid in root_pids}
 
