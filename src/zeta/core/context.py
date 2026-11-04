@@ -1,12 +1,9 @@
 """Context assembly and durable conversation compaction."""
-
 from __future__ import annotations
-
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
-
 from .context_parts.budget import ContextRequestBudget
 from .context_parts.types import (
     AssembledContext,
@@ -58,8 +55,6 @@ from ..protocol.types import (
     TextContent,
     ToolUseContent,
 )
-
-
 SummaryCompletionError = _SummaryCompletionError
 SummaryInputTooLarge = _SummaryInputTooLarge
 

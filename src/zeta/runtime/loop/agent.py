@@ -1,5 +1,4 @@
 """The provider-neutral agent loop."""
-
 from __future__ import annotations
 
 import asyncio
@@ -134,7 +133,6 @@ def _sanitize_account_message(message: Message) -> Message:
         metadata=message.metadata,
     )
 
-
 TaskResult = TypeVar("TaskResult")
 
 
@@ -156,7 +154,6 @@ class AgentLoop(
     MCPSession,
 ):
     post_stream_provider_retry = True
-
     def __init__(
         self,
         backend: CompletionBackend,
@@ -311,7 +308,6 @@ class AgentLoop(
         self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -320,7 +316,6 @@ class AgentLoop(
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
-
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
