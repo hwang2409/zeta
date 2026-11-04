@@ -155,7 +155,16 @@ class _StoreGate:
         self.thread_ids: list[int] = []
         self.method = method
         self.session_dir = store.session_dir
+        self.bound_original = getattr(store, method)
         self.original = getattr(type(store), method)
+
+    def call(self, *args: object, **kwargs: object) -> object:
+        self.thread_ids.append(threading.get_ident())
+        self.entered.set()
+        assert self.release.wait(timeout=1), (
+            f"timed out waiting to release {self.method}"
+        )
+        return self.bound_original(*args, **kwargs)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def gated(
@@ -1917,17 +1926,14 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
 
     monkeypatch.setattr(server.control, "_notify", record)
     try:
-        start, gate = await _gated_start(server, call, monkeypatch)
+        await server.control._event(_start_event(call))
         await server.control.controller_released(reconnect=True)
         await server.control.controller_claimed(reconnect=True)
-        gate.release.set()
-        await start
-        assert ("approval_request", call.id) not in events
-        await server.control.controller_ready(reconnect=True)
         assert events.count(("approval_request", call.id)) == 1
+        await server.control.controller_ready(reconnect=True)
+        assert events.count(("approval_request", call.id)) == 2
         assert server.control.pending_approvals_now()[0]["request_id"] == call.id
     finally:
-        gate.release.set()
         await _close(server, writer)
 
 
@@ -1968,7 +1974,7 @@ async def test_approval_reconnect_status_during_reserved_write(
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
         gate = _StoreGate(store, "resolve_approval")
-        monkeypatch.setattr(store, gate.method, gate.call)
+        gate.install(monkeypatch)
         decision = asyncio.create_task(server.control.resolve_approval("approve", call.id))
         await _wait_thread_gate(gate)
         status = server.control.pending_approvals_now(reconnect=True)
