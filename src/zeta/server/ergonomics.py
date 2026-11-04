@@ -571,6 +571,7 @@ def _backward_page_history(
     validator: dict[str, object],
     *,
     include_delivery_id: bool,
+    first_page: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     end = len(projection.entry_groups) - 1
     stable_end = validator["end"]
@@ -584,7 +585,7 @@ def _backward_page_history(
             "session history changed; restart from the newest page",
             {"code": "stale_history_snapshot"},
         )
-    if before < 0 or before > stable_end:
+    if before < 0 or before > stable_end + int(first_page):
         raise ProtocolError(-32602, "before must not exceed history end")
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
@@ -672,6 +673,7 @@ def page_history(
     include_delivery_id: bool,
     backward: bool = False,
     validator: dict[str, object] | None = None,
+    first_page: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     if backward:
         assert cursor is not None and validator is not None
@@ -680,6 +682,7 @@ def page_history(
             cursor,
             validator,
             include_delivery_id=include_delivery_id,
+            first_page=first_page,
         )
     assert cursor is not None
     return _forward_page_history(
@@ -725,6 +728,7 @@ def history(
                 include_delivery_id=include_delivery_id,
                 backward=True,
                 validator=validator,
+                first_page=True,
             )
         else:
             assert validator is not None

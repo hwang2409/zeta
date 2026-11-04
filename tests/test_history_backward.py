@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from zeta.server import ergonomics
+from tests.support.server_client import request
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
+from zeta.server import ZetaServer, ergonomics
 from zeta.server.protocol import ProtocolError
 
 
@@ -31,6 +43,105 @@ def _runtime(store: object) -> SimpleNamespace:
 
 def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
     return ergonomics.history(_runtime(store), params, backward_enabled=True)
+
+
+@contextlib.asynccontextmanager
+async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterator[tuple[object, object, str, ZetaServer]]:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=Path("/tmp") / f"zeta-history-{tmp_path.name}.sock",
+        provider="codex",
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(
+        str(server.socket_path), limit=2_000_000
+    )
+    try:
+        hello = (await request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.2", "features": ["session_history_backward"]},
+        ))[-1]["result"]
+        assert "session_history_backward" in hello["capabilities"]["features"]
+        session = (await request(
+            reader, writer, 2, "new_session", {"provider": "codex"}
+        ))[-1]["result"]["session"]
+        for number in range(count):
+            server.runtime.opened.store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
+                    MessageOrigin.USER,
+                )
+            )
+        yield reader, writer, session["session_id"], server
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _history_request(reader: object, writer: object, request_id: int, session_id: str, params: dict[str, object]) -> dict[str, object]:
+    response = (await request(
+        reader, writer, request_id, "session_history", {"session_id": session_id, **params}
+    ))[-1]
+    assert "error" not in response, response
+    return response["result"]
+
+
+@pytest.mark.asyncio
+async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    async with _real_history_server(tmp_path) as (reader, writer, session_id, _server):
+        first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        assert first["messages"]
+        validator = first["history_validator"]
+        pages = [first]
+        cursor = first["next_before"]
+        request_id = 4
+        while cursor is not None:
+            page = await _history_request(
+                reader, writer, request_id, session_id,
+                {"before": cursor, "history_validator": validator},
+            )
+            pages.append(page)
+            cursor = page["next_before"]
+            request_id += 1
+        texts = [
+            row["content"][0]["text"]
+            for page in reversed(pages)
+            for row in page["messages"]
+            if row["role"] == "user"
+        ]
+        assert [text.split("x", 1)[0] for text in texts] == [f"message-{number}" for number in range(220)]
+
+
+@pytest.mark.asyncio
+async def test_real_socket_backward_continuation_survives_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
+        first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        assert first["next_before"] is not None
+        server.runtime.opened.store.append_message(
+            with_message_origin(Message(MessageRole.USER, [TextContent("new")]), MessageOrigin.USER)
+        )
+        page = await _history_request(
+            reader, writer, 4, session_id,
+            {"before": first["next_before"], "history_validator": first["history_validator"]},
+        )
+        assert "new" not in {row["content"][0]["text"] for row in page["messages"] if row["role"] == "user"}
+
+
+@pytest.mark.asyncio
+async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
+        first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        user_id = server.runtime.opened.store.active_branch_snapshot()[0].id
+        fork = (await request(reader, writer, 4, "fork_message", {"session_id": session_id, "message_id": user_id}))[-1]
+        assert "error" not in fork
+        response = (await request(reader, writer, 5, "session_history", {
+            "session_id": session_id, "before": first["next_before"],
+            "history_validator": first["history_validator"],
+        }))[-1]
+        assert response["error"]["code"] == -32009
 
 
 def test_newest_page_then_full_backward_walk_has_no_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,7 +214,7 @@ def test_backward_rejects_cursor_past_stable_end_and_terminal_append() -> None:
     store._log_offset += 1
     page = _backward_history(
         store,
-        {"before": first["next_before"], "history_validator": first["history_validator"]},
+        {"before": 1, "history_validator": first["history_validator"]},
     )
     assert "approval-end" not in {row["id"] for row in page["messages"]}
 
