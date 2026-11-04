@@ -1168,9 +1168,12 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         approval_end = _named_events(frames, "approval_end")
         assert len(approval_end) == 1
         assert approval_end[0]["request_id"] == approval["request_id"]
-        end = await _event(reader, "tool_end")
+        if not _named_events(frames, "tool_end"):
+            frames += await _frames_until_event(reader, "tool_end")
+        end = _named_events(frames, "tool_end")[-1]
         assert end["tool_result"]["is_error"] is True
-        await _event(reader, "turn_end")
+        if not _named_events(frames, "turn_end"):
+            frames += await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
@@ -2069,7 +2072,9 @@ async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
+async def test_lifecycle_prunes_ended_approvals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     turns = 20
     backend = FakeBackend(
         [
@@ -2095,19 +2100,38 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
+    tool_end_written = asyncio.Event()
+    controller = server.connections.controller_metadata().connection
+    original_write = controller._write_physical
+
+    async def gated_write(payload: bytes) -> bool:
+        frame = json.loads(payload)
+        if frame.get("id") == 4:
+            await tool_end_written.wait()
+        written = await original_write(payload)
+        if (
+            frame.get("method") == "event"
+            and frame["params"].get("event") == "tool_end"
+        ):
+            tool_end_written.set()
+        return written
+
+    monkeypatch.setattr(controller, "_write_physical", gated_write)
     try:
         for index in range(turns):
             await _request(reader, writer, 3 + index * 2, "send", {"text": "read it"})
             approval = await _event(reader, "approval_request")
-            await _request(
+            frames = await _request(
                 reader,
                 writer,
                 4 + index * 2,
                 "deny",
                 {"request_id": approval["request_id"]},
             )
-            await _event(reader, "tool_end")
-            await _event(reader, "agent_end")
+            if not _named_events(frames, "tool_end"):
+                frames += await _frames_until_event(reader, "tool_end")
+            if not _named_events(frames, "agent_end"):
+                frames += await _frames_until_event(reader, "agent_end")
 
         assert server._client is not None
         assert server.control._approvals.state.records == {}
@@ -2198,8 +2222,9 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
         assert next_ask["request_id"] == "call-3", (
             "read must auto-approve after always_tool, so the next ask is bash"
         )
-        await _request(reader, writer, 5, "deny", {"request_id": "call-3"})
-        await _event(reader, "turn_end")
+        frames = await _request(reader, writer, 5, "deny", {"request_id": "call-3"})
+        if not _named_events(frames, "turn_end"):
+            frames += await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
@@ -2289,8 +2314,9 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
             assert error["code"] == -32602, f"scope={bad_scope!r} error {error!r}"
             assert error["message"] == "scope must be 'once' or 'always_tool'"
             next_id += 1
-        await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
-        await _event(reader, "turn_end")
+        frames = await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
+        if not _named_events(frames, "turn_end"):
+            frames += await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
