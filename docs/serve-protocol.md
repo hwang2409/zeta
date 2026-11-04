@@ -1014,11 +1014,16 @@ error code and message. Provider status and origin remain internal.
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). The cursor counts the same
-  durable message and notification entries as before. Pages use the
-  frame-size bound rather than a fixed entry target. Approval lifecycle entries
-  between them do not change the
-  cursor value, so an offset issued by an older server resumes without a gap or
-  duplicate. All rows projected from one entry are atomic on a page. An
+  durable message and notification entries as before. The server chooses page
+  sizes: the first page has at most 128 durable entries, and later pages use the
+  frame-size bound. Clients must follow `next_offset` and must not assume a
+  fixed page size. Approval lifecycle entries between cursor entries do not
+  change the cursor value, so an offset issued by an older server resumes
+  without a gap or duplicate. All rows projected from one entry are atomic on
+  a page. History string fields larger than 8,000 bytes use the existing
+  `... [truncated: N bytes]` marker. If a group still cannot fit after its
+  strings are bounded, the group becomes one
+  `[history group too large; truncated]` system row. An
   assistant approval anchor emits its message row and then its
   `approval_request`; a resolution emits its `approval_end`. These lifecycle
   rows use the same fields as the live events. The parent history includes only
