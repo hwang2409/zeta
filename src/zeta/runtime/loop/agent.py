@@ -582,6 +582,7 @@ class AgentLoop(
         *,
         prepared: bool = False,
         event_sink: Callable[[StreamEvent], None] | None = None,
+        host_environment: Mapping[str, str] | None = None,
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
 
@@ -620,6 +621,7 @@ class AgentLoop(
                 tool_call,
                 abort_signal=abort_signal,
                 _scope_signal=abort_signal,
+                _host_environment=host_environment,
                 _lifecycle_sink=lifecycle,
             )
         except asyncio.CancelledError:
@@ -707,6 +709,8 @@ class AgentLoop(
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         await self.refresh_skills()
@@ -815,7 +819,7 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or self.context_assembler.needs_compaction():
+                if retrying_context or self.context_assembler.needs_compaction(system_append=host_instruction):
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
                         data={"turn": turn_number},
@@ -825,6 +829,7 @@ class AgentLoop(
                         backend=self.backend,
                         force=retrying_context,
                         emergency=retrying_context,
+                        system_append=host_instruction,
                     )
                 except BudgetExceeded:
                     if not notification_turn:
@@ -833,6 +838,7 @@ class AgentLoop(
                         backend=self.backend,
                         force=True,
                         emergency=True,
+                        system_append=host_instruction,
                     )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
@@ -1123,6 +1129,7 @@ class AgentLoop(
                 calls,
                 _validated_tool_result,
                 abort_signal=turn_abort_signal,
+                host_environment=host_environment,
             )
             try:
                 async for event in dispatch:
