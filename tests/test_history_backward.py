@@ -260,6 +260,36 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
         assert not ({row.get("id") for row in first["messages"]} & {row.get("id") for row in next_page["messages"]})
 
 
+def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 1_400)
+    atomic = SimpleNamespace(
+        id="atomic",
+        type="message",
+        data={
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "x" * 240}]},
+            "approval_requests": [{
+                "request_id": "request",
+                "tool_call": {"id": "call", "name": "tool", "arguments": {"value": "y" * 240}},
+            }],
+        },
+    )
+    store = _HistoryStore([_entry(i) for i in range(45)] + [atomic])
+    first = _backward_history(store, {"before": None})
+    first_ids = {row["id"] for row in first["messages"]}
+    assert "atomic" in first_ids
+    assert all(row["id"] == "atomic" for row in first["messages"] if row["id"] == "atomic")
+    continuation = _backward_history(
+        store,
+        {"before": first["next_before"], "history_validator": first["history_validator"]},
+    )
+    continuation_ids = {row["id"] for row in continuation["messages"]}
+    assert not first_ids & continuation_ids
+    assert first_ids | continuation_ids <= {f"message-{i}" for i in range(45)} | {"atomic"}
+    assert min(int(row["id"].split("-", 1)[1]) for row in continuation["messages"] if row["id"].startswith("message-")) < min(int(row["id"].split("-", 1)[1]) for row in first["messages"] if row["id"].startswith("message-"))
+    assert len(FrameCodec().response("id", first)) <= MAX_FRAME_BYTES
+    assert len(FrameCodec().response("id", continuation)) <= MAX_FRAME_BYTES
+
+
 def test_backward_does_not_replace_forward_cache_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
