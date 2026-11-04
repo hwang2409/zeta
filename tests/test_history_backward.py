@@ -86,6 +86,28 @@ def test_backward_params_require_negotiation() -> None:
     assert error.value.code == -32602
 
 
+def test_backward_rejects_cursor_past_stable_end_and_terminal_append() -> None:
+    store = _HistoryStore([_entry(i) for i in range(3)])
+    first = _backward_history(store, {"before": None})
+    with pytest.raises(ProtocolError) as error:
+        _backward_history(
+            store,
+            {"before": first["history_validator"]["end"] + 1,
+             "history_validator": first["history_validator"]},
+        )
+    assert error.value.code == -32602
+
+    store.entries.append(SimpleNamespace(
+        id="approval-end", type="approval_history", data={"event": "approval_end"}
+    ))
+    store._log_offset += 1
+    page = _backward_history(
+        store,
+        {"before": first["next_before"], "history_validator": first["history_validator"]},
+    )
+    assert "approval-end" not in {row["id"] for row in page["messages"]}
+
+
 def test_backward_zero_is_empty_and_malformed_params_are_rejected() -> None:
     store = _HistoryStore([_entry(i) for i in range(3)])
     first = _backward_history(store, {"before": None})

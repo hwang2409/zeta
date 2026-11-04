@@ -1045,9 +1045,10 @@ error code and message. Provider status and origin remain internal.
   `offset`, or malformed values return `-32602`; a changed validator returns
   `-32009` with data code `stale_history_snapshot`. The cursor counts the same
   durable message and notification entries as before. The server chooses page
-  sizes: the first page has at most 128 durable entries, and later pages use the
-  frame-size bound. Clients must follow `next_offset` and must not assume a
-  fixed page size. Approval lifecycle entries between cursor entries do not
+  sizes: forward first pages have at most 128 durable entries, and later forward
+  pages use the frame-size bound. Backward first pages are frame-limited, have no
+  128-entry cap, and clients must follow `next_before`. Forward clients must
+  follow `next_offset`; clients must not assume a fixed page size. Approval lifecycle entries between cursor entries do not
   change the cursor value, so an offset issued by an older server resumes
   without a gap or duplicate. All rows projected from one entry are atomic on
   a page. History string fields larger than 8,000 bytes use the existing
