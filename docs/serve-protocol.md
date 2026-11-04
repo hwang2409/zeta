@@ -1183,7 +1183,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
-| `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers") |
+| `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 
@@ -1204,5 +1204,7 @@ filtering and response-size limits apply before the response is sent.
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
 observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+
+observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
 this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. A claimed controller's pre-`hello` output is retained in emission order, up to 256 frames or 4 MiB, and is flushed after the successful `hello` response. If that bound is exceeded, the controller receives `-32011` (`controller output overflow`) after `hello` and is closed. Observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. Requests are read and dispatched sequentially.

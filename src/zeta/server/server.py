@@ -419,7 +419,7 @@ class _Client:
             self._closed = True
 
     async def _route_request(
-        self, method: str, params: dict[str, Any]
+        self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
         if method == "hello":
             result = self._hello(params)
@@ -434,12 +434,14 @@ class _Client:
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         assert self.server.connections is not None
-        return await self.server.connections.route_request(self, method, params)
+        return await self.server.connections.route_request(
+            self, request_id, method, params
+        )
 
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
-        handled, result = await self._route_request(method, params)
+        handled, result = await self._route_request(request_id, method, params)
         if handled:
             return result
         if method in LOADED_SESSION_MUTATIONS and method not in _DELIVERY_MUTATIONS:
