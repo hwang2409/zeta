@@ -6,18 +6,28 @@ import json
 import threading
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import ergonomics
 from .protocol import ProtocolError
 
-OBSERVER_REQUESTS = frozenset({
-    "list_sessions", "status", "session_tree", "session_history",
-    "model_catalog", "session_settings", "ping", "delivery_status",
-})
+OBSERVER_REQUESTS = frozenset(
+    {
+        "list_sessions",
+        "status",
+        "session_tree",
+        "session_history",
+        "model_catalog",
+        "session_settings",
+        "ping",
+        "delivery_status",
+    }
+)
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
+_CONTROLLER_BUFFER_LIMIT = 4 * 1024 * 1024
+_CONTROLLER_BUFFER_FRAMES = 256
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,10 @@ class _Connection:
     writer_task: asyncio.Task[None] | None = None
     queued_bytes: int = 0
     ready: bool = False
+    flushing: bool = False
+    buffered_frames: deque[bytes] = field(default_factory=deque)
+    buffered_bytes: int = 0
+    overflowed: bool = False
 
 
 class ConnectionRegistry:
@@ -51,7 +65,12 @@ class ConnectionRegistry:
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
-        self._read_threads = [threading.Thread(target=self._read_worker, daemon=True, name=f"zeta-read-{i}") for i in range(2)]
+        self._read_threads = [
+            threading.Thread(
+                target=self._read_worker, daemon=True, name=f"zeta-read-{i}"
+            )
+            for i in range(2)
+        ]
         for thread in self._read_threads:
             thread.start()
 
@@ -92,7 +111,11 @@ class ConnectionRegistry:
         return role
 
     def _claim(
-        self, connection: Any, role: str, protocol_version: str, features: frozenset[str]
+        self,
+        connection: Any,
+        role: str,
+        protocol_version: str,
+        features: frozenset[str],
     ) -> None:
         state = self._connections[connection]
         if state.role is not None:
@@ -118,21 +141,79 @@ class ConnectionRegistry:
     def controller_ready(self, connection: Any) -> None:
         if not self.is_controller(connection):
             raise RuntimeError("connection does not own the controller claim")
-        self._connections[connection].ready = True
+        state = self._connections[connection]
+        state.ready = True
+        state.flushing = bool(state.buffered_frames)
+
+    async def flush_controller(self, connection: Any) -> bool:
+        state = self._connections.get(connection)
+        if state is None or state is not self._controller:
+            return False
+        if state.overflowed:
+            error = (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32011,
+                            "message": "controller output overflow",
+                        },
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+            with contextlib.suppress(ConnectionError, OSError, RuntimeError):
+                await connection._write_physical(error)
+            await connection.close()
+            return False
+        try:
+            while state.buffered_frames:
+                frame = state.buffered_frames[0]
+                if not await connection._write_physical(frame):
+                    return False
+                state.buffered_frames.popleft()
+                state.buffered_bytes -= len(frame)
+            return True
+        finally:
+            state.flushing = False
 
     def current_controller(self) -> ControllerMetadata | None:
         state = self._controller
         if state is None or not state.ready:
             return None
-        return ControllerMetadata(state.connection, state.protocol_version, state.features)
+        return ControllerMetadata(
+            state.connection, state.protocol_version, state.features
+        )
 
     async def publish_controller(
         self, event: str, session_id: str | None, **fields: object
     ) -> bool:
-        controller = self.current_controller()
-        if controller is None:
+        state = self._controller
+        if state is None:
             return False
-        frame = controller.connection.codec.notification(event, session_id, **fields)
+        if (
+            event == "approval_end"
+            and "approval_reconnect" not in state.features
+            and isinstance(fields.get("data"), dict)
+            and fields["data"].get("reason") == "grace_expired"
+        ):
+            return False
+        controller = self.current_controller()
+        frame = state.connection.codec.notification(event, session_id, **fields)
+        if controller is None or state.flushing:
+            if (
+                state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT
+                or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES
+            ):
+                state.overflowed = True
+                state.buffered_frames.clear()
+                state.buffered_bytes = 0
+                return False
+            state.buffered_frames.append(frame)
+            state.buffered_bytes += len(frame)
+            return True
         return await self.send(controller.connection, frame)
 
     def release(self, connection: Any) -> None:
@@ -141,6 +222,8 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
+        state.buffered_frames.clear()
+        state.buffered_bytes = 0
         if state in self._observers:
             self._observers.remove(state)
         if state.writer_task is not None:
@@ -197,7 +280,17 @@ class ConnectionRegistry:
             state.writer_task.cancel()
             await asyncio.gather(state.writer_task, return_exceptions=True)
             state.writer_task = None
-        error = json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "observer output overflow"}}, separators=(",", ":")).encode() + b"\n"
+        error = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32011, "message": "observer output overflow"},
+                },
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
         with contextlib.suppress(ConnectionError, OSError, RuntimeError):
             await state.connection._write_physical(error)
         await state.connection.close()
@@ -259,7 +352,9 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(self, connection: Any, callable: Callable[[], Any]) -> Any:
+    async def run_observer_read(
+        self, connection: Any, callable: Callable[[], Any]
+    ) -> Any:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             raise RuntimeError("observer is not connected")
@@ -283,7 +378,9 @@ class ConnectionRegistry:
                 self.loop.call_soon_threadsafe(self._read_done, future, result, None)
 
     @staticmethod
-    def _read_done(future: asyncio.Future[Any], result: Any, error: BaseException | None) -> None:
+    def _read_done(
+        future: asyncio.Future[Any], result: Any, error: BaseException | None
+    ) -> None:
         if future.done():
             return
         if error is None:
@@ -346,14 +443,24 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
-def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
+
+def capture_read(
+    client: Any, method: str, params: dict[str, Any]
+) -> tuple[str | None, object]:
     runtime = client.server.runtime
     if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
         if runtime.opened is None:
-            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
+            return None, {
+                "session": None,
+                "state": "idle",
+                "explicit_finish": False,
+                "pending_approvals": [],
+                "usage": {},
+                "compaction_markers": 0,
+            }
         return runtime.session_id, {
             "session": client._session_snapshot(),
             "state": (
@@ -361,8 +468,12 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
                 if client.server.control.unhealthy() or runtime.state is None
                 else runtime.state.status
             ),
-            "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
-            "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
+            "explicit_finish": runtime.loop.explicit_finish
+            if runtime.loop is not None
+            else runtime._config(None, None).agents_explicit_finish,
+            "pending_approvals": [],
+            "usage": dict(runtime.usage),
+            "store": runtime.opened.store,
         }
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)
@@ -397,7 +508,9 @@ def perform_read(
     if method in {"model_catalog", "session_settings"}:
         return target[1]
     store = target[1]
-    runtime = type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()
+    runtime = type(
+        "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
+    )()
     if method == "session_tree":
         return ergonomics.tree(runtime)
     if method == "session_history":

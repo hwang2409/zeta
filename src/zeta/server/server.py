@@ -350,7 +350,10 @@ class _Client:
                         and self.role == "controller"
                     ):
                         self.connections.controller_ready(self)
-                        if "approval_reconnect" in self.features:
+                        if (
+                            await self.connections.flush_controller(self)
+                            and "approval_reconnect" in self.features
+                        ):
                             await self.server.control.controller_ready(reconnect=True)
                 if not self.handshaken:
                     break
