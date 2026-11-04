@@ -12,18 +12,10 @@ from typing import Any
 from . import ergonomics
 from .protocol import ProtocolError
 
-OBSERVER_REQUESTS = frozenset(
-    {
-        "list_sessions",
-        "status",
-        "session_tree",
-        "session_history",
-        "model_catalog",
-        "session_settings",
-        "ping",
-        "delivery_status",
-    }
-)
+OBSERVER_REQUESTS = frozenset({
+    "list_sessions", "status", "session_tree", "session_history",
+    "model_catalog", "session_settings", "ping", "delivery_status",
+})
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 _CONTROLLER_BUFFER_LIMIT = 4 * 1024 * 1024
@@ -65,12 +57,7 @@ class ConnectionRegistry:
         self._read_condition = threading.Condition()
         self._read_jobs: deque[tuple[Callable[[], Any], asyncio.Future[Any]]] = deque()
         self._read_stopping = False
-        self._read_threads = [
-            threading.Thread(
-                target=self._read_worker, daemon=True, name=f"zeta-read-{i}"
-            )
-            for i in range(2)
-        ]
+        self._read_threads = [threading.Thread(target=self._read_worker, daemon=True, name=f"zeta-read-{i}") for i in range(2)]
         for thread in self._read_threads:
             thread.start()
 
@@ -111,11 +98,7 @@ class ConnectionRegistry:
         return role
 
     def _claim(
-        self,
-        connection: Any,
-        role: str,
-        protocol_version: str,
-        features: frozenset[str],
+        self, connection: Any, role: str, protocol_version: str, features: frozenset[str]
     ) -> None:
         state = self._connections[connection]
         if state.role is not None:
@@ -150,20 +133,10 @@ class ConnectionRegistry:
         if state is None or state is not self._controller:
             return False
         if state.overflowed:
-            error = (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {
-                            "code": -32011,
-                            "message": "controller output overflow",
-                        },
-                    },
-                    separators=(",", ":"),
-                ).encode()
-                + b"\n"
-            )
+            error = json.dumps(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "controller output overflow"}},
+                separators=(",", ":"),
+            ).encode() + b"\n"
             with contextlib.suppress(ConnectionError, OSError, RuntimeError):
                 await connection._write_physical(error)
             await connection.close()
@@ -183,9 +156,7 @@ class ConnectionRegistry:
         state = self._controller
         if state is None or not state.ready:
             return None
-        return ControllerMetadata(
-            state.connection, state.protocol_version, state.features
-        )
+        return ControllerMetadata(state.connection, state.protocol_version, state.features)
 
     async def publish_controller(
         self, event: str, session_id: str | None, **fields: object
@@ -203,10 +174,7 @@ class ConnectionRegistry:
         controller = self.current_controller()
         frame = state.connection.codec.notification(event, session_id, **fields)
         if controller is None or state.flushing:
-            if (
-                state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT
-                or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES
-            ):
+            if state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES:
                 state.overflowed = True
                 state.buffered_frames.clear()
                 state.buffered_bytes = 0
@@ -280,17 +248,7 @@ class ConnectionRegistry:
             state.writer_task.cancel()
             await asyncio.gather(state.writer_task, return_exceptions=True)
             state.writer_task = None
-        error = (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32011, "message": "observer output overflow"},
-                },
-                separators=(",", ":"),
-            ).encode()
-            + b"\n"
-        )
+        error = json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "observer output overflow"}}, separators=(",", ":")).encode() + b"\n"
         with contextlib.suppress(ConnectionError, OSError, RuntimeError):
             await state.connection._write_physical(error)
         await state.connection.close()
@@ -352,9 +310,7 @@ class ConnectionRegistry:
             session_id=session_id,
         )
 
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
+    async def run_observer_read(self, connection: Any, callable: Callable[[], Any]) -> Any:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             raise RuntimeError("observer is not connected")
@@ -378,9 +334,7 @@ class ConnectionRegistry:
                 self.loop.call_soon_threadsafe(self._read_done, future, result, None)
 
     @staticmethod
-    def _read_done(
-        future: asyncio.Future[Any], result: Any, error: BaseException | None
-    ) -> None:
+    def _read_done(future: asyncio.Future[Any], result: Any, error: BaseException | None) -> None:
         if future.done():
             return
         if error is None:
@@ -443,24 +397,14 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
-
-def capture_read(
-    client: Any, method: str, params: dict[str, Any]
-) -> tuple[str | None, object]:
+def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
     runtime = client.server.runtime
     if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
         if runtime.opened is None:
-            return None, {
-                "session": None,
-                "state": "idle",
-                "explicit_finish": False,
-                "pending_approvals": [],
-                "usage": {},
-                "compaction_markers": 0,
-            }
+            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
         return runtime.session_id, {
             "session": client._session_snapshot(),
             "state": (
@@ -468,12 +412,8 @@ def capture_read(
                 if client.server.control.unhealthy() or runtime.state is None
                 else runtime.state.status
             ),
-            "explicit_finish": runtime.loop.explicit_finish
-            if runtime.loop is not None
-            else runtime._config(None, None).agents_explicit_finish,
-            "pending_approvals": [],
-            "usage": dict(runtime.usage),
-            "store": runtime.opened.store,
+            "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
+            "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
         }
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)
@@ -508,9 +448,7 @@ def perform_read(
     if method in {"model_catalog", "session_settings"}:
         return target[1]
     store = target[1]
-    runtime = type(
-        "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
-    )()
+    runtime = type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()
     if method == "session_tree":
         return ergonomics.tree(runtime)
     if method == "session_history":
