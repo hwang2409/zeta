@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
@@ -64,12 +64,18 @@ class PendingTurnContexts:
         session_id: str,
         loop: AgentLoop,
         emit: _EventSink,
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> tuple[bool, StreamEvent | None]:
         """Deliver claimed context and classify notification-turn events."""
         success = True
         agent_end = None
         with self.delivery(session_id) as context:
-            async for event in loop.run_notification_turn(**context):
+            async for event in loop.run_notification_turn(
+                **context,
+                host_environment=host_environment,
+                host_instruction=host_instruction,
+            ):
                 if event.type is StreamEventType.ERROR:
                     success = False
                 if event.type is StreamEventType.AGENT_END:
