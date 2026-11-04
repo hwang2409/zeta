@@ -344,7 +344,7 @@ class ConnectionRegistry:
     @staticmethod
     def requests_for_role(role: str, requests: list[str]) -> list[str]:
         if role == "observer":
-            return sorted(OBSERVER_REQUESTS)
+            return sorted(OBSERVER_REQUESTS.intersection(requests))
         return requests
 
     async def route_request(

@@ -746,3 +746,31 @@ async def test_all_connection_output_is_registry_owned(tmp_path: Path) -> None:
         assert hasattr(server, "connections")
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", [["serve_observers"], ["serve_observers", "ping", "delivery_id"]])
+async def test_observer_hello_advertises_only_callable_requests(
+    tmp_path: Path, features: list[str]
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        hello = (await _request(reader, writer, 2, "hello", {
+            "protocol_version": "1.2", "role": "observer", "features": features,
+        }))[-1]["result"]
+        advertised = hello["capabilities"]["requests"]
+        params = {"delivery_status": {"delivery_id": "missing"}}
+        for number, method in enumerate(advertised, start=3):
+            if method == "hello":
+                continue
+            reply = (await _request(reader, writer, number, method, params.get(method, {})))[-1]
+            error = reply.get("error", {})
+            assert error.get("code") != -32601, (method, reply)
+            assert "requires negotiated feature" not in error.get("message", ""), (method, reply)
+    finally:
+        await _close(server, controller_writer)
+        writer.close()
+        await writer.wait_closed()
