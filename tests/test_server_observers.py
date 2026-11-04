@@ -35,10 +35,13 @@ async def _observer(server: ZetaServer, number: int = 1, features: list[str] | N
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
     else:
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-    await _request(reader, writer, number, "hello", {
+    requested_features = features or ["serve_observers"]
+    hello = (await _request(reader, writer, number, "hello", {
         "protocol_version": "1.2", "role": "observer",
-        "features": features or ["serve_observers"],
-    })
+        "features": requested_features,
+    }))[-1]["result"]
+    if "session_history_backward" in requested_features:
+        assert "session_history_backward" in hello["capabilities"]["features"]
     return reader, writer
 
 

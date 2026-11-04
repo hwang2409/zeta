@@ -14,8 +14,10 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
+    ToolUseContent,
     with_message_origin,
 )
+from zeta.protocol.types import ToolCall
 from zeta.server import ZetaServer, ergonomics
 from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec, ProtocolError
 
@@ -61,7 +63,6 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
             reader, writer, 1, "hello",
             {"protocol_version": "1.2", "features": ["session_history_backward"]},
         ))[-1]["result"]
-        assert "session_history_backward" in hello["capabilities"]["features"]
         session = (await request(
             reader, writer, 2, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]
@@ -92,6 +93,8 @@ async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeyp
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path) as (reader, writer, session_id, _server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        first_ids = [row["content"][0]["text"] for row in first["messages"] if row["role"] != "system"]
+        assert max(int(text.split("x", 1)[0].split("-", 1)[1]) for text in first_ids) == 219
         assert first["messages"]
         validator = first["history_validator"]
         pages = [first]
@@ -119,6 +122,8 @@ async def test_real_socket_backward_continuation_survives_append(tmp_path: Path,
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        assert [row["id"] for row in first["messages"] if row["role"] != "system"]
+        assert first["messages"][0]["content"][0]["text"].startswith("message-")
         assert first["next_before"] is not None
         server.runtime.opened.store.append_message(
             with_message_origin(Message(MessageRole.USER, [TextContent("new")]), MessageOrigin.USER)
@@ -135,6 +140,7 @@ async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
+        assert first["messages"][0]["content"][0]["text"].startswith("message-")
         user_id = server.runtime.opened.store.active_branch_snapshot()[0].id
         fork = (await request(reader, writer, 4, "fork_message", {"session_id": session_id, "message_id": user_id}))[-1]
         assert "error" not in fork
