@@ -6,7 +6,8 @@ import asyncio
 import logging
 import os
 import signal
-from collections.abc import Awaitable, Callable
+import subprocess
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from .tool_spawn import create_tool_subprocess_shell
@@ -35,26 +36,19 @@ def _group_exists(process_id: int) -> bool:
     return True
 
 
-async def _descendant_pids(root_pid: int | None) -> dict[int, str]:
-    """Snapshot descendants and their stable process identities."""
-
-    process = await asyncio.create_subprocess_exec(
-        "ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
-        stdout=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await process.communicate()
+def _parse_process_table(stdout: bytes) -> dict[int, list[tuple[int, str]]]:
     children: dict[int, list[tuple[int, str]]] = {}
     for line in stdout.splitlines():
         fields = line.split(maxsplit=2)
         if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
             pid, ppid = int(fields[0]), int(fields[1])
             children.setdefault(ppid, []).append((pid, fields[2]))
-    if root_pid is None:
-        return {
-            pid: start
-            for entries in children.values()
-            for pid, start in entries
-        }
+    return children
+
+
+def _descendant_pids_from_table(
+    children: dict[int, list[tuple[int, str]]], root_pid: int
+) -> dict[int, str]:
     descendants: dict[int, str] = {}
     pending = [root_pid]
     while pending:
@@ -63,6 +57,38 @@ async def _descendant_pids(root_pid: int | None) -> dict[int, str]:
                 descendants[pid] = start
                 pending.append(pid)
     return descendants
+
+
+def _snapshot_descendants_sync(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
+    """Take one process-table snapshot for session shutdown."""
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],
+            timeout=2,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {pid: {} for pid in root_pids}
+    children = _parse_process_table(result.stdout)
+    return {pid: _descendant_pids_from_table(children, pid) for pid in root_pids}
+
+
+async def _descendant_pids(root_pid: int | None) -> dict[int, str]:
+    """Snapshot descendants and their stable process identities."""
+    process = await asyncio.create_subprocess_exec(
+        "ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    children = _parse_process_table(stdout)
+    if root_pid is None:
+        return {
+            pid: start
+            for entries in children.values()
+            for pid, start in entries
+        }
+    return _descendant_pids_from_table(children, root_pid)
 
 
 def _signal_pids(pids: dict[int, str], signal_number: int) -> None:

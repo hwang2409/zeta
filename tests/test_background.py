@@ -2005,6 +2005,74 @@ raise SystemExit(1 if alive or not closed else 0)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_asyncio_run_teardown_during_close_kills_escaped_descendant(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import os
+import signal
+import shlex
+import sys
+
+from zeta.tools._shared.process import BackgroundTaskRegistry
+
+
+async def main():
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    escaped_path = sys.argv[2]
+    child = (
+        "import os,pathlib,time; os.setsid(); "
+        f"pathlib.Path({escaped_path!r}).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys,time,signal; "
+        f"subprocess.Popen({shlex.join([sys.executable, '-c', child])!r}, shell=True); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    )
+    command = shlex.join([sys.executable, "-c", parent])
+    await tasks.start(command, sys.argv[1])
+    for _ in range(100):
+        if os.path.exists(escaped_path):
+            break
+        await asyncio.sleep(0.01)
+    asyncio.create_task(tasks.close())
+    await asyncio.sleep(0.05)
+    return tasks, escaped_path
+
+
+tasks, escaped_path = asyncio.run(main())
+escaped = int(open(escaped_path).read())
+try:
+    os.kill(escaped, 0)
+except ProcessLookupError:
+    alive = False
+else:
+    alive = True
+if alive:
+    try:
+        os.kill(escaped, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+print({"escaped_alive_after_asyncio_run_teardown": alive})
+raise SystemExit(1 if alive else 0)
+""",
+            str(tmp_path),
+            str(tmp_path / "escaped.pid"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
     tmp_path: Path,
 ) -> None:
