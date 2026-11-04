@@ -30,12 +30,6 @@ EMPTY_TURN_NUDGE_TEXT = (
     "Reply to the user or continue the task."
 )
 
-# Surfaced (TUI and subagent receipt) when a thinking-only turn hit the limit.
-MAX_TOKENS_THINKING_NOTICE = (
-    "The model reached its output-token limit while thinking "
-    "and did not produce a reply."
-)
-
 # Provider stop reasons are short; keep the persisted value bounded regardless.
 MAX_STOP_REASON_CHARS = 64
 

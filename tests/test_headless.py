@@ -25,6 +25,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
 )
 from zeta.runtime.headless import DENIAL_MARKER, drive_turn, run_headless
@@ -64,6 +65,17 @@ async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int,
 
 
 @pytest.mark.asyncio
+async def test_headless_thinking_only_max_tokens_is_an_error(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]),
+        ConversationStore(tmp_path),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    code, _stdout, stderr = await _drive(loop, "hello", "text")
+    assert code == 1
+    assert "output-token limit" in stderr
+
+
 async def test_headless_text_marks_restarted_assistant_output() -> None:
     final = Message(MessageRole.ASSISTANT, [TextContent("keep me")])
 

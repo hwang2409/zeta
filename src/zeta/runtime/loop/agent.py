@@ -111,6 +111,7 @@ from ._store_writes import StoreWriteMixin
 from .empty_turn import (
     annotate_turn_metadata,
     build_nudge_message,
+    has_visible_output,
     read_turn_metadata,
     should_nudge_empty_turn,
 )
@@ -1080,6 +1081,21 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
+            if (
+                self._turn_stop_reason == "max_tokens"
+                and not calls
+                and not has_visible_output(assistant_message)
+            ):
+                error = ErrorInfo(
+                    "max_tokens",
+                    "the model reached its output-token limit while thinking "
+                    "and did not produce a reply",
+                )
+                yield StreamEvent(StreamEventType.ERROR, error=error)
+                if self.agent_instance_id is None:
+                    await step_delivery.admit_terminal("foreground_end")
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
                 if not self.plan_mode_allows(tool_call):

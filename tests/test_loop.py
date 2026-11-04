@@ -3105,16 +3105,17 @@ async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER)
     )
 
-    # Truncated at the output-token limit: surfaced via metadata, not nudged.
+    # Truncated at the output-token limit: surfaced as a terminal error, not nudged.
     assert len(backend.calls) == 1
+    assert events[-2].type is StreamEventType.ERROR
+    assert events[-2].error is not None
+    assert events[-2].error.code == "max_tokens"
+    assert "output-token limit" in events[-2].error.message
     assert not [
         message
         for message in store.messages()
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
-    assistant = store.messages()[-1]
-    assert assistant.role is MessageRole.ASSISTANT
-    assert assistant.metadata["stop_reason"] == "max_tokens"
     assert events[-1].type is StreamEventType.AGENT_END
 
 
