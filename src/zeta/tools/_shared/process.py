@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,10 +40,10 @@ from .tool_spawn import create_tool_subprocess_shell
 logger = logging.getLogger(__name__)
 
 
-def tool_subprocess_env() -> dict[str, str]:
+def tool_subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     """Return the scrubbed parent environment for a tool child."""
 
-    return subprocess_env()
+    return subprocess_env(overrides)
 
 
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
@@ -325,6 +325,7 @@ class BackgroundTaskRegistry:
         log_path: str | Path | None = None,
         notify_on_exit: bool = True,
         owner: str = "run_background",
+        environment: Mapping[str, str] | None = None,
     ) -> tuple[str, int]:
         """Start a task, taking ownership of ``cwd_fd`` when one is supplied."""
 
@@ -339,6 +340,7 @@ class BackgroundTaskRegistry:
                 log_path=log_path,
                 notify_on_exit=notify_on_exit,
                 owner=owner,
+                environment=environment,
             )
         except BackgroundSpawnCleanupError as exc:
             self._start_cleanup_error = exc
@@ -358,6 +360,7 @@ class BackgroundTaskRegistry:
         log_path: str | Path | None,
         notify_on_exit: bool,
         owner: str,
+        environment: Mapping[str, str] | None,
     ) -> tuple[str, int]:
         self._require_open()
         task_id = f"task-{uuid.uuid4().hex[:12]}"
@@ -376,7 +379,7 @@ class BackgroundTaskRegistry:
                     "stdin": asyncio.subprocess.PIPE,
                     "stdout": asyncio.subprocess.PIPE,
                     "stderr": asyncio.subprocess.STDOUT,
-                    "env": tool_subprocess_env(),
+                    "env": tool_subprocess_env(environment),
                     "niceness": self.command_niceness,
                 }
                 if cwd_fd is None:

@@ -201,6 +201,7 @@ async def _bash(
             log_path=log_path,
             notify_on_exit=False,
             owner="background_macro",
+            environment=execution_context.host_environment if execution_context else None,
         )
         message = f"background task {task_id} started (pid {pid})"
         return _success_result(
@@ -252,7 +253,7 @@ async def _bash(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=(write_fd,),
-                    env=tool_subprocess_env(),
+                    env=tool_subprocess_env(execution_context.host_environment if execution_context else None),
                     niceness=registry.command_niceness,
                 )
                 process = await spawn_background(
@@ -271,7 +272,7 @@ async def _bash(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 pass_fds=(write_fd,),
-                env=tool_subprocess_env(),
+                env=tool_subprocess_env(execution_context.host_environment if execution_context else None),
                 niceness=registry.command_niceness,
             )
             process = await spawn_background(

@@ -891,6 +891,7 @@ class ToolRegistry:
         _background: bool = False,
         _capture_output: bool = False,
         _skip_approval: bool = False,
+        _host_environment: Mapping[str, str] | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
@@ -1057,6 +1058,7 @@ class ToolRegistry:
             self._agent_runner,
             _lifecycle_sink,
             approved_execution,
+            host_environment={} if _host_environment is None else _host_environment,
         )
         handler = bind_execution_context(definition.handler, execution_context)
         execution_arguments = build_execution_arguments(

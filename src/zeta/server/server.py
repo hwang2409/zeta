@@ -22,6 +22,7 @@ from . import (
 )
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
+from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -483,53 +484,59 @@ class _Client:
                 await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
-            await self.server.control.require_idle()
-            cwd = None
-            if "cwd" in params:
-                self._require_feature("session_cwd", "cwd")
-                cwd = _directory(params, "cwd")
-            await self.server.control._terminate_pending_approvals()
-            await self.server.runtime.create_session(
-                provider=_optional_string(params, "provider"),
-                model=_optional_string(params, "model"),
-                cwd=cwd,
-            )
-            self.server.control.session_replaced()
-            self.server.control.clear_approvals()
-            await self.server.control.controller_ready()
-            return {"session": self._session_snapshot()}
+            candidate = self._host_commands(params)
+            try:
+                await self.server.control.require_idle()
+                cwd = None
+                if "cwd" in params:
+                    self._require_feature("session_cwd", "cwd")
+                    cwd = _directory(params, "cwd")
+                await self.server.control._terminate_pending_approvals()
+                await self.server.runtime.create_session(
+                    provider=_optional_string(params, "provider"),
+                    model=_optional_string(params, "model"),
+                    cwd=cwd,
+                )
+                self.server.control._active_host_commands = candidate
+                self.server.control.session_replaced()
+                self.server.control.clear_approvals()
+                await self.server.control.controller_ready()
+                return {"session": self._session_snapshot()}
+            except BaseException:
+                if self.server.runtime.state is None:
+                    self.server.control._active_host_commands = None
+                raise
         if method == "resume":
-            await self.server.control.require_idle()
-            session_id = _required_string(params, "session_id")
-            unhealthy_same_session = (
-                self.server.control.unhealthy()
-                and self.server.runtime.session_id == session_id
-            )
-            await self.server.control._terminate_pending_approvals()
-            if unhealthy_same_session:
-                try:
-                    await self.server.runtime.resume_session(session_id, force=True)
-                except SessionNotFoundError as exc:
-                    raise ProtocolError(
-                        -32602,
-                        str(exc),
-                        {"code": "session_not_found", "session_id": session_id},
-                    ) from exc
-                except Exception as exc:
-                    raise ProtocolError(-32000, "approval persistence failed") from exc
-            else:
-                try:
-                    await self.server.runtime.resume_session(session_id)
-                except SessionNotFoundError as exc:
-                    raise ProtocolError(
-                        -32602,
-                        str(exc),
-                        {"code": "session_not_found", "session_id": session_id},
-                    ) from exc
-            self.server.control.session_replaced()
-            self.server.control.clear_approvals()
-            await self.server.control.controller_ready()
-            return {"session": self._session_snapshot()}
+            candidate = self._host_commands(params)
+            try:
+                await self.server.control.require_idle()
+                session_id = _required_string(params, "session_id")
+                unhealthy_same_session = (
+                    self.server.control.unhealthy()
+                    and self.server.runtime.session_id == session_id
+                )
+                await self.server.control._terminate_pending_approvals()
+                if unhealthy_same_session:
+                    try:
+                        await self.server.runtime.resume_session(session_id, force=True)
+                    except SessionNotFoundError as exc:
+                        raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
+                    except Exception as exc:
+                        raise ProtocolError(-32000, "approval persistence failed") from exc
+                else:
+                    try:
+                        await self.server.runtime.resume_session(session_id)
+                    except SessionNotFoundError as exc:
+                        raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
+                self.server.control._active_host_commands = candidate
+                self.server.control.session_replaced()
+                self.server.control.clear_approvals()
+                await self.server.control.controller_ready()
+                return {"session": self._session_snapshot()}
+            except BaseException:
+                if self.server.runtime.state is None:
+                    self.server.control._active_host_commands = None
+                raise
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":
@@ -633,6 +640,12 @@ class _Client:
             assert isinstance(notices, list)
             notices.extend(self.server._account_warnings)
         return result
+
+    def _host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
+        if "host_commands" not in params:
+            return SessionHostCommands.parse([])
+        self._require_feature("session_host_commands", "host_commands")
+        return SessionHostCommands.parse(params["host_commands"])
 
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
