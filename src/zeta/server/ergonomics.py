@@ -7,9 +7,13 @@ import base64
 import binascii
 import os
 import shutil
+import threading
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
@@ -29,8 +33,17 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
-from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
+from .protocol import (
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_ID_BYTES,
+    FrameCodec,
+    ProtocolError,
+    bounded,
+)
 from .runtime import ServerRuntime
+
+if TYPE_CHECKING:
+    from ..core.store import ConversationStore
 
 EXTENSION_REQUESTS = [
     "rename_session",
@@ -156,7 +169,254 @@ def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | N
     }
 
 
-HISTORY_PAGE_ENTRIES = 8
+Generation = tuple[int, bytes]
+HISTORY_FIRST_PAGE_ENTRIES = 128
+HISTORY_GROUP_TRUNCATED = "[history group too large; truncated]"
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryProjection:
+    entry_groups: tuple[tuple[Any, ...], ...]
+    approval_calls: Mapping[str, object]
+    groups: tuple[tuple[dict[str, object], ...], ...] = ()
+    body_sizes: tuple[int, ...] = ()
+
+
+@dataclass
+class _CachedProjection:
+    generation: Generation
+    projection: HistoryProjection
+
+
+_cache_creation_lock = threading.Lock()
+
+
+def _generation(store: ConversationStore) -> Generation:
+    return (
+        getattr(store, "_log_offset", 0),
+        getattr(store, "_entry_prefix_digest", b""),
+    )
+
+
+def _cache(
+    store: ConversationStore, include_delivery_id: bool
+) -> _CachedProjection | None:
+    attribute = (
+        "_serve_history_projection_delivery_ids"
+        if include_delivery_id
+        else "_serve_history_projection"
+    )
+    return getattr(store, attribute, None)
+
+
+def _publish_cache(
+    store: ConversationStore,
+    include_delivery_id: bool,
+    cached: _CachedProjection,
+) -> None:
+    attribute = (
+        "_serve_history_projection_delivery_ids"
+        if include_delivery_id
+        else "_serve_history_projection"
+    )
+    setattr(store, attribute, cached)
+
+
+def _bounded_history_value(value: object) -> object:
+    if isinstance(value, str):
+        return bounded(value)
+    if isinstance(value, dict):
+        return {key: _bounded_history_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_history_value(item) for item in value]
+    return value
+
+
+def _history_frame_size(
+    codec: FrameCodec,
+    request_id: str,
+    *,
+    messages_body_size: int,
+    next_offset: int | None,
+) -> int:
+    empty_page_size = codec.response_size(
+        request_id, {"messages": [], "next_offset": next_offset}
+    )
+    return empty_page_size + messages_body_size
+
+
+def _history_group_body_size(
+    codec: FrameCodec, group: tuple[dict[str, object], ...]
+) -> int:
+    return codec.serialized_size(group) - len(b"[]\n")
+
+
+def _project_history_group(
+    rows: list[dict[str, object]], entry_count: int
+) -> tuple[tuple[dict[str, object], ...], int]:
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    raw_group = tuple(rows)
+    raw_body_size = _history_group_body_size(codec, raw_group)
+    if (
+        _history_frame_size(
+            codec,
+            request_id,
+            messages_body_size=raw_body_size,
+            next_offset=entry_count,
+        )
+        <= MAX_FRAME_BYTES
+    ):
+        return raw_group, raw_body_size
+
+    group = tuple(
+        _bounded_history_value(row)
+        if row.get("event") in {"approval_request", "approval_end"}
+        or row.get("notification") is not None
+        else row
+        for row in rows
+    )
+    body_size = _history_group_body_size(codec, group)
+    if (
+        _history_frame_size(
+            codec,
+            request_id,
+            messages_body_size=body_size,
+            next_offset=entry_count,
+        )
+        <= MAX_FRAME_BYTES
+    ):
+        return group, body_size
+    row_id = rows[0].get("id", "history") if rows else "history"
+    group = (
+        {
+            "id": row_id,
+            "role": "system",
+            "content": [{"type": "text", "text": HISTORY_GROUP_TRUNCATED}],
+            "tool_result": None,
+        },
+    )
+    return group, _history_group_body_size(codec, group)
+
+
+def history_projection(
+    store: ConversationStore, *, include_delivery_id: bool = False
+) -> HistoryProjection:
+    """Return one immutable wire projection for the store's generation."""
+    cached = _cache(store, include_delivery_id)
+    generation = _generation(store)
+    if cached is not None and cached.generation == generation:
+        return cached.projection
+
+    # The store is loop-owned, but its validated snapshots are read here by the
+    # serve worker. Retry if an append publishes a newer generation mid-copy.
+    while True:
+        generation = _generation(store)
+        branch = store.active_branch_snapshot()
+        if generation == _generation(store):
+            break
+
+    approval_calls: dict[str, object] = {}
+    entries: list[list[Any]] = [[]]
+    for entry in branch:
+        if entry.type == "message":
+            approval_calls.update(
+                {
+                    request["request_id"]: request["tool_call"]
+                    for request in entry.data.get("approval_requests", [])
+                }
+            )
+        if entry.type == "message" and is_passive_harness_message(
+            entry.data["message"]
+        ):
+            continue
+        if entry.type in {"message", "notification"}:
+            entries[-1].append(entry)
+            entries.append([])
+        elif entry.type in {"approval_resolution", "approval_history"}:
+            entries[-1].append(entry)
+
+    built = HistoryProjection(
+        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls)
+    )
+    with _cache_creation_lock:
+        cached = _cache(store, include_delivery_id)
+        if cached is None or cached.generation != generation:
+            _publish_cache(
+                store, include_delivery_id, _CachedProjection(generation, built)
+            )
+            return built
+        return cached.projection
+
+
+def page_history(
+    projection: HistoryProjection,
+    offset: int,
+    *,
+    include_delivery_id: bool,
+) -> tuple[dict[str, object], HistoryProjection]:
+    entry_count = len(projection.entry_groups) - 1
+    if offset > entry_count:
+        return {"messages": [], "next_offset": None}, projection
+    groups = list(projection.groups)
+    body_sizes = list(projection.body_sizes)
+    rows: list[dict[str, object]] = []
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    stop = min(HISTORY_FIRST_PAGE_ENTRIES, entry_count) if offset == 0 else entry_count
+    indexes = range(offset, stop)
+    if stop == entry_count:
+        indexes = range(offset, stop + 1)
+    next_offset = offset
+    messages_body_size = 0
+    for group_index in indexes:
+        while group_index >= len(groups):
+            next_group_index = len(groups)
+            group, body_size = _project_history_group(
+                [
+                    row
+                    for entry in projection.entry_groups[next_group_index]
+                    for row in _history_entry_rows(
+                        entry,
+                        projection.approval_calls,
+                        include_delivery_id=include_delivery_id,
+                    )
+                ],
+                entry_count,
+            )
+            groups.append(group)
+            body_sizes.append(body_size)
+        group = groups[group_index]
+        group_body_size = body_sizes[group_index]
+        separator_size = int(bool(rows and group))
+        candidate_body_size = messages_body_size + separator_size + group_body_size
+        candidate_offset = min(group_index + 1, entry_count)
+        wire_offset = candidate_offset if candidate_offset < entry_count else None
+        candidate_size = _history_frame_size(
+            codec,
+            request_id,
+            messages_body_size=candidate_body_size,
+            next_offset=wire_offset,
+        )
+        if candidate_size > MAX_FRAME_BYTES and rows:
+            break
+        assert candidate_size <= MAX_FRAME_BYTES
+        rows.extend(group)
+        messages_body_size = candidate_body_size
+        next_offset = candidate_offset
+    expanded = HistoryProjection(
+        projection.entry_groups,
+        projection.approval_calls,
+        tuple(groups),
+        tuple(body_sizes),
+    )
+    return (
+        {
+            "messages": rows,
+            "next_offset": next_offset if next_offset < entry_count else None,
+        },
+        expanded,
+    )
 
 
 def _history_entry_rows(
@@ -290,70 +550,25 @@ def history(
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    branch = runtime.opened.store.active_branch_snapshot()
-    approval_calls: dict[str, object] = {}
-    # Cursor-bearing entries are exactly origin/main's message/notification set.
-    # New lifecycle entries occupy the gap before the next old-space cursor.
-    groups: list[list[object]] = [[]]
-    for entry in branch:
-        if entry.type == "message":
-            approval_calls.update(
-                {
-                    request["request_id"]: request["tool_call"]
-                    for request in entry.data.get("approval_requests", [])
-                }
-            )
-        if entry.type == "message" and is_passive_harness_message(
-            entry.data["message"]
+    store = runtime.opened.store
+    generation = _generation(store)
+    projection = history_projection(store, include_delivery_id=include_delivery_id)
+    result, expanded = page_history(
+        projection, offset, include_delivery_id=include_delivery_id
+    )
+    with _cache_creation_lock:
+        cached = _cache(store, include_delivery_id)
+        if (
+            cached is not None
+            and cached.generation == generation
+            and len(cached.projection.groups) < len(expanded.groups)
         ):
-            continue
-        if entry.type in {"message", "notification"}:
-            groups[-1].append(entry)
-            groups.append([])
-        elif entry.type in {"approval_resolution", "approval_history"}:
-            groups[-1].append(entry)
-    entry_count = len(groups) - 1
-    if offset > entry_count:
-        return {"messages": [], "next_offset": None}
-
-    rows: list[dict[str, object]] = []
-    codec = FrameCodec()
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    stop = min(offset + HISTORY_PAGE_ENTRIES, entry_count)
-    group_indexes = list(range(offset, stop))
-    if stop == entry_count:
-        group_indexes.append(entry_count)
-    next_offset = offset
-    for group_index in group_indexes:
-        group = [
-            row
-            for entry in groups[group_index]
-            for row in _history_entry_rows(
-                entry, approval_calls, include_delivery_id=include_delivery_id
+            _publish_cache(
+                store,
+                include_delivery_id,
+                _CachedProjection(generation, expanded),
             )
-        ]
-        candidate_offset = min(group_index + 1, entry_count)
-        candidate = {
-            "messages": [*rows, *group],
-            "next_offset": candidate_offset if candidate_offset < entry_count else None,
-        }
-        if not codec.response_fits(request_id, candidate) and rows:
-            break
-        if not codec.response_fits(request_id, candidate):
-            for row in group:
-                if "content" in row:
-                    row["content"] = [
-                        {"type": "text", "text": "[history row too large; truncated]"}
-                    ]
-                    row["tool_result"] = None
-                if "notification" in row:
-                    row["notification"] = None
-        rows.extend(group)
-        next_offset = candidate_offset
-    return {
-        "messages": rows,
-        "next_offset": next_offset if next_offset < entry_count else None,
-    }
+    return result
 
 
 def settings(runtime: ServerRuntime) -> dict:
