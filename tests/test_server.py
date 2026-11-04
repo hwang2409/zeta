@@ -1302,8 +1302,9 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
 
 @pytest.mark.asyncio
 async def test_session_history_keeps_main_durable_entry_cursor_space(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(ergonomics_module, "HISTORY_PAGE_ENTRIES", 8)
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
@@ -3801,7 +3802,10 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_passive_harness_message(tmp_path: Path) -> None:
+async def test_session_history_hides_passive_harness_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ergonomics_module, "HISTORY_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -4176,7 +4180,7 @@ async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path
             assert next_offset is None or next_offset == offset + len(page["messages"])
             offset = next_offset
         assert [row["id"] for row in rows] == [entry.id for entry in entries]
-        assert page_sizes == ([8, 8, 1] if not block_count else [1] * 17)
+        assert page_sizes == ([17] if not block_count else [1] * 17)
         for index, row in enumerate(rows):
             assert row["content"][:-1] == [{"type": "text", "text": text}] * block_count
             assert row["content"][-1] == {

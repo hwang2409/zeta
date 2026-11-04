@@ -25,12 +25,15 @@ from ..protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
-    is_passive_harness_message,
     with_message_origin,
 )
 from . import event_contract
-from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
+from .history_projection import page as page_history
+from .history_projection import projection as history_projection
+from .protocol import ProtocolError, bounded
 from .runtime import ServerRuntime
+
+HISTORY_PAGE_ENTRIES = 128
 
 EXTENSION_REQUESTS = [
     "rename_session",
@@ -154,9 +157,6 @@ def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | N
         "message": bounded(text, 1000),
         "provider_error": provider_error,
     }
-
-
-HISTORY_PAGE_ENTRIES = 8
 
 
 def _history_entry_rows(
@@ -290,70 +290,15 @@ def history(
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    branch = runtime.opened.store.active_branch_snapshot()
-    approval_calls: dict[str, object] = {}
-    # Cursor-bearing entries are exactly origin/main's message/notification set.
-    # New lifecycle entries occupy the gap before the next old-space cursor.
-    groups: list[list[object]] = [[]]
-    for entry in branch:
-        if entry.type == "message":
-            approval_calls.update(
-                {
-                    request["request_id"]: request["tool_call"]
-                    for request in entry.data.get("approval_requests", [])
-                }
-            )
-        if entry.type == "message" and is_passive_harness_message(
-            entry.data["message"]
-        ):
-            continue
-        if entry.type in {"message", "notification"}:
-            groups[-1].append(entry)
-            groups.append([])
-        elif entry.type in {"approval_resolution", "approval_history"}:
-            groups[-1].append(entry)
-    entry_count = len(groups) - 1
-    if offset > entry_count:
-        return {"messages": [], "next_offset": None}
-
-    rows: list[dict[str, object]] = []
-    codec = FrameCodec()
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    stop = min(offset + HISTORY_PAGE_ENTRIES, entry_count)
-    group_indexes = list(range(offset, stop))
-    if stop == entry_count:
-        group_indexes.append(entry_count)
-    next_offset = offset
-    for group_index in group_indexes:
-        group = [
-            row
-            for entry in groups[group_index]
-            for row in _history_entry_rows(
-                entry, approval_calls, include_delivery_id=include_delivery_id
-            )
-        ]
-        candidate_offset = min(group_index + 1, entry_count)
-        candidate = {
-            "messages": [*rows, *group],
-            "next_offset": candidate_offset if candidate_offset < entry_count else None,
-        }
-        if not codec.response_fits(request_id, candidate) and rows:
-            break
-        if not codec.response_fits(request_id, candidate):
-            for row in group:
-                if "content" in row:
-                    row["content"] = [
-                        {"type": "text", "text": "[history row too large; truncated]"}
-                    ]
-                    row["tool_result"] = None
-                if "notification" in row:
-                    row["notification"] = None
-        rows.extend(group)
-        next_offset = candidate_offset
-    return {
-        "messages": rows,
-        "next_offset": next_offset if next_offset < entry_count else None,
-    }
+    projection = history_projection(runtime.opened.store)
+    return page_history(
+        projection,
+        offset,
+        lambda entry, approval_calls: _history_entry_rows(
+            entry, approval_calls, include_delivery_id=include_delivery_id
+        ),
+        page_limit=HISTORY_PAGE_ENTRIES,
+    )
 
 
 def settings(runtime: ServerRuntime) -> dict:
