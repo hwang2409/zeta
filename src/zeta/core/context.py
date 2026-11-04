@@ -455,7 +455,7 @@ class ContextAssembler:
             bypass_hysteresis=bypass_eviction_hysteresis or emergency,
             target_ratio=EMERGENCY_TARGET_RATIO if emergency else TARGET_RATIO,
             assembly_budget=assembly_budget,
-            reserved_estimator_tokens=reserved_estimator_tokens, system_append=system_append,
+            reserved_estimator_tokens=reserved_estimator_tokens,
         )
         if evicted is not None:
             return evicted
