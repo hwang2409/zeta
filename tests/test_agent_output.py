@@ -705,6 +705,7 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
     read_threads: list[int] = []
     core_load = agent_progress.load_session_json
     tool_load = agent_tools.load_session_json
+    tool_read = agent_tools._read_agent_lifecycle
 
     def tracked_core_load(*args: object, **kwargs: object) -> object:
         read_threads.append(threading.get_ident())
@@ -714,8 +715,13 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
         read_threads.append(threading.get_ident())
         return tool_load(*args, **kwargs)
 
+    def tracked_tool_read(path: str) -> dict[str, object]:
+        read_threads.append(threading.get_ident())
+        return tool_read(path)
+
     monkeypatch.setattr(agent_progress, "load_session_json", tracked_core_load)
     monkeypatch.setattr(agent_tools, "load_session_json", tracked_tool_load)
+    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", tracked_tool_read)
     loop, _ = await _terminal_agent_event(tmp_path, child)
     assert read_threads and loop_thread not in read_threads
     await loop.close()
