@@ -1713,7 +1713,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         )
         await server.runtime.loop._background_owner.wait()
         frames = await _request(reader, writer, 4, "status")
-        frames += await _frames_until_event(reader, "turn_end")
+        frames += await _frames_until_event(reader, "approval_end")
         ends = _named_events(frames, "approval_end")
         assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
