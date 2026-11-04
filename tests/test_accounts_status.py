@@ -423,16 +423,18 @@ def test_accounts_status_lock_timeout_keeps_json_valid_and_reports_other_account
     fallback_release = threading.Timer(1, release.touch)
     fallback_release.start()
 
-    started = time.monotonic()
     try:
         assert _run_json(tmp_path, monkeypatch) == 1
+        # Status must answer while the other process still holds the lock.
+        # Only the 1 s fallback timer can release it before this point.
+        lock_was_still_held = not release.exists()
     finally:
         release.touch()
         fallback_release.cancel()
         fallback_release.join(timeout=2)
         process.wait(timeout=10)
     assert process.returncode == 0
-    assert time.monotonic() - started < 0.5
+    assert lock_was_still_held
     assert json.loads(capsys.readouterr().out) == [
         {
             "provider": "codex",
