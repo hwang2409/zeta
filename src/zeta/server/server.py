@@ -23,7 +23,6 @@ from . import (
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
-from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,

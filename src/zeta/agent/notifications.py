@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Mapping, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal

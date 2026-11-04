@@ -1,9 +1,14 @@
 from __future__ import annotations
-import html, posixpath, re
+
+import html
+import posixpath
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+
 from .protocol import ProtocolError
+
 _NAME=re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,63}$'); _ENV=re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,127}$')
 @dataclass(frozen=True, slots=True)
 class HostCommand: name:str; executable:str; summary:str
