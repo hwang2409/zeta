@@ -2449,6 +2449,46 @@ def test_incremental_tail_payload_validation_matches_full_load(
     assert not incremental_accepted
 
 
+def test_approval_states_snapshot_isolated_from_resident_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    resident = ConversationStore(root, session_id="snapshot-race")
+    foreign = ConversationStore(root, session_id="snapshot-race")
+    call = ToolCall("call-1", "read", {"path": "/tmp/input"})
+    foreign.append_approval_request(call.id, call)
+    published = foreign._snapshot_log_state()
+    reader_inside_load = threading.Event()
+    continue_read = threading.Event()
+    original_from_dict = ConversationEntry.from_dict
+
+    def gated_from_dict(
+        cls: type[ConversationEntry], value: dict[str, object]
+    ) -> ConversationEntry:
+        if (
+            threading.current_thread().name == "approval-snapshot-reader"
+            and value.get("seq") == 1
+        ):
+            reader_inside_load.set()
+            assert continue_read.wait(2)
+        return original_from_dict(value)
+
+    monkeypatch.setattr(
+        ConversationEntry, "from_dict", classmethod(gated_from_dict)
+    )
+
+    def read_snapshot() -> dict[str, tuple[ToolCall, str | None]]:
+        threading.current_thread().name = "approval-snapshot-reader"
+        return resident.approval_states_snapshot()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(read_snapshot)
+        assert reader_inside_load.wait(2)
+        resident._install_log_state(published)
+        continue_read.set()
+        assert result.result(timeout=2) == {call.id: (call, None)}
+
+
 def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
     script = tmp_path / "pending_approval_reentry.py"
     script.write_text(

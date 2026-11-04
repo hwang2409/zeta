@@ -1110,18 +1110,10 @@ class ConversationStore(
             return self._approval_states_from_indexes()
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for request_id, entry in self._active_approval_requests.items():
-            request = next(
-                request
-                for request in entry.data.get("approval_requests", [])
-                if request["request_id"] == request_id
-            )
-            states[request_id] = (
-                ToolCall.from_dict(request["tool_call"]),
-                self._active_approval_resolutions.get(request_id),
-            )
-        return states
+        return self._approval_states_from_maps(
+            self._active_approval_requests,
+            self._active_approval_resolutions,
+        )
 
     @staticmethod
     def _request_entry(

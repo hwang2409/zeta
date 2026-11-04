@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
+from ..core.store import ConversationIntegrityError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -331,6 +332,10 @@ class _Client:
                             str(exc),
                             {"code": exc.code, "retryable": exc.retryable},
                         )
+                    )
+                except ConversationIntegrityError as exc:
+                    await self._write(
+                        self.codec.error_response(request_id, -32000, str(exc))
                     )
                 except (SessionError, ValueError) as exc:
                     await self._write(

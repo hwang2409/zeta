@@ -39,7 +39,11 @@ from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
-from zeta.core.store import ConversationStore
+from zeta.core.store import (
+    ConversationEntry,
+    ConversationIntegrityError,
+    ConversationStore,
+)
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
@@ -1801,6 +1805,120 @@ async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -
         assert pending[0]["request_id"] == approval["request_id"]
         assert pending[0]["delegated"] is True
         assert pending[0]["agent_instance_id"] == approval["agent_instance_id"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_status_reads_delegated_approval_from_committed_snapshot_during_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(target)})
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
+    server = ZetaServer(provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    continue_read = threading.Event()
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        await server.control.wait_for_approval_settlement()
+        assert server.runtime.loop is not None
+        child_store = next(
+            store
+            for store in server.runtime.loop._background_owner.conversation_stores()
+            if store.session_id == approval["agent_instance_id"].rsplit(":", 1)[1]
+        )
+        delegated_record = next(
+            record
+            for record in server.control._approvals._state.records.values()
+            if isinstance(record.target.key, tuple)
+        )
+        assert delegated_record.target.store is child_store
+        with ConversationStore(
+            child_store.root_dir, session_id=child_store.session_id, _must_exist=True
+        ) as foreign:
+            foreign._append_row("warning", {"message": "publication gate"})
+            foreign._append_row("warning", {"message": "after publication gate"})
+            published = foreign._snapshot_log_state()
+
+        reader_inside_load = threading.Event()
+        snapshot_read = threading.local()
+        original_snapshot = child_store.approval_states_snapshot
+
+        def marked_snapshot() -> dict[str, tuple[ToolCall, str | None]]:
+            snapshot_read.active = True
+            try:
+                return original_snapshot()
+            finally:
+                snapshot_read.active = False
+
+        monkeypatch.setattr(child_store, "approval_states_snapshot", marked_snapshot)
+        original_from_dict = ConversationEntry.from_dict
+
+        def gated_from_dict(
+            cls: type[ConversationEntry], value: dict[str, Any]
+        ) -> ConversationEntry:
+            if (
+                getattr(snapshot_read, "active", False)
+                and value.get("data") == {"message": "publication gate"}
+            ):
+                reader_inside_load.set()
+                assert continue_read.wait(2)
+            return original_from_dict(value)
+
+        monkeypatch.setattr(
+            ConversationEntry, "from_dict", classmethod(gated_from_dict)
+        )
+        status_request = asyncio.create_task(_request(reader, writer, 4, "status"))
+        assert await asyncio.to_thread(reader_inside_load.wait, 2)
+        child_store._install_log_state(published)
+        continue_read.set()
+        status = (await status_request)[-1]["result"]
+
+        assert status["pending_approvals"][0]["request_id"] == approval["request_id"]
+        assert [entry.seq for entry in child_store.entries] == list(
+            range(1, len(child_store.entries) + 1)
+        )
+    finally:
+        continue_read.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_status_store_integrity_failure_is_server_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _ready(server)
+
+    async def fail_read() -> list[dict[str, object]]:
+        raise ConversationIntegrityError("store read failed")
+
+    monkeypatch.setattr(server.control, "pending_approvals", fail_read)
+    try:
+        response = (await _request(reader, writer, 3, "status"))[-1]
+        assert response["error"] == {
+            "code": -32000,
+            "message": "store read failed",
+        }
     finally:
         await _close(server, writer)
 

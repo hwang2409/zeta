@@ -51,6 +51,32 @@ def validate_approval_history_data(data: Mapping[str, Any]) -> None:
 class ApprovalHistoryStoreMixin:
     """Persist delegated wire identity and retrieve durable resolutions."""
 
+    def approval_states_snapshot(self) -> dict[str, tuple[ToolCall, str | None]]:
+        """Read strict approval state without mutating this resident store."""
+        state = self._load_detached_log_state()
+        return self._approval_states_from_maps(
+            state.active_approval_requests,
+            state.active_approval_resolutions,
+        )
+
+    @staticmethod
+    def _approval_states_from_maps(
+        requests: Mapping[str, ConversationEntry],
+        resolutions: Mapping[str, str],
+    ) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for request_id, entry in requests.items():
+            request = next(
+                request
+                for request in entry.data.get("approval_requests", [])
+                if request["request_id"] == request_id
+            )
+            states[request_id] = (
+                ToolCall.from_dict(request["tool_call"]),
+                resolutions.get(request_id),
+            )
+        return states
+
     def append_approval_history(
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:

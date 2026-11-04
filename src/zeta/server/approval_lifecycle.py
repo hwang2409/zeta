@@ -407,8 +407,8 @@ class ApprovalLifecycle:
             dict[ConversationStore, dict[str, tuple[ToolCall, str | None]]],
         ]:
             child_stores = {target.store for target in delegated}
-            return foreground.approval_states(), {
-                store: store.approval_states() for store in child_stores
+            return foreground.approval_states_snapshot(), {
+                store: store.approval_states_snapshot() for store in child_stores
             }
 
         foreground_states, child_states = await self._offload(strict)
