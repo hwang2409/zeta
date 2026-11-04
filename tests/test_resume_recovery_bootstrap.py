@@ -254,6 +254,18 @@ async def test_warm_writer_startup_and_close_are_cancellation_safe(
     await asyncio.wait_for(close, 2)
 
 
+def test_writer_snapshot_uses_structural_copy(tmp_path: Path) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "structural-snapshot")
+    try:
+        with patch(
+            "zeta.core.store._async_writes.copy.deepcopy",
+            side_effect=AssertionError("resume writer copied the full state"),
+        ):
+            resident._prepare_durable_writer_snapshot()
+    finally:
+        resident.close()
+
+
 @pytest.mark.asyncio
 async def test_warm_writer_payloads_do_not_alias_resident_store(tmp_path: Path) -> None:
     resident = _opened_store_with_writer_snapshot(tmp_path, "payload-isolation")
@@ -262,10 +274,21 @@ async def test_warm_writer_payloads_do_not_alias_resident_store(tmp_path: Path) 
     try:
         writer = resident._durable_writer
         assert writer is not None
-        writer._entries[0].data["message"]["content"][0]["text"] = "writer mutation"
-        assert resident._entries[0].data["message"]["content"][0]["text"] == (
-            "resident payload"
+        original = resident._entries[0].data["message"]["content"][0]["text"]
+        writer.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("writer payload")]),
+                MessageOrigin.USER,
+            )
         )
+        assert resident._entries[0].data["message"]["content"][0]["text"] == original
+        resident.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("resident payload 2")]),
+                MessageOrigin.USER,
+            )
+        )
+        assert writer._entries[0].data["message"]["content"][0]["text"] == original
     finally:
         await asyncio.to_thread(resident.close)
 
