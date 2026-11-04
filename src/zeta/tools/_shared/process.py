@@ -680,7 +680,11 @@ class BackgroundTaskRegistry:
                 pass
             for _, process in entries:
                 _signal_group(process, signal.SIGKILL)
-            current = await finish(_descendant_pids(None))
+            current = (
+                await finish(_descendant_pids(None))
+                if any(descendants.values())
+                else None
+            )
             if current is not None:
                 for _, process in entries:
                     survivors = {
