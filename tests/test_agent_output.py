@@ -17,6 +17,7 @@ from zeta.agent.receipt import (
 )
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core import agent_progress
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
@@ -577,6 +578,7 @@ async def _terminal_agent_event(
     tmp_path: Path,
     child: ConversationStore,
 ) -> tuple[AgentLoop, StreamEvent]:
+    remove_live_agent_lifecycle(child.agent_lifecycle_path)
     registry = ToolRegistry(
         tmp_path,
         session_store=ConversationStore(tmp_path / "parent"),
