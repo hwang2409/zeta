@@ -43,6 +43,80 @@ async def _observer(server: ZetaServer, number: int = 1, features: list[str] | N
 
 
 @pytest.mark.asyncio
+async def test_observer_catalog_matches_controller_with_paging(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {
+        "protocol_version": "1.2", "features": ["list_sessions_paging"]
+    })
+    await _request(controller_reader, controller_writer, 2, "new_session", {"provider": "codex"})
+    await _request(controller_reader, controller_writer, 3, "new_session", {"provider": "codex"})
+    observer_reader, observer_writer = await _observer(
+        server, 4, features=["serve_observers", "list_sessions_paging"]
+    )
+    try:
+        controller_page = (await _request(
+            controller_reader, controller_writer, 5, "list_sessions", {"offset": 0, "limit": 1}
+        ))[-1]["result"]
+        observer_page = (await _request(
+            observer_reader, observer_writer, 6, "list_sessions", {"offset": 0, "limit": 1}
+        ))[-1]["result"]
+        assert observer_page == controller_page
+        assert observer_page["next_offset"] == 1
+        observer_tail = (await _request(
+            observer_reader, observer_writer, 7, "list_sessions", {"offset": 1, "limit": 1}
+        ))[-1]["result"]
+        assert observer_tail["next_offset"] is None
+        assert "first_message_preview" in observer_page["sessions"][0]
+    finally:
+        await _close(server, controller_writer)
+        observer_writer.close()
+        await observer_writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_observer_catalog_does_not_wait_for_controller_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    session_id = (await _request(
+        controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+    ))[-1]["result"]["session"]["session_id"]
+    observer_reader, observer_writer = await _observer(
+        server, 3, features=["serve_observers", "list_sessions_paging", "ping"]
+    )
+    store = server.runtime.opened.store
+    entered = threading.Event()
+    release = threading.Event()
+    original_snapshot = store.active_branch_snapshot
+
+    def gated_snapshot() -> Any:
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return original_snapshot()
+
+    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
+    try:
+        history = asyncio.create_task(_request(
+            controller_reader, controller_writer, 4, "session_history", {"session_id": session_id}
+        ))
+        assert await asyncio.to_thread(entered.wait, TIMEOUT)
+        catalog = await asyncio.wait_for(
+            _request(observer_reader, observer_writer, 5, "list_sessions", {"limit": 1}), TIMEOUT
+        )
+        assert catalog[-1]["result"]["sessions"]
+        release.set()
+        assert (await history)[-1]["result"]["messages"] == []
+    finally:
+        release.set()
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
 async def test_observer_project_and_account_requests_are_read_only(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
     controller_reader, controller_writer = await _connect(server)
@@ -672,3 +746,31 @@ async def test_all_connection_output_is_registry_owned(tmp_path: Path) -> None:
         assert hasattr(server, "connections")
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", [["serve_observers"], ["serve_observers", "ping", "delivery_id"]])
+async def test_observer_hello_advertises_only_callable_requests(
+    tmp_path: Path, features: list[str]
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        hello = (await _request(reader, writer, 2, "hello", {
+            "protocol_version": "1.2", "role": "observer", "features": features,
+        }))[-1]["result"]
+        advertised = hello["capabilities"]["requests"]
+        params = {"delivery_status": {"delivery_id": "missing"}}
+        for number, method in enumerate(advertised, start=3):
+            if method == "hello":
+                continue
+            reply = (await _request(reader, writer, number, method, params.get(method, {})))[-1]
+            error = reply.get("error", {})
+            assert error.get("code") != -32601, (method, reply)
+            assert "requires negotiated feature" not in error.get("message", ""), (method, reply)
+    finally:
+        await _close(server, controller_writer)
+        writer.close()
+        await writer.wait_closed()

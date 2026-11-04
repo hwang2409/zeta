@@ -344,11 +344,11 @@ class ConnectionRegistry:
     @staticmethod
     def requests_for_role(role: str, requests: list[str]) -> list[str]:
         if role == "observer":
-            return sorted(OBSERVER_REQUESTS)
+            return sorted(OBSERVER_REQUESTS.intersection(requests))
         return requests
 
     async def route_request(
-        self, connection: Any, method: str, params: dict[str, Any]
+        self, connection: Any, request_id: str | int, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
@@ -372,6 +372,11 @@ class ConnectionRegistry:
             return False, None
         if method in {"session_tree", "session_history"}:
             return True, await self.read_session(connection, method, params)
+        if method == "list_sessions":
+            result, _ = await self.run_read(
+                connection, lambda: connection._list_sessions(request_id, params)
+            )
+            return True, result
         target = capture_read(connection, method, params)
         result = await self.run_read(
             connection,
@@ -418,9 +423,6 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
         return None, ergonomics.catalog(runtime)
     if method == "session_settings":
         return runtime.session_id, ergonomics.settings(runtime)
-    if method == "list_sessions":
-        # The scan opens every session: hand it to the read worker, not the loop.
-        return None, runtime.list_sessions_read_only
     raise ProtocolError(-32601, "method not found")
 
 
@@ -442,8 +444,7 @@ def perform_read(
 ) -> object:
     if method == "status":
         return project_status(target[1])
-    if method == "list_sessions":
-        return {"sessions": [item.to_catalog_dict() for item in target[1]()]}
+
     if method in {"model_catalog", "session_settings"}:
         return target[1]
     store = target[1]
