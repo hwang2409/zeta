@@ -358,8 +358,7 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         force: bool = False,
         emergency: bool = False,
-        reserved_estimator_tokens: int = 0,
-        system_append: str = "",
+        reserved_estimator_tokens: int = 0, system_append: str = "",
     ) -> list[Message]:
         context = await self.assemble_context(
             backend=backend,
@@ -377,8 +376,7 @@ class ContextAssembler:
         force: bool = False,
         bypass_eviction_hysteresis: bool = False,
         emergency: bool = False,
-        reserved_estimator_tokens: int = 0,
-        system_append: str = "",
+        reserved_estimator_tokens: int = 0, system_append: str = "",
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -585,8 +583,7 @@ class ContextAssembler:
         branch: Sequence[ConversationEntry],
         *,
         force: bool,
-        assembly_budget: int,
-        system_append: str = "",
+        assembly_budget: int, system_append: str = "",
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 

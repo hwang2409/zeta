@@ -709,8 +709,7 @@ class AgentLoop(
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
-        host_environment: Mapping[str, str] | None = None,
-        host_instruction: str = "",
+        host_environment: Mapping[str, str] | None = None, host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         await self.refresh_skills()
