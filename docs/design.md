@@ -27,7 +27,9 @@ the harness-native distillation.
   OAuth requests only. It is off by default, is unsupported routing rather than
   a permission or billing guarantee, and does not alter API-key requests. The
   block is derived from the first eligible original user turn (harness/meta
-  turns excluded); image-only or empty turns produce no billing block, and zeta
+  turns excluded). When eviction has removed every typed turn, it is derived
+  from the first harness notification instead, so wake turns keep it.
+  Image-only or empty turns produce no billing block, and zeta
   does not add `cache_control` for it. This is an explicitly versioned
   compatibility snapshot: the checked-in recipe is pinned to Claude Code
   `2.1.280`, with first-party `cch=00000` and JavaScript UTF-16 indexing. A

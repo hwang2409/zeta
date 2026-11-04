@@ -395,6 +395,50 @@ async def test_anthropic_oauth_compat_is_opt_in_and_adds_only_oauth_headers(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_oauth_compat_keeps_billing_block_after_typed_turns_are_evicted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Eviction can leave only assistant notes, tool results, and harness
+    # notifications. A notification wake turn must still carry the billing
+    # block; without it Anthropic answered HTTP 400 "Third-party apps now draw
+    # from your extra usage" on every wake turn in a long Phoebe session.
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    notification = "Background updates only. A child agent finished its work."
+    client = client_for(handler)
+    backend = AnthropicBackend(client=client, token_store=store)
+    _ = [
+        event
+        async for event in backend.complete(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system prompt")]),
+                Message(MessageRole.ASSISTANT, [TextContent("[evicted range] seq 1-90")]),
+                Message(
+                    MessageRole.SYSTEM,
+                    [TextContent(notification)],
+                    metadata={"zeta_event": "agent_notifications"},
+                ),
+            ],
+            [],
+        )
+    ]
+    system = json.loads(requests[0].content)["system"]
+    wire_text = json.loads(requests[0].content)["messages"][-1]["content"][0]["text"]
+    assert wire_text.endswith(notification)
+    assert system[0]["text"] == anthropic_module.build_billing_header_value(wire_text)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_oauth_compat_without_user_text_omits_billing_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
