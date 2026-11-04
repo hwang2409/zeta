@@ -1800,11 +1800,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
             {"request_id": call.id},
         )
         assert approved[-1]["result"]["request_id"] == call.id
-        if not any(
-            frame.get("params", {}).get("event") == "agent_end"
-            for frame in approved
-        ):
-            await _frames_until_event(replay_reader, "agent_end")
+        await _frames_until_event(replay_reader, "agent_end")
         assert server.runtime.opened.store.approval_resolution_data(call.id)[
             "decision"
         ] == "allow"

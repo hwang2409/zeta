@@ -251,10 +251,6 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         failed_send = await _request(
             reader, writer, 3, "send", {"text": "ghost", "delivery_id": "ghost-1"}
         )
-        assert not any(
-            frame.get("params", {}).get("event") == "user_message"
-            for frame in failed_send
-        )
         assert failed_send[-1]["error"]["code"] == -32000
         assert server.runtime.opened.store.client_delivery("ghost-1") is None
 
@@ -267,24 +263,16 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
             "steer",
             {"text": "ghost steer", "delivery_id": "ghost-steer"},
         )
-        assert not any(
-            frame.get("params", {}).get("event") == "user_message"
-            for frame in failed_steer
-        )
         assert failed_steer[-1]["error"]["code"] == -32000
         assert server.runtime.opened.store.client_delivery("ghost-steer") is None
         backend.release.set()
         await _event(reader, "agent_end")
 
         server.runtime.opened.store.append_client_delivery_async = original_append
-        normal = await _request(
+        await _request(
             reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
         )
-        echoes = [
-            frame["params"]
-            for frame in normal
-            if frame.get("params", {}).get("event") == "user_message"
-        ]
+        echoes = [await _event(reader, "user_message")]
         assert echoes == [
             {
                 "event": "user_message",

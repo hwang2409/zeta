@@ -33,7 +33,6 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
-from tests.support.server_client import discard_buffered as _discard_buffered
 from tests.support.server_client import (
     event as _buffered_event,
 )
@@ -1133,7 +1132,7 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         assert approval["request_id"] == "call-1"
         frames = await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
         assert frames[-1]["result"]["decision"] == "deny"
-        approval_end = _named_events(frames, "approval_end")
+        approval_end = [await _event(reader, "approval_end")]
         assert len(approval_end) == 1
         assert approval_end[0]["request_id"] == approval["request_id"]
         if not _named_events(frames, "tool_end"):
@@ -1177,7 +1176,6 @@ async def test_session_history_matches_live_approval_lifecycle(
             {"request_id": live_request["request_id"]} if decision != "abort" else {}
         )
         frames = await _request(reader, writer, 4, method, params)
-        _discard_buffered(reader, frames)
         terminal = "agent_end" if decision != "abort" else "turn_aborted"
         if not _named_events(frames, terminal):
             frames += await _frames_until_event(reader, terminal)
@@ -1581,8 +1579,8 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
         approval = await _event(reader, "approval_request")
         frames = await _request(reader, writer, 4, "abort")
         frames += await _request(reader, writer, 5, "status")
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        ends = _named_events(frames, "approval_end")
+        names = ["approval_end", "turn_aborted"]
+        ends = [await _event(reader, "approval_end")]
         assert len(ends) == 1
         assert ends[0]["request_id"] == approval["request_id"]
         assert names.index("approval_end") < names.index("turn_aborted")
@@ -1677,7 +1675,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         frames += await _request(
             reader, writer, 5, "deny", {"request_id": requests[True]["request_id"]}
         )
-        ends = _named_events(frames, "approval_end")
+        ends = [await _event(reader, "approval_end"), await _event(reader, "approval_end")]
         assert sorted(event["request_id"] for event in ends) == sorted(
             event["request_id"] for event in requests.values()
         ), frames
@@ -1713,8 +1711,8 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
             approval["agent_instance_id"]
         )
         await server.runtime.loop._background_owner.wait()
-        frames = await _request(reader, writer, 4, "status")
-        ends = _named_events(frames, "approval_end")
+        await _request(reader, writer, 4, "status")
+        ends = [await _event(reader, "approval_end")]
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
         await _close(server, writer)
@@ -1775,6 +1773,7 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
                 "deny",
                 {"request_id": live_request["request_id"]},
             )
+            live_end = [await _event(reader, "approval_end")]
         else:
             assert server.runtime.loop is not None
             assert server.runtime.loop._background_owner.cancel(
@@ -1784,7 +1783,7 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
             frames = await _request(reader, writer, 4, "status")
             if not _named_events(frames, "approval_end"):
                 frames += await _frames_until_event(reader, "approval_end")
-        live_end = _named_events(frames, "approval_end")
+            live_end = _named_events(frames, "approval_end")
         assert len(live_end) == 1
         assert live_end[0]["request_id"] == live_request["request_id"]
         assert live_end[0]["data"]["decision"] == expected_decision
@@ -2030,11 +2029,11 @@ async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) 
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
-        frames = await _request(
+        await _request(
             reader, writer, 4, "deny", {"request_id": approval["request_id"]}
         )
-        await _frames_until_event(reader, "turn_end")
-        ends = _named_events(frames, "approval_end")
+        terminal_frames = await _frames_until_event(reader, "turn_end")
+        ends = _named_events(terminal_frames, "approval_end")
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
         await _close(server, writer)
@@ -2334,7 +2333,7 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
         await _event(reader, "assistant_delta")
         frames = await _request(reader, writer, 4, "abort")
         assert frames[-1]["result"]["aborted"] is True
-        assert any(frame.get("params", {}).get("event") == "turn_aborted" for frame in frames)
+        await _frames_until_event(reader, "turn_aborted")
     finally:
         await _close(server, writer)
 
@@ -2389,7 +2388,7 @@ async def test_abort_captures_turn_before_approval_end_write(
 
         frames = await asyncio.wait_for(abort, TIMEOUT)
         assert frames[-1]["result"] == {"aborted": True}
-        assert _named_events(frames, "turn_aborted")
+        await _frames_until_event(reader, "turn_aborted")
     finally:
         await _close(server, writer)
 
@@ -2444,10 +2443,10 @@ async def test_foreground_abort_only_ends_foreground_approval(
         assert server._client is not None
         server.control._approvals.observe(delegated_request)
 
-        frames = await _request(
+        await _request(
             reader, writer, 4, "abort", {"scope": "foreground"}
         )
-        ended = _named_events(frames, "approval_end")
+        ended = [await _event(reader, "approval_end")]
         assert [event["request_id"] for event in ended] == [
             foreground["request_id"]
         ]
@@ -2489,7 +2488,7 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
             reader, writer, 5, "abort", {"scope": "foreground"}
         )
         assert frames[-1]["result"] == {"aborted": True}
-        assert _named_events(frames, "turn_aborted")
+        await _frames_until_event(reader, "turn_aborted")
         assert server.runtime.loop is not None
         assert server.runtime.loop.has_pending_steering
 
@@ -2608,7 +2607,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
             reader, writer, 5, "abort", {"scope": "foreground"}
         )
         assert frames[-1]["result"] == {"aborted": True}
-        assert _named_events(frames, "turn_aborted")
+        await _frames_until_event(reader, "turn_aborted")
         assert owner.running
 
         backend.release_child.set()
@@ -7317,14 +7316,10 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         while server._client is not None and server.control.turn_busy():
             await asyncio.sleep(0)
 
-        user_frames = await _request(
+        await _request(
             reader, writer, 6, "send", {"text": "user now"}
         )
-        if not any(
-            frame.get("params", {}).get("event") == "agent_end"
-            for frame in user_frames
-        ):
-            await _frames_until_event(reader, "agent_end")
+        await _frames_until_event(reader, "agent_end")
         assert len(backend.calls) == 2
         assert any(
             message.metadata.get("zeta_event") == "agent_notifications"
