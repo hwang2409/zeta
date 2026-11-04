@@ -575,6 +575,7 @@ def _fit_history_groups(
     cache_sizes = list(projection.body_sizes)
     rows: list[dict[str, object]] = []
     selected: list[int] = []
+    response_groups: list[tuple[dict[str, object], ...]] = []
     body_size = 0
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
@@ -604,7 +605,8 @@ def _fit_history_groups(
         rows.extend(group)
         body_size += int(bool(rows[:-len(group)] and group)) + size if group else 0
         selected.append(index)
-    return rows, selected, HistoryProjection(
+        response_groups.append(group)
+    return rows, selected, response_groups, HistoryProjection(
         projection.entry_groups, projection.approval_calls,
         tuple(cache_groups), tuple(cache_sizes),
     )
@@ -621,7 +623,7 @@ def _forward_page_history(
     stop = min(HISTORY_FIRST_PAGE_ENTRIES, entry_count) if offset == 0 else entry_count
     if stop == entry_count:
         stop += 1
-    rows, selected, expanded = _fit_history_groups(
+    rows, selected, _response_groups, expanded = _fit_history_groups(
         projection, range(offset, stop), end=entry_count,
         include_delivery_id=include_delivery_id, backward=False,
     )
@@ -651,13 +653,14 @@ def _backward_page_history(
         )
     if before < 0 or before > stable_end + int(first_page):
         raise ProtocolError(-32602, "before must not exceed history end")
-    rows, selected, expanded = _fit_history_groups(
+    rows, selected, response_groups, expanded = _fit_history_groups(
         projection, range(before - 1, -1, -1), end=end,
         include_delivery_id=include_delivery_id, backward=True,
         validator=validator,
     )
     selected.reverse()
-    rows = [row for index in selected for row in expanded.groups[index]]
+    response_groups.reverse()
+    rows = [row for group in response_groups for row in group]
     boundary = selected[0] if selected else 0
     return {
         "messages": rows,
