@@ -35,7 +35,7 @@ def _group_exists(process_id: int) -> bool:
     return True
 
 
-async def _descendant_pids(root_pid: int) -> dict[int, str]:
+async def _descendant_pids(root_pid: int | None) -> dict[int, str]:
     """Snapshot descendants and their stable process identities."""
 
     process = await asyncio.create_subprocess_exec(
@@ -49,6 +49,12 @@ async def _descendant_pids(root_pid: int) -> dict[int, str]:
         if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
             pid, ppid = int(fields[0]), int(fields[1])
             children.setdefault(ppid, []).append((pid, fields[2]))
+    if root_pid is None:
+        return {
+            pid: start
+            for entries in children.values()
+            for pid, start in entries
+        }
     descendants: dict[int, str] = {}
     pending = [root_pid]
     while pending:
@@ -85,7 +91,7 @@ async def _terminate_process(
         await asyncio.wait_for(process.wait(), timeout=term_grace)
     except asyncio.TimeoutError:
         pass
-    current = await _descendant_pids(process.pid)
+    current = await _descendant_pids(None)
     survivors = {
         pid: start for pid, start in current.items() if descendants.get(pid) == start
     }
