@@ -2449,6 +2449,53 @@ def test_incremental_tail_payload_validation_matches_full_load(
     assert not incremental_accepted
 
 
+def test_approval_states_snapshot_uses_resident_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    resident = ConversationStore(root, session_id="snapshot-race")
+    foreign = ConversationStore(root, session_id="snapshot-race")
+    call = ToolCall("call-1", "read", {"path": "/tmp/input"})
+    foreign.append_approval_request(call.id, call)
+    def fail_if_parsed(
+        cls: type[ConversationEntry], value: dict[str, object]
+    ) -> ConversationEntry:
+        raise AssertionError(f"approval snapshot parsed {value!r}")
+
+    monkeypatch.setattr(
+        ConversationEntry, "from_dict", classmethod(fail_if_parsed)
+    )
+    resident._install_log_state(foreign._snapshot_log_state())
+    assert resident.approval_states_snapshot() == {call.id: (call, None)}
+
+
+def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.bind_owner_thread()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            store.append_message,
+            Message(MessageRole.ASSISTANT, [TextContent("off owner")]),
+        )
+        with pytest.raises(
+            RuntimeError, match="resident conversation store accessed off owner thread"
+        ):
+            future.result()
+
+
+def test_approval_resolution_data_never_mutates_resident_store_off_owner(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("call-1", "read", {"path": "/tmp/input"})
+    store.append_approval_request(call.id, call)
+    store.bind_owner_thread()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(store.approval_resolution_data, call.id).result() is None
+
+
 def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
     script = tmp_path / "pending_approval_reentry.py"
     script.write_text(

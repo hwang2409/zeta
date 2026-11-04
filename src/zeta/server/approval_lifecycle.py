@@ -402,16 +402,11 @@ class ApprovalLifecycle:
             if isinstance(record.target.key, tuple)
         )
 
-        def strict() -> tuple[
-            dict[str, tuple[ToolCall, str | None]],
-            dict[ConversationStore, dict[str, tuple[ToolCall, str | None]]],
-        ]:
-            child_stores = {target.store for target in delegated}
-            return foreground.approval_states(), {
-                store: store.approval_states() for store in child_stores
-            }
-
-        foreground_states, child_states = await self._offload(strict)
+        foreground_states = foreground.approval_states_snapshot()
+        child_states = {
+            target.store: target.store.approval_states_snapshot()
+            for target in delegated
+        }
         requests = [
             policy.request_from_store(request_id, tool_call)
             for request_id, (tool_call, decision) in foreground_states.items()
@@ -608,9 +603,7 @@ class ApprovalLifecycle:
         record = self._new_record(_ApprovalTarget(core_key, policy.store, core_key))
         token = record.token
         generation = record.generation
-        state = await self._offload(
-            lambda: record.target.store.approval_states().get(core_key)
-        )
+        state = record.target.store.approval_states_snapshot().get(core_key)
         current = self._state.records.get(core_key)
         if (
             current is None
@@ -645,41 +638,40 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        def resolve(outcome: str, outcome_reason: str | None) -> None:
-            target.store.resolve_approval(
-                target.store_request_id,
-                outcome,
-                **(
-                    {"reason": outcome_reason}
-                    if outcome == "abort" and outcome_reason
-                    else {}
-                ),
-            )
-
-        def persist() -> dict[str, str] | None:
+        async def persist() -> dict[str, str] | None:
             write_failed = False
             try:
-                resolve(decision, reason)
-            except OSError:
-                write_failed = True
-            try:
-                resolution = target.store.approval_resolution_data(
-                    target.store_request_id
+                await target.store._to_thread_durable(
+                    target.store.resolve_approval,
+                    target.store_request_id,
+                    decision,
+                    **(
+                        {"reason": reason}
+                        if decision == "abort" and reason
+                        else {}
+                    ),
                 )
             except OSError:
                 write_failed = True
-                resolution = None
+            resolution = target.store.approval_resolution_data(
+                target.store_request_id
+            )
             if resolution is not None:
                 return resolution
             if not write_failed:
                 return None
             try:
-                resolve("abort", reason or "turn_canceled")
+                await target.store._to_thread_durable(
+                    target.store.resolve_approval,
+                    target.store_request_id,
+                    "abort",
+                    reason=reason or "turn_canceled",
+                )
                 return target.store.approval_resolution_data(target.store_request_id)
             except OSError:
                 return None
 
-        resolution = await self._offload(persist)
+        resolution = await persist()
         current = self._state.records.get(target.key)
         owns_record = (
             current is not None
@@ -756,10 +748,8 @@ class ApprovalLifecycle:
                 if settlement is not None and settlement is not asyncio.current_task():
                     with contextlib.suppress(OSError):
                         return await settlement
-                return await self._offload(
-                    lambda: record.target.store.approval_resolution_data(
-                        record.target.store_request_id
-                    )
+                return record.target.store.approval_resolution_data(
+                    record.target.store_request_id
                 )
             record = reserved
         if record.phase == "starting":
@@ -767,20 +757,16 @@ class ApprovalLifecycle:
             if settlement is not None and settlement is not asyncio.current_task():
                 with contextlib.suppress(OSError):
                     await settlement
-            return await self._offload(
-                lambda: record.target.store.approval_resolution_data(
-                    record.target.store_request_id
-                )
+            return record.target.store.approval_resolution_data(
+                record.target.store_request_id
             )
         settlement = asyncio.create_task(self._settle_record(record, "abort", reason))
         self._change(record, settlement=settlement)
         return await settlement
 
     async def _finish_external(self, record: ApprovalRecord) -> None:
-        resolution = await self._offload(
-            lambda: record.target.store.approval_resolution_data(
-                record.target.store_request_id
-            )
+        resolution = record.target.store.approval_resolution_data(
+            record.target.store_request_id
         )
         if resolution is not None:
             await self._finish_record(record, resolution)
@@ -839,14 +825,9 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        def lookup() -> tuple[ToolCall, str | None] | None:
-            return target.store.approval_states().get(target.store_request_id)
-
-        try:
-            durable_state = await self._offload(lookup)
-        except OSError:
-            await self._settle_failed_start(record)
-            return
+        durable_state = target.store.approval_states_snapshot().get(
+            target.store_request_id
+        )
         current = self._state.records.get(key)
         if (
             current is None
@@ -913,8 +894,8 @@ class ApprovalLifecycle:
             return
         record = current
         if record.disposition == "external":
-            resolution = await self._offload(
-                lambda: target.store.approval_resolution_data(target.store_request_id)
+            resolution = target.store.approval_resolution_data(
+                target.store_request_id
             )
             if resolution is not None:
                 await self._finish_record(record, resolution)
@@ -966,10 +947,8 @@ class ApprovalLifecycle:
             return
         if record.phase != "pending":
             return
-        resolution = await self._offload(
-            lambda: record.target.store.approval_resolution_data(
-                record.target.store_request_id
-            )
+        resolution = record.target.store.approval_resolution_data(
+            record.target.store_request_id
         )
         if resolution is not None:
             await self._finish_record(record, resolution)
@@ -979,10 +958,8 @@ class ApprovalLifecycle:
         for record in tuple(self._state.records.values()):
             if record.phase != "pending":
                 continue
-            resolution = await self._offload(
-                lambda record=record: record.target.store.approval_resolution_data(
-                    record.target.store_request_id
-                )
+            resolution = record.target.store.approval_resolution_data(
+                record.target.store_request_id
             )
             if resolution is not None:
                 await self._finish_record(record, resolution)

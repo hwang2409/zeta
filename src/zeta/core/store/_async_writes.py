@@ -273,6 +273,7 @@ class AsyncDurableWritesMixin:
         fence: _PublicationFence,
     ) -> None:
         """Install recovery fields that their owner has not changed."""
+        self._assert_owner_thread()
         if self._agent_counter == fence.agent_counter:
             self._agent_counter = state.agent_counter
         if self._agent_parent == fence.agent_parent:

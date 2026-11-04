@@ -7,6 +7,7 @@ import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
+import threading
 import time
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
@@ -147,6 +148,7 @@ class ConversationStore(
         self._runtime_lease: SessionRuntimeLease | None = None
         self._closed = False
         self._closing = False
+        self._owner_thread_id: int | None = None
         self._transcript_generation = 0
         self._initialize_async_writes()
         if not _read_only and not _must_exist:
@@ -213,6 +215,15 @@ class ConversationStore(
                 self._runtime_lease,
                 lease.pop_all(),
             )
+
+    def bind_owner_thread(self) -> None:
+        """Bind resident state publication and mutation to the event-loop thread."""
+        self._owner_thread_id = threading.get_ident()
+
+    def _assert_owner_thread(self) -> None:
+        owner = self._owner_thread_id
+        if owner is not None and owner != threading.get_ident():
+            raise RuntimeError("resident conversation store accessed off owner thread")
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
@@ -639,8 +650,7 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         with self._append_lock():
-            entry = self._append_row_unlocked(entry_type, data, parent_id)
-            return self._snapshot_entry(entry)
+            return self._snapshot_entry(self._append_row_unlocked(entry_type, data, parent_id))
 
     def append_many(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
@@ -723,6 +733,7 @@ class ConversationStore(
         deadline: float | None = None,
         copy_data: bool = True,
     ) -> ConversationEntry:
+        self._assert_owner_thread()
         self._validate_notification_write(entry_type, data)
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
@@ -1115,18 +1126,10 @@ class ConversationStore(
             return self._approval_states_from_indexes()
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for request_id, entry in self._active_approval_requests.items():
-            request = next(
-                request
-                for request in entry.data.get("approval_requests", [])
-                if request["request_id"] == request_id
-            )
-            states[request_id] = (
-                ToolCall.from_dict(request["tool_call"]),
-                self._active_approval_resolutions.get(request_id),
-            )
-        return states
+        return self._approval_states_from_maps(
+            self._active_approval_requests,
+            self._active_approval_resolutions,
+        )
 
     @staticmethod
     def _request_entry(
