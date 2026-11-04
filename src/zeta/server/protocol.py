@@ -29,6 +29,8 @@ FEATURES = (
     "approval_history",
     "approval_reconnect",
     "session_history_backward",
+    "session_history_fidelity",
+    "content_read",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
