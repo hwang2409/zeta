@@ -1201,7 +1201,6 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
-| `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 
 These features are available on protocol 1.1 and 1.2. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
