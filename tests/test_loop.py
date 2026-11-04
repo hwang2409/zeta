@@ -1773,7 +1773,9 @@ async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
     assert len(retries) == 2
     assert budget is not None
     assert budget.stall_retries == 2
-    assert budget.excluded_stall_seconds == 270.0
+    # The window starts at the first stall (t=90); later stalls are excluded.
+    assert budget.started_at == 90.0
+    assert budget.excluded_stall_seconds == 180.0
     assert now - budget.started_at - budget.excluded_stall_seconds == 60.0
     assert now == 3 * 90.0 + 2 * 30.0
     assert now <= 330.0
