@@ -412,7 +412,17 @@ class ConnectionRegistry:
 
 def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
     runtime = client.server.runtime
-    if method in {"session_tree", "session_history", "content_read"}:
+    if method == "content_read":
+        if set(params) - {"handle", "offset", "limit"}:
+            raise ProtocolError(
+                -32602,
+                "invalid content read",
+                {"code": "invalid_content_read"},
+            )
+        if runtime.opened is None:
+            raise ProtocolError(-32003, "session is not active")
+        return runtime.session_id, runtime.opened.store
+    if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":

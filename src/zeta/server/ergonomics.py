@@ -191,6 +191,14 @@ class _CachedProjection:
 
 
 _cache_creation_lock = threading.Lock()
+_HISTORY_ROW_FEATURES = ("include_delivery_id", "fidelity", "content_read")
+
+
+def _history_feature_key(
+    *, include_delivery_id: bool, fidelity: bool, content_read: bool
+) -> tuple[bool, ...]:
+    values = locals()
+    return tuple(values[name] for name in _HISTORY_ROW_FEATURES)
 
 
 def _generation(store: ConversationStore) -> Generation:
@@ -201,27 +209,39 @@ def _generation(store: ConversationStore) -> Generation:
 
 
 def _cache(
-    store: ConversationStore, include_delivery_id: bool
+    store: ConversationStore,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
 ) -> _CachedProjection | None:
-    attribute = (
-        "_serve_history_projection_delivery_ids"
-        if include_delivery_id
-        else "_serve_history_projection"
+    cache = getattr(store, "_serve_history_projections", {})
+    return cache.get(
+        _history_feature_key(
+            include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
+        )
     )
-    return getattr(store, attribute, None)
 
 
 def _publish_cache(
     store: ConversationStore,
+    *,
     include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
     cached: _CachedProjection,
 ) -> None:
-    attribute = (
-        "_serve_history_projection_delivery_ids"
-        if include_delivery_id
-        else "_serve_history_projection"
-    )
-    setattr(store, attribute, cached)
+    cache = getattr(store, "_serve_history_projections", None)
+    if cache is None:
+        cache = {}
+        store._serve_history_projections = cache
+    cache[_history_feature_key(
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+    )] = cached
 
 
 def _bounded_history_value(value: object) -> object:
@@ -311,10 +331,14 @@ def _project_history_group(
 
 
 def history_projection(
-    store: ConversationStore, *, include_delivery_id: bool = False
+    store: ConversationStore, *, include_delivery_id: bool = False,
+    fidelity: bool = False, content_read: bool = False,
 ) -> HistoryProjection:
     """Return one immutable wire projection for the store's generation."""
-    cached = _cache(store, include_delivery_id)
+    cached = _cache(
+        store, include_delivery_id=include_delivery_id, fidelity=fidelity,
+        content_read=content_read,
+    )
     generation = _generation(store)
     if cached is not None and cached.generation == generation:
         return cached.projection
@@ -352,13 +376,36 @@ def history_projection(
         tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index)
     )
     with _cache_creation_lock:
-        cached = _cache(store, include_delivery_id)
+        cached = _cache(
+            store, include_delivery_id=include_delivery_id, fidelity=fidelity,
+            content_read=content_read,
+        )
         if cached is None or cached.generation != generation:
             _publish_cache(
-                store, include_delivery_id, _CachedProjection(generation, built)
+                store,
+                include_delivery_id=include_delivery_id,
+                fidelity=fidelity,
+                content_read=content_read,
+                cached=_CachedProjection(generation, built),
             )
             return built
         return cached.projection
+
+
+def _attach_row_handle(
+    block: dict[str, object],
+    entry_id: str,
+    field: str,
+    index: int,
+    *,
+    fidelity: bool,
+    content_read: bool,
+) -> dict[str, object]:
+    if fidelity and content_read:
+        from .content import row_handle
+
+        block["handle"] = row_handle(entry_id, field, index)
+    return block
 
 
 def _history_entry_rows(
@@ -411,10 +458,10 @@ def _history_entry_rows(
     for index, block in enumerate(message.get("content", [])):
         if block.get("type") == "image":
             attachment = {"type": "attachment", "name": Path(block.get("path") or "image").name, "size": block.get("size") or 0}
-            if fidelity and content_read:
-                from .content import row_handle
-                attachment["handle"] = row_handle(entry.id, "message.content", index)
-            content.append(attachment)
+            content.append(_attach_row_handle(
+                attachment, entry.id, "message.content", index,
+                fidelity=fidelity, content_read=content_read,
+            ))
         elif block.get("type") == "text":
             content.append({"type": "text", "text": bounded(block["text"], 8000)})
         elif block.get("type") == "tool_use":
@@ -445,10 +492,10 @@ def _history_entry_rows(
                     stub = {key: block[key] for key in ("type", "mimeType", "caption", "width", "height", "size") if key in block}
                     stub["size"] = stub.get("size", 0)
                     stub["data_omitted"] = True
-                    if content_read:
-                        from .content import row_handle
-                        stub["handle"] = row_handle(entry.id, "message.tool_result.content_blocks", index)
-                    blocks.append(stub)
+                    blocks.append(_attach_row_handle(
+                        stub, entry.id, "message.tool_result.content_blocks", index,
+                        fidelity=fidelity, content_read=content_read,
+                    ))
         result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks, "structured_content": None}
     row = {
         "id": entry.id,
@@ -558,6 +605,8 @@ def _history_group_fits(
         for row in _history_entry_rows(
             entry, projection.approval_calls,
             include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
         )
     ]
     group, size = _project_history_group(raw, kwargs)
@@ -700,11 +749,22 @@ def _publish_history_page(
     result: dict,
     expanded: HistoryProjection,
     include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
 ) -> dict:
     with _cache_creation_lock:
-        cached = _cache(store, include_delivery_id)
+        cached = _cache(
+            store, include_delivery_id=include_delivery_id, fidelity=fidelity,
+            content_read=content_read,
+        )
         if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
-            _publish_cache(store, include_delivery_id, _CachedProjection(generation, expanded))
+            _publish_cache(
+                store,
+                include_delivery_id=include_delivery_id,
+                fidelity=fidelity,
+                content_read=content_read,
+                cached=_CachedProjection(generation, expanded),
+            )
     return result
 
 
@@ -720,7 +780,10 @@ def _backward_history_request(
         validator = {"end": 0, "entry_id": None}
     store = runtime.opened.store
     generation = _generation(store)
-    projection = history_projection(store, include_delivery_id=include_delivery_id)
+    projection = history_projection(
+        store, include_delivery_id=include_delivery_id, fidelity=fidelity,
+        content_read=content_read,
+    )
     end = len(projection.entry_groups) - 1
     if before is None:
         validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
@@ -731,7 +794,9 @@ def _backward_history_request(
         projection, cursor, include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read,
         backward=True, validator=validator, first_page=first_page,
     )
-    return _publish_history_page(store, generation, result, expanded, include_delivery_id)
+    return _publish_history_page(
+        store, generation, result, expanded, include_delivery_id, fidelity, content_read
+    )
 
 
 def _forward_history_request(
@@ -742,11 +807,16 @@ def _forward_history_request(
 ) -> dict:
     store = runtime.opened.store
     generation = _generation(store)
-    projection = history_projection(store, include_delivery_id=include_delivery_id)
+    projection = history_projection(
+        store, include_delivery_id=include_delivery_id, fidelity=fidelity,
+        content_read=content_read,
+    )
     result, expanded = page_history(
         projection, params.get("offset", 0), include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read,
     )
-    return _publish_history_page(store, generation, result, expanded, include_delivery_id)
+    return _publish_history_page(
+        store, generation, result, expanded, include_delivery_id, fidelity, content_read
+    )
 
 
 def _validate_history_params(params: dict) -> None:

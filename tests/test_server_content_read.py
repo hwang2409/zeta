@@ -145,6 +145,88 @@ async def _history_with_image(reader, writer, *, request_id: int = 2, session_id
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("negotiated_first", [False, True])
+async def test_history_cache_is_keyed_by_row_shaping_features(
+    tmp_path: Path, negotiated_first: bool
+) -> None:
+    from zeta.server import ZetaServer
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    observer_reader = observer_writer = None
+    try:
+        controller_features = ["session_history_fidelity", "content_read"] if negotiated_first else []
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": controller_features},
+        )
+        session = (await _request(
+            controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+        ))[-1]["result"]["session"]
+        server.runtime.opened.store.append_message(
+            with_message_origin(
+                Message(
+                    MessageRole.USER,
+                    [ImageContent(base64.b64encode(_PNG).decode(), "image/png")],
+                ),
+                MessageOrigin.USER,
+            )
+        )
+        first = (await _request(
+            controller_reader,
+            controller_writer,
+            3,
+            "session_history",
+            {"session_id": session["session_id"]},
+        ))[-1]
+        assert "result" in first
+
+        observer_reader, observer_writer = await asyncio.open_connection(
+            "127.0.0.1", server.port
+        )
+        observer_features = ["serve_observers"]
+        if not negotiated_first:
+            observer_features += ["session_history_fidelity", "content_read"]
+        await _request(
+            observer_reader,
+            observer_writer,
+            4,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": observer_features,
+            },
+        )
+        second = (await _request(
+            observer_reader,
+            observer_writer,
+            5,
+            "session_history",
+            {"session_id": session["session_id"]},
+        ))[-1]
+        assert "result" in second
+        attachments = [
+            block
+            for row in second["result"]["messages"]
+            for block in row.get("content", [])
+            if block.get("type") == "attachment"
+        ]
+        if negotiated_first:
+            assert "handle" not in attachments[0]
+        else:
+            assert attachments[0]["handle"]
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
 async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
     from zeta.server import ZetaServer
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -160,7 +242,7 @@ async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
         writer.close(); await writer.wait_closed(); await asyncio.sleep(0.05)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 3, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
-        reply = (await _request(reader, writer, 4, "content_read", {"session_id": session["session_id"], "handle": handle}))[-1]
+        reply = (await _request(reader, writer, 4, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
     finally:
         await _close(server, writer)
@@ -185,7 +267,7 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
         await restarted.runtime.resume_session(session["session_id"])
         await _request(reader, writer, 2, "session_history", {"session_id": session["session_id"]})
-        reply = (await _request(reader, writer, 3, "content_read", {"session_id": session["session_id"], "handle": handle}))[-1]
+        reply = (await _request(reader, writer, 3, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
     finally:
         await _close(restarted, writer)
@@ -207,13 +289,13 @@ async def test_handle_is_scoped_to_session_for_controller_and_observer(tmp_path:
     reader_b, writer_b = await _connect(second)
     try:
         await _request(reader_b, writer_b, 1, "hello", {"protocol_version": "1.2", "features": ["content_read"]})
-        session_b = (await _request(reader_b, writer_b, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
-        controller = (await _request(reader_b, writer_b, 3, "content_read", {"session_id": session_b["session_id"], "handle": handle}))[-1]["error"]
+        await _request(reader_b, writer_b, 2, "new_session", {"provider": "codex"})
+        controller = (await _request(reader_b, writer_b, 3, "content_read", {"handle": handle}))[-1]["error"]
         writer_b.close(); await writer_b.wait_closed(); await asyncio.sleep(0.05)
         observer_reader, observer_writer = await asyncio.open_connection("127.0.0.1", second.port)
         try:
             await _request(observer_reader, observer_writer, 3, "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "content_read"]})
-            observer = (await _request(observer_reader, observer_writer, 4, "content_read", {"session_id": session_b["session_id"], "handle": handle}))[-1]["error"]
+            observer = (await _request(observer_reader, observer_writer, 4, "content_read", {"handle": handle}))[-1]["error"]
         finally:
             observer_writer.close(); await observer_writer.wait_closed()
         assert controller == observer == {"code": -32012, "message": "content not found", "data": {"code": "content_not_found"}}
