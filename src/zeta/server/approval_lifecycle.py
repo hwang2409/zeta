@@ -609,7 +609,7 @@ class ApprovalLifecycle:
         token = record.token
         generation = record.generation
         state = await self._offload(
-            lambda: record.target.store.approval_states().get(core_key)
+            lambda: record.target.store.approval_states_snapshot().get(core_key)
         )
         current = self._state.records.get(core_key)
         if (
@@ -840,7 +840,9 @@ class ApprovalLifecycle:
         target = record.target
 
         def lookup() -> tuple[ToolCall, str | None] | None:
-            return target.store.approval_states().get(target.store_request_id)
+            return target.store.approval_states_snapshot().get(
+                target.store_request_id
+            )
 
         try:
             durable_state = await self._offload(lookup)

@@ -259,7 +259,7 @@ async def _gated_start(
     server: ZetaServer, call: ToolCall, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[asyncio.Task[None], _StoreGate]:
     store = server.runtime.opened.store
-    gate = _StoreGate(store)
+    gate = _StoreGate(store, "approval_states_snapshot")
     monkeypatch.setattr(store, gate.method, gate.call)
     task = asyncio.create_task(server.control._event(_start_event(call)))
     await _wait_thread_gate(gate)
@@ -1406,7 +1406,7 @@ async def test_legacy_status_bytes_match_main_off_loop(
             server._client, "_session_snapshot", lambda: {"session_id": "fixed"}
         )
         store = server.runtime.opened.store
-        gate = _StoreGate(store)
+        gate = _StoreGate(store, "approval_states_snapshot")
         monkeypatch.setattr(store, gate.method, gate.call)
         expected = (
             Path(__file__).parent
