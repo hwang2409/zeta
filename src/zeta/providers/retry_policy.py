@@ -59,7 +59,9 @@ class RetryPlan:
 
 @dataclass(slots=True)
 class ProviderRetryBudget:
-    """Bound all provider requests and retry waits made by one agent turn."""
+    """Bound the retries of one provider call: at most MAX_PROVIDER_ATTEMPTS
+    attempts, and MAX_PROVIDER_RETRY_SECONDS of retrying counted from the first
+    failure, so a long healthy first request does not use up the window."""
 
     started_at: float = field(default_factory=lambda: time.monotonic())
     attempts: int = 0
@@ -96,8 +98,13 @@ class ProviderRetryBudget:
         owner: str,
         event_data: Mapping[str, Any] | None = None,
     ) -> RetryPlan | None:
-        if self.original_error is None:
+        first_failure = self.original_error is None
+        if first_failure:
             self.original_error = source
+            # The window bounds retrying, not the first request: a long healthy
+            # request must not use it up before it fails.
+            self.started_at = time.monotonic()
+            self.excluded_stall_seconds = 0.0
         if self.exhausted:
             return None
         if not retryable_provider_error(source, event_data):
@@ -113,7 +120,8 @@ class ProviderRetryBudget:
             isinstance(stall_seconds, (int, float)) and stall_seconds > 0
         )
         if is_stall:
-            if has_stall_duration:
+            # The first failure's silence happened before the window started.
+            if has_stall_duration and not first_failure:
                 self.excluded_stall_seconds += float(stall_seconds)
             if self.stall_retries >= self.max_stall_retries:
                 self.exhausted = True
