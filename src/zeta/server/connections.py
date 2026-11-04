@@ -457,13 +457,10 @@ def perform_read(
     if method == "session_tree":
         return ergonomics.tree(runtime)
     if method == "session_history":
-        if include_delivery_id:
-            if backward_enabled:
-                return ergonomics.history(
-                    runtime, params, include_delivery_id=True, backward_enabled=True
-                )
-            return ergonomics.history(runtime, params, include_delivery_id=True)
-        if backward_enabled:
-            return ergonomics.history(runtime, params, backward_enabled=True)
-        return ergonomics.history(runtime, params)
+        return ergonomics.history(
+            runtime,
+            params,
+            include_delivery_id=include_delivery_id,
+            backward_enabled=backward_enabled,
+        )
     raise ProtocolError(-32601, "method not found")

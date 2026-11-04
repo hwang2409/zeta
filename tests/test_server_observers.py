@@ -327,7 +327,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
     release = threading.Event()
     original_history = ergonomics.history
 
-    def gated_history(runtime: Any, params: dict[str, Any]) -> dict[str, Any]:
+    def gated_history(runtime: Any, params: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         entered.set()
         assert release.wait(TIMEOUT)
         return original_history(runtime, params)

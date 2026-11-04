@@ -584,7 +584,7 @@ def _backward_page_history(
             "session history changed; restart from the newest page",
             {"code": "stale_history_snapshot"},
         )
-    if before < 0 or before > stable_end + 1:
+    if before < 0 or before > stable_end:
         raise ProtocolError(-32602, "before must not exceed history end")
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
