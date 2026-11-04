@@ -103,6 +103,57 @@ def test_session_history_oversized_store_row_returns_truncated_page(tmp_path) ->
     assert "[truncated:" in command
 
 
+def test_session_history_keeps_frame_fitting_approval_and_notification_bytes() -> None:
+    command = "c" * 16_000
+    payload = "p" * 16_000
+    entries = (
+        SimpleNamespace(
+            id="approval-1",
+            type="message",
+            data={
+                "message": {
+                    "role": "assistant",
+                    "content": [],
+                    "tool_result": {
+                        "tool_call_id": "call-1",
+                        "content": "r" * 16_000,
+                        "is_error": False,
+                    },
+                },
+                "approval_requests": [
+                    {
+                        "request_id": "request-1",
+                        "tool_call": {
+                            "id": "call-1",
+                            "name": "bash",
+                            "arguments": {"command": command},
+                        },
+                    }
+                ],
+            },
+        ),
+        SimpleNamespace(
+            id="notification-1",
+            type="notification",
+            data={"kind": "agent_completion", "text": "done", "payload": payload},
+        ),
+    )
+
+    class Store:
+        _log_offset = 1
+        _entry_prefix_digest = b"one"
+
+        def active_branch_snapshot(self):
+            return entries
+
+    result = ergonomics.history(_runtime(Store()), {})
+    messages = result["messages"]
+    approval = next(row for row in messages if row.get("event") == "approval_request")
+    notification = next(row for row in messages if row.get("notification") is not None)
+    assert approval["tool_call"]["arguments"]["command"] == command
+    assert notification["notification"]["payload"] == payload
+
+
 def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
     store = ConversationStore(tmp_path)
     store.append_approval_history(

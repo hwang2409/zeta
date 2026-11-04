@@ -254,6 +254,21 @@ def _history_group_body_size(
 def _project_history_group(
     rows: list[dict[str, object]], entry_count: int
 ) -> tuple[tuple[dict[str, object], ...], int]:
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    raw_group = tuple(rows)
+    raw_body_size = _history_group_body_size(codec, raw_group)
+    if (
+        _history_frame_size(
+            codec,
+            request_id,
+            messages_body_size=raw_body_size,
+            next_offset=entry_count,
+        )
+        <= MAX_FRAME_BYTES
+    ):
+        return raw_group, raw_body_size
+
     group = tuple(
         _bounded_history_value(row)
         if row.get("event") in {"approval_request", "approval_end"}
@@ -261,8 +276,6 @@ def _project_history_group(
         else row
         for row in rows
     )
-    codec = FrameCodec()
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
     body_size = _history_group_body_size(codec, group)
     if (
         _history_frame_size(
