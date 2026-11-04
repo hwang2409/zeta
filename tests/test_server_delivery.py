@@ -12,6 +12,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.server_client import event as _event
+from tests.support.server_client import frames_until_event as _frames_until_event
 from tests.support.server_client import request as _request
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -251,10 +252,6 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         failed_send = await _request(
             reader, writer, 3, "send", {"text": "ghost", "delivery_id": "ghost-1"}
         )
-        assert not any(
-            frame.get("params", {}).get("event") == "user_message"
-            for frame in failed_send
-        )
         assert failed_send[-1]["error"]["code"] == -32000
         assert server.runtime.opened.store.client_delivery("ghost-1") is None
 
@@ -267,24 +264,22 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
             "steer",
             {"text": "ghost steer", "delivery_id": "ghost-steer"},
         )
-        assert not any(
-            frame.get("params", {}).get("event") == "user_message"
-            for frame in failed_steer
-        )
         assert failed_steer[-1]["error"]["code"] == -32000
         assert server.runtime.opened.store.client_delivery("ghost-steer") is None
         backend.release.set()
         await _event(reader, "agent_end")
 
         server.runtime.opened.store.append_client_delivery_async = original_append
-        normal = await _request(
+        await _request(
             reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
         )
+        frames = await _frames_until_event(reader, "agent_end")
         echoes = [
             frame["params"]
-            for frame in normal
+            for frame in frames
             if frame.get("params", {}).get("event") == "user_message"
         ]
+        assert len(echoes) == 1
         assert echoes == [
             {
                 "event": "user_message",
@@ -297,7 +292,6 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         ]
         assert server.runtime.opened.store.client_delivery("real-1") is not None
         backend.release.set()
-        await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
 

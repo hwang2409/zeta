@@ -48,24 +48,14 @@ async def request(
         ).encode()
     )
     await asyncio.wait_for(writer.drain(), TIMEOUT)
-    frames: list[dict[str, Any]] = []
     buffered = _buffer(reader)
-    prior = list(buffered)
-    buffered.clear()
-    new_frames: list[dict[str, Any]] = []
     while True:
-        frame = await read(reader)
-        frames.append(frame)
-        new_frames.append(frame)
+        line = await asyncio.wait_for(reader.readline(), TIMEOUT)
+        assert line, "server closed the socket"
+        frame = json.loads(line)
         if frame.get("id") == request_id:
-            # Keep newly read notifications available to the next event helper.
-            # Callers may inspect returned frames, but must not consume those
-            # same notifications through an event helper.
-            buffered.extend(prior)
-            buffered.extend(
-                candidate for candidate in new_frames if candidate.get("id") != request_id
-            )
-            return frames
+            return [frame]
+        buffered.append(frame)
 
 
 async def frames_until_event(
@@ -82,13 +72,3 @@ async def frames_until_event(
 async def event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
     frames = await frames_until_event(reader, name)
     return frames[-1]["params"]
-
-
-def discard_buffered(reader: asyncio.StreamReader, frames: list[dict[str, Any]]) -> None:
-    """Drop notifications a caller already consumed from a request result."""
-    buffered = _buffer(reader)
-    for frame in (frame for frame in frames if frame.get("id") is None):
-        try:
-            buffered.remove(frame)
-        except ValueError:
-            pass
