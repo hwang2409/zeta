@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .tool_spawn import create_tool_subprocess_shell
+
+logger = logging.getLogger(__name__)
 
 
 async def create_subprocess_shell_in_fd(
@@ -30,6 +33,39 @@ def _group_exists(process_id: int) -> bool:
     except OSError:
         return False
     return True
+
+
+async def _descendant_pids(root_pid: int) -> set[int]:
+    """Snapshot descendants without blocking the event loop."""
+
+    process = await asyncio.create_subprocess_exec(
+        "ps", "-A", "-o", "pid=", "-o", "ppid=", stdout=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await process.communicate()
+    children: dict[int, list[int]] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, ppid = map(int, fields)
+            children.setdefault(ppid, []).append(pid)
+    descendants: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        for pid in children.get(pending.pop(), ()):
+            if pid not in descendants:
+                descendants.add(pid)
+                pending.append(pid)
+    return descendants
+
+
+def _signal_pids(pids: set[int], signal_number: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.debug("could not signal background descendant %s", pid, exc_info=True)
 
 
 def _signal_group(process: asyncio.subprocess.Process, signal_number: int) -> None:

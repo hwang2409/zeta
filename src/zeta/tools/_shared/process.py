@@ -30,8 +30,10 @@ from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
+    _descendant_pids,
     _group_exists,
     _signal_group,
+    _signal_pids,
     create_subprocess_shell_in_fd,
     spawn_background,
 )
@@ -44,39 +46,6 @@ def tool_subprocess_env() -> dict[str, str]:
     """Return the scrubbed parent environment for a tool child."""
 
     return subprocess_env()
-
-
-async def _descendant_pids(root_pid: int) -> set[int]:
-    """Snapshot descendants without blocking the event loop."""
-
-    process = await asyncio.create_subprocess_exec(
-        "ps", "-A", "-o", "pid=", "-o", "ppid=", stdout=asyncio.subprocess.PIPE
-    )
-    stdout, _ = await process.communicate()
-    children: dict[int, list[int]] = {}
-    for line in stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and all(field.isdigit() for field in fields):
-            pid, ppid = map(int, fields)
-            children.setdefault(ppid, []).append(pid)
-    descendants: set[int] = set()
-    pending = [root_pid]
-    while pending:
-        for pid in children.get(pending.pop(), ()):
-            if pid not in descendants:
-                descendants.add(pid)
-                pending.append(pid)
-    return descendants
-
-
-def _signal_pids(pids: set[int], signal_number: int) -> None:
-    for pid in pids:
-        try:
-            os.kill(pid, signal_number)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            logger.debug("could not signal background descendant %s", pid, exc_info=True)
 
 
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
