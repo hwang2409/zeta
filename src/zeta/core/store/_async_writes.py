@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ..checkpoints import ConversationEntry
     from ._log import InstalledEntriesDelta, _DetachedLogState
     from ._store import ConversationStore
 
@@ -57,6 +58,7 @@ class AsyncDurableWritesMixin:
         self._durable_write_condition = threading.Condition()
         self._durable_writes_in_flight = 0
         self._durable_writer: ConversationStore | None = None
+        self._durable_writer_snapshot: tuple[int, _DetachedLogState] | None = None
 
     def _drain_durable_writes_for_close(self: ConversationStore) -> bool:
         with self._durable_write_condition:
@@ -68,9 +70,35 @@ class AsyncDurableWritesMixin:
             self._closed = True
             writer = self._durable_writer
             self._durable_writer = None
+            self._durable_writer_snapshot = None
         if writer is not None:
             writer.close()
         return True
+
+    def _prepare_durable_writer_snapshot(self: ConversationStore) -> None:
+        """Detach one validated generation before the store becomes loop-owned."""
+        snapshot = copy.deepcopy(self._detach_log_state())
+        with self._durable_write_condition:
+            if self._closing or self._closed:
+                return
+            self._durable_writer_snapshot = (
+                self._transcript_generation,
+                snapshot,
+            )
+
+    def _new_persistent_durable_writer(self: ConversationStore) -> ConversationStore:
+        with self._durable_write_condition:
+            prepared = self._durable_writer_snapshot
+            self._durable_writer_snapshot = None
+            if prepared is not None and prepared[0] != self._transcript_generation:
+                prepared = None
+        return type(self)(
+            self.root_dir,
+            session_id=self.session_id,
+            _must_exist=True,
+            _collect_persisted_appends=True,
+            _validated_log_state=None if prepared is None else prepared[1],
+        )
 
     def _run_durable_write(
         self: ConversationStore,
@@ -83,11 +111,15 @@ class AsyncDurableWritesMixin:
             persistent = method_name in _STEP_DELIVERY_WRITES
             writer = self._durable_writer if persistent else None
             if writer is None:
-                writer = type(self)(
-                    self.root_dir,
-                    session_id=self.session_id,
-                    _must_exist=True,
-                    _collect_persisted_appends=True,
+                writer = (
+                    self._new_persistent_durable_writer()
+                    if persistent
+                    else type(self)(
+                        self.root_dir,
+                        session_id=self.session_id,
+                        _must_exist=True,
+                        _collect_persisted_appends=True,
+                    )
                 )
                 if persistent:
                     self._durable_writer = writer
@@ -169,6 +201,19 @@ class AsyncDurableWritesMixin:
         delta = self._installed_delta_from_baseline(state.log.entries, baseline)
         return replace(state, log=replace(state.log, installed_delta=delta))
 
+    @staticmethod
+    def _linear_suffix(
+        entries: list[ConversationEntry], baseline_count: int
+    ) -> bool:
+        previous = entries[baseline_count - 1] if baseline_count else None
+        for entry in entries[baseline_count:]:
+            expected_seq = previous.seq + 1 if previous is not None else 1
+            expected_parent = previous.id if previous is not None else None
+            if entry.seq != expected_seq or entry.parent_id != expected_parent:
+                return False
+            previous = entry
+        return True
+
     def _run_durable_write_with_delta(
         self: ConversationStore,
         method_name: str,
@@ -185,7 +230,22 @@ class AsyncDurableWritesMixin:
             )
         else:
             delta = self._installed_delta_from_baseline(state.entries, baseline)
-        return result, replace(state, installed_delta=delta), receipts
+        if delta != "reset" and (
+            len(delta) > 64
+            or not self._linear_suffix(state.entries, baseline[0])
+        ):
+            # Keep owner publication bounded; large or nonlinear suffixes use
+            # one worker-owned state copy and an owner-thread pointer swap.
+            delta = "reset"
+        publication_delta = self._owned_installed_delta(delta)
+        state = replace(
+            state,
+            installed_delta=delta,
+            publication_delta=publication_delta,
+        )
+        if delta == "reset":
+            state = copy.deepcopy(state)
+        return result, state, receipts
 
     def _publication_fence(self: ConversationStore) -> _PublicationFence:
         """Capture every owner field that a recovery refresh may replace."""
@@ -269,8 +329,22 @@ class AsyncDurableWritesMixin:
             if self._closing or self._closed:
                 return released_log, installed_delta
             if self._transcript_generation == generation:
-                released_log = self._install_log_state(state)
                 installed_delta = state.installed_delta
+                publication_delta = state.publication_delta
+                if publication_delta == "reset":
+                    released_log = self._install_log_state(state)
+                else:
+                    entries = list(publication_delta)
+                    if entries:
+                        self._before_incremental_state_install()
+                        self._install_validated_linear_entries(entries)
+                        self._record_client_delivery_entries(entries)
+                        self._transcript_generation += 1
+                    self._entry_prefix_digest = state.entry_prefix_digest
+                    self._log_identity = state.log_identity
+                    self._log_offset = state.log_offset
+                    self._log_mtime_ns = state.log_mtime_ns
+                    self._log_prefix_fingerprint = state.log_prefix_fingerprint
             self._accept_persisted_appends(receipts)
         return released_log, installed_delta
 

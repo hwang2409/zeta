@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -9,8 +10,10 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.conversation_channel import ConversationChannel
+from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.core.store._step_delivery import NotificationInput, PromptInput
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -64,7 +67,7 @@ def _seed_session(home: Path, cwd: Path, *, children: int = 0) -> str:
 
 
 @pytest.mark.asyncio
-async def test_resume_large_root_without_children_does_not_reload_root(
+async def test_resume_warm_writer_does_not_reload_root(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -101,9 +104,170 @@ async def test_resume_large_root_without_children_does_not_reload_root(
     with patch.object(ConversationStore, "_load_full", count_root_loads):
         await runtime.resume_session(session_id)
     try:
-        assert full_root_loads == 2
+        assert full_root_loads == 1
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_warm_writer_admits_pending_prompt_notification_and_terminal_after_resume(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    session_id = await asyncio.to_thread(_seed_session, home, tmp_path)
+    runtime = _runtime(home, tmp_path)
+    await runtime.resume_session(session_id)
+    try:
+        assert runtime.loop is not None
+        flow = runtime.loop.step_delivery
+        assert flow is not None
+        prompt = await flow.produce(
+            PromptInput("follow up", MessageOrigin.AGENT_SEND, None)
+        )
+        notification = await flow.produce(
+            NotificationInput(
+                "task_exit",
+                {
+                    "task_id": "warm-writer-task",
+                    "headline": "command warm-writer-task",
+                    "exit_code": 0,
+                    "output_tail": "done",
+                    "background_owner": "run_background",
+                    "background_phase": "natural_exit",
+                },
+                dedupe_key="warm-writer-task",
+            )
+        )
+        staged = await flow.prepare_request("terminal_fallback", [], None)
+        assert staged.prompt_id == prompt.entries[0].id
+        assert staged.notification_ids == (notification.entries[0].id,)
+        await flow.acknowledge_active()
+        assert (await flow.admit_terminal("finish")).pending is False
+    finally:
+        await runtime.close()
+
+
+def _opened_store_with_writer_snapshot(tmp_path: Path, session_id: str) -> ConversationStore:
+    created = ConversationStore(tmp_path, session_id=session_id)
+    created.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("resident payload")]),
+            MessageOrigin.USER,
+        )
+    )
+    created.close()
+    resident = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
+    resident._prepare_durable_writer_snapshot()
+    return resident
+
+
+@pytest.mark.asyncio
+async def test_warm_writer_sees_external_append_between_open_and_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "external-append")
+    external = ConversationStore(tmp_path, session_id=resident.session_id, _must_exist=True)
+    external.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("external")]), MessageOrigin.USER
+        )
+    )
+    external.close()
+    reloads = 0
+    original = ConversationStore._load_full
+
+    def count_reloads(store: ConversationStore) -> None:
+        nonlocal reloads
+        reloads += 1
+        original(store)
+
+    monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
+    flow = StepDeliveryFlow(resident)
+    await flow.initialize()
+    try:
+        assert reloads == 0
+        assert resident.messages()[-1].content == [TextContent("external")]
+    finally:
+        await asyncio.to_thread(resident.close)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["replaced", "truncated", "torn"])
+async def test_warm_writer_falls_back_on_replaced_or_truncated_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, f"fallback-{damage}")
+    if damage == "replaced":
+        replacement = resident.path.with_suffix(".replacement")
+        replacement.write_bytes(resident.path.read_bytes())
+        os.replace(replacement, resident.path)
+    elif damage == "truncated":
+        rows = resident.path.read_bytes().splitlines(keepends=True)
+        resident.path.write_bytes(b"".join(rows[:-1]))
+    else:
+        with resident.path.open("ab") as handle:
+            handle.write(b'{"type":"message"')
+
+    reloads = 0
+    original = ConversationStore._load_full
+
+    def count_reloads(store: ConversationStore) -> None:
+        nonlocal reloads
+        reloads += 1
+        original(store)
+
+    monkeypatch.setattr(ConversationStore, "_load_full", count_reloads)
+    flow = StepDeliveryFlow(resident)
+    await flow.initialize()
+    try:
+        assert reloads == 1
+    finally:
+        await asyncio.to_thread(resident.close)
+
+
+@pytest.mark.asyncio
+async def test_warm_writer_startup_and_close_are_cancellation_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "cancel-warm-writer")
+    entered = threading.Event()
+    release = threading.Event()
+    original = ConversationStore._warm_step_delivery_writer
+
+    def gated_warm(store: ConversationStore) -> None:
+        entered.set()
+        assert release.wait(2)
+        original(store)
+
+    gated_warm.__name__ = "_warm_step_delivery_writer"
+    monkeypatch.setattr(ConversationStore, "_warm_step_delivery_writer", gated_warm)
+    flow = StepDeliveryFlow(resident)
+    startup = asyncio.create_task(flow.initialize())
+    assert await asyncio.to_thread(entered.wait, 2)
+    startup.cancel()
+    close = asyncio.create_task(asyncio.to_thread(resident.close))
+    await asyncio.sleep(0)
+    assert not close.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    await asyncio.wait_for(close, 2)
+
+
+@pytest.mark.asyncio
+async def test_warm_writer_payloads_do_not_alias_resident_store(tmp_path: Path) -> None:
+    resident = _opened_store_with_writer_snapshot(tmp_path, "payload-isolation")
+    flow = StepDeliveryFlow(resident)
+    await flow.initialize()
+    try:
+        writer = resident._durable_writer
+        assert writer is not None
+        writer._entries[0].data["message"]["content"][0]["text"] = "writer mutation"
+        assert resident._entries[0].data["message"]["content"][0]["text"] == (
+            "resident payload"
+        )
+    finally:
+        await asyncio.to_thread(resident.close)
 
 
 @pytest.mark.asyncio
