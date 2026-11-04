@@ -1031,11 +1031,24 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
-  `messages` and `next_offset` (null at the end). The cursor counts the same
+  `messages` and `next_offset` (null at the end). With negotiated
+  `session_history_backward`, `before: null` returns the newest page and returns
+  `next_before` plus a fixed `history_validator`; continuations use `before` and
+  return complete groups strictly below it in chronological order. Appends are
+  safe, but a branch change returns `-32009` with
+  `stale_history_snapshot`. Backward and forward walks share source groups,
+  but response-local truncation can differ because their envelopes differ.
+  Example request: `{ "session_id": "abc", "before": null }`; the reply has
+  `messages`, `next_before`, and `history_validator: { "end": 12,
+  "entry_id": "..." }`. A continuation supplies both `before` and that
+  validator. `before` and `history_validator` without the feature, mixed with
+  `offset`, or malformed values return `-32602`; a changed validator returns
+  `-32009` with data code `stale_history_snapshot`. The cursor counts the same
   durable message and notification entries as before. The server chooses page
-  sizes: the first page has at most 128 durable entries, and later pages use the
-  frame-size bound. Clients must follow `next_offset` and must not assume a
-  fixed page size. Approval lifecycle entries between cursor entries do not
+  sizes: forward first pages have at most 128 durable entries, and later forward
+  pages use the frame-size bound. Backward first pages are frame-limited, have no
+  128-entry cap, and clients must follow `next_before`. Forward clients must
+  follow `next_offset`; clients must not assume a fixed page size. Approval lifecycle entries between cursor entries do not
   change the cursor value, so an offset issued by an older server resumes
   without a gap or duplicate. All rows projected from one entry are atomic on
   a page. History string fields larger than 8,000 bytes use the existing
@@ -1186,6 +1199,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
+| `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 
 These features are available on protocol 1.1 and 1.2. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

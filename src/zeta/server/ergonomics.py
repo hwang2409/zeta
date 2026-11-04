@@ -237,11 +237,18 @@ def _history_frame_size(
     request_id: str,
     *,
     messages_body_size: int,
-    next_offset: int | None,
+    next_offset: int | None = None,
+    next_before: int | None = None,
+    history_validator: dict[str, object] | None = None,
 ) -> int:
-    empty_page_size = codec.response_size(
-        request_id, {"messages": [], "next_offset": next_offset}
-    )
+    reply = {"messages": [], "next_offset": next_offset}
+    if next_before is not None or history_validator is not None:
+        reply = {
+            "messages": [],
+            "next_before": next_before,
+            "history_validator": history_validator,
+        }
+    empty_page_size = codec.response_size(request_id, reply)
     return empty_page_size + messages_body_size
 
 
@@ -252,8 +259,10 @@ def _history_group_body_size(
 
 
 def _project_history_group(
-    rows: list[dict[str, object]], entry_count: int
+    rows: list[dict[str, object]], envelope: dict[str, object],
 ) -> tuple[tuple[dict[str, object], ...], int]:
+    """Return the group raw, bounded, or as a marker, whichever fits alone in a
+    page with this cursor envelope and the largest legal request id."""
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     raw_group = tuple(rows)
@@ -263,7 +272,7 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=raw_body_size,
-            next_offset=entry_count,
+            **envelope,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -282,7 +291,7 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=body_size,
-            next_offset=entry_count,
+            **envelope,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -347,76 +356,6 @@ def history_projection(
             )
             return built
         return cached.projection
-
-
-def page_history(
-    projection: HistoryProjection,
-    offset: int,
-    *,
-    include_delivery_id: bool,
-) -> tuple[dict[str, object], HistoryProjection]:
-    entry_count = len(projection.entry_groups) - 1
-    if offset > entry_count:
-        return {"messages": [], "next_offset": None}, projection
-    groups = list(projection.groups)
-    body_sizes = list(projection.body_sizes)
-    rows: list[dict[str, object]] = []
-    codec = FrameCodec()
-    request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    stop = min(HISTORY_FIRST_PAGE_ENTRIES, entry_count) if offset == 0 else entry_count
-    indexes = range(offset, stop)
-    if stop == entry_count:
-        indexes = range(offset, stop + 1)
-    next_offset = offset
-    messages_body_size = 0
-    for group_index in indexes:
-        while group_index >= len(groups):
-            next_group_index = len(groups)
-            group, body_size = _project_history_group(
-                [
-                    row
-                    for entry in projection.entry_groups[next_group_index]
-                    for row in _history_entry_rows(
-                        entry,
-                        projection.approval_calls,
-                        include_delivery_id=include_delivery_id,
-                    )
-                ],
-                entry_count,
-            )
-            groups.append(group)
-            body_sizes.append(body_size)
-        group = groups[group_index]
-        group_body_size = body_sizes[group_index]
-        separator_size = int(bool(rows and group))
-        candidate_body_size = messages_body_size + separator_size + group_body_size
-        candidate_offset = min(group_index + 1, entry_count)
-        wire_offset = candidate_offset if candidate_offset < entry_count else None
-        candidate_size = _history_frame_size(
-            codec,
-            request_id,
-            messages_body_size=candidate_body_size,
-            next_offset=wire_offset,
-        )
-        if candidate_size > MAX_FRAME_BYTES and rows:
-            break
-        assert candidate_size <= MAX_FRAME_BYTES
-        rows.extend(group)
-        messages_body_size = candidate_body_size
-        next_offset = candidate_offset
-    expanded = HistoryProjection(
-        projection.entry_groups,
-        projection.approval_calls,
-        tuple(groups),
-        tuple(body_sizes),
-    )
-    return (
-        {
-            "messages": rows,
-            "next_offset": next_offset if next_offset < entry_count else None,
-        },
-        expanded,
-    )
 
 
 def _history_entry_rows(
@@ -544,32 +483,300 @@ def _history_entry_rows(
     return rows
 
 
-def history(
-    runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False
+
+
+def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
+    if end == 0:
+        return None
+    for entry in reversed(projection.entry_groups[end - 1]):
+        if entry.type in {"message", "notification"}:
+            return entry.id
+    return None
+
+
+def _history_group(
+    projection: HistoryProjection,
+    index: int,
+    *,
+    end: int,
+    include_delivery_id: bool,
+    backward: bool,
+    validator: dict[str, object] | None,
+) -> tuple[tuple[dict[str, object], ...], int, tuple[dict[str, object], ...], int]:
+    raw = [
+        row
+        for entry in projection.entry_groups[index]
+        for row in _history_entry_rows(
+            entry, projection.approval_calls,
+            include_delivery_id=include_delivery_id,
+        )
+    ]
+    forward, forward_size = _project_history_group(raw, {"next_offset": end})
+    if not backward:
+        return forward, forward_size, forward, forward_size
+    response, response_size = _project_history_group(
+        raw, {"next_before": end, "history_validator": validator},
+    )
+    return response, response_size, forward, forward_size
+
+
+def _history_group_fits(
+    codec: FrameCodec,
+    request_id: str,
+    group: tuple[dict[str, object], ...],
+    size: int,
+    *,
+    body_size: int,
+    rows: list[dict[str, object]],
+    cursor: int,
+    end: int,
+    backward: bool,
+    validator: dict[str, object] | None,
+    raw_group: tuple[object, ...],
+    projection: HistoryProjection,
+    include_delivery_id: bool = False,
+) -> tuple[bool, tuple[dict[str, object], ...], int]:
+    candidate = body_size + int(bool(rows and group)) + size
+    kwargs = {"next_before": cursor or None, "history_validator": validator} if backward else {
+        "next_offset": cursor if cursor < end else None,
+    }
+    if _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs) <= MAX_FRAME_BYTES:
+        return True, group, size
+    if rows:
+        return False, group, size
+    # Alone on its page, the group must still fit this page's real envelope.
+    raw = [
+        row
+        for entry in raw_group
+        for row in _history_entry_rows(
+            entry, projection.approval_calls,
+            include_delivery_id=include_delivery_id,
+        )
+    ]
+    group, size = _project_history_group(raw, kwargs)
+    candidate = body_size + int(bool(rows and group)) + size
+    return _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs) <= MAX_FRAME_BYTES, group, size
+
+
+def _fit_history_groups(
+    projection: HistoryProjection,
+    indexes: range,
+    *,
+    end: int,
+    include_delivery_id: bool,
+    backward: bool,
+    validator: dict[str, object] | None = None,
+) -> tuple[
+    list[dict[str, object]], list[int], list[tuple[dict[str, object], ...]], HistoryProjection
+]:
+    groups = list(projection.groups)
+    sizes = list(projection.body_sizes)
+    cache_groups = list(projection.groups)
+    cache_sizes = list(projection.body_sizes)
+    rows: list[dict[str, object]] = []
+    selected: list[int] = []
+    response_groups: list[tuple[dict[str, object], ...]] = []
+    body_size = 0
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    for index in indexes:
+        while index >= len(groups):
+            next_index = len(groups)
+            group, size, forward, forward_size = _history_group(
+                projection, next_index, end=end,
+                include_delivery_id=include_delivery_id,
+                backward=backward, validator=validator,
+            )
+            cache_groups.append(forward)
+            cache_sizes.append(forward_size)
+            groups.append(group)
+            sizes.append(size)
+        cursor = index if backward else min(index + 1, end)
+        raw_group = projection.entry_groups[index]
+        fits, group, size = _history_group_fits(
+            codec, request_id, groups[index], sizes[index],
+            body_size=body_size, rows=rows, cursor=cursor, end=end,
+            backward=backward, validator=validator, raw_group=raw_group,
+            projection=projection, include_delivery_id=include_delivery_id,
+        )
+        if not fits:
+            break
+        groups[index], sizes[index] = group, size
+        rows.extend(group)
+        body_size += int(bool(rows[:-len(group)] and group)) + size if group else 0
+        selected.append(index)
+        response_groups.append(group)
+    return rows, selected, response_groups, HistoryProjection(
+        projection.entry_groups, projection.approval_calls,
+        tuple(cache_groups), tuple(cache_sizes),
+    )
+
+def _forward_page_history(
+    projection: HistoryProjection,
+    offset: int,
+    *,
+    include_delivery_id: bool,
+) -> tuple[dict[str, object], HistoryProjection]:
+    entry_count = len(projection.entry_groups) - 1
+    if offset > entry_count:
+        return {"messages": [], "next_offset": None}, projection
+    stop = min(HISTORY_FIRST_PAGE_ENTRIES, entry_count) if offset == 0 else entry_count
+    if stop == entry_count:
+        stop += 1
+    rows, selected, _response_groups, expanded = _fit_history_groups(
+        projection, range(offset, stop), end=entry_count,
+        include_delivery_id=include_delivery_id, backward=False,
+    )
+    next_offset = min(selected[-1] + 1, entry_count) if selected else offset
+    return {"messages": rows, "next_offset": next_offset if next_offset < entry_count else None}, expanded
+
+
+def _backward_page_history(
+    projection: HistoryProjection,
+    before: int,
+    validator: dict[str, object],
+    *,
+    include_delivery_id: bool,
+    first_page: bool = False,
+) -> tuple[dict[str, object], HistoryProjection]:
+    end = len(projection.entry_groups) - 1
+    stable_end = validator["end"]
+    if (
+        not isinstance(stable_end, int)
+        or stable_end > end
+        or validator.get("entry_id") != _history_endpoint(projection, stable_end)
+    ):
+        raise ProtocolError(
+            -32009,
+            "session history changed; restart from the newest page",
+            {"code": "stale_history_snapshot"},
+        )
+    if before < 0 or before > stable_end + int(first_page):
+        raise ProtocolError(-32602, "before must not exceed history end")
+    rows, selected, response_groups, expanded = _fit_history_groups(
+        projection, range(before - 1, -1, -1), end=end,
+        include_delivery_id=include_delivery_id, backward=True,
+        validator=validator,
+    )
+    selected.reverse()
+    response_groups.reverse()
+    rows = [row for group in response_groups for row in group]
+    boundary = selected[0] if selected else 0
+    return {
+        "messages": rows,
+        "next_before": boundary if boundary > 0 else None,
+        "history_validator": validator,
+    }, expanded
+
+
+def page_history(
+    projection: HistoryProjection,
+    cursor: int | None,
+    *,
+    include_delivery_id: bool,
+    backward: bool = False,
+    validator: dict[str, object] | None = None,
+    first_page: bool = False,
+) -> tuple[dict[str, object], HistoryProjection]:
+    assert cursor is not None
+    if backward:
+        assert validator is not None
+        return _backward_page_history(
+            projection, cursor, validator,
+            include_delivery_id=include_delivery_id, first_page=first_page,
+        )
+    return _forward_page_history(projection, cursor, include_delivery_id=include_delivery_id)
+
+def _publish_history_page(
+    store: ConversationStore,
+    generation: tuple[int, bytes],
+    result: dict,
+    expanded: HistoryProjection,
+    include_delivery_id: bool,
 ) -> dict:
-    offset = params.get("offset", 0)
-    if type(offset) is not int or offset < 0:
-        raise ProtocolError(-32602, "offset must be a nonnegative integer")
+    with _cache_creation_lock:
+        cached = _cache(store, include_delivery_id)
+        if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
+            _publish_cache(store, include_delivery_id, _CachedProjection(generation, expanded))
+    return result
+
+
+def _backward_history_request(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+) -> dict:
+    before = params["before"]
+    validator = params.get("history_validator")
+    if before is None:
+        validator = {"end": 0, "entry_id": None}
+    store = runtime.opened.store
+    generation = _generation(store)
+    projection = history_projection(store, include_delivery_id=include_delivery_id)
+    end = len(projection.entry_groups) - 1
+    if before is None:
+        validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
+        cursor, first_page = end + 1, True
+    else:
+        cursor, first_page = before, False
+    result, expanded = page_history(
+        projection, cursor, include_delivery_id=include_delivery_id,
+        backward=True, validator=validator, first_page=first_page,
+    )
+    return _publish_history_page(store, generation, result, expanded, include_delivery_id)
+
+
+def _forward_history_request(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+) -> dict:
     store = runtime.opened.store
     generation = _generation(store)
     projection = history_projection(store, include_delivery_id=include_delivery_id)
     result, expanded = page_history(
-        projection, offset, include_delivery_id=include_delivery_id
+        projection, params.get("offset", 0), include_delivery_id=include_delivery_id,
     )
-    with _cache_creation_lock:
-        cached = _cache(store, include_delivery_id)
-        if (
-            cached is not None
-            and cached.generation == generation
-            and len(cached.projection.groups) < len(expanded.groups)
-        ):
-            _publish_cache(
-                store,
-                include_delivery_id,
-                _CachedProjection(generation, expanded),
-            )
-    return result
+    return _publish_history_page(store, generation, result, expanded, include_delivery_id)
 
+
+def _validate_history_params(params: dict) -> None:
+    if set(params) - {"session_id", "before", "history_validator"}:
+        raise ProtocolError(-32602, "invalid backward session history parameters")
+    before = params["before"]
+    if before is not None and (type(before) is not int or before < 0):
+        raise ProtocolError(-32602, "before must be null or a nonnegative integer")
+    validator = params.get("history_validator")
+    if before is None and "history_validator" in params:
+        raise ProtocolError(-32602, "history_validator is only valid for continuations")
+    if before is not None and (
+        not isinstance(validator, dict)
+        or set(validator) != {"end", "entry_id"}
+        or type(validator.get("end")) is not int
+        or validator.get("end") < 0
+        or (validator.get("entry_id") is not None and not isinstance(validator.get("entry_id"), str))
+    ):
+        raise ProtocolError(-32602, "history_validator is invalid")
+
+
+def history(
+    runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False,
+    backward_enabled: bool = False,
+) -> dict:
+    backward_keys = {"before", "history_validator"}
+    if backward_keys.intersection(params) and not backward_enabled:
+        raise ProtocolError(-32602, "backward session history requires negotiation")
+    if "before" in params:
+        _validate_history_params(params)
+        return _backward_history_request(runtime, params, include_delivery_id=include_delivery_id)
+    if backward_keys.intersection(params):
+        raise ProtocolError(-32602, "invalid session history parameters")
+    offset = params.get("offset", 0)
+    if type(offset) is not int or offset < 0:
+        raise ProtocolError(-32602, "offset must be a nonnegative integer")
+    return _forward_history_request(runtime, params, include_delivery_id=include_delivery_id)
 
 def settings(runtime: ServerRuntime) -> dict:
     return {"model": runtime.model, "approval_mode": runtime.policy.default.value}
