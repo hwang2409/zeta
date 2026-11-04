@@ -5205,9 +5205,9 @@ async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> Non
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=30)
     loop.abort()
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=30)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     grandchild_store = ConversationStore(

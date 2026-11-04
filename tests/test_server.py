@@ -79,7 +79,9 @@ from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
-TIMEOUT = 3
+# A hang guard for waits on real frames, not a speed limit: a loaded CI
+# runner can take more than a few seconds between frames.
+TIMEOUT = 30
 
 
 def _client_notifier(client: _Client):
