@@ -274,6 +274,70 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_content_read_rejects_session_id_for_controller_and_observer(
+    tmp_path: Path,
+) -> None:
+    from zeta.server import ZetaServer
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    observer_reader = observer_writer = None
+    try:
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["content_read"]},
+        )
+        controller = (
+            await _request(
+                controller_reader,
+                controller_writer,
+                2,
+                "content_read",
+                {"handle": "r1.missing.mc.0", "session_id": "unexpected"},
+            )
+        )[-1]["error"]
+
+        observer_reader, observer_writer = await asyncio.open_connection(
+            "127.0.0.1", server.port
+        )
+        await _request(
+            observer_reader,
+            observer_writer,
+            3,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "content_read"],
+            },
+        )
+        observer = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                4,
+                "content_read",
+                {"handle": "r1.missing.mc.0", "session_id": "unexpected"},
+            )
+        )[-1]["error"]
+
+        expected = {
+            "code": -32602,
+            "message": "invalid content read",
+            "data": {"code": "invalid_content_read"},
+        }
+        assert controller == observer == expected
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
+        await _close(server, controller_writer)
+
+
+@pytest.mark.asyncio
 async def test_handle_is_scoped_to_session_for_controller_and_observer(tmp_path: Path) -> None:
     from zeta.server import ZetaServer
     first = ZetaServer(home=tmp_path / "a", port=0, provider="codex")

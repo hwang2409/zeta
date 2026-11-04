@@ -1067,6 +1067,20 @@ error code and message. Provider status and origin remain internal.
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.
+- `content_read`: reads the raw bytes for an inline image row. The session is
+  implicit: it is the attached session, so `session_id` must not be supplied.
+  Params are `{ "handle": string, "offset"?: integer, "limit"?: integer }`.
+  `offset` defaults to `0`; `limit` defaults to `524288` and is capped at
+  `524288` raw bytes. The reply is `{ "handle": string, "media_type": string,
+  "title": string, "size": integer, "offset": integer, "data": string,
+  "next_offset": integer, "eof": boolean }`, where `data` is base64-encoded
+  raw content.
+
+  | code | data.code | meaning |
+  | ---: | --- | --- |
+  | `-32601` | — | `content_read` was not negotiated |
+  | `-32602` | `invalid_content_read` | params are invalid, including when `session_id` is supplied |
+  | `-32012` | `content_not_found` | the handle does not resolve to an inline image row |
 - `model_catalog`: returns `models`, sorted names from both built-in real provider
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
 - `session_settings`: returns `model` and `approval_mode`.
@@ -1201,9 +1215,9 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_history_fidelity` | preserves negotiated tool-result image metadata stubs in `session_history` |
-| `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity |
+| `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
-These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnects and restarts while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
+These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
 work without the extensions when it connects to that older server.
 
