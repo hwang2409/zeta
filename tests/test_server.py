@@ -356,9 +356,13 @@ async def test_repeated_stalled_unix_writes_close_each_transport(
             original_write = codec.write
 
             async def write(
-                target: object, payload: bytes, *, _original=original_write
+                target: object,
+                payload: bytes,
+                *,
+                _original=original_write,
+                _started=write_started,
             ) -> bool:
-                write_started.set()
+                _started.set()
                 return await _original(target, payload)
 
             codec.write = write  # type: ignore[method-assign]

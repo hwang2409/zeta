@@ -106,7 +106,7 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
             if transport is not None:
                 try:
                     transport.abort()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - abort must not block cleanup
                     pass
             task.cancel()
             continue
