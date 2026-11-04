@@ -48,6 +48,8 @@ from zeta.tools._shared.process import (
     _group_exists,
     _OrderedLogWriter,
 )
+from zeta.tools._shared import background_spawn as spawn_module
+from zeta.tools._shared.background_spawn import _terminate_process
 from zeta.tui.render import format_status
 
 
@@ -57,6 +59,32 @@ def _python(*parts: str) -> str:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_termination_does_not_signal_reused_descendant_pid(monkeypatch) -> None:
+    snapshots = iter(({42: "old"}, {42: "new"}))
+    signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 10
+        returncode = None
+
+        async def wait(self) -> None:
+            await asyncio.sleep(0.01)
+            self.returncode = -9
+
+    async def snapshot(_):
+        return next(snapshots)
+
+    monkeypatch.setattr(spawn_module, "_descendant_pids", snapshot)
+    monkeypatch.setattr(spawn_module, "_signal_group", lambda process, number: None)
+    monkeypatch.setattr(spawn_module, "_signal_pids", lambda pids, number: signals.extend(
+        (pid, number) for pid in pids
+    ))
+
+    await _terminate_process(Process(), 0.001)
+    assert signals == [(42, signal.SIGTERM)]
 
 
 def _task_notification(item: TaskExitInput) -> pending_delivery_module.NotificationInput:

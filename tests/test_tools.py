@@ -2339,7 +2339,7 @@ async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Pa
 async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> None:
     holder_pid = tmp_path / "holder.pid"
     child = (
-        "import os,pathlib,time; "
+        "import os,pathlib,time; os.setsid(); "
         f"pathlib.Path({str(holder_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
     )
     command = _python_command(
