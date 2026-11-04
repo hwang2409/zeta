@@ -171,12 +171,25 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         del args, kwargs
         raise RuntimeError("registry clone exploded")
 
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    lifecycle_read = agent_tools._read_agent_lifecycle
+
+    def tracked_lifecycle_read(path: str) -> dict[str, object]:
+        read_threads.append(threading.get_ident())
+        return lifecycle_read(path)
+
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
+    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", tracked_lifecycle_read)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _result(store, call.id)
     assert result.is_error is True
     assert result.structured_content is not None
+    assert "0 turns" in result.content
+    assert "0 tool calls" in result.content
+    assert "error=true · canceled=false" in result.content
+    assert loop_thread not in read_threads
     handle = result.structured_content["child_instance_id"]
     assert type(handle) is str
 
@@ -726,6 +739,66 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
     assert read_threads and loop_thread not in read_threads
     await loop.close()
     child.close()
+
+
+@pytest.mark.asyncio
+async def test_full_child_runs_never_read_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle_read = agent_tools._read_agent_lifecycle
+    loop_reads: list[str] = []
+
+    def guarded_lifecycle_read(path: str) -> dict[str, object]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            loop_reads.append(path)
+        return lifecycle_read(path)
+
+    monkeypatch.setattr(agent_tools, "_read_agent_lifecycle", guarded_lifecycle_read)
+
+    async def run_child(case: str) -> None:
+        call = ToolCall(
+            f"child-{case}",
+            "agent",
+            {"prompt": "inspect", "description": case},
+        )
+        turns = [ScriptedTurn(tool_calls=[call])]
+        if case == "success":
+            turns.append(ScriptedTurn([TextContent("done")]))
+        elif case == "cancel":
+            turns.append(ScriptedTurn([TextContent("late")], delay=10))
+        store = ConversationStore(tmp_path / case)
+        loop = AgentLoop(
+            FakeBackend(turns),
+            store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        if case == "setup-failure":
+            def fail_clone(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+                raise RuntimeError("registry clone exploded")
+
+            monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
+        task = asyncio.create_task(
+            _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        )
+        if case == "cancel":
+            while len(loop.backend.calls) < 2:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+        await loop.close()
+
+    for case in ("success", "failure", "cancel", "setup-failure"):
+        await run_child(case)
+    assert loop_reads == []
 
 
 @pytest.mark.asyncio
