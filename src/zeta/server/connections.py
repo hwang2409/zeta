@@ -9,11 +9,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import ergonomics
+from . import content, ergonomics
 from .protocol import ProtocolError
 
 OBSERVER_REQUESTS = frozenset({
-    "list_sessions", "status", "session_tree", "session_history",
+    "list_sessions", "status", "session_tree", "session_history", "content_read",
     "model_catalog", "session_settings", "ping", "delivery_status",
 })
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
@@ -296,7 +296,7 @@ class ConnectionRegistry:
                 target,
                 params,
                 include_delivery_id=include_delivery_id,
-                backward_enabled="session_history_backward" in features,
+                backward_enabled="session_history_backward" in features, fidelity="session_history_fidelity" in features, content_read="content_read" in features,
             ),
             session_id=target[0],
         )
@@ -368,11 +368,16 @@ class ConnectionRegistry:
             "session_tree",
             "session_history",
             "model_catalog",
-            "session_settings",
+            "session_settings", "content_read",
         }:
             return False, None
         if method in {"session_tree", "session_history"}:
             return True, await self.read_session(connection, method, params)
+        if method == "content_read":
+            if "content_read" not in state.features:
+                raise ProtocolError(-32601, "content_read requires the negotiated content_read feature")
+            target = capture_read(connection, method, params)
+            return True, await self.run_read(connection, lambda: perform_read(method, target, params), session_id=target[0])
         if method == "list_sessions":
             result, _ = await self.run_read(
                 connection, lambda: connection._list_sessions(request_id, params)
@@ -383,7 +388,7 @@ class ConnectionRegistry:
             connection,
             lambda: perform_read(
                 method, target, params,
-                backward_enabled="session_history_backward" in state.features,
+                backward_enabled="session_history_backward" in state.features, fidelity="session_history_fidelity" in state.features, content_read="content_read" in state.features,
             ),
             session_id=target[0],
         )
@@ -407,7 +412,7 @@ class ConnectionRegistry:
 
 def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
     runtime = client.server.runtime
-    if method in {"session_tree", "session_history"}:
+    if method in {"session_tree", "session_history", "content_read"}:
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
@@ -446,6 +451,8 @@ def perform_read(
     *,
     include_delivery_id: bool = False,
     backward_enabled: bool = False,
+    fidelity: bool = False,
+    content_read: bool = False,
 ) -> object:
     if method == "status":
         return project_status(target[1])
@@ -462,5 +469,9 @@ def perform_read(
             params,
             include_delivery_id=include_delivery_id,
             backward_enabled=backward_enabled,
+            fidelity=fidelity,
+            content_read=content_read,
         )
+    if method == "content_read":
+        return content.read(store, params.get("handle"), offset=params.get("offset", 0), limit=params.get("limit", content.MAX_CONTENT_READ))
     raise ProtocolError(-32601, "method not found")
