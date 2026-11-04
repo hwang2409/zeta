@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +11,8 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_client import event as _event
+from tests.support.server_client import request as _request
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ErrorInfo,
@@ -43,42 +44,6 @@ async def _connect(server: ZetaServer):
     return await asyncio.wait_for(
         asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
     )
-
-
-async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
-    line = await asyncio.wait_for(reader.readline(), TIMEOUT)
-    assert line
-    return json.loads(line)
-
-
-async def _request(reader, writer, request_id, method, params=None):
-    writer.write(
-        (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params or {},
-                }
-            )
-            + "\n"
-        ).encode()
-    )
-    await writer.drain()
-    frames = []
-    while True:
-        frame = await _read(reader)
-        frames.append(frame)
-        if frame.get("id") == request_id:
-            return frames
-
-
-async def _event(reader, name):
-    while True:
-        frame = await _read(reader)
-        if frame.get("params", {}).get("event") == name:
-            return frame["params"]
 
 
 async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:

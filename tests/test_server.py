@@ -33,6 +33,19 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
+from tests.support.server_client import discard_buffered as _discard_buffered
+from tests.support.server_client import (
+    event as _buffered_event,
+)
+from tests.support.server_client import (
+    frames_until_event as _buffered_frames_until_event,
+)
+from tests.support.server_client import (
+    read as _buffered_read,
+)
+from tests.support.server_client import (
+    request as _buffered_request,
+)
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -664,61 +677,16 @@ async def _connect(server: ZetaServer):
     return await asyncio.wait_for(asyncio.open_connection("127.0.0.1", server.port), TIMEOUT)
 
 
-async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
-    line = await asyncio.wait_for(reader.readline(), TIMEOUT)
-    assert line, "server closed the socket"
-    return json.loads(line)
+_read = _buffered_read
+_request = _buffered_request
+_frames_until_event = _buffered_frames_until_event
+_event = _buffered_event
 
 
 async def _read_raw(reader: asyncio.StreamReader) -> bytes:
     line = await asyncio.wait_for(reader.readline(), TIMEOUT)
     assert line, "server closed the socket"
     return line
-
-
-async def _request(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    request_id: str | int,
-    method: str,
-    params: dict[str, object] | None = None,
-) -> list[dict[str, Any]]:
-    writer.write(
-        (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params or {},
-                }
-            )
-            + "\n"
-        ).encode()
-    )
-    await asyncio.wait_for(writer.drain(), TIMEOUT)
-    frames: list[dict[str, Any]] = []
-    while True:
-        frame = await _read(reader)
-        frames.append(frame)
-        if frame.get("id") == request_id:
-            return frames
-
-
-async def _frames_until_event(
-    reader: asyncio.StreamReader, name: str
-) -> list[dict[str, Any]]:
-    frames: list[dict[str, Any]] = []
-    while True:
-        frame = await _read(reader)
-        frames.append(frame)
-        if frame.get("params", {}).get("event") == name:
-            return frames
-
-
-async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
-    frames = await _frames_until_event(reader, name)
-    return frames[-1]["params"]
 
 
 def _named_events(
@@ -1209,6 +1177,7 @@ async def test_session_history_matches_live_approval_lifecycle(
             {"request_id": live_request["request_id"]} if decision != "abort" else {}
         )
         frames = await _request(reader, writer, 4, method, params)
+        _discard_buffered(reader, frames)
         terminal = "agent_end" if decision != "abort" else "turn_aborted"
         if not _named_events(frames, terminal):
             frames += await _frames_until_event(reader, terminal)
@@ -2064,7 +2033,7 @@ async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) 
         frames = await _request(
             reader, writer, 4, "deny", {"request_id": approval["request_id"]}
         )
-        frames += await _frames_until_event(reader, "turn_end")
+        await _frames_until_event(reader, "turn_end")
         ends = _named_events(frames, "approval_end")
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
@@ -2121,17 +2090,15 @@ async def test_lifecycle_prunes_ended_approvals(
         for index in range(turns):
             await _request(reader, writer, 3 + index * 2, "send", {"text": "read it"})
             approval = await _event(reader, "approval_request")
-            frames = await _request(
+            await _request(
                 reader,
                 writer,
                 4 + index * 2,
                 "deny",
                 {"request_id": approval["request_id"]},
             )
-            if not _named_events(frames, "tool_end"):
-                frames += await _frames_until_event(reader, "tool_end")
-            if not _named_events(frames, "agent_end"):
-                frames += await _frames_until_event(reader, "agent_end")
+            await _frames_until_event(reader, "tool_end")
+            await _frames_until_event(reader, "agent_end")
 
         assert server._client is not None
         assert server.control._approvals.state.records == {}
@@ -2222,9 +2189,8 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
         assert next_ask["request_id"] == "call-3", (
             "read must auto-approve after always_tool, so the next ask is bash"
         )
-        frames = await _request(reader, writer, 5, "deny", {"request_id": "call-3"})
-        if not _named_events(frames, "turn_end"):
-            frames += await _frames_until_event(reader, "turn_end")
+        await _request(reader, writer, 5, "deny", {"request_id": "call-3"})
+        await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
@@ -2314,9 +2280,8 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
             assert error["code"] == -32602, f"scope={bad_scope!r} error {error!r}"
             assert error["message"] == "scope must be 'once' or 'always_tool'"
             next_id += 1
-        frames = await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
-        if not _named_events(frames, "turn_end"):
-            frames += await _frames_until_event(reader, "turn_end")
+        await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
+        await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
