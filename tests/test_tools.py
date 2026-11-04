@@ -7,6 +7,7 @@ import os
 import pty
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2342,9 +2343,13 @@ async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> N
         "import os,pathlib,time; os.setsid(); "
         f"pathlib.Path({str(holder_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
     )
+    helper = (
+        "import subprocess,sys,os; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); os._exit(0)"
+    )
     command = _python_command(
         "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+        f"subprocess.Popen([sys.executable, '-c', {helper!r}]); time.sleep(30)"
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     started = await registry.execute(
@@ -2358,11 +2363,11 @@ async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> N
     assert holder_pid.exists()
 
     await asyncio.wait_for(registry.close(), timeout=3)
-    status = await registry.background_tasks.wait(task_id)
+    status = await registry.background_tasks.output(task_id)
     assert status["running"] is False
+    assert "background output was cut off" in status["note"]
     escaped = int(holder_pid.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(escaped, 0)
+    os.kill(escaped, signal.SIGKILL)
     await registry.close()
 
 
