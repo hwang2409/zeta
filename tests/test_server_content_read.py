@@ -95,8 +95,14 @@ def test_repeated_chunks_do_not_scan_a_large_projection(monkeypatch: pytest.Monk
     store, projection, raw = _store()
     scanned = 0
 
-    class NoScan(dict[str, object]):
-        def __iter__(self):
+    class NoScan:
+        def __init__(self, entries: dict[str, object]) -> None:
+            self._entries = entries
+
+        def get(self, key: str, default: object = None) -> object:
+            return self._entries.get(key, default)
+
+        def items(self):
             nonlocal scanned
             scanned += 1
             raise AssertionError("content resolution scanned the projection")
