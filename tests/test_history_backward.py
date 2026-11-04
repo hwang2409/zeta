@@ -360,3 +360,145 @@ async def test_real_socket_backward_near_limit_groups_never_overflow_frame(
         assert result["next_before"] is None
         assert len(seen) == len(sizes)
         assert "marker" in seen
+
+
+async def _raw_request(reader: object, writer: object, request_id: object, method: str, params: dict[str, object]) -> dict[str, object]:
+    writer.write((protocol.json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+    }) + "\n").encode())
+    await writer.drain()
+    while True:
+        line = await asyncio.wait_for(reader.readline(), 30)
+        frame = protocol.json.loads(line)
+        if frame.get("id") == request_id:
+            assert len(line) <= protocol.MAX_FRAME_BYTES + 1
+            return frame
+
+
+@pytest.mark.asyncio
+async def test_real_socket_backward_after_forward_cache_never_drops_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """a newest group already cached by a forward read is reprojected for the
+    real backward cursor, so it comes back raw or as a marker, never dropped."""
+    limit = 8_000
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", limit)
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", limit)
+    fillers = 100
+    big_request_id = "\x00" * protocol.MAX_REQUEST_ID_BYTES
+    async with _real_history_server(tmp_path, count=0) as (reader, writer, _first, server):
+        ids = iter(range(10_000, 1_000_000))
+
+        async def walk(size: int) -> list[str]:
+            session = (await _raw_request(
+                reader, writer, next(ids), "new_session", {"provider": "codex"}
+            ))["result"]["session"]["session_id"]
+            store = server.runtime.opened.store
+            for number in range(fillers):
+                store.append_message(with_message_origin(
+                    Message(MessageRole.USER, [TextContent("f")]), MessageOrigin.USER,
+                ))
+            store.append_message(with_message_origin(
+                Message(MessageRole.USER, [TextContent("big:" + "x" * size)]), MessageOrigin.USER,
+            ))
+            # fill the forward cache with every group first
+            offset: int | None = 0
+            while offset is not None:
+                forward = await _raw_request(
+                    reader, writer, next(ids), "session_history",
+                    {"session_id": session, "offset": offset},
+                )
+                assert "error" not in forward, forward
+                assert forward["result"]["messages"] or forward["result"]["next_offset"] is None
+                offset = forward["result"]["next_offset"]
+            seen: list[str] = []
+            params: dict[str, object] = {"before": None}
+            for _page in range(fillers + 3):
+                frame = await _raw_request(
+                    reader, writer, big_request_id, "session_history", {"session_id": session, **params}
+                )
+                assert "error" not in frame, frame["error"]
+                result = frame["result"]
+                if not result["messages"]:
+                    assert result["next_before"] is None, result
+                for row in result["messages"]:
+                    text = row["content"][0]["text"]
+                    seen.append("marker" if text == ergonomics.HISTORY_GROUP_TRUNCATED else text[:4])
+                if result["next_before"] is None:
+                    return seen
+                params = {"before": result["next_before"], "history_validator": result["history_validator"]}
+            raise AssertionError("backward walk did not end")
+
+        # find the largest newest group still returned raw, then step one
+        # byte at a time across the envelope difference above it.
+        low, high = 6_000, 7_800
+        while low < high:
+            middle = (low + high + 1) // 2
+            if "big:" in await walk(middle):
+                low = middle
+            else:
+                high = middle - 1
+        for size in range(low - 2, low + 6):
+            seen = await walk(size)
+            assert len(seen) == fillers + 1, (size, seen[:3], len(seen))
+            assert {"big:", "marker"} & set(seen), (size, seen[-3:])
+
+
+def test_backward_after_forward_cache_reprojects_for_real_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """a newest group cached raw by a forward read, a few bytes too large for
+    the backward envelope, comes back as a marker, not as an empty page."""
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 8_000)
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
+    for size in range(6_700, 7_300):
+        big = SimpleNamespace(
+            id="big", type="message",
+            data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
+        )
+        store = _HistoryStore([_entry(i) for i in range(100)] + [big])
+        # fill the forward cache with every group; each forward page must
+        # make progress and the walk must return every group.
+        offset: int | None = 0
+        forward_ids: list[str] = []
+        while offset is not None:
+            page = ergonomics.history(_runtime(store), {"offset": offset})
+            assert page["messages"] or page["next_offset"] is None, (size, offset)
+            forward_ids.extend(row["id"] for row in page["messages"])
+            offset = page["next_offset"]
+        assert len(forward_ids) == 101, (size, len(forward_ids))
+        seen: list[str] = []
+        params: dict[str, object] = {"before": None}
+        for _page in range(110):
+            page = _backward_history(store, params)
+            assert page["messages"] or page["next_before"] is None, (size, page["next_before"])
+            seen.extend(row["id"] for row in page["messages"])
+            if page["next_before"] is None:
+                break
+            params = {"before": page["next_before"], "history_validator": page["history_validator"]}
+        assert len(seen) == 101, (size, len(seen))
+
+
+def test_forward_walk_progresses_when_last_group_is_near_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """the last page's next_offset is null, wider than the cursor the group was
+    projected for; the group must still come back instead of an empty page."""
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 8_000)
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
+    for size in range(6_700, 7_300):
+        big = SimpleNamespace(
+            id="big", type="message",
+            data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
+        )
+        store = _HistoryStore([_entry(i) for i in range(100)] + [big])
+        offset: int | None = 0
+        seen: list[str] = []
+        while offset is not None:
+            page = ergonomics.history(_runtime(store), {"offset": offset})
+            assert page["messages"] or page["next_offset"] is None, (size, offset)
+            payload = FrameCodec().response("\x00" * protocol.MAX_REQUEST_ID_BYTES, page)
+            assert b'"error"' not in payload and len(payload) <= 8_000, size
+            seen.extend(row["id"] for row in page["messages"])
+            offset = page["next_offset"]
+        assert seen[-1] == "big", size

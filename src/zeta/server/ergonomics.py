@@ -259,9 +259,10 @@ def _history_group_body_size(
 
 
 def _project_history_group(
-    rows: list[dict[str, object]], entry_count: int, *, backward: bool = False,
-    validator: dict[str, object] | None = None,
+    rows: list[dict[str, object]], envelope: dict[str, object],
 ) -> tuple[tuple[dict[str, object], ...], int]:
+    """Return the group raw, bounded, or as a marker, whichever fits alone in a
+    page with this cursor envelope and the largest legal request id."""
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     raw_group = tuple(rows)
@@ -271,9 +272,7 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=raw_body_size,
-            next_offset=None if backward else entry_count,
-            next_before=entry_count if backward else None,
-            history_validator=validator if backward else None,
+            **envelope,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -292,9 +291,7 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=body_size,
-            next_offset=None if backward else entry_count,
-            next_before=entry_count if backward else None,
-            history_validator=validator if backward else None,
+            **envelope,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -514,11 +511,11 @@ def _history_group(
             include_delivery_id=include_delivery_id,
         )
     ]
-    forward, forward_size = _project_history_group(raw, end)
+    forward, forward_size = _project_history_group(raw, {"next_offset": end})
     if not backward:
         return forward, forward_size, forward, forward_size
     response, response_size = _project_history_group(
-        raw, end, backward=True, validator=validator,
+        raw, {"next_before": end, "history_validator": validator},
     )
     return response, response_size, forward, forward_size
 
@@ -535,18 +532,19 @@ def _history_group_fits(
     end: int,
     backward: bool,
     validator: dict[str, object] | None,
-    raw_group: tuple[object, ...] | None = None,
-    projection: HistoryProjection | None = None,
+    raw_group: tuple[object, ...],
+    projection: HistoryProjection,
     include_delivery_id: bool = False,
 ) -> tuple[bool, tuple[dict[str, object], ...], int]:
     candidate = body_size + int(bool(rows and group)) + size
-    kwargs = {"next_before": cursor, "history_validator": validator} if backward else {
+    kwargs = {"next_before": cursor or None, "history_validator": validator} if backward else {
         "next_offset": cursor if cursor < end else None,
     }
     if _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs) <= MAX_FRAME_BYTES:
         return True, group, size
-    if rows or not backward or projection is None or raw_group is None:
+    if rows:
         return False, group, size
+    # Alone on its page, the group must still fit this page's real envelope.
     raw = [
         row
         for entry in raw_group
@@ -555,7 +553,7 @@ def _history_group_fits(
             include_delivery_id=include_delivery_id,
         )
     ]
-    group, size = _project_history_group(raw, 0, backward=True, validator=validator)
+    group, size = _project_history_group(raw, kwargs)
     candidate = body_size + int(bool(rows and group)) + size
     return _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs) <= MAX_FRAME_BYTES, group, size
 
@@ -594,7 +592,7 @@ def _fit_history_groups(
             groups.append(group)
             sizes.append(size)
         cursor = index if backward else min(index + 1, end)
-        raw_group = projection.entry_groups[index] if backward else None
+        raw_group = projection.entry_groups[index]
         fits, group, size = _history_group_fits(
             codec, request_id, groups[index], sizes[index],
             body_size=body_size, rows=rows, cursor=cursor, end=end,
