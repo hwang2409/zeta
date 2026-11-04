@@ -9,6 +9,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,7 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
+from zeta.server.control import ServeControl
 from zeta.server.protocol import FrameCodec
 from zeta.server.server import _Client
 
@@ -105,6 +107,47 @@ class _ControllerConnection:
 
     async def close(self) -> None:
         pass
+
+
+@pytest.mark.asyncio
+async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset({"memory_updated"}))
+    control = object.__new__(ServeControl)
+    control.closing = False
+    control.server = SimpleNamespace(connections=registry)
+    control._notify = lambda event, session_id=None, **fields: registry.publish_controller(event, session_id, **fields)
+    control._publish_memory_notice("session", "updated")
+    await asyncio.sleep(0)
+    registry.controller_ready(connection)
+    await registry.flush_controller(connection)
+    assert json.loads(connection.frames[0])["params"]["event"] == "memory_updated"
+    registry.release(connection)
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    control = object.__new__(ServeControl)
+    control.server = SimpleNamespace(connections=registry)
+    assert control._protocol_version() == "1.2"
+    registry.release(connection)
+    await registry.aclose()
+
+
+def test_no_server_caller_branches_on_ready_controller() -> None:
+    server_sources = "".join(
+        path.read_text()
+        for path in Path("src/zeta/server").glob("*.py")
+        if path.name != "connections.py"
+    )
+    assert "current_controller" not in server_sources
 
 
 @pytest.mark.asyncio

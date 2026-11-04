@@ -152,9 +152,9 @@ class ConnectionRegistry:
         finally:
             state.flushing = False
 
-    def current_controller(self) -> ControllerMetadata | None:
+    def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
-        if state is None or not state.ready:
+        if state is None:
             return None
         return ControllerMetadata(state.connection, state.protocol_version, state.features)
 
@@ -171,9 +171,8 @@ class ConnectionRegistry:
             and fields["data"].get("reason") == "grace_expired"
         ):
             return False
-        controller = self.current_controller()
         frame = state.connection.codec.notification(event, session_id, **fields)
-        if controller is None or state.flushing:
+        if not state.ready or state.flushing:
             if state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES:
                 state.overflowed = True
                 state.buffered_frames.clear()
@@ -182,7 +181,7 @@ class ConnectionRegistry:
             state.buffered_frames.append(frame)
             state.buffered_bytes += len(frame)
             return True
-        return await self.send(controller.connection, frame)
+        return await state.connection._write_physical(frame)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)

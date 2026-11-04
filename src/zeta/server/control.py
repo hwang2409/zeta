@@ -666,7 +666,7 @@ class ServeControl:
     def _protocol_version(self) -> str:
         connections = self.server.connections
         controller = (
-            connections.current_controller() if connections is not None else None
+            connections.controller_metadata() if connections is not None else None
         )
         return controller.protocol_version if controller is not None else "1.0"
 
@@ -680,7 +680,7 @@ class ServeControl:
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
         controller = (
-            self.server.connections.current_controller()
+            self.server.connections.controller_metadata()
             if self.server.connections
             else None
         )
