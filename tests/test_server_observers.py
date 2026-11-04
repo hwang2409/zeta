@@ -774,3 +774,42 @@ async def test_observer_hello_advertises_only_callable_requests(
         await _close(server, controller_writer)
         writer.close()
         await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_observer_history_shape_matches_negotiated_backward_feature(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    controller_reader, controller_writer = await _connect(server)
+    await _request(controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"})
+    session_id = (await _request(
+        controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+    ))[-1]["result"]["session"]["session_id"]
+    server.runtime.opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER
+        )
+    )
+    backward_reader, backward_writer = await _observer(
+        server, 3, features=["serve_observers", "session_history_backward"]
+    )
+    forward_reader, forward_writer = await _observer(server, 4, features=["serve_observers"])
+    try:
+        backward = (await _request(
+            backward_reader, backward_writer, 5, "session_history",
+            {"session_id": session_id, "before": None},
+        ))[-1]
+        assert "error" not in backward
+        assert "next_before" in backward["result"]
+        forward = (await _request(
+            forward_reader, forward_writer, 6, "session_history",
+            {"session_id": session_id, "offset": 0},
+        ))[-1]
+        assert "error" not in forward
+        assert "next_offset" in forward["result"]
+        assert "next_before" not in forward["result"]
+    finally:
+        backward_writer.close()
+        forward_writer.close()
+        await backward_writer.wait_closed()
+        await forward_writer.wait_closed()
+        await _close(server, controller_writer)
