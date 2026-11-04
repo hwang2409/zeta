@@ -12,6 +12,7 @@ import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -175,8 +176,10 @@ HISTORY_GROUP_TRUNCATED = "[history group too large; truncated]"
 
 @dataclass(frozen=True, slots=True)
 class HistoryProjection:
-    groups: tuple[tuple[dict[str, object], ...], ...]
-    body_sizes: tuple[int, ...]
+    entry_groups: tuple[tuple[Any, ...], ...]
+    approval_calls: Mapping[str, object]
+    groups: tuple[tuple[dict[str, object], ...], ...] = ()
+    body_sizes: tuple[int, ...] = ()
 
 
 @dataclass
@@ -320,25 +323,8 @@ def history_projection(
         elif entry.type in {"approval_resolution", "approval_history"}:
             entries[-1].append(entry)
 
-    entry_count = len(entries) - 1
-    projected = tuple(
-        _project_history_group(
-            [
-                row
-                for entry in group
-                for row in _history_entry_rows(
-                    entry,
-                    approval_calls,
-                    include_delivery_id=include_delivery_id,
-                )
-            ],
-            entry_count,
-        )
-        for group in entries
-    )
     built = HistoryProjection(
-        tuple(group for group, _ in projected),
-        tuple(body_size for _, body_size in projected),
+        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls)
     )
     with _cache_creation_lock:
         cached = _cache(store, include_delivery_id)
@@ -350,11 +336,17 @@ def history_projection(
         return cached.projection
 
 
-def page_history(projection: HistoryProjection, offset: int) -> dict[str, object]:
-    groups = projection.groups
-    entry_count = len(groups) - 1
+def page_history(
+    projection: HistoryProjection,
+    offset: int,
+    *,
+    include_delivery_id: bool,
+) -> tuple[dict[str, object], HistoryProjection]:
+    entry_count = len(projection.entry_groups) - 1
     if offset > entry_count:
-        return {"messages": [], "next_offset": None}
+        return {"messages": [], "next_offset": None}, projection
+    groups = list(projection.groups)
+    body_sizes = list(projection.body_sizes)
     rows: list[dict[str, object]] = []
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
@@ -365,8 +357,24 @@ def page_history(projection: HistoryProjection, offset: int) -> dict[str, object
     next_offset = offset
     messages_body_size = 0
     for group_index in indexes:
+        while group_index >= len(groups):
+            next_group_index = len(groups)
+            group, body_size = _project_history_group(
+                [
+                    row
+                    for entry in projection.entry_groups[next_group_index]
+                    for row in _history_entry_rows(
+                        entry,
+                        projection.approval_calls,
+                        include_delivery_id=include_delivery_id,
+                    )
+                ],
+                entry_count,
+            )
+            groups.append(group)
+            body_sizes.append(body_size)
         group = groups[group_index]
-        group_body_size = projection.body_sizes[group_index]
+        group_body_size = body_sizes[group_index]
         separator_size = int(bool(rows and group))
         candidate_body_size = messages_body_size + separator_size + group_body_size
         candidate_offset = min(group_index + 1, entry_count)
@@ -383,10 +391,19 @@ def page_history(projection: HistoryProjection, offset: int) -> dict[str, object
         rows.extend(group)
         messages_body_size = candidate_body_size
         next_offset = candidate_offset
-    return {
-        "messages": rows,
-        "next_offset": next_offset if next_offset < entry_count else None,
-    }
+    expanded = HistoryProjection(
+        projection.entry_groups,
+        projection.approval_calls,
+        tuple(groups),
+        tuple(body_sizes),
+    )
+    return (
+        {
+            "messages": rows,
+            "next_offset": next_offset if next_offset < entry_count else None,
+        },
+        expanded,
+    )
 
 
 def _history_entry_rows(
@@ -520,10 +537,25 @@ def history(
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    projection = history_projection(
-        runtime.opened.store, include_delivery_id=include_delivery_id
+    store = runtime.opened.store
+    generation = _generation(store)
+    projection = history_projection(store, include_delivery_id=include_delivery_id)
+    result, expanded = page_history(
+        projection, offset, include_delivery_id=include_delivery_id
     )
-    return page_history(projection, offset)
+    with _cache_creation_lock:
+        cached = _cache(store, include_delivery_id)
+        if (
+            cached is not None
+            and cached.generation == generation
+            and len(cached.projection.groups) < len(expanded.groups)
+        ):
+            _publish_cache(
+                store,
+                include_delivery_id,
+                _CachedProjection(generation, expanded),
+            )
+    return result
 
 
 def settings(runtime: ServerRuntime) -> dict:
