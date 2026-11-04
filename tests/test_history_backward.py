@@ -76,6 +76,7 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
     finally:
         writer.close()
         await writer.wait_closed()
+        await server.close()
 
 
 async def _history_request(reader: object, writer: object, request_id: int, session_id: str, params: dict[str, object]) -> dict[str, object]:
