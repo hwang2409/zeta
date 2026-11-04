@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
@@ -1960,6 +1961,65 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
     assert result["exit_code"] in {-signal.SIGTERM, -signal.SIGKILL}
     assert not _group_exists(tasks.records[0].pid)
     await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_task_kill_cancellation_still_kills_escaped_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    child_code = (
+        "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"open({str(child_pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
+    )
+    tasks = BackgroundTaskRegistry(term_grace=0.03)
+    task_id, _ = await tasks.start(
+        _python(
+            "import os,subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+            "preexec_fn=os.setsid, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); time.sleep(30)"
+        ),
+        tmp_path,
+    )
+    for _ in range(100):
+        if child_pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert child_pid_file.exists()
+    child_pid = int(child_pid_file.read_text())
+    second_snapshot_started = asyncio.Event()
+    release_second_snapshot = asyncio.Event()
+    original_snapshot = spawn_module._snapshot_descendants_sync
+    snapshot_calls = 0
+
+    def blocked_second_snapshot(root_pids: Sequence[int]):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 2:
+            second_snapshot_started.set()
+            while not release_second_snapshot.is_set():
+                time.sleep(0.001)
+        return original_snapshot(root_pids)
+
+    monkeypatch.setattr(
+        spawn_module, "_snapshot_descendants_sync", blocked_second_snapshot
+    )
+    killing = asyncio.create_task(tasks.kill(task_id))
+    try:
+        await second_snapshot_started.wait()
+        killing.cancel()
+        release_second_snapshot.set()
+        with pytest.raises(asyncio.CancelledError):
+            await killing
+        await tasks.close()
+        assert not _group_exists(child_pid)
+    finally:
+        release_second_snapshot.set()
+        await asyncio.gather(killing, return_exceptions=True)
+        if _group_exists(child_pid):
+            os.killpg(child_pid, signal.SIGKILL)
+        await tasks.close()
 
 
 @pytest.mark.asyncio

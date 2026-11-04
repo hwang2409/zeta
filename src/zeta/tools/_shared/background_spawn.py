@@ -115,9 +115,11 @@ async def _terminate_processes(
         _signal_group(process, signal.SIGTERM)
         _signal_pids(descendants.get(process.pid, {}), signal.SIGTERM)
     try:
-        await asyncio.wait_for(
-            asyncio.gather(*(process.wait() for process in processes)),
-            timeout=term_grace,
+        await snapshot(
+            asyncio.wait_for(
+                asyncio.gather(*(process.wait() for process in processes)),
+                timeout=term_grace,
+            )
         )
     except TimeoutError:
         pass
@@ -141,11 +143,16 @@ async def _terminate_process(
     term_grace: float,
     close_stdin: Callable[[], Awaitable[object]] | None = None,
 ) -> None:
+    cancellation = _DeferredCancellation()
     if close_stdin is not None:
-        await close_stdin()
-    await _terminate_processes((process,), term_grace)
+        await cancellation.finish(close_stdin())
+    await _terminate_processes(
+        (process,), term_grace, finish=cancellation.finish
+    )
     if process.returncode is None:
-        await process.wait()
+        await cancellation.finish(process.wait())
+    if cancellation.cancelled:
+        raise asyncio.CancelledError
 
 
 def _signal_group(process: asyncio.subprocess.Process, signal_number: int) -> None:
