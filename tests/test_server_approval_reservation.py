@@ -1888,7 +1888,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
 
 async def _wait_controller_release(server: ZetaServer) -> None:
     for _ in range(100):
-        if server.connections is not None and server.connections.current_controller() is None:
+        if server.connections is not None and server.connections.controller_metadata() is None:
             return
         await asyncio.sleep(0)
     raise AssertionError("controller was not released")
