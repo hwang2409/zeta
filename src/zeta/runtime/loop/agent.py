@@ -132,7 +132,6 @@ def _sanitize_account_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=message.metadata,
     )
-
 TaskResult = TypeVar("TaskResult")
 
 
