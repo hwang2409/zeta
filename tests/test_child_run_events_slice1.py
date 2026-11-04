@@ -16,6 +16,7 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from zeta.context_eviction import recall_history
+from zeta.core.agent_progress import publish_agent_lifecycle_projection
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -318,6 +319,7 @@ def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
         "final_result": "done",
     }
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+    publish_agent_lifecycle_projection(child.agent_lifecycle_path, lifecycle, 0)
     call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "child"})
     rendered = AgentCard.render_receipt(
         StreamEvent(

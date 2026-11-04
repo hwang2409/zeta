@@ -99,6 +99,7 @@ class AgentCard:
         self._tail_loaded = False
         self._transcript_source: AgentTranscriptSource | None = None
         self._final_tail_pending = False
+        self._lifecycle_projection: dict[str, Any] = {}
 
     @property
     def supported(self) -> bool:
@@ -346,6 +347,7 @@ class AgentCard:
         elapsed_seconds: float | None = None,
         turns_used: int | None = None,
         depth: int | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ) -> Text | None:
         call = event.tool_call
         result = event.tool_result
@@ -354,7 +356,7 @@ class AgentCard:
         structured = result.structured_content or {}
         child_path = structured.get("child_session_path")
         structured_status = structured.get("status")
-        lifecycle = _read_lifecycle(
+        lifecycle = lifecycle or _read_lifecycle(
             child_path if type(child_path) is str else ""
         )
         if lifecycle:
@@ -646,11 +648,15 @@ class AgentCard:
         )
         if not self._final_tail_pending:
             self.release_transcript_source()
+        self._lifecycle_projection = _read_lifecycle(
+            path if isinstance(path, str) else ""
+        )
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,
             turns_used=self._turns,
             depth=self._depth,
+            lifecycle=self._lifecycle_projection,
         )
         return (
             self._progress()

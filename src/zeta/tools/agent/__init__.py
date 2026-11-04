@@ -31,7 +31,6 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.agent_progress import (
-    live_agent_lifecycle,
     live_agent_lifecycle_snapshot,
     publish_agent_lifecycle_projection,
     read_agent_lifecycle,
