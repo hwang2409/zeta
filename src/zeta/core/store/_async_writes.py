@@ -77,7 +77,7 @@ class AsyncDurableWritesMixin:
 
     def _prepare_durable_writer_snapshot(self: ConversationStore) -> None:
         """Detach one validated generation before the store becomes loop-owned."""
-        snapshot = copy.deepcopy(self._detach_log_state())
+        snapshot = self._snapshot_log_state()
         with self._durable_write_condition:
             if self._closing or self._closed:
                 return
