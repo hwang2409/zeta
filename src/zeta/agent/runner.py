@@ -764,6 +764,7 @@ async def run_agent_tool(
         loop._background_owner.release_unused_stores()
         await loop._background_owner.wait_for_store_closes()
         raise
+    child_store.bind_owner_thread()
     child_policy: ChildApprovalPolicy | None = None
     try:
         loop._agent_child_stores[tool_call.id] = child_store
