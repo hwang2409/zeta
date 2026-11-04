@@ -251,7 +251,13 @@ def _history_group_body_size(
 def _project_history_group(
     rows: list[dict[str, object]], entry_count: int
 ) -> tuple[tuple[dict[str, object], ...], int]:
-    group = tuple(_bounded_history_value(row) for row in rows)
+    group = tuple(
+        _bounded_history_value(row)
+        if row.get("event") in {"approval_request", "approval_end"}
+        or row.get("notification") is not None
+        else row
+        for row in rows
+    )
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     body_size = _history_group_body_size(codec, group)
