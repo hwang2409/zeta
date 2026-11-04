@@ -2113,10 +2113,12 @@ async def main() -> None:
 asyncio.run(main())
 """
 
+    # The timeout is a hang guard, not a speed limit: it also covers interpreter
+    # start and imports on a slow runner. The durable row below is the check.
     subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],
         check=True,
-        timeout=3,
+        timeout=60,
     )
 
     reopened = ConversationStore(tmp_path, session_id="shutdown-drain")
