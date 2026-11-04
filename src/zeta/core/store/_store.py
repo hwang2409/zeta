@@ -1186,7 +1186,7 @@ class ConversationStore(
         ]
 
     def compaction_marker_count(self) -> int:
-        return sum(entry.type == "compaction" for entry in self.replay())
+        return sum(entry.type == "compaction" for entry in self._active_branch())
 
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""

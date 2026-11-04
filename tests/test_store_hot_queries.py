@@ -169,6 +169,38 @@ def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
     assert store._approval_states_from_indexes()[request.id][1] == "abort"
 
 
+def test_compaction_marker_count_does_not_snapshot_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(100):
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"row {index}")]),
+                MessageOrigin.USER,
+            )
+        )
+    store.append_compaction_marker("summary", 1, 2)
+
+    def unexpected_snapshot(_entry: object) -> object:
+        raise AssertionError("marker count copied an entry payload")
+
+    monkeypatch.setattr(ConversationStore, "_snapshot_entry", unexpected_snapshot)
+
+    assert store.compaction_marker_count() == 1
+
+
+def test_compaction_marker_count_includes_replaced_markers(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    first = store.append_compaction_marker("first", 1, 2)
+    second = store.append_compaction_marker(
+        "second", 1, 2, replaces=[first.id]
+    )
+    store.append_compaction_marker("third", 1, 2, replaces=[second.id])
+
+    assert store.compaction_marker_count() == 3
+
+
 def test_tool_result_query_uses_incremental_state_without_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     result = ToolResult("call-1", "done")
