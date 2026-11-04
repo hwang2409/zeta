@@ -293,6 +293,7 @@ def compose_runtime(
         loop.account_context = account_context
         if resuming:
             bootstrap_agent_children(loop)
+            opened.store._prepare_durable_writer_snapshot()
         memory_reconciler = None
         if memory_enabled:
             memory_backend: CompletionBackend | None = None
