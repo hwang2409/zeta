@@ -646,9 +646,14 @@ class BackgroundTaskRegistry:
                 if record.running and record.process is not None
             ]
             records = [record for record, _ in entries]
+            descendant_lists = await finish(
+                asyncio.gather(
+                    *(_descendant_pids(process.pid) for _, process in entries)
+                )
+            )
             descendants = {
-                record.task_id: await _descendant_pids(process.pid)
-                for record, process in entries
+                record.task_id: found
+                for record, found in zip(records, descendant_lists or ())
             }
             killed = [record.task_id for record in records]
             # Whole-session and child-completion shutdown kills silently; callers
