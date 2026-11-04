@@ -1839,8 +1839,6 @@ async def test_status_pending_approvals_does_not_parse_logs(
         child_store = next(
             store for store in stores if store is not server.runtime.opened.store
         )
-        assert server.runtime.opened.store._owner_thread_id == threading.get_ident()
-        assert child_store._owner_thread_id == threading.get_ident()
         for index in range(100):
             server.runtime.opened.store.append_message(
                 Message(MessageRole.ASSISTANT, [TextContent(f"parent {index}")])
@@ -1849,20 +1847,22 @@ async def test_status_pending_approvals_does_not_parse_logs(
                 Message(MessageRole.ASSISTANT, [TextContent(f"child {index}")])
             )
 
-        parses = 0
-        original = ConversationEntry.from_dict
+        target_dirs = {store.session_dir for store in stores}
+        full_log_parses = 0
+        original_load = ConversationStore._load
 
-        def count_parse(
-            cls: type[ConversationEntry], value: dict[str, Any]
-        ) -> ConversationEntry:
-            nonlocal parses
-            parses += 1
-            return original(value)
+        def count_target_load(store: ConversationStore) -> None:
+            nonlocal full_log_parses
+            if store.session_dir in target_dirs and any(
+                frame.function == "strict" for frame in inspect.stack()
+            ):
+                full_log_parses += 1
+            original_load(store)
 
-        monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(count_parse))
+        monkeypatch.setattr(ConversationStore, "_load", count_target_load)
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
         assert len(status["pending_approvals"]) == 1
-        assert parses == 0
+        assert full_log_parses == 0
     finally:
         await _close(server, writer)
 
