@@ -35,30 +35,31 @@ def _group_exists(process_id: int) -> bool:
     return True
 
 
-async def _descendant_pids(root_pid: int) -> set[int]:
-    """Snapshot descendants without blocking the event loop."""
+async def _descendant_pids(root_pid: int) -> dict[int, str]:
+    """Snapshot descendants and their stable process identities."""
 
     process = await asyncio.create_subprocess_exec(
-        "ps", "-A", "-o", "pid=", "-o", "ppid=", stdout=asyncio.subprocess.PIPE
+        "ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
+        stdout=asyncio.subprocess.PIPE,
     )
     stdout, _ = await process.communicate()
-    children: dict[int, list[int]] = {}
+    children: dict[int, list[tuple[int, str]]] = {}
     for line in stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and all(field.isdigit() for field in fields):
-            pid, ppid = map(int, fields)
-            children.setdefault(ppid, []).append(pid)
-    descendants: set[int] = set()
+        fields = line.split(maxsplit=2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            pid, ppid = int(fields[0]), int(fields[1])
+            children.setdefault(ppid, []).append((pid, fields[2]))
+    descendants: dict[int, str] = {}
     pending = [root_pid]
     while pending:
-        for pid in children.get(pending.pop(), ()):
+        for pid, start in children.get(pending.pop(), ()):
             if pid not in descendants:
-                descendants.add(pid)
+                descendants[pid] = start
                 pending.append(pid)
     return descendants
 
 
-def _signal_pids(pids: set[int], signal_number: int) -> None:
+def _signal_pids(pids: dict[int, str], signal_number: int) -> None:
     for pid in pids:
         try:
             os.kill(pid, signal_number)
@@ -66,6 +67,33 @@ def _signal_pids(pids: set[int], signal_number: int) -> None:
             pass
         except OSError:
             logger.debug("could not signal background descendant %s", pid, exc_info=True)
+
+
+async def _terminate_process(
+    process: asyncio.subprocess.Process,
+    term_grace: float,
+    close_stdin: Callable[[], Awaitable[object]] | None = None,
+) -> None:
+    """Terminate a process and descendants without trusting reused pids."""
+
+    if close_stdin is not None:
+        await close_stdin()
+    descendants = await _descendant_pids(process.pid)
+    _signal_group(process, signal.SIGTERM)
+    _signal_pids(descendants, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=term_grace)
+    except asyncio.TimeoutError:
+        pass
+    current = await _descendant_pids(process.pid)
+    survivors = {
+        pid: start for pid, start in current.items() if descendants.get(pid) == start
+    }
+    if _group_exists(process.pid):
+        _signal_group(process, signal.SIGKILL)
+    _signal_pids(survivors, signal.SIGKILL)
+    if process.returncode is None:
+        await process.wait()
 
 
 def _signal_group(process: asyncio.subprocess.Process, signal_number: int) -> None:
