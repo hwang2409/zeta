@@ -239,18 +239,23 @@ class FrameCodec:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}
         return self._bounded_json(value, request_id=request_id)
 
+    def serialized_size(self, value: object) -> int:
+        """Return the exact encoded size under this codec's JSON settings."""
+
+        return len(self._json_bytes(value))
+
+    def response_size(self, request_id: str | int | None, result: object) -> int:
+        """Return the exact encoded response size without applying a fallback."""
+
+        return self.serialized_size(
+            {"jsonrpc": "2.0", "id": request_id, "result": result}
+        )
+
     def response_fits(self, request_id: str | int | None, result: object) -> bool:
         """Return whether a response can be sent without a size fallback."""
 
         try:
-            return (
-                len(
-                    self._json_bytes(
-                        {"jsonrpc": "2.0", "id": request_id, "result": result}
-                    )
-                )
-                <= MAX_FRAME_BYTES
-            )
+            return self.response_size(request_id, result) <= MAX_FRAME_BYTES
         except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
             return False
 
@@ -323,7 +328,7 @@ class FrameCodec:
         )
 
     @staticmethod
-    def _json_bytes(value: Mapping[str, Any]) -> bytes:
+    def _json_bytes(value: object) -> bytes:
         return (
             json.dumps(
                 value,

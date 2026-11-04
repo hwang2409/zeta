@@ -33,7 +33,13 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
-from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
+from .protocol import (
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_ID_BYTES,
+    FrameCodec,
+    ProtocolError,
+    bounded,
+)
 from .runtime import ServerRuntime
 
 if TYPE_CHECKING:
@@ -239,6 +245,19 @@ def history_projection(store: ConversationStore) -> HistoryProjection:
         return cached.projection
 
 
+def _history_frame_size(
+    codec: FrameCodec,
+    request_id: str,
+    *,
+    messages_body_size: int,
+    next_offset: int | None,
+) -> int:
+    empty_page_size = codec.response_size(
+        request_id, {"messages": [], "next_offset": next_offset}
+    )
+    return empty_page_size + messages_body_size
+
+
 def page_history(
     projection: HistoryProjection,
     offset: int,
@@ -258,20 +277,27 @@ def page_history(
     if stop == entry_count:
         indexes = range(offset, stop + 1)
     next_offset = offset
+    messages_body_size = 0
     for group_index in indexes:
         group = [
             row
             for entry in groups[group_index]
             for row in row_builder(entry, projection.approval_calls)
         ]
+        group_body_size = codec.serialized_size(group) - len(b"[]\n")
+        separator_size = int(bool(rows and group))
+        candidate_body_size = messages_body_size + separator_size + group_body_size
         candidate_offset = min(group_index + 1, entry_count)
-        candidate = {
-            "messages": [*rows, *group],
-            "next_offset": candidate_offset if candidate_offset < entry_count else None,
-        }
-        if not codec.response_fits(request_id, candidate) and rows:
+        wire_offset = candidate_offset if candidate_offset < entry_count else None
+        candidate_size = _history_frame_size(
+            codec,
+            request_id,
+            messages_body_size=candidate_body_size,
+            next_offset=wire_offset,
+        )
+        if candidate_size > MAX_FRAME_BYTES and rows:
             break
-        if not codec.response_fits(request_id, candidate):
+        if candidate_size > MAX_FRAME_BYTES:
             for row in group:
                 if "content" in row:
                     row["content"] = [
@@ -280,7 +306,10 @@ def page_history(
                     row["tool_result"] = None
                 if "notification" in row:
                     row["notification"] = None
+            group_body_size = codec.serialized_size(group) - len(b"[]\n")
+            candidate_body_size = group_body_size
         rows.extend(group)
+        messages_body_size = candidate_body_size
         next_offset = candidate_offset
     return {
         "messages": rows,
