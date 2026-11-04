@@ -1153,6 +1153,7 @@ class AgentLoop(
             await step_delivery.admit_terminal("foreground_end")
         yield StreamEvent(StreamEventType.AGENT_END)
 
+
     def _finalize_tool_results(
         self,
         calls: Sequence[ToolCall],

@@ -24,10 +24,7 @@ from ...agent.receipt import (
     has_agent_receipt_suffix,
     terminal_state,
 )
-from ...core.agent_progress import (
-    agent_lifecycle_projection,
-    live_agent_lifecycle,
-)
+from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
@@ -72,9 +69,6 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     if not path:
         return {}
     lifecycle_path = Path(path) / "agent_lifecycle.json"
-    projection = agent_lifecycle_projection(lifecycle_path)
-    if projection is not None:
-        return projection.lifecycle
     resident = live_agent_lifecycle(lifecycle_path)
     return resident if resident is not None else {}
 
@@ -356,7 +350,7 @@ class AgentCard:
         structured = result.structured_content or {}
         child_path = structured.get("child_session_path")
         structured_status = structured.get("status")
-        lifecycle = lifecycle or _read_lifecycle(
+        lifecycle = lifecycle or result.lifecycle_projection or _read_lifecycle(
             child_path if type(child_path) is str else ""
         )
         if lifecycle:
@@ -648,9 +642,9 @@ class AgentCard:
         )
         if not self._final_tail_pending:
             self.release_transcript_source()
-        self._lifecycle_projection = _read_lifecycle(
-            path if isinstance(path, str) else ""
-        )
+        self._lifecycle_projection = (
+            result.lifecycle_projection if result is not None else None
+        ) or _read_lifecycle(path if isinstance(path, str) else "")
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,

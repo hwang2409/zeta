@@ -1,9 +1,12 @@
+import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
@@ -12,8 +15,10 @@ from zeta.agent.receipt import (
     receipt_message_size,
     receipt_tool_result,
 )
-from zeta.core.agent_progress import publish_agent_lifecycle_projection
+from zeta.agent.tool_results import validated_tool_result
+from zeta.core import agent_progress
 from zeta.core.store import ConversationStore
+from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -29,6 +34,8 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.agent import _active_agent_receipts, agent_result
+from zeta.tools.registry import ToolRegistry
+from zeta.tui.cards.agent import AgentCard
 from zeta.tui.render import render_event
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -542,11 +549,6 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
         turns_used=1,
         finished_at="2026-09-04T10:00:01+00:00",
     )
-    publish_agent_lifecycle_projection(
-        child.agent_lifecycle_path,
-        child.agent_lifecycle(),
-        0,
-    )
     call = ToolCall(
         "agent-receipt-stats",
         "agent",
@@ -562,12 +564,214 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
                 "child_session_path": str(child.session_dir),
                 "turns_used": 1,
             },
+            lifecycle_projection=child.agent_lifecycle(),
         ),
     )
 
     rendered = render_event(event)
     assert rendered is not None
     assert "2 tool calls" in rendered.plain
+
+
+async def _terminal_agent_event(
+    tmp_path: Path,
+    child: ConversationStore,
+) -> tuple[AgentLoop, StreamEvent]:
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=ConversationStore(tmp_path / "parent"),
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "agent",
+        lambda arguments: agent_result(
+            "done",
+            error=False,
+            turns_used=1,
+            child_session_path=str(child.session_dir),
+            status="completed",
+            stats=child.agent_lifecycle(),
+        ),
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        registry.session_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    events = [
+        event
+        async for event in dispatch_tool_calls(
+            loop,
+            [ToolCall("agent-terminal", "agent", {})],
+            validated_tool_result,
+        )
+    ]
+    return loop, next(
+        event for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_status_calls_cannot_regress_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(tool_calls=2)
+    child.finish_agent_lifecycle(
+        "completed",
+        final_result="done",
+        turns_used=1,
+        finished_at="2026-01-01T00:00:01+00:00",
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    older = {**lifecycle, "tool_calls": 1}
+    newer = {**lifecycle, "tool_calls": 2}
+    older_started = threading.Event()
+    release_older = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+
+    def controlled_read(*args: object) -> bytes:
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            older_started.set()
+            assert release_older.wait(1)
+            return json.dumps(older).encode()
+        release_older.set()
+        return json.dumps(newer).encode()
+
+    monkeypatch.setattr(agent_tools, "_read_child_file", controlled_read)
+    first = asyncio.create_task(
+        asyncio.to_thread(
+            agent_tools._project_agent_status,
+            object(),
+            "parent:1",
+            child.session_dir,
+            notifications=(),
+        )
+    )
+    assert await asyncio.to_thread(older_started.wait, 1)
+    second = asyncio.create_task(
+        asyncio.to_thread(
+            agent_tools._project_agent_status,
+            object(),
+            "parent:1",
+            child.session_dir,
+            notifications=(),
+        )
+    )
+    newer_result, older_result = await asyncio.gather(second, first)
+    assert newer_result["tool_calls"] == 2
+    assert older_result["tool_calls"] == 1
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    assert "2 tool calls" in rendered.plain
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    core_load = agent_progress.load_session_json
+    tool_load = agent_tools.load_session_json
+
+    def tracked_core_load(*args: object, **kwargs: object) -> object:
+        read_threads.append(threading.get_ident())
+        return core_load(*args, **kwargs)
+
+    def tracked_tool_load(*args: object, **kwargs: object) -> object:
+        read_threads.append(threading.get_ident())
+        return tool_load(*args, **kwargs)
+
+    monkeypatch.setattr(agent_progress, "load_session_json", tracked_core_load)
+    monkeypatch.setattr(agent_tools, "load_session_json", tracked_tool_load)
+    loop, _ = await _terminal_agent_event(tmp_path, child)
+    assert read_threads and loop_thread not in read_threads
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_receipt_render_never_reads_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    monkeypatch.setattr(
+        "zeta.tui.cards.agent._read_lifecycle",
+        lambda path: pytest.fail("terminal render read lifecycle storage"),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_terminal_receipt_survives_repeated_renders(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(tool_calls=3)
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    assert event.tool_call is not None
+    card = AgentCard(event.tool_call)
+    first = card.finish(event)
+    second = card.terminal_render()
+    assert first is not None and second is not None
+    assert "3 tool calls" in first.plain
+    assert second.plain == first.plain
+    await loop.close()
+    child.close()
 
 
 @pytest.mark.asyncio

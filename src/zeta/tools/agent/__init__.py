@@ -30,11 +30,7 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
-from ...core.agent_progress import (
-    live_agent_lifecycle_snapshot,
-    publish_agent_lifecycle_projection,
-    read_agent_lifecycle,
-)
+from ...core.agent_progress import live_agent_lifecycle, read_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -87,22 +83,14 @@ def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
     lifecycle_path = Path(path) / "agent_lifecycle.json"
-    live_snapshot = live_agent_lifecycle_snapshot(lifecycle_path)
-    live = live_snapshot[1] if live_snapshot is not None else None
+    live = live_agent_lifecycle(lifecycle_path)
     if live is not None:
         return live
     try:
         value = read_agent_lifecycle(lifecycle_path)
     except ConversationIntegrityError:
         return {}
-    if type(value) is dict:
-        publish_agent_lifecycle_projection(
-            lifecycle_path,
-            value,
-            live_snapshot[0] if live_snapshot is not None else 0,
-        )
-        return value
-    return {}
+    return value if type(value) is dict else {}
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -422,9 +410,7 @@ def _project_agent_status(
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    live_snapshot = live_agent_lifecycle_snapshot(child_path / "agent_lifecycle.json")
-    live = live_snapshot[1] if live_snapshot is not None else None
-    live_generation = live_snapshot[0] if live_snapshot is not None else 0
+    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
     try:
         durable = load_session_json(
             _read_child_file(store, child_path, "agent_lifecycle.json")
@@ -435,9 +421,6 @@ def _project_agent_status(
         lifecycle = live
     else:
         lifecycle = select_legacy_child_lifecycle(durable, live)
-    publish_agent_lifecycle_projection(
-        child_path / "agent_lifecycle.json", lifecycle, live_generation
-    )
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:

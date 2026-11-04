@@ -21,6 +21,7 @@ class ChildResultPayloadMixin:
         turns_used: int | None = None,
         agent_type: str | None = None,
         child_instance_id: str | None = None,
+        stats: dict[str, object] | None = None,
     ) -> ToolResult:
         return validated_tool_result(
             self._child_result_payload(
@@ -31,6 +32,7 @@ class ChildResultPayloadMixin:
                 turns_used=turns_used,
                 agent_type=agent_type,
                 child_instance_id=child_instance_id,
+                stats=stats,
             ),
             tool_call_id,
         )

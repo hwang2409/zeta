@@ -13,12 +13,14 @@ import pytest
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import encode_json
+from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.agent_progress import (
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
 from zeta.core.store import ConversationStore
+from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -33,6 +35,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools.registry import ToolRegistry
 from zeta.tui.cards.agent import AgentCard
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -409,36 +412,51 @@ async def test_terminal_durable_record_wins_over_stale_live_progress_in_status_a
     }
     publish_live_agent_lifecycle(child.agent_lifecycle_path, stale)
 
-    status = await _status(
-        AgentLoop(
-            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ),
-        handle,
+    status_loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
+    status = await _status(status_loop, handle)
     assert status["structuredContent"]["children"][0]["state"] == "completed"
 
-    call = ToolCall(
-        "agent-1", "agent", {"prompt": "inspect", "description": "child 1"}
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
     )
-    rendered = AgentCard.render_receipt(
-        StreamEvent(
-            StreamEventType.TOOL_EXECUTION_END,
-            tool_call=call,
-            tool_result=ToolResult(
-                call.id,
-                "terminal result",
-                structured_content={
-                    "child_session_path": str(child.session_dir),
-                    "status": "completed",
-                    "turns_used": 1,
-                },
-            ),
+    registry.register(
+        "agent",
+        lambda arguments: agent_tools.agent_result(
+            "terminal result",
+            error=False,
+            turns_used=1,
+            child_session_path=str(child.session_dir),
+            status="completed",
+        ),
+    )
+    render_loop = AgentLoop(
+        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
+    )
+    events = [
+        event
+        async for event in dispatch_tool_calls(
+            render_loop,
+            [ToolCall("agent-1", "agent", {})],
+            validated_tool_result,
         )
+    ]
+    event = next(
+        item for item in events if item.type is StreamEventType.TOOL_EXECUTION_END
     )
+    rendered = AgentCard.render_receipt(event)
     assert rendered is not None
-    assert "completed" in rendered.plain
     assert "0 tool calls" in rendered.plain
     assert "99 tool calls" not in rendered.plain
+    rendered_again = AgentCard.render_receipt(event)
+    assert rendered_again is not None
+    assert rendered_again.plain == rendered.plain
+    await status_loop.close()
+    await render_loop.close()
 
 
 def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> None:
