@@ -30,12 +30,9 @@ from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
-    _descendant_pids,
     _group_exists,
-    _signal_group,
-    _signal_pids,
-    _snapshot_descendants_sync,
     _terminate_process,
+    _terminate_processes,
     create_subprocess_shell_in_fd,
     spawn_background,
 )
@@ -661,38 +658,13 @@ class BackgroundTaskRegistry:
                     *(self._close_stdin(record) for record in records)
                 )
             )
-            # Session teardown is the one closing path where a brief blocking
-            # process-table query is safe: signal before any later await.
-            descendants = _snapshot_descendants_sync(
-                [process.pid for _, process in entries]
-            )
-            for _, process in entries:
-                _signal_group(process, signal.SIGTERM)
-                _signal_pids(descendants[process.pid], signal.SIGTERM)
-            try:
-                await finish(
-                    asyncio.wait_for(
-                        asyncio.gather(*(process.wait() for _, process in entries)),
-                        timeout=self.term_grace,
-                    )
+            await finish(
+                _terminate_processes(
+                    [process for _, process in entries],
+                    self.term_grace,
+                    finish=finish,
                 )
-            except asyncio.TimeoutError:
-                pass
-            for _, process in entries:
-                _signal_group(process, signal.SIGKILL)
-            current = (
-                await finish(_descendant_pids(None))
-                if any(descendants.values())
-                else None
             )
-            if current is not None:
-                for _, process in entries:
-                    survivors = {
-                        pid: start
-                        for pid, start in current.items()
-                        if descendants[process.pid].get(pid) == start
-                    }
-                    _signal_pids(survivors, signal.SIGKILL)
 
             cleanup_timeout = self.term_grace + self.stdin_drain_timeout
             if entries:

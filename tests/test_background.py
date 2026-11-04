@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import threading
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -63,7 +64,7 @@ async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None
 
 @pytest.mark.asyncio
 async def test_termination_does_not_signal_reused_descendant_pid(monkeypatch) -> None:
-    snapshots = iter(({42: "old"}, {42: "new"}))
+    snapshots = iter(({10: {42: "old"}}, {42: "new"}))
     signals: list[tuple[int, int]] = []
 
     class Process:
@@ -74,10 +75,10 @@ async def test_termination_does_not_signal_reused_descendant_pid(monkeypatch) ->
             await asyncio.sleep(0.01)
             self.returncode = -9
 
-    async def snapshot(_):
+    def snapshot(_):
         return next(snapshots)
 
-    monkeypatch.setattr(spawn_module, "_descendant_pids", snapshot)
+    monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", snapshot)
     monkeypatch.setattr(spawn_module, "_signal_group", lambda process, number: None)
     monkeypatch.setattr(spawn_module, "_signal_pids", lambda pids, number: signals.extend(
         (pid, number) for pid in pids
@@ -114,6 +115,52 @@ def _notification_registry(
     return BackgroundTaskRegistry(
         notification_sink=lambda item: flow.produce(_task_notification(item))
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_snapshot_does_not_block_live_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    during_snapshot_ticks: list[int] = []
+    snapshot_calls = 0
+
+    def slow_snapshot(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            snapshot_started.set()
+            threading.Timer(0.1, lambda: during_snapshot_ticks.append(ticks)).start()
+            release_snapshot.wait(0.3)
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
+
+    monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", slow_snapshot)
+    registry = BackgroundTaskRegistry(term_grace=0.01)
+    await registry.start("sleep 30", tmp_path)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            if snapshot_started.is_set():
+                ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticking = asyncio.create_task(ticker())
+    closing = asyncio.create_task(registry.close())
+    try:
+        await asyncio.to_thread(snapshot_started.wait, 1)
+        await asyncio.sleep(0.05)
+        release_snapshot.set()
+        await closing
+        await asyncio.sleep(0.2)
+        assert during_snapshot_ticks and during_snapshot_ticks[0] > 0
+    finally:
+        release_snapshot.set()
+        ticking.cancel()
+        await asyncio.gather(ticking, return_exceptions=True)
+        await asyncio.gather(closing, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -2018,17 +2065,18 @@ import os
 import signal
 import shlex
 import sys
+import time
 
 from zeta.tools._shared.process import BackgroundTaskRegistry
 from zeta.tools._shared import background_spawn
 
 
 async def main():
-    original_snapshot = background_spawn._descendant_pids
-    async def delayed_snapshot(root_pid):
-        await asyncio.sleep(1)
-        return await original_snapshot(root_pid)
-    background_spawn._descendant_pids = delayed_snapshot
+    original_snapshot = background_spawn._snapshot_descendants_sync
+    def delayed_snapshot(root_pids):
+        time.sleep(1)
+        return original_snapshot(root_pids)
+    background_spawn._snapshot_descendants_sync = delayed_snapshot
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     escaped_path = sys.argv[2]
     child = (
@@ -2141,7 +2189,7 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
         for _ in range(3)
     ]
     term_sent = asyncio.Event()
-    original_signal_group = process_module._signal_group
+    original_signal_group = spawn_module._signal_group
 
     def signal_group(process: object, signum: signal.Signals) -> None:
         if signum == signal.SIGTERM:
@@ -2149,7 +2197,7 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
             return
         original_signal_group(process, signum)
 
-    monkeypatch.setattr(process_module, "_signal_group", signal_group)
+    monkeypatch.setattr(spawn_module, "_signal_group", signal_group)
     try:
         closing = asyncio.create_task(tasks.close())
         await term_sent.wait()

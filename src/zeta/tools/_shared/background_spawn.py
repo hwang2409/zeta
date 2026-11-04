@@ -59,9 +59,11 @@ def _descendant_pids_from_table(
     return descendants
 
 
-def _snapshot_descendants_sync(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
-    """Take one process-table snapshot for session shutdown."""
-    if not root_pids:
+def _snapshot_descendants_sync(
+    root_pids: Sequence[int] | None,
+) -> dict[int, dict[int, str]] | dict[int, str]:
+    """Take one process-table snapshot for termination and identity checks."""
+    if root_pids == () or root_pids == []:
         return {}
     try:
         result = subprocess.run(
@@ -71,28 +73,17 @@ def _snapshot_descendants_sync(root_pids: Sequence[int]) -> dict[int, dict[int, 
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {pid: {} for pid in root_pids}
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
     if result.returncode != 0:
-        return {pid: {} for pid in root_pids}
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
     children = _parse_process_table(result.stdout)
-    return {pid: _descendant_pids_from_table(children, pid) for pid in root_pids}
-
-
-async def _descendant_pids(root_pid: int | None) -> dict[int, str]:
-    """Snapshot descendants and their stable process identities."""
-    process = await asyncio.create_subprocess_exec(
-        "ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=",
-        stdout=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await process.communicate()
-    children = _parse_process_table(stdout)
-    if root_pid is None:
+    if root_pids is None:
         return {
             pid: start
             for entries in children.values()
             for pid, start in entries
         }
-    return _descendant_pids_from_table(children, root_pid)
+    return {pid: _descendant_pids_from_table(children, pid) for pid in root_pids}
 
 
 def _signal_pids(pids: dict[int, str], signal_number: int) -> None:
@@ -105,29 +96,54 @@ def _signal_pids(pids: dict[int, str], signal_number: int) -> None:
             logger.debug("could not signal background descendant %s", pid, exc_info=True)
 
 
+async def _terminate_processes(
+    processes: Sequence[asyncio.subprocess.Process],
+    term_grace: float,
+    *,
+    finish: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None,
+) -> None:
+    """Terminate processes and descendants without trusting reused pids."""
+    if not processes:
+        return
+    snapshot = finish or (lambda awaitable: awaitable)
+    descendants = await snapshot(
+        asyncio.to_thread(
+            _snapshot_descendants_sync, [process.pid for process in processes]
+        )
+    ) or {}
+    for process in processes:
+        _signal_group(process, signal.SIGTERM)
+        _signal_pids(descendants.get(process.pid, {}), signal.SIGTERM)
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(process.wait() for process in processes)),
+            timeout=term_grace,
+        )
+    except TimeoutError:
+        pass
+    current = await snapshot(asyncio.to_thread(_snapshot_descendants_sync, None))
+    for process in processes:
+        _signal_group(process, signal.SIGKILL)
+        survivors = (
+            descendants.get(process.pid, {})
+            if current is None
+            else {
+                pid: start
+                for pid, start in current.items()
+                if descendants.get(process.pid, {}).get(pid) == start
+            }
+        )
+        _signal_pids(survivors, signal.SIGKILL)
+
+
 async def _terminate_process(
     process: asyncio.subprocess.Process,
     term_grace: float,
     close_stdin: Callable[[], Awaitable[object]] | None = None,
 ) -> None:
-    """Terminate a process and descendants without trusting reused pids."""
-
     if close_stdin is not None:
         await close_stdin()
-    descendants = await _descendant_pids(process.pid)
-    _signal_group(process, signal.SIGTERM)
-    _signal_pids(descendants, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(process.wait(), timeout=term_grace)
-    except TimeoutError:
-        pass
-    current = await _descendant_pids(None)
-    survivors = {
-        pid: start for pid, start in current.items() if descendants.get(pid) == start
-    }
-    if _group_exists(process.pid):
-        _signal_group(process, signal.SIGKILL)
-    _signal_pids(survivors, signal.SIGKILL)
+    await _terminate_processes((process,), term_grace)
     if process.returncode is None:
         await process.wait()
 
