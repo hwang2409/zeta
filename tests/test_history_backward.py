@@ -14,10 +14,8 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
-    ToolUseContent,
     with_message_origin,
 )
-from zeta.protocol.types import ToolCall
 from zeta.server import ZetaServer, ergonomics
 from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec, ProtocolError
 
@@ -59,10 +57,10 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
         str(server.socket_path), limit=2_000_000
     )
     try:
-        hello = (await request(
+        await request(
             reader, writer, 1, "hello",
             {"protocol_version": "1.2", "features": ["session_history_backward"]},
-        ))[-1]["result"]
+        )
         session = (await request(
             reader, writer, 2, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]
