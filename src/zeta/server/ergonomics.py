@@ -568,7 +568,9 @@ def _fit_history_groups(
     include_delivery_id: bool,
     backward: bool,
     validator: dict[str, object] | None = None,
-) -> tuple[list[dict[str, object]], list[int], HistoryProjection]:
+) -> tuple[
+    list[dict[str, object]], list[int], list[tuple[dict[str, object], ...]], HistoryProjection
+]:
     groups = list(projection.groups)
     sizes = list(projection.body_sizes)
     cache_groups = list(projection.groups)

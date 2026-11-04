@@ -16,8 +16,8 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
-from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec, ProtocolError
+from zeta.server import ZetaServer, ergonomics, protocol
+from zeta.server.protocol import FrameCodec, ProtocolError
 
 
 def _entry(number: int) -> SimpleNamespace:
@@ -249,6 +249,7 @@ def test_backward_zero_is_empty_and_malformed_params_are_rejected() -> None:
 
 def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 4_000)
     group = SimpleNamespace(
         id="approval",
         type="approval_history",
@@ -257,7 +258,8 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
     store = _HistoryStore([_entry(0), group, _entry(1)])
     first = _backward_history(store, {"before": None})
     payload = FrameCodec().response("id", first)
-    assert len(payload) <= MAX_FRAME_BYTES
+    assert b'"error"' not in payload
+    assert len(payload) <= protocol.MAX_FRAME_BYTES
     assert any(row.get("content", [{}])[0].get("text") == ergonomics.HISTORY_GROUP_TRUNCATED for row in first["messages"])
     if first["next_before"] is not None:
         next_page = _backward_history(store, {"before": first["next_before"], "history_validator": first["history_validator"]})
@@ -266,6 +268,7 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
 
 def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 1_400)
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 1_400)
     atomic = SimpleNamespace(
         id="atomic",
         type="message",
@@ -290,8 +293,10 @@ def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest
     assert not first_ids & continuation_ids
     assert first_ids | continuation_ids <= {f"message-{i}" for i in range(45)} | {"atomic"}
     assert min(int(row["id"].split("-", 1)[1]) for row in continuation["messages"] if row["id"].startswith("message-")) < min(int(row["id"].split("-", 1)[1]) for row in first["messages"] if row["id"].startswith("message-"))
-    assert len(FrameCodec().response("id", first)) <= MAX_FRAME_BYTES
-    assert len(FrameCodec().response("id", continuation)) <= MAX_FRAME_BYTES
+    for page in (first, continuation):
+        payload = FrameCodec().response("id", page)
+        assert b'"error"' not in payload
+        assert len(payload) <= protocol.MAX_FRAME_BYTES
 
 
 def test_backward_does_not_replace_forward_cache_projection(
@@ -304,3 +309,54 @@ def test_backward_does_not_replace_forward_cache_projection(
     after = ergonomics.history(_runtime(store), {"offset": 0})
     assert before == after
     assert backward["history_validator"]["end"] == 220
+
+
+@pytest.mark.asyncio
+async def test_real_socket_backward_near_limit_groups_never_overflow_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """a group that fits the forward page but not the larger backward envelope
+    must come back as a marker, not as the raw forward projection."""
+    limit = 8_000
+    monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", limit)
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", limit)
+    # group sizes step through the forward/backward envelope difference, so
+    # some group fits forward raw but needs a marker backward.
+    sizes = range(6_000, 7_600, 10)
+    async with _real_history_server(tmp_path, count=0) as (reader, writer, session_id, server):
+        for number, size in enumerate(sizes):
+            server.runtime.opened.store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"g{number:03d}" + "x" * size)]),
+                    MessageOrigin.USER,
+                )
+            )
+        params: dict[str, object] = {"before": None}
+        seen: list[str] = []
+        for page in range(len(sizes) + 2):
+            # the largest legal request id: 128 utf-8 bytes, escaped on the wire
+            request_id = "\x00" * 124 + f"{page:04d}"
+            writer.write(
+                (protocol.json.dumps({
+                    "jsonrpc": "2.0", "id": request_id, "method": "session_history",
+                    "params": {"session_id": session_id, **params},
+                }) + "\n").encode()
+            )
+            await writer.drain()
+            while True:
+                line = await asyncio.wait_for(reader.readline(), 30)
+                frame = protocol.json.loads(line)
+                if frame.get("id") == request_id:
+                    break
+            assert "error" not in frame, frame["error"]
+            assert len(line) <= limit + 1
+            result = frame["result"]
+            for row in result["messages"]:
+                text = row["content"][0]["text"] if row.get("content") else ""
+                seen.append("marker" if text == ergonomics.HISTORY_GROUP_TRUNCATED else text[:4])
+            if result["next_before"] is None:
+                break
+            params = {"before": result["next_before"], "history_validator": result["history_validator"]}
+        assert result["next_before"] is None
+        assert len(seen) == len(sizes)
+        assert "marker" in seen
