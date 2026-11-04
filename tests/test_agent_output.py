@@ -12,6 +12,7 @@ from zeta.agent.receipt import (
     receipt_message_size,
     receipt_tool_result,
 )
+from zeta.core.agent_progress import publish_agent_lifecycle_projection
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -540,6 +541,11 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
         final_result="done",
         turns_used=1,
         finished_at="2026-09-04T10:00:01+00:00",
+    )
+    publish_agent_lifecycle_projection(
+        child.agent_lifecycle_path,
+        child.agent_lifecycle(),
+        0,
     )
     call = ToolCall(
         "agent-receipt-stats",

@@ -95,7 +95,14 @@ def _read_agent_lifecycle(path: str) -> dict[str, object]:
         value = read_agent_lifecycle(lifecycle_path)
     except ConversationIntegrityError:
         return {}
-    return value if type(value) is dict else {}
+    if type(value) is dict:
+        publish_agent_lifecycle_projection(
+            lifecycle_path,
+            value,
+            live_snapshot[0] if live_snapshot is not None else 0,
+        )
+        return value
+    return {}
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
