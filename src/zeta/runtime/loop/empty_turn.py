@@ -33,6 +33,10 @@ EMPTY_TURN_NUDGE_TEXT = (
 
 # Provider stop reasons are short; keep the persisted value bounded regardless.
 MAX_STOP_REASON_CHARS = 64
+OUTPUT_LIMIT_ERROR_MESSAGE = (
+    "the model reached its output-token limit while thinking "
+    "and did not produce a reply"
+)
 
 
 def has_visible_output(message: Message) -> bool:
@@ -102,11 +106,7 @@ def output_limit_error(
 ) -> ErrorInfo | None:
     if stop_reason != "max_tokens" or has_visible_output(message):
         return None
-    return ErrorInfo(
-        "max_tokens",
-        "the model reached its output-token limit while thinking "
-        "and did not produce a reply",
-    )
+    return ErrorInfo("max_tokens", OUTPUT_LIMIT_ERROR_MESSAGE)
 
 
 def should_nudge_empty_turn(
