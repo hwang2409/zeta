@@ -3116,6 +3116,9 @@ async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
         for message in store.messages()
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
+    assistant = store.messages()[-1]
+    assert assistant.role is MessageRole.ASSISTANT
+    assert assistant.metadata["stop_reason"] == "max_tokens"
     assert events[-1].type is StreamEventType.AGENT_END
 
 

@@ -1077,15 +1077,6 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
-            error = output_limit_error(
-                assistant_message, stop_reason=self._turn_stop_reason
-            )
-            if error is not None and not calls:
-                yield StreamEvent(StreamEventType.ERROR, error=error)
-                if self.agent_instance_id is None:
-                    await step_delivery.admit_terminal("foreground_end")
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
             approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
                 if not self.plan_mode_allows(tool_call):
@@ -1099,6 +1090,15 @@ class AgentLoop(
             )
             attempt_state.persisted = True
             self._turn_provider_retry_records = []
+            error = output_limit_error(
+                assistant_message, stop_reason=self._turn_stop_reason
+            )
+            if error is not None and not calls:
+                yield StreamEvent(StreamEventType.ERROR, error=error)
+                if self.agent_instance_id is None:
+                    await step_delivery.admit_terminal("foreground_end")
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             if not calls:
                 transition = await self._toolless_transition(
                     step_delivery,
