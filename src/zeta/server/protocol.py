@@ -64,10 +64,9 @@ class FrameWriteCancelled(asyncio.CancelledError):
         self.written = written
 
 
-# How long a canceled caller waits for a started frame write to drain before
-# the transport is aborted. A stalled client must not hang abort or shutdown.
+# Deadline for a canceled caller's started frame write before its transport is
+# aborted. A stalled client must not hang abort or shutdown.
 FRAME_CANCEL_GRACE = 1.0
-_DETACHED_FRAME_WRITES: set[asyncio.Future[bool]] = set()
 
 
 async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
@@ -87,7 +86,7 @@ async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> 
 
 
 async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> bool:
-    """Wait at most two grace periods; abort the transport after the first."""
+    """Wait for the deadline, abort the transport, then finish cleanup."""
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + FRAME_CANCEL_GRACE
@@ -96,16 +95,19 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
         remaining = deadline - loop.time()
         if remaining <= 0:
             if aborted:
-                # The write ignored abort and cancellation; stop waiting but
-                # keep ownership so its outcome is still observed.
-                _DETACHED_FRAME_WRITES.add(task)
+                # Supported transports settle after abort. Keep observing an
+                # abnormal transport without retaining it in process-global
+                # state or coupling it to another connection.
                 task.add_done_callback(_observe_write)
                 return False
             aborted = True
             deadline = loop.time() + FRAME_CANCEL_GRACE
             transport = getattr(writer, "transport", None)
             if transport is not None:
-                transport.abort()
+                try:
+                    transport.abort()
+                except Exception:  # noqa: BLE001, S110 - abort must not block cleanup
+                    pass
             task.cancel()
             continue
         try:
@@ -121,11 +123,8 @@ async def _settle_canceled_write(task: asyncio.Future[bool], writer: Any) -> boo
 
 
 def _observe_write(task: asyncio.Future[bool]) -> None:
-    try:
-        if not task.cancelled():
-            task.exception()
-    finally:
-        _DETACHED_FRAME_WRITES.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 class ProtocolError(Exception):
