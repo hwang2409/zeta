@@ -12,6 +12,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.server_client import event as _event
+from tests.support.server_client import frames_until_event as _frames_until_event
 from tests.support.server_client import request as _request
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -272,7 +273,13 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         await _request(
             reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
         )
-        echoes = [await _event(reader, "user_message")]
+        frames = await _frames_until_event(reader, "agent_end")
+        echoes = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "user_message"
+        ]
+        assert len(echoes) == 1
         assert echoes == [
             {
                 "event": "user_message",
@@ -285,7 +292,6 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         ]
         assert server.runtime.opened.store.client_delivery("real-1") is not None
         backend.release.set()
-        await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
 

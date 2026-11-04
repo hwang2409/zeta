@@ -1132,15 +1132,13 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         assert approval["request_id"] == "call-1"
         frames = await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
         assert frames[-1]["result"]["decision"] == "deny"
-        approval_end = [await _event(reader, "approval_end")]
+        frames += await _frames_until_event(reader, "tool_end")
+        frames += await _frames_until_event(reader, "turn_end")
+        approval_end = _named_events(frames, "approval_end")
         assert len(approval_end) == 1
         assert approval_end[0]["request_id"] == approval["request_id"]
-        if not _named_events(frames, "tool_end"):
-            frames += await _frames_until_event(reader, "tool_end")
         end = _named_events(frames, "tool_end")[-1]
         assert end["tool_result"]["is_error"] is True
-        if not _named_events(frames, "turn_end"):
-            frames += await _frames_until_event(reader, "turn_end")
     finally:
         await _close(server, writer)
 
@@ -1177,8 +1175,7 @@ async def test_session_history_matches_live_approval_lifecycle(
         )
         frames = await _request(reader, writer, 4, method, params)
         terminal = "agent_end" if decision != "abort" else "turn_aborted"
-        if not _named_events(frames, terminal):
-            frames += await _frames_until_event(reader, terminal)
+        frames += await _frames_until_event(reader, terminal)
         live_end = _named_events(frames, "approval_end")
         assert len(live_end) == 1
 
@@ -1579,11 +1576,13 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
         approval = await _event(reader, "approval_request")
         frames = await _request(reader, writer, 4, "abort")
         frames += await _request(reader, writer, 5, "status")
-        names = ["approval_end", "turn_aborted"]
-        ends = [await _event(reader, "approval_end")]
-        assert len(ends) == 1
-        assert ends[0]["request_id"] == approval["request_id"]
+        frames += await _frames_until_event(reader, "turn_aborted")
+        names = [frame["params"]["event"] for frame in frames if "params" in frame]
+        assert names.count("approval_end") == 1
+        assert names.count("turn_aborted") == 1
         assert names.index("approval_end") < names.index("turn_aborted")
+        ends = _named_events(frames, "approval_end")
+        assert ends[0]["request_id"] == approval["request_id"]
     finally:
         await _close(server, writer)
 
@@ -1675,7 +1674,9 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         frames += await _request(
             reader, writer, 5, "deny", {"request_id": requests[True]["request_id"]}
         )
-        ends = [await _event(reader, "approval_end"), await _event(reader, "approval_end")]
+        frames += await _frames_until_event(reader, "agent_end")
+        ends = _named_events(frames, "approval_end")
+        assert len(ends) == 2
         assert sorted(event["request_id"] for event in ends) == sorted(
             event["request_id"] for event in requests.values()
         ), frames
@@ -1711,8 +1712,10 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
             approval["agent_instance_id"]
         )
         await server.runtime.loop._background_owner.wait()
-        await _request(reader, writer, 4, "status")
-        ends = [await _event(reader, "approval_end")]
+        frames = await _request(reader, writer, 4, "status")
+        frames += await _frames_until_event(reader, "turn_end")
+        ends = _named_events(frames, "approval_end")
+        assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
         await _close(server, writer)
@@ -1781,8 +1784,7 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
             )
             await server.runtime.loop._background_owner.wait()
             frames = await _request(reader, writer, 4, "status")
-            if not _named_events(frames, "approval_end"):
-                frames += await _frames_until_event(reader, "approval_end")
+            frames += await _frames_until_event(reader, "approval_end")
             live_end = _named_events(frames, "approval_end")
         assert len(live_end) == 1
         assert live_end[0]["request_id"] == live_request["request_id"]

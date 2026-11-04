@@ -267,7 +267,8 @@ def test_writer_snapshot_uses_structural_copy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_warm_writer_payloads_do_not_alias_resident_store(tmp_path: Path) -> None:
+async def test_warm_writer_appends_are_structurally_isolated(tmp_path: Path) -> None:
+    """existing payloads may alias after #638; newly appended entries must not."""
     resident = _opened_store_with_writer_snapshot(tmp_path, "payload-isolation")
     flow = StepDeliveryFlow(resident)
     await flow.initialize()

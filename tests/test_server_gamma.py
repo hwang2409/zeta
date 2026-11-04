@@ -16,6 +16,7 @@ from tests.test_server import (
     _close,
     _connect,
     _event,
+    _frames_until_event,
     _read,
     _request,
     _socket_path,
@@ -547,7 +548,9 @@ async def test_user_message_delivery_id_survives_restart_in_history(
 async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
     tmp_path: Path,
 ) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("done")]), ScriptedTurn([TextContent("done")])]
+    )
     server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -569,7 +572,12 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
             "send",
             {"text": "once", "delivery_id": "duplicate-send"},
         )
-        await _event(reader, "agent_end")
+        first_frames = await _frames_until_event(reader, "agent_end")
+        assert [
+            frame["params"]["event"]
+            for frame in first_frames
+            if "params" in frame
+        ].count("user_message") == 1
         frames = await _request(
             reader,
             writer,
@@ -578,7 +586,17 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
             {"text": "once", "delivery_id": "duplicate-send"},
         )
         assert frames[-1]["result"]["duplicate"] is True
-        assert all(frame.get("method") != "event" for frame in frames)
+        frames += await _request(
+            reader, writer, 5, "send", {"text": "next", "delivery_id": "next-send"}
+        )
+        frames += await _frames_until_event(reader, "agent_end")
+        messages = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "user_message"
+        ]
+        assert len(messages) == 1
+        assert messages[0]["text"] == "next"
     finally:
         await _close(server, writer)
 
