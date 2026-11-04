@@ -1713,7 +1713,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         )
         await server.runtime.loop._background_owner.wait()
         frames = await _request(reader, writer, 4, "status")
-        frames += await _frames_until_event(reader, "approval_end")
+        frames += await _frames_until_event(reader, "tool_end")
         ends = _named_events(frames, "approval_end")
         assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
@@ -1776,7 +1776,8 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
                 "deny",
                 {"request_id": live_request["request_id"]},
             )
-            live_end = [await _event(reader, "approval_end")]
+            frames += await _frames_until_event(reader, "tool_end")
+            live_end = _named_events(frames, "approval_end")
         else:
             assert server.runtime.loop is not None
             assert server.runtime.loop._background_owner.cancel(
@@ -1784,7 +1785,7 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
             )
             await server.runtime.loop._background_owner.wait()
             frames = await _request(reader, writer, 4, "status")
-            frames += await _frames_until_event(reader, "approval_end")
+            frames += await _frames_until_event(reader, "tool_end")
             live_end = _named_events(frames, "approval_end")
         assert len(live_end) == 1
         assert live_end[0]["request_id"] == live_request["request_id"]
