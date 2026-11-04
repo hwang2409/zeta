@@ -109,6 +109,26 @@ class Terminate:
 
 
 @dataclass(frozen=True, slots=True)
+class BeginGrace:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Reclaim:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Ready:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Expire:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class Replace:
     pass
 
@@ -126,6 +146,10 @@ ApprovalEvent = (
     | Cancel
     | CleanupChild
     | Terminate
+    | BeginGrace
+    | Reclaim
+    | Ready
+    | Expire
     | Replace
     | Close
 )
@@ -235,7 +259,11 @@ class ApprovalLifecycle:
         return self._change(record, phase="settling", disposition=disposition)
 
     def _mark_pending(self, record: ApprovalRecord) -> ApprovalRecord:
-        if record.phase != "starting" or record.disposition != "active":
+        if record.phase != "starting" or record.disposition not in {
+            "active",
+            "grace",
+            "reclaiming",
+        }:
             raise ValueError(f"cannot mark approval {record.phase} as pending")
         return self._change(record, phase="pending")
 
@@ -298,6 +326,16 @@ class ApprovalLifecycle:
                     suppress_write_errors=suppress_write_errors,
                     reason=reason,
                 )
+            case BeginGrace():
+                self._set_grace("grace")
+                return _Completed()
+            case Reclaim():
+                self._set_grace("reclaiming")
+                return _Completed()
+            case Ready():
+                return self._ready_reclaimed()
+            case Expire():
+                return self._expire_grace()
             case Replace():
                 self._replace_state()
                 return _Completed()
@@ -361,17 +399,81 @@ class ApprovalLifecycle:
     def prune_ended(self) -> None:
         return
 
-    def pending_approvals_now(self) -> list[dict[str, object]]:
+    def pending_approvals_now(
+        self,
+        *,
+        reconnect: bool = False,
+        include_truncated: bool = False,
+    ) -> list[dict[str, object]] | tuple[list[dict[str, object]], bool]:
         """Return the loop-owned visible projection without touching a store."""
 
-        return [
+        visible = [
             {
                 **self.observe(record.request),
                 **approval_display_fields(record.request),
+                **(
+                    {"resolution_pending": self._resolution_pending(record)}
+                    if reconnect and record.phase == "settling"
+                    else {}
+                ),
             }
             for record in self._state.records.values()
-            if record.phase == "pending" and record.request is not None
+            if record.phase in ({"pending", "settling"} if reconnect else {"pending"})
+            and record.request is not None
         ]
+        if not reconnect:
+            return visible
+        truncated = len(visible) > 64
+        bounded = visible[:64]
+        return (bounded, truncated) if include_truncated else bounded
+
+    @staticmethod
+    def _resolution_pending(record: ApprovalRecord) -> str:
+        return {
+            "allow": "approve",
+            "deny": "deny",
+            "grace_expired": "expire",
+        }.get(record.disposition, "abort")
+
+    def _set_grace(self, disposition: str) -> None:
+        for record in tuple(self._state.records.values()):
+            if record.phase in {"starting", "pending"} and record.disposition in {
+                "active",
+                "grace",
+            }:
+                self._change(record, disposition=disposition)
+
+    async def _ready_reclaimed(self) -> None:
+        replay: list[tuple[str, str | None, dict[str, object]]] = []
+        for record in tuple(self._state.records.values()):
+            if record.disposition != "reclaiming":
+                continue
+            record = self._change(record, disposition="active")
+            if record.phase == "pending" and record.request is not None:
+                replay.append(
+                    (
+                        event_contract.STREAM_EVENT_WIRE_EVENTS[
+                            StreamEventType.TOOL_APPROVAL_START
+                        ],
+                        self._session_id(),
+                        self.observe(
+                            record.request,
+                            fields=approval_display_fields(record.request),
+                        ),
+                    )
+                )
+        for event, session_id, payload in replay:
+            await self._publish(event, session_id, **payload)
+
+    async def _expire_grace(self) -> None:
+        for record in tuple(self._state.records.values()):
+            if record.disposition in {"grace", "reclaiming"}:
+                self._change(record, disposition="active")
+        await self._terminate_approval_records(
+            foreground_only=False,
+            suppress_write_errors=True,
+            reason="grace_expired",
+        )
 
     def pending_approval_labels(self) -> tuple[str, ...]:
         return tuple(
@@ -901,6 +1003,10 @@ class ApprovalLifecycle:
                 await self._finish_record(record, resolution)
             else:
                 self._remove(target.key)
+            return
+        if record.disposition in {"grace", "reclaiming"}:
+            record = self._mark_pending(record)
+            self._change(record, settlement=None)
             return
         if record.disposition != "active":
             record = self._reserve_record(record, record.disposition)

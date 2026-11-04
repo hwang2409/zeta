@@ -83,6 +83,7 @@ class ZetaServer:
         auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
         max_turns: int | None = None,
+        approval_reconnect_grace: int = 90,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -98,6 +99,7 @@ class ZetaServer:
             else self.home / "run" / "serve.sock"
         )
         self.port = port
+        self.approval_reconnect_grace = approval_reconnect_grace
         self.runtime = ServerRuntime(
             self.home,
             cwd=cwd,
@@ -346,7 +348,18 @@ class _Client:
                         self.codec.error_response(request_id, -32000, str(exc))
                     )
                 else:
-                    await self._write(self.codec.response(request_id, result))
+                    written = await self._write(self.codec.response(request_id, result))
+                    if (
+                        written
+                        and request["method"] == "hello"
+                        and self.role == "controller"
+                    ):
+                        self.connections.controller_ready(self)
+                        if (
+                            await self.connections.flush_controller(self)
+                            and "approval_reconnect" in self.features
+                        ):
+                            await self.server.control.controller_ready(reconnect=True)
                 if not self.handshaken:
                     break
         finally:
@@ -394,13 +407,10 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
-            controller = self.connections.current_controller()
-            if (
-                self.role == "controller"
-                and controller is not None
-                and controller.connection is self
-            ):
-                await self.server.control.controller_released()
+            if self.role == "controller" and self.connections.is_controller(self):
+                await self.server.control.controller_released(
+                    reconnect="approval_reconnect" in self.features
+                )
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
             self.writer.close()
@@ -416,7 +426,10 @@ class _Client:
             if self.role == "controller":
                 self.server._client_active = True
                 self.server._client = self
-                await self.server.control.controller_claimed()
+                reconnect = "approval_reconnect" in self.features
+                await self.server.control.controller_claimed(reconnect=reconnect)
+                if not reconnect:
+                    await self.server.control.controller_ready()
             return True, result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
@@ -481,7 +494,7 @@ class _Client:
             )
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
-            await self.server.control.controller_claimed()
+            await self.server.control.controller_ready()
             return {"session": self._session_snapshot()}
         if method == "resume":
             await self.server.control.require_idle()
@@ -513,7 +526,7 @@ class _Client:
                     ) from exc
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
-            await self.server.control.controller_claimed()
+            await self.server.control.controller_ready()
             return {"session": self._session_snapshot()}
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
@@ -705,9 +718,18 @@ class _Client:
     async def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
-        pending = (
-            await self.server.control.pending_approvals() if self.role != "observer" else []
-        )
+        reconnect = "approval_reconnect" in self.features and self.role != "observer"
+        if reconnect:
+            pending, truncated = self.server.control.pending_approvals_now(
+                reconnect=True, include_truncated=True
+            )
+        else:
+            pending = (
+                await self.server.control.pending_approvals()
+                if self.role != "observer"
+                else []
+            )
+            truncated = False
         return {
             "session": session,
             "state": (
@@ -721,6 +743,7 @@ class _Client:
                 else runtime._config(None, None).agents_explicit_finish
             ),
             "pending_approvals": pending,
+            **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }

@@ -357,7 +357,7 @@ async def test_login_required_notice_is_delivered_to_serve_client(
     control.closing = False
     controller = SimpleNamespace(features=frozenset({"memory_updated"}))
     control.server = SimpleNamespace(
-        connections=SimpleNamespace(current_controller=lambda: controller)
+        connections=SimpleNamespace(controller_metadata=lambda: controller)
     )
     events: list[tuple[str, str | None, dict[str, object]]] = []
 
@@ -400,7 +400,7 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
     control.closing = False
     controller = SimpleNamespace(features=frozenset({"memory_updated"}))
     control.server = SimpleNamespace(
-        connections=SimpleNamespace(current_controller=lambda: controller)
+        connections=SimpleNamespace(controller_metadata=lambda: controller)
     )
     events: list[tuple[str, str | None, dict[str, object]]] = []
 

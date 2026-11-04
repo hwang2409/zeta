@@ -16,7 +16,9 @@ The server accepts one client. A second connection receives a JSON-RPC error
 with code `-32001`, then closes. The limit is shared by all enabled transports.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
-selects `127.0.0.1:N`. Set `ZETA_ACCOUNT_HOME` to an absolute directory when
+selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
+negotiated approval reconnect grace and defaults to `90`. Set
+`ZETA_ACCOUNT_HOME` to an absolute directory when
 served sessions must use a shared provider account store while all other state
 remains under `ZETA_HOME`.
 
@@ -572,6 +574,13 @@ and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
 and `delegated`. Delegated approvals also have `agent_instance_id`, the child
 agent instance that owns the approval.
 
+With the negotiated `approval_reconnect` feature, `pending_approvals` is the
+server's live projection and is limited to 64 entries. The result also contains
+`pending_approvals_truncated`. An approval whose durable resolution is being
+written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
+or `abort`. Without the feature, the status shape and unbounded strict durable
+projection are unchanged.
+
 ```json
 {"jsonrpc":"2.0","id":9,"method":"status","params":{}}
 ```
@@ -660,9 +669,8 @@ and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`
 or `abort`, and an abort also sets `data.reason`. `data` can carry other
 loop-provided fields, and it is `{}` when there are none and no outcome is
 stored. Emitted reasons
-are `controller_disconnected`, `turn_canceled`, or `child_cleanup`. The stored
-format also accepts `grace_expired`, reserved for the approval reconnect
-grace; no current path emits it. For delegated approvals, the request ID is an opaque
+are `controller_disconnected`, `turn_canceled`, `child_cleanup`, or
+`grace_expired`. For delegated approvals, the request ID is an opaque
 server-issued key, even when the parent and child use the same raw tool call ID.
 
 ```json
@@ -681,6 +689,15 @@ running child starts answering a staged `agent_send`; its data contains the
 child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
+
+When a controller negotiated `approval_reconnect`, a disconnect keeps its live
+approval wait for the configured grace. The first replacement controller that
+also negotiates the feature receives each still-pending `approval_request`
+after its successful `hello`, with the original `request_id`; `approve` or
+`deny` then resumes the original turn. If the replacement does not negotiate
+the feature, or the grace expires first, the server durably aborts the approval
+once with reason `grace_expired`; a later decision returns `-32006`. Clients
+without the feature keep immediate disconnect abort and the prior wire shapes.
 
 A disconnected client does not stop the active served session or its
 background children. When a client attaches with `hello`, `new_session`, or
@@ -757,7 +774,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32003` | no active session |
 | `-32004` | a turn is already running |
 | `-32005` | no turn is running for steering |
-| `-32006` | approval request is missing or already resolved |
+| `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
 | `-32007` | outbound frame exceeds the size limit |
 | `-32008` | the selected account lock is held by another process |
 | `-32010` | delivery ID was accepted but its full details were evicted |
@@ -1168,6 +1185,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers") |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
+| `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 
 These features are available on protocol 1.1 and 1.2. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -1187,4 +1205,4 @@ protocol 1.1 and later clients can request `role: "observer"` in `hello`. an obs
 
 observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
-this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. requests are read and dispatched sequentially.
+this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. A claimed controller's pre-`hello` output is retained in emission order, up to 256 frames or 4 MiB, and is flushed after the successful `hello` response. If that bound is exceeded, the controller receives `-32011` (`controller output overflow`) after `hello` and is closed. Observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. Requests are read and dispatched sequentially.

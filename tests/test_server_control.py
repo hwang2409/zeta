@@ -9,6 +9,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,6 +35,9 @@ from zeta.protocol.types import (
     ToolSchema,
 )
 from zeta.server import ZetaServer
+from zeta.server.connections import ConnectionRegistry
+from zeta.server.control import ServeControl
+from zeta.server.protocol import FrameCodec
 from zeta.server.server import _Client
 
 
@@ -81,6 +85,131 @@ class _PostTurnBackend(CompletionBackend):
         elif self.calls == 3:
             self.later_woke.set()
         yield StreamEvent(StreamEventType.MESSAGE_END)
+
+
+class _ControllerConnection:
+    def __init__(self) -> None:
+        self.codec = FrameCodec()
+        self.frames: list[bytes] = []
+        self.server = type(
+            "Server",
+            (),
+            {
+                "runtime": type(
+                    "Runtime", (), {"set_post_stream_provider_retry": lambda *_: None}
+                )()
+            },
+        )()
+
+    async def _write_physical(self, frame: bytes) -> bool:
+        self.frames.append(frame)
+        return True
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset({"memory_updated"}))
+    control = object.__new__(ServeControl)
+    control.closing = False
+    control.server = SimpleNamespace(connections=registry)
+    control._notify = lambda event, session_id=None, **fields: registry.publish_controller(event, session_id, **fields)
+    control._publish_memory_notice("session", "updated")
+    await asyncio.sleep(0)
+    registry.controller_ready(connection)
+    await registry.flush_controller(connection)
+    assert json.loads(connection.frames[0])["params"]["event"] == "memory_updated"
+    registry.release(connection)
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    control = object.__new__(ServeControl)
+    control.server = SimpleNamespace(connections=registry)
+    assert control._protocol_version() == "1.2"
+    registry.release(connection)
+    await registry.aclose()
+
+
+def test_no_server_caller_branches_on_ready_controller() -> None:
+    server_sources = "".join(
+        path.read_text()
+        for path in Path("src/zeta/server").glob("*.py")
+        if path.name != "connections.py"
+    )
+    assert "current_controller" not in server_sources
+
+
+@pytest.mark.asyncio
+async def test_controller_event_emitted_before_hello_is_delivered_after_hello() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    await registry.publish_controller("assistant_delta", "session", delta="x")
+    registry.controller_ready(connection)
+    await registry.flush_controller(connection)
+    assert json.loads(connection.frames[0])["params"]["event"] == "assistant_delta"
+    registry.release(connection)
+
+
+@pytest.mark.asyncio
+async def test_controller_pre_hello_events_keep_emission_order() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    for value in ("a", "b", "c"):
+        await registry.publish_controller("assistant_delta", "session", delta=value)
+    registry.controller_ready(connection)
+    await registry.flush_controller(connection)
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+        "a",
+        "b",
+        "c",
+    ]
+    registry.release(connection)
+
+
+@pytest.mark.asyncio
+async def test_controller_claim_failure_drops_pre_hello_events() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    first = _ControllerConnection()
+    registry.register(first)
+    registry.negotiate_role(first, "controller", "1.2", frozenset())
+    await registry.publish_controller("assistant_delta", "session", delta="old")
+    registry.release(first)
+    second = _ControllerConnection()
+    registry.register(second)
+    registry.negotiate_role(second, "controller", "1.2", frozenset())
+    registry.controller_ready(second)
+    await registry.flush_controller(second)
+    assert second.frames == []
+    registry.release(second)
+
+
+@pytest.mark.asyncio
+async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    for _ in range(257):
+        await registry.publish_controller("assistant_delta", "session", delta="x")
+    registry.controller_ready(connection)
+    assert not await registry.flush_controller(connection)
+    assert json.loads(connection.frames[0])["error"]["code"] == -32011
+    registry.release(connection)
 
 
 class _RecordingWriter:
@@ -191,6 +320,7 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
+    server.connections.controller_ready(replacement)
     return replacement, writer
 
 

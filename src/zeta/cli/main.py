@@ -364,6 +364,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
     serve_parser.add_argument(
+        "--approval-reconnect-grace",
+        type=int,
+        default=90,
+        metavar="SECONDS",
+        help="keep approvals pending after a controller drops (default: 90)",
+    )
+    serve_parser.add_argument(
         "--auto-memory",
         dest="serve_auto_memory",
         action=argparse.BooleanOptionalAction,
@@ -929,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 cli_yolo=args.yolo,
                 max_turns=args.max_turns,
+                approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
         except (SessionError, ValueError) as exc:

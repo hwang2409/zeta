@@ -6,7 +6,7 @@ import json
 import threading
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import ergonomics
@@ -18,6 +18,8 @@ OBSERVER_REQUESTS = frozenset({
 })
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
+_CONTROLLER_BUFFER_LIMIT = 4 * 1024 * 1024
+_CONTROLLER_BUFFER_FRAMES = 256
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,11 @@ class _Connection:
     queue: asyncio.Queue[tuple[bytes, asyncio.Future[bool]]] | None = None
     writer_task: asyncio.Task[None] | None = None
     queued_bytes: int = 0
+    ready: bool = False
+    flushing: bool = False
+    buffered_frames: deque[bytes] = field(default_factory=deque)
+    buffered_bytes: int = 0
+    overflowed: bool = False
 
 
 class ConnectionRegistry:
@@ -110,7 +117,42 @@ class ConnectionRegistry:
         state.protocol_version = protocol_version
         state.features = features
 
-    def current_controller(self) -> ControllerMetadata | None:
+    def is_controller(self, connection: Any) -> bool:
+        state = self._connections.get(connection)
+        return state is not None and state is self._controller
+
+    def controller_ready(self, connection: Any) -> None:
+        if not self.is_controller(connection):
+            raise RuntimeError("connection does not own the controller claim")
+        state = self._connections[connection]
+        state.ready = True
+        state.flushing = bool(state.buffered_frames)
+
+    async def flush_controller(self, connection: Any) -> bool:
+        state = self._connections.get(connection)
+        if state is None or state is not self._controller:
+            return False
+        if state.overflowed:
+            error = json.dumps(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "controller output overflow"}},
+                separators=(",", ":"),
+            ).encode() + b"\n"
+            with contextlib.suppress(ConnectionError, OSError, RuntimeError):
+                await connection._write_physical(error)
+            await connection.close()
+            return False
+        try:
+            while state.buffered_frames:
+                frame = state.buffered_frames[0]
+                if not await connection._write_physical(frame):
+                    return False
+                state.buffered_frames.popleft()
+                state.buffered_bytes -= len(frame)
+            return True
+        finally:
+            state.flushing = False
+
+    def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
         if state is None:
             return None
@@ -119,11 +161,27 @@ class ConnectionRegistry:
     async def publish_controller(
         self, event: str, session_id: str | None, **fields: object
     ) -> bool:
-        controller = self.current_controller()
-        if controller is None:
+        state = self._controller
+        if state is None:
             return False
-        frame = controller.connection.codec.notification(event, session_id, **fields)
-        return await self.send(controller.connection, frame)
+        if (
+            event == "approval_end"
+            and "approval_reconnect" not in state.features
+            and isinstance(fields.get("data"), dict)
+            and fields["data"].get("reason") == "grace_expired"
+        ):
+            return False
+        frame = state.connection.codec.notification(event, session_id, **fields)
+        if not state.ready or state.flushing:
+            if state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES:
+                state.overflowed = True
+                state.buffered_frames.clear()
+                state.buffered_bytes = 0
+                return False
+            state.buffered_frames.append(frame)
+            state.buffered_bytes += len(frame)
+            return True
+        return await state.connection._write_physical(frame)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
@@ -131,6 +189,8 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
+        state.buffered_frames.clear()
+        state.buffered_bytes = 0
         if state in self._observers:
             self._observers.remove(state)
         if state.writer_task is not None:

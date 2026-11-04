@@ -15,11 +15,12 @@ from pathlib import Path
 import pytest
 
 import zeta.core.session as session_module
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
     TIMEOUT,
     _close,
     _connect,
+    _frames_until_event,
     _read_raw,
     _request,
     _socket_path,
@@ -31,6 +32,7 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ToolCall,
     ToolUseContent,
 )
@@ -153,7 +155,16 @@ class _StoreGate:
         self.thread_ids: list[int] = []
         self.method = method
         self.session_dir = store.session_dir
+        self.bound_original = getattr(store, method)
         self.original = getattr(type(store), method)
+
+    def call(self, *args: object, **kwargs: object) -> object:
+        self.thread_ids.append(threading.get_ident())
+        self.entered.set()
+        assert self.release.wait(timeout=1), (
+            f"timed out waiting to release {self.method}"
+        )
+        return self.bound_original(*args, **kwargs)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def gated(
@@ -222,6 +233,7 @@ async def _approval_server(
     *,
     protocol_version: str = "1.0",
     features: list[str] | None = None,
+    approval_reconnect_grace: int = 90,
 ) -> tuple[ZetaServer, asyncio.StreamReader, asyncio.StreamWriter, ToolCall]:
     server = ZetaServer(
         home=tmp_path,
@@ -232,6 +244,7 @@ async def _approval_server(
             FakeBackend([]),
             model or "offline",
         ),
+        approval_reconnect_grace=approval_reconnect_grace,
     )
     reader, writer = await _connect(server)
     hello: dict[str, object] = {"protocol_version": protocol_version}
@@ -1712,3 +1725,297 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     finally:
         await _close(server, writer)
         child.close()
+
+async def _wait_controller_release(server: ZetaServer) -> None:
+    for _ in range(100):
+        if server.connections is not None and server.connections.controller_metadata() is None:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("controller was not released")
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_drop_replay_and_approve_same_id(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("reconnected")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    replay_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["approval_reconnect"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        request = (await _frames_until_event(reader, "approval_request"))[-1][
+            "params"
+        ]
+        assert request["request_id"] == call.id
+        writer.close()
+        await writer.wait_closed()
+        await _wait_controller_release(server)
+
+        replay_reader, replay_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello = await _request(
+            replay_reader,
+            replay_writer,
+            10,
+            "hello",
+            {"protocol_version": "1.2", "features": ["approval_reconnect"]},
+        )
+        assert hello[-1]["result"]["capabilities"]["features"] == [
+            "approval_reconnect"
+        ]
+        replay = json.loads(await _read_raw(replay_reader))["params"]
+        assert replay["event"] == "approval_request"
+        assert replay["request_id"] == call.id
+        status = (await _request(replay_reader, replay_writer, 11, "status"))[-1]
+        assert status["result"]["pending_approvals"][0]["request_id"] == call.id
+
+        approved = await _request(
+            replay_reader,
+            replay_writer,
+            12,
+            "approve",
+            {"request_id": call.id},
+        )
+        assert approved[-1]["result"]["request_id"] == call.id
+        if not any(
+            frame.get("params", {}).get("event") == "agent_end"
+            for frame in approved
+        ):
+            await _frames_until_event(replay_reader, "agent_end")
+        assert server.runtime.opened.store.approval_resolution_data(call.id)[
+            "decision"
+        ] == "allow"
+        assert len(backend.calls) == 2
+    finally:
+        if replay_writer is not None:
+            await _close(server, replay_writer)
+        else:
+            await server.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_legacy_claim_during_grace_gets_hello_first_and_no_end_event(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await writer.wait_closed()
+        await _wait_controller_release(server)
+
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {"protocol_version": "1.2"},
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await replacement.drain()
+        hello = await _read_raw(replacement_reader)
+        assert json.loads(hello)["id"] == 10
+
+        status_request = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "status",
+            "params": {},
+        }
+        replacement.write((json.dumps(status_request) + "\n").encode())
+        await replacement.drain()
+        status = json.loads(await _read_raw(replacement_reader))
+        assert status["id"] == 11
+    finally:
+        await _close(server, replacement or writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    replacement: asyncio.StreamWriter | None = None
+    gate = _StoreGate(server.runtime.opened.store, "resolve_approval")
+    try:
+        await server.control._event(_start_event(call))
+        writer.close()
+        await writer.wait_closed()
+        await _wait_controller_release(server)
+
+        grace = server.control._grace_task
+        assert grace is not None
+        grace.cancel()
+        await asyncio.gather(grace, return_exceptions=True)
+        server.approval_reconnect_grace = 0
+        monkeypatch.setattr(
+            server.runtime.opened.store, gate.method, gate.call
+        )
+        server.control._grace_task = asyncio.create_task(server.control._expire_grace())
+        await _wait_thread_gate(gate)
+
+        replacement_reader, replacement = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        hello_request = {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "hello",
+            "params": {
+                "protocol_version": "1.2",
+                "features": ["approval_reconnect"],
+            },
+        }
+        replacement.write((json.dumps(hello_request) + "\n").encode())
+        await replacement.drain()
+        gate.release.set()
+
+        hello = json.loads(await _read_raw(replacement_reader))
+        assert hello["id"] == 10
+    finally:
+        gate.release.set()
+        await _close(server, replacement or writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_starting_claim_before_lookup_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    events: list[tuple[str, str | None]] = []
+    original = server.control._notify
+
+    async def record(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        request_id = fields.get("request_id")
+        events.append((event, request_id if isinstance(request_id, str) else None))
+        return await original(event, session_id, **fields)
+
+    monkeypatch.setattr(server.control, "_notify", record)
+    try:
+        await server.control._event(_start_event(call))
+        await server.control.controller_released(reconnect=True)
+        await server.control.controller_claimed(reconnect=True)
+        assert events.count(("approval_request", call.id)) == 1
+        await server.control.controller_ready(reconnect=True)
+        assert events.count(("approval_request", call.id)) == 2
+        assert server.control.pending_approvals_now()[0]["request_id"] == call.id
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_expiry_aborts_once(tmp_path: Path) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path,
+        protocol_version="1.2",
+        features=["approval_reconnect"],
+        approval_reconnect_grace=0,
+    )
+    try:
+        await server.control._event(_start_event(call))
+        await server.control.controller_released(reconnect=True)
+        await server.control.wait_for_approval_settlement()
+        rows = [
+            row
+            for row in server.runtime.opened.store.entries
+            if row.type == "approval_resolution" and row.data["request_id"] == call.id
+        ]
+        assert len(rows) == 1
+        assert rows[0].data["reason"] == "grace_expired"
+        with pytest.raises(ProtocolError) as late:
+            await server.control.resolve_approval("approve", call.id)
+        assert late.value.code == -32006
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_status_during_reserved_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(
+        tmp_path, protocol_version="1.2", features=["approval_reconnect"]
+    )
+    try:
+        await server.control._event(_start_event(call))
+        store = server.runtime.opened.store
+        gate = _StoreGate(store, "resolve_approval")
+        gate.install(monkeypatch)
+        decision = asyncio.create_task(server.control.resolve_approval("approve", call.id))
+        await _wait_thread_gate(gate)
+        status = server.control.pending_approvals_now(reconnect=True)
+        assert status == [
+            {
+                **server.control._approvals.observe(
+                    server.control._approvals.state.records[call.id].request
+                ),
+                "resolution_pending": "approve",
+            }
+        ]
+        with pytest.raises(ProtocolError) as competing:
+            await server.control.resolve_approval("deny", call.id)
+        assert competing.value.code == -32006
+        gate.release.set()
+        await decision
+    finally:
+        gate.release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_reconnect_status_bound_is_negotiated(tmp_path: Path) -> None:
+    server, _reader, writer, first = await _approval_server(
+        tmp_path,
+        approval_count=65,
+        protocol_version="1.2",
+        features=["approval_reconnect"],
+    )
+    try:
+        states = server.runtime.opened.store.approval_states()
+        for call, _decision in states.values():
+            await server.control._event(_start_event(call))
+        negotiated, truncated = server.control.pending_approvals_now(
+            reconnect=True, include_truncated=True
+        )
+        assert len(negotiated) == 64
+        assert truncated is True
+        legacy = await server.control.pending_approvals()
+        assert len(legacy) == 65
+        assert all("resolution_pending" not in item for item in legacy)
+        assert first.id == negotiated[0]["request_id"]
+    finally:
+        await _close(server, writer)
