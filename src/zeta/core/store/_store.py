@@ -7,6 +7,7 @@ import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
+import threading
 import time
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
@@ -147,6 +148,7 @@ class ConversationStore(
         self._runtime_lease: SessionRuntimeLease | None = None
         self._closed = False
         self._closing = False
+        self._owner_thread_id: int | None = None
         self._transcript_generation = 0
         self._initialize_async_writes()
         if not _read_only and not _must_exist:
@@ -213,6 +215,15 @@ class ConversationStore(
                 self._runtime_lease,
                 lease.pop_all(),
             )
+
+    def bind_owner_thread(self) -> None:
+        """Bind resident state publication and mutation to the event-loop thread."""
+        self._owner_thread_id = threading.get_ident()
+
+    def _assert_owner_thread(self) -> None:
+        owner = self._owner_thread_id
+        if owner is not None and owner != threading.get_ident():
+            raise RuntimeError("resident conversation store accessed off owner thread")
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
@@ -723,6 +734,7 @@ class ConversationStore(
         deadline: float | None = None,
         copy_data: bool = True,
     ) -> ConversationEntry:
+        self._assert_owner_thread()
         self._validate_notification_write(entry_type, data)
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
