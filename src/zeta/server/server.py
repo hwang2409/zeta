@@ -23,6 +23,7 @@ from . import (
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
+from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -498,7 +499,8 @@ class _Client:
                     cwd=cwd,
                 )
                 self.server.control._active_host_commands = candidate
-                self.server.control.session_replaced()
+                self.server.control._active_host_commands = candidate
+            self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
                 return {"session": self._session_snapshot()}
@@ -529,7 +531,8 @@ class _Client:
                     except SessionNotFoundError as exc:
                         raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
                 self.server.control._active_host_commands = candidate
-                self.server.control.session_replaced()
+                self.server.control._active_host_commands = candidate
+            self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
                 return {"session": self._session_snapshot()}
@@ -640,6 +643,12 @@ class _Client:
             assert isinstance(notices, list)
             notices.extend(self.server._account_warnings)
         return result
+
+    def _host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
+        if "host_commands" not in params:
+            return SessionHostCommands.parse([])
+        self._require_feature("session_host_commands", "host_commands")
+        return SessionHostCommands.parse(params["host_commands"])
 
     def _host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
         if "host_commands" not in params:
