@@ -648,12 +648,6 @@ class _Client:
         self._require_feature("session_host_commands", "host_commands")
         return SessionHostCommands.parse(params["host_commands"])
 
-    def _host_commands(self, params: dict[str, Any]) -> SessionHostCommands:
-        if "host_commands" not in params:
-            return SessionHostCommands.parse([])
-        self._require_feature("session_host_commands", "host_commands")
-        return SessionHostCommands.parse(params["host_commands"])
-
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
