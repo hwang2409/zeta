@@ -650,8 +650,7 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         with self._append_lock():
-            entry = self._append_row_unlocked(entry_type, data, parent_id)
-            return self._snapshot_entry(entry)
+            return self._snapshot_entry(self._append_row_unlocked(entry_type, data, parent_id))
 
     def append_many(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
