@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_client import discard_buffered
 from tests.test_server import (
     _close,
     _connect,
@@ -86,7 +88,9 @@ async def _create_session_in(tmp_path: Path, cwd: Path) -> str:
 
 
 @pytest.mark.asyncio
-async def test_resume_runs_tools_in_the_session_cwd(tmp_path: Path) -> None:
+async def test_resume_runs_tools_in_the_session_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     original = tmp_path / "original"
     original.mkdir()
     session_id = await _create_session_in(tmp_path, original)
@@ -98,6 +102,23 @@ async def test_resume_runs_tools_in_the_session_cwd(tmp_path: Path) -> None:
     reader, writer = await _connect(server)
     try:
         await _legacy_hello(reader, writer)
+        tool_end_written = asyncio.Event()
+        controller = server.connections.controller_metadata().connection
+        original_write = controller._write_physical
+
+        async def gated_write(payload: bytes) -> bool:
+            frame = json.loads(payload)
+            if frame.get("id") == 4:
+                await tool_end_written.wait()
+            written = await original_write(payload)
+            if (
+                frame.get("method") == "event"
+                and frame["params"].get("event") == "tool_end"
+            ):
+                tool_end_written.set()
+            return written
+
+        monkeypatch.setattr(controller, "_write_physical", gated_write)
         resumed = await _request(reader, writer, 2, "resume", {"session_id": session_id})
         assert resumed[-1]["result"]["session"]["cwd"] == str(original.resolve())
         await _request(reader, writer, 3, "send", {"text": "where am I"})
@@ -437,6 +458,7 @@ async def test_queued_steer_keeps_its_delivery_id_when_another_request_is_pendin
             if frame.get("params", {}).get("event") == "user_message"
         )
         assert echo["delivery_id"] == "steer-queued"
+        discard_buffered(reader, frames)
 
         writer.write(
             json.dumps(
