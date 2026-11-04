@@ -45,7 +45,7 @@ from .runtime import ServerRuntime
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
 
-HISTORY_PAGE_ENTRIES = 128
+HISTORY_PAGE_ENTRIES: int | None = None
 
 EXTENSION_REQUESTS = [
     "rename_session",
@@ -263,7 +263,7 @@ def page_history(
     offset: int,
     row_builder: Callable[[Any, Mapping[str, object]], list[dict[str, object]]],
     *,
-    page_limit: int = HISTORY_PAGE_ENTRIES,
+    page_limit: int | None = HISTORY_PAGE_ENTRIES,
 ) -> dict[str, object]:
     groups = projection.groups
     entry_count = len(groups) - 1
@@ -272,7 +272,11 @@ def page_history(
     rows: list[dict[str, object]] = []
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
-    stop = min(offset + page_limit, entry_count)
+    stop = (
+        entry_count
+        if page_limit is None
+        else min(offset + page_limit, entry_count)
+    )
     indexes = range(offset, stop)
     if stop == entry_count:
         indexes = range(offset, stop + 1)

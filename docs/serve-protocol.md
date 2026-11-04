@@ -1013,10 +1013,10 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
-  `messages` and `next_offset` (null at the end). The cursor and page limit count
-  the same durable message and notification entries as before; one page targets
-  up to 128 such entries, with the frame-size bound ending a page earlier when
-  needed. Approval lifecycle entries between them do not change the
+  `messages` and `next_offset` (null at the end). The cursor counts the same
+  durable message and notification entries as before. Pages use the
+  frame-size bound rather than a fixed entry target. Approval lifecycle entries
+  between them do not change the
   cursor value, so an offset issued by an older server resumes without a gap or
   duplicate. All rows projected from one entry are atomic on a page. An
   assistant approval anchor emits its message row and then its
