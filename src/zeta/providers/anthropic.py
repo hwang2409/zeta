@@ -24,6 +24,7 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
+from .payload_common import is_harness_notification
 from ..oauth import (
     OAuthRefreshFailure,
     ProviderLoginRequiredError,
@@ -92,7 +93,11 @@ CLAUDE_CODE_CCH = "00000"  # First-party cch in the 2.1.280 snapshot.
 
 
 def _first_user_text(messages: Sequence[Message]) -> str:
-    """Return text from the first original user turn, including an empty turn."""
+    """Return text from the first original user turn, including an empty turn.
+
+    Eviction can drop every typed turn. Then fall back to the first harness
+    notification, so a wake turn still carries the billing block.
+    """
     for message in messages:
         if message.role is not MessageRole.USER or message.metadata.get("zeta_event"):
             continue
@@ -100,6 +105,11 @@ def _first_user_text(messages: Sequence[Message]) -> str:
             if isinstance(block, TextContent):
                 return block.text
         return ""
+    for message in messages:
+        if message.role is MessageRole.SYSTEM and is_harness_notification(message):
+            for block in message.content:
+                if isinstance(block, TextContent) and block.text:
+                    return block.text
     return ""
 
 
