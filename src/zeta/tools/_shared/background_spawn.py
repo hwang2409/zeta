@@ -61,6 +61,8 @@ def _descendant_pids_from_table(
 
 def _snapshot_descendants_sync(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
     """Take one process-table snapshot for session shutdown."""
+    if not root_pids:
+        return {}
     try:
         result = subprocess.run(
             ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],

@@ -2343,3 +2343,18 @@ async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Pa
     assert event.data["background_phase"] == "task_kill"
     await registry.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_without_running_tasks_runs_no_process_table_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """an empty session exit must not block the loop on a `ps` subprocess."""
+
+    def no_subprocess(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("session exit ran a process-table query with no tasks")
+
+    monkeypatch.setattr(spawn_module.subprocess, "run", no_subprocess)
+    registry = BackgroundTaskRegistry()
+    assert not await registry.close()
