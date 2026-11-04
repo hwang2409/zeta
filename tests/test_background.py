@@ -2020,9 +2020,15 @@ import shlex
 import sys
 
 from zeta.tools._shared.process import BackgroundTaskRegistry
+from zeta.tools._shared import background_spawn
 
 
 async def main():
+    original_snapshot = background_spawn._descendant_pids
+    async def delayed_snapshot(root_pid):
+        await asyncio.sleep(1)
+        return await original_snapshot(root_pid)
+    background_spawn._descendant_pids = delayed_snapshot
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     escaped_path = sys.argv[2]
     child = (
