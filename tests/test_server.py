@@ -75,7 +75,9 @@ from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 
-TIMEOUT = 3
+# A hang guard for waits on real frames, not a speed limit: a loaded CI
+# runner can take more than a few seconds between frames.
+TIMEOUT = 30
 
 
 def _client_notifier(client: _Client):
@@ -3626,6 +3628,45 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "home"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    ProjectRegistry(home / "projects").create_project(
+        "activation", "activation test", project_root
+    )
+    entries_reads = 0
+    original_entries = ConversationStore.entries
+
+    def counted_entries(store: ConversationStore):
+        nonlocal entries_reads
+        entries_reads += 1
+        return original_entries.__get__(store, ConversationStore)
+
+    monkeypatch.setattr(ConversationStore, "entries", property(counted_entries))
+    server = ZetaServer(
+        home=home,
+        cwd=project_root,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    try:
+        await server.runtime.create_session()
+        assert "inbox" in server.runtime.loop.tool_registry.registered_names
+        assert entries_reads == 0
+    finally:
+        await server.close()
 
 
 @pytest.mark.asyncio

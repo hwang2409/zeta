@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .core.store import ConversationEntry
+from .core.store._startup_facts import ContextCalibrationRecord
 
 _ALPHA = 0.5
 _MIN_RATIO = 1.0
@@ -28,7 +28,7 @@ class ContextCalibration:
 
     def __init__(
         self,
-        entries: Sequence[ConversationEntry],
+        records: Sequence[ContextCalibrationRecord],
         *,
         provider_limit: int,
         safety_margin: float,
@@ -42,21 +42,12 @@ class ContextCalibration:
         self.ratio = 1.0
         self.has_measurement = False
         self.provider_token_total: int | None = None
-        for entry in entries:
-            if entry.type != "message":
-                continue
-            metadata = entry.data.get("message", {}).get("metadata", {})
-            persisted = metadata.get("context_calibration_ratio")
-            if type(persisted) in {int, float}:
-                self.ratio = min(_MAX_RATIO, max(_MIN_RATIO, float(persisted)))
+        for record in records:
+            if record.ratio is not None:
+                self.ratio = min(_MAX_RATIO, max(_MIN_RATIO, record.ratio))
                 self.has_measurement = True
-                continue
-            usage = metadata.get("provider_usage")
-            estimate = metadata.get("context_estimate_tokens")
-            if isinstance(usage, Mapping) and type(estimate) is int:
-                actual = self.provider_input_tokens(usage)
-                if actual is not None:
-                    self._observe(estimate, actual)
+            elif record.estimate is not None and record.actual is not None:
+                self._observe(record.estimate, record.actual)
 
     @staticmethod
     def provider_input_tokens(usage: Mapping[str, Any]) -> int | None:

@@ -60,7 +60,7 @@ from ._incremental_validation import (
     IncrementalValidationMixin,
 )
 from ._lifecycle import StoreLifecycleMixin
-from ._log import ConversationLogMixin, PersistedAppend
+from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -69,6 +69,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -100,6 +101,7 @@ class ConversationStore(
     AsyncDurableWritesMixin,
     PendingPromptStoreMixin,
     ClientDeliveryMixin,
+    StartupFactsMixin,
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
@@ -121,6 +123,7 @@ class ConversationStore(
         _read_only: bool = False,
         _must_exist: bool = False,
         _collect_persisted_appends: bool = False,
+        _validated_log_state: _DetachedLogState | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -178,6 +181,7 @@ class ConversationStore(
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
+        self._sent_message_receipts: list[tuple[str, str]] = []
         self._todo_items: list[TodoItem] = []
         self._todo_dismissed = False
         self._agent_counter = 0
@@ -195,8 +199,12 @@ class ConversationStore(
                 self._load()
                 self._load_session_state()
             else:
+                if _validated_log_state is not None:
+                    self._install_log_state(_validated_log_state)
+                    self._strict_snapshot_sync = True
                 with self._append_lock(deadline=_lock_deadline):
                     self._load_session_state()
+                self._strict_snapshot_sync = False
             if not _read_only:
                 self._runtime_lease = SessionRuntimeLease(self.directory_fd)
             self._release_lease = weakref.finalize(
@@ -692,6 +700,7 @@ class ConversationStore(
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
+            self._sent_message_receipts.extend(sent_message_receipts(entry))
             if (
                 entry.type == "notification"
                 and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
@@ -747,6 +756,7 @@ class ConversationStore(
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
+        self._sent_message_receipts.extend(sent_message_receipts(entry))
         if linear:
             self._record_active_entry(entry)
         else:

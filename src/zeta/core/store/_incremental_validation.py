@@ -7,6 +7,7 @@ import time
 
 from ...protocol.types import Message, ToolResult, ToolUseContent
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
+from ._startup_facts import sent_message_receipts
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     TASK_EXITED_NOTIFICATION_KIND,
@@ -91,6 +92,7 @@ class IncrementalValidationMixin:
         )
         staged._active_last_message = self._active_last_message
         staged._task_notification_ids = set(self._task_notification_ids)
+        staged._sent_message_receipts = list(self._sent_message_receipts)
         for index, entry in enumerate(entries):
             # Large off-thread refreshes must release the GIL often enough for
             # the owner event loop to remain responsive.
@@ -123,6 +125,7 @@ class IncrementalValidationMixin:
         )
         self._active_last_message = staged._active_last_message
         self._task_notification_ids = staged._task_notification_ids
+        self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
         self._entries = staged._entries
         self._record_client_delivery_entries(entries)
@@ -159,11 +162,34 @@ class IncrementalValidationMixin:
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
+        self._sent_message_receipts.extend(sent_message_receipts(entry))
         if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
         return True
+
+    def _install_validated_linear_entries(
+        self, entries: list[ConversationEntry]
+    ) -> None:
+        """Install worker-validated tail rows and publish the entry list once."""
+        previous = self._entries[-1] if self._entries else None
+        for entry in entries:
+            expected_seq = previous.seq + 1 if previous is not None else 1
+            expected_parent = previous.id if previous is not None else None
+            assert entry.seq == expected_seq and entry.parent_id == expected_parent
+            assert entry.id not in self._entry_ids
+            self._record_active_entry(entry)
+            self._entry_ids.add(entry.id)
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
+                task_id = entry.data.get("task_id")
+                if type(task_id) is str and task_id:
+                    self._task_notification_ids.add(task_id)
+            previous = entry
+        self._entries.extend(entries)
 
     def _record_agent_receipt(self, result: ToolResult) -> None:
         structured = result.structured_content
