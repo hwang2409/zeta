@@ -432,7 +432,9 @@ async def test_anthropic_oauth_compat_keeps_billing_block_after_typed_turns_are_
         )
     ]
     system = json.loads(requests[0].content)["system"]
-    assert system[0]["text"] == anthropic_module.build_billing_header_value(notification)
+    wire_text = json.loads(requests[0].content)["messages"][-1]["content"][0]["text"]
+    assert wire_text.endswith(notification)
+    assert system[0]["text"] == anthropic_module.build_billing_header_value(wire_text)
     await client.aclose()
 
 

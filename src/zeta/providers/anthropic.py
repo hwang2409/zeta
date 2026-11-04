@@ -24,7 +24,10 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
-from .payload_common import is_harness_notification
+from .payload_common import (
+    HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
+    is_harness_notification,
+)
 from ..oauth import (
     OAuthRefreshFailure,
     ProviderLoginRequiredError,
@@ -95,21 +98,19 @@ CLAUDE_CODE_CCH = "00000"  # First-party cch in the 2.1.280 snapshot.
 def _first_user_text(messages: Sequence[Message]) -> str:
     """Return text from the first original user turn, including an empty turn.
 
-    Eviction can drop every typed turn. Then fall back to the first harness
-    notification, so a wake turn still carries the billing block.
+    Eviction can drop every typed turn. Then use the first harness
+    notification as sent on the wire, so a wake turn keeps the billing block.
     """
-    for message in messages:
-        if message.role is not MessageRole.USER or message.metadata.get("zeta_event"):
-            continue
-        for block in message.content:
-            if isinstance(block, TextContent):
-                return block.text
-        return ""
+    typed = [
+        m for m in messages if m.role is MessageRole.USER and not m.metadata.get("zeta_event")
+    ]
+    if typed:
+        return next((b.text for b in typed[0].content if isinstance(b, TextContent)), "")
     for message in messages:
         if message.role is MessageRole.SYSTEM and is_harness_notification(message):
-            for block in message.content:
-                if isinstance(block, TextContent) and block.text:
-                    return block.text
+            text = next((b.text for b in message.content if isinstance(b, TextContent)), "")
+            if text:
+                return f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{text}"
     return ""
 
 
