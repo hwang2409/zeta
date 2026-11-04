@@ -421,6 +421,7 @@ async def test_live_slow_write_is_not_aborted(
     assert not task.done()
     release.set()
     assert await asyncio.wait_for(task, 1)
+    assert not hasattr(protocol_module, "_DETACHED_FRAME_WRITES")
 
 
 @pytest.mark.asyncio
@@ -451,6 +452,7 @@ async def test_abort_error_still_completes_canceled_write(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 1)
+    assert not hasattr(protocol_module, "_DETACHED_FRAME_WRITES")
 
 
 @pytest.mark.asyncio
