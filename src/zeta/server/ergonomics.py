@@ -590,6 +590,8 @@ def _backward_page(
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     groups = list(projection.groups)
     sizes = list(projection.body_sizes)
+    cache_groups = list(projection.groups)
+    cache_sizes = list(projection.body_sizes)
     rows: list[dict[str, object]] = []
     body_size = 0
     selected: list[tuple[dict[str, object], ...]] = []
@@ -604,8 +606,14 @@ def _backward_page(
                     entry, projection.approval_calls, include_delivery_id=include_delivery_id
                 )
             ]
-            groups.append(_project_history_group(raw, end, backward=True, validator=validator)[0])
-            sizes.append(_history_group_body_size(codec, groups[-1]))
+            forward_group, forward_size = _project_history_group(raw, end)
+            backward_group, backward_size = _project_history_group(
+                raw, end, backward=True, validator=validator
+            )
+            cache_groups.append(forward_group)
+            cache_sizes.append(forward_size)
+            groups.append(backward_group)
+            sizes.append(backward_size)
         group = groups[index]
         candidate = body_size + int(bool(selected and group)) + sizes[index]
         next_before = index
@@ -627,8 +635,11 @@ def _backward_page(
                     entry, projection.approval_calls, include_delivery_id=include_delivery_id
                 )
             ]
-            group, sizes[index] = _project_history_group(raw, 0, backward=True, validator=validator)
-            candidate = body_size + int(bool(selected and group)) + sizes[index]
+            group, response_size = _project_history_group(
+                raw, 0, backward=True, validator=validator
+            )
+            sizes[index] = response_size
+            candidate = body_size + int(bool(selected and group)) + response_size
             if _history_frame_size(codec, request_id, messages_body_size=candidate,
                                    next_before=next_before,
                                    history_validator=validator) > MAX_FRAME_BYTES:
@@ -646,7 +657,12 @@ def _backward_page(
         "messages": rows,
         "next_before": boundary if boundary > 0 else None,
         "history_validator": validator,
-    }, HistoryProjection(projection.entry_groups, projection.approval_calls, tuple(groups), tuple(sizes))
+    }, HistoryProjection(
+        projection.entry_groups,
+        projection.approval_calls,
+        tuple(cache_groups),
+        tuple(cache_sizes),
+    )
 
 
 def history(

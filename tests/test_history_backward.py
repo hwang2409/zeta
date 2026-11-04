@@ -33,7 +33,8 @@ def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[s
     return ergonomics.history(_runtime(store), params, backward_enabled=True)
 
 
-def test_newest_page_then_full_backward_walk_has_no_gaps() -> None:
+def test_newest_page_then_full_backward_walk_has_no_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     validator = first["history_validator"]
@@ -48,23 +49,27 @@ def test_newest_page_then_full_backward_walk_has_no_gaps() -> None:
     assert seen == [f"message-{i}" for i in range(220)]
 
 
-def test_backward_continuation_survives_append() -> None:
+def test_backward_continuation_survives_append(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     store.entries.append(_entry(220))
     store._log_offset += 1
+    assert first["next_before"] is not None
     page = _backward_history(
         store,
         {"before": first["next_before"], "history_validator": first["history_validator"]},
     )
-    assert "message-20" not in {row["id"] for row in page["messages"]}
+    assert "message-220" not in {row["id"] for row in page["messages"]}
 
 
-def test_backward_continuation_is_stale_after_prefix_change() -> None:
+def test_backward_continuation_is_stale_after_prefix_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
     first = _backward_history(store, {"before": None})
     store.entries[:] = store.entries[:5] + [_entry(99)]
     store._log_offset += 1
+    assert first["next_before"] is not None
     with pytest.raises(ProtocolError) as error:
         _backward_history(
             store,
@@ -79,3 +84,38 @@ def test_backward_params_require_negotiation() -> None:
     with pytest.raises(ProtocolError) as error:
         ergonomics.history(_runtime(store), {"before": None})
     assert error.value.code == -32602
+
+
+def test_backward_zero_is_empty_and_malformed_params_are_rejected() -> None:
+    store = _HistoryStore([_entry(i) for i in range(3)])
+    first = _backward_history(store, {"before": None})
+    empty = _backward_history(
+        store,
+        {"before": 0, "history_validator": first["history_validator"]},
+    )
+    assert empty == {
+        "messages": [],
+        "next_before": None,
+        "history_validator": first["history_validator"],
+    }
+    for params in (
+        {"before": -1},
+        {"before": 1, "offset": 0},
+        {"before": 1, "history_validator": {"end": 1}},
+        {"history_validator": first["history_validator"]},
+    ):
+        with pytest.raises(ProtocolError) as error:
+            _backward_history(store, params)
+        assert error.value.code == -32602
+
+
+def test_backward_does_not_replace_forward_cache_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    store = _HistoryStore([_entry(i) for i in range(220)])
+    before = ergonomics.history(_runtime(store), {"offset": 0})
+    backward = _backward_history(store, {"before": None})
+    after = ergonomics.history(_runtime(store), {"offset": 0})
+    assert before == after
+    assert backward["history_validator"]["end"] == 220
