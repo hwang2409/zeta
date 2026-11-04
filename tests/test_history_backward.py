@@ -17,7 +17,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import ZetaServer, ergonomics
-from zeta.server.protocol import ProtocolError
+from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec, ProtocolError
 
 
 def _entry(number: int) -> SimpleNamespace:
@@ -240,6 +240,23 @@ def test_backward_zero_is_empty_and_malformed_params_are_rejected() -> None:
         with pytest.raises(ProtocolError) as error:
             _backward_history(store, params)
         assert error.value.code == -32602
+
+
+def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    group = SimpleNamespace(
+        id="approval",
+        type="approval_history",
+        data={"event": "approval_request", "tool_call": {"arguments": {f"k{i}": "x" * 8000 for i in range(20)}}},
+    )
+    store = _HistoryStore([_entry(0), group, _entry(1)])
+    first = _backward_history(store, {"before": None})
+    payload = FrameCodec().response("id", first)
+    assert len(payload) <= MAX_FRAME_BYTES
+    assert any(row.get("content", [{}])[0].get("text") == ergonomics.HISTORY_GROUP_TRUNCATED for row in first["messages"])
+    if first["next_before"] is not None:
+        next_page = _backward_history(store, {"before": first["next_before"], "history_validator": first["history_validator"]})
+        assert not ({row.get("id") for row in first["messages"]} & {row.get("id") for row in next_page["messages"]})
 
 
 def test_backward_does_not_replace_forward_cache_projection(
