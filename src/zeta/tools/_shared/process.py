@@ -31,6 +31,7 @@ from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
     _group_exists,
+    _signal_group,
     _terminate_process,
     _terminate_processes,
     create_subprocess_shell_in_fd,

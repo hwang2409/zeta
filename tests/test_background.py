@@ -12,7 +12,6 @@ import signal
 import stat
 import subprocess
 import sys
-import time
 import threading
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -41,7 +40,6 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import background_spawn as spawn_module
-from zeta.tools._shared import process as process_module
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 from zeta.tools._shared.background_spawn import _terminate_process
 from zeta.tools._shared.process import (
