@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
@@ -39,8 +40,9 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
-from zeta.tools._shared import process as process_module
+from zeta.tools._shared import background_spawn as spawn_module
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
+from zeta.tools._shared.background_spawn import _terminate_process
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     TaskExitInput,
@@ -57,6 +59,32 @@ def _python(*parts: str) -> str:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_termination_does_not_signal_reused_descendant_pid(monkeypatch) -> None:
+    snapshots = iter(({10: {42: "old"}}, {42: "new"}))
+    signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 10
+        returncode = None
+
+        async def wait(self) -> None:
+            await asyncio.sleep(0.01)
+            self.returncode = -9
+
+    def snapshot(_):
+        return next(snapshots)
+
+    monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", snapshot)
+    monkeypatch.setattr(spawn_module, "_signal_group", lambda process, number: None)
+    monkeypatch.setattr(spawn_module, "_signal_pids", lambda pids, number: signals.extend(
+        (pid, number) for pid in pids
+    ))
+
+    await _terminate_process(Process(), 0.001)
+    assert signals == [(42, signal.SIGTERM)]
 
 
 def _task_notification(item: TaskExitInput) -> pending_delivery_module.NotificationInput:
@@ -86,6 +114,52 @@ def _notification_registry(
     return BackgroundTaskRegistry(
         notification_sink=lambda item: flow.produce(_task_notification(item))
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_snapshot_does_not_block_live_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    during_snapshot_ticks: list[int] = []
+    snapshot_calls = 0
+
+    def slow_snapshot(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            snapshot_started.set()
+            threading.Timer(0.1, lambda: during_snapshot_ticks.append(ticks)).start()
+            release_snapshot.wait(0.3)
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
+
+    monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", slow_snapshot)
+    registry = BackgroundTaskRegistry(term_grace=0.01)
+    await registry.start("sleep 30", tmp_path)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            if snapshot_started.is_set():
+                ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticking = asyncio.create_task(ticker())
+    closing = asyncio.create_task(registry.close())
+    try:
+        await asyncio.to_thread(snapshot_started.wait, 1)
+        await asyncio.sleep(0.05)
+        release_snapshot.set()
+        await closing
+        await asyncio.sleep(0.2)
+        assert during_snapshot_ticks and during_snapshot_ticks[0] > 0
+    finally:
+        release_snapshot.set()
+        ticking.cancel()
+        await asyncio.gather(ticking, return_exceptions=True)
+        await asyncio.gather(closing, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1890,6 +1964,69 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_task_kill_cancellation_still_kills_escaped_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    child_code = (
+        "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        f"open({str(child_pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
+    )
+    tasks = BackgroundTaskRegistry(term_grace=0.03)
+    task_id, _ = await tasks.start(
+        _python(
+            "import os,subprocess,sys,time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+            "preexec_fn=os.setsid, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); time.sleep(30)"
+        ),
+        tmp_path,
+    )
+    for _ in range(100):
+        if child_pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert child_pid_file.exists()
+    child_pid = int(child_pid_file.read_text())
+    second_snapshot_started = asyncio.Event()
+    release_second_snapshot = asyncio.Event()
+    original_snapshot = spawn_module._snapshot_descendants_sync
+    snapshot_calls = 0
+
+    def blocked_second_snapshot(root_pids: Sequence[int]):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 2:
+            second_snapshot_started.set()
+            while not release_second_snapshot.is_set():
+                time.sleep(0.001)
+        return original_snapshot(root_pids)
+
+    monkeypatch.setattr(
+        spawn_module, "_snapshot_descendants_sync", blocked_second_snapshot
+    )
+    killing = asyncio.create_task(tasks.kill(task_id))
+    try:
+        await second_snapshot_started.wait()
+        killing.cancel()
+        release_second_snapshot.set()
+        with pytest.raises(asyncio.CancelledError):
+            await killing
+        await tasks.close()
+        for _ in range(200):
+            if not _group_exists(child_pid):
+                break
+            await asyncio.sleep(0.01)
+        assert not _group_exists(child_pid)
+    finally:
+        release_second_snapshot.set()
+        await asyncio.gather(killing, return_exceptions=True)
+        if _group_exists(child_pid):
+            os.killpg(child_pid, signal.SIGKILL)
+        await tasks.close()
+
+
+@pytest.mark.asyncio
 async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1928,53 +2065,6 @@ async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
         for record in tasks.records:
             if _group_exists(record.pid):
                 os.killpg(record.pid, signal.SIGKILL)
-
-
-def test_asyncio_run_teardown_during_close_terminates_all_groups(
-    tmp_path: Path,
-) -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import asyncio
-import os
-import signal
-import sys
-
-from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
-
-
-async def main():
-    tasks = BackgroundTaskRegistry(term_grace=0.25)
-    _, pid = await tasks.start(
-        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
-        sys.argv[1],
-    )
-    await asyncio.sleep(0.1)
-    asyncio.create_task(tasks.close())
-    await asyncio.sleep(0.05)
-    return tasks, pid
-
-
-tasks, pid = asyncio.run(main())
-alive = _group_exists(pid)
-closed = tasks._closed
-if alive:
-    os.killpg(pid, signal.SIGKILL)
-print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
-raise SystemExit(1 if alive or not closed else 0)
-""",
-            str(tmp_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
@@ -2039,7 +2129,7 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
         for _ in range(3)
     ]
     term_sent = asyncio.Event()
-    original_signal_group = process_module._signal_group
+    original_signal_group = spawn_module._signal_group
 
     def signal_group(process: object, signum: signal.Signals) -> None:
         if signum == signal.SIGTERM:
@@ -2047,7 +2137,7 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
             return
         original_signal_group(process, signum)
 
-    monkeypatch.setattr(process_module, "_signal_group", signal_group)
+    monkeypatch.setattr(spawn_module, "_signal_group", signal_group)
     try:
         closing = asyncio.create_task(tasks.close())
         await term_sent.wait()
@@ -2241,3 +2331,18 @@ async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Pa
     assert event.data["background_phase"] == "task_kill"
     await registry.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_without_running_tasks_runs_no_process_table_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """an empty session exit must not block the loop on a `ps` subprocess."""
+
+    def no_subprocess(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("session exit ran a process-table query with no tasks")
+
+    monkeypatch.setattr(spawn_module.subprocess, "run", no_subprocess)
+    registry = BackgroundTaskRegistry()
+    assert not await registry.close()

@@ -7,6 +7,7 @@ import os
 import pty
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2298,6 +2299,75 @@ async def test_bash_tool_subprocess_sets_tool_marker(
         ToolCall("bg-marker-read", "task_output", {"task_id": task_id})
     )
     assert "ZETA_TOOL_SUBPROCESS=1" in output["structuredContent"]["output"]
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Path) -> None:
+    escaped_pid = tmp_path / "escaped.pid"
+    child = (
+        "import os,pathlib,time; os.setsid(); "
+        f"pathlib.Path({str(escaped_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    command = _python_command(
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    started = await registry.execute(
+        ToolCall("bg-escaped", "run_background", {"command": command})
+    )
+    task_id = started["structuredContent"]["task_id"]
+    for _ in range(100):
+        if escaped_pid.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert escaped_pid.exists()
+
+    result = await asyncio.wait_for(
+        registry.execute(ToolCall("kill-escaped", "task_kill", {"task_id": task_id})),
+        timeout=3,
+    )
+
+    assert result["structuredContent"]["running"] is False
+    escaped = int(escaped_pid.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(escaped, 0)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> None:
+    holder_pid = tmp_path / "holder.pid"
+    child = (
+        "import os,pathlib,time; os.setsid(); "
+        f"pathlib.Path({str(holder_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    helper = (
+        "import subprocess,sys,os; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); os._exit(0)"
+    )
+    command = _python_command(
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {helper!r}]); time.sleep(30)"
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    started = await registry.execute(
+        ToolCall("bg-shutdown", "run_background", {"command": command})
+    )
+    task_id = started["structuredContent"]["task_id"]
+    for _ in range(100):
+        if holder_pid.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert holder_pid.exists()
+
+    await asyncio.wait_for(registry.close(), timeout=3)
+    status = await registry.background_tasks.output(task_id)
+    assert status["running"] is False
+    assert "background output was cut off" in status["note"]
+    escaped = int(holder_pid.read_text())
+    os.kill(escaped, signal.SIGKILL)
     await registry.close()
 
 

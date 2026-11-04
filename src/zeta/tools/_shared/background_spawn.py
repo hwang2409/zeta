@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
-from collections.abc import Awaitable, Callable
+import subprocess
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from .tool_spawn import create_tool_subprocess_shell
+
+logger = logging.getLogger(__name__)
 
 
 async def create_subprocess_shell_in_fd(
@@ -30,6 +34,125 @@ def _group_exists(process_id: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _parse_process_table(stdout: bytes) -> dict[int, list[tuple[int, str]]]:
+    children: dict[int, list[tuple[int, str]]] = {}
+    for line in stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            pid, ppid = int(fields[0]), int(fields[1])
+            children.setdefault(ppid, []).append((pid, fields[2]))
+    return children
+
+
+def _descendant_pids_from_table(
+    children: dict[int, list[tuple[int, str]]], root_pid: int
+) -> dict[int, str]:
+    descendants: dict[int, str] = {}
+    pending = [root_pid]
+    while pending:
+        for pid, start in children.get(pending.pop(), ()):
+            if pid not in descendants:
+                descendants[pid] = start
+                pending.append(pid)
+    return descendants
+
+
+def _snapshot_descendants_sync(
+    root_pids: Sequence[int] | None,
+) -> dict[int, dict[int, str]] | dict[int, str]:
+    """Take one process-table snapshot for termination and identity checks."""
+    if root_pids == () or root_pids == []:
+        return {}
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="],
+            timeout=2,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
+    if result.returncode != 0:
+        return {} if root_pids is None else {pid: {} for pid in root_pids}
+    children = _parse_process_table(result.stdout)
+    if root_pids is None:
+        return {
+            pid: start
+            for entries in children.values()
+            for pid, start in entries
+        }
+    return {pid: _descendant_pids_from_table(children, pid) for pid in root_pids}
+
+
+def _signal_pids(pids: dict[int, str], signal_number: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.debug("could not signal background descendant %s", pid, exc_info=True)
+
+
+async def _terminate_processes(
+    processes: Sequence[asyncio.subprocess.Process],
+    term_grace: float,
+    *,
+    finish: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None,
+) -> None:
+    """Terminate processes and descendants without trusting reused pids."""
+    if not processes:
+        return
+    snapshot = finish or (lambda awaitable: awaitable)
+    descendants = await snapshot(
+        asyncio.to_thread(
+            _snapshot_descendants_sync, [process.pid for process in processes]
+        )
+    ) or {}
+    for process in processes:
+        _signal_group(process, signal.SIGTERM)
+        _signal_pids(descendants.get(process.pid, {}), signal.SIGTERM)
+    try:
+        await snapshot(
+            asyncio.wait_for(
+                asyncio.gather(*(process.wait() for process in processes)),
+                timeout=term_grace,
+            )
+        )
+    except TimeoutError:
+        pass
+    current = await snapshot(asyncio.to_thread(_snapshot_descendants_sync, None))
+    for process in processes:
+        _signal_group(process, signal.SIGKILL)
+        survivors = (
+            descendants.get(process.pid, {})
+            if current is None
+            else {
+                pid: start
+                for pid, start in current.items()
+                if descendants.get(process.pid, {}).get(pid) == start
+            }
+        )
+        _signal_pids(survivors, signal.SIGKILL)
+
+
+async def _terminate_process(
+    process: asyncio.subprocess.Process,
+    term_grace: float,
+    close_stdin: Callable[[], Awaitable[object]] | None = None,
+) -> None:
+    cancellation = _DeferredCancellation()
+    if close_stdin is not None:
+        await cancellation.finish(close_stdin())
+    await _terminate_processes(
+        (process,), term_grace, finish=cancellation.finish
+    )
+    if process.returncode is None:
+        await cancellation.finish(process.wait())
+    if cancellation.cancelled:
+        raise asyncio.CancelledError
 
 
 def _signal_group(process: asyncio.subprocess.Process, signal_number: int) -> None:
