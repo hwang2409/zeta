@@ -193,6 +193,7 @@ def test_details_view_shows_fields_and_output_counter() -> None:
                 ended_at=65.0,
                 output_bytes=10,
                 output_lines=12,
+                note="background output was cut off because a process outside the task still held its output",
             )
         ],
         now=65.0,
@@ -205,6 +206,7 @@ def test_details_view_shows_fields_and_output_counter() -> None:
     assert "Runtime 1m05s" in text
     assert "PID     4242" in text
     assert "Exit    1" in text
+    assert "background output was cut off because a process outside the task still held its output" in text
     assert "python manage.py runserver 0.0.0.0:8000" in text
     assert "showing 2 of 12 lines" in text
     assert "line one" in text and "line two" in text

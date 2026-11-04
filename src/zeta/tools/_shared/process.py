@@ -46,11 +46,48 @@ def tool_subprocess_env() -> dict[str, str]:
     return subprocess_env()
 
 
+async def _descendant_pids(root_pid: int) -> set[int]:
+    """Snapshot descendants without blocking the event loop."""
+
+    process = await asyncio.create_subprocess_exec(
+        "ps", "-A", "-o", "pid=", "-o", "ppid=", stdout=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await process.communicate()
+    children: dict[int, list[int]] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, ppid = map(int, fields)
+            children.setdefault(ppid, []).append(pid)
+    descendants: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        for pid in children.get(pending.pop(), ()):
+            if pid not in descendants:
+                descendants.add(pid)
+                pending.append(pid)
+    return descendants
+
+
+def _signal_pids(pids: set[int], signal_number: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.debug("could not signal background descendant %s", pid, exc_info=True)
+
+
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
+BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
+OUTPUT_CUTOFF_NOTE = (
+    "background output was cut off because a process outside the task still held its output"
+)
 @dataclass(frozen=True, slots=True)
 class BackgroundTaskNotice:
     """Structured lifecycle notice emitted by a background task owner."""
@@ -640,6 +677,10 @@ class BackgroundTaskRegistry:
                 if record.running and record.process is not None
             ]
             records = [record for record, _ in entries]
+            descendants = {
+                record.task_id: await _descendant_pids(process.pid)
+                for record, process in entries
+            }
             killed = [record.task_id for record in records]
             # Whole-session and child-completion shutdown kills silently; callers
             # surface the ids (child receipt) instead. Prepare every record before
@@ -651,8 +692,9 @@ class BackgroundTaskRegistry:
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
             )
-            for _, process in entries:
+            for record, process in entries:
                 _signal_group(process, signal.SIGTERM)
+                _signal_pids(descendants[record.task_id], signal.SIGTERM)
 
             # Use one shared grace period for the whole session, not one period
             # per process. Escalate all survivors together, then let monitors
@@ -667,9 +709,10 @@ class BackgroundTaskRegistry:
                     )
                 except asyncio.TimeoutError:
                     pass
-            for _, process in entries:
+            for record, process in entries:
                 if _group_exists(process.pid):
                     _signal_group(process, signal.SIGKILL)
+                _signal_pids(descendants[record.task_id], signal.SIGKILL)
 
             cleanup_timeout = self.term_grace + self.stdin_drain_timeout
             if entries:
@@ -711,6 +754,9 @@ class BackgroundTaskRegistry:
                     )
                 )
                 pending = set(monitors) if monitor_result is None else monitor_result[1]
+                for record in records:
+                    if record.monitor in pending:
+                        record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
                 for monitor in pending:
                     monitor.cancel()
                 if pending:
@@ -952,6 +998,7 @@ class BackgroundTaskRegistry:
         process = record.process
         if process is None:
             return
+        descendants = await _descendant_pids(process.pid)
         # Set the phase before signaling: the monitor commonly wins the race to
         # finalize the record and must preserve the initiating lifecycle event.
         record.terminal_phase = phase
@@ -959,16 +1006,27 @@ class BackgroundTaskRegistry:
         await self._close_stdin(record)
         record.note = reason
         _signal_group(process, signal.SIGTERM)
+        _signal_pids(descendants, signal.SIGTERM)
         try:
             await asyncio.wait_for(process.wait(), timeout=self.term_grace)
         except asyncio.TimeoutError:
             pass
         if _group_exists(process.pid):
             _signal_group(process, signal.SIGKILL)
+        _signal_pids(descendants, signal.SIGKILL)
         if process.returncode is None:
             await process.wait()
+        monitor_cutoff = False
         if record.monitor is not None and record.monitor is not asyncio.current_task():
-            await asyncio.gather(record.monitor, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                (record.monitor,), timeout=BACKGROUND_OUTPUT_DRAIN_TIMEOUT
+            )
+            if not done:
+                monitor_cutoff = True
+                record.monitor.cancel()
+                await asyncio.gather(record.monitor, return_exceptions=True)
+        if monitor_cutoff:
+            record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
         if not record.running:
             return
         record.running = False
