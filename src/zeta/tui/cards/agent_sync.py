@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...core.agent_progress import live_agent_lifecycle
+from ...core.agent_progress import read_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -41,12 +41,10 @@ _LOGGER = logging.getLogger(__name__)
 
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
     lifecycle_path = path / "agent_lifecycle.json"
-    lifecycle = live_agent_lifecycle(lifecycle_path)
-    if lifecycle is None:
-        try:
-            lifecycle = load_session_json(lifecycle_path)
-        except (ConversationIntegrityError, OSError, ValueError):
-            return None
+    try:
+        lifecycle = read_agent_lifecycle(lifecycle_path)
+    except (ConversationIntegrityError, OSError, ValueError):
+        return None
     return lifecycle if type(lifecycle) is dict else None
 
 

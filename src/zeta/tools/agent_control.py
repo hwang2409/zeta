@@ -39,7 +39,7 @@ async def agent_cancel(
         if abort_signal.is_set():
             raise asyncio.CancelledError
         owner = _owner(registry)
-        if _status(registry, [handle]):
+        if await asyncio.to_thread(_status, registry, [handle]):
             return _agent_error("unknown child handle", max_bytes)
         outcome = await owner.cancel_and_wait(handle)
         status = {

@@ -1,9 +1,12 @@
+import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
@@ -12,7 +15,11 @@ from zeta.agent.receipt import (
     receipt_message_size,
     receipt_tool_result,
 )
+from zeta.agent.tool_results import validated_tool_result
+from zeta.core import agent_progress, tool_dispatch
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
+from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -28,6 +35,8 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.agent import _active_agent_receipts, agent_result
+from zeta.tools.registry import ToolRegistry
+from zeta.tui.cards.agent import AgentCard
 from zeta.tui.render import render_event
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -162,12 +171,25 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         del args, kwargs
         raise RuntimeError("registry clone exploded")
 
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    lifecycle_read = tool_dispatch.read_agent_lifecycle
+
+    def tracked_lifecycle_read(path: str | Path) -> object:
+        read_threads.append(threading.get_ident())
+        return lifecycle_read(path)
+
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
+    monkeypatch.setattr(tool_dispatch, "read_agent_lifecycle", tracked_lifecycle_read)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _result(store, call.id)
     assert result.is_error is True
     assert result.structured_content is not None
+    assert "0 turns" in result.content
+    assert "0 tool calls" in result.content
+    assert "error=true · canceled=false" in result.content
+    assert loop_thread not in read_threads
     handle = result.structured_content["child_instance_id"]
     assert type(handle) is str
 
@@ -471,6 +493,7 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
         child_session_path=str(child.session_dir),
         status="completed",
         child_instance_id=handle,
+        stats=child.agent_lifecycle() or {},
     )
     receipt_text = receipt["content"][0]["text"]
     assert "2 turns" in receipt_text
@@ -556,12 +579,274 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
                 "child_session_path": str(child.session_dir),
                 "turns_used": 1,
             },
+            lifecycle_projection=child.agent_lifecycle(),
         ),
     )
 
     rendered = render_event(event)
     assert rendered is not None
     assert "2 tool calls" in rendered.plain
+
+
+async def _terminal_agent_event(
+    tmp_path: Path,
+    child: ConversationStore,
+) -> tuple[AgentLoop, StreamEvent]:
+    remove_live_agent_lifecycle(child.agent_lifecycle_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=ConversationStore(tmp_path / "parent"),
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "agent",
+        lambda arguments: agent_result(
+            "done",
+            error=False,
+            turns_used=1,
+            child_session_path=str(child.session_dir),
+            status="completed",
+            stats=child.agent_lifecycle(),
+        ),
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        registry.session_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    events = [
+        event
+        async for event in dispatch_tool_calls(
+            loop,
+            [ToolCall("agent-terminal", "agent", {})],
+            validated_tool_result,
+        )
+    ]
+    return loop, next(
+        event for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_status_calls_cannot_regress_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(tool_calls=2)
+    child.finish_agent_lifecycle(
+        "completed",
+        final_result="done",
+        turns_used=1,
+        finished_at="2026-01-01T00:00:01+00:00",
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    older = {**lifecycle, "tool_calls": 1}
+    newer = {**lifecycle, "tool_calls": 2}
+    older_started = threading.Event()
+    release_older = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+
+    def controlled_read(*args: object) -> bytes:
+        nonlocal calls
+        with lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            older_started.set()
+            assert release_older.wait(1)
+            return json.dumps(older).encode()
+        release_older.set()
+        return json.dumps(newer).encode()
+
+    monkeypatch.setattr(agent_tools, "_read_child_file", controlled_read)
+    first = asyncio.create_task(
+        asyncio.to_thread(
+            agent_tools._project_agent_status,
+            object(),
+            "parent:1",
+            child.session_dir,
+            notifications=(),
+        )
+    )
+    assert await asyncio.to_thread(older_started.wait, 1)
+    second = asyncio.create_task(
+        asyncio.to_thread(
+            agent_tools._project_agent_status,
+            object(),
+            "parent:1",
+            child.session_dir,
+            notifications=(),
+        )
+    )
+    newer_result, older_result = await asyncio.gather(second, first)
+    assert newer_result["tool_calls"] == 2
+    assert older_result["tool_calls"] == 1
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    assert "2 tool calls" in rendered.plain
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    core_load = agent_progress.load_session_json
+    tool_load = agent_tools.load_session_json
+    def tracked_core_load(*args: object, **kwargs: object) -> object:
+        read_threads.append(threading.get_ident())
+        return core_load(*args, **kwargs)
+
+    def tracked_tool_load(*args: object, **kwargs: object) -> object:
+        read_threads.append(threading.get_ident())
+        return tool_load(*args, **kwargs)
+
+    monkeypatch.setattr(agent_progress, "load_session_json", tracked_core_load)
+    monkeypatch.setattr(agent_tools, "load_session_json", tracked_tool_load)
+    loop, _ = await _terminal_agent_event(tmp_path, child)
+    assert read_threads and loop_thread not in read_threads
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_full_child_runs_never_read_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle_read = tool_dispatch.read_agent_lifecycle
+    loop_reads: list[str] = []
+
+    def guarded_lifecycle_read(path: str | Path) -> object:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            loop_reads.append(str(path))
+        return lifecycle_read(path)
+
+    monkeypatch.setattr(tool_dispatch, "read_agent_lifecycle", guarded_lifecycle_read)
+
+    async def run_child(case: str) -> None:
+        call = ToolCall(
+            f"child-{case}",
+            "agent",
+            {"prompt": "inspect", "description": case},
+        )
+        turns = [ScriptedTurn(tool_calls=[call])]
+        if case == "success":
+            turns.append(ScriptedTurn([TextContent("done")]))
+        elif case == "cancel":
+            turns.append(ScriptedTurn([TextContent("late")], delay=10))
+        store = ConversationStore(tmp_path / case)
+        loop = AgentLoop(
+            FakeBackend(turns),
+            store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        if case == "setup-failure":
+            def fail_clone(*args: object, **kwargs: object) -> None:
+                del args, kwargs
+                raise RuntimeError("registry clone exploded")
+
+            monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
+        task = asyncio.create_task(
+            _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        )
+        if case == "cancel":
+            while len(loop.backend.calls) < 2:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+        await loop.close()
+
+    for case in ("success", "failure", "cancel", "setup-failure"):
+        await run_child(case)
+    assert loop_reads == []
+
+
+@pytest.mark.asyncio
+async def test_tui_receipt_render_never_reads_lifecycle_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    monkeypatch.setattr(
+        "zeta.tui.cards.agent._read_lifecycle",
+        lambda path: pytest.fail("terminal render read lifecycle storage"),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    await loop.close()
+    child.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_terminal_receipt_survives_repeated_renders(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="child",
+    )
+    child.update_agent_lifecycle(tool_calls=3)
+    child.finish_agent_lifecycle(
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
+    )
+    loop, event = await _terminal_agent_event(tmp_path, child)
+    assert event.tool_call is not None
+    card = AgentCard(event.tool_call)
+    first = card.finish(event)
+    second = card.terminal_render()
+    assert first is not None and second is not None
+    assert "3 tool calls" in first.plain
+    assert second.plain == first.plain
+    await loop.close()
+    child.close()
 
 
 @pytest.mark.asyncio
@@ -821,6 +1106,7 @@ def test_terminal_receipt_keeps_legacy_status_flags_compatible(tmp_path: Path) -
         "turns_used": 1,
         "child_session_path": str(tmp_path / "child"),
         "child_instance_id": "parent:1",
+        "stats": {"turns_used": 1, "elapsed": 0.0, "tool_calls": 0},
     }
     completed = agent_result("done", error=False, status="completed", **common)
     failed = agent_result("broken", error=True, status="error", **common)

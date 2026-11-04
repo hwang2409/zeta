@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import random
+import threading
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -12,13 +13,20 @@ import pytest
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import encode_json
+from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.agent_progress import remove_live_agent_lifecycle
+from zeta.core.agent_progress import (
+    publish_live_agent_lifecycle,
+    remove_live_agent_lifecycle,
+)
 from zeta.core.store import ConversationStore
+from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -27,6 +35,8 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools.registry import ToolRegistry
+from zeta.tui.cards.agent import AgentCard
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
@@ -307,6 +317,147 @@ def _new_live_child(
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
     remove_live_agent_lifecycle(child.agent_lifecycle_path)
     return child, handle
+
+
+@pytest.mark.asyncio
+async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    live = child.agent_lifecycle()
+    assert live is not None
+    live.update(tool_calls=3, current_step="valid live work")
+    publish_live_agent_lifecycle(child.agent_lifecycle_path, live)
+    child.agent_lifecycle_path.write_text("{", encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop, handle)
+    item = status["structuredContent"]["children"][0]
+    assert item["state"] == "running"
+    assert item["tool_calls"] == 3
+    assert item["current_step"] == "valid live work"
+
+    call = ToolCall(
+        "agent-1", "agent", {"prompt": "inspect", "description": "child 1"}
+    )
+    rendered = AgentCard.render_receipt(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "still running",
+                structured_content={
+                    "child_session_path": str(child.session_dir),
+                    "status": "running",
+                    "turns_used": 0,
+                },
+            ),
+        )
+    )
+    assert rendered is not None
+    assert "3 tool calls" in rendered.plain
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(1, 9):
+        child, handle = _new_live_child(store, index)
+        _persist_finished_receipt(store, child, f"agent-{index}", handle)
+
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    original = agent_tools._read_child_file
+
+    def tracked_read(*args: object, **kwargs: object) -> bytes:
+        read_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(agent_tools, "_read_child_file", tracked_read)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+
+    assert len(status["structuredContent"]["children"]) == 8
+    assert len(read_threads) == 8
+    assert loop_thread not in read_threads
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_durable_record_wins_over_stale_live_progress_in_status_and_card(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_finished_child(store, 1, result="terminal result")
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    terminal = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    stale = {
+        **terminal,
+        "state": "running",
+        "finished_at": None,
+        "elapsed": 99.0,
+        "turns_used": 99,
+        "tool_calls": 99,
+        "current_step": "stale live work",
+    }
+    publish_live_agent_lifecycle(child.agent_lifecycle_path, stale)
+
+    status_loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(status_loop, handle)
+    assert status["structuredContent"]["children"][0]["state"] == "completed"
+
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "agent",
+        lambda arguments: agent_tools.agent_result(
+            "terminal result",
+            error=False,
+            turns_used=1,
+            child_session_path=str(child.session_dir),
+            status="completed",
+            stats={},
+        ),
+    )
+    render_loop = AgentLoop(
+        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
+    )
+    events = [
+        event
+        async for event in dispatch_tool_calls(
+            render_loop,
+            [ToolCall("agent-1", "agent", {})],
+            validated_tool_result,
+        )
+    ]
+    event = next(
+        item for item in events if item.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    assert "0 tool calls" in rendered.plain
+    assert "99 tool calls" not in rendered.plain
+    rendered_again = AgentCard.render_receipt(event)
+    assert rendered_again is not None
+    assert rendered_again.plain == rendered.plain
+    await status_loop.close()
+    await render_loop.close()
 
 
 def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> None:
