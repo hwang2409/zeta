@@ -169,6 +169,28 @@ class IncrementalValidationMixin:
                 self._task_notification_ids.add(task_id)
         return True
 
+    def _install_validated_linear_entries(
+        self, entries: list[ConversationEntry]
+    ) -> None:
+        """Install worker-validated tail rows and publish the entry list once."""
+        previous = self._entries[-1] if self._entries else None
+        for entry in entries:
+            expected_seq = previous.seq + 1 if previous is not None else 1
+            expected_parent = previous.id if previous is not None else None
+            assert entry.seq == expected_seq and entry.parent_id == expected_parent
+            assert entry.id not in self._entry_ids
+            self._record_active_entry(entry)
+            self._entry_ids.add(entry.id)
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
+                task_id = entry.data.get("task_id")
+                if type(task_id) is str and task_id:
+                    self._task_notification_ids.add(task_id)
+            previous = entry
+        self._entries.extend(entries)
+
     def _record_agent_receipt(self, result: ToolResult) -> None:
         structured = result.structured_content
         if structured is None:
