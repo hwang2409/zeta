@@ -7,6 +7,9 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .checkpoints import load_session_json
+from .child_lifecycle import select_legacy_child_lifecycle
+
 _lock = threading.Lock()
 _lifecycles: dict[Path, dict[str, Any]] = {}
 
@@ -26,6 +29,21 @@ def live_agent_lifecycle(path: str | Path) -> dict[str, Any] | None:
     with _lock:
         lifecycle = _lifecycles.get(resolved)
         return copy.deepcopy(lifecycle) if lifecycle is not None else None
+
+
+def read_agent_lifecycle(path: str | Path) -> object:
+    """Read one legacy projection with durable terminal precedence."""
+
+    lifecycle_path = Path(path)
+    live = live_agent_lifecycle(lifecycle_path)
+    try:
+        durable = load_session_json(lifecycle_path)
+    except (OSError, ValueError):
+        if live is not None:
+            return live
+        raise
+    selected = select_legacy_child_lifecycle(durable, live)
+    return selected if selected is not None else {}
 
 
 def remove_live_agent_lifecycle(path: str | Path) -> None:

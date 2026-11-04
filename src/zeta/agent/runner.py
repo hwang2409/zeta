@@ -764,6 +764,7 @@ async def run_agent_tool(
         loop._background_owner.release_unused_stores()
         await loop._background_owner.wait_for_store_closes()
         raise
+    child_store.bind_owner_thread()
     child_policy: ChildApprovalPolicy | None = None
     try:
         loop._agent_child_stores[tool_call.id] = child_store
@@ -797,6 +798,9 @@ async def run_agent_tool(
             final_result=failure_text,
             turns_used=0,
         )
+        terminal_stats = agent_stats(
+            child_store.agent_lifecycle(), status="failed", turns_used=0
+        )
         loop._background_owner.mark_store_finished(child_store)
         failure_payload = loop._child_result_payload(
             tool_call.id,
@@ -806,6 +810,7 @@ async def run_agent_tool(
             agent_type=preset.name,
             child_instance_id=child_instance_id,
             depth=child_depth,
+            stats=terminal_stats,
         )
         failure_content = failure_payload.get("content")
         if (

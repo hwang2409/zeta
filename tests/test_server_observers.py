@@ -243,9 +243,10 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
     session_a = (await _request(
         controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
     ))[-1]["result"]["session"]["session_id"]
-    await asyncio.to_thread(
-        server.runtime.opened.store.append_message,
-        with_message_origin(Message(MessageRole.USER, [TextContent("from-a")]), MessageOrigin.USER),
+    server.runtime.opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("from-a")]), MessageOrigin.USER
+        )
     )
     observer_reader, observer_writer = await _observer(server, 3)
     entered = threading.Event()
@@ -266,9 +267,10 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
         session_b = (await _request(
             controller_reader, controller_writer, 5, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]["session_id"]
-        await asyncio.to_thread(
-            server.runtime.opened.store.append_message,
-            with_message_origin(Message(MessageRole.USER, [TextContent("from-b")]), MessageOrigin.USER),
+        server.runtime.opened.store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("from-b")]), MessageOrigin.USER
+            )
         )
         release.set()
         response = (await asyncio.wait_for(request, TIMEOUT))[-1]

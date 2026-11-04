@@ -9,8 +9,9 @@ MAX_FILE_LINES = 1250
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.
 # Bumped on 2026-09-10 for the ZETA-103 fd-anchored session-file safety seam,
-# and on 2026-10-09 for the stdlib-only migration-plan seam shipped over SSH.
-MAX_FILES_PER_DIRECTORY = 19
+# on 2026-10-09 for the stdlib-only migration-plan seam shipped over SSH, and
+# on 2026-11-03 for the explicit child-lifecycle seam.
+MAX_FILES_PER_DIRECTORY = 20
 
 
 def test_module_limits() -> None:

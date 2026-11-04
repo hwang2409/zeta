@@ -780,7 +780,8 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32010` | delivery ID was accepted but its full details were evicted |
 
 Error objects have `code` and `message`, and may have a method-specific
-`data` object. A malformed frame never terminates the server process. The
+`data` object. Durable store read failures use `-32000`, not the invalid-params
+code. A malformed frame never terminates the server process. The
 server returns its parse error and continues reading frames.
 
 ## normative wire schema

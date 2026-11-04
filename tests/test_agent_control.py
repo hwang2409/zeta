@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,39 @@ async def test_agent_control_tools_execute_through_registry(
     try:
         canceled = await registry.execute(ToolCall("cancel", "agent_cancel", {"handle": "child"}))
         assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
+        owner.unregister("child")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_reads_status_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        register_builtin=True,
+    )
+    owner = BackgroundAgentOwner(store)
+    task = asyncio.create_task(asyncio.sleep(10))
+    owner.register("child", lambda: None, task)
+    registry._agent_owner = owner
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+
+    def status(_: object) -> list[dict[str, str]]:
+        read_threads.append(threading.get_ident())
+        return [{"handle": "child"}]
+
+    monkeypatch.setattr("zeta.tools.agent._read_agent_status", status)
+    try:
+        await registry.execute(ToolCall("cancel", "agent_cancel", {"handle": "child"}))
+        assert read_threads and loop_thread not in read_threads
         owner.unregister("child")
     finally:
         task.cancel()

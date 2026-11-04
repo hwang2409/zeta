@@ -560,6 +560,7 @@ class AgentLoop(
 
         if self._activated:
             return
+        self.store.bind_owner_thread()
         self._activated = True
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
@@ -1152,6 +1153,7 @@ class AgentLoop(
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
         yield StreamEvent(StreamEventType.AGENT_END)
+
 
     def _finalize_tool_results(
         self,

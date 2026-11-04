@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
 from ..protocol.types import (
@@ -14,6 +16,7 @@ from ..protocol.types import (
     ToolResult,
 )
 from .abort import AbortSignal
+from .agent_progress import read_agent_lifecycle
 
 TaskResult = TypeVar("TaskResult")
 
@@ -51,6 +54,26 @@ class _AgentLoop(Protocol):
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]: ...
+
+
+async def _prepare_tool_result(call: ToolCall, result: ToolResult) -> ToolResult:
+    if call.name.casefold() != "agent" or result.lifecycle_projection is not None:
+        return result
+    structured = result.structured_content or {}
+    child_path = structured.get("child_session_path")
+    if type(child_path) is not str or not child_path:
+        return replace(result, lifecycle_projection={})
+    try:
+        lifecycle = await asyncio.to_thread(
+            read_agent_lifecycle,
+            Path(child_path) / "agent_lifecycle.json",
+        )
+    except (OSError, ValueError):
+        lifecycle = {}
+    return replace(
+        result,
+        lifecycle_projection=lifecycle if type(lifecycle) is dict else {},
+    )
 
 
 async def dispatch_tool_calls(
@@ -190,9 +213,9 @@ async def dispatch_tool_calls(
                                 str(exc),
                                 is_error=True,
                             )
-                        parallel_results[index] = validate_result(
-                            task_result,
-                            tool_call.id,
+                        parallel_results[index] = await _prepare_tool_result(
+                            tool_call,
+                            validate_result(task_result, tool_call.id),
                         )
                 while not stream_updates.empty():
                     yield stream_updates.get_nowait()
@@ -250,6 +273,7 @@ async def dispatch_tool_calls(
             except Exception as exc:
                 result = ToolResult(tool_call.id, str(exc), is_error=True)
             result = validate_result(result, tool_call.id)
+            result = await _prepare_tool_result(tool_call, result)
             result = loop._finalize_tool_results([tool_call], [result])[0]
             completed_tool_indexes.add(call_index)
             yield StreamEvent(

@@ -281,6 +281,7 @@ class ConversationLogMixin:
         self: ConversationStore, state: _DetachedLogState
     ) -> _DetachedLogState:
         """Install validated state on the owner thread using pointer swaps only."""
+        self._assert_owner_thread()
         previous = (
             self._detach_log_state() if hasattr(self, "_entry_ids") else state
         )
@@ -396,6 +397,7 @@ class ConversationLogMixin:
         Replacements, truncations, and non-linear tails fall back to a complete
         parse; ordinary external appends read and validate only the new bytes.
         """
+        self._assert_owner_thread()
         had_entries = bool(self._entries)
         try:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)

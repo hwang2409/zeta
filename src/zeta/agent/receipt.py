@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Literal, Protocol
 
 from ..core.checkpoints import ConversationEntry
@@ -720,19 +721,41 @@ def finalize_agent_results(
                     if type(metadata.get("depth")) is int
                     else None
                 ),
+                stats=agent_stats(
+                    candidate.lifecycle_projection or {},
+                    status=terminal_state(
+                        error=candidate.is_error,
+                        canceled=candidate.is_canceled,
+                    ),
+                    turns_used=(
+                        metadata.get("turns_used")
+                        if type(metadata.get("turns_used")) is int
+                        else owner._agent_child_turns.get(call.id, 0)
+                    ),
+                ),
             )
-            result = receipt_tool_result(call.id, payload)
+            result = replace(
+                receipt_tool_result(call.id, payload),
+                lifecycle_projection=candidate.lifecycle_projection or {},
+            )
             candidate = result
         if child_store is not None and (candidate is None or candidate.is_canceled):
             result = owner._canceled_agent_result(
                 call.id,
                 child_session_path=str(child_store.session_dir),
                 agent_type=owner._agent_child_types.get(call.id),
+                stats=agent_stats(
+                    (candidate.lifecycle_projection or {})
+                    if candidate is not None
+                    else {},
+                    status="canceled",
+                    turns_used=owner._agent_child_turns.get(call.id, 0),
+                ),
             )
         if result is None:
             result = slot
             if result is None and call.name.casefold() == "agent":
-                result = owner._canceled_agent_result(call.id)
+                result = owner._canceled_agent_result(call.id, stats={})
             if result is None:
                 result = ToolResult(
                     call.id,
