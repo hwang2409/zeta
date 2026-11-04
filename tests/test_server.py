@@ -1304,7 +1304,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
 async def test_session_history_keeps_main_durable_entry_cursor_space(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ergonomics_module, "HISTORY_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
@@ -3805,7 +3805,7 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 async def test_session_history_hides_passive_harness_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ergonomics_module, "HISTORY_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
