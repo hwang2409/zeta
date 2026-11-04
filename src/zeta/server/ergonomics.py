@@ -361,7 +361,7 @@ def history_projection(
         return cached.projection
 
 
-def page_history(
+def _forward_page_history(
     projection: HistoryProjection,
     offset: int,
     *,
@@ -565,7 +565,7 @@ def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
     return None
 
 
-def _backward_page(
+def _backward_page_history(
     projection: HistoryProjection,
     before: int,
     validator: dict[str, object],
@@ -665,6 +665,28 @@ def _backward_page(
     )
 
 
+def page_history(
+    projection: HistoryProjection,
+    cursor: int | None,
+    *,
+    include_delivery_id: bool,
+    backward: bool = False,
+    validator: dict[str, object] | None = None,
+) -> tuple[dict[str, object], HistoryProjection]:
+    if backward:
+        assert cursor is not None and validator is not None
+        return _backward_page_history(
+            projection,
+            cursor,
+            validator,
+            include_delivery_id=include_delivery_id,
+        )
+    assert cursor is not None
+    return _forward_page_history(
+        projection, cursor, include_delivery_id=include_delivery_id
+    )
+
+
 def history(
     runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False,
     backward_enabled: bool = False,
@@ -697,10 +719,22 @@ def history(
         end = len(projection.entry_groups) - 1
         if before is None:
             validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
-            result, expanded = _backward_page(projection, end + 1, validator, include_delivery_id=include_delivery_id)
+            result, expanded = page_history(
+                projection,
+                end + 1,
+                include_delivery_id=include_delivery_id,
+                backward=True,
+                validator=validator,
+            )
         else:
             assert validator is not None
-            result, expanded = _backward_page(projection, before, validator, include_delivery_id=include_delivery_id)
+            result, expanded = page_history(
+                projection,
+                before,
+                include_delivery_id=include_delivery_id,
+                backward=True,
+                validator=validator,
+            )
         with _cache_creation_lock:
             cached = _cache(store, include_delivery_id)
             if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
@@ -714,7 +748,9 @@ def history(
     store = runtime.opened.store
     generation = _generation(store)
     projection = history_projection(store, include_delivery_id=include_delivery_id)
-    result, expanded = page_history(projection, offset, include_delivery_id=include_delivery_id)
+    result, expanded = page_history(
+        projection, offset, include_delivery_id=include_delivery_id
+    )
     with _cache_creation_lock:
         cached = _cache(store, include_delivery_id)
         if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
