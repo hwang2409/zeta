@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -35,6 +36,7 @@ from ...core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
+from ...core.child_lifecycle import select_legacy_child_lifecycle
 from ...core.session_files import child_directory, read_session_file
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
@@ -75,19 +77,6 @@ _STATUS_ROW_STRING_FIELDS = (
     "cwd",
 )
 _MISSING = object()
-
-
-def _read_agent_lifecycle(path: str) -> dict[str, object]:
-    if not path:
-        return {}
-    live = live_agent_lifecycle(Path(path) / "agent_lifecycle.json")
-    if live is not None:
-        return live
-    try:
-        value = load_session_json(Path(path) / "agent_lifecycle.json")
-    except ConversationIntegrityError:
-        return {}
-    return value if type(value) is dict else {}
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -407,14 +396,17 @@ def _project_agent_status(
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    lifecycle = live_agent_lifecycle(child_path / "agent_lifecycle.json")
-    if lifecycle is None:
-        try:
-            lifecycle = load_session_json(
-                _read_child_file(store, child_path, "agent_lifecycle.json")
-            )
-        except (OSError, ValueError) as exc:
+    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+    try:
+        durable = load_session_json(
+            _read_child_file(store, child_path, "agent_lifecycle.json")
+        )
+    except (OSError, ValueError) as exc:
+        if live is None:
             raise ValueError("could not read child state") from exc
+        lifecycle = live
+    else:
+        lifecycle = select_legacy_child_lifecycle(durable, live)
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:
@@ -719,7 +711,7 @@ def _read_agent_status(
     if requested_handle is not None and requested_handle not in active_receipts:
         raise ValueError("unknown child handle")
     children: list[dict[str, StructuredContentValue]] = []
-    # One read for all children: this runs on the event loop.
+    # One transcript snapshot for all children; the caller runs this in a worker.
     notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
         pending_only=False
     )
@@ -759,7 +751,8 @@ async def _agent_status(
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
     try:
-        children = _read_agent_status(
+        children = await asyncio.to_thread(
+            _read_agent_status,
             registry.session_store,
             requested_handle=requested,
         )
@@ -895,7 +888,7 @@ def agent_result(
     child_instance_id: str | None = None,
     description: str | None = None,
     depth: int | None = None,
-    stats: dict[str, object] | None = None,
+    stats: dict[str, object],
     include_stats: bool = True,
     canceled: bool = False,
     notice: str | None = None,
@@ -917,14 +910,6 @@ def agent_result(
     # Keep depth-one result payloads byte-compatible with the pre-nesting shape.
     if depth is not None and depth != 1:
         structured_content["depth"] = depth
-    if stats is None:
-        lifecycle = _read_agent_lifecycle(child_session_path)
-        stats = agent_stats(
-            lifecycle,
-            status=status
-            or ("canceled" if canceled else "failed" if error else "completed"),
-            turns_used=turns_used,
-        )
     if status == "running":
         return build_agent_progress(
             text,
@@ -963,6 +948,7 @@ async def _agent(
             error=True,
             turns_used=0,
             child_session_path="",
+            stats=agent_stats({}, status="failed", turns_used=0),
         )
     return await runner(
         call,

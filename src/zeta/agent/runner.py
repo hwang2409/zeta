@@ -797,6 +797,9 @@ async def run_agent_tool(
             final_result=failure_text,
             turns_used=0,
         )
+        terminal_stats = agent_stats(
+            child_store.agent_lifecycle(), status="failed", turns_used=0
+        )
         loop._background_owner.mark_store_finished(child_store)
         failure_payload = loop._child_result_payload(
             tool_call.id,
@@ -806,6 +809,7 @@ async def run_agent_tool(
             agent_type=preset.name,
             child_instance_id=child_instance_id,
             depth=child_depth,
+            stats=terminal_stats,
         )
         failure_content = failure_payload.get("content")
         if (

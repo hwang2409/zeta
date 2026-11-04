@@ -25,7 +25,7 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.agent_progress import live_agent_lifecycle
-from ...core.checkpoints import ConversationIntegrityError, load_session_json
+from ...core.checkpoints import ConversationIntegrityError
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
 from .. import theme
@@ -68,14 +68,9 @@ def _arguments(arguments: dict[str, Any]) -> str:
 def _read_lifecycle(path: str) -> dict[str, Any]:
     if not path:
         return {}
-    live = live_agent_lifecycle(Path(path) / "agent_lifecycle.json")
-    if live is not None:
-        return live
-    try:
-        value = load_session_json(Path(path) / "agent_lifecycle.json")
-    except ConversationIntegrityError:
-        return {}
-    return value if type(value) is dict else {}
+    lifecycle_path = Path(path) / "agent_lifecycle.json"
+    resident = live_agent_lifecycle(lifecycle_path)
+    return resident if resident is not None else {}
 
 
 class AgentCard:
@@ -98,6 +93,7 @@ class AgentCard:
         self._tail_loaded = False
         self._transcript_source: AgentTranscriptSource | None = None
         self._final_tail_pending = False
+        self._lifecycle_projection: dict[str, Any] = {}
 
     @property
     def supported(self) -> bool:
@@ -345,6 +341,7 @@ class AgentCard:
         elapsed_seconds: float | None = None,
         turns_used: int | None = None,
         depth: int | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ) -> Text | None:
         call = event.tool_call
         result = event.tool_result
@@ -352,7 +349,10 @@ class AgentCard:
             return None
         structured = result.structured_content or {}
         child_path = structured.get("child_session_path")
-        lifecycle = _read_lifecycle(child_path if type(child_path) is str else "")
+        structured_status = structured.get("status")
+        lifecycle = lifecycle or result.lifecycle_projection or _read_lifecycle(
+            child_path if type(child_path) is str else ""
+        )
         if lifecycle:
             lifecycle_elapsed = lifecycle.get("elapsed")
             if type(lifecycle_elapsed) in {int, float} and lifecycle_elapsed >= 0:
@@ -385,7 +385,6 @@ class AgentCard:
             ):
                 display_depth = value
         turns = turns or 0
-        structured_status = structured.get("status")
         receipt_status = terminal_state(
             error=result.is_error,
             canceled=result.is_canceled,
@@ -643,11 +642,15 @@ class AgentCard:
         )
         if not self._final_tail_pending:
             self.release_transcript_source()
+        self._lifecycle_projection = (
+            result.lifecycle_projection if result is not None else None
+        ) or _read_lifecycle(path if isinstance(path, str) else "")
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,
             turns_used=self._turns,
             depth=self._depth,
+            lifecycle=self._lifecycle_projection,
         )
         return (
             self._progress()

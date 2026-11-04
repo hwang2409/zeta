@@ -580,6 +580,7 @@ class ToolResult:
         default=None, compare=False
     )
     is_canceled: bool = field(default=False, compare=False)
+    lifecycle_projection: dict[str, Any] | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
