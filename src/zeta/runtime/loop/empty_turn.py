@@ -14,6 +14,7 @@ from typing import Any
 
 from ...protocol.types import (
     MESSAGE_ORIGIN_METADATA,
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -93,6 +94,18 @@ def build_nudge_message() -> Message:
             "zeta_event": EMPTY_TURN_NUDGE_EVENT,
             MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
         },
+    )
+
+
+def output_limit_error(
+    message: Message, *, stop_reason: str | None
+) -> ErrorInfo | None:
+    if stop_reason != "max_tokens" or has_visible_output(message):
+        return None
+    return ErrorInfo(
+        "max_tokens",
+        "the model reached its output-token limit while thinking "
+        "and did not produce a reply",
     )
 
 
