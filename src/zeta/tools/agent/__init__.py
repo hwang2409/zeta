@@ -32,8 +32,9 @@ from ...agent.receipt import (
 )
 from ...core.agent_progress import (
     live_agent_lifecycle,
+    live_agent_lifecycle_snapshot,
+    publish_agent_lifecycle_projection,
     read_agent_lifecycle,
-    remember_terminal_agent_lifecycle,
 )
 from ...core.checkpoints import (
     ConversationEntry,
@@ -87,7 +88,8 @@ def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
     lifecycle_path = Path(path) / "agent_lifecycle.json"
-    live = live_agent_lifecycle(lifecycle_path)
+    live_snapshot = live_agent_lifecycle_snapshot(lifecycle_path)
+    live = live_snapshot[1] if live_snapshot is not None else None
     if live is not None:
         return live
     try:
@@ -414,7 +416,9 @@ def _project_agent_status(
     notifications: Sequence[ConversationEntry],
     requested_handle: str | None = None,
 ) -> dict[str, StructuredContentValue]:
-    live = live_agent_lifecycle(child_path / "agent_lifecycle.json")
+    live_snapshot = live_agent_lifecycle_snapshot(child_path / "agent_lifecycle.json")
+    live = live_snapshot[1] if live_snapshot is not None else None
+    live_generation = live_snapshot[0] if live_snapshot is not None else 0
     try:
         durable = load_session_json(
             _read_child_file(store, child_path, "agent_lifecycle.json")
@@ -425,10 +429,9 @@ def _project_agent_status(
         lifecycle = live
     else:
         lifecycle = select_legacy_child_lifecycle(durable, live)
-        if live is not None:
-            remember_terminal_agent_lifecycle(
-                child_path / "agent_lifecycle.json", lifecycle
-            )
+    publish_agent_lifecycle_projection(
+        child_path / "agent_lifecycle.json", lifecycle, live_generation
+    )
     if type(lifecycle) is not dict:
         raise ValueError("lifecycle data is not an object")
     if lifecycle.get("handle") != handle:

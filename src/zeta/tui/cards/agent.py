@@ -25,9 +25,8 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.agent_progress import (
+    agent_lifecycle_projection,
     live_agent_lifecycle,
-    read_agent_lifecycle,
-    take_terminal_agent_lifecycle,
 )
 from ...core.checkpoints import ConversationIntegrityError
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
@@ -73,16 +72,11 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     if not path:
         return {}
     lifecycle_path = Path(path) / "agent_lifecycle.json"
-    resident = take_terminal_agent_lifecycle(lifecycle_path) or live_agent_lifecycle(
-        lifecycle_path
-    )
-    if resident is not None:
-        return resident
-    try:
-        value = read_agent_lifecycle(lifecycle_path)
-    except ConversationIntegrityError:
-        return {}
-    return value if type(value) is dict else {}
+    projection = agent_lifecycle_projection(lifecycle_path)
+    if projection is not None:
+        return projection.lifecycle
+    resident = live_agent_lifecycle(lifecycle_path)
+    return resident if resident is not None else {}
 
 
 class AgentCard:
