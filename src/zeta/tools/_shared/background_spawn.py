@@ -89,7 +89,7 @@ async def _terminate_process(
     _signal_pids(descendants, signal.SIGTERM)
     try:
         await asyncio.wait_for(process.wait(), timeout=term_grace)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass
     current = await _descendant_pids(None)
     survivors = {

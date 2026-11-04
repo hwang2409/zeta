@@ -14,7 +14,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Literal
 
