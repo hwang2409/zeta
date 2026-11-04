@@ -14,7 +14,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -151,6 +151,7 @@ class _BackgroundRecord:
         "natural_exit", "task_kill", "session_shutdown"
     ] | None = None
     monitor: asyncio.Task[None] | None = None
+    descendants: set[int] = field(default_factory=set)
 
 
 class BackgroundTaskRegistry:
@@ -646,15 +647,6 @@ class BackgroundTaskRegistry:
                 if record.running and record.process is not None
             ]
             records = [record for record, _ in entries]
-            descendant_lists = await finish(
-                asyncio.gather(
-                    *(_descendant_pids(process.pid) for _, process in entries)
-                )
-            )
-            descendants = {
-                record.task_id: found
-                for record, found in zip(records, descendant_lists or ())
-            }
             killed = [record.task_id for record in records]
             # Whole-session and child-completion shutdown kills silently; callers
             # surface the ids (child receipt) instead. Prepare every record before
@@ -668,7 +660,7 @@ class BackgroundTaskRegistry:
             )
             for record, process in entries:
                 _signal_group(process, signal.SIGTERM)
-                _signal_pids(descendants[record.task_id], signal.SIGTERM)
+                _signal_pids(record.descendants, signal.SIGTERM)
 
             # Use one shared grace period for the whole session, not one period
             # per process. Escalate all survivors together, then let monitors
@@ -686,7 +678,7 @@ class BackgroundTaskRegistry:
             for record, process in entries:
                 if _group_exists(process.pid):
                     _signal_group(process, signal.SIGKILL)
-                _signal_pids(descendants[record.task_id], signal.SIGKILL)
+                _signal_pids(record.descendants, signal.SIGKILL)
 
             cleanup_timeout = self.term_grace + self.stdin_drain_timeout
             if entries:
@@ -853,6 +845,7 @@ class BackgroundTaskRegistry:
         if process is None or process.stdout is None:
             return
         log_writer = _OrderedLogWriter(log_handle) if log_handle is not None else None
+        record.descendants = await _descendant_pids(process.pid)
         reader = asyncio.create_task(
             self._read_output(record, process.stdout, log_writer)
         )
