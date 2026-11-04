@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Mapping
 from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -162,6 +162,8 @@ class AgentNotificationMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         return self._run_turn(
             user_text,
@@ -169,6 +171,8 @@ class AgentNotificationMixin:
             user_message=user_message,
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
+            host_environment=host_environment,
+            host_instruction=host_instruction,
         )
 
     async def _run_turn(
@@ -182,6 +186,8 @@ class AgentNotificationMixin:
         notification_turn: bool = False,
         turn_context: str | None = None,
         on_turn_context_persisted: Callable[[], None] | None = None,
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         from ..runtime.loop._completion import close_completion
 
@@ -199,6 +205,8 @@ class AgentNotificationMixin:
             system_message=system_message,
             on_persisted=on_turn_context_persisted,
             notification_turn=notification_turn,
+            host_environment=host_environment,
+            host_instruction=host_instruction,
         )
         try:
             async for event in stream:
@@ -273,6 +281,8 @@ class AgentNotificationMixin:
         abort_signal: ToolAbortSignal | None = None,
         turn_context: str | None = None,
         on_turn_context_persisted: Callable[[], None] | None = None,
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         if (
             not self._notification_turn_scheduled
@@ -287,4 +297,6 @@ class AgentNotificationMixin:
             notification_turn=True,
             turn_context=turn_context,
             on_turn_context_persisted=on_turn_context_persisted,
+            host_environment=host_environment,
+            host_instruction=host_instruction,
         )

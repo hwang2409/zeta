@@ -164,13 +164,13 @@ class ContextAssembler:
     def digest(self) -> str | None:
         return self.last_context.digest if self.last_context is not None else None
 
-    def needs_compaction(self, *, force: bool = False) -> bool:
+    def needs_compaction(self, *, force: bool = False, system_append: str = "") -> bool:
         """Return whether the next assembly must compact the active branch."""
         if force:
             return True
         branch = self.store.replay()
         items = self._visible_items(branch)
-        system_prompt = self._system_prompt_message()
+        system_prompt = self._system_prompt_message(system_append)
         messages = [
             *([] if system_prompt is None else [system_prompt]),
             *(item.message for item in items),
@@ -359,12 +359,14 @@ class ContextAssembler:
         force: bool = False,
         emergency: bool = False,
         reserved_estimator_tokens: int = 0,
+        system_append: str = "",
     ) -> list[Message]:
         context = await self.assemble_context(
             backend=backend,
             force=force,
             emergency=emergency,
             reserved_estimator_tokens=reserved_estimator_tokens,
+            system_append=system_append,
         )
         return list(context.messages)
 
@@ -376,6 +378,7 @@ class ContextAssembler:
         bypass_eviction_hysteresis: bool = False,
         emergency: bool = False,
         reserved_estimator_tokens: int = 0,
+        system_append: str = "",
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -400,6 +403,7 @@ class ContextAssembler:
                 branch,
                 force=force,
                 assembly_budget=assembly_budget,
+                system_append=system_append,
             )
             # Cancellation is observed before accepting preparation derived
             # from a branch that may have changed while the worker ran.
@@ -451,7 +455,7 @@ class ContextAssembler:
             bypass_hysteresis=bypass_eviction_hysteresis or emergency,
             target_ratio=EMERGENCY_TARGET_RATIO if emergency else TARGET_RATIO,
             assembly_budget=assembly_budget,
-            reserved_estimator_tokens=reserved_estimator_tokens,
+            reserved_estimator_tokens=reserved_estimator_tokens, system_append=system_append,
         )
         if evicted is not None:
             return evicted
@@ -582,6 +586,7 @@ class ContextAssembler:
         *,
         force: bool,
         assembly_budget: int,
+        system_append: str = "",
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 
@@ -592,7 +597,7 @@ class ContextAssembler:
             if item.entry is not None and item.message.tool_result is not None
         }
         boundary = self._tail_boundary(items)
-        system_prompt = self._system_prompt_message()
+        system_prompt = self._system_prompt_message(system_append)
         system_messages = [] if system_prompt is None else [system_prompt]
         latest_user = self._latest_user_index(items)
         committed_messages = self._committed_messages(
@@ -1040,10 +1045,13 @@ class ContextAssembler:
     def _count(self, messages: Sequence[Message]) -> int:
         return sum(self.token_counter(message) for message in messages)
 
-    def _system_prompt_message(self) -> Message | None:
+    def _system_prompt_message(self, system_append: str = "") -> Message | None:
         if not _text_from_message(self.system_prompt).strip():
             return None
-        return self.system_prompt
+        if not system_append:
+            return self.system_prompt
+        base = _text_from_message(self.system_prompt)
+        return Message(MessageRole.SYSTEM, [TextContent(f"{base}\n\n{system_append}")])
 
     def _total_tokens(self, messages: Sequence[Message]) -> int:
         return self._request_budget.calibrated_tokens(self._count(messages))
