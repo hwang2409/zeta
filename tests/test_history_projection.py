@@ -30,6 +30,20 @@ def _runtime(store: object) -> SimpleNamespace:
     return SimpleNamespace(opened=SimpleNamespace(store=store))
 
 
+class _HistoryStore:
+    def __init__(self, entries: list[object]) -> None:
+        self.entries = entries
+        self._log_offset = len(entries)
+        self._entry_prefix_digest = bytes([len(entries)])
+
+    def active_branch_snapshot(self) -> list[object]:
+        return list(self.entries)
+
+
+def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
+    return ergonomics.history(_runtime(store), params, backward_enabled=True)
+
+
 def test_session_history_full_paging_visits_each_entry_once() -> None:
     entries = tuple(_entry(i) for i in range(300))
     visits = 0

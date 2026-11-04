@@ -296,6 +296,7 @@ class ConnectionRegistry:
                 target,
                 params,
                 include_delivery_id=include_delivery_id,
+                backward_enabled="session_history_backward" in features,
             ),
             session_id=target[0],
         )
@@ -380,7 +381,10 @@ class ConnectionRegistry:
         target = capture_read(connection, method, params)
         result = await self.run_read(
             connection,
-            lambda: perform_read(method, target, params),
+            lambda: perform_read(
+                method, target, params,
+                backward_enabled="session_history_backward" in state.features,
+            ),
             session_id=target[0],
         )
         return True, result
@@ -441,6 +445,7 @@ def perform_read(
     params: dict[str, Any],
     *,
     include_delivery_id: bool = False,
+    backward_enabled: bool = False,
 ) -> object:
     if method == "status":
         return project_status(target[1])
@@ -453,6 +458,9 @@ def perform_read(
         return ergonomics.tree(runtime)
     if method == "session_history":
         if include_delivery_id:
-            return ergonomics.history(runtime, params, include_delivery_id=True)
-        return ergonomics.history(runtime, params)
+            return ergonomics.history(
+                runtime, params, include_delivery_id=True,
+                backward_enabled=backward_enabled,
+            )
+        return ergonomics.history(runtime, params, backward_enabled=backward_enabled)
     raise ProtocolError(-32601, "method not found")

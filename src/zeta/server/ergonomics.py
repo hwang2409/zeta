@@ -237,11 +237,18 @@ def _history_frame_size(
     request_id: str,
     *,
     messages_body_size: int,
-    next_offset: int | None,
+    next_offset: int | None = None,
+    next_before: int | None = None,
+    history_validator: dict[str, object] | None = None,
 ) -> int:
-    empty_page_size = codec.response_size(
-        request_id, {"messages": [], "next_offset": next_offset}
-    )
+    reply = {"messages": [], "next_offset": next_offset}
+    if next_before is not None or history_validator is not None:
+        reply = {
+            "messages": [],
+            "next_before": next_before,
+            "history_validator": history_validator,
+        }
+    empty_page_size = codec.response_size(request_id, reply)
     return empty_page_size + messages_body_size
 
 
@@ -252,7 +259,8 @@ def _history_group_body_size(
 
 
 def _project_history_group(
-    rows: list[dict[str, object]], entry_count: int
+    rows: list[dict[str, object]], entry_count: int, *, backward: bool = False,
+    validator: dict[str, object] | None = None,
 ) -> tuple[tuple[dict[str, object], ...], int]:
     codec = FrameCodec()
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
@@ -263,7 +271,9 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=raw_body_size,
-            next_offset=entry_count,
+            next_offset=None if backward else entry_count,
+            next_before=entry_count if backward else None,
+            history_validator=validator if backward else None,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -282,7 +292,9 @@ def _project_history_group(
             codec,
             request_id,
             messages_body_size=body_size,
-            next_offset=entry_count,
+            next_offset=None if backward else entry_count,
+            next_before=entry_count if backward else None,
+            history_validator=validator if backward else None,
         )
         <= MAX_FRAME_BYTES
     ):
@@ -544,30 +556,153 @@ def _history_entry_rows(
     return rows
 
 
+def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
+    if end == 0:
+        return None
+    for entry in reversed(projection.entry_groups[end - 1]):
+        if entry.type in {"message", "notification"}:
+            return entry.id
+    return None
+
+
+def _backward_page(
+    projection: HistoryProjection,
+    before: int,
+    validator: dict[str, object],
+    *,
+    include_delivery_id: bool,
+) -> tuple[dict[str, object], HistoryProjection]:
+    end = len(projection.entry_groups) - 1
+    stable_end = validator["end"]
+    if (
+        not isinstance(stable_end, int)
+        or stable_end > end
+        or validator.get("entry_id") != _history_endpoint(projection, stable_end)
+    ):
+        raise ProtocolError(
+            -32009,
+            "session history changed; restart from the newest page",
+            {"code": "stale_history_snapshot"},
+        )
+    if before < 0 or before > stable_end + 1:
+        raise ProtocolError(-32602, "before must not exceed history end")
+    codec = FrameCodec()
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
+    groups = list(projection.groups)
+    sizes = list(projection.body_sizes)
+    rows: list[dict[str, object]] = []
+    body_size = 0
+    selected: list[tuple[dict[str, object], ...]] = []
+    selected_indexes: list[int] = []
+    for index in range(before - 1, -1, -1):
+        while index >= len(groups):
+            next_group_index = len(groups)
+            raw = [
+                row
+                for entry in projection.entry_groups[next_group_index]
+                for row in _history_entry_rows(
+                    entry, projection.approval_calls, include_delivery_id=include_delivery_id
+                )
+            ]
+            groups.append(_project_history_group(raw, end, backward=True, validator=validator)[0])
+            sizes.append(_history_group_body_size(codec, groups[-1]))
+        group = groups[index]
+        candidate = body_size + int(bool(selected and group)) + sizes[index]
+        next_before = index
+        if _history_frame_size(
+            codec, request_id, messages_body_size=candidate,
+            next_before=next_before,
+            history_validator=validator,
+        ) > MAX_FRAME_BYTES and selected:
+            break
+        if _history_frame_size(
+            codec, request_id, messages_body_size=candidate,
+            next_before=next_before,
+            history_validator=validator,
+        ) > MAX_FRAME_BYTES:
+            raw = [
+                row
+                for entry in projection.entry_groups[index]
+                for row in _history_entry_rows(
+                    entry, projection.approval_calls, include_delivery_id=include_delivery_id
+                )
+            ]
+            group, sizes[index] = _project_history_group(raw, 0, backward=True, validator=validator)
+            candidate = body_size + int(bool(selected and group)) + sizes[index]
+            if _history_frame_size(codec, request_id, messages_body_size=candidate,
+                                   next_before=next_before,
+                                   history_validator=validator) > MAX_FRAME_BYTES:
+                break
+        if group:
+            selected.append(group)
+            selected_indexes.append(index)
+            body_size = candidate
+    selected.reverse()
+    selected_indexes.reverse()
+    for group in selected:
+        rows.extend(group)
+    boundary = selected_indexes[0] if selected_indexes else 0
+    return {
+        "messages": rows,
+        "next_before": boundary if boundary > 0 else None,
+        "history_validator": validator,
+    }, HistoryProjection(projection.entry_groups, projection.approval_calls, tuple(groups), tuple(sizes))
+
+
 def history(
-    runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False
+    runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False,
+    backward_enabled: bool = False,
 ) -> dict:
+    backward_keys = {"before", "history_validator"}
+    if backward_keys.intersection(params) and not backward_enabled:
+        raise ProtocolError(-32602, "backward session history requires negotiation")
+    if "before" in params:
+        if set(params) - {"session_id", "before", "history_validator"}:
+            raise ProtocolError(-32602, "invalid backward session history parameters")
+        before = params["before"]
+        if before is not None and (type(before) is not int or before < 0):
+            raise ProtocolError(-32602, "before must be null or a nonnegative integer")
+        validator = params.get("history_validator")
+        if before is None:
+            if "history_validator" in params:
+                raise ProtocolError(-32602, "history_validator is only valid for continuations")
+            validator = {"end": 0, "entry_id": None}
+        elif (
+            not isinstance(validator, dict)
+            or set(validator) != {"end", "entry_id"}
+            or type(validator.get("end")) is not int
+            or validator.get("end") < 0
+            or (validator.get("entry_id") is not None and not isinstance(validator.get("entry_id"), str))
+        ):
+            raise ProtocolError(-32602, "history_validator is invalid")
+        store = runtime.opened.store
+        generation = _generation(store)
+        projection = history_projection(store, include_delivery_id=include_delivery_id)
+        end = len(projection.entry_groups) - 1
+        if before is None:
+            validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
+            result, expanded = _backward_page(projection, end + 1, validator, include_delivery_id=include_delivery_id)
+        else:
+            assert validator is not None
+            result, expanded = _backward_page(projection, before, validator, include_delivery_id=include_delivery_id)
+        with _cache_creation_lock:
+            cached = _cache(store, include_delivery_id)
+            if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
+                _publish_cache(store, include_delivery_id, _CachedProjection(generation, expanded))
+        return result
+    if "history_validator" in params or "before" in params:
+        raise ProtocolError(-32602, "invalid session history parameters")
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
     store = runtime.opened.store
     generation = _generation(store)
     projection = history_projection(store, include_delivery_id=include_delivery_id)
-    result, expanded = page_history(
-        projection, offset, include_delivery_id=include_delivery_id
-    )
+    result, expanded = page_history(projection, offset, include_delivery_id=include_delivery_id)
     with _cache_creation_lock:
         cached = _cache(store, include_delivery_id)
-        if (
-            cached is not None
-            and cached.generation == generation
-            and len(cached.projection.groups) < len(expanded.groups)
-        ):
-            _publish_cache(
-                store,
-                include_delivery_id,
-                _CachedProjection(generation, expanded),
-            )
+        if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
+            _publish_cache(store, include_delivery_id, _CachedProjection(generation, expanded))
     return result
 
 
