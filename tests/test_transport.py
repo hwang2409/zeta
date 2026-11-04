@@ -568,7 +568,7 @@ async def test_non_stall_retry_window_unchanged(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_long_stream_then_stall_respects_wall_window_minus_stall(
+async def test_long_stream_then_stall_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = 0.0
@@ -581,7 +581,8 @@ async def test_long_stream_then_stall_respects_wall_window_minus_stall(
         stall_seconds = 90.0
 
     # The request made useful progress for 61 seconds, then waited silently for
-    # 90 seconds. Only the silent interval is outside the 60-second window.
+    # 90 seconds. The retry window starts at this first failure, so the
+    # request's own running time does not block the retry.
     now = 151.0
     plan = budget.plan(
         StallError("stalled", retry_after=0.0),
@@ -589,10 +590,8 @@ async def test_long_stream_then_stall_respects_wall_window_minus_stall(
         event_data={"retryable": True},
     )
 
-    excluded_stall_seconds = getattr(budget, "excluded_stall_seconds", 0.0)
-    assert now - budget.started_at - excluded_stall_seconds == 61.0
-    assert plan is None
-    assert budget.records[-1] == {"decision": "budget-exhausted"}
+    assert plan is not None
+    assert budget.started_at == 151.0
 
 
 @pytest.mark.asyncio
@@ -687,3 +686,39 @@ async def test_worst_case_turn_wall_time_bounded(
     assert attempts == 3
     assert now == 3 * 90.0 + 2 * 30.0
     assert now <= 330.0
+
+
+@pytest.mark.asyncio
+async def test_server_error_after_long_healthy_request_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """a long first request must not use up the retry window before it fails."""
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+    budget = ProviderRetryBudget()
+    assert budget.start_attempt("transport")
+
+    # the model worked for 753 seconds, then the stream failed with server_error
+    # before any output (the failure seen on long sol workers).
+    now = 753.0
+    error = CodexHTTPError("server_error", status_code=500)
+    plan = budget.plan(error, owner="transport")
+
+    assert plan is not None
+    now += plan.delay
+    assert budget.start_attempt("transport")
+
+
+@pytest.mark.asyncio
+async def test_retry_window_still_bounds_retries_after_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+    budget = ProviderRetryBudget()
+    assert budget.start_attempt("transport")
+    now = 500.0
+    assert budget.plan(CodexHTTPError("boom", status_code=500), owner="transport")
+    now = 500.0 + 61.0
+    assert budget.plan(CodexHTTPError("boom", status_code=500), owner="transport") is None
+    assert budget.records[-1] == {"decision": "budget-exhausted"}
