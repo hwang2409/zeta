@@ -95,6 +95,7 @@ class ServeControl:
         self.deliveries = DeliveryRequests(self)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
+        self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
             publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
@@ -196,7 +197,10 @@ class ServeControl:
     async def wait_for_approval_settlement(self) -> None:
         await self._approvals.wait_for_approval_settlement()
 
-    async def controller_claimed(self, *, reconnect: bool = False) -> None:
+    async def controller_claimed(
+        self, *, reconnect: bool = False, require_host_binding: bool = False
+    ) -> None:
+        self._host_binding_required = require_host_binding
         task = self._grace_task
         if task is None:
             return
@@ -442,7 +446,9 @@ class ServeControl:
         if loop is None or state is None or state.session_id != session_id:
             return
         host_commands = self._active_host_commands
-        if host_commands is None or not loop.schedule_notification_turn():
+        if (
+            self._host_binding_required and host_commands is None
+        ) or not loop.schedule_notification_turn():
             return
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(session_id, host_commands)

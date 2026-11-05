@@ -428,7 +428,10 @@ class _Client:
                 self.server._client_active = True
                 self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(reconnect=reconnect)
+                await self.server.control.controller_claimed(
+                    reconnect=reconnect,
+                    require_host_binding="session_host_commands" in self.features,
+                )
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
