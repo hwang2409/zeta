@@ -9784,6 +9784,29 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
+async def test_empty_max_tokens_completion_does_not_print_neutral_fallback(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([], stop_reason="max_tokens")]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("prompt")
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert rendered.count("error · max_tokens") == 1
+    assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(

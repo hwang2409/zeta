@@ -14,6 +14,7 @@ from typing import Any
 
 from ...protocol.types import (
     MESSAGE_ORIGIN_METADATA,
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -30,14 +31,12 @@ EMPTY_TURN_NUDGE_TEXT = (
     "Reply to the user or continue the task."
 )
 
-# Surfaced (TUI and subagent receipt) when a thinking-only turn hit the limit.
-MAX_TOKENS_THINKING_NOTICE = (
-    "The model reached its output-token limit while thinking "
-    "and did not produce a reply."
-)
-
 # Provider stop reasons are short; keep the persisted value bounded regardless.
 MAX_STOP_REASON_CHARS = 64
+OUTPUT_LIMIT_ERROR_MESSAGE = (
+    "the model reached its output-token limit while thinking "
+    "and did not produce a reply"
+)
 
 
 def has_visible_output(message: Message) -> bool:
@@ -100,6 +99,14 @@ def build_nudge_message() -> Message:
             MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
         },
     )
+
+
+def output_limit_error(
+    message: Message, *, stop_reason: str | None
+) -> ErrorInfo | None:
+    if stop_reason != "max_tokens" or has_visible_output(message):
+        return None
+    return ErrorInfo("max_tokens", OUTPUT_LIMIT_ERROR_MESSAGE)
 
 
 def should_nudge_empty_turn(
