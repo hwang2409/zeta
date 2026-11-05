@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.test_server import TIMEOUT, _close, _connect, _request, _socket_path
+from tests.test_server import TIMEOUT, _close, _connect, _read, _request, _socket_path
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -182,7 +182,7 @@ async def test_observer_disconnects_keep_controller_approval(
     await _request(controller_reader, controller_writer, 2, "new_session", {"provider": "codex"})
     await _request(controller_reader, controller_writer, 3, "send", {"text": "read it"})
     while True:
-        frame = json.loads(await asyncio.wait_for(controller_reader.readline(), TIMEOUT))
+        frame = await _read(controller_reader)
         if frame.get("params", {}).get("event") == "approval_request":
             break
 
