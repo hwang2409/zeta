@@ -21,7 +21,7 @@ import pytest
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import wait_for_path_command
+from tests.support.processes import read_pid_file, wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
@@ -1970,10 +1970,7 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
     child_pid_file = tmp_path / "child.pid"
     child_code = (
         "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
-        # write then rename, so the file never exists while it is still empty
-        f"open({str(child_pid_file)!r} + '.tmp', 'w').write(str(os.getpid())); "
-        f"os.replace({str(child_pid_file)!r} + '.tmp', {str(child_pid_file)!r}); "
-        "time.sleep(30)"
+        f"open({str(child_pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
     )
     tasks = BackgroundTaskRegistry(term_grace=0.03)
     task_id, _ = await tasks.start(
@@ -1985,12 +1982,7 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         ),
         tmp_path,
     )
-    for _ in range(100):
-        if child_pid_file.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert child_pid_file.exists()
-    child_pid = int(child_pid_file.read_text())
+    child_pid = await read_pid_file(child_pid_file)
     second_snapshot_started = asyncio.Event()
     release_second_snapshot = asyncio.Event()
     original_snapshot = spawn_module._snapshot_descendants_sync

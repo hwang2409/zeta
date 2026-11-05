@@ -21,6 +21,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import read_pid_file
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -1560,8 +1561,7 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
 
     async def spawn_after_grandchild_started(*args, **kwargs):
         process = await original_spawn(*args, **kwargs)
-        while not pid_file.exists():
-            await asyncio.sleep(0.01)
+        await read_pid_file(pid_file)
         return process
 
     monkeypatch.setattr(
@@ -2318,11 +2318,7 @@ async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Pa
         ToolCall("bg-escaped", "run_background", {"command": command})
     )
     task_id = started["structuredContent"]["task_id"]
-    for _ in range(100):
-        if escaped_pid.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert escaped_pid.exists()
+    escaped = await read_pid_file(escaped_pid)
 
     result = await asyncio.wait_for(
         registry.execute(ToolCall("kill-escaped", "task_kill", {"task_id": task_id})),
@@ -2330,7 +2326,6 @@ async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Pa
     )
 
     assert result["structuredContent"]["running"] is False
-    escaped = int(escaped_pid.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(escaped, 0)
     await registry.close()
@@ -2356,17 +2351,12 @@ async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> N
         ToolCall("bg-shutdown", "run_background", {"command": command})
     )
     task_id = started["structuredContent"]["task_id"]
-    for _ in range(100):
-        if holder_pid.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert holder_pid.exists()
+    escaped = await read_pid_file(holder_pid)
 
     await asyncio.wait_for(registry.close(), timeout=3)
     status = await registry.background_tasks.output(task_id)
     assert status["running"] is False
     assert "background output was cut off" in status["note"]
-    escaped = int(holder_pid.read_text())
     os.kill(escaped, signal.SIGKILL)
     await registry.close()
 
