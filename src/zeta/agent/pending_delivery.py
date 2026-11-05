@@ -726,6 +726,7 @@ async def send_to_run(
     message: object,
     *,
     channel: ConversationChannel,
+    origin: MessageOrigin = MessageOrigin.AGENT_SEND,
 ) -> str | None:
     """Queue one follow-up through the child's resident delivery flow."""
 
@@ -759,7 +760,7 @@ async def send_to_run(
             child_instance_id,
             PromptInput(
                 message,
-                MessageOrigin.AGENT_SEND,
+                origin,
                 time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
             ),
         )

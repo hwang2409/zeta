@@ -49,6 +49,8 @@ async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -700,6 +702,8 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),

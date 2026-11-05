@@ -59,7 +59,6 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
         console=Console(
             file=StringIO(), force_terminal=True, color_system="truecolor"
         ),
-        history_path=tmp_path / "history",
     )
     session = app._make_session()
     app._active_session = session

@@ -1159,6 +1159,8 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),

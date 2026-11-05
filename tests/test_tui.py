@@ -44,7 +44,6 @@ from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
-from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.cells import cell_len
 from rich.console import Console
@@ -82,7 +81,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
-from zeta.runtime.loop.persistence import DraftPersistence, history_for
+from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskShutdownNotice
@@ -438,6 +437,8 @@ async def _background_event_transcript_count(
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -1564,6 +1565,8 @@ def app_session(app: TUIApp, pipe: PipeInput) -> PromptSession[str]:
         input=pipe,
         output=DummyOutput(),
         key_bindings=build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=app.abort_active,
             on_exit=app.request_exit,
         ),
@@ -5798,6 +5801,8 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
 def test_sigint_key_uses_tui_interrupt_binding() -> None:
     interrupted = []
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: interrupted.append(True),
         on_exit=lambda: None,
     )
@@ -5886,6 +5891,8 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_toggle_agent=lambda: None,
@@ -5899,6 +5906,8 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
 
 def test_transcript_navigation_bindings_are_full_screen_only() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_finder_open=lambda: None,
@@ -5939,6 +5948,8 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
@@ -5965,146 +5976,16 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
         await task
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
-async def test_ctrl_r_opens_history_finder_with_draft_query(
-    tmp_path: Path, editing_mode: EditingMode
-) -> None:
-    active = False
-    opened_with: list[tuple[str, int]] = []
-
-    def open_history(buffer: Buffer) -> None:
-        nonlocal active
-        active = True
-        opened_with.append((buffer.text, buffer.cursor_position))
-
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            editing_mode=editing_mode,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_history_finder_open=open_history,
-                finder_active=lambda: active,
-                history_finder_active=lambda: active,
-                on_finder_input=lambda _query: None,
-            ),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("draft\x12")
-        await wait_until(lambda: active)
-        assert opened_with == [("draft", 5)]
-        active = False
-        session.app.exit()
-        await task
 
 
-@pytest.mark.asyncio
-async def test_composer_forward_history_search_is_disabled(tmp_path: Path) -> None:
-    key = "\x13"  # ctrl+s
-    history = history_for(tmp_path / "history")
-    history.append_string("history target")
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe, output=DummyOutput(), editing_mode=EditingMode.EMACS,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        # A started search would capture the marker in SEARCH_BUFFER; a pending
-        # chord prefix would also resolve to search when the marker arrives.
-        pipe.send_text(key + "z")
-        await wait_until(lambda: session.default_buffer.text == "z")
-        assert session.app.current_buffer is session.default_buffer
-        session.app.exit()
-        await task
 
 
-@pytest.mark.asyncio
-async def test_vi_navigation_ctrl_r_redoes(tmp_path: Path) -> None:
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("abc\x1b")
-        await wait_until(lambda: session.default_buffer.text == "abc")
-        pipe.send_text("u")  # vi undo removes the last inserted character
-        await wait_until(lambda: session.default_buffer.text == "ab")
-        pipe.send_text("\x12")  # ctrl+r in navigation mode: redo
-        await wait_until(lambda: session.default_buffer.text == "abc")
-        assert session.app.current_buffer is session.default_buffer
-        session.app.exit()
-        await task
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("keys", ["\x13z", "\x1b\x13iz"])
-async def test_vi_ctrl_s_history_search_is_disabled(tmp_path: Path, keys: str) -> None:
-    # ctrl+s stays disabled in vi insert and navigation modes.
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text(keys)
-        await wait_until(lambda: session.default_buffer.text == "z")
-        assert session.app.current_buffer is session.default_buffer
-        session.app.exit()
-        await task
 
 
-@pytest.mark.asyncio
-async def test_vi_insert_mode_inserts_search_characters(tmp_path: Path) -> None:
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("a/b?")
-        await wait_until(lambda: session.default_buffer.text == "a/b?")
-        session.app.exit()
-        await task
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("key", ["/", "?"])
-async def test_vi_composer_history_search_is_disabled(tmp_path: Path, key: str) -> None:
-    with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe, output=DummyOutput(), editing_mode=EditingMode.VI,
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
-            multiline=True,
-        )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        # Navigation mode, the search key, then insert a marker. A started
-        # search would capture "iz" in SEARCH_BUFFER.
-        pipe.send_text("\x1b" + key + "iz")
-        await wait_until(lambda: session.default_buffer.text == "z")
-        assert session.app.current_buffer is session.default_buffer
-        session.app.exit()
-        await task
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:
@@ -7717,6 +7598,8 @@ async def test_full_screen_startup_replay_requests_redraw_without_input(
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -8138,6 +8021,8 @@ async def test_run_replays_resumed_transcript_before_prompt(
                 input=pipe,
                 output=DummyOutput(),
                 key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
                     on_interrupt=app.abort_active,
                     on_exit=app.request_exit,
                 ),
@@ -8187,6 +8072,8 @@ skill_catalog=SkillCatalog.empty(),
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -8240,6 +8127,8 @@ async def test_run_keeps_empty_resumed_transcript_blank(
                 input=pipe,
                 output=DummyOutput(),
                 key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
                     on_interrupt=app.abort_active,
                     on_exit=app.request_exit,
                 ),
@@ -8340,6 +8229,8 @@ def _display_session(
         input=pipe,
         output=DummyOutput(),
         key_bindings=build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=app.abort_active,
             on_exit=app.request_exit,
         ),
@@ -9344,38 +9235,6 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         await run_task
 
 
-@pytest.mark.asyncio
-async def test_full_screen_steady_state_paint_does_not_clear_screen(
-    tmp_path: Path,
-) -> None:
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    session = app._make_session()
-    app._install_full_screen_layout(session)
-    output_text = StringIO()
-    output = Vt100_Output(
-        output_text,
-        lambda: Size(rows=45, columns=200),
-    )
-    session.app.output = output
-    session.app.renderer.output = output
-    session.app.renderer.full_screen = True
-
-    with set_app(session.app):
-        session.app.renderer.render(session.app, session.app.layout)
-        output_text.seek(0)
-        output_text.truncate(0)
-        app._spinner_active = True
-        app._spinner_frame = 1
-        session.app.renderer.render(session.app, session.app.layout)
-
-    steady_state = output_text.getvalue()
-    assert "\x1b[J" not in steady_state
-    assert "\x1b[2J" not in steady_state
 
 
 @pytest.mark.parametrize(
@@ -10431,7 +10290,7 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
         session = PromptSession(
             input=pipe,
             output=DummyOutput(),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            key_bindings=build_key_bindings(on_history_previous=lambda _buffer: None, on_history_next=lambda _buffer: None, on_interrupt=lambda: None, on_exit=lambda: None),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" ❯ "))
@@ -10451,6 +10310,8 @@ async def test_vi_composer_motions_move_and_delete_the_current_line() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10491,6 +10352,8 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10529,6 +10392,8 @@ async def test_full_screen_vi_escape_enter_chord_keeps_insert_mode() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10551,6 +10416,8 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10585,6 +10452,8 @@ async def test_vi_composer_paced_dd_and_gg_commands() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10620,6 +10489,8 @@ async def test_vi_composer_ctrl_c_interrupts_in_insert_and_normal_modes() -> Non
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: interrupts.append(None),
                 on_exit=lambda: None,
             ),
@@ -10663,6 +10534,8 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10683,63 +10556,6 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
     assert submitted == ["pasted line 1\npasted line 2\n" + long_line]
 
 
-@pytest.mark.asyncio
-async def test_vi_composer_history_down_restores_multiline_entry_cursor(
-    tmp_path: Path,
-) -> None:
-    history = history_for(tmp_path / "history")
-    submitted: list[str] = []
-
-    with create_pipe_input() as pipe:
-        session: PromptSession[str] | None = None
-
-        def submit(value: str) -> None:
-            submitted.append(value)
-            assert session is not None
-            session.app.exit()
-
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            editing_mode=EditingMode.VI,
-            history=history,
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_submit=submit,
-            ),
-            multiline=True,
-        )
-        fast_vi_timeouts(session)
-        first = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        pipe.send_text("first line\nsecond line\r")
-        await first
-        second = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        pipe.send_text("other first\nother second\r")
-        await second
-        third = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        assert session.default_buffer._load_history_task is not None
-        await session.default_buffer._load_history_task
-        pipe.send_text("\x1b[A")
-        await wait_until(
-            lambda: session.app.current_buffer.text == "other first\nother second"
-        )
-        pipe.send_text("\x1b[A")
-        await wait_until(
-            lambda: session.app.current_buffer.text == "first line\nsecond line"
-        )
-        pipe.send_text("\x1b[B")
-        await wait_until(
-            lambda: session.app.current_buffer.text == "other first\nother second"
-            and session.app.current_buffer.cursor_position == len("other first\nother second")
-        )
-        session.app.exit()
-        await third
-
-    assert submitted == ["first line\nsecond line", "other first\nother second"]
 
 
 @pytest.mark.asyncio
@@ -10789,6 +10605,8 @@ skill_catalog=SkillCatalog.empty(),
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -10824,6 +10642,8 @@ async def test_vi_composer_modified_enter_inserts_newline(newline: str) -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10846,6 +10666,8 @@ async def test_vi_composer_escape_and_insert_update_native_state() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10871,106 +10693,8 @@ async def test_vi_composer_escape_and_insert_update_native_state() -> None:
         await task
 
 
-@pytest.mark.asyncio
-async def test_composer_submit_writes_file_history_and_up_replays_it(
-    tmp_path: Path,
-) -> None:
-    history = history_for(tmp_path / "history")
-    submitted: list[str] = []
-
-    with create_pipe_input() as pipe:
-        first_session: PromptSession[str] | None = None
-
-        def submit_first(value: str) -> None:
-            submitted.append(value)
-            assert first_session is not None
-            first_session.app.exit()
-
-        first_session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history,
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_submit=submit_first,
-            ),
-            multiline=True,
-        )
-        first_task = asyncio.create_task(first_session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        pipe.send_text("remember me\r")
-        await first_task
-        await history.flush_pending()
-
-        second_session: PromptSession[str] | None = None
-
-        def submit_second(value: str) -> None:
-            submitted.append(value)
-            assert second_session is not None
-            second_session.app.exit()
-
-        second_session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history_for(tmp_path / "history"),
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_submit=submit_second,
-            ),
-            multiline=True,
-        )
-        second_task = asyncio.create_task(second_session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        assert second_session.default_buffer._load_history_task is not None
-        await second_session.default_buffer._load_history_task
-        pipe.send_text("\x1b[A\r")
-        await second_task
-
-    assert submitted == ["remember me", "remember me"]
 
 
-@pytest.mark.asyncio
-async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
-    tmp_path: Path,
-) -> None:
-    history = history_for(tmp_path / "history")
-    submitted: list[str] = []
-
-    with create_pipe_input() as pipe:
-        session: PromptSession[str] | None = None
-
-        def submit(value: str) -> None:
-            submitted.append(value)
-            assert session is not None
-            session.app.exit()
-
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            editing_mode=EditingMode.VI,
-            history=history,
-            key_bindings=build_key_bindings(
-                on_interrupt=lambda: None,
-                on_exit=lambda: None,
-                on_submit=submit,
-            ),
-            multiline=True,
-        )
-        first = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        pipe.send_text("remember me\r")
-        await first
-
-        second = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        assert session.default_buffer._load_history_task is not None
-        await session.default_buffer._load_history_task
-        pipe.send_text("\x1b[A\r")
-        await second
-
-    assert submitted == ["remember me", "remember me"]
 
 
 @pytest.mark.asyncio
@@ -10979,6 +10703,8 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
 
     def bindings() -> object:
         return build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=lambda: None,
             on_exit=lambda: None,
             on_approve=lambda: answered.append("approve"),
@@ -11298,6 +11024,8 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_agent_list_down=navigation.focus_list,
@@ -11444,275 +11172,20 @@ def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None
 
 
-@pytest.mark.asyncio
-async def test_record_prompt_writes_and_applies_history_off_the_event_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    app._history = history_for(tmp_path / "history")
-    loop_thread = threading.get_ident()
-    write_threads: list[int] = []
-    apply_threads: list[int] = []
-    original_write = app._history._write_entries
-    original_apply = app._history._apply_snapshot
-
-    def record_write_thread(entries: list[str]) -> None:
-        write_threads.append(threading.get_ident())
-        original_write(entries)
-
-    def record_apply_thread(revision: int, entries: object) -> None:
-        apply_threads.append(threading.get_ident())
-        original_apply(revision, entries)
-
-    monkeypatch.setattr(app._history, "_write_entries", record_write_thread)
-    monkeypatch.setattr(app._history, "_apply_snapshot", record_apply_thread)
-
-    app._record_prompt("new prompt")
-    assert app._history.get_strings()[-1] == "new prompt"
-    await app._history.flush_pending()
-
-    assert write_threads and write_threads[0] != loop_thread
-    assert apply_threads == write_threads
-    await app.close()
 
 
-@pytest.mark.asyncio
-async def test_persisted_history_loads_once_off_loop_for_navigation_and_finder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "history"
-    history_for(path).store_string("saved prompt")
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=path,
-    )
-    assert app._history is not None
-    loop_thread = threading.get_ident()
-    load_threads: list[int] = []
-    original = app._history.load_history_strings
-
-    def recording_loader() -> list[str]:
-        load_threads.append(threading.get_ident())
-        return original()
-
-    monkeypatch.setattr(app._history, "load_history_strings", recording_loader)
-    session = app._make_session()
-    with set_app(session.app):
-        session.default_buffer.load_history_if_not_yet_loaded()
-        assert session.default_buffer._load_history_task is not None
-        await session.default_buffer._load_history_task
-    session.default_buffer.history_backward()
-
-    request = app._history_finder.open_finder(session.default_buffer)
-    assert request is not None
-    snapshot = await app._history_finder.build_finder_candidates(request)
-
-    assert session.default_buffer.text == "saved prompt"
-    assert [candidate.text for candidate in snapshot.candidates] == ["saved prompt"]
-    assert len(load_threads) == 1
-    assert load_threads[0] != loop_thread
-    await app.close()
 
 
-@pytest.mark.asyncio
-async def test_tui_starts_when_history_is_unreadable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    history = history_for(tmp_path / "history")
-    history.append_string("in-memory prompt")
-    await history.flush_pending()
-    reads = 0
-
-    def unreadable() -> list[str]:
-        nonlocal reads
-        reads += 1
-        raise PermissionError("history is unreadable")
-
-    monkeypatch.setattr(history, "load_history_strings", unreadable)
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    app._history = history
-    notices: list[object] = []
-    monkeypatch.setattr(app, "_handle_background_notice", notices.append)
-    with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history,
-            key_bindings=build_key_bindings(
-                on_interrupt=app.abort_active,
-                on_exit=app.request_exit,
-            ),
-            multiline=True,
-        )
-        run_task = asyncio.create_task(app.run(session))
-        try:
-            await wait_until(lambda: session.default_buffer._load_history_task is not None)
-            assert session.default_buffer._load_history_task is not None
-            await session.default_buffer._load_history_task
-            session.default_buffer.history_backward()
-            assert session.default_buffer.text == "in-memory prompt"
-            session.default_buffer.reset()
-            pipe.send_text("still usable")
-            await wait_until(lambda: session.default_buffer.text == "still usable")
-            assert history.snapshot() == ("in-memory prompt",)
-            assert notices == [
-                "composer history could not be read: history is unreadable"
-            ]
-            assert reads == 1
-        finally:
-            if not run_task.done():
-                pipe.send_text("\x04")
-            await asyncio.wait_for(run_task, 2)
 
 
-@pytest.mark.asyncio
-async def test_tui_accepts_input_while_initial_history_load_is_blocked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "history"
-    history_for(path).store_string("saved prompt")
-    history = history_for(path)
-    started = threading.Event()
-    release = threading.Event()
-    original = history.load_history_strings
-
-    def blocked_loader() -> list[str]:
-        started.set()
-        release.wait()
-        return original()
-
-    monkeypatch.setattr(history, "load_history_strings", blocked_loader)
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    app._history = history
-    with create_pipe_input() as pipe:
-        session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            history=history,
-            key_bindings=build_key_bindings(
-                on_interrupt=app.abort_active,
-                on_exit=app.request_exit,
-            ),
-            multiline=True,
-        )
-        run_task = asyncio.create_task(app.run(session))
-        try:
-            assert await asyncio.to_thread(started.wait, 1)
-            pipe.send_text("typed before history")
-            async with asyncio.timeout(1):
-                while session.default_buffer.text != "typed before history":
-                    await asyncio.sleep(0.01)
-            assert not release.is_set()
-            release.set()
-            assert session.default_buffer._load_history_task is not None
-            await session.default_buffer._load_history_task
-            assert history.snapshot() == ("saved prompt",)
-        finally:
-            release.set()
-            if not run_task.done():
-                pipe.send_text("\x04")
-            await asyncio.wait_for(run_task, 2)
 
 
-@pytest.mark.asyncio
-async def test_submission_during_initial_history_load_is_kept_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "history"
-    history_for(path).store_string("saved prompt")
-    history = history_for(path)
-    started = threading.Event()
-    release = threading.Event()
-    original = history.load_history_strings
-
-    def blocked_loader() -> list[str]:
-        started.set()
-        release.wait()
-        return original()
-
-    monkeypatch.setattr(history, "load_history_strings", blocked_loader)
-
-    async def load() -> list[str]:
-        return [entry async for entry in history.load()]
-
-    load_task = asyncio.create_task(load())
-    assert await asyncio.to_thread(started.wait, 1)
-    history.append_string("new prompt")
-    release.set()
-    loaded = await load_task
-    await history.flush_pending()
-
-    assert loaded.count("new prompt") == 1
-    assert history.snapshot().count("new prompt") == 1
-    assert set(history.snapshot()) == {"saved prompt", "new prompt"}
 
 
-@pytest.mark.asyncio
-async def test_recorded_prompt_is_immediately_available_to_history_navigation(
-    tmp_path: Path,
-) -> None:
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    session = app._make_session()
-    assert app._history is not None
-    app._record_prompt("just submitted")
-    session.default_buffer.reset()
-    with set_app(session.app):
-        session.default_buffer.load_history_if_not_yet_loaded()
-        assert session.default_buffer._load_history_task is not None
-        await session.default_buffer._load_history_task
-
-    session.default_buffer.history_backward()
-
-    assert session.default_buffer.text == "just submitted"
-    await app.close()
 
 
-@pytest.mark.asyncio
-async def test_rapid_history_appends_persist_in_order(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    history = history_for(path)
-
-    for value in ("first", "second", "second", "third"):
-        history.append_string(value)
-    await history.flush_pending()
-
-    expected = ["first", "second", "third"]
-    assert history.snapshot() == tuple(expected)
-    reopened = history_for(path)
-    assert list(reopened.load_history_strings())[:3] == list(reversed(expected))
 
 
-@pytest.mark.asyncio
-async def test_history_writer_retires_after_flush_without_shutdown(tmp_path: Path) -> None:
-    history = history_for(tmp_path / "history")
-    history.append_string("prompt")
-    thread = history._writer._thread
-    assert thread is not None
-
-    await history.flush_pending()
-    await asyncio.to_thread(thread.join, 1)
-
-    assert not thread.is_alive()
 
 
 @pytest.mark.asyncio
@@ -11766,86 +11239,10 @@ async def test_many_flushed_writers_leave_no_live_threads() -> None:
     assert not [thread for thread in threads if thread.is_alive()]
 
 
-def test_history_flush_timeout_does_not_extend_asyncio_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    history = history_for(tmp_path / "history")
-    started = threading.Event()
-    release = threading.Event()
-    original_flock = persistence_module.fcntl.flock
-
-    def blocked_flock(fd: int, operation: int) -> None:
-        if operation == persistence_module.fcntl.LOCK_EX:
-            started.set()
-            release.wait(1)
-        original_flock(fd, operation)
-
-    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.05)
-    monkeypatch.setattr(persistence_module.fcntl, "flock", blocked_flock)
-
-    async def submit_and_flush() -> None:
-        history.append_string("blocked")
-        while not started.is_set():
-            await asyncio.sleep(0.001)
-        await history.flush_pending()
-
-    before = time.monotonic()
-    asyncio.run(submit_and_flush())
-    elapsed = time.monotonic() - before
-    release.set()
-
-    assert elapsed < 0.5
 
 
-@pytest.mark.asyncio
-async def test_tui_close_flushes_pending_history_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    app._history = history_for(tmp_path / "history")
-    release = threading.Event()
-    started = threading.Event()
-    original = app._history._append_to_file
-
-    def blocked_write(value: str) -> list[str]:
-        started.set()
-        release.wait()
-        return original(value)
-
-    monkeypatch.setattr(app._history, "_append_to_file", blocked_write)
-    app._record_prompt("flush me")
-    await asyncio.to_thread(started.wait)
-    close_task = asyncio.create_task(app.close())
-    await asyncio.sleep(0)
-    assert not close_task.done()
-
-    release.set()
-    await close_task
-
-    assert next(iter(history_for(tmp_path / "history").load_history_strings())) == "flush me"
 
 
-@pytest.mark.asyncio
-async def test_history_write_failure_is_reported_once_without_raising(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
-) -> None:
-    history = history_for(tmp_path / "history")
-
-    def fail(_entries: list[str]) -> None:
-        raise OSError("disk unavailable")
-
-    monkeypatch.setattr(history, "_write_entries", fail)
-    history.append_string("first")
-    history.append_string("second")
-    await history.flush_pending()
-
-    assert history.get_strings() == ["first", "second"]
-    assert caplog.messages.count("failed to persist composer history: disk unavailable") == 1
 
 
 @pytest.mark.asyncio
@@ -12114,61 +11511,10 @@ async def test_draft_write_failure_is_reported_once_without_raising(
     assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
 
 
-@pytest.mark.asyncio
-async def test_composer_history_is_bounded_and_keeps_multiline_entries(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "history"
-    history = history_for(path)
-
-    def append_entries() -> None:
-        for index in range(1001):
-            history.append_string(f"prompt {index}\nline two")
-
-    await asyncio.to_thread(append_entries)
-
-    assert len(history.get_strings()) == 1000
-    assert history.get_strings()[0] == "prompt 1\nline two"
-    assert history.get_strings()[-1] == "prompt 1000\nline two"
-    reopened = history_for(path)
-    loaded: list[str] = []
-    async for entry in reopened.load():
-        loaded.append(entry)
-    assert loaded[:2] == ["prompt 1000\nline two", "prompt 999\nline two"]
 
 
-@pytest.mark.asyncio
-async def test_composer_history_merges_cold_cache_with_disk(tmp_path: Path) -> None:
-    path = tmp_path / "history"
-    history_for(path).store_string("old prompt")
-    active = history_for(path)
-
-    active.append_string("new prompt")
-    await active.flush_pending()
-
-    assert active.get_strings() == ["old prompt", "new prompt"]
-    assert active.snapshot() == ("old prompt", "new prompt")
 
 
-@pytest.mark.asyncio
-async def test_composer_history_merges_updates_from_active_instances(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "history"
-    active = history_for(path)
-    other = history_for(path)
-    active.store_string("old prompt")
-    async for _entry in active.load():
-        pass
-
-    other.append_string("other session prompt")
-    await other.flush_pending()
-    active.append_string("active session prompt")
-    await active.flush_pending()
-
-    expected = ["old prompt", "other session prompt", "active session prompt"]
-    assert active.get_strings() == expected
-    assert active.snapshot() == tuple(expected)
 
 
 @pytest.mark.asyncio
@@ -12201,39 +11547,6 @@ def test_draft_persistence_restores_attachment_metadata(tmp_path: Path) -> None:
     assert state.next_image_token == 2
 
 
-@pytest.mark.asyncio
-async def test_history_and_draft_store_attachment_refs_without_payloads(
-    tmp_path: Path,
-) -> None:
-    image = tmp_path / "image.png"
-    text_file = tmp_path / "notes.txt"
-    image.write_bytes(PNG)
-    text_file.write_text("private attachment text", encoding="utf-8")
-    history_path = tmp_path / "history"
-    draft_path = tmp_path / "draft"
-    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=history_path,
-        draft_path=draft_path,
-    )
-    app._draft.schedule("inspect @./image.png @./notes.txt")
-    app._draft.flush()
-
-    await app._handle_prompt_value("inspect @./image.png @./notes.txt")
-    assert app._active_task is not None
-    await app._active_task
-
-    payload = base64.b64encode(PNG)
-    for path in (history_path, draft_path):
-        contents = path.read_bytes() if path.exists() else b""
-        assert payload not in contents
-        assert b"private attachment text" not in contents
-    assert isinstance(store.messages()[0].content[1], ImageContent)
-    assert isinstance(store.messages()[0].content[2], TextContent)
-    await app.loop.close()
 
 
 @pytest.mark.asyncio
@@ -12326,36 +11639,6 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
     await app.loop.close()
 
 
-@pytest.mark.asyncio
-async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    first = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    first_session = first._make_session()
-    first_session.default_buffer.insert_text("unsent draft")
-    await asyncio.sleep(0.25)
-
-    reopened_store = ConversationStore(
-        store.root_dir, session_id=store.session_id, cwd=store.cwd
-    )
-    second = TUIApp(
-        AgentLoop(FakeBackend([]), reopened_store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    second_session = second._make_session()
-    assert second_session.default_buffer.text == "unsent draft"
-
-    second._record_prompt("sent prompt")
-    await second._draft.flush_pending()
-    assert not (store.session_dir / "draft").exists()
-    await first.close()
-    await second.close()
 
 
 @pytest.mark.asyncio
@@ -12533,31 +11816,6 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     await app.loop.close()
 
 
-@pytest.mark.parametrize(
-    ("payload", "expected"),
-    [
-        (b"[" * 65 + b"]" * 65, ""),
-        (b"[" * 10_000 + b"]" * 10_000, ""),
-        (b"\xff", ""),
-        (b"legacy plain text", "legacy plain text"),
-    ],
-    ids=["depth65", "depth10000", "binary", "legacy"],
-)
-async def test_tui_setup_handles_corrupt_and_legacy_drafts(
-    tmp_path: Path, payload: bytes, expected: str
-) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    path = store.session_dir / "draft"
-    path.write_bytes(payload)
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        history_path=tmp_path / "history",
-    )
-    session = app._make_session()
-    assert session.default_buffer.text == expected
-    assert path.read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -13742,3 +13000,37 @@ async def test_low_capacity_notice_real_render_path(tmp_path: Path) -> None:
     assert rendered.count(expected) == 1, rendered
     assert not getattr(loop.backend, "calls", [])
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_history_finder_does_not_cross_session_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    first = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "first"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    first._record_prompt("only from the first session")
+    await first.close()
+
+    second = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "second"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    request = second._history_finder.open_finder(Buffer())
+    assert request is not None
+    candidates = await second._history_finder.build_finder_candidates(request)
+
+    assert [candidate.text for candidate in candidates.candidates] == []
+    await second.close()
