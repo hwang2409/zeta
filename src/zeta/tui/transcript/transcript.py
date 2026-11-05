@@ -15,7 +15,7 @@ from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.dimension import AnyDimension, Dimension
-from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console, RenderableType
 from rich.text import Text
 
@@ -36,12 +36,9 @@ from .streaming_text import StreamingText
 from .transcript_finder import TranscriptFinderMixin
 from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
-    AnchoredSelection,
     HighlightCache,
     SearchMatch,
-    Selection,
     find_matches,
-    highlight_fragments,
 )
 
 if TYPE_CHECKING:
@@ -231,10 +228,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._unit_search_cache: dict[int, dict[int, tuple[int, str]]] = {}
         self._unit_search_widths: OrderedDict[int, None] = OrderedDict()
         self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
-        self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
-        self._copy_handler: Callable[[str], str | None] | None = None
-        self.copy_notice: str | None = None
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
         self._cache_palette = theme.active_palette()
@@ -370,8 +364,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._user_units.clear()
         self._search_cache.clear()
         self._highlight_cache = None
-        self._selection = None
-        self.copy_notice = None
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
@@ -1070,7 +1062,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             and self._max_lines is None
             and not self._search_active
             and self._anchor is None
-            and self._selection is None
             and (
                 len(self._units) >= _LAZY_TAIL_MIN_UNITS
                 or bool(
@@ -1093,7 +1084,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             (self._locations_revision != self._revision and not lazy_tail)
             or not self._follow_tail
             or self._anchor is not None
-            or self._selection is not None
         )
         locations = self._locations(width) if need_locations else []
         if self._follow_tail:
@@ -1137,18 +1127,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             if lazy_tail
             else min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
         )
-        selection = self._resolved_selection(locations)
-        selection_style = f"bg:{theme.active_palette().search_bg}"
-
         def get_line(index: int) -> list[tuple[str, str]]:
-            line = visible_lines[index]
-            if selection is None:
-                return line
-            length = sum(len(fragment[1]) for fragment in line)
-            span = selection.line_span(index - prefix_lines, length)
-            if span is None:
-                return line
-            return highlight_fragments(line, span, selection_style)
+            return visible_lines[index]
 
         return UIContent(
             get_line=get_line,
@@ -1161,66 +1141,14 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         del window
         return 0 if self._uses_virtual_history() else self._scroll_offset
 
-    def set_copy_handler(self, handler: Callable[[str], str | None] | None) -> None:
-        """Receive the text of each finished drag; return a footer notice."""
-
-        self._copy_handler = handler
-
-    @property
-    def selection(self) -> Selection | None:
-        """The current selection resolved to rows, or None when there is none."""
-
-        return self._resolved_selection()
-
-
     def mouse_handler(self, mouse_event: MouseEvent):
-        """Scroll on the wheel; turn a left-button drag into a copied selection.
+        """Scroll on the wheel and leave other mouse events to the terminal."""
 
-        The terminal reports drags because the session turns on button-event
-        tracking; positions arrive in content coordinates, so the blank rows
-        padded above a short transcript are subtracted before mapping to lines.
-        """
-
-        event_type = mouse_event.event_type
-        if event_type is MouseEventType.SCROLL_UP:
+        if mouse_event.event_type is MouseEventType.SCROLL_UP:
             self.scroll_up()
             return None
-        if event_type is MouseEventType.SCROLL_DOWN:
+        if mouse_event.event_type is MouseEventType.SCROLL_DOWN:
             self.scroll_down()
-            return None
-        if event_type is MouseEventType.MOUSE_DOWN:
-            if mouse_event.button is not MouseButton.LEFT:
-                return NotImplemented
-            if self._uses_virtual_history():
-                self._mouse_coordinate_base = 0
-            else:
-                was_lazy = self._materialize_for_interaction()
-                self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
-        row = mouse_event.position.y - self._prefix_lines
-        if self._mouse_coordinate_base and row < self._mouse_coordinate_base:
-            row += self._mouse_coordinate_base
-        cell = (row, mouse_event.position.x)
-        if event_type is MouseEventType.MOUSE_DOWN:
-            anchor = self._anchor_for(cell)
-            self._selection = AnchoredSelection(anchor, anchor)
-            self.copy_notice = None
-            return None
-        selection = self._selection
-        if selection is None or not selection.dragging:
-            return NotImplemented
-        if event_type is MouseEventType.MOUSE_MOVE:
-            self._selection = selection.extend(self._anchor_for(cell))
-            return None
-        if event_type is MouseEventType.MOUSE_UP:
-            released = selection.released(self._anchor_for(cell))
-            resolved = self._selection_for_copy(released)
-            if resolved is None or resolved.is_click:
-                self._selection = None
-                return None
-            self._selection = released
-            text = self.selection_text()
-            if text and self._copy_handler is not None:
-                self.copy_notice = self._copy_handler(text)
             return None
         return NotImplemented
 
