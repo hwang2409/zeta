@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-import fcntl
+from contextlib import nullcontext
 import json
 import logging
 import os
 import queue
-import tempfile
 import threading
-from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 

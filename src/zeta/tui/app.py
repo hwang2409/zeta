@@ -94,6 +94,7 @@ from .render import (
     render_thought_live_delta,
 )
 from .runtime_close import RuntimeCloseMixin
+from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
@@ -104,7 +105,6 @@ from .slash_handlers.model_picker import ModelPicker
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
-from .session_prompt_history import SessionPromptHistory
 from .transcript import (
     FinderControl,
     TranscriptPresenter,

@@ -27,9 +27,9 @@ from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     MESSAGE_ORIGIN_METADATA,
-    MessageOrigin,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -42,7 +42,6 @@ from ..protocol.types import (
     is_passive_harness_message,
 )
 from .cards.base import strip_terminal_controls
-from .user import displayed_user_text
 from .render import (
     is_retryable_error,
     render_agent_notification,
@@ -50,6 +49,7 @@ from .render import (
     render_markdown,
     render_thought,
 )
+from .user import displayed_user_text
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 _MAX_DEFERRED_TOOL_UPDATES = 64
