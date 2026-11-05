@@ -28,6 +28,7 @@ from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 FEATURES = [
     "session_cwd",
+    "new_session_settings",
     "user_message_event",
     "list_sessions_paging",
     "ping",
@@ -73,6 +74,70 @@ def _tool_stdout(end: dict) -> str:
     match = re.search(r"stdout:\n(.*?)\n", content)
     assert match is not None, content
     return match.group(1)
+
+
+@pytest.mark.asyncio
+async def test_controller_model_catalog_works_before_session_attachment(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        result = (await _request(reader, writer, 2, "model_catalog"))[-1]
+        assert result["result"]["models"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_new_session_settings_apply_before_first_turn(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["new_session_settings"])
+        created = await _request(
+            reader,
+            writer,
+            2,
+            "new_session",
+            {"model": "gpt-5.4-mini", "approval_mode": "allow"},
+        )
+        assert created[-1]["result"]["session"]["model"] == "gpt-5.4-mini"
+        await _request(reader, writer, 3, "send", {"text": "hello"})
+        await _event(reader, "agent_end")
+        assert server.runtime.metadata.model == "gpt-5.4-mini"
+        assert server.runtime.policy.default.value == "allow"
+        assert backend.calls
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_new_session_settings_invalid_does_not_create_session(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["new_session_settings"])
+        result = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "new_session",
+                {"model": "not-a-model", "approval_mode": "allow"},
+            )
+        )[-1]
+        assert result["error"] == {
+            "code": -32602,
+            "message": "invalid model or approval mode",
+        }
+        assert server.runtime.opened is None
+    finally:
+        await _close(server, writer)
 
 
 # Finding 1: resume uses the persisted session cwd.
