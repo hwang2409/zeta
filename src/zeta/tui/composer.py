@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
