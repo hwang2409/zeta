@@ -1134,18 +1134,18 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
         wake_task = server.control._turn_task
         assert wake_task is not None
         await asyncio.wait_for(asyncio.shield(wake_task), 10)
-        assert captured[0][0].environment["GAMMA_TEST_TOKEN"] == "snapshot-a"
+        assert captured[0][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-a"
         assert "gamma-a" in captured[0][0].instruction
         assert captured[0][1] == "snapshot-a"
         release_resume.set()
         assert "result" in (await resume)[-1]
-        assert captured[0][0].environment["GAMMA_TEST_TOKEN"] == "snapshot-a"
+        assert captured[0][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-a"
 
         server.control._schedule_background_wake(session_id)
         later_wake = server.control._turn_task
         assert later_wake is not None
         await asyncio.wait_for(asyncio.shield(later_wake), 10)
-        assert captured[1][0].environment["GAMMA_TEST_TOKEN"] == "snapshot-b"
+        assert captured[1][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-b"
         assert "gamma-b" in captured[1][0].instruction
         assert captured[1][1] == "snapshot-b"
         assert isinstance(captured[0][0], SessionHostCommands)
