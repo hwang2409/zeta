@@ -36,7 +36,6 @@ from ..protocol.types import (
     TextContent,
     with_message_origin,
 )
-from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
 from ..submission.notification_retry import NotificationFailure, NotificationOutcome
 from . import theme
 from ._attachments import (
@@ -246,8 +245,6 @@ class TurnConsumerMixin:
                     self._finish_message(event)
                     self._streaming = False
                     self._finish_stream_invalidation()
-                elif event.type is StreamEventType.TURN_END:
-                    self._surface_output_limit(event, notification=notification)
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
@@ -361,6 +358,8 @@ class TurnConsumerMixin:
             return False
         if not (suppress_errors and event.type is StreamEventType.ERROR):
             self._print_unit(rendered)
+            if event.type is StreamEventType.ERROR:
+                self._turn_had_visible_output = True
         if event.type is not StreamEventType.ERROR or not is_retryable_error(
             event.error
         ):
@@ -759,17 +758,6 @@ class ComposerAttachmentMixin:
             self._draft.schedule(candidate.text)
             return
         self._submissions.undo()
-
-    def _surface_output_limit(self, event: StreamEvent, *, notification: bool) -> None:
-        """Note when a thinking-only turn hit the output-token limit."""
-
-        if notification or self._turn_had_visible_output:
-            return
-        message = event.message
-        if message is None or message.metadata.get("stop_reason") != "max_tokens":
-            return
-        self._print_unit(Text(MAX_TOKENS_THINKING_NOTICE, style=theme.CHROME))
-        self._turn_had_visible_output = True
 
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()

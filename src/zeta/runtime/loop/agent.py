@@ -1,5 +1,4 @@
 """The provider-neutral agent loop."""
-
 from __future__ import annotations
 
 import asyncio
@@ -111,6 +110,7 @@ from ._store_writes import StoreWriteMixin
 from .empty_turn import (
     annotate_turn_metadata,
     build_nudge_message,
+    output_limit_error,
     read_turn_metadata,
     should_nudge_empty_turn,
 )
@@ -778,9 +778,6 @@ class AgentLoop(
             or step_delivery.has_pending_edge
             or retrying_context
             or retrying_provider
-            # A nudge is persisted as a user message, so it must always get
-            # exactly one following model call. This recovery call counts as
-            # one additional turn, bounded to at most max_turns + 1 calls.
             or nudge_turn_pending
         ):
             if not retrying_context and not retrying_provider:
@@ -1093,6 +1090,15 @@ class AgentLoop(
             )
             attempt_state.persisted = True
             self._turn_provider_retry_records = []
+            error = output_limit_error(
+                assistant_message, stop_reason=self._turn_stop_reason
+            )
+            if error is not None and not calls:
+                yield StreamEvent(StreamEventType.ERROR, error=error)
+                if self.agent_instance_id is None:
+                    await step_delivery.admit_terminal("foreground_end")
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             if not calls:
                 transition = await self._toolless_transition(
                     step_delivery,
@@ -1110,8 +1116,6 @@ class AgentLoop(
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
-                # Foreground turns consume a newly armed step before ending.
-                # One idle epoch makes only its existing provider attempt.
                 consuming_notifications = transition.consuming_notifications
                 if transition.continue_turn:
                     continue
@@ -1153,18 +1157,14 @@ class AgentLoop(
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
         yield StreamEvent(StreamEventType.AGENT_END)
-
-
     def _finalize_tool_results(
         self,
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
         return finalize_agent_results(self, calls, slots)
-
     def _annotate_current_turn(self, message: Message) -> Message:
         """Apply provider metadata before any assistant message is persisted."""
-
         annotated = annotate_turn_metadata(
             message,
             stop_reason=self._turn_stop_reason,
@@ -1193,7 +1193,6 @@ class AgentLoop(
             tool_result=annotated.tool_result,
             metadata=metadata,
         )
-
     def _persist_partial(
         self,
         partial_blocks: list[ContentBlock],
@@ -1230,7 +1229,6 @@ class AgentLoop(
             metadata=metadata,
         )
         self.store.append_message(durable_message(assistant_message))
-
     def _persist_partial_with_cancelled_tools(
         self,
         partial_blocks: list[ContentBlock],

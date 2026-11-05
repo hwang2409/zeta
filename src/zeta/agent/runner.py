@@ -282,9 +282,9 @@ async def consume_child(
     final_text = assistant_text(final_message)
     if not final_text.strip():
         if final_message.metadata.get("stop_reason") == "max_tokens":
-            from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
+            from ..runtime.loop.empty_turn import OUTPUT_LIMIT_ERROR_MESSAGE
 
-            return terminal_result(state="completed", text=MAX_TOKENS_THINKING_NOTICE)
+            return terminal_result(state="completed", text=OUTPUT_LIMIT_ERROR_MESSAGE)
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(state="failed", text=text)
     if record_report is not None:
