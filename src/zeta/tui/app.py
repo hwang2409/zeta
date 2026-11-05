@@ -342,9 +342,8 @@ class TUIApp(
         )
         self._status_restore_text = ""
         self._status_restore_cursor = 0
-        self._agent_navigation = AgentNavigation(
-            self.loop.store, on_view_change=lambda: app._viewed_session_changed()
-        )
+        self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_snapshot = (
             lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
         )
