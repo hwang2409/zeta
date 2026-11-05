@@ -612,7 +612,7 @@ class _Client:
             "status",
         ]
         if extended:
-            requests += ergonomics.EXTENSION_REQUESTS
+            requests += [method for method in ergonomics.EXTENSION_REQUESTS if method != "content_read" or "content_read" in self.features]
             requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
@@ -664,6 +664,11 @@ class _Client:
                 self.server.control.require_idle,
             )
         if method in {"session_tree", "session_history"}:
+            assert self.server.connections is not None
+            return await self.server.connections.read_session(self, method, params)
+        if method == "content_read":
+            if "content_read" not in self.features:
+                raise ProtocolError(-32601, "content_read requires the negotiated content_read feature")
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
         store = ergonomics.active(runtime, params)
