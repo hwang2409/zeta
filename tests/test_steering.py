@@ -1166,6 +1166,8 @@ async def test_open_editor_binding_wires_to_buffer_open_in_editor() -> None:
                 input=pipe,
                 output=DummyOutput(),
                 key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
                     on_interrupt=lambda: None,
                     on_exit=lambda: None,
                     on_submit=lambda _value: None,

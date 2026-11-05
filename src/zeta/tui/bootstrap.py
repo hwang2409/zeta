@@ -630,7 +630,6 @@ def _create_app_with_root(
         model=selected_model,
         zeta_home=home,
         verbose=args.verbose,
-        history_path=(ephemeral_root if ephemeral else home) / "history",
         approval_policy=approval_policy,
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,

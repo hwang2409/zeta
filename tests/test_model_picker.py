@@ -75,7 +75,6 @@ def _app(
         model=model,
         on_model_change=_accept_model_change,
         console=Console(file=output, force_terminal=False, width=100),
-        history_path=tmp_path / "history",
         model_catalog_loader=loader or (lambda provider: None),
     )
     if full_screen:
@@ -355,6 +354,8 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_picker_move=moves.append,

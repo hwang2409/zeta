@@ -82,8 +82,6 @@ class RuntimeCloseMixin:
             await attempt_async(self._submissions.close)
             attempt(self._draft.detach)
             await attempt_async(self._draft.shutdown_pending)
-            if self._history is not None:
-                await attempt_async(self._history.shutdown_pending)
             if self._on_session_close is not None:
                 await attempt_async(self._on_session_close)
             await attempt_async(
@@ -110,8 +108,6 @@ class RuntimeCloseMixin:
             )
             if self._hooks is not None:
                 attempt(lambda: setattr(self._hooks, "notice_sink", None))
-            if self._history is not None:
-                attempt(lambda: self._history.set_notice_sink(None))
             self._active_session = None
             self._draft_session = None
             self._session = None

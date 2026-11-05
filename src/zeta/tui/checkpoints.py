@@ -26,8 +26,10 @@ from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
+    MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -47,6 +49,7 @@ from .render import (
     render_markdown,
     render_thought,
 )
+from .user import displayed_user_text
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 _MAX_DEFERRED_TOOL_UPDATES = 64
@@ -598,6 +601,7 @@ class CheckpointTranscriptMixin:
         self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
+        prompts: list[str] = []
         branch = self.loop.store.tui_replay_entries()
         acknowledged_notifications = {
             entry.data["notification_id"]
@@ -652,6 +656,8 @@ class CheckpointTranscriptMixin:
             if message.role is MessageRole.USER:
                 self._failed_turn = None
                 last_user = message
+                if message.metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER:
+                    prompts.append(displayed_user_text(message))
                 self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
                 render_replayed_message(
@@ -692,6 +698,7 @@ class CheckpointTranscriptMixin:
                     session_path=self.loop.store.session_dir,
                 )
             yield
+        self._prompt_history.replace(self.loop.store.session_dir, prompts)
 
 
 def render_replayed_message(

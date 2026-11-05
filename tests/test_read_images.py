@@ -44,6 +44,7 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
+from zeta.tui.session_prompt_history import SessionPromptHistory
 
 LEGACY_IMAGE_SIZE = 4 * 1024 * 1024
 OPENAI_IMAGE_URL_MAX_LENGTH = 20_971_520
@@ -671,6 +672,7 @@ def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> 
     app._presenter = SimpleNamespace(clear=lambda: None)
     app._dismiss_model_picker = lambda: None
     app._failed_turn = None
+    app._prompt_history = SessionPromptHistory()
     app._print_unit = printed.append
     app._print_system = printed.append
 
