@@ -39,6 +39,20 @@ _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
 
 
+def _message_display_text(message: dict[str, Any]) -> str:
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict) and isinstance(metadata.get("zeta.user_display_text"), str):
+        return metadata["zeta.user_display_text"]
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    return next(
+        (block.get("text", "") for block in content
+         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)),
+        "",
+    )
+
+
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
     lifecycle_path = path / "agent_lifecycle.json"
     try:
@@ -256,6 +270,7 @@ class AgentTranscriptSnapshot:
     unavailable_reason: str | None = None
     # Follow-ups sent to this child that its loop has not consumed yet.
     pending_prompts: tuple[str, ...] = ()
+    typed_prompts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,13 +424,21 @@ class AgentTranscriptSource:
             for entry in entries
             if entry.type == "pending_prompt_ack"
         }
+        typed_prompts = tuple(
+            text
+            for _entry_id, message in messages
+            if message.get("role") == "user"
+            and message.get("metadata", {}).get("zeta.origin") == "user"
+            and (text := _message_display_text(message))
+        )
         pending_prompts = tuple(
             str(entry.data.get("text", ""))
             for entry in entries
             if entry.type == "pending_prompt" and entry.id not in acknowledged
         )
         return AgentTranscriptSnapshot(
-            entry_ids, tuple(messages), pending_prompts=pending_prompts
+            entry_ids, tuple(messages), pending_prompts=pending_prompts,
+            typed_prompts=typed_prompts,
         )
 
     def _tree_snapshot(self) -> AgentTranscriptTreeSnapshot:
