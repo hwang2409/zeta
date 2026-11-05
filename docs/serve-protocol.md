@@ -297,13 +297,14 @@ other trust grant occurs. Project MCP servers still need `zeta mcp trust`.
 The example omits metadata fields for readability. A real response includes
 all metadata fields.
 
-With the `new_session_settings` feature, `new_session` also accepts the same
-`model` and `approval_mode` fields as `set_settings`. Both fields are required
-when either is supplied. They are validated by the same validator, applied
-before the first turn, and recorded as session settings. Invalid values return
-the same `-32602` error as `set_settings`, and no session is created. Without
-the negotiated feature, `approval_mode` is rejected so an older server cannot
-silently ignore the initial settings.
+`new_session` has always accepted `model` alone; that still works without any
+feature. With the `new_session_settings` feature, `new_session` also accepts
+`approval_mode`, which requires `model` in the same request. Both are
+validated by the same validator as `set_settings`, applied before the first
+turn, and recorded as session settings. Invalid values return the same
+`-32602` error as `set_settings`, and no session is created. Without the
+negotiated feature, `approval_mode` is rejected, so an older server that does
+not know it cannot silently ignore it.
 
 With the `session_host_commands` feature, `new_session` and `resume` accept an
 optional `host_commands` array that binds host commands to this attachment.
@@ -1256,7 +1257,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | feature | effect |
 | --- | --- |
 | `session_cwd` | `new_session` accepts `cwd` |
-| `new_session_settings` | `new_session` accepts initial `model` and `approval_mode` settings |
+| `new_session_settings` | `new_session` accepts `approval_mode` (with `model`) as an initial setting |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
 | `user_message_delivery_id` | with `user_message_event` and `delivery_id`, adds `delivery_id` to matching `user_message` events and `session_history` user rows |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
