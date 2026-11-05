@@ -48,7 +48,7 @@ from zeta.tui.cards import agent_sync as agent_sync_module
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.key_bindings import FullScreenPromptSession
 from zeta.tui.render import render_markdown, render_thought_live
-from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
+from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.tui.transcript.streaming_text import StreamingText
 from zeta.tui.transcript.transcript_search import find_matches
 
@@ -1024,21 +1024,6 @@ def test_virtual_card_collapse_reclamps_near_tail() -> None:
     assert transcript._virtual_start == transcript._virtual_tail_start(80, 10)
     assert transcript.follow_tail
     assert content.line_count >= 10
-
-
-def test_virtual_threshold_transition_preserves_selection() -> None:
-    transcript = _threshold_transcript()
-    top = transcript.scroll_offset
-    anchor = transcript._anchor_for((top, 0))
-    extent = transcript._anchor_for((top + 1, 5))
-    transcript._selection = AnchoredSelection(anchor, extent, False)
-    before = transcript.selection_text()
-
-    transcript.append(Text("threshold line 127"))
-    transcript.create_content(40, 10)
-
-    assert transcript.selection_text() == before
-    assert transcript.selection is not None
 
 
 def test_virtual_threshold_transition_preserves_active_search() -> None:

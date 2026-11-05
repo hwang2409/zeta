@@ -783,7 +783,6 @@ def format_status(
     transcript_search: str | None = None,
     transcript_match: tuple[int, int] | None = None,
     transcript_position: str | None = None,
-    copy_notice: str | None = None,
     approval_mode: str | None = None,
     cwd: str | Path | None = None,
 ) -> Text:
@@ -866,8 +865,6 @@ def format_status(
             segments.append("◆ main")
         if transcript_position:
             segments.append(transcript_position)
-        if copy_notice:
-            segments.append(copy_notice)
         return "  ".join(segments)
 
     left = build_left()

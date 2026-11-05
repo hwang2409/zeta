@@ -10,7 +10,6 @@ from .transcript import (
     Callable,
     Console,
     Dimension,
-    MouseButton,
     MouseEvent,
     MouseEventType,
     OrderedDict,
@@ -40,16 +39,11 @@ from .transcript import (
 )
 from .transcript_presenter import TranscriptPresenter
 from .transcript_search import (
-    AnchoredSelection,
-    Cell,
     HighlightCache,
     SearchMatch,
-    Selection,
-    SelectionAnchor,
     find_matches,
     highlight,
     highlight_fragments,
-    resolve_anchor,
 )
 
 __all__ = [
@@ -57,16 +51,13 @@ __all__ = [
     "MAX_TOOL_TAIL_CHARS",
     "RICH_THEME",
     "AgentCard",
-    "AnchoredSelection",
     "AnyDimension",
     "Callable",
-    "Cell",
     "Console",
     "Dimension",
     "FinderControl",
     "FinderState",
     "HighlightCache",
-    "MouseButton",
     "MouseEvent",
     "MouseEventType",
     "OrderedDict",
@@ -74,8 +65,6 @@ __all__ = [
     "RedactedThinkingContent",
     "RenderableType",
     "SearchMatch",
-    "Selection",
-    "SelectionAnchor",
     "StreamEvent",
     "StringIO",
     "Text",
@@ -96,7 +85,6 @@ __all__ = [
     "highlight_fragments",
     "re",
     "render_tool_progress",
-    "resolve_anchor",
     "split_lines",
     "stream_key",
     "theme",

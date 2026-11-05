@@ -3090,6 +3090,35 @@ async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: P
         assert app._transcript.scroll_offset == tail_offset - 3
 
 
+async def test_transcript_left_drag_does_not_copy_or_show_notice(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    app._transcript.append(Text("line 0"))
+    app._transcript.append(Text("line 1"))
+    mouse_handlers = MouseHandlers()
+    with set_app(session.app):
+        session.app.clipboard.set_text("unchanged")
+        _render_layout(session, mouse_handlers)
+        over_transcript = mouse_handlers.mouse_handlers[5][10]
+        for event_type, x, y in (
+            (MouseEventType.MOUSE_DOWN, 1, 5),
+            (MouseEventType.MOUSE_MOVE, 4, 6),
+            (MouseEventType.MOUSE_UP, 4, 6),
+        ):
+            over_transcript(
+                MouseEvent(
+                    position=Point(x=x, y=y),
+                    event_type=event_type,
+                    button=MouseButton.LEFT,
+                    modifiers=frozenset(),
+                )
+            )
+
+    assert session.app.clipboard.get_data().text == "unchanged"
+    assert not hasattr(app._transcript, "copy_notice")
+
+
 async def test_wheel_down_stays_at_transcript_tail(tmp_path: Path) -> None:
     app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
     session = app._make_session()

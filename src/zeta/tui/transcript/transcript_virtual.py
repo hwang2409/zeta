@@ -22,11 +22,7 @@ from .. import theme
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
 from .transcript_search import (
-    AnchoredSelection,
-    Cell,
     SearchMatch,
-    Selection,
-    SelectionAnchor,
     find_matches,
     highlight_fragments,
 )
@@ -692,22 +688,8 @@ class TranscriptVirtualMixin:
             self._indexed_search_matches()
             self._highlight_virtual_search(lines, locations, unit_line_numbers)
 
-        selection = self._resolved_selection()
-        selection_style = f"bg:{theme.active_palette().search_bg}"
-
         def get_line(line: int) -> list[tuple[str, str]]:
-            if not 0 <= line < len(lines):
-                return []
-            fragments = lines[line]
-            if selection is None:
-                return fragments
-            length = sum(len(fragment[1]) for fragment in fragments)
-            span = selection.line_span(line, length)
-            return (
-                highlight_fragments(fragments, span, selection_style)
-                if span is not None
-                else fragments
-            )
+            return lines[line] if 0 <= line < len(lines) else []
 
         return UIContent(
             get_line=get_line,
@@ -787,127 +769,6 @@ class TranscriptVirtualMixin:
         ]
         self._keyed_cache = (width, self._revision, keyed)
         return keyed
-
-    def _anchor_for(self, cell: Cell) -> SelectionAnchor:
-        """Pin a viewport cell to a stable unit and source offset."""
-
-        line, column = cell
-        locations = (
-            self._virtual_locations
-            if self._uses_virtual_history()
-            else self._locations(self._content_width)
-        )
-        if 0 <= line < len(locations) and locations[line][0] is not None:
-            unit, offset = locations[line]
-            return SelectionAnchor(unit.key, offset, line, column)
-        return SelectionAnchor(None, 0, line, column)
-
-    def _resolved_selection(self, locations: Any = None) -> Selection | None:
-        """Resolve a selection for paint without dropping off-screen anchors."""
-
-        del locations
-        anchored = self._selection
-        if anchored is None:
-            return None
-        resolved = anchored.resolve(self._keyed_locations())
-        if resolved is not None:
-            return resolved
-        live_keys = {unit.key for unit in self._units if unit is not None}
-        anchored_keys = {anchored.anchor.unit_key, anchored.extent.unit_key} - {None}
-        if not anchored_keys <= live_keys:
-            self._selection = None
-        return None
-
-    def _virtual_copy_material(
-        self, anchored: AnchoredSelection
-    ) -> tuple[Selection | None, list[str]]:
-        keyed_units = {
-            unit.key: index for index, unit in enumerate(self._units) if unit is not None
-        }
-        selected_indexes = [
-            keyed_units[anchor.unit_key]
-            for anchor in (anchored.anchor, anchored.extent)
-            if anchor.unit_key in keyed_units
-        ]
-        if not selected_indexes:
-            return None, []
-        first, last = min(selected_indexes), max(selected_indexes)
-        raw_lines: list[tuple[str, int | None, int]] = []
-        for unit in self._units[first : last + 1]:
-            if unit is None:
-                raw_lines.append(("", None, 0))
-                continue
-            rendered_lines, offsets = self._unit_locations(unit, self._content_width)
-            raw_lines.extend(
-                (line, unit.key, offset)
-                for line, offset in zip(rendered_lines, offsets)
-            )
-        keyed = [(key, offset) for _, key, offset in raw_lines]
-
-        def local_anchor(anchor: SelectionAnchor) -> SelectionAnchor:
-            candidates = [
-                index
-                for index, location in enumerate(keyed)
-                if location == (anchor.unit_key, anchor.text_offset)
-            ]
-            line = candidates[0] if candidates else 0
-            return SelectionAnchor(
-                anchor.unit_key, anchor.text_offset, line, anchor.column
-            )
-
-        local = AnchoredSelection(
-            local_anchor(anchored.anchor),
-            local_anchor(anchored.extent),
-            anchored.dragging,
-        )
-        selection = local.resolve(keyed)
-        leading = 0
-        if first == 0:
-            while raw_lines and not raw_lines[0][0]:
-                raw_lines.pop(0)
-                leading += 1
-        if last == len(self._units) - 1:
-            while raw_lines and not raw_lines[-1][0]:
-                raw_lines.pop()
-        if selection is not None and leading:
-            selection = Selection(
-                (selection.anchor[0] - leading, selection.anchor[1]),
-                (selection.extent[0] - leading, selection.extent[1]),
-                selection.dragging,
-            )
-        return selection, [line for line, _, _ in raw_lines]
-
-    def _selection_for_copy(
-        self, anchored: AnchoredSelection | None = None
-    ) -> Selection | None:
-        anchored = anchored or self._selection
-        if anchored is None:
-            return None
-        if not self._uses_virtual_history():
-            return anchored.resolve(self._keyed_locations())
-        return self._virtual_copy_material(anchored)[0]
-
-    def selection_text(self) -> str:
-        """Render only the selected virtual units when text is copied."""
-
-        if self._selection is None:
-            return ""
-        if self._uses_virtual_history():
-            selection, plain_lines = self._virtual_copy_material(self._selection)
-            lines = plain_lines
-        else:
-            selection = self._selection_for_copy()
-            lines = [
-                "".join(fragment[1] for fragment in line)
-                for line in self._parsed_lines(self._content_width)
-            ]
-        if selection is None:
-            return ""
-
-        def line_text(index: int) -> str | None:
-            return lines[index] if 0 <= index < len(lines) else None
-
-        return selection.text(line_text)
 
     @staticmethod
     def _plain_lines(rendered: str) -> list[str]:

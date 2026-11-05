@@ -523,7 +523,6 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         ),
         transcript_match=app._transcript.search_status(),
         transcript_position=app._transcript.position_indicator(),
-        copy_notice=app._transcript.copy_notice,
         approval_mode=(
             app._approval_policy.default.value if app._approval_policy is not None else None
         ),

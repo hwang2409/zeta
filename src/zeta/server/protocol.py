@@ -13,6 +13,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # server echoes the supported subset in ``capabilities.features``.
 FEATURES = (
     "session_cwd",
+    "new_session_settings",
     "user_message_event",
     "user_message_delivery_id",
     "list_sessions_paging",

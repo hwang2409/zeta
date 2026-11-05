@@ -17,6 +17,8 @@ from tests.support.scripted_provider import (
     load_fake_script,
     parse_fake_script,
 )
+from tests.support.server_client import event as _event
+from tests.support.server_client import request as _request
 from zeta.cli.main import build_parser
 from zeta.protocol.types import (
     Message,
@@ -306,29 +308,6 @@ def _socket_path(tmp_path: Path) -> Path:
     return Path("/tmp") / f"zeta-sf-{tmp_path.name}.sock"
 
 
-async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
-    line = await asyncio.wait_for(reader.readline(), TIMEOUT)
-    assert line, "server closed the socket"
-    return json.loads(line)
-
-
-async def _request(reader, writer, request_id: int, method: str, params=None):
-    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
-    writer.write((json.dumps(payload) + "\n").encode())
-    await asyncio.wait_for(writer.drain(), TIMEOUT)
-    while True:
-        frame = await _read(reader)
-        if frame.get("id") == request_id:
-            return frame
-
-
-async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
-    while True:
-        frame = await _read(reader)
-        if frame.get("params", {}).get("event") == name:
-            return frame["params"]
-
-
 async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
     script = parse_fake_script(BASH_SCRIPT)
     server = ZetaServer(
@@ -341,6 +320,27 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
             model or "gpt-5.6-luna",
         ),
     )
+    tool_ended = asyncio.Event()
+    notify = server.control._notify
+    resolve_approval = server.control.resolve_approval
+
+    async def record_tool_end(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        published = await notify(event, session_id, **fields)
+        if event == "tool_end":
+            tool_ended.set()
+        return published
+
+    async def delay_decision_response_until_tool_end(
+        method: str, request_id: str, scope: str = "once"
+    ) -> dict[str, object]:
+        result = await resolve_approval(method, request_id, scope)
+        await tool_ended.wait()
+        return result
+
+    server.control._notify = record_tool_end
+    server.control.resolve_approval = delay_decision_response_until_tool_end
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
         asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
@@ -353,7 +353,9 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         request_id = approval["request_id"]
         assert request_id.startswith("fake_")
         assert approval["tool_call"]["name"] == "bash"
-        reply = await _request(reader, writer, 4, decision, {"request_id": request_id})
+        reply = (
+            await _request(reader, writer, 4, decision, {"request_id": request_id})
+        )[-1]
         assert reply["result"]["decision"] == decision
         end = await _event(reader, "tool_end")
         message = await _event(reader, "assistant_message")

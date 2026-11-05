@@ -101,6 +101,73 @@ async def _append_during_preparation(
     return assembled
 
 
+def test_needs_compaction_uses_resident_branch_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results: list[bool] = []
+    for name, offset in (("below", -1), ("at", 0), ("above", 1)):
+        store = ConversationStore(tmp_path / name)
+        tokens = [0]
+        assembler = ContextAssembler(
+            store,
+            token_budget=100,
+            token_counter=lambda _message, tokens=tokens: tokens[0],
+        )
+        tokens[0] = assembler.trigger_token_budget + offset
+        store.append_message(text(MessageRole.USER, name))
+        monkeypatch.setattr(
+            store,
+            "replay",
+            lambda: pytest.fail("needs_compaction must not replay the branch"),
+        )
+
+        results.append(assembler.needs_compaction())
+
+    store = ConversationStore(tmp_path / "after-marker")
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_compaction_marker("summary", 1, 1)
+    assembler = ContextAssembler(store, token_budget=100, token_counter=lambda _: 1)
+    monkeypatch.setattr(
+        store,
+        "replay",
+        lambda: pytest.fail("needs_compaction must not replay the branch"),
+    )
+    results.append(assembler.needs_compaction())
+
+    assert results == [False, False, True, False]
+
+
+@pytest.mark.asyncio
+async def test_context_count_and_digest_run_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_thread = threading.get_ident()
+    count_threads: set[int] = set()
+    digest_threads: set[int] = set()
+    real_digest = context_module._digest
+
+    def token_count(_message: Message) -> int:
+        count_threads.add(threading.get_ident())
+        return 1
+
+    def observed_digest(messages: list[Message]) -> str:
+        digest_threads.add(threading.get_ident())
+        return real_digest(messages)
+
+    store = ConversationStore(tmp_path)
+    for index in range(100):
+        store.append_message(text(MessageRole.USER, f"message {index} " * 1_000))
+    assembler = ContextAssembler(store, token_budget=10_000, token_counter=token_count)
+    monkeypatch.setattr(context_module, "_digest", observed_digest)
+
+    await assembler.assemble_context()
+
+    assert count_threads
+    assert digest_threads
+    assert loop_thread not in count_threads
+    assert loop_thread not in digest_threads
+
+
 @pytest.mark.asyncio
 async def test_append_during_offloop_preparation_is_included(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import sys
@@ -33,3 +34,24 @@ while not path.exists():
     time.sleep(0.1)
 """.strip()
     return shlex.join((sys.executable, "-c", source))
+
+
+async def read_pid_file(path: Path, *, timeout: float = 10.0) -> int:
+    """Wait until a child has written its pid, not just created the file.
+
+    A child that runs ``Path(p).write_text(pid)`` creates the file before it
+    writes, so ``path.exists()`` alone can see an empty file.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            text = path.read_text().split()
+            if text:
+                return int(text[0])
+        except (FileNotFoundError, ValueError):
+            pass
+        if loop.time() >= deadline:
+            raise AssertionError(f"no pid written to {path} within {timeout}s")
+        await asyncio.sleep(0.01)
