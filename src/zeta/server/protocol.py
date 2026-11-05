@@ -29,6 +29,7 @@ FEATURES = (
     "approval_history",
     "approval_reconnect",
     "session_history_backward",
+    "session_host_commands",
     "session_history_fidelity",
     "content_read",
 )

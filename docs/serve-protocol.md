@@ -771,7 +771,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32000` | unexpected server failure |
 | `-32001` | another client owns the socket |
 | `-32002` | handshake missing or protocol version mismatch |
-| `-32003` | no active session |
+| `-32003` | no active session, or a detached host-bound session cannot start a turn |
 | `-32004` | a turn is already running |
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
@@ -780,9 +780,12 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32010` | delivery ID was accepted but its full details were evicted |
 
 Error objects have `code` and `message`, and may have a method-specific
-`data` object. Durable store read failures use `-32000`, not the invalid-params
-code. A malformed frame never terminates the server process. The
-server returns its parse error and continues reading frames.
+`data` object. A new `send` or `send_images` turn on a detached session that
+requires host commands returns `-32003` with
+`data.code: "host_binding_required"`; the controller must `resume` with a new
+binding first. Durable store read failures use `-32000`, not the invalid-params
+code. A malformed frame never terminates the server process. The server returns
+its parse error and continues reading frames.
 
 ## normative wire schema
 
@@ -1215,6 +1218,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
+| `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves negotiated tool-result image metadata stubs in `session_history` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 

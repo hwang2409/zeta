@@ -141,6 +141,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
         )
     })()
     control.turn_busy = lambda: method == "steer"
+    control.reject_client_turn_if_detached = lambda: None
     control._reject_if_unhealthy = lambda: None
 
     async def user_message(*args: Any, **kwargs: Any) -> None:
@@ -197,6 +198,7 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
         )
     })()
     control.turn_busy = lambda: method == "steer"
+    control.reject_client_turn_if_detached = lambda: None
     control._reject_if_unhealthy = lambda: None
     effects: list[str] = []
 
@@ -1215,6 +1217,9 @@ class _Control:
 
     def turn_busy(self) -> bool:
         return self._steer
+
+    def reject_client_turn_if_detached(self) -> None:
+        pass
 
     def _reject_if_unhealthy(self) -> None:
         pass

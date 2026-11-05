@@ -15091,3 +15091,107 @@ async def test_8k_window_prompt_alone_over_budget_keeps_priority(
     assert flow.prompt_priority == prompt.id
     assert await asyncio.to_thread(store.pending_prompt_queue.pending) == [prompt]
     assert flow.active_prompt_id is None
+
+
+@pytest.mark.asyncio
+async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RetryThenToolBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            index = len(self.calls)
+            if index == 1:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo(
+                        "server_error", "retryable failure", retryable=True
+                    ),
+                )
+                return
+            if index == 2:
+                call = ToolCall("capture-host", "capture_host", {})
+                blocks = [ToolUseContent(call)]
+            else:
+                blocks = [TextContent("done")]
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            for block in blocks:
+                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    active = {"instruction": "instruction-a", "environment": {"HOST": "env-a"}}
+
+    async def retry_now(*_args, **_kwargs) -> bool:
+        active.update(instruction="instruction-b", environment={"HOST": "env-b"})
+        return True
+
+    environments = []
+
+    async def capture_host(arguments, *, execution_context=None):
+        del arguments
+        environments.append(dict(execution_context.host_environment))
+        return "captured"
+
+    backend = RetryThenToolBackend()
+    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register(
+        "capture_host",
+        capture_host,
+        parameters={"type": "object", "additionalProperties": False},
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=2,
+        system_prompt="base",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        await _collect(
+            loop.run_turn(
+                "start",
+                origin=MessageOrigin.USER,
+                host_environment={"HOST": "env-a"},
+                host_instruction="instruction-a",
+            )
+        )
+        assert environments == [{"HOST": "env-a"}]
+        assert all(
+            any(
+                isinstance(block, TextContent) and "instruction-a" in block.text
+                for block in message.content
+            )
+            for request in backend.calls[:3]
+            for message in request
+            if message.role is MessageRole.SYSTEM
+        )
+
+        await _collect(
+            loop.run_turn(
+                "next",
+                origin=MessageOrigin.USER,
+                host_environment=active["environment"],
+                host_instruction=active["instruction"],
+            )
+        )
+        assert any(
+            isinstance(block, TextContent) and "instruction-b" in block.text
+            for message in backend.calls[-1]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+        )
+    finally:
+        await loop.close()

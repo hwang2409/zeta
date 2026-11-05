@@ -43,6 +43,7 @@ class ToolExecutionContext:
     agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None
     lifecycle_sink: ToolLifecycleSink | None
     approved_execution: ApprovedExecution | None = None
+    host_environment: Mapping[str, str] = field(default_factory=dict)
     path_binding_consumed: bool = False
 
     def consume_path_binding(self, raw_path: str) -> ApprovedPathExecution | None:

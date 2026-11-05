@@ -55,6 +55,7 @@ class DeliveryRequests:
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
             return duplicate
+        control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")

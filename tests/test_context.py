@@ -1988,3 +1988,37 @@ async def test_model_context_strips_client_delivery_marker(tmp_path: Path) -> No
     assert len(assembled) == 1
     assert "zeta_client_delivery_id" not in assembled[0].metadata
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_host_instruction_counts_toward_context_budget_without_persisting(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+
+    def exact_text_tokens(message: Message) -> int:
+        return sum(
+            len(block.text)
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        system_prompt="base",
+        token_counter=exact_text_tokens,
+    )
+    instruction = "host instruction " * 8
+
+    assert not assembler.needs_compaction()
+    assert assembler.needs_compaction(system_append=instruction)
+    assembled = await assembler.assemble_context(
+        force=True,
+        system_append=instruction,
+    )
+
+    assert assembled.messages[0].content[-1].text.endswith(instruction)
+    assert assembled.token_count >= len(instruction)
+    assert all(instruction not in json.dumps(entry.data) for entry in store.replay())

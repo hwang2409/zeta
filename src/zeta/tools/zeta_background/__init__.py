@@ -49,7 +49,10 @@ async def _run_background(
             start_cwd, approved_execution.identity
         )
     task_id, pid = await registry.background_tasks.start(
-        arguments["command"], start_cwd, cwd_fd=cwd_fd
+        arguments["command"],
+        start_cwd,
+        cwd_fd=cwd_fd,
+        environment=execution_context.host_environment if execution_context else None,
     )
     return _result(
         f"started background task {task_id} (pid {pid})",

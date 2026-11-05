@@ -36,6 +36,7 @@ class _ToolRegistry(Protocol):
         _scope_signal: AbortSignal | None = None,
         _stream_sink: Callable[[StreamEvent], None],
         _lifecycle_sink: Callable[..., None],
+        _host_environment: Mapping[str, str] | None = None,
     ) -> Coroutine[Any, Any, StructuredToolResult]: ...
 
 
@@ -82,6 +83,7 @@ async def dispatch_tool_calls(
     validate_result: Callable[[object, str], ToolResult],
     *,
     abort_signal: AbortSignal | None = None,
+    host_environment: Mapping[str, str] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """Execute one tool batch and yield its lifecycle and result events."""
 
@@ -175,6 +177,7 @@ async def dispatch_tool_calls(
                             tool_call,
                             abort_signal=abort_signal,
                             _scope_signal=abort_signal,
+                            _host_environment=host_environment,
                             _stream_sink=enqueue_tool_update,
                             _lifecycle_sink=(
                                 lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
@@ -241,6 +244,7 @@ async def dispatch_tool_calls(
                     tool_call,
                     abort_signal=abort_signal,
                     _scope_signal=abort_signal,
+                    _host_environment=host_environment,
                     _stream_sink=enqueue_tool_update,
                     _lifecycle_sink=(
                         lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
