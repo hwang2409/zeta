@@ -1070,8 +1070,9 @@ error code and message. Provider status and origin remain internal.
 - `content_read`: reads the raw bytes for an inline image row. The session is
   implicit: it is the attached session, so `session_id` must not be supplied.
   Params are `{ "handle": string, "offset"?: integer, "limit"?: integer }`.
-  `offset` defaults to `0`; `limit` defaults to `524288` and is capped at
-  `524288` raw bytes. The reply is `{ "handle": string, "media_type": string,
+  `offset` defaults to `0` and must be an integer from `0` to the content size;
+  `limit` defaults to `524288`, must be an integer of at least `1`, and is
+  capped at `524288` raw bytes. The reply is `{ "handle": string, "media_type": string,
   "title": string, "size": integer, "offset": integer, "data": string,
   "next_offset": integer, "eof": boolean }`, where `data` is base64-encoded
   raw content.
@@ -1079,8 +1080,8 @@ error code and message. Provider status and origin remain internal.
   | code | data.code | meaning |
   | ---: | --- | --- |
   | `-32601` | — | `content_read` was not negotiated |
-  | `-32602` | `invalid_content_read` | params are invalid, including when `session_id` is supplied |
-  | `-32012` | `content_not_found` | the handle does not resolve to an inline image row |
+  | `-32602` | `invalid_content_read` | `offset` or `limit` is not a valid integer, `offset` is past the end, or an extra param such as `session_id` is supplied |
+  | `-32012` | `content_not_found` | the handle is malformed, foreign, stale, path-only, or does not resolve to an inline image row; all cases return the same error |
 - `model_catalog`: returns `models`, sorted names from both built-in real provider
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
 - `session_settings`: returns `model` and `approval_mode`.
@@ -1233,7 +1234,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
