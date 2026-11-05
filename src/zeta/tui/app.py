@@ -343,6 +343,7 @@ class TUIApp(
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_snapshot = (
             lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
         )
@@ -509,10 +510,10 @@ class TUIApp(
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
             on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
-            search_active=lambda: app._transcript.search_active,
-            on_search_next=lambda: app._transcript.next_search_match(),
-            on_search_previous=lambda: app._transcript.previous_search_match(),
-            on_search_end=lambda: app._transcript.end_search(),
+            search_active=lambda: app._viewed_transcript().search_active,
+            on_search_next=lambda: app._viewed_transcript().next_search_match(),
+            on_search_previous=lambda: app._viewed_transcript().previous_search_match(),
+            on_search_end=lambda: app._viewed_transcript().end_search(),
             on_previous_user=self._transcript.previous_user_message,
             on_next_user=self._transcript.next_user_message,
             on_toggle_agent=lambda: (
@@ -613,6 +614,20 @@ class TUIApp(
         if self._agent_navigation.child_view_active:
             return self._agent_navigation.current_path
         return self.loop.store.session_dir
+
+    def _viewed_transcript(self) -> TranscriptWidget:
+        if self._agent_navigation.child_view_active:
+            return self._agent_navigation.transcript_control.transcript
+        return self._transcript
+
+    def _viewed_session_changed(self) -> None:
+        self._prompt_history.reset_navigation()
+        finder = self._active_finder
+        if finder.finder_active:
+            self._finder_cancel()
+            return
+        self._cancel_finder_workers()
+        self._active_finder = self._viewed_transcript()
 
     def _history_previous(self, buffer: Any) -> None:
         document = self._prompt_history.older(self._viewed_session_path(), buffer.document)

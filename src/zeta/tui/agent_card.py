@@ -913,6 +913,8 @@ class AgentNavigation:
                 return
 
     def _switch_transcript(self) -> None:
+        if on_view_change := getattr(self, "_on_view_change", None):
+            on_view_change()
         if self._transcript_layout is None:
             return
         replacement = self.view_container if self.child_view_active else self._main_transcript
