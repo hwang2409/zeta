@@ -812,7 +812,7 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or self.context_assembler.needs_compaction(system_append=host_instruction):
+                if retrying_context or (self.context_assembler.needs_compaction() if not host_instruction else self.context_assembler.needs_compaction(system_append=host_instruction)):
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
                         data={"turn": turn_number},
