@@ -3944,3 +3944,240 @@ def test_anthropic_falls_back_for_images_over_many_image_limit() -> None:
     assert isinstance(content, str)
     assert "dimensions are 3001x1" in content
     assert "limit is 3000x3000" in content
+
+
+MAX_TOKENS_MID_WRITE = """event: message_start
+data: {"type":"message_start","message":{"id":"msg-limit","model":"claude-test","role":"assistant","usage":{"input_tokens":12}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"preparing the file"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-write","name":"write"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"large.txt\\",\\"content\\":\\"unfinished"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":16384}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"""
+
+SIMPLE_TEXT_RESPONSE = """event: message_start
+data: {"type":"message_start","message":{"id":"msg-done","model":"claude-test","role":"assistant","usage":{"input_tokens":12}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"""
+
+
+def _max_tokens_loop(
+    tmp_path: Path,
+    handler,
+    *,
+    tools: dict[str, object] | None = None,
+) -> tuple[httpx.AsyncClient, ConversationStore, AgentLoop]:
+    credentials = anthropic_credentials(tmp_path / "zeta.json")
+    credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(
+        AnthropicBackend(
+            client=client,
+            token_store=credentials,
+            base_url="https://test.invalid/v1/messages",
+        ),
+        store,
+        tools=tools,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    return client, store, loop
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_mid_tool_call_recovers_and_next_response_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests: list[dict[str, object]] = []
+    executed: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=MAX_TOKENS_MID_WRITE if len(requests) == 1 else SIMPLE_TEXT_RESPONSE,
+            request=request,
+        )
+
+    client, store, loop = _max_tokens_loop(
+        tmp_path, handler, tools={"write": lambda arguments: executed.append(arguments)}
+    )
+    events = [
+        event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert executed == []
+    assert any(
+        event.type is StreamEventType.TURN_END
+        and event.message is not None
+        and event.message.content == [TextContent("done")]
+        for event in events
+    )
+    recovery_text = requests[1]["messages"][-1]["content"][0]["text"]
+    assert "output token limit while writing a <write> call" in recovery_text
+    assert "split the work into smaller calls" in recovery_text
+    assert "create a smaller file, then edit/append" in recovery_text
+    assistant_messages = [
+        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+    ]
+    assert assistant_messages[0].content == [TextContent("preparing the file")]
+    assert not any(
+        isinstance(block, ToolUseContent)
+        for message in assistant_messages
+        for block in message.content
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_max_tokens_mid_tool_calls_end_with_max_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=MAX_TOKENS_MID_WRITE,
+            request=request,
+        )
+
+    client, store, loop = _max_tokens_loop(tmp_path, handler)
+    events = [
+        event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
+    ]
+
+    errors = [
+        event.error
+        for event in events
+        if event.type is StreamEventType.ERROR and event.error is not None
+    ]
+    assert len(requests) == 2
+    assert errors[-1].code == "max_tokens"
+    assert "output-token limit" in errors[-1].message
+    assert all(error.code != "stream_error" for error in errors)
+    assert not any(
+        message.metadata.get("provider_retries") for message in store.messages()
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_mid_tool_call_has_no_provider_retry_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=MAX_TOKENS_MID_WRITE if requests == 1 else SIMPLE_TEXT_RESPONSE,
+            request=request,
+        )
+
+    client, store, loop = _max_tokens_loop(tmp_path, handler)
+    events = [
+        event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
+    ]
+
+    assert not any(
+        event.type is StreamEventType.ERROR
+        and event.error is not None
+        and event.error.code == "stream_error"
+        for event in events
+    )
+    assert not any(
+        event.type is StreamEventType.RETRY
+        and event.data.get("reason") == "budget-exhausted"
+        for event in events
+    )
+    assert not any(
+        message.metadata.get("provider_retries") for message in store.messages()
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_anthropic_stream_disconnect_still_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests = 0
+    disconnected = (
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"text","text":""}}\n\n'
+        'data: {"type":"content_block_delta","index":0,'
+        '"delta":{"type":"text_delta","text":"partial"}}\n\n'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=disconnected if requests == 1 else SIMPLE_TEXT_RESPONSE,
+            request=request,
+        )
+
+    client, store, loop = _max_tokens_loop(tmp_path, handler)
+    events = [
+        event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
+    ]
+
+    assert requests == 2
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert any(
+        message.metadata.get("provider_retries") for message in store.messages()
+    )
+    assert store.messages()[-1].content == [TextContent("done")]
+    await client.aclose()
