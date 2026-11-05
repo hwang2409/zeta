@@ -2081,8 +2081,37 @@ import asyncio
 import os
 import signal
 import sys
+import threading
+import time
 
-from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+from zeta.tools._shared import background_spawn as spawn_module
+from zeta.tools._shared import process as process_module
+from zeta.tools._shared.process import BackgroundTaskRegistry
+
+
+snapshot_started = threading.Event()
+original_snapshot = spawn_module._snapshot_descendants_sync
+original_group_exists = process_module._group_exists
+group_reap_checks = 3
+
+
+def slow_snapshot(root_pids):
+    snapshot_started.set()
+    time.sleep(0.5)
+    return original_snapshot(root_pids)
+
+
+def delayed_group_reap(process_id):
+    global group_reap_checks
+    exists = original_group_exists(process_id)
+    if not exists and group_reap_checks:
+        group_reap_checks -= 1
+        return True
+    return exists
+
+
+spawn_module._snapshot_descendants_sync = slow_snapshot
+process_module._group_exists = delayed_group_reap
 
 
 async def main():
@@ -2093,14 +2122,15 @@ async def main():
     )
     await asyncio.sleep(0.1)
     asyncio.create_task(tasks.close())
-    await asyncio.sleep(0)
+    while not snapshot_started.is_set():
+        await asyncio.sleep(0)
     return tasks, pid
 
 
 tasks, pid = asyncio.run(main())
-alive = _group_exists(pid)
+alive = process_module._group_exists(pid)
 closed = tasks._closed
-if alive:
+if original_group_exists(pid):
     os.killpg(pid, signal.SIGKILL)
 print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
 raise SystemExit(1 if alive or not closed else 0)
