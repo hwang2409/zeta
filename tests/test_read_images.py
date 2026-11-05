@@ -560,7 +560,7 @@ def test_codex_pasted_image_path_keeps_image_bytes_in_user_content() -> None:
         model="codex-test",
     )
 
-    image = payload["input"][0]["content"][1]
+    image = payload["input"][0]["content"][0]
     assert image == {
         "type": "input_image",
         "image_url": "data:image/png;base64," + encoded,

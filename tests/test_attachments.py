@@ -256,10 +256,10 @@ def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Pat
     anthropic = build_messages_payload(
         [persisted], [], model="claude", max_tokens=4096, thinking_budget=1024
     )
-    assert anthropic["messages"][0]["content"][1]["type"] == "image"
+    assert anthropic["messages"][0]["content"][0]["type"] == "image"
 
     codex = build_responses_payload([persisted], [], model="codex")
-    assert codex["input"][0]["content"][1] == {
+    assert codex["input"][0]["content"][0] == {
         "type": "input_image",
         "image_url": "data:image/png;base64," + base64.b64encode(PNG).decode(),
     }
