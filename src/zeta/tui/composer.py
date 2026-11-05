@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import platform  # noqa: F401 - tests patch the module for paste behavior
+import shutil  # noqa: F401 - tests patch the module for paste behavior
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
