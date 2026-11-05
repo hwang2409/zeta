@@ -1310,7 +1310,8 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             text="wake while detached",
         )
         server.control._schedule_background_wake(session_id)
-        await asyncio.sleep(0)
+        for _ in range(10):
+            await asyncio.sleep(0)
         assert backend.calls == []
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
