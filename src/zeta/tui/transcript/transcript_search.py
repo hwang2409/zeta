@@ -13,8 +13,6 @@ from rich.text import Text
 from .. import theme
 from ..theme import RICH_THEME
 
-Cell = tuple[int, int]
-
 
 def highlight_fragments(
     fragments: Sequence[tuple], span: tuple[int, int], style: str
