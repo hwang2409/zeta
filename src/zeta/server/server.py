@@ -60,7 +60,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "switch_branch",
     }
 )
-_DELIVERY_MUTATIONS = frozenset({"send", "steer"})
+_DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
 
 
 class ZetaServer:
