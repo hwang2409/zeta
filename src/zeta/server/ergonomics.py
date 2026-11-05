@@ -18,7 +18,12 @@ from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
-from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
+from ..core.store._client_delivery import (
+    CLIENT_DELIVERY_METADATA,
+)
+from ..core.store._client_delivery import (
+    image_payload_digest as _semantic_image_payload_digest,
+)
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
@@ -870,7 +875,9 @@ def catalog(runtime: ServerRuntime) -> dict:
     }
 
 
-def image_message(runtime: ServerRuntime, params: dict) -> Message:
+def _validated_image_payload(
+    params: dict,
+) -> tuple[str, list[tuple[str, str, str, bytes]]]:
     text = params.get("text", "")
     images = params.get("images")
     if (
@@ -903,10 +910,11 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             or not isinstance(data, str)
         ):
             raise ProtocolError(-32602, "unsupported image type or data")
-        if len(data) > (MAX_IMAGE_BYTES + 2) // 3 * 4:
+        compact_data = "".join(data.split())
+        if len(compact_data) > (MAX_IMAGE_BYTES + 2) // 3 * 4:
             raise ProtocolError(-32602, "images exceed 512 KiB")
         try:
-            raw = base64.b64decode(data, validate=True)
+            raw = base64.b64decode(compact_data, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise ProtocolError(-32602, "invalid image base64") from exc
         total += len(raw)
@@ -916,7 +924,19 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             raise ProtocolError(-32602, "image signature does not match its type")
         if Path(name).suffix.lower() not in IMAGE_EXTENSIONS[mime]:
             raise ProtocolError(-32602, "image extension does not match its type")
-        decoded.append((name, mime, data, raw))
+        decoded.append((name, mime, base64.b64encode(raw).decode(), raw))
+    return text, decoded
+
+
+def image_payload_digest(params: dict) -> str:
+    text, decoded = _validated_image_payload(params)
+    return _semantic_image_payload_digest(
+        text, [(name, mime, raw) for name, mime, _data, raw in decoded]
+    )
+
+
+def image_message(runtime: ServerRuntime, params: dict) -> Message:
+    text, decoded = _validated_image_payload(params)
     blocks = [TextContent(text)]
     store = runtime.opened.store
     attachments_existed = "attachments" in os.listdir(store.directory_fd)

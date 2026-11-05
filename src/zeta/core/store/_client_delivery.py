@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import re
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard
 
-from ...protocol.types import Message, MessageRole, require_new_message_origin
+from ...protocol.types import (
+    ImageContent,
+    Message,
+    MessageRole,
+    TextContent,
+    require_new_message_origin,
+)
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -37,6 +46,7 @@ class ClientDelivery:
     method: DeliveryMethod
     status: DeliveryStatus
     outcome: dict[str, object]
+    payload_digest: str | None = None
     reason: DeliveryDropReason | None = None
 
 
@@ -85,7 +95,10 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        if set(data) != {"delivery_id", "method", "status", "outcome"} or not valid_acceptance:
+        if (
+            set(data) != {"delivery_id", "method", "status", "outcome"}
+            or not valid_acceptance
+        ):
             raise ValueError("invalid client delivery")
         return
 
@@ -123,6 +136,15 @@ class ClientDeliveryMixin:
     def _record_client_delivery_entries(
         self: ConversationStore, entries: list[ConversationEntry]
     ) -> None:
+        payload_digests: dict[str, str] = {}
+        for entry in entries:
+            if entry.type != "message":
+                continue
+            message = Message.from_dict(entry.data["message"])
+            marker = message.metadata.get(CLIENT_DELIVERY_METADATA)
+            digest = _message_image_payload_digest(message)
+            if valid_client_delivery_id(marker) and digest is not None:
+                payload_digests[marker] = digest
         for entry in entries:
             if entry.type != "client_delivery":
                 continue
@@ -137,6 +159,7 @@ class ClientDeliveryMixin:
                     method=data["method"],
                     status=data["status"],
                     outcome=dict(data["outcome"]),
+                    payload_digest=payload_digests.get(delivery_id),
                 )
                 self._client_deliveries.move_to_end(delivery_id)
                 while len(self._client_deliveries) > MAX_RECENT_CLIENT_DELIVERIES:
@@ -154,6 +177,7 @@ class ClientDeliveryMixin:
                     status=data["status"],
                     outcome=accepted.outcome,
                     reason=data.get("reason"),
+                    payload_digest=accepted.payload_digest,
                 )
 
     def recover_client_deliveries(self: ConversationStore) -> int:
@@ -335,6 +359,42 @@ class ClientDeliveryMixin:
                     self._append_many_unlocked(rows)
         self._client_steering.clear()
         return len(queued)
+
+
+def image_payload_digest(
+    text: str, images: list[tuple[str, str, bytes]]
+) -> str:
+    """Fingerprint the semantic payload of one ``send_images`` request."""
+
+    digest = hashlib.sha256()
+    values = [text.encode()]
+    for name, media_type, data in images:
+        values.extend((name.encode(), media_type.encode(), data))
+    for value in values:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def _message_image_payload_digest(message: Message) -> str | None:
+    if (
+        message.role is not MessageRole.USER
+        or not message.content
+        or not isinstance(message.content[0], TextContent)
+    ):
+        return None
+    images: list[tuple[str, str, bytes]] = []
+    for block in message.content[1:]:
+        if not isinstance(block, ImageContent) or block.path is None:
+            return None
+        try:
+            data = base64.b64decode(block.data, validate=True)
+        except (ValueError, binascii.Error):
+            return None
+        images.append((Path(block.path).name, block.mime_type, data))
+    if not images:
+        return None
+    return image_payload_digest(message.content[0].text, images)
 
 
 def _delivery_digest(delivery_id: str) -> bytes:
