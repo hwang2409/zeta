@@ -699,6 +699,8 @@ async def test_shift_tab_toggles_plan_mode() -> None:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_plan_toggle=on_plan_toggle,
@@ -731,6 +733,8 @@ def test_shift_tab_is_inert_without_a_handler() -> None:
     from zeta.tui.key_bindings import build_key_bindings
 
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
     )

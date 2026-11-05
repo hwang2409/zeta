@@ -307,11 +307,6 @@ class VimCursorShapeConfig(CursorShapeConfig):
         return CursorShape.BLOCK
 
 
-def _history_forward(buffer: Buffer) -> None:
-    buffer.history_forward()
-    buffer.cursor_position = len(buffer.text)
-
-
 def build_key_bindings(
     *,
     on_interrupt: Callable[[], None],
@@ -335,9 +330,9 @@ def build_key_bindings(
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
+    on_history_previous: Callable[[Buffer], None],
+    on_history_next: Callable[[Buffer], None],
     on_history_finder_open: Callable[[Buffer], None] | None = None,
-    on_history_previous: Callable[[Buffer], None] = Buffer.history_backward,
-    on_history_next: Callable[[Buffer], None] = _history_forward,
     finder_active: Callable[[], bool] | None = None,
     history_finder_active: Callable[[], bool] | None = None,
     on_finder_input: Callable[[str], None] | None = None,

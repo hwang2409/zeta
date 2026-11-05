@@ -437,6 +437,8 @@ async def _background_event_transcript_count(
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -1563,6 +1565,8 @@ def app_session(app: TUIApp, pipe: PipeInput) -> PromptSession[str]:
         input=pipe,
         output=DummyOutput(),
         key_bindings=build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=app.abort_active,
             on_exit=app.request_exit,
         ),
@@ -5797,6 +5801,8 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
 def test_sigint_key_uses_tui_interrupt_binding() -> None:
     interrupted = []
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: interrupted.append(True),
         on_exit=lambda: None,
     )
@@ -5885,6 +5891,8 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_toggle_agent=lambda: None,
@@ -5898,6 +5906,8 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
 
 def test_transcript_navigation_bindings_are_full_screen_only() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_finder_open=lambda: None,
@@ -5938,6 +5948,8 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
@@ -7586,6 +7598,8 @@ async def test_full_screen_startup_replay_requests_redraw_without_input(
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -8007,6 +8021,8 @@ async def test_run_replays_resumed_transcript_before_prompt(
                 input=pipe,
                 output=DummyOutput(),
                 key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
                     on_interrupt=app.abort_active,
                     on_exit=app.request_exit,
                 ),
@@ -8056,6 +8072,8 @@ skill_catalog=SkillCatalog.empty(),
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -8109,6 +8127,8 @@ async def test_run_keeps_empty_resumed_transcript_blank(
                 input=pipe,
                 output=DummyOutput(),
                 key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
                     on_interrupt=app.abort_active,
                     on_exit=app.request_exit,
                 ),
@@ -8209,6 +8229,8 @@ def _display_session(
         input=pipe,
         output=DummyOutput(),
         key_bindings=build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=app.abort_active,
             on_exit=app.request_exit,
         ),
@@ -10268,7 +10290,7 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
         session = PromptSession(
             input=pipe,
             output=DummyOutput(),
-            key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
+            key_bindings=build_key_bindings(on_history_previous=lambda _buffer: None, on_history_next=lambda _buffer: None, on_interrupt=lambda: None, on_exit=lambda: None),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" ❯ "))
@@ -10288,6 +10310,8 @@ async def test_vi_composer_motions_move_and_delete_the_current_line() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10328,6 +10352,8 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10366,6 +10392,8 @@ async def test_full_screen_vi_escape_enter_chord_keeps_insert_mode() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10388,6 +10416,8 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10422,6 +10452,8 @@ async def test_vi_composer_paced_dd_and_gg_commands() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10457,6 +10489,8 @@ async def test_vi_composer_ctrl_c_interrupts_in_insert_and_normal_modes() -> Non
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: interrupts.append(None),
                 on_exit=lambda: None,
             ),
@@ -10500,6 +10534,8 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10569,6 +10605,8 @@ skill_catalog=SkillCatalog.empty(),
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=app.abort_active,
                 on_exit=app.request_exit,
             ),
@@ -10604,6 +10642,8 @@ async def test_vi_composer_modified_enter_inserts_newline(newline: str) -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_submit=submit,
@@ -10626,6 +10666,8 @@ async def test_vi_composer_escape_and_insert_update_native_state() -> None:
             output=DummyOutput(),
             editing_mode=EditingMode.VI,
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -10661,6 +10703,8 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
 
     def bindings() -> object:
         return build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=lambda: None,
             on_exit=lambda: None,
             on_approve=lambda: answered.append("approve"),
@@ -10980,6 +11024,8 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_agent_list_down=navigation.focus_list,

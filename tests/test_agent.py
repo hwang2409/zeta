@@ -23,6 +23,7 @@ import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
+import zeta.tui.cards.agent as agent_card_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
@@ -88,6 +89,7 @@ from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.agent_sync import AgentTranscriptSource
 from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.todo import TodoWidget
@@ -14036,6 +14038,120 @@ async def test_resume_legacy_interrupted_send_row_delivers_once(
     assert len(user_rows) == 1
     assert backend.prompt_count == 1
     assert await asyncio.to_thread(store.pending_prompts) == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_child_send_keeps_target_history_across_view_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child_a = ConversationStore(parent.session_dir / "agents", session_id="a")
+    child_b = ConversationStore(parent.session_dir / "agents", session_id="b")
+    loop = AgentLoop(FakeBackend([]), parent, skill_catalog=SkillCatalog.empty())
+    handle = "parent:a"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child_a.session_dir),
+        description="run a",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child_a)
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original_send = agent_card_module.send_to_run
+
+    async def delayed_send(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_send(*args, **kwargs)
+
+    monkeypatch.setattr(agent_card_module, "send_to_run", delayed_send)
+    commands = _RunCommands(loop)
+    commands._agent_navigation = SimpleNamespace(
+        child_view_active=True,
+        child_instance_id=lambda: handle,
+        current_path=child_a.session_dir,
+    )
+    commands._active_session = None
+    commands._ui_generation = 0
+    commands._print_system = lambda _text: None
+
+    assert commands._send_to_child("message for a") is False
+    await started.wait()
+    commands._agent_navigation.current_path = child_b.session_dir
+    release.set()
+    await asyncio.wait_for(commands._child_send_tasks[handle][0], timeout=2)
+    await asyncio.sleep(0)
+
+    assert commands._prompt_history.snapshot(child_a.session_dir) == ("message for a",)
+    assert commands._prompt_history.snapshot(child_b.session_dir) == ()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_send_records_history_for_target_child(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child_a = ConversationStore(parent.session_dir / "agents", session_id="a")
+    child_b = ConversationStore(parent.session_dir / "agents", session_id="b")
+    loop = AgentLoop(FakeBackend([]), parent, skill_catalog=SkillCatalog.empty())
+    handle = "parent:a"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child_a.session_dir),
+        description="run a",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child_a)
+    )
+    commands = _RunCommands(loop)
+    commands._agent_navigation.current_path = child_b.session_dir
+
+    result = await commands.slash_send(f"{handle} message for a")
+
+    assert result.startswith(f"queued for {handle}")
+    assert commands._prompt_history.snapshot(child_a.session_dir) == ("message for a",)
+    assert commands._prompt_history.snapshot(child_b.session_dir) == ()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_tui_child_prompt_survives_transcript_refresh(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="a")
+    loop = AgentLoop(FakeBackend([]), parent, skill_catalog=SkillCatalog.empty())
+    handle = "parent:a"
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run a",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    loop._background_owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
+    )
+    commands = _RunCommands(loop)
+
+    await commands.slash_send(f"{handle} still pending")
+    source = AgentTranscriptSource(child.session_dir)
+    snapshot = source.refresh().transcript(child.session_dir)
+    assert snapshot is not None
+    commands._prompt_history.replace(child.session_dir, snapshot.typed_prompts)
+
+    assert commands._prompt_history.snapshot(child.session_dir) == ("still pending",)
+    source.close()
     await loop.close()
 
 

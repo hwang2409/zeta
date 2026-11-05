@@ -431,10 +431,18 @@ class AgentTranscriptSource:
             and message.get("metadata", {}).get("zeta.origin") == "user"
             and (text := _message_display_text(message))
         )
-        pending_prompts = tuple(
-            str(entry.data.get("text", ""))
+        pending_entries = tuple(
+            entry
             for entry in entries
             if entry.type == "pending_prompt" and entry.id not in acknowledged
+        )
+        pending_prompts = tuple(
+            str(entry.data.get("text", "")) for entry in pending_entries
+        )
+        typed_prompts += tuple(
+            str(entry.data.get("text", ""))
+            for entry in pending_entries
+            if entry.data.get("origin") == "user"
         )
         return AgentTranscriptSnapshot(
             entry_ids, tuple(messages), pending_prompts=pending_prompts,

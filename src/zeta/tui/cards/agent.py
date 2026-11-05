@@ -752,6 +752,15 @@ class AgentRunCommandMixin:
     reaches a run through the same seam the agent_send tool uses.
     """
 
+    def _child_prompt_target(
+        self, child_id: str
+    ) -> tuple[dict[str, Any], Path] | None:
+        marker = self.loop.store.agent_children().get(child_id)
+        path = marker.get("child_session_path") if marker is not None else None
+        if marker is None or not isinstance(path, str):
+            return None
+        return marker, Path(path)
+
     def _send_to_child(self, value: str) -> bool:
         if (
             not value.strip()
@@ -760,7 +769,8 @@ class AgentRunCommandMixin:
         ):
             return False
         child_id = self._agent_navigation.child_instance_id()
-        marker = self.loop.store.agent_children().get(child_id) if child_id else None
+        target = self._child_prompt_target(child_id) if child_id else None
+        marker = target[0] if target is not None else None
         eligible = marker is not None and has_follow_up_loop(
             accepts_follow_ups=marker.get("accepts_follow_ups") is True,
             background=marker.get("background") is True,
@@ -775,6 +785,9 @@ class AgentRunCommandMixin:
             sends = self._child_send_tasks = {}
         if child_id in sends:
             return False
+        if target is None:
+            return False
+        history_path = target[1]
         session = self._active_session
         buffer = session.default_buffer if session is not None else None
         ui_generation = getattr(self, "_ui_generation", 0)
@@ -810,7 +823,7 @@ class AgentRunCommandMixin:
             except BaseException as exc:  # noqa: BLE001 - surface send failures
                 error = str(exc) or exc.__class__.__name__
             if error is None:
-                self._prompt_history.append(self._agent_navigation.current_path, value)
+                self._prompt_history.append(history_path, value)
                 if buffer is not None and not edited:
                     buffer.reset()
                 self._print_system(f"queued message for {child_id}")
@@ -870,6 +883,8 @@ class AgentRunCommandMixin:
         if len(parts) != 2:
             return "use /send <run-id> <message>; /runs lists the live ones"
         run_id, message = parts
+        target = self._child_prompt_target(run_id)
+        history_path = target[1] if target is not None else None
         error = await send_to_run(
             self.loop.store,
             run_id,
@@ -879,7 +894,8 @@ class AgentRunCommandMixin:
         )
         if error is not None:
             return error
-        self._prompt_history.append(self._agent_navigation.current_path, message)
+        if history_path is not None:
+            self._prompt_history.append(history_path, message)
         return (
             f"queued for {run_id}; a running child receives it after its current "
             "tool call, before its next model call; an idle child receives it at "

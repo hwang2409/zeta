@@ -350,6 +350,8 @@ async def test_completion_menu_arrows_do_not_navigate_history(tmp_path: Path) ->
                 lambda: Size(rows=24, columns=80),
             ),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
             ),
@@ -526,6 +528,8 @@ async def test_message_finder_cancels_completion_before_up_navigation(
                 lambda: Size(rows=24, columns=80),
             ),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_finder_open=open_finder,

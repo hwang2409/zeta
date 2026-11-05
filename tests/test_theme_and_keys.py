@@ -82,6 +82,8 @@ def test_history_search_is_a_remappable_action() -> None:
 
 def test_history_search_binds_the_remapped_key() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_history_finder_open=lambda _buffer: None,
@@ -101,6 +103,8 @@ def test_open_decisions_is_a_remappable_action() -> None:
 
 def test_open_decisions_binds_the_remapped_key() -> None:
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_decisions_open=lambda: None,
@@ -154,6 +158,8 @@ def _binding_keys(bindings: KeyBindings, callback_name: str) -> set[tuple[str, .
 def test_build_key_bindings_applies_remap_over_defaults() -> None:
     calls: list[str] = []
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: calls.append("interrupt"),
         on_exit=lambda: calls.append("exit"),
         on_retry=lambda: calls.append("retry"),
@@ -167,6 +173,8 @@ def test_build_key_bindings_applies_remap_over_defaults() -> None:
 def test_build_key_bindings_loud_fails_on_bad_remap() -> None:
     with pytest.raises(KeybindingError):
         build_key_bindings(
+            on_history_previous=lambda _buffer: None,
+            on_history_next=lambda _buffer: None,
             on_interrupt=lambda: None,
             on_exit=lambda: None,
             key_remap={"retry": "not-a-key"},
@@ -177,6 +185,8 @@ def test_build_key_bindings_composes_with_vim_mode() -> None:
     """Remaps live on top of vim; the native escape binding stays intact."""
 
     bindings = build_key_bindings(
+        on_history_previous=lambda _buffer: None,
+        on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_retry=lambda: None,

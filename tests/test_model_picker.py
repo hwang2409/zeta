@@ -354,6 +354,8 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
             input=pipe,
             output=DummyOutput(),
             key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
                 on_picker_move=moves.append,
