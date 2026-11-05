@@ -75,7 +75,6 @@ def _app(
         model=model,
         on_model_change=_accept_model_change,
         console=Console(file=output, force_terminal=False, width=100),
-        history_path=tmp_path / "history",
         model_catalog_loader=loader or (lambda provider: None),
     )
     if full_screen:

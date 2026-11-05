@@ -327,7 +327,6 @@ def _app(tmp_path: Path) -> TUIApp:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-        history_path=tmp_path / "history",
     )
     app._active_session = app._make_session()
     return app

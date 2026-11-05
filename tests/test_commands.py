@@ -713,7 +713,6 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
         provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
-        history_path=tmp_path / "history",
         console=Console(file=StringIO(), force_terminal=False),
     )
     original_start_turn = app._start_turn
@@ -811,7 +810,6 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         [(call.id, call)],
     )
     policy = ApprovalPolicy(store=store)
-    history_path = tmp_path / "history"
     app = TUIApp(
         AgentLoop(
             FakeBackend([]),
@@ -821,7 +819,6 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
-        history_path=history_path,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -833,13 +830,11 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         await asyncio.sleep(0.01)
 
     assert not app.pending_approvals
-    assert not history_path.exists()
+    assert app._prompt_history.snapshot(store.session_dir) == ()
 
     await app._handle_prompt_value("/approve missing")
-    assert app._history is not None
-    await app._history.flush_pending()
 
-    history = history_path.read_text(encoding="utf-8")
+    history = app._prompt_history.snapshot(store.session_dir)
     assert "/approve missing" in history
     assert "shortcut-approval" not in history
     await app.close()
@@ -861,7 +856,6 @@ async def test_failed_approval_action_acknowledges_waiter(
         provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
-        history_path=tmp_path / "history",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -956,7 +950,6 @@ async def test_tui_always_allow_remembers_only_the_current_action(
         provider="codex",
         model="offline",
         zeta_home=tmp_path / "home",
-        history_path=tmp_path / "history",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -1080,7 +1073,6 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
         provider="codex",
         model="offline",
         zeta_home=home,
-        history_path=tmp_path / "history",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
@@ -1193,7 +1185,6 @@ async def test_unmapped_durable_approval_is_finalized(
         provider="codex",
         model="offline",
         zeta_home=home,
-        history_path=home / "history",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )

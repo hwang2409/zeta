@@ -33,6 +33,7 @@ import httpx
 import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
@@ -12924,3 +12925,37 @@ async def test_low_capacity_notice_real_render_path(tmp_path: Path) -> None:
     assert rendered.count(expected) == 1, rendered
     assert not getattr(loop.backend, "calls", [])
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_history_finder_does_not_cross_session_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    first = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "first"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    first._record_prompt("only from the first session")
+    await first.close()
+
+    second = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "second"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    request = second._history_finder.open_finder(Buffer())
+    assert request is not None
+    candidates = await second._history_finder.build_finder_candidates(request)
+
+    assert [candidate.text for candidate in candidates.candidates] == []
+    await second.close()

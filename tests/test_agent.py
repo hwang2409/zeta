@@ -89,6 +89,7 @@ from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
 from zeta.tui.render import render_approval_card, render_event
+from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.todo import TodoWidget
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -6839,6 +6840,8 @@ class _RunCommands(AgentRunCommandMixin):
 
     def __init__(self, loop: AgentLoop) -> None:
         self.loop = loop
+        self._agent_navigation = SimpleNamespace(current_path=loop.store.session_dir)
+        self._prompt_history = SessionPromptHistory()
 
 
 def test_run_preset_is_registered_without_a_turn_cap(tmp_path: Path) -> None:

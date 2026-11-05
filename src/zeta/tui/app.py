@@ -318,7 +318,7 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
             lambda: None,
-            lambda: self._prompt_history.snapshot(self._viewed_session_path()),
+            lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
@@ -347,7 +347,7 @@ class TUIApp(
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
         self._agent_navigation.transcript_control.on_snapshot = (
-            lambda path, snapshot: self._prompt_history.replace(path, snapshot.typed_prompts)
+            lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
         )
         self._init_fork_view()
         self._todo_widget = TodoWidget(
