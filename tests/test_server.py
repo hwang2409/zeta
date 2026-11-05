@@ -1776,7 +1776,18 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
                 "deny",
                 {"request_id": live_request["request_id"]},
             )
-            frames += await _frames_until_event(reader, "tool_end")
+            seen_events = {
+                frame.get("params", {}).get("event")
+                for frame in frames
+                if frame.get("params", {}).get("event")
+                in {"tool_end", "approval_end"}
+            }
+            while seen_events != {"tool_end", "approval_end"}:
+                frame = await _read(reader)
+                frames.append(frame)
+                event_name = frame.get("params", {}).get("event")
+                if event_name in {"tool_end", "approval_end"}:
+                    seen_events.add(event_name)
             live_end = _named_events(frames, "approval_end")
         else:
             assert server.runtime.loop is not None
@@ -1785,7 +1796,18 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
             )
             await server.runtime.loop._background_owner.wait()
             frames = await _request(reader, writer, 4, "status")
-            frames += await _frames_until_event(reader, "tool_end")
+            seen_events = {
+                frame.get("params", {}).get("event")
+                for frame in frames
+                if frame.get("params", {}).get("event")
+                in {"tool_end", "approval_end"}
+            }
+            while seen_events != {"tool_end", "approval_end"}:
+                frame = await _read(reader)
+                frames.append(frame)
+                event_name = frame.get("params", {}).get("event")
+                if event_name in {"tool_end", "approval_end"}:
+                    seen_events.add(event_name)
             live_end = _named_events(frames, "approval_end")
         assert len(live_end) == 1
         assert live_end[0]["request_id"] == live_request["request_id"]
