@@ -4,7 +4,7 @@ import html
 import posixpath
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from ..protocol import ProtocolError
@@ -23,7 +23,7 @@ class HostCommand:
 @dataclass(frozen=True, slots=True)
 class SessionHostCommands:
     commands: tuple[HostCommand, ...]
-    environment: Mapping[str, str]
+    environment: Mapping[str, str] = field(repr=False)
     instruction: str
 
     @classmethod

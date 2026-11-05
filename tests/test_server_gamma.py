@@ -940,6 +940,7 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
         assert token not in json.dumps(created)
         session_id = created[-1]["result"]["session"]["session_id"]
         assert server.control._active_host_commands is not None
+        assert token not in repr(server.control._active_host_commands)
 
         status = await _request(reader, writer, 4, "status")
         assert token not in json.dumps(status)
@@ -1246,6 +1247,169 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
         )
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send", "send_images"])
+@pytest.mark.parametrize("reconnect_features", [[], ["session_host_commands"]])
+async def test_session_host_commands_reject_client_turn_before_resume(
+    tmp_path: Path,
+    method: str,
+    reconnect_features: list[str],
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("must not run")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    replay_writer = None
+    try:
+        await _hello(reader, writer, ["session_host_commands"])
+        created = await _request(
+            reader,
+            writer,
+            2,
+            "new_session",
+            {"host_commands": _host_binding("detached")},
+        )
+        session_id = created[-1]["result"]["session"]["session_id"]
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            if server.connections.controller_metadata() is None:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("controller was not released")
+
+        durable_rows = tuple(server.runtime.opened.store.entries)
+        replay_reader, replay_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        await _request(
+            replay_reader,
+            replay_writer,
+            3,
+            "hello",
+            {"protocol_version": "1.2", "features": reconnect_features},
+        )
+        params: dict[str, object] = {"text": "must not run"}
+        if method == "send_images":
+            params["session_id"] = session_id
+            params["images"] = [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(PNG).decode(),
+                }
+            ]
+        rejected = await _request(replay_reader, replay_writer, 4, method, params)
+
+        assert rejected[-1]["error"] == {
+            "code": -32003,
+            "message": "session is not attached",
+            "data": {"code": "host_binding_required"},
+        }
+        assert backend.calls == []
+        assert tuple(server.runtime.opened.store.entries) == durable_rows
+    finally:
+        if replay_writer is not None:
+            await _close(server, replay_writer)
+        else:
+            await server.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_still_accepts_send_after_reconnect(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("legacy ok")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    replay_writer = None
+    try:
+        await _hello(reader, writer, [])
+        await _request(reader, writer, 2, "new_session", {})
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            if server.connections.controller_metadata() is None:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("controller was not released")
+
+        replay_reader, replay_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        await _hello(replay_reader, replay_writer, [])
+        sent = await _request(
+            replay_reader, replay_writer, 3, "send", {"text": "legacy"}
+        )
+        assert sent[-1]["result"]["accepted"] is True
+        await _event(replay_reader, "agent_end")
+        assert len(backend.calls) == 1
+    finally:
+        if replay_writer is not None:
+            await _close(server, replay_writer)
+        else:
+            await server.close()
+
+
+@pytest.mark.asyncio
+async def test_detached_session_returns_existing_duplicate_delivery(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    replay_writer = None
+    features = ["delivery_id", "session_host_commands"]
+    try:
+        await _hello(reader, writer, features)
+        await _request(
+            reader,
+            writer,
+            2,
+            "new_session",
+            {"host_commands": _host_binding("duplicate")},
+        )
+        first = await _request(
+            reader,
+            writer,
+            3,
+            "send",
+            {"text": "once", "delivery_id": "detached-duplicate"},
+        )
+        await _event(reader, "agent_end")
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            if server.connections.controller_metadata() is None:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("controller was not released")
+
+        replay_reader, replay_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        await _hello(replay_reader, replay_writer, features)
+        durable_rows = tuple(server.runtime.opened.store.entries)
+        duplicate = await _request(
+            replay_reader,
+            replay_writer,
+            4,
+            "send",
+            {"text": "once", "delivery_id": "detached-duplicate"},
+        )
+        assert duplicate[-1]["result"] == {
+            **first[-1]["result"],
+            "duplicate": True,
+        }
+        assert len(backend.calls) == 1
+        assert tuple(server.runtime.opened.store.entries) == durable_rows
+    finally:
+        if replay_writer is not None:
+            await _close(server, replay_writer)
+        else:
+            await server.close()
 
 
 @pytest.mark.asyncio

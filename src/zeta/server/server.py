@@ -487,8 +487,8 @@ class _Client:
                 await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
-            candidate = self._host_commands(params)
             try:
+                candidate = self._host_commands(params)
                 await self.server.control.require_idle()
                 cwd = None
                 if "cwd" in params:
@@ -514,8 +514,8 @@ class _Client:
                     self.server.control._host_binding_required = False
                 raise
         if method == "resume":
-            candidate = self._host_commands(params)
             try:
+                candidate = self._host_commands(params)
                 await self.server.control.require_idle()
                 session_id = _required_string(params, "session_id")
                 unhealthy_same_session = (
@@ -707,6 +707,8 @@ class _Client:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
+        if method == "send_images":
+            self.server.control.reject_client_turn_if_detached()
         await self.server.control.require_idle()
         if method == "slash_run":
             register = self.server.control.model_input_registrar(self.features)

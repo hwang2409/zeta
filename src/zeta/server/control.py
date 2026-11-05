@@ -139,6 +139,14 @@ class ServeControl:
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
 
+    def reject_client_turn_if_detached(self) -> None:
+        if self._host_binding_required and self._active_host_commands is None:
+            raise ProtocolError(
+                -32003,
+                "session is not attached",
+                {"code": "host_binding_required"},
+            )
+
     def request_turn_failure(self) -> None:
         """Request whole-session cancellation without joining teardown."""
         loop = self.server.runtime.loop
