@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
-from ..protocol.types import ContentBlock, ImageContent, Message
+from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    ContentBlock,
+    ImageContent,
+    Message,
+    MessageOrigin,
+    TextContent,
+)
 
 HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER = (
     "[harness-injected system message; not written by the user]"
@@ -16,9 +21,14 @@ def is_harness_notification(message: Message) -> bool:
     return message.metadata.get("zeta_event") == "agent_notifications"
 
 
-def images_before_prompt(blocks: Sequence[ContentBlock]) -> list[ContentBlock]:
-    """Place images before their prompt so vision models attend to them reliably."""
-    return [
-        *(block for block in blocks if isinstance(block, ImageContent)),
-        *(block for block in blocks if not isinstance(block, ImageContent)),
-    ]
+def images_before_prompt(message: Message) -> list[ContentBlock]:
+    """Place canonical user attachments before their prompt."""
+    blocks = message.content
+    if (
+        message.metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER
+        and blocks
+        and isinstance(blocks[0], TextContent)
+        and all(isinstance(block, ImageContent) for block in blocks[1:])
+    ):
+        return [*blocks[1:], blocks[0]]
+    return list(blocks)

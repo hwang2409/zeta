@@ -30,12 +30,14 @@ from zeta.media.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
 from zeta.protocol.types import (
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
+    with_message_origin,
 )
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
@@ -551,9 +553,12 @@ def test_codex_pasted_image_path_keeps_image_bytes_in_user_content() -> None:
     encoded = base64.b64encode(PNG).decode("ascii")
     payload = build_responses_payload(
         [
-            Message(
-                MessageRole.USER,
-                [TextContent("inspect this"), ImageContent(encoded, "image/png")],
+            with_message_origin(
+                Message(
+                    MessageRole.USER,
+                    [TextContent("inspect this"), ImageContent(encoded, "image/png")],
+                ),
+                MessageOrigin.USER,
             )
         ],
         [],

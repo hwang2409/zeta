@@ -200,7 +200,7 @@ def build_responses_payload(
                 input_items.extend(_normalize_assistant_item(item) for item in replayed)
                 continue
             blocks = (
-                images_before_prompt(message.content)
+                images_before_prompt(message)
                 if message.role is MessageRole.USER
                 else message.content
             )

@@ -226,7 +226,7 @@ def build_messages_payload(
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         blocks = (
-            images_before_prompt(message.content)
+            images_before_prompt(message)
             if message.role is MessageRole.USER
             else message.content
         )

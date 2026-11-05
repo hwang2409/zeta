@@ -16,7 +16,14 @@ from prompt_toolkit.output import DummyOutput
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ImageContent, MessageRole, TextContent
+from zeta.protocol.types import (
+    ImageContent,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.skills import SkillCatalog
@@ -263,6 +270,39 @@ def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Pat
         "type": "input_image",
         "image_url": "data:image/png;base64," + base64.b64encode(PNG).decode(),
     }
+
+
+def test_provider_payloads_preserve_interleaved_image_labels() -> None:
+    message = with_message_origin(
+        Message(
+            MessageRole.USER,
+            [
+                TextContent("image 1:"),
+                ImageContent(base64.b64encode(PNG).decode(), "image/png"),
+                TextContent("image 2:"),
+                ImageContent(base64.b64encode(PNG).decode(), "image/png"),
+            ],
+        ),
+        MessageOrigin.USER,
+    )
+
+    anthropic = build_messages_payload(
+        [message], [], model="claude", max_tokens=4096, thinking_budget=1024
+    )
+    codex = build_responses_payload([message], [], model="codex")
+
+    assert [block["type"] for block in anthropic["messages"][0]["content"]] == [
+        "text",
+        "image",
+        "text",
+        "image",
+    ]
+    assert [block["type"] for block in codex["input"][0]["content"]] == [
+        "input_text",
+        "input_image",
+        "input_text",
+        "input_image",
+    ]
 
 
 def test_paste_image_queues_a_session_attachment(
