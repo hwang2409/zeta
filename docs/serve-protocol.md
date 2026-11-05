@@ -414,8 +414,11 @@ running. With the `user_message_event` feature, a `user_message` event with
 
 ### client delivery IDs (`delivery_id` feature)
 
-A negotiated client can add `delivery_id` to `send` or `steer`. The value is
-1–128 ASCII characters, starts with a letter or digit, and otherwise contains
+A negotiated client can add `delivery_id` to `send` or `steer`. A client that
+also negotiates `send_images_delivery_id` can add it to `send_images`; the extra
+feature prevents older servers from silently accepting the parameter without
+applying idempotency. The value is 1–128 ASCII characters, starts with a letter
+or digit, and otherwise contains
 only letters, digits, `.`, `_`, `:`, or `-`. A client should derive a stable ID
 from the inbound item that caused the request and reuse it after an uncertain
 transport outcome.
@@ -434,8 +437,10 @@ or is canceled. A request already canceled when its append commits gets no
 echo, only the effect. Cancellation before a commit produces no row or effect.
 
 Repeating a retained queued or delivered ID returns the original result with
-`duplicate: true`. It does not validate changed text against the first request,
-enqueue steering, or start another turn. A dropped ID instead returns
+`duplicate: true`. For `send_images`, the retry must have the same text and image
+payload; a changed payload returns `-32010`. `send` and `steer` do not validate
+changed text against the first request. A duplicate does not enqueue steering or
+start another turn. A dropped ID instead returns
 `{"accepted":false,"duplicate":true,"status":"dropped"}`. The client must
 resend that work with a new ID if it is still wanted. Reusing an accepted ID
 whose details were evicted returns `-32010` with
@@ -1184,7 +1189,11 @@ error code and message. Provider status and origin remain internal.
   `compaction mode selection was removed; eviction is always used`. New clients
   must not advertise or send this request.
 - `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
-  objects with `name`, `mime_type`, and base64 `data`. Supported types are
+  objects with `name`, `mime_type`, and base64 `data`. With both `delivery_id`
+  and `send_images_delivery_id` negotiated, it also accepts `delivery_id` with
+  the validation, idempotency, status, echo, and history behavior described
+  above. Without `send_images_delivery_id`, supplying the parameter returns
+  `-32602`; this keeps clients from assuming support on older servers. Supported types are
   `image/png`, `image/jpeg`, `image/gif`, and `image/webp`. The combined decoded
   limit is 524,288 bytes. Names are plain filenames of at most 128 characters.
   Invalid base64, signatures, names, counts, types, or sizes return `-32602`.
@@ -1260,6 +1269,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `new_session_settings` | `new_session` accepts `approval_mode` (with `model`) as an initial setting |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
 | `user_message_delivery_id` | with `user_message_event` and `delivery_id`, adds `delivery_id` to matching `user_message` events and `session_history` user rows |
+| `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
@@ -1268,7 +1278,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
 | `abort_scope` | `abort` accepts `scope: "session" \| "foreground"`; adds `clear_steering` |
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
-| `delivery_id` | `send` and `steer` accept durable idempotency IDs; adds `delivery_status` |
+| `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |

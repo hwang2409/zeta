@@ -713,6 +713,176 @@ async def test_send_images_emits_user_message_with_attachment_summary(
 
 
 @pytest.mark.asyncio
+async def test_send_images_delivery_id_reaches_echo_and_history(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        hello = await _hello(
+            reader,
+            writer,
+            [
+                "user_message_event",
+                "user_message_delivery_id",
+                "delivery_id",
+                "send_images_delivery_id",
+            ],
+        )
+        assert "send_images_delivery_id" in hello["capabilities"]["features"]
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        image = {
+            "name": "shot.png",
+            "mime_type": "image/png",
+            "data": base64.b64encode(PNG).decode(),
+        }
+        await _request(
+            reader,
+            writer,
+            3,
+            "send_images",
+            {
+                "session_id": session_id,
+                "text": "look",
+                "images": [image],
+                "delivery_id": "image-3",
+            },
+        )
+        event = await _event(reader, "user_message")
+        assert event.get("delivery_id") == "image-3"
+        await _event(reader, "agent_end")
+        history = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        user_rows = [row for row in history if row["role"] == "user"]
+        assert user_rows[0].get("delivery_id") == "image-3"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_retry_is_idempotent(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("seen")]), ScriptedTurn([TextContent("again")])]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(PNG).decode(),
+                }
+            ],
+            "delivery_id": "image-retry",
+        }
+        first = await _request(reader, writer, 3, "send_images", params)
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+    restarted = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(restarted)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        duplicate = await _request(reader, writer, 5, "send_images", params)
+        assert duplicate[-1].get("result") == {
+            **first[-1]["result"],
+            "duplicate": True,
+        }
+        assert len(backend.calls) == 1
+    finally:
+        await _close(restarted, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(PNG).decode(),
+                }
+            ],
+            "delivery_id": "image-conflict",
+        }
+        await _request(reader, writer, 3, "send_images", params)
+        await _event(reader, "agent_end")
+        conflict = await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {**params, "text": "different"},
+        )
+        assert conflict[-1].get("error", {}).get("code") == -32010
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_requires_its_feature(tmp_path: Path) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        frames = await _request(
+            reader,
+            writer,
+            3,
+            "send_images",
+            {
+                "session_id": session_id,
+                "text": "look",
+                "images": [
+                    {
+                        "name": "shot.png",
+                        "mime_type": "image/png",
+                        "data": base64.b64encode(PNG).decode(),
+                    }
+                ],
+                "delivery_id": "image-no-feature",
+            },
+        )
+        assert frames[-1].get("error", {}).get("code") == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_user_message_event_requires_the_negotiated_feature(
     tmp_path: Path,
 ) -> None:

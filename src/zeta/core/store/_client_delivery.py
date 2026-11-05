@@ -37,6 +37,7 @@ class ClientDelivery:
     method: DeliveryMethod
     status: DeliveryStatus
     outcome: dict[str, object]
+    payload_digest: str | None = None
     reason: DeliveryDropReason | None = None
 
 
@@ -85,7 +86,21 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        if set(data) != {"delivery_id", "method", "status", "outcome"} or not valid_acceptance:
+        payload_digest = data.get("payload_digest")
+        valid_keys = {"delivery_id", "method", "status", "outcome"}
+        if payload_digest is not None:
+            valid_keys.add("payload_digest")
+        if (
+            set(data) != valid_keys
+            or not valid_acceptance
+            or (
+                payload_digest is not None
+                and (
+                    not isinstance(payload_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", payload_digest) is None
+                )
+            )
+        ):
             raise ValueError("invalid client delivery")
         return
 
@@ -137,6 +152,7 @@ class ClientDeliveryMixin:
                     method=data["method"],
                     status=data["status"],
                     outcome=dict(data["outcome"]),
+                    payload_digest=data.get("payload_digest"),
                 )
                 self._client_deliveries.move_to_end(delivery_id)
                 while len(self._client_deliveries) > MAX_RECENT_CLIENT_DELIVERIES:
@@ -153,6 +169,7 @@ class ClientDeliveryMixin:
                     method=accepted.method,
                     status=data["status"],
                     outcome=accepted.outcome,
+                    payload_digest=accepted.payload_digest,
                     reason=data.get("reason"),
                 )
 
@@ -205,22 +222,23 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        payload_digest: str | None = None,
     ) -> ClientDelivery:
         """Atomically append one acceptance and its optional user message."""
 
         with self._append_lock():
             if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
+            acceptance: dict[str, object] = {
+                "delivery_id": delivery_id,
+                "method": method,
+                "status": status,
+                "outcome": dict(outcome),
+            }
+            if payload_digest is not None:
+                acceptance["payload_digest"] = payload_digest
             rows: list[tuple[str, dict[str, object]]] = [
-                (
-                    "client_delivery",
-                    {
-                        "delivery_id": delivery_id,
-                        "method": method,
-                        "status": status,
-                        "outcome": dict(outcome),
-                    },
-                )
+                ("client_delivery", acceptance)
             ]
             if message is not None:
                 rows.append(
@@ -242,6 +260,7 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        payload_digest: str | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
@@ -253,6 +272,7 @@ class ClientDeliveryMixin:
             status,
             outcome,
             message=message,
+            payload_digest=payload_digest,
             _on_persisted=on_persisted,
         )
 

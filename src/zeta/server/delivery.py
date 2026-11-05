@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -114,6 +116,73 @@ class DeliveryRequests:
         )
         return outcome
 
+    async def send_images(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        from . import ergonomics
+
+        control = self._control
+        runtime = control.server.runtime
+        if runtime.loop is None or runtime.opened is None:
+            raise ProtocolError(-32003, "no active session")
+        delivery_id = self._delivery_id(
+            params, features, feature="send_images_delivery_id"
+        )
+        payload_digest = _image_payload_digest(params) if delivery_id is not None else None
+        duplicate = self._duplicate(delivery_id, payload_digest=payload_digest)
+        if duplicate is not None:
+            return duplicate
+        control.reject_client_turn_if_detached()
+        control._reject_if_unhealthy()
+        if control.turn_busy():
+            raise ProtocolError(-32004, "a turn is already running")
+        ergonomics.require_mutable(runtime, control.has_pending_approvals())
+        message = ergonomics.image_message(runtime, params)
+        text = params.get("text", "")
+        assert isinstance(text, str)
+        attachments = ergonomics.attachment_summary(message)
+        if delivery_id is None:
+            await control.user_message(text, "send", features, attachments)
+            control.start_turn(text, message)
+            return {"accepted": True, "session_id": runtime.session_id}
+
+        tagged = tag_client_delivery(message, delivery_id)
+        outcome: dict[str, object] = {
+            "accepted": True,
+            "session_id": runtime.session_id,
+        }
+        canceled_after_commit = False
+        try:
+            await runtime.opened.store.append_client_delivery_async(
+                delivery_id,
+                "send",
+                "delivered",
+                outcome,
+                message=tagged,
+                payload_digest=payload_digest,
+            )
+        except asyncio.CancelledError:
+            if runtime.opened.store.client_delivery(delivery_id) is None:
+                raise
+            canceled_after_commit = True
+
+        await _deliver_after_commit(
+            lambda: control.user_message(
+                text,
+                "send",
+                features,
+                attachments,
+                delivery_id=delivery_id,
+            ),
+            lambda: control.start_turn(
+                text,
+                tagged,
+                persist_user_message=False,
+            ),
+            canceled=canceled_after_commit,
+        )
+        return outcome
+
     async def steer(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
@@ -218,20 +287,33 @@ class DeliveryRequests:
         return {"delivery_id": delivery_id, "status": "unknown"}
 
     def _delivery_id(
-        self, params: dict[str, Any], features: frozenset[str]
+        self,
+        params: dict[str, Any],
+        features: frozenset[str],
+        *,
+        feature: str = "delivery_id",
     ) -> str | None:
         if "delivery_id" not in params:
             return None
+        _require_feature(features, feature, "delivery_id")
         _require_feature(features, "delivery_id", "delivery_id")
         return _required_delivery_id(params)
 
-    def _duplicate(self, delivery_id: str | None) -> dict[str, object] | None:
+    def _duplicate(
+        self, delivery_id: str | None, *, payload_digest: str | None = None
+    ) -> dict[str, object] | None:
         runtime = self._control.server.runtime
         if delivery_id is None or runtime.opened is None:
             return None
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
+            if payload_digest is not None and delivery.payload_digest != payload_digest:
+                raise ProtocolError(
+                    -32010,
+                    "delivery id already used for a different payload",
+                    {"outcome": delivery.status},
+                )
             if delivery.status == "dropped":
                 return {"accepted": False, "duplicate": True, "status": "dropped"}
             return {**delivery.outcome, "duplicate": True}
@@ -243,6 +325,16 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
+
+
+def _image_payload_digest(params: Mapping[str, object]) -> str:
+    payload = json.dumps(
+        {"text": params.get("text", ""), "images": params.get("images")},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 async def _deliver_after_commit(
