@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -414,31 +415,51 @@ def test_session_metadata_rejects_bad_name_type(
         SessionManager(home).open(opened.store.session_id)
 
 
-def test_ephemeral_history_does_not_touch_shared_history(
+def test_tui_never_opens_legacy_history_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
     home.mkdir()
     history = home / "history"
     history.write_text("persisted-line\n", encoding="utf-8")
-    baseline_bytes = history.read_bytes()
-    baseline_mtime_ns = history.stat().st_mtime_ns
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
+    import builtins
+    import io
+
+    opened: list[Path] = []
+    original_builtin_open = builtins.open
+    original_io_open = io.open
+    original_os_open = os.open
+
+    def track(path: object) -> None:
+        if isinstance(path, (str, os.PathLike)) and Path(path) == history:
+            opened.append(history)
+
+    def tracked_builtin_open(path: object, *args: object, **kwargs: object):
+        track(path)
+        return original_builtin_open(path, *args, **kwargs)
+
+    def tracked_io_open(path: object, *args: object, **kwargs: object):
+        track(path)
+        return original_io_open(path, *args, **kwargs)
+
+    def tracked_os_open(path: object, *args: object, **kwargs: object):
+        track(path)
+        return original_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracked_builtin_open)
+    monkeypatch.setattr(io, "open", tracked_io_open)
+    monkeypatch.setattr(os, "open", tracked_os_open)
     app = create_app(build_parser().parse_args(["--provider", "codex", "--no-session"]))
-    root = app.ephemeral_root
-    assert root is not None
-    assert app._history_path is not None
-    assert Path(app._history_path).parent == root
+    app._record_prompt("session-only prompt")
 
     from zeta.cli.main import _cleanup_ephemeral
 
     asyncio.run(app.close())
     _cleanup_ephemeral(app)
-
-    assert history.read_bytes() == baseline_bytes
-    assert history.stat().st_mtime_ns == baseline_mtime_ns
+    assert opened == []
 
 
 def test_session_delete_refuses_when_locked(

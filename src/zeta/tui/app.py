@@ -51,7 +51,7 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..runtime.loop import AgentLoop
-from ..runtime.loop.persistence import DraftPersistence, history_for
+from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, theme
@@ -92,6 +92,7 @@ from .render import (
     render_thought_live_delta,
 )
 from .runtime_close import RuntimeCloseMixin
+from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
@@ -189,7 +190,6 @@ class TUIApp(
         verbose: bool = False,
         console: Console | None = None,
         session: PromptSession[str] | None = None,
-        history_path: str | Path | None = None,
         draft_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
@@ -266,10 +266,7 @@ class TUIApp(
         self._active_turn_submission_id: int | None = None
         self._resuming_tool = False
         self._session = session
-        self._history_path = (
-            Path(history_path) if history_path else env_home() / "history"
-        )
-        self._history = history_for(self._history_path)
+        self._prompt_history = SessionPromptHistory()
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
@@ -318,8 +315,8 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._history_finder = HistoryFinder(
-            self._history.load_from_disk_once,
-            self._history.snapshot,
+            lambda: None,
+            lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
@@ -346,6 +343,10 @@ class TUIApp(
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
+        self._agent_navigation.transcript_control.on_snapshot = (
+            lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
+        )
         self._init_fork_view()
         self._todo_widget = TodoWidget(
             self.loop.store, selected_snapshot=self._agent_navigation.todo_snapshot
@@ -477,8 +478,6 @@ class TUIApp(
 
     def _make_session(self) -> PromptSession[str]:
         app = weakref.proxy(self)
-        if self._history is None:
-            self._history = history_for(self._history_path)
         bindings = build_key_bindings(
             on_interrupt=lambda: app.abort_active(),
             on_exit=lambda: app.request_exit(),
@@ -502,6 +501,8 @@ class TUIApp(
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
+            on_history_previous=lambda buffer: app._history_previous(buffer),
+            on_history_next=lambda buffer: app._history_next(buffer),
             finder_active=lambda: app._active_finder.finder_active,
             history_finder_active=lambda: app._history_finder.finder_active,
             on_finder_input=lambda query: app._finder_input(query),
@@ -509,10 +510,10 @@ class TUIApp(
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
             on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
-            search_active=lambda: app._transcript.search_active,
-            on_search_next=lambda: app._transcript.next_search_match(),
-            on_search_previous=lambda: app._transcript.previous_search_match(),
-            on_search_end=lambda: app._transcript.end_search(),
+            search_active=lambda: app._viewed_transcript().search_active,
+            on_search_next=lambda: app._viewed_transcript().next_search_match(),
+            on_search_previous=lambda: app._viewed_transcript().previous_search_match(),
+            on_search_end=lambda: app._viewed_transcript().end_search(),
             on_previous_user=self._transcript.previous_user_message,
             on_next_user=self._transcript.next_user_message,
             on_toggle_agent=lambda: (
@@ -572,7 +573,7 @@ class TUIApp(
         session = FullScreenPromptSession(
             message=[("class:prompt", " › ")],
             placeholder=[("class:placeholder", "type a message...")],
-            history=self._history,
+            history=None,
             key_bindings=bindings,
             completer=ComposerCompleter(
                 self._slash_commands,
@@ -609,10 +610,37 @@ class TUIApp(
         self._attach_draft_state(session.default_buffer, self._draft.load_state())
         self._draft_session = session
 
+    def _viewed_session_path(self) -> Path:
+        if self._agent_navigation.child_view_active:
+            return self._agent_navigation.current_path
+        return self.loop.store.session_dir
+
+    def _viewed_transcript(self) -> TranscriptWidget:
+        if self._agent_navigation.child_view_active:
+            return self._agent_navigation.transcript_control.transcript
+        return self._transcript
+
+    def _viewed_session_changed(self) -> None:
+        self._prompt_history.reset_navigation()
+        finder = self._active_finder
+        if finder.finder_active:
+            self._finder_cancel()
+            return
+        self._cancel_finder_workers()
+        self._active_finder = self._viewed_transcript()
+
+    def _history_previous(self, buffer: Any) -> None:
+        document = self._prompt_history.older(self._viewed_session_path(), buffer.document)
+        if document is not None:
+            buffer.set_document(document, bypass_readonly=True)
+
+    def _history_next(self, buffer: Any) -> None:
+        document = self._prompt_history.newer(self._viewed_session_path())
+        if document is not None:
+            buffer.set_document(document, bypass_readonly=True)
+
     def _record_prompt(self, value: str, draft_revision: int | None = None) -> None:
-        if self._history is None:
-            self._history = history_for(self._history_path)
-        self._history.append_string(value)
+        self._prompt_history.append(self._viewed_session_path(), value)
         if draft_revision is None:
             self._draft.clear()
         else:
@@ -1113,8 +1141,6 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
-            if self._history is not None:
-                self._history.set_notice_sink(self._handle_background_notice)
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             await self.loop.activate()
             session = session or self._session or self._make_session()
@@ -1167,8 +1193,6 @@ class TUIApp(
                 # alive: do not cancel the turn or drop the session reference.
                 if self._suspending_for_fork:
                     await self._draft.flush_pending()
-                    if self._history is not None:
-                        await self._history.flush_pending()
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()

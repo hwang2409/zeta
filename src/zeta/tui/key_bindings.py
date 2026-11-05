@@ -330,6 +330,8 @@ def build_key_bindings(
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
+    on_history_previous: Callable[[Buffer], None],
+    on_history_next: Callable[[Buffer], None],
     on_history_finder_open: Callable[[Buffer], None] | None = None,
     finder_active: Callable[[], bool] | None = None,
     history_finder_active: Callable[[], bool] | None = None,
@@ -944,7 +946,7 @@ def build_key_bindings(
             return
         suppress_history_detach = True
         try:
-            buffer.history_backward()
+            on_history_previous(buffer)
         finally:
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
@@ -959,8 +961,7 @@ def build_key_bindings(
             return
         suppress_history_detach = True
         try:
-            buffer.history_forward()
-            buffer.cursor_position = len(buffer.text)
+            on_history_next(buffer)
         finally:
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""

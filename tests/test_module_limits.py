@@ -3,8 +3,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # the codex stream parser is a legitimate provider module at this size; bumped
-# to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser.
-MAX_FILE_LINES = 1250
+# to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser,
+# and to 1255 for viewed-session history wiring in the existing TUI modules.
+MAX_FILE_LINES = 1255
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.

@@ -494,6 +494,7 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         "cache_creation_input_tokens",
         app.loop.context_assembler.cache_creation_input_tokens_this_session,
     )
+    transcript = app._viewed_transcript()
     status = format_status(
         app.provider,
         app.model,
@@ -519,10 +520,10 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
             and app._loop_state in {"streaming", "compacting", "tool-running", "approval"}
         ),
         transcript_search=(
-            app._transcript.search_query if app._transcript.search_active else None
+            transcript.search_query if transcript.search_active else None
         ),
-        transcript_match=app._transcript.search_status(),
-        transcript_position=app._transcript.position_indicator(),
+        transcript_match=transcript.search_status(),
+        transcript_position=transcript.position_indicator(),
         approval_mode=(
             app._approval_policy.default.value if app._approval_policy is not None else None
         ),

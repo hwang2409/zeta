@@ -104,7 +104,6 @@ class HistoryFinder:
         return await asyncio.to_thread(self._load_snapshot)
 
     def _load_snapshot(self) -> HistorySnapshot:
-        self._load_history()
         return build_history_candidates(self._history_snapshot())
 
     def finder_publish_candidates(

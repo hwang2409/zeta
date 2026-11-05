@@ -12,11 +12,12 @@ class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
 
     def _finder_target(self) -> Any:
-        return getattr(self, "_active_finder", self._transcript)
+        finder = getattr(self, "_active_finder", None)
+        return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
-        self._active_finder = self._transcript
-        request = self._transcript.open_finder()
+        self._active_finder = self._viewed_transcript()
+        request = self._active_finder.open_finder()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
@@ -105,13 +106,13 @@ class FinderRuntimeMixin:
         finder = self._finder_target()
         if finder.finder_accept():
             self._cancel_finder_workers()
-            self._active_finder = self._transcript
+            self._active_finder = self._viewed_transcript()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
-        self._active_finder = self._transcript
+        self._active_finder = self._viewed_transcript()
         self._invalidate_prompt()
 
     async def _prepare_ui_session_change(self) -> None:

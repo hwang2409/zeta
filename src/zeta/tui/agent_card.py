@@ -540,6 +540,7 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         self._unit_entries: dict[Any, str] = {}
         self._sync_task: asyncio.Task[bool] | None = None
         self._pending_path: Path | None = None
+        self.on_snapshot: Callable[[Path, AgentTranscriptSnapshot], None] | None = None
 
     @property
     def offset(self) -> int:
@@ -595,6 +596,8 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         if self._closed:
             return False
         self._snapshot = snapshot
+        if self.on_snapshot is not None:
+            self.on_snapshot(path, snapshot)
         return True
 
     def request_sync(
@@ -910,6 +913,8 @@ class AgentNavigation:
                 return
 
     def _switch_transcript(self) -> None:
+        if on_view_change := getattr(self, "_on_view_change", None):
+            on_view_change()
         if self._transcript_layout is None:
             return
         replacement = self.view_container if self.child_view_active else self._main_transcript

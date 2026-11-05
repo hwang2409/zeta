@@ -3,26 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-import fcntl
+from contextlib import nullcontext
 import json
 import logging
 import os
 import queue
-import tempfile
 import threading
-from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.history import FileHistory
 
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
 from ...core.session_files import read_session_file, session_root, write_session_json
 
-HISTORY_LIMIT = 1000
 DRAFT_WRITE_DELAY = 0.2
 PERSISTENCE_FLUSH_TIMEOUT = 2.0
 _LOGGER = logging.getLogger(__name__)
@@ -158,194 +154,6 @@ class _OrderedFileWriter:
                 return
             self._reported_failure = True
         _LOGGER.warning("failed to persist %s: %s", self._label, exc)
-
-
-class BoundedFileHistory(FileHistory):
-    """Store recent composer entries without retaining attachment payloads."""
-
-    def __init__(self, filename: str | Path, *, limit: int = HISTORY_LIMIT) -> None:
-        if limit < 1:
-            raise ValueError("history limit must be positive")
-        self.limit = limit
-        self._writer = _OrderedFileWriter("composer history")
-        self._snapshot_lock = threading.Lock()
-        self._load_complete = threading.Condition(self._snapshot_lock)
-        self._disk_loading = False
-        self._disk_load_complete = False
-        self._shutdown = False
-        self._notice_sink: Callable[[str], None] | None = None
-        self._notice_loop: asyncio.AbstractEventLoop | None = None
-        self._revision = 0
-        self._applied_revision = 0
-        self._pending: list[tuple[int, str]] = []
-        super().__init__(str(filename))
-
-    def load_history_strings(self) -> list[str]:
-        return list(super().load_history_strings())[: self.limit]
-
-    def set_notice_sink(self, sink: Callable[[str], None] | None) -> None:
-        """Set the optional destination for a history read failure notice."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        with self._snapshot_lock:
-            self._notice_sink = sink
-            self._notice_loop = loop
-
-    def load_from_disk_once(self) -> None:
-        """Make one terminal attempt to merge persisted and in-memory entries."""
-
-        with self._load_complete:
-            while self._disk_loading:
-                self._load_complete.wait()
-            if self._disk_load_complete or self._shutdown:
-                return
-            self._disk_loading = True
-            notice_sink = self._notice_sink
-            notice_loop = self._notice_loop
-        try:
-            disk_entries = self.load_history_strings()
-        except Exception as exc:  # noqa: BLE001 - history must not stop the TUI
-            with self._load_complete:
-                self._disk_load_complete = True
-                self._disk_loading = False
-                self._load_complete.notify_all()
-            message = f"composer history could not be read: {exc}"
-            _LOGGER.warning(message)
-            if notice_sink is not None:
-                try:
-                    if notice_loop is None:
-                        notice_sink(message)
-                    else:
-                        notice_loop.call_soon_threadsafe(notice_sink, message)
-                except Exception:  # a notice must not stop history
-                    _LOGGER.debug("failed to report composer history read error", exc_info=True)
-            return
-        with self._load_complete:
-            newest = [value for _, value in reversed(self._pending)]
-            self._loaded_strings = self._merge_newest(newest, disk_entries)
-            self._disk_load_complete = True
-            self._disk_loading = False
-            self._pending = [
-                item for item in self._pending if item[0] > self._applied_revision
-            ]
-            self._load_complete.notify_all()
-
-    async def load(self) -> AsyncGenerator[str, None]:
-        await asyncio.to_thread(self.load_from_disk_once)
-        for item in reversed(self.snapshot()):
-            yield item
-
-    def append_string(self, string: str) -> None:
-        with self._snapshot_lock:
-            self._revision += 1
-            revision = self._revision
-            self._pending.append((revision, string))
-            if not self._loaded_strings or self._loaded_strings[0] != string:
-                self._loaded_strings.insert(0, string)
-                del self._loaded_strings[self.limit :]
-        self._writer.submit(
-            lambda: self._append_to_file(string),
-            lambda entries: self._apply_snapshot(revision, entries),
-        )
-
-    def _append_to_file(self, string: str) -> list[str]:
-        with self._locked():
-            entries = list(self.load_history_strings())
-            if not entries or entries[0] != string:
-                entries.insert(0, string)
-                del entries[self.limit :]
-                self._write_entries(entries[::-1])
-        return entries
-
-    def _apply_snapshot(self, revision: int, disk_entries: object) -> None:
-        assert isinstance(disk_entries, list)
-        with self._snapshot_lock:
-            self._applied_revision = max(self._applied_revision, revision)
-            if not self._disk_loading:
-                self._pending = [
-                    item for item in self._pending if item[0] > self._applied_revision
-                ]
-            newest = [value for _, value in reversed(self._pending)]
-            self._loaded_strings = self._merge_newest(newest, disk_entries)
-
-    def _merge_newest(self, newest: list[str], disk_entries: list[str]) -> list[str]:
-        local = [
-            value
-            for index, value in enumerate(newest)
-            if index == 0 or newest[index - 1] != value
-        ]
-        overlap = min(len(local), len(disk_entries))
-        while overlap and local[-overlap:] != disk_entries[:overlap]:
-            overlap -= 1
-        return [*local, *disk_entries[overlap:]][: self.limit]
-
-    def get_strings(self) -> list[str]:
-        with self._snapshot_lock:
-            return list(reversed(self._loaded_strings))
-
-    def snapshot(self) -> tuple[str, ...]:
-        """Return the current canonical snapshot without file I/O."""
-        with self._snapshot_lock:
-            return tuple(reversed(self._loaded_strings))
-
-    async def flush_pending(self) -> None:
-        await self._writer.flush(timeout=PERSISTENCE_FLUSH_TIMEOUT)
-
-    async def shutdown_pending(self) -> None:
-        with self._load_complete:
-            self._shutdown = True
-            self._notice_sink = None
-            self._notice_loop = None
-            self._load_complete.notify_all()
-        await self._writer.shutdown(timeout=PERSISTENCE_FLUSH_TIMEOUT)
-
-    def store_string(self, string: str) -> None:
-        """Keep direct history writes bounded as well."""
-
-        with self._locked():
-            entries = [string, *self.load_history_strings()]
-            entries = entries[: self.limit]
-            self._write_entries(entries[::-1])
-        self._loaded_strings = entries
-
-    @contextmanager
-    def _locked(self) -> Iterator[None]:
-        history_path = Path(self.filename)
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = history_path.with_name(f".{history_path.name}.lock")
-        lock = lock_path.open("a+")
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
-
-    def _write_entries(self, entries: list[str]) -> None:
-        history_path = Path(self.filename)
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=history_path.parent,
-                prefix=f".{history_path.name}.",
-                delete=False,
-            ) as handle:
-                temporary_path = handle.name
-                for entry in entries:
-                    handle.write(b"\n# zeta composer history\n")
-                    for line in entry.split("\n"):
-                        handle.write(f"+{line}\n".encode("utf-8", errors="replace"))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, history_path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                Path(temporary_path).unlink(missing_ok=True)
 
 
 class DraftPersistence:
@@ -595,11 +403,3 @@ class DraftState:
     text: str
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
-
-
-def history_for(path: str | Path) -> BoundedFileHistory:
-    """Create a persistent history object and its parent directory."""
-
-    history_path = Path(path)
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    return BoundedFileHistory(history_path)

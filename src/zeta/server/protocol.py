@@ -16,6 +16,7 @@ FEATURES = (
     "new_session_settings",
     "user_message_event",
     "user_message_delivery_id",
+    "send_images_delivery_id",
     "list_sessions_paging",
     "memory_updated",
     "ping",
