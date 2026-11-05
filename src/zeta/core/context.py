@@ -164,7 +164,7 @@ class ContextAssembler(ContextMarkerMixin):
         """Return whether the next assembly must compact the active branch."""
         if force:
             return True
-        branch = self.store.replay()
+        branch = self.store.active_branch_snapshot()
         items = self._visible_items(branch)
         system_prompt = self._system_prompt_message(system_append)
         messages = [
@@ -411,12 +411,11 @@ class ContextAssembler(ContextMarkerMixin):
         committed_messages = preparation.committed_messages
         committed_tokens = preparation.committed_tokens
         all_messages = preparation.all_messages
+        prepared_context = preparation.context
         should_compact = preparation.should_compact
         if not should_compact:
-            return self._save(
-                all_messages,
-                False,
-            )
+            self.last_context = prepared_context
+            return prepared_context
         adaptive_tail = preparation.adaptive_tail
         pinned_user = preparation.pinned_user
         prefix_has_uncompacted_items = preparation.prefix_has_uncompacted_items
@@ -597,7 +596,8 @@ class ContextAssembler(ContextMarkerMixin):
         )
         committed_tokens = self._count(committed_messages)
         all_messages = [*system_messages, *(item.message for item in items)]
-        total_tokens = self._total_tokens(all_messages)
+        context = self._context(all_messages, False)
+        total_tokens = self._request_budget.calibrated_tokens(context.token_count)
         should_compact = force or self.compaction_policy.should_compact(
             total_tokens, self.trigger_token_budget
         )
@@ -633,6 +633,7 @@ class ContextAssembler(ContextMarkerMixin):
             committed_messages,
             committed_tokens,
             all_messages,
+            context,
             should_compact,
             adaptive_tail,
             pinned_user,

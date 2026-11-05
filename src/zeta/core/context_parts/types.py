@@ -36,6 +36,7 @@ class _AssemblyPreparation:
     committed_messages: list[Message]
     committed_tokens: int
     all_messages: list[Message]
+    context: AssembledContext
     should_compact: bool
     adaptive_tail: bool
     pinned_user: _ContextItem | None
