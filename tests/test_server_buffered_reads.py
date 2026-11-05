@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -38,7 +37,7 @@ def _unbuffered_reader_reads(source: str, path: str) -> list[str]:
             and expression.func.attr in _READ_METHODS
             and isinstance(expression.func.value, ast.Name)
         }
-        if node.name == "_frames_until_event" or request_readers & direct_readers:
+        if request_readers & direct_readers:
             violations.append(f"{path}:{node.lineno}:{node.name}")
     return violations
 
@@ -50,8 +49,9 @@ def test_server_tests_do_not_mix_raw_reader_reads_with_buffered_requests() -> No
         for path in sorted(root.glob("test_server*.py"))
         for violation in _unbuffered_reader_reads(path.read_text(), str(path))
     ]
-    assert not violations, "use _read(reader); raw reader reads mixed with _request: " + ", ".join(
-        violations
+    assert not violations, (
+        "use _read(reader); raw reader reads mixed with _request: "
+        + ", ".join(violations)
     )
 
 
@@ -91,21 +91,27 @@ async def test_buffered_read_regression_rejects_old_direct_read() -> None:
     assert (await buffered_read(reader))["params"]["event"] == "tool_end"
 
 
-def test_buffered_read_guard_catches_pre_647_mistake() -> None:
-    result = subprocess.run(
-        ["git", "show", "eecf85c9^:tests/test_server.py"],
-        capture_output=True,
-        check=False,
-        text=True,
-        cwd=Path(__file__).parents[1],
-    )
-    source = result.stdout or '''
+# The shape of the pre-#647 mistake in test_server.py: a raw readline on the
+# same reader that _request had already buffered frames from.
+_PRE_647_SOURCE = """
 async def test_parent_mode_resolves_live_delegated_approvals_independently(reader):
     await _request(reader, writer, 4, "status")
     frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
-'''
-    violations = _unbuffered_reader_reads(source, "eecf85c9^:tests/test_server.py")
-    assert any(
-        "test_parent_mode_resolves_live_delegated_approvals_independently" in violation
-        for violation in violations
-    )
+"""
+
+
+def test_buffered_read_guard_catches_pre_647_mistake() -> None:
+    violations = _unbuffered_reader_reads(_PRE_647_SOURCE, "pre-647")
+    assert violations == [
+        "pre-647:2:test_parent_mode_resolves_live_delegated_approvals_independently"
+    ]
+
+
+def test_buffered_read_guard_allows_buffered_helpers() -> None:
+    source = """
+async def test_ok(reader):
+    await _request(reader, writer, 1, "status")
+    frames = await _frames_until_event(reader, "tool_end")
+    frame = await _read(reader)
+"""
+    assert _unbuffered_reader_reads(source, "ok") == []
