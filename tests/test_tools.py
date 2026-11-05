@@ -2505,5 +2505,5 @@ def test_gamma_environment_is_currently_inherited_by_tool_subprocesses(
 
     env = subprocess_env()
 
-    assert env["GAMMA_API_URL"] == "http://gamma.test"
-    assert env["GAMMA_API_TOKEN"] == "gamma-token"
+    assert env.get("GAMMA_API_URL") == "http://gamma.test"
+    assert env.get("GAMMA_API_TOKEN") == "gamma-token"
