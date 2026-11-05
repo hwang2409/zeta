@@ -488,6 +488,13 @@ class _Client:
             return result
         if method == "new_session":
             try:
+                initial_model = _optional_string(params, "model")
+                initial_mode = _optional_string(params, "approval_mode")
+                if initial_mode is not None:
+                    self._require_feature("new_session_settings", "approval_mode")
+                    if initial_model is None:
+                        initial_model = _required_string(params, "model")
+                    model_selection.validate(initial_model, initial_mode)
                 candidate = self._host_commands(params)
                 await self.server.control.require_idle()
                 cwd = None
@@ -497,9 +504,13 @@ class _Client:
                 await self.server.control._terminate_pending_approvals()
                 await self.server.runtime.create_session(
                     provider=_optional_string(params, "provider"),
-                    model=_optional_string(params, "model"),
+                    model=initial_model,
                     cwd=cwd,
                 )
+                if initial_model is not None and initial_mode is not None:
+                    await model_selection.apply_rpc(
+                        self.server.runtime, initial_model, initial_mode
+                    )
                 self.server.control._active_host_commands = candidate
                 self.server.control._host_binding_required = (
                     "session_host_commands" in self.features
@@ -698,9 +709,9 @@ class _Client:
                 )
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
-        store = ergonomics.active(runtime, params)
         if method == "model_catalog":
             return ergonomics.catalog(runtime)
+        store = ergonomics.active(runtime, params)
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method in slash_commands.READ_REQUESTS:
@@ -732,12 +743,7 @@ class _Client:
         if method == "set_settings":
             model = _required_string(params, "model")
             mode = _required_string(params, "approval_mode")
-            if model not in ergonomics.catalog(runtime)["models"] or mode not in {
-                "ask",
-                "allow",
-                "deny",
-            }:
-                raise ProtocolError(-32602, "invalid model or approval mode")
+            model_selection.validate(model, mode)
             await model_selection.apply_rpc(runtime, model, mode)
             return ergonomics.settings(runtime)
         if method == "set_compaction":

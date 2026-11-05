@@ -14,10 +14,15 @@ from ..accounts import (
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionMetadata, persist_metadata_change
 from ..core.slash import resolve_session_budget
-from ..models.catalog import provider_for_model
+from ..models.catalog import known_model_names, provider_for_model
 from ..protocol.types import ErrorInfo
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
+
+
+def validate(model: str, mode: str) -> None:
+    if model not in known_model_names() or mode not in {"ask", "allow", "deny"}:
+        raise ProtocolError(-32602, "invalid model or approval mode")
 
 
 async def apply(
