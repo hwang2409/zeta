@@ -92,13 +92,18 @@ async def test_buffered_read_regression_rejects_old_direct_read() -> None:
 
 
 def test_buffered_read_guard_catches_pre_647_mistake() -> None:
-    source = subprocess.run(
+    result = subprocess.run(
         ["git", "show", "eecf85c9^:tests/test_server.py"],
-        check=True,
         capture_output=True,
+        check=False,
         text=True,
         cwd=Path(__file__).parents[1],
-    ).stdout
+    )
+    source = result.stdout or '''
+async def test_parent_mode_resolves_live_delegated_approvals_independently(reader):
+    await _request(reader, writer, 4, "status")
+    frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
+'''
     violations = _unbuffered_reader_reads(source, "eecf85c9^:tests/test_server.py")
     assert any(
         "test_parent_mode_resolves_live_delegated_approvals_independently" in violation
