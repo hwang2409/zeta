@@ -1489,7 +1489,7 @@ async def test_response_incomplete_max_output_tokens_finishes_turn_as_max_tokens
 
 
 @pytest.mark.asyncio
-async def test_incomplete_function_call_is_dropped_not_executed_on_max_output_tokens(
+async def test_incomplete_function_call_recovers_without_execution_on_max_output_tokens(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -1503,12 +1503,14 @@ async def test_incomplete_function_call_is_dropped_not_executed_on_max_output_to
         },
     )
 
+    completed_stream = message_stream()
+
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=sse(stream),
+            text=sse(stream if len(requests) == 1 else completed_stream),
             request=request,
         )
 
@@ -1527,12 +1529,22 @@ async def test_incomplete_function_call_is_dropped_not_executed_on_max_output_to
         ).run_turn("read", origin=MessageOrigin.USER)
     ]
 
-    assert len(requests) == 1
+    assert len(requests) == 2
     assert executed == []
-    assert not any(item.type is StreamEventType.RETRY for item in events)
-    assistant = store.messages()[-1]
-    assert assistant.content == []
-    assert assistant.metadata["stop_reason"] == "max_tokens"
+    recovery = next(
+        item
+        for item in events
+        if item.type is StreamEventType.RETRY
+        and item.data.get("kind") == "output_limit_recovery"
+    )
+    assert "<read> call" in recovery.data["text"]
+    assert b"split the work into smaller calls" in requests[1].content
+    assistants = [
+        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+    ]
+    assert assistants[0].content == []
+    assert assistants[0].metadata["stop_reason"] == "max_tokens"
+    assert assistants[-1].content == [TextContent("hello")]
     await client.aclose()
 
 

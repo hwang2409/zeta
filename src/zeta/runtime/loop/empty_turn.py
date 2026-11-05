@@ -30,6 +30,7 @@ EMPTY_TURN_NUDGE_TEXT = (
     "You ended your turn without a visible response. "
     "Reply to the user or continue the task."
 )
+TOOL_LIMIT_RECOVERY_EVENT = "tool_call_output_limit_recovery"
 
 # Provider stop reasons are short; keep the persisted value bounded regardless.
 MAX_STOP_REASON_CHARS = 64
@@ -96,6 +97,22 @@ def build_nudge_message() -> Message:
         [TextContent(EMPTY_TURN_NUDGE_TEXT)],
         metadata={
             "zeta_event": EMPTY_TURN_NUDGE_EVENT,
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+        },
+    )
+
+
+def build_tool_limit_recovery_message(tool_name: str) -> Message:
+    text = (
+        f"Your output hit the output token limit while writing a <{tool_name[:128]}> "
+        "call. You should split the work into smaller calls. For files, create a "
+        "smaller file, then edit/append it."
+    )
+    return Message(
+        MessageRole.USER,
+        [TextContent(text)],
+        metadata={
+            "zeta_event": TOOL_LIMIT_RECOVERY_EVENT,
             MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
         },
     )

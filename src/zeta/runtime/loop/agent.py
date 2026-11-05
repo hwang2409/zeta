@@ -102,7 +102,9 @@ from ._completion import (
 )
 from ._store_writes import StoreWriteMixin
 from .empty_turn import (
+    OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
+    build_tool_limit_recovery_message,
     output_limit_error,
     read_turn_metadata,
     should_nudge_empty_turn,
@@ -769,6 +771,7 @@ class AgentLoop(
         self._turn_provider_retry_records = []
         nudged_empty_turn = False
         nudge_turn_pending = False
+        recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
         while (
@@ -778,6 +781,7 @@ class AgentLoop(
             or retrying_context
             or retrying_provider
             or nudge_turn_pending
+            or recovering_tool_limit
         ):
             if not retrying_context and not retrying_provider:
                 provider_retry_budget = None
@@ -802,6 +806,7 @@ class AgentLoop(
             provider_error_source: BaseException | ErrorInfo | None = None
             provider_error_data: dict[str, Any] = {}
             provider_retry_usage: dict[str, Any] | None = None
+            incomplete_tool_name: str | None = None
             attempt_state = ProviderAttemptState()
             try:
                 account_context = getattr(self, "account_context", None)
@@ -940,10 +945,14 @@ class AgentLoop(
                         reason, tokens = read_turn_metadata(event.data)
                         if reason is not None:
                             self._turn_stop_reason = reason
+                        tool_name = event.data.get("incomplete_tool_name")
+                        if type(tool_name) is str and tool_name:
+                            incomplete_tool_name = tool_name
                         if tokens is not None:
                             self._turn_output_tokens = tokens
-                    if event.type is StreamEventType.MESSAGE_END and not event.data.get(
-                        "truncated"
+                    if event.type is StreamEventType.MESSAGE_END and (
+                        not event.data.get("truncated")
+                        or self._turn_stop_reason == "max_tokens"
                     ):
                         completion_succeeded = True
                     yield event
@@ -1066,6 +1075,17 @@ class AgentLoop(
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
+            if incomplete_tool_name is not None:
+                assistant_message = Message(
+                    assistant_message.role,
+                    [
+                        block
+                        for block in assistant_message.content
+                        if not isinstance(block, ToolUseContent)
+                    ],
+                    tool_result=assistant_message.tool_result,
+                    metadata=assistant_message.metadata,
+                )
             assistant_message = self._annotate_current_turn(assistant_message)
             metadata = {
                 **assistant_message.metadata,
@@ -1100,6 +1120,38 @@ class AgentLoop(
             error = output_limit_error(
                 assistant_message, stop_reason=self._turn_stop_reason
             )
+            if incomplete_tool_name is not None:
+                if recovering_tool_limit:
+                    error = ErrorInfo("max_tokens", OUTPUT_LIMIT_ERROR_MESSAGE)
+                    yield StreamEvent(StreamEventType.ERROR, error=error)
+                    if self.agent_instance_id is None:
+                        await step_delivery.admit_terminal("foreground_end")
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
+                await step_delivery.admit_terminal("nudge")
+                await self._append_turn_message(
+                    build_tool_limit_recovery_message(incomplete_tool_name)
+                )
+                yield StreamEvent(
+                    StreamEventType.RETRY,
+                    data={
+                        "kind": "output_limit_recovery",
+                        "reason": "max_tokens",
+                        "text": (
+                            "output token limit reached while writing a "
+                            f"<{incomplete_tool_name[:128]}> call; asking the model "
+                            "to split the work into smaller calls"
+                        ),
+                    },
+                )
+                yield StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": 0},
+                )
+                recovering_tool_limit = True
+                continue
+            recovering_tool_limit = False
             if error is not None and not calls:
                 yield StreamEvent(StreamEventType.ERROR, error=error)
                 if self.agent_instance_id is None:

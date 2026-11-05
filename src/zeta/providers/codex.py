@@ -991,6 +991,7 @@ def _decode_terminal_response(
 
     content: list[ContentBlock] = []
     output_items: list[dict[str, Any]] = []
+    incomplete_tool_name = None
     for index in sorted(items):
         item = items[index]
         if item.completed_item is None:
@@ -1000,6 +1001,7 @@ def _decode_terminal_response(
             and item.kind == "function_call"
             and item.completion_status != "completed"
         ):
+            incomplete_tool_name = item.name
             continue
         content.extend(_complete_item(item))
         output_items.append(dict(item.completed_item))
@@ -1014,6 +1016,11 @@ def _decode_terminal_response(
             "usage": normalize_usage(usage),
             **response_data,
             "stop_reason": stop_reason,
+            **(
+                {"incomplete_tool_name": incomplete_tool_name}
+                if stop_reason == "max_tokens" and incomplete_tool_name is not None
+                else {}
+            ),
         },
     )
 
