@@ -688,7 +688,7 @@ class BackgroundTaskRegistry:
                     loop = asyncio.get_running_loop()
                     deadline = loop.time() + cleanup_timeout
                     while any(
-                        process.returncode is None for _, process in entries
+                        _group_exists(process.pid) for _, process in entries
                     ):
                         if loop.time() >= deadline:
                             return False
