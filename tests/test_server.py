@@ -3617,9 +3617,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         record_progress(first_result)
         record_progress(second_result)
         while len(terminal_children) < 2:
-            frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
-            assert frame
-            record_progress([json.loads(frame)])
+            record_progress([await _read(reader)])
         # Terminal child notifications can precede parent-turn finalization.
         # agent_end is published only after the server marks the turn idle.
         if not agent_ended:
