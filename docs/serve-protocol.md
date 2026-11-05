@@ -293,6 +293,42 @@ other trust grant occurs. Project MCP servers still need `zeta mcp trust`.
 The example omits metadata fields for readability. A real response includes
 all metadata fields.
 
+With the `session_host_commands` feature, `new_session` and `resume` accept an
+optional `host_commands` array that binds host commands to this attachment.
+Each item has exactly the keys `name`, `executable`, `summary`, and
+`environment`:
+
+- `name`: 1 to 64 characters, `[A-Za-z][A-Za-z0-9._-]*`, unique in the array.
+- `executable`: a normalized absolute path, at most 4096 bytes, with no NUL or
+  newline.
+- `summary`: non-empty, single line, at most 256 bytes.
+- `environment`: an object of string values added to `bash` and background
+  task subprocesses. Keys match `[A-Za-z_][A-Za-z0-9_]{0,127}` and must be
+  unique across all items. `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`,
+  `CDPATH`, `GLOBIGNORE`, `ZETA_TOOL_SUBPROCESS`, and `LD_*`/`DYLD_*` are
+  rejected. Values have no NUL and are at most 4096 bytes.
+
+Limits: at most 4 items, 16 environment entries, and 16384 bytes of
+environment keys and values. Any violation returns `-32602`, and `host_commands`
+without the negotiated feature also returns `-32602`. An empty array or an
+absent field binds no commands.
+
+The binding is not stored. It never appears in responses, notifications,
+`status`, metadata, history, exports, transcripts, child agents, or background
+task metadata. The model sees only one instruction block that lists each
+command's name, executable, and summary. Each turn uses the binding that was
+current when the turn started; a later `resume` with a new binding affects the
+next turn. A failed `new_session` or `resume` keeps the previous binding while
+the session runtime still exists, and clears it when the runtime is gone.
+After a controller disconnect, a host-bound session rejects new `send` and
+`send_images` turns with `-32003` and `data.code: "host_binding_required"`
+until a controller sends `resume` with the binding again. A tool call that
+resumes after approval uses the binding that is current at that time.
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123","host_commands":[{"name":"gamma-render","executable":"/opt/gamma/bin/render","summary":"render a file in the web surface","environment":{"GAMMA_SESSION":"s-1"}}]}}
+```
+
 ### `resume`
 
 Params: required `session_id`, a non-empty string. The result has `session`
