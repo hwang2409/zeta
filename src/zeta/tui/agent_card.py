@@ -764,8 +764,14 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
-    def __init__(self, store: ConversationStore) -> None:
+    def __init__(
+        self,
+        store: ConversationStore,
+        *,
+        on_view_change: Callable[[], None] | None = None,
+    ) -> None:
         self.store = store
+        self._on_view_change = on_view_change
         self.root_path = store.session_dir
         self.current_path = self.root_path
         self._path_stack: list[Path] = [self.root_path]
@@ -913,6 +919,8 @@ class AgentNavigation:
                 return
 
     def _switch_transcript(self) -> None:
+        if self._on_view_change is not None:
+            self._on_view_change()
         if self._transcript_layout is None:
             return
         replacement = self.view_container if self.child_view_active else self._main_transcript

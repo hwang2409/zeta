@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from prompt_toolkit.styles import Style
 from rich.text import Text
 
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
+from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.message_finder import Role
@@ -34,9 +37,16 @@ def _rank_finder(transcript: TranscriptWidget, query: str) -> None:
     assert transcript.finder_publish(result)
 
 
-def _app_for_finder(transcript: TranscriptWidget) -> Any:
+def _app_for_finder(
+    transcript: TranscriptWidget, *, child: TranscriptWidget | None = None
+) -> Any:
     app = object.__new__(TUIApp)
     app._transcript = transcript
+    app._agent_navigation = SimpleNamespace(
+        child_view_active=child is not None,
+        transcript_control=SimpleNamespace(transcript=child),
+    )
+    app._active_finder = transcript
     app._finder_prepare_task = None
     app._finder_rank_task = None
     app._invalidate_prompt = lambda: None
@@ -192,6 +202,75 @@ def test_finder_jump_works_on_virtual_history() -> None:
     # The virtual viewport is positioned at the accepted message.
     assert transcript._virtual_start is not None
     assert transcript._virtual_start[0] == target
+
+
+@pytest.mark.asyncio
+async def test_child_view_finder_stays_in_child_transcript() -> None:
+    root = TranscriptWidget()
+    root.append(Text("root-only searchable marker"))
+    root.create_content(80, 5)
+    child = TranscriptWidget()
+    child.append(Text("child-only searchable marker one"))
+    child.append(Text("child-only searchable marker two"))
+    child.create_content(80, 5)
+    app = _app_for_finder(root, child=child)
+
+    app._finder_open()
+    assert app._finder_prepare_task is not None
+    await app._finder_prepare_task
+
+    assert child.finder_active
+    state = child.finder_state()
+    assert state is not None
+    assert [row.candidate.text for row in state.rows] == [
+        "child-only searchable marker two",
+        "child-only searchable marker one",
+    ]
+    app._finder_input("child-only")
+    assert app._finder_rank_task is not None
+    await app._finder_rank_task
+    app._finder_accept()
+    assert child.search_active
+    assert child.search_status() == (2, 2)
+    child.next_search_match()
+    assert child.search_status() == (1, 2)
+    child.previous_search_match()
+    assert child.search_status() == (2, 2)
+    child.end_search()
+    assert not child.search_active
+    assert not root.search_active
+
+
+@pytest.mark.asyncio
+async def test_switching_from_child_to_root_cancels_stale_finder_work(
+    tmp_path: Any,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    navigation = AgentNavigation(store)
+    child_path = store.session_dir / "agents" / "child"
+    child_path.mkdir(parents=True)
+    navigation.current_path = child_path
+    child = navigation.transcript_control.transcript
+    child.append(Text("child-only searchable marker"))
+    child.create_content(80, 5)
+    root = TranscriptWidget()
+    root.append(Text("root-only searchable marker"))
+    root.create_content(80, 5)
+    app = _app_for_finder(root, child=child)
+    app._agent_navigation = navigation
+    navigation._on_view_change = app._finder_cancel
+
+    app._finder_open()
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+    navigation.current_path = navigation.root_path
+    navigation._switch_transcript()
+    await asyncio.sleep(0)
+
+    assert prepare_task.cancelled()
+    assert not child.finder_active
+    assert app._active_finder is root
+    store.close()
 
 
 @pytest.mark.asyncio
