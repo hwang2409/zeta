@@ -2452,3 +2452,58 @@ async def test_run_background_scrubs_credentials_from_child_env(
 
     _assert_env_dump_is_scrubbed(output["structuredContent"]["output"])
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_session_host_commands_reach_foreground_bash_spawn(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        result = await registry.execute(
+            ToolCall("host-env", "bash", {"command": 'printf %s "$GAMMA_SENTINEL"'}),
+            _host_environment={"GAMMA_SENTINEL": "ordinary-pass"},
+        )
+        assert result["structuredContent"]["stdout"] == "ordinary-pass"
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_session_host_commands_reach_approved_cwd_bash_spawn(
+    tmp_path: Path,
+) -> None:
+    from zeta.core.approval import ApprovedCwdExecution
+    from zeta.tools.registry import ToolExecutionContext
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    identity = os.stat(tmp_path)
+    context = ToolExecutionContext(
+        ToolCall("host-env-approved", "bash", {}),
+        None,
+        None,
+        ApprovedCwdExecution(str(tmp_path), (identity.st_dev, identity.st_ino)),
+        {"GAMMA_SENTINEL": "approved-pass"},
+    )
+    try:
+        result = await bash_module._bash(
+            registry,
+            {"command": 'printf %s "$GAMMA_SENTINEL"'},
+            ToolAbortSignal(),
+            execution_context=context,
+        )
+        assert result["structuredContent"]["stdout"] == "approved-pass"
+    finally:
+        await registry.close()
+
+
+def test_gamma_environment_is_currently_inherited_by_tool_subprocesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GAMMA_API_URL", "http://gamma.test")
+    monkeypatch.setenv("GAMMA_API_TOKEN", "gamma-token")
+
+    env = subprocess_env()
+
+    assert env["GAMMA_API_URL"] == "http://gamma.test"
+    assert env["GAMMA_API_TOKEN"] == "gamma-token"

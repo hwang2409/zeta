@@ -1,4 +1,5 @@
 """The provider-neutral agent loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -33,7 +34,6 @@ from ...agent.plan_mode import (
     plan_mode_messages,
     plan_mode_tool_schemas,
 )
-from ...agent.receipt import finalize_agent_results
 from ...agent.result_payload import ChildResultPayloadMixin
 from ...agent.runner import run_agent_tool
 from ...agent.tool_results import validated_tool_result as _validated_tool_result
@@ -50,12 +50,8 @@ from ...mcp import (
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
-    ASSISTANT_RESPONSE_ABORTED,
     ASSISTANT_RESPONSE_COMPLETED,
-    ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
-    FAILED_TURN_ERROR,
-    FAILED_TURN_MARKER,
     CompletionBackend,
     ContentBlock,
     ContextWindowBackend,
@@ -75,7 +71,6 @@ from ...protocol.types import (
     user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
-from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -108,7 +103,6 @@ from ._completion import (
 )
 from ._store_writes import StoreWriteMixin
 from .empty_turn import (
-    annotate_turn_metadata,
     build_nudge_message,
     read_turn_metadata,
     should_nudge_empty_turn,
@@ -118,6 +112,7 @@ from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
+from .turn_persistence import TurnPersistenceMixin
 
 
 def _sanitize_account_message(message: Message) -> Message:
@@ -132,6 +127,8 @@ def _sanitize_account_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=message.metadata,
     )
+
+
 TaskResult = TypeVar("TaskResult")
 
 
@@ -144,6 +141,7 @@ class _ToollessTransition:
 
 
 class AgentLoop(
+    TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
     SkillRefreshMixin,
@@ -153,6 +151,7 @@ class AgentLoop(
     MCPSession,
 ):
     post_stream_provider_retry = True
+
     def __init__(
         self,
         backend: CompletionBackend,
@@ -307,6 +306,7 @@ class AgentLoop(
         self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
+
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -315,6 +315,7 @@ class AgentLoop(
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
+
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -703,7 +704,8 @@ class AgentLoop(
         system_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
         notification_turn: bool = False,
-        host_environment: Mapping[str, str] | None = None, host_instruction: str = "",
+        host_environment: Mapping[str, str] | None = None,
+        host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         await self.refresh_skills()
@@ -812,7 +814,13 @@ class AgentLoop(
                 ):
                     yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
                     await account_context.ensure_account_state(self)
-                if retrying_context or (self.context_assembler.needs_compaction() if not host_instruction else self.context_assembler.needs_compaction(system_append=host_instruction)):
+                if retrying_context or (
+                    self.context_assembler.needs_compaction()
+                    if not host_instruction
+                    else self.context_assembler.needs_compaction(
+                        system_append=host_instruction
+                    )
+                ):
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
                         data={"turn": turn_number},
@@ -878,9 +886,7 @@ class AgentLoop(
                     self._persist_partial_with_cancelled_tools(
                         [], None, failure=disposition
                     )
-                    yield StreamEvent(
-                        StreamEventType.ERROR, error=disposition
-                    )
+                    yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
                 provider_retry_budget = start_provider_attempt(provider_retry_budget)
@@ -1025,7 +1031,9 @@ class AgentLoop(
                         retrying_provider = True
                         continue
                 if plan is None and attempt_state.started and has_active_delivery:
-                    async for publication in self._accepted_delivery_events(step_delivery):
+                    async for publication in self._accepted_delivery_events(
+                        step_delivery
+                    ):
                         yield publication
                 if (
                     provider_retry_budget is not None
@@ -1153,98 +1161,3 @@ class AgentLoop(
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
         yield StreamEvent(StreamEventType.AGENT_END)
-
-
-    def _finalize_tool_results(
-        self,
-        calls: Sequence[ToolCall],
-        slots: Sequence[ToolResult | None],
-    ) -> list[ToolResult]:
-        return finalize_agent_results(self, calls, slots)
-
-    def _annotate_current_turn(self, message: Message) -> Message:
-        """Apply provider metadata before any assistant message is persisted."""
-
-        annotated = annotate_turn_metadata(
-            message,
-            stop_reason=self._turn_stop_reason,
-            output_tokens=self._turn_output_tokens,
-        )
-        account_context = getattr(self, "account_context", None)
-        if account_context is not None and account_context.active_provider is not None:
-            metadata = dict(annotated.metadata)
-            metadata["account_provider"] = account_context.active_provider
-            metadata["account_switch_sequence"] = account_context.switch_sequence
-            annotated = Message(
-                annotated.role,
-                annotated.content,
-                tool_result=annotated.tool_result,
-                metadata=metadata,
-            )
-        if not self._turn_provider_retry_records:
-            return annotated
-        metadata = dict(annotated.metadata)
-        metadata["provider_retries"] = [
-            dict(record) for record in self._turn_provider_retry_records
-        ]
-        return Message(
-            annotated.role,
-            annotated.content,
-            tool_result=annotated.tool_result,
-            metadata=metadata,
-        )
-
-    def _persist_partial(
-        self,
-        partial_blocks: list[ContentBlock],
-        assistant_message: Message | None,
-        *,
-        failure: ErrorInfo | None = None,
-    ) -> None:
-        if assistant_message is None:
-            durable_blocks = [
-                block
-                for block in partial_blocks
-                if not isinstance(block, ThinkingContent)
-                or not block.text
-                or block.signature
-            ]
-            if not durable_blocks and failure is None:
-                return
-            assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
-        assistant_message = self._annotate_current_turn(assistant_message)
-        metadata = dict(assistant_message.metadata)
-        metadata[ASSISTANT_RESPONSE_STATE] = (
-            ASSISTANT_RESPONSE_FAILED
-            if failure is not None
-            else ASSISTANT_RESPONSE_ABORTED
-        )
-        if failure is not None:
-            metadata[FAILED_TURN_MARKER] = True
-            metadata[FAILED_TURN_ERROR] = failure.to_dict()
-            metadata["fd_diagnostics"] = fd_diagnostics()
-        assistant_message = Message(
-            assistant_message.role,
-            assistant_message.content,
-            tool_result=assistant_message.tool_result,
-            metadata=metadata,
-        )
-        self.store.append_message(durable_message(assistant_message))
-
-    def _persist_partial_with_cancelled_tools(
-        self,
-        partial_blocks: list[ContentBlock],
-        assistant_message: Message | None,
-        *,
-        failure: ErrorInfo | None = None,
-    ) -> None:
-        self._persist_partial(partial_blocks, assistant_message, failure=failure)
-        blocks = (
-            assistant_message.content
-            if assistant_message is not None
-            else partial_blocks
-        )
-        calls = [
-            block.tool_call for block in blocks if isinstance(block, ToolUseContent)
-        ]
-        self._finalize_tool_results(calls, [None] * len(calls))

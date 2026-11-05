@@ -520,14 +520,24 @@ class _Client:
                     try:
                         await self.server.runtime.resume_session(session_id, force=True)
                     except SessionNotFoundError as exc:
-                        raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
+                        raise ProtocolError(
+                            -32602,
+                            str(exc),
+                            {"code": "session_not_found", "session_id": session_id},
+                        ) from exc
                     except Exception as exc:
-                        raise ProtocolError(-32000, "approval persistence failed") from exc
+                        raise ProtocolError(
+                            -32000, "approval persistence failed"
+                        ) from exc
                 else:
                     try:
                         await self.server.runtime.resume_session(session_id)
                     except SessionNotFoundError as exc:
-                        raise ProtocolError(-32602, str(exc), {"code": "session_not_found", "session_id": session_id}) from exc
+                        raise ProtocolError(
+                            -32602,
+                            str(exc),
+                            {"code": "session_not_found", "session_id": session_id},
+                        ) from exc
                 self.server.control._active_host_commands = candidate
                 self.server.control.session_replaced()
                 self.server.control.clear_approvals()
@@ -612,7 +622,11 @@ class _Client:
             "status",
         ]
         if extended:
-            requests += [method for method in ergonomics.EXTENSION_REQUESTS if method != "content_read" or "content_read" in self.features]
+            requests += [
+                method
+                for method in ergonomics.EXTENSION_REQUESTS
+                if method != "content_read" or "content_read" in self.features
+            ]
             requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
@@ -668,7 +682,9 @@ class _Client:
             return await self.server.connections.read_session(self, method, params)
         if method == "content_read":
             if "content_read" not in self.features:
-                raise ProtocolError(-32601, "content_read requires the negotiated content_read feature")
+                raise ProtocolError(
+                    -32601, "content_read requires the negotiated content_read feature"
+                )
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
         store = ergonomics.active(runtime, params)

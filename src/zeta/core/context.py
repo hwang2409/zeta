@@ -1,10 +1,12 @@
 """Context assembly and durable conversation compaction."""
+
 from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from .context_parts.budget import ContextRequestBudget
+from .context_parts.markers import ContextMarkerMixin
 from .context_parts.types import (
     AssembledContext,
     _AssemblyPreparation,
@@ -16,7 +18,6 @@ from .context_usage import SessionUsage
 from ..context_accounting import (
     context_digest as _digest,
     cooperative_call as _cooperative_call,
-    cooperative_pause as _cooperative_pause,
     message_token_count as _message_token_count,
 )
 from .context_parts.admission import (
@@ -34,7 +35,6 @@ from ..context_eviction import (
     evict_messages,
     eviction_view,
     invalid_eviction_markers,
-    normalize_evicted_tool_result,
     valid_eviction_view,
 )
 from ..context_eviction import _fact_floor
@@ -55,6 +55,7 @@ from ..protocol.types import (
     TextContent,
     ToolUseContent,
 )
+
 SummaryCompletionError = _SummaryCompletionError
 SummaryInputTooLarge = _SummaryInputTooLarge
 
@@ -79,7 +80,7 @@ def _text_from_message(message: Message) -> str:
     return "".join(parts)
 
 
-class ContextAssembler:
+class ContextAssembler(ContextMarkerMixin):
     """Build provider messages from the active branch and compact old entries."""
 
     def __init__(
@@ -229,9 +230,7 @@ class ContextAssembler:
         try:
             return await self._request_admission.admit(messages, tool_schemas)
         except RequestBudgetExceeded as exc:
-            model_limit = ollama_model_window_guidance(
-                self.backend, self.token_budget
-            )
+            model_limit = ollama_model_window_guidance(self.backend, self.token_budget)
             if model_limit is not None:
                 raise BudgetExceeded(f"{exc}; {model_limit}") from exc
             raise BudgetExceeded(str(exc)) from exc
@@ -249,9 +248,7 @@ class ContextAssembler:
     def provider_attempt_estimate(self) -> int | None:
         return self._request_budget.provider_attempt_estimate
 
-    def estimate_tool_schemas(
-        self, tool_schemas: Sequence[Mapping[str, Any]]
-    ) -> int:
+    def estimate_tool_schemas(self, tool_schemas: Sequence[Mapping[str, Any]]) -> int:
         """Count the schema part of the provider request."""
 
         return self._request_budget.estimate_tool_schemas(tool_schemas)
@@ -353,7 +350,8 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         force: bool = False,
         emergency: bool = False,
-        reserved_estimator_tokens: int = 0, system_append: str = "",
+        reserved_estimator_tokens: int = 0,
+        system_append: str = "",
     ) -> list[Message]:
         context = await self.assemble_context(
             backend=backend,
@@ -371,7 +369,8 @@ class ContextAssembler:
         force: bool = False,
         bypass_eviction_hysteresis: bool = False,
         emergency: bool = False,
-        reserved_estimator_tokens: int = 0, system_append: str = "",
+        reserved_estimator_tokens: int = 0,
+        system_append: str = "",
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -578,7 +577,8 @@ class ContextAssembler:
         branch: Sequence[ConversationEntry],
         *,
         force: bool,
-        assembly_budget: int, system_append: str = "",
+        assembly_budget: int,
+        system_append: str = "",
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 
@@ -740,7 +740,9 @@ class ContextAssembler:
         eviction_markers = [
             m for m in active_markers if m.data.get("kind") == EVICTION_KIND
         ]
-        invalid_markers, invalid_floor_markers = invalid_eviction_markers(eviction_markers, active_source_seqs)
+        invalid_markers, invalid_floor_markers = invalid_eviction_markers(
+            eviction_markers, active_source_seqs
+        )
         if invalid_markers:
             bypass_hysteresis = True
         previous_ends = [m.data["source_seq_end"] for m in eviction_markers]
@@ -788,10 +790,13 @@ class ContextAssembler:
                 ]
             )
         )
-        previous_floor = _fact_floor.previous_fact_floor(eviction_markers, invalid_markers)
+        previous_floor = _fact_floor.previous_fact_floor(
+            eviction_markers, invalid_markers
+        )
         record_rows = (
             (int(item.message.metadata.get("source_seq", item.entry.seq)), item.message)
-            for item in candidates if item.entry is not None
+            for item in candidates
+            if item.entry is not None
         )
         source_messages = {
             entry.seq: Message.from_dict(entry.data["message"])
@@ -853,11 +858,15 @@ class ContextAssembler:
             for m in view_messages
             if m.tool_result is not None
         }
-        truncated = truncate_tool_results(proposed, assembly_budget, result_seqs, self.token_counter)
+        truncated = truncate_tool_results(
+            proposed, assembly_budget, result_seqs, self.token_counter
+        )
         if truncated is None:
             return _EvictionPlan("none-fallback")
         context = self._context(truncated, True)
-        telemetry = floor_plan.telemetry(result, context.token_count, self.token_counter)
+        telemetry = floor_plan.telemetry(
+            result, context.token_count, self.token_counter
+        )
         return _EvictionPlan(
             "marker",
             context,
@@ -883,7 +892,9 @@ class ContextAssembler:
             for m in messages
             if m.tool_result is not None and type(m.metadata.get("source_seq")) is int
         }
-        truncated = truncate_tool_results(messages, assembly_budget, result_seqs, self.token_counter)
+        truncated = truncate_tool_results(
+            messages, assembly_budget, result_seqs, self.token_counter
+        )
         return (
             _EvictionPlan(
                 "reuse",
@@ -1003,7 +1014,6 @@ class ContextAssembler:
             ),
             None,
         )
-
 
     def _raise_committed_budget(
         self, committed_tokens: int, budget: int | None = None
@@ -1125,92 +1135,6 @@ class ContextAssembler:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker, active_source_seqs))
         return items
-
-    @staticmethod
-    def _marker_items(
-        entry: ConversationEntry, active_source_seqs: set[int]
-    ) -> list[_ContextItem]:
-        if entry.data.get("kind") == EVICTION_KIND:
-            view = entry.data["view"]
-            valid = valid_eviction_view(entry, active_source_seqs)
-            if valid:
-                messages = ContextAssembler._eviction_view_messages(view)
-                messages.extend(_fact_floor.projected_fact_floor(entry.data.get("fact_floor")))
-            else:
-                messages = [
-                    normalize_evicted_tool_result(
-                        Message(
-                            message.role,
-                            list(message.content),
-                            tool_result=message.tool_result,
-                            metadata={
-                                **message.metadata,
-                                "eviction_view_invalid": True,
-                            },
-                        )
-                    )
-                    for item in view
-                    if isinstance(item.get("message"), Mapping)
-                    for message in [Message.from_dict(item["message"])]
-                ]
-            items = [_ContextItem(entry, message) for message in messages]
-        else:
-            messages = ContextAssembler._marker_messages(
-                entry.data["source_seq_start"],
-                entry.data["source_seq_end"],
-                entry.data["summary"],
-            )
-            items = [_ContextItem(entry, message, fixed=True) for message in messages]
-        pinned = entry.data.get("pinned_message")
-        if pinned is not None:
-            items.append(_ContextItem(entry, Message.from_dict(pinned)))
-        return items
-
-    @staticmethod
-    def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
-        """Project a stored or proposed eviction view into request messages."""
-        messages: list[Message] = []
-        for index, item in enumerate(view):
-            messages.append(ContextAssembler._eviction_view_message(item))
-            if index % 4 == 3:
-                _cooperative_pause()
-        return messages
-
-    @staticmethod
-    def _eviction_view_message(item: Mapping[str, Any]) -> Message:
-        message = Message.from_dict(item["message"])
-        return normalize_evicted_tool_result(
-            Message(
-                message.role,
-                list(message.content),
-                tool_result=message.tool_result,
-                metadata={**message.metadata, "source_seq": item["seq"]},
-            )
-        )
-
-    @staticmethod
-    def _marker_messages(
-        source_start: int,
-        source_end: int,
-        summary: str,
-    ) -> list[Message]:
-        marker_text = f"[compaction marker: entries {source_start}–{source_end}]"
-        metadata = {
-            "source_seq_start": source_start,
-            "source_seq_end": source_end,
-        }
-        return [
-            Message(
-                MessageRole.COMPACTION,
-                [TextContent(marker_text)],
-                metadata=metadata,
-            ),
-            Message(
-                MessageRole.ASSISTANT,
-                [TextContent(summary)],
-                metadata={"compaction_summary": True, **metadata},
-            ),
-        ]
 
     @staticmethod
     def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:

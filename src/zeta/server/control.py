@@ -95,7 +95,6 @@ class ServeControl:
         self.deliveries = DeliveryRequests(self)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
-        self._active_host_commands: SessionHostCommands | None = None
         self._approvals = ApprovalLifecycle(
             publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
@@ -220,7 +219,6 @@ class ServeControl:
 
     async def controller_released(self, *, reconnect: bool = False) -> None:
         self._active_host_commands = None
-        self._active_host_commands = None
         if reconnect and self._grace_task is not None:
             await asyncio.shield(self._grace_task)
             return
@@ -331,7 +329,9 @@ class ServeControl:
             host_commands = self._active_host_commands
             if self.server.runtime.state is not None:
                 self.server.runtime.state.tool_started()
-            self._turn_task = asyncio.create_task(self._resume_tool(core_key, host_commands))
+            self._turn_task = asyncio.create_task(
+                self._resume_tool(core_key, host_commands)
+            )
         return result
 
     def request_approval_abort(
@@ -401,8 +401,12 @@ class ServeControl:
                 origin=origin,
                 user_message=user_message,
                 persist_user_message=persist_user_message,
-                host_environment=None if host_commands is None else host_commands.environment,
-                host_instruction="" if host_commands is None else host_commands.instruction,
+                host_environment=None
+                if host_commands is None
+                else host_commands.environment,
+                host_instruction=""
+                if host_commands is None
+                else host_commands.instruction,
             ):
                 if event.type is StreamEventType.ERROR:
                     outcome = TurnOutcome.FAILED
@@ -440,9 +444,13 @@ class ServeControl:
         if not loop.schedule_notification_turn():
             return
         host_commands = self._active_host_commands
-        self._turn_task = asyncio.create_task(self._run_notification_turn(session_id, host_commands))
+        self._turn_task = asyncio.create_task(
+            self._run_notification_turn(session_id, host_commands)
+        )
 
-    async def _run_notification_turn(self, session_id: str, host_commands: SessionHostCommands | None = None) -> None:
+    async def _run_notification_turn(
+        self, session_id: str, host_commands: SessionHostCommands | None = None
+    ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None or state.session_id != session_id:
@@ -455,9 +463,15 @@ class ServeControl:
             state.turn_started()
             started = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
-                session_id, loop, self._event,
-                host_environment=None if host_commands is None else host_commands.environment,
-                host_instruction="" if host_commands is None else host_commands.instruction,
+                session_id,
+                loop,
+                self._event,
+                host_environment=None
+                if host_commands is None
+                else host_commands.environment,
+                host_instruction=""
+                if host_commands is None
+                else host_commands.instruction,
             )
             outcome = TurnOutcome.COMPLETED if success else TurnOutcome.FAILED
         except asyncio.CancelledError:
@@ -495,7 +509,9 @@ class ServeControl:
         if loop.notification_system_message() is not None:
             self._schedule_background_wake(runtime.session_id)
 
-    async def _resume_tool(self, request_id: str, host_commands: SessionHostCommands | None = None) -> None:
+    async def _resume_tool(
+        self, request_id: str, host_commands: SessionHostCommands | None = None
+    ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None:
@@ -519,7 +535,9 @@ class ServeControl:
                 request_id,
                 prepared=True,
                 event_sink=emit,
-                host_environment=None if host_commands is None else host_commands.environment,
+                host_environment=None
+                if host_commands is None
+                else host_commands.environment,
             )
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
