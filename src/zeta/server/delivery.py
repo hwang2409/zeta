@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -128,7 +126,9 @@ class DeliveryRequests:
         delivery_id = self._delivery_id(
             params, features, feature="send_images_delivery_id"
         )
-        payload_digest = _image_payload_digest(params) if delivery_id is not None else None
+        payload_digest = (
+            ergonomics.image_payload_digest(params) if delivery_id is not None else None
+        )
         duplicate = self._duplicate(delivery_id, payload_digest=payload_digest)
         if duplicate is not None:
             return duplicate
@@ -159,7 +159,6 @@ class DeliveryRequests:
                 "delivered",
                 outcome,
                 message=tagged,
-                payload_digest=payload_digest,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -308,7 +307,10 @@ class DeliveryRequests:
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
-            if payload_digest is not None and delivery.payload_digest != payload_digest:
+            if (
+                payload_digest is not None
+                and delivery.payload_digest != payload_digest
+            ):
                 raise ProtocolError(
                     -32010,
                     "delivery id already used for a different payload",
@@ -325,16 +327,6 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
-
-
-def _image_payload_digest(params: Mapping[str, object]) -> str:
-    payload = json.dumps(
-        {"text": params.get("text", ""), "images": params.get("images")},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
 
 
 async def _deliver_after_commit(

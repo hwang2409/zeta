@@ -798,8 +798,9 @@ It carries `text` (the user text, bounded to 262,144 UTF-8 bytes), `mode`
 array of `{name, mime_type, size}` objects (empty for text-only messages; no
 image data). Observers and reconnecting clients use it to rebuild the
 transcript. When `user_message_delivery_id`, `delivery_id`, and
-`user_message_event` are all negotiated, an accepted `send` or `steer` that
-carried a delivery ID also has `delivery_id`. The field is omitted for requests
+`user_message_event` are all negotiated, an accepted `send`, `steer`, or
+`send_images` that carried a delivery ID also has `delivery_id`; `send_images`
+also requires `send_images_delivery_id`. The field is omitted for requests
 without an ID. The same opt-in field appears on matching user rows from
 `session_history` and survives restart. The echo is emitted at request
 acceptance; applying queued steering does not emit it again.

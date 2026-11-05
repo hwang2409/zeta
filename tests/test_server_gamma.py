@@ -794,6 +794,22 @@ async def test_send_images_delivery_id_retry_is_idempotent(tmp_path: Path) -> No
             "delivery_id": "image-retry",
         }
         first = await _request(reader, writer, 3, "send_images", params)
+        assert first[-1].get("result", {}).get("accepted") is True, first
+        rows = [
+            json.loads(line)
+            for line in (
+                tmp_path / "home" / "sessions" / session_id / "conversation.jsonl"
+            )
+            .read_text()
+            .splitlines()[1:]
+        ]
+        delivery_row = next(row for row in rows if row.get("type") == "client_delivery")
+        assert set(delivery_row["data"]) == {
+            "delivery_id",
+            "method",
+            "status",
+            "outcome",
+        }
         await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
@@ -845,6 +861,53 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
             {**params, "text": "different"},
         )
         assert conflict[-1].get("error", {}).get("code") == -32010
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_uses_semantic_image_payload(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        encoded = base64.b64encode(PNG).decode()
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": encoded,
+                }
+            ],
+            "delivery_id": "image-semantic",
+        }
+        first = await _request(reader, writer, 3, "send_images", params)
+        await _event(reader, "agent_end")
+        wrapped = "\n".join(encoded[index : index + 20] for index in range(0, len(encoded), 20))
+        duplicate = await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {
+                **params,
+                "images": [{**params["images"][0], "data": wrapped, "ignored": True}],
+            },
+        )
+        assert duplicate[-1].get("result") == {
+            **first[-1]["result"],
+            "duplicate": True,
+        }
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
