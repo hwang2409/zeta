@@ -501,6 +501,9 @@ class _Client:
                     cwd=cwd,
                 )
                 self.server.control._active_host_commands = candidate
+                self.server.control._host_binding_required = (
+                    "session_host_commands" in self.features
+                )
                 self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
@@ -508,6 +511,7 @@ class _Client:
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
+                    self.server.control._host_binding_required = False
                 raise
         if method == "resume":
             candidate = self._host_commands(params)
@@ -542,6 +546,9 @@ class _Client:
                             {"code": "session_not_found", "session_id": session_id},
                         ) from exc
                 self.server.control._active_host_commands = candidate
+                self.server.control._host_binding_required = (
+                    "session_host_commands" in self.features
+                )
                 self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
@@ -549,6 +556,7 @@ class _Client:
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
+                    self.server.control._host_binding_required = False
                 raise
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)

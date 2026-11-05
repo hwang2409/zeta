@@ -1315,6 +1315,32 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             await asyncio.sleep(0)
         assert backend.calls == []
 
+        probe_reader, probe_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        probe_features = ["approval_reconnect"] if approval_reconnect else []
+        await _request(
+            probe_reader,
+            probe_writer,
+            9,
+            "hello",
+            {"protocol_version": "1.2", "features": probe_features},
+        )
+        await asyncio.sleep(0)
+        assert server.control._turn_task is None
+        assert backend.calls == []
+        probe_writer.close()
+        await probe_writer.wait_closed()
+        for _ in range(100):
+            if (
+                server.connections is not None
+                and server.connections.controller_metadata() is None
+            ):
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("probe controller was not released")
+
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )

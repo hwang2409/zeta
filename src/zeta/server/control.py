@@ -200,7 +200,7 @@ class ServeControl:
     async def controller_claimed(
         self, *, reconnect: bool = False, require_host_binding: bool = False
     ) -> None:
-        self._host_binding_required = require_host_binding
+        self._host_binding_required |= require_host_binding
         task = self._grace_task
         if task is None:
             return
