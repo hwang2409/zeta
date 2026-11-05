@@ -926,14 +926,14 @@ class AgentNavigation:
             return None
         return stat.st_mtime_ns, stat.st_size
 
-    def _agents_directory_signature(self) -> tuple[object, ...]:
+    def _agents_directory_signature(self) -> tuple[int, int, int] | None:
         agents = self.current_path / "agents"
-        signature = self._path_signature(agents)
         try:
-            entry_count = sum(1 for _ in os.scandir(agents))
+            stat = agents.stat()
         except OSError:
-            entry_count = 0
-        return signature, entry_count
+            return None
+        # size and inode catch mutations that share a coarse mtime tick.
+        return stat.st_mtime_ns, stat.st_size, stat.st_ino
 
     def _agent_tree_signature(self) -> tuple[object, ...]:
         """Detect tree changes while statting lifecycle only for live children."""

@@ -11238,6 +11238,96 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
 
 
 @pytest.mark.asyncio
+def _write_test_agent(path: Path, state: str = "running") -> None:
+    path.mkdir(parents=True)
+    (path / "agent_lifecycle.json").write_text(
+        json.dumps({"description": path.name, "agent_type": "general", "state": state})
+    )
+
+
+def _poll_agents(navigation: AgentNavigation) -> None:
+    navigation._last_refresh_at = float("-inf")
+    navigation.refresh()
+
+
+def test_agent_poll_does_not_scan_unchanged_agents_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for index in range(40):
+        _write_test_agent(store.session_dir / "agents" / str(index), "completed")
+    navigation = AgentNavigation(store)
+
+    calls: list[os.PathLike[str] | str] = []
+    real_scandir = os.scandir
+
+    def unexpected_scan(path: os.PathLike[str] | str) -> object:
+        calls.append(path)
+        if Path(path) == store.session_dir / "agents":
+            raise AssertionError("agents directory scanned")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", unexpected_scan)
+    _poll_agents(navigation)
+
+    assert calls == []
+    assert navigation.entries == []
+    store.close()
+
+
+def test_agent_poll_detects_create_finish_and_remove(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    running = store.session_dir / "agents" / "1"
+    _write_test_agent(running)
+    navigation = AgentNavigation(store)
+    assert [entry.path for entry in navigation.entries if entry.path == running] == [running]
+
+    created = store.session_dir / "agents" / "2"
+    _write_test_agent(created)
+    _poll_agents(navigation)
+    assert {entry.path for entry in navigation.entries} >= {running, created}
+
+    (running / "agent_lifecycle.json").write_text(
+        json.dumps({"description": "1", "agent_type": "general", "state": "completed"})
+    )
+    _poll_agents(navigation)
+    assert running not in {entry.path for entry in navigation.entries}
+
+    (created / "agent_lifecycle.json").unlink()
+    created.rmdir()
+    _poll_agents(navigation)
+    assert created not in {entry.path for entry in navigation.entries}
+    store.close()
+
+
+def test_agent_poll_uses_directory_size_when_creates_share_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    first = store.session_dir / "agents" / "1"
+    _write_test_agent(first)
+    navigation = AgentNavigation(store)
+    real_stat = Path.stat
+    fixed_mtime = 123456789
+
+    def coarse_stat(path: Path, *args: object, **kwargs: object):
+        stat = real_stat(path, *args, **kwargs)
+        if path == store.session_dir / "agents":
+            return SimpleNamespace(
+                st_mtime_ns=fixed_mtime,
+                st_size=stat.st_size,
+                st_ino=stat.st_ino,
+            )
+        return stat
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+    second = store.session_dir / "agents" / "2"
+    _write_test_agent(second)
+    _poll_agents(navigation)
+    assert second in {entry.path for entry in navigation.entries}
+    store.close()
+
+
 async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
