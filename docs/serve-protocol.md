@@ -310,8 +310,12 @@ Each item has exactly the keys `name`, `executable`, `summary`, and
 
 Limits: at most 4 items, 16 environment entries, and 16384 bytes of
 environment keys and values. Any violation returns `-32602`, and `host_commands`
-without the negotiated feature also returns `-32602`. An empty array or an
-absent field binds no commands.
+without the negotiated feature also returns `-32602`. An empty array, `null`,
+or an absent field binds no commands. The server does not check that
+`executable` exists or is executable; a missing command fails when the model
+runs it. Subprocesses inherit the server's scrubbed environment, including
+`PATH`, and the bound `environment` entries are added on top, so a binding can
+override `PATH`.
 
 The binding is not stored. It never appears in responses, notifications,
 `status`, metadata, history, exports, transcripts, child agents, or background
