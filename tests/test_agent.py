@@ -89,7 +89,7 @@ from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
-from zeta.tui.cards.agent_sync import AgentTranscriptSource
+from zeta.tui.cards.agent_sync import AgentTranscriptSource, _project_typed_prompts
 from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.todo import TodoWidget
@@ -14124,8 +14124,43 @@ async def test_slash_send_records_history_for_target_child(tmp_path: Path) -> No
     await loop.close()
 
 
+def test_typed_prompt_projection_deduplicates_by_pending_prompt_id() -> None:
+    consumed = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "same"}],
+            "metadata": {
+                "zeta.origin": "user",
+                "zeta.pending_prompt_id": "prompt-1",
+            },
+        }
+    ]
+    pending = [
+        ConversationEntry(
+            1,
+            "prompt-1",
+            None,
+            "main",
+            "pending_prompt",
+            {"text": "same", "origin": "user"},
+        ),
+        ConversationEntry(
+            2,
+            "prompt-2",
+            "prompt-1",
+            "main",
+            "pending_prompt",
+            {"text": "same", "origin": "user"},
+        ),
+    ]
+
+    assert _project_typed_prompts(consumed, pending) == ("same", "same")
+
+
 @pytest.mark.asyncio
-async def test_pending_tui_child_prompt_survives_transcript_refresh(tmp_path: Path) -> None:
+async def test_tui_child_prompt_history_tracks_pending_consumed_and_acknowledged(
+    tmp_path: Path,
+) -> None:
     parent = ConversationStore(tmp_path / "parent")
     child = ConversationStore(parent.session_dir / "agents", session_id="a")
     loop = AgentLoop(FakeBackend([]), parent, skill_catalog=SkillCatalog.empty())
@@ -14143,14 +14178,34 @@ async def test_pending_tui_child_prompt_survives_transcript_refresh(tmp_path: Pa
         handle, pending_delivery_module.StepDeliveryFlow(child)
     )
     commands = _RunCommands(loop)
-
-    await commands.slash_send(f"{handle} still pending")
     source = AgentTranscriptSource(child.session_dir)
-    snapshot = source.refresh().transcript(child.session_dir)
-    assert snapshot is not None
-    commands._prompt_history.replace(child.session_dir, snapshot.typed_prompts)
 
-    assert commands._prompt_history.snapshot(child.session_dir) == ("still pending",)
+    await commands.slash_send(f"{handle} same")
+    await commands.slash_send(f"{handle} same")
+    pending = await asyncio.to_thread(child.pending_prompts)
+
+    def refresh_history() -> tuple[str, ...]:
+        snapshot = source.refresh().transcript(child.session_dir)
+        assert snapshot is not None
+        commands._prompt_history.replace(child.session_dir, snapshot.typed_prompts)
+        return commands._prompt_history.snapshot(child.session_dir)
+
+    assert refresh_history() == ("same", "same")
+
+    child.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("same")],
+            metadata={
+                "zeta.origin": MessageOrigin.USER.value,
+                "zeta.pending_prompt_id": pending[0].id,
+            },
+        )
+    )
+    assert refresh_history() == ("same", "same")
+
+    await asyncio.to_thread(child.acknowledge_pending_prompt, pending[0].id)
+    assert refresh_history() == ("same", "same")
     source.close()
     await loop.close()
 

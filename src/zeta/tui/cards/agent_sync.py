@@ -53,6 +53,32 @@ def _message_display_text(message: dict[str, Any]) -> str:
     )
 
 
+def _project_typed_prompts(
+    messages: Sequence[dict[str, Any]], pending_entries: Sequence[ConversationEntry]
+) -> tuple[str, ...]:
+    represented_prompt_ids = {
+        prompt_id
+        for message in messages
+        if message.get("role") == "user"
+        and isinstance(metadata := message.get("metadata"), dict)
+        and isinstance(prompt_id := metadata.get("zeta.pending_prompt_id"), str)
+    }
+    consumed = tuple(
+        text
+        for message in messages
+        if message.get("role") == "user"
+        and isinstance(metadata := message.get("metadata"), dict)
+        and metadata.get("zeta.origin") == "user"
+        and (text := _message_display_text(message))
+    )
+    pending = tuple(
+        str(entry.data.get("text", ""))
+        for entry in pending_entries
+        if entry.data.get("origin") == "user" and entry.id not in represented_prompt_ids
+    )
+    return consumed + pending
+
+
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
     lifecycle_path = path / "agent_lifecycle.json"
     try:
@@ -424,13 +450,6 @@ class AgentTranscriptSource:
             for entry in entries
             if entry.type == "pending_prompt_ack"
         }
-        typed_prompts = tuple(
-            text
-            for _entry_id, message in messages
-            if message.get("role") == "user"
-            and message.get("metadata", {}).get("zeta.origin") == "user"
-            and (text := _message_display_text(message))
-        )
         pending_entries = tuple(
             entry
             for entry in entries
@@ -439,13 +458,13 @@ class AgentTranscriptSource:
         pending_prompts = tuple(
             str(entry.data.get("text", "")) for entry in pending_entries
         )
-        typed_prompts += tuple(
-            str(entry.data.get("text", ""))
-            for entry in pending_entries
-            if entry.data.get("origin") == "user"
+        typed_prompts = _project_typed_prompts(
+            [message for _entry_id, message in messages], pending_entries
         )
         return AgentTranscriptSnapshot(
-            entry_ids, tuple(messages), pending_prompts=pending_prompts,
+            entry_ids,
+            tuple(messages),
+            pending_prompts=pending_prompts,
             typed_prompts=typed_prompts,
         )
 
