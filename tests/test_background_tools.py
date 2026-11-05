@@ -7,9 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.approval import ApprovedCwdExecution
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
-from zeta.tools import ToolRegistry
+from zeta.tools import ToolAbortSignal, ToolRegistry
+from zeta.tools.bash import _bash
+from zeta.tools.registry import ToolExecutionContext
+from zeta.tools.zeta_background import _run_background
 
 
 async def _output(registry: ToolRegistry, task_id: str) -> str:
@@ -51,13 +55,44 @@ async def test_session_host_commands_reach_run_background_spawns(
             registry, macro["structuredContent"]["task_id"]
         )
 
-        cwd_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
-        task_id, _ = await registry.background_tasks.start(
-            'printf %s "$GAMMA_SENTINEL"',
-            tmp_path,
-            cwd_fd=cwd_fd,
-            environment={"GAMMA_SENTINEL": "approved-pass"},
+        identity = os.stat(tmp_path)
+        approved = ApprovedCwdExecution(
+            str(tmp_path), (identity.st_dev, identity.st_ino)
         )
-        assert "approved-pass" in await _output(registry, task_id)
+        approved_context = ToolExecutionContext(
+            ToolCall("host-bg-approved", "run_background", {}),
+            None,
+            None,
+            approved,
+            {"GAMMA_SENTINEL": "approved-dedicated-pass"},
+        )
+        approved_dedicated = await _run_background(
+            registry,
+            {"command": 'printf %s "$GAMMA_SENTINEL"'},
+            execution_context=approved_context,
+        )
+        assert "approved-dedicated-pass" in await _output(
+            registry, approved_dedicated["structuredContent"]["task_id"]
+        )
+
+        approved_macro_context = ToolExecutionContext(
+            ToolCall("host-bg-approved-macro", "bash", {}),
+            None,
+            None,
+            approved,
+            {"GAMMA_SENTINEL": "approved-macro-pass"},
+        )
+        approved_macro = await _bash(
+            registry,
+            {
+                "command": 'printf %s "$GAMMA_SENTINEL"',
+                "_background": True,
+            },
+            ToolAbortSignal(),
+            execution_context=approved_macro_context,
+        )
+        assert "approved-macro-pass" in await _output(
+            registry, approved_macro["structuredContent"]["task_id"]
+        )
     finally:
         await registry.close()

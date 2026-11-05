@@ -56,7 +56,9 @@ async def _hello(reader, writer, features: list[str] | None = None) -> dict:
 
 
 async def _legacy_hello(reader, writer) -> dict:
-    frames = await _request(reader, writer, "hello", "hello", {"protocol_version": "1.0"})
+    frames = await _request(
+        reader, writer, "hello", "hello", {"protocol_version": "1.0"}
+    )
     return frames[-1]["result"]
 
 
@@ -119,7 +121,9 @@ async def test_resume_runs_tools_in_the_session_cwd(
             return written
 
         monkeypatch.setattr(controller, "_write_physical", gated_write)
-        resumed = await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        resumed = await _request(
+            reader, writer, 2, "resume", {"session_id": session_id}
+        )
         assert resumed[-1]["result"]["session"]["cwd"] == str(original.resolve())
         await _request(reader, writer, 3, "send", {"text": "where am I"})
         await _event(reader, "approval_request")
@@ -169,7 +173,9 @@ async def test_hello_echoes_requested_supported_features_only(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_clients_without_features_see_unchanged_capabilities(tmp_path: Path) -> None:
+async def test_clients_without_features_see_unchanged_capabilities(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -188,7 +194,11 @@ async def test_legacy_hello_ignores_features(tmp_path: Path) -> None:
     reader, writer = await _connect(server)
     try:
         frames = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0", "features": FEATURES}
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0", "features": FEATURES},
         )
         hello = frames[-1]["result"]
         assert hello["protocol_version"] == "1.0"
@@ -254,7 +264,9 @@ async def test_new_session_cwd_must_be_an_existing_absolute_directory(
         for index, value in enumerate(
             [str(tmp_path / "missing"), str(afile), "relative/dir", "", 7]
         ):
-            frames = await _request(reader, writer, index + 2, "new_session", {"cwd": value})
+            frames = await _request(
+                reader, writer, index + 2, "new_session", {"cwd": value}
+            )
             assert frames[-1]["error"]["code"] == -32602, value
         status = (await _request(reader, writer, 20, "status"))[-1]["result"]
         assert status["session"] is None
@@ -293,9 +305,9 @@ async def test_send_and_steer_emit_user_message_events(tmp_path: Path) -> None:
             writer,
             ["user_message_event", "delivery_id", "user_message_delivery_id"],
         )
-        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"][
-            "session"
-        ]["session_id"]
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
         await _request(
             reader,
             writer,
@@ -574,9 +586,7 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
         )
         first_frames = await _frames_until_event(reader, "agent_end")
         assert [
-            frame["params"]["event"]
-            for frame in first_frames
-            if "params" in frame
+            frame["params"]["event"] for frame in first_frames if "params" in frame
         ].count("user_message") == 1
         frames = await _request(
             reader,
@@ -610,9 +620,9 @@ async def test_send_images_emits_user_message_with_attachment_summary(
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["user_message_event"])
-        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"][
-            "session"
-        ]["session_id"]
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
         image = {
             "name": "shot.png",
             "mime_type": "image/png",
@@ -638,7 +648,9 @@ async def test_send_images_emits_user_message_with_attachment_summary(
 
 
 @pytest.mark.asyncio
-async def test_user_message_event_requires_the_negotiated_feature(tmp_path: Path) -> None:
+async def test_user_message_event_requires_the_negotiated_feature(
+    tmp_path: Path,
+) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("ok")])])
     server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
@@ -681,7 +693,9 @@ async def test_extensions_report_missing_session_id_as_invalid_params(
         for index, params in enumerate([{}, {"session_id": ""}, {"session_id": 4}]):
             frames = await _request(reader, writer, index + 3, "session_tree", params)
             assert frames[-1]["error"]["code"] == -32602, params
-        frames = await _request(reader, writer, 9, "session_tree", {"session_id": "other"})
+        frames = await _request(
+            reader, writer, 9, "session_tree", {"session_id": "other"}
+        )
         assert frames[-1]["error"]["code"] == -32003
     finally:
         await _close(server, writer)
@@ -815,16 +829,22 @@ async def test_list_sessions_paging_requires_the_negotiated_feature(
 
 @pytest.mark.asyncio
 async def test_ping_answers_before_a_session_and_during_a_turn(tmp_path: Path) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("a"), TextContent("b")], delay=0.2)])
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("a"), TextContent("b")], delay=0.2)]
+    )
     server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["ping"])
-        assert (await _request(reader, writer, 2, "ping"))[-1]["result"] == {"pong": True}
+        assert (await _request(reader, writer, 2, "ping"))[-1]["result"] == {
+            "pong": True
+        }
         await _request(reader, writer, 3, "new_session", {})
         await _request(reader, writer, 4, "send", {"text": "slow"})
         await _event(reader, "assistant_delta")
-        assert (await _request(reader, writer, 5, "ping"))[-1]["result"] == {"pong": True}
+        assert (await _request(reader, writer, 5, "ping"))[-1]["result"] == {
+            "pong": True
+        }
         await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
@@ -837,14 +857,18 @@ def _documented_features() -> list[str]:
     return [row.split("`", 2)[1] for row in rows]
 
 
-def test_every_advertised_feature_is_documented_and_every_documented_one_exists() -> None:
+def test_every_advertised_feature_is_documented_and_every_documented_one_exists() -> (
+    None
+):
     # A feature name is a promise to clients: advertise only what works, and
     # document everything advertised.
     assert sorted(_documented_features()) == sorted(SERVER_FEATURES)
 
 
 @pytest.mark.asyncio
-async def test_hello_advertises_approval_history_only_when_requested(tmp_path: Path) -> None:
+async def test_hello_advertises_approval_history_only_when_requested(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -876,6 +900,27 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
     try:
         hello = await _hello(reader, writer, ["session_host_commands"])
         assert "session_host_commands" in hello["capabilities"]["features"]
+
+        invalid_bindings = [
+            [_host_binding("x")[0]] * 5,
+            [
+                {
+                    **_host_binding("x")[0],
+                    "environment": {f"KEY_{index}": "x" for index in range(33)},
+                }
+            ],
+            [{**_host_binding("x")[0], "summary": "x" * 1025}],
+        ]
+        for request_id, invalid in enumerate(invalid_bindings, 20):
+            rejected = await _request(
+                reader,
+                writer,
+                request_id,
+                "new_session",
+                {"host_commands": invalid},
+            )
+            assert rejected[-1]["error"]["code"] == -32602
+            assert token not in json.dumps(rejected)
 
         malformed = _host_binding(token)
         malformed[0]["unexpected"] = token
@@ -1073,15 +1118,42 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
 async def test_session_host_commands_wake_during_same_session_resume_uses_one_turn_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.server.host_commands import SessionHostCommands
-    from zeta.skills import SkillCatalog
-    from zeta.tools import ToolRegistry
+    from zeta.protocol.types import MessageRole
 
-    launch = _launch(tmp_path)
-    server = _server(tmp_path, None, launch)
+    call_a = ToolCall(
+        "wake-host-a",
+        "bash",
+        {"command": 'printf %s "$GAMMA_TEST_TOKEN"'},
+    )
+    call_b = ToolCall(
+        "wake-host-b",
+        "bash",
+        {"command": 'printf %s "$GAMMA_TEST_TOKEN"'},
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call_a]),
+            ScriptedTurn([TextContent("continued a")]),
+            ScriptedTurn(tool_calls=[call_b]),
+            ScriptedTurn([TextContent("continued b")]),
+        ]
+    )
+    entered = [asyncio.Event(), asyncio.Event()]
+    release_backend = [asyncio.Event(), asyncio.Event()]
+    original_complete = backend.complete
+
+    async def gated_complete(messages, tool_schemas):
+        turn = len(backend.calls)
+        if turn in {0, 2}:
+            gate = turn // 2
+            entered[gate].set()
+            await release_backend[gate].wait()
+        async for event in original_complete(messages, tool_schemas):
+            yield event
+
+    monkeypatch.setattr(backend, "complete", gated_complete)
+    server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
-    spawn_registry = ToolRegistry(launch, skill_catalog=SkillCatalog.empty())
-    captured = []
     started = asyncio.Event()
     release_resume = asyncio.Event()
     try:
@@ -1101,22 +1173,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             await release_resume.wait()
             return await real_resume(*args, **kwargs)
 
-        async def capture_wake(_session_id, host_commands=None):
-            result = await spawn_registry.execute(
-                ToolCall(
-                    "wake-host-env",
-                    "bash",
-                    {"command": 'printf %s "$GAMMA_TEST_TOKEN"'},
-                ),
-                _host_environment=host_commands.environment,
-            )
-            captured.append((host_commands, result["structuredContent"]["stdout"]))
-
         monkeypatch.setattr(server.runtime, "resume_session", paused_resume)
-        monkeypatch.setattr(
-            server.runtime.loop, "schedule_notification_turn", lambda: True
-        )
-        monkeypatch.setattr(server.control, "_run_notification_turn", capture_wake)
         resume = asyncio.create_task(
             _request(
                 reader,
@@ -1130,27 +1187,64 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             )
         )
         await started.wait()
+        server.runtime.opened.store.append_agent_notification(
+            "wake-a",
+            child_session_path="/wake-a",
+            description="child",
+            status="completed",
+            text="wake a",
+        )
         server.control._schedule_background_wake(session_id)
-        wake_task = server.control._turn_task
-        assert wake_task is not None
-        await asyncio.wait_for(asyncio.shield(wake_task), 10)
-        assert captured[0][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-a"
-        assert "gamma-a" in captured[0][0].instruction
-        assert captured[0][1] == "snapshot-a"
+        await entered[0].wait()
         release_resume.set()
         assert "result" in (await resume)[-1]
-        assert captured[0][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-a"
+        release_backend[0].set()
+        approval = await _event(reader, "approval_request")
+        assert approval["request_id"] == call_a.id
+        await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": call_a.id},
+        )
+        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-a"
+        await _event(reader, "agent_end")
+        assert any(
+            isinstance(block, TextContent) and "gamma-a" in block.text
+            for message in backend.calls[1][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+        )
 
+        server.runtime.opened.store.append_agent_notification(
+            "wake-b",
+            child_session_path="/wake-b",
+            description="child",
+            status="completed",
+            text="wake b",
+        )
         server.control._schedule_background_wake(session_id)
-        later_wake = server.control._turn_task
-        assert later_wake is not None
-        await asyncio.wait_for(asyncio.shield(later_wake), 10)
-        assert captured[1][0].environment.get("GAMMA_TEST_TOKEN") == "snapshot-b"
-        assert "gamma-b" in captured[1][0].instruction
-        assert captured[1][1] == "snapshot-b"
-        assert isinstance(captured[0][0], SessionHostCommands)
+        await entered[1].wait()
+        release_backend[1].set()
+        approval = await _event(reader, "approval_request")
+        assert approval["request_id"] == call_b.id
+        await _request(
+            reader,
+            writer,
+            5,
+            "approve",
+            {"request_id": call_b.id},
+        )
+        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-b"
+        await _event(reader, "agent_end")
+        assert any(
+            isinstance(block, TextContent) and "gamma-b" in block.text
+            for message in backend.calls[3][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+        )
     finally:
-        await spawn_registry.close()
         await _close(server, writer)
 
 
@@ -1158,13 +1252,24 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
 @pytest.mark.parametrize("approval_reconnect", [False, True])
 async def test_session_host_commands_notification_after_release_has_no_binding(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     approval_reconnect: bool,
 ) -> None:
-    server = _server(tmp_path, None, _launch(tmp_path))
+    from zeta.protocol.types import MessageRole
+
+    call = ToolCall(
+        "released-host-call",
+        "bash",
+        {"command": 'printf %s "$GAMMA_TEST_TOKEN"'},
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("continued")]),
+        ]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(server)
     replay_writer = None
-    captured = []
     features = ["session_host_commands"]
     if approval_reconnect:
         features.append("approval_reconnect")
@@ -1184,14 +1289,6 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             {"host_commands": _host_binding("released-a")},
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-
-        async def capture_wake(_session_id, host_commands=None):
-            captured.append(host_commands)
-
-        monkeypatch.setattr(
-            server.runtime.loop, "schedule_notification_turn", lambda: True
-        )
-        monkeypatch.setattr(server.control, "_run_notification_turn", capture_wake)
         writer.close()
         await writer.wait_closed()
         for _ in range(100):
@@ -1204,9 +1301,17 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
         else:
             raise AssertionError("controller was not released")
         assert server.control._active_host_commands is None
+
+        server.runtime.opened.store.append_agent_notification(
+            "released-wake",
+            child_session_path="/released-wake",
+            description="child",
+            status="completed",
+            text="wake while detached",
+        )
         server.control._schedule_background_wake(session_id)
         await asyncio.sleep(0)
-        assert captured == [None]
+        assert backend.calls == []
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -1218,10 +1323,9 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             "hello",
             {"protocol_version": "1.2", "features": features},
         )
-        assert server.control._active_host_commands is None
-        server.control._schedule_background_wake(session_id)
         await asyncio.sleep(0)
-        assert captured == [None, None]
+        assert server.control._active_host_commands is None
+        assert backend.calls == []
 
         resumed = await _request(
             replay_reader,
@@ -1230,13 +1334,28 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             "resume",
             {
                 "session_id": session_id,
-                "host_commands": _host_binding("released-c"),
+                "host_commands": _host_binding("released-c", name="gamma-c"),
             },
         )
         assert "result" in resumed[-1]
-        server.control._schedule_background_wake(session_id)
-        await asyncio.sleep(0)
-        assert captured[-1].environment["GAMMA_TEST_TOKEN"] == "released-c"
+        approval = await _event(replay_reader, "approval_request")
+        assert approval["request_id"] == call.id
+        await _request(
+            replay_reader,
+            replay_writer,
+            12,
+            "approve",
+            {"request_id": call.id},
+        )
+        assert _tool_stdout(await _event(replay_reader, "tool_end")) == "released-c"
+        await _event(replay_reader, "agent_end")
+        assert any(
+            isinstance(block, TextContent) and "gamma-c" in block.text
+            for messages, _schemas in backend.calls
+            for message in messages
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+        )
     finally:
         if replay_writer is not None:
             await _close(server, replay_writer)
@@ -1254,7 +1373,7 @@ async def test_session_host_commands_live_approval_before_resume_keeps_original_
         {
             "command": (
                 'test "$GAMMA_TEST_TOKEN" = live-a '
-                '&& printf live-pass || printf live-fail'
+                "&& printf live-pass || printf live-fail"
             )
         },
     )
@@ -1380,7 +1499,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
         {
             "command": (
                 'test -z "$GAMMA_TEST_TOKEN" '
-                '&& printf durable-none || printf leaked-host-env'
+                "&& printf durable-none || printf leaked-host-env"
             )
         },
     )
@@ -1469,14 +1588,17 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             },
         )
         assert "result" in resumed[-1]
-        assert len(
-            [
-                row
-                for row in server.runtime.opened.store.entries
-                if row.type == "approval_resolution"
-                and row.data.get("request_id") == call.id
-            ]
-        ) == 1
+        assert (
+            len(
+                [
+                    row
+                    for row in server.runtime.opened.store.entries
+                    if row.type == "approval_resolution"
+                    and row.data.get("request_id") == call.id
+                ]
+            )
+            == 1
+        )
     finally:
         if replay_writer is not None:
             await _close(server, replay_writer)
@@ -1537,6 +1659,10 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
         assert forced[-1]["error"]["code"] == -32000
         assert server.runtime.state is None
         assert server.control._active_host_commands is None
+        no_send = await _request(reader, writer, 40, "send", {"text": "must fail"})
+        assert no_send[-1]["error"]["code"] == -32003
+        server.control._schedule_background_wake(session_id)
+        assert server.control._turn_task is None
 
         await real_resume(session_id)
         server.control._active_host_commands = binding_a
@@ -1562,6 +1688,10 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
         assert replacement[-1]["error"]["code"] == -32000
         assert server.runtime.state is None
         assert server.control._active_host_commands is None
+        no_send = await _request(reader, writer, 50, "send", {"text": "must fail"})
+        assert no_send[-1]["error"]["code"] == -32003
+        server.control._schedule_background_wake(session_id)
+        assert server.control._turn_task is None
 
         monkeypatch.setattr(server.control, "unhealthy", lambda: False)
         monkeypatch.setattr(server.runtime, "resume_session", real_resume)

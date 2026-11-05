@@ -441,9 +441,9 @@ class ServeControl:
         state = self.server.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
-        if not loop.schedule_notification_turn():
-            return
         host_commands = self._active_host_commands
+        if host_commands is None or not loop.schedule_notification_turn():
+            return
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(session_id, host_commands)
         )
