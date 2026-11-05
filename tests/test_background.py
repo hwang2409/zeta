@@ -21,7 +21,7 @@ import pytest
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import wait_for_path_command
+from tests.support.processes import read_pid_file, wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
@@ -1982,12 +1982,7 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         ),
         tmp_path,
     )
-    for _ in range(100):
-        if child_pid_file.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert child_pid_file.exists()
-    child_pid = int(child_pid_file.read_text())
+    child_pid = await read_pid_file(child_pid_file)
     second_snapshot_started = asyncio.Event()
     release_second_snapshot = asyncio.Event()
     original_snapshot = spawn_module._snapshot_descendants_sync
