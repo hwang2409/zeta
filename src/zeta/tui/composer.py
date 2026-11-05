@@ -358,6 +358,8 @@ class TurnConsumerMixin:
             return False
         if not (suppress_errors and event.type is StreamEventType.ERROR):
             self._print_unit(rendered)
+            if event.type is StreamEventType.ERROR:
+                self._turn_had_visible_output = True
         if event.type is not StreamEventType.ERROR or not is_retryable_error(
             event.error
         ):
