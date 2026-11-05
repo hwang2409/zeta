@@ -1970,7 +1970,10 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
     child_pid_file = tmp_path / "child.pid"
     child_code = (
         "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
-        f"open({str(child_pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
+        # write then rename, so the file never exists while it is still empty
+        f"open({str(child_pid_file)!r} + '.tmp', 'w').write(str(os.getpid())); "
+        f"os.replace({str(child_pid_file)!r} + '.tmp', {str(child_pid_file)!r}); "
+        "time.sleep(30)"
     )
     tasks = BackgroundTaskRegistry(term_grace=0.03)
     task_id, _ = await tasks.start(
