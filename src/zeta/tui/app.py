@@ -64,7 +64,6 @@ from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
-    ClipboardError,
     ComposerAttachmentMixin,
     ComposerCompleter,
     FullScreenPromptSession,
@@ -72,7 +71,6 @@ from .composer import (
     TurnConsumerMixin,
     UndoCandidate,
     build_key_bindings,
-    copy_to_clipboard,
 )
 from .fork_session import ForkRuntimeMixin, RuntimeResult
 from .layout import (
@@ -347,7 +345,6 @@ class TUIApp(
         )
         self._status_restore_text = ""
         self._status_restore_cursor = 0
-        self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
         self._init_fork_view()
         self._todo_widget = TodoWidget(
@@ -627,19 +624,6 @@ class TUIApp(
         else:
             self._composer_insertions.append(token)
 
-
-    def _copy_selection(self, text: str) -> str:
-        """Put a finished mouse selection on both clipboards; describe the outcome."""
-        lines = text.count("\n") + 1
-        noun = "line" if lines == 1 else "lines"
-        # prompt-toolkit's own clipboard so vi `p` can paste into the composer
-        # even when no system clipboard tool exists.
-        get_app().clipboard.set_text(text)
-        try:
-            copy_to_clipboard(text)
-        except ClipboardError as exc:
-            return f"copy failed: {exc}"
-        return f"copied {lines} {noun}"
 
     def _answer_first_pending(self, verb: str) -> None:
         """Answer the request the y/n shortcuts point at, if it is still there."""
