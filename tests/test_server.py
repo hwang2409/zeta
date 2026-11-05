@@ -59,6 +59,7 @@ from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -3262,6 +3263,71 @@ async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
         "retry",
         "assistant_reset",
         "assistant_delta",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
+    client = object.__new__(ServeControl)
+    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    async def ignore_stale_approvals(_session_id: str | None) -> None:
+        return None
+
+    client._notify = notify
+    client._end_stale_approvals = ignore_stale_approvals
+    await client._event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "kind": "output_limit_recovery",
+                "reason": "max_tokens",
+                "text": "output token limit reached while writing a <write> call",
+            },
+        ),
+        session_id="session",
+        background=True,
+    )
+    await client._event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo(
+                "max_tokens",
+                "the model reached its output-token limit while thinking and did not produce a reply",
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    assert notifications == [
+        (
+            "retry",
+            {
+                "data": {
+                    "kind": "output_limit_recovery",
+                    "reason": "max_tokens",
+                    "text": "output token limit reached while writing a <write> call",
+                }
+            },
+        ),
+        (
+            "error",
+            {
+                "error": {
+                    "code": "max_tokens",
+                    "message": "the model reached its output-token limit while thinking and did not produce a reply",
+                },
+                "data": {},
+            },
+        ),
     ]
 
 

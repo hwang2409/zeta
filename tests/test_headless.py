@@ -19,6 +19,7 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRule
 from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    ErrorInfo,
     Message,
     MessageOrigin,
     MessageRole,
@@ -113,6 +114,55 @@ async def test_headless_text_marks_restarted_assistant_output() -> None:
         "discard me\n[assistant response restarted]\nkeep me\n"
     )
     assert "retry scheduled" in stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_headless_renders_tool_output_limit_recovery_and_error() -> None:
+    class LimitedLoop:
+        context_assembler = SimpleNamespace(
+            descendant_usage={}, descendant_usage_by_model={}
+        )
+
+        async def run_turn(
+            self,
+            _prompt: str,
+            *,
+            origin: MessageOrigin,
+            user_message: Message | None = None,
+        ):
+            del origin, user_message
+            yield StreamEvent(
+                StreamEventType.RETRY,
+                data={
+                    "kind": "output_limit_recovery",
+                    "reason": "max_tokens",
+                    "text": "output token limit reached while writing a <write> call",
+                },
+            )
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo(
+                    "max_tokens",
+                    "the model reached its output-token limit while thinking and did not produce a reply",
+                ),
+            )
+
+    code, stdout, stderr = await _drive(LimitedLoop(), "hello", "json")  # type: ignore[arg-type]
+
+    rows = [json.loads(line) for line in stdout.splitlines()]
+    assert code == 1
+    assert next(row for row in rows if row["type"] == "retry") == {
+        "type": "retry",
+        "text": "output token limit reached while writing a <write> call",
+        "kind": "output_limit_recovery",
+        "reason": "max_tokens",
+    }
+    assert rows[-1] == {
+        "type": "error",
+        "code": "max_tokens",
+        "message": "the model reached its output-token limit while thinking and did not produce a reply",
+    }
+    assert "max_tokens" in stderr
 
 
 def test_print_mode_runs_session_hook_inside_async_activation(

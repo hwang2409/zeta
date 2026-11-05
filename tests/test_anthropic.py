@@ -3959,10 +3959,19 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: content_block_start
-data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-write","name":"write"}}
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-read","name":"read"}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"large.txt\\",\\"content\\":\\"unfinished"}}
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"source.txt\\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-write","name":"write"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"large.txt\\",\\"content\\":\\"unfinished"}}
 
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":16384}}
@@ -4034,7 +4043,12 @@ async def test_max_tokens_mid_tool_call_recovers_and_next_response_runs(
         )
 
     client, store, loop = _max_tokens_loop(
-        tmp_path, handler, tools={"write": lambda arguments: executed.append(arguments)}
+        tmp_path,
+        handler,
+        tools={
+            "read": lambda arguments: executed.append(arguments),
+            "write": lambda arguments: executed.append(arguments),
+        },
     )
     events = [
         event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
@@ -4093,6 +4107,18 @@ async def test_two_consecutive_max_tokens_mid_tool_calls_end_with_max_tokens(
         if event.type is StreamEventType.ERROR and event.error is not None
     ]
     assert len(requests) == 2
+    recovery_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.RETRY
+        and event.data.get("kind") == "output_limit_recovery"
+    ]
+    error_index = next(
+        index for index, event in enumerate(events) if event.error is errors[-1]
+    )
+    assert len(recovery_indexes) == 1
+    assert recovery_indexes[0] < error_index
+    assert events[-1].type is StreamEventType.AGENT_END
     assert errors[-1].code == "max_tokens"
     assert "output-token limit" in errors[-1].message
     assert all(error.code != "stream_error" for error in errors)
@@ -4165,7 +4191,13 @@ async def test_real_anthropic_stream_disconnect_still_retries(
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=disconnected if requests == 1 else SIMPLE_TEXT_RESPONSE,
+            text=(
+                MAX_TOKENS_MID_WRITE
+                if requests == 1
+                else disconnected
+                if requests == 2
+                else SIMPLE_TEXT_RESPONSE
+            ),
             request=request,
         )
 
@@ -4174,10 +4206,17 @@ async def test_real_anthropic_stream_disconnect_still_retries(
         event async for event in loop.run_turn("write it", origin=MessageOrigin.USER)
     ]
 
-    assert requests == 2
-    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert requests == 3
     assert any(
-        message.metadata.get("provider_retries") for message in store.messages()
+        event.type is StreamEventType.RETRY
+        and event.data.get("kind") == "output_limit_recovery"
+        for event in events
     )
+    provider_retries = [
+        record
+        for message in store.messages()
+        for record in message.metadata.get("provider_retries", [])
+    ]
+    assert len(provider_retries) == 1
     assert store.messages()[-1].content == [TextContent("done")]
     await client.aclose()

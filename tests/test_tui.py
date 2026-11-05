@@ -6481,6 +6481,35 @@ def test_retry_notice_is_dim() -> None:
     assert rendered.style == DIM
 
 
+def test_tool_output_limit_recovery_and_error_render_in_scrollback() -> None:
+    notice = render_event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "kind": "output_limit_recovery",
+                "reason": "max_tokens",
+                "text": "output token limit reached while writing a <write> call",
+            },
+        )
+    )
+    error = render_event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo(
+                "max_tokens",
+                "the model reached its output-token limit while thinking and did not produce a reply",
+            ),
+        )
+    )
+
+    assert isinstance(notice, Text)
+    assert notice.plain == "output token limit reached while writing a <write> call"
+    assert error is not None
+    rendered_error = terminal_plain(error)
+    assert "max_tokens" in rendered_error
+    assert "output-token limit" in rendered_error
+
+
 @pytest.mark.asyncio
 async def test_early_close_retry_drops_inline_partial_from_scrollback(
     tmp_path: Path,

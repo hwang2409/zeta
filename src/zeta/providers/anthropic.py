@@ -664,13 +664,36 @@ async def _decode_response(
         event, payload = record
         event_type = payload.get("type", event)
         truncation_counts = None
+        incomplete_tool_name = None
         if event_type == "message_stop" and active_blocks:
             truncation_counts = (len(active_blocks), len(stopped_blocks))
+            incomplete_tool_name = next(
+                (
+                    blocks[index].name
+                    for index in sorted(active_blocks, reverse=True)
+                    if blocks[index].kind == "tool_use"
+                ),
+                None,
+            )
         if type(event_type) is str:
             message_state = _advance_message_state(message_state, event_type)
         translated = _translate_event(
             event, payload, blocks, active_blocks, stopped_blocks, usage
         )
+        if (
+            translated is not None
+            and translated.type is StreamEventType.MESSAGE_END
+            and stop_reason == "max_tokens"
+            and incomplete_tool_name is not None
+        ):
+            translated = StreamEvent(
+                translated.type,
+                message=translated.message,
+                data={
+                    **translated.data,
+                    "incomplete_tool_name": incomplete_tool_name,
+                },
+            )
         if translated is None and payload.get("type") == "message_delta":
             delta = payload.get("delta")
             if not isinstance(delta, Mapping):
