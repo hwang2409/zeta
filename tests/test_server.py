@@ -1635,6 +1635,7 @@ async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_matched_ends(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_id = "shared-call"
     target = tmp_path / "input.txt"
@@ -1659,6 +1660,27 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
+    agent_ended = asyncio.Event()
+    publish_approval = server.control._approvals._publish
+    notify = server.control._notify
+
+    async def delay_delegated_approval_end(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if event == "approval_end" and fields.get("request_id") != raw_id:
+            await agent_ended.wait()
+        return await publish_approval(event, session_id, **fields)
+
+    async def record_agent_end(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        published = await notify(event, session_id, **fields)
+        if event == "agent_end":
+            agent_ended.set()
+        return published
+
+    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
+    monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
         await _request(reader, writer, 3, "send", {"text": "both"})
@@ -1675,12 +1697,14 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         frames += await _request(
             reader, writer, 5, "deny", {"request_id": requests[True]["request_id"]}
         )
-        frames += await _frames_until_event(reader, "agent_end")
-        ends = _named_events(frames, "approval_end")
-        assert len(ends) == 2
-        assert sorted(event["request_id"] for event in ends) == sorted(
-            event["request_id"] for event in requests.values()
-        ), frames
+        expected_end_ids = {event["request_id"] for event in requests.values()}
+        while not expected_end_ids <= {
+            event["request_id"] for event in _named_events(frames, "approval_end")
+        }:
+            frames.append(await _read(reader))
+        assert {
+            event["request_id"] for event in _named_events(frames, "approval_end")
+        } == expected_end_ids
     finally:
         await _close(server, writer)
 
