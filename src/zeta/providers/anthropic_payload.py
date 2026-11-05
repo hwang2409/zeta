@@ -30,6 +30,7 @@ from ..protocol.types import (
 )
 from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
+    images_before_prompt,
     is_harness_notification,
 )
 
@@ -224,7 +225,12 @@ def build_messages_payload(
             previous_message_was_nudge = False
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
-        content = _wire_content(message.content)
+        blocks = (
+            images_before_prompt(message.content)
+            if message.role is MessageRole.USER
+            else message.content
+        )
+        content = _wire_content(blocks)
         message_was_appended = bool(content or role != "assistant")
         if message_was_appended:
             wire_messages.append({"role": role, "content": content})

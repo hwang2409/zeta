@@ -28,6 +28,7 @@ from ..protocol.types import (
 from .codex_errors import CodexHTTPError
 from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
+    images_before_prompt,
     is_harness_notification,
 )
 
@@ -198,7 +199,12 @@ def build_responses_payload(
                     raise CodexHTTPError("Codex replay output items are invalid")
                 input_items.extend(_normalize_assistant_item(item) for item in replayed)
                 continue
-            wire_blocks = _wire_text(message.content, output=output)
+            blocks = (
+                images_before_prompt(message.content)
+                if message.role is MessageRole.USER
+                else message.content
+            )
+            wire_blocks = _wire_text(blocks, output=output)
             if not output:
                 input_items.append({"role": "user", "content": wire_blocks})
                 continue

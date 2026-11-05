@@ -23,6 +23,8 @@ from tests.test_server import (
 )
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.providers.anthropic_payload import build_messages_payload
+from zeta.providers.codex_payload import build_responses_payload
 from zeta.server import ZetaServer
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
@@ -708,6 +710,66 @@ async def test_send_images_emits_user_message_with_attachment_summary(
             {"name": "shot.png", "mime_type": "image/png", "size": len(PNG)}
         ]
         await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_keeps_image_before_prompt_in_provider_request(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["user_message_event"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        settings = await _request(
+            reader,
+            writer,
+            3,
+            "set_settings",
+            {
+                "session_id": session_id,
+                "model": "claude-sonnet-5",
+                "approval_mode": "ask",
+            },
+        )
+        assert settings[-1]["result"]["model"] == "claude-sonnet-5"
+        image = {
+            "name": "circle.png",
+            "mime_type": "image/png",
+            "data": base64.b64encode(PNG).decode(),
+        }
+        await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {"session_id": session_id, "text": "what shape is this?", "images": [image]},
+        )
+        await _event(reader, "agent_end")
+
+        messages = backend.calls[0][0]
+        anthropic = build_messages_payload(
+            messages,
+            [],
+            model="claude-sonnet-5",
+            max_tokens=4096,
+            thinking_budget=2048,
+        )
+        codex = build_responses_payload(messages, [], model="gpt-5.6-luna")
+
+        assert [block["type"] for block in anthropic["messages"][-1]["content"]] == [
+            "image",
+            "text",
+        ]
+        assert [block["type"] for block in codex["input"][-1]["content"]] == [
+            "input_image",
+            "input_text",
+        ]
     finally:
         await _close(server, writer)
 
