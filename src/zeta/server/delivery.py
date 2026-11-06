@@ -215,6 +215,7 @@ class DeliveryRequests:
                 "steer",
                 "queued",
                 outcome,
+                accepted_message=message,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -230,7 +231,7 @@ class DeliveryRequests:
         )
         return outcome
 
-    def finalize_turn(
+    async def finalize_turn(
         self,
         session_id: str,
         state: SessionState,
@@ -249,6 +250,14 @@ class DeliveryRequests:
         }.get(outcome)
         if reason is not None:
             state.loop.drop_pending_steering(reason)
+        turn_reason = {
+            TurnOutcome.COMPLETED: "completed",
+            TurnOutcome.FOREGROUND_CANCELED: "user_stop",
+            TurnOutcome.SESSION_CANCELED: "user_stop",
+            TurnOutcome.FAILED: "error",
+            TurnOutcome.DISCONNECTED: "disconnect",
+        }[outcome]
+        await state.opened.store.append_turn_end_async(turn_reason)
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()

@@ -72,6 +72,7 @@ from ._pending_prompts import (
 )
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
+from ._turn_history import TurnHistoryMixin, validate_turn_end_data
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -110,6 +111,7 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
+    TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
 ):
@@ -544,6 +546,8 @@ class ConversationStore(
                 validate_compaction_data(entry.data)
             elif entry.type == "client_delivery":
                 validate_client_delivery_data(entry.data, self.session_id)
+            elif entry.type == "turn_end":
+                validate_turn_end_data(entry.data)
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")

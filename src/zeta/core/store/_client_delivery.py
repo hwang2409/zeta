@@ -95,10 +95,13 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        if (
-            set(data) != {"delivery_id", "method", "status", "outcome"}
-            or not valid_acceptance
-        ):
+        accepted_message = data.get("accepted_message")
+        if accepted_message is not None:
+            if not (method == "steer" and status == "queued" and isinstance(accepted_message, dict)):
+                raise ValueError("invalid accepted steering message")
+            Message.from_dict(accepted_message)
+        allowed = {"delivery_id", "method", "status", "outcome", "accepted_message"}
+        if set(data) - allowed or not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
 
@@ -229,9 +232,16 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        accepted_message: Message | None = None,
     ) -> ClientDelivery:
         """Atomically append one acceptance and its optional user message."""
 
+        if message is not None and accepted_message is not None:
+            raise ValueError("message and accepted_message are mutually exclusive")
+        if accepted_message is not None and (
+            method != "steer" or status != "queued" or accepted_message.role is not MessageRole.USER
+        ):
+            raise ValueError("invalid accepted steering message")
         with self._append_lock():
             if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
@@ -243,6 +253,7 @@ class ClientDeliveryMixin:
                         "method": method,
                         "status": status,
                         "outcome": dict(outcome),
+                        **({"accepted_message": accepted_message.to_dict()} if accepted_message is not None else {}),
                     },
                 )
             ]
@@ -266,6 +277,7 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        accepted_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
@@ -277,6 +289,7 @@ class ClientDeliveryMixin:
             status,
             outcome,
             message=message,
+            accepted_message=accepted_message,
             _on_persisted=on_persisted,
         )
 

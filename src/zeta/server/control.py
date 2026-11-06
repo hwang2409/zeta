@@ -438,7 +438,7 @@ class ServeControl:
                 data={},
             )
         finally:
-            self.deliveries.finalize_turn(
+            await self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
         if agent_end is not None:
@@ -507,7 +507,7 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
-            self.deliveries.finalize_turn(
+            await self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
         if agent_end is not None:
@@ -562,7 +562,7 @@ class ServeControl:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
-            self.deliveries.finalize_turn(
+            await self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
         if agent_end is not None:
@@ -626,11 +626,13 @@ class ServeControl:
                     wire_event, session_id, **event_contract.assistant_message(event)
                 )
             return
+        controller = self.server.connections.controller_metadata()
+        fidelity = controller is not None and "session_history_fidelity" in controller.features
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,
                 session_id,
-                **event_contract.tool_output(event),
+                **event_contract.tool_output(event, fidelity=fidelity),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
@@ -639,7 +641,7 @@ class ServeControl:
             await self._notify(
                 wire_event,
                 session_id,
-                **event_contract.tool_start(event),
+                **event_contract.tool_start(event, fidelity=fidelity),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
@@ -648,7 +650,7 @@ class ServeControl:
             await self._notify(
                 wire_event,
                 session_id,
-                **event_contract.tool_end(event),
+                **event_contract.tool_end(event, fidelity=fidelity),
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:

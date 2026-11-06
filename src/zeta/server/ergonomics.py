@@ -373,7 +373,7 @@ def history_projection(
         if entry.type in {"message", "notification"}:
             entries[-1].append(entry)
             entries.append([])
-        elif entry.type in {"approval_resolution", "approval_history"}:
+        elif entry.type == "client_delivery" or entry.type in {"approval_resolution", "approval_history"}:
             entries[-1].append(entry)
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
@@ -413,6 +413,14 @@ def _attach_row_handle(
     return block
 
 
+def _project_tool_call_arguments(call: dict[str, object], *, fidelity: bool) -> dict[str, object]:
+    arguments = call.get("arguments", {})
+    if not fidelity:
+        return {"arguments": {}}
+    projected, truncated = event_contract.project_tool_value(arguments)
+    return {"arguments": projected, "arguments_truncated": truncated}
+
+
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
@@ -422,6 +430,17 @@ def _history_entry_rows(
     """Project one durable entry to one atomic group of history rows."""
 
     entry_type = entry.type
+    if entry_type == "client_delivery":
+        data = entry.data
+        if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
+            return []
+        row = {"id": entry.id, "role": "system", "event": "delivery_status", "delivery_id": data.get("delivery_id"), "method": "steer", "status": data.get("status"), "content": []}
+        if "reason" in data:
+            row["reason"] = data["reason"]
+        accepted = data.get("accepted_message")
+        if isinstance(accepted, dict):
+            row["content"] = [{"type": "text", "text": bounded(next((b.get("text", "") for b in accepted.get("content", []) if isinstance(b, dict) and b.get("type") == "text"), ""), 8000)}]
+        return [row]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -438,6 +457,12 @@ def _history_entry_rows(
             }
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
+    if entry_type == "turn_end":
+        data = entry.data if isinstance(entry.data, dict) else {}
+        row = {"id": entry.id, "role": "system", "event": "turn_end", "data": {}}
+        if "reason" in data:
+            row["data"] = {"reason": data["reason"]}
+        return [row]
     if entry_type == "notification":
         data = entry.data
         kind = data.get("kind", "agent_completion")
@@ -477,7 +502,7 @@ def _history_entry_rows(
                     "tool_call": {
                         "id": call["id"],
                         "name": call["name"],
-                        "arguments": {},
+                        **_project_tool_call_arguments(call, fidelity=fidelity),
                     },
                 }
             )
@@ -501,7 +526,23 @@ def _history_entry_rows(
                         stub, entry.id, "message.tool_result.content_blocks", index,
                         fidelity=fidelity, content_read=content_read,
                     ))
-        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks, "structured_content": None}
+        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks}
+        structured = result.get("structured_content")
+        if fidelity and structured is not None:
+            projected, wire_truncated = event_contract.project_tool_value(structured)
+            source_facts = (
+                isinstance(structured, dict)
+                and type(structured.get("stdout_truncated")) is bool
+                and type(structured.get("stderr_truncated")) is bool
+            )
+            source_truncated = (
+                True if isinstance(structured, dict) and (structured.get("stdout_truncated") is True or structured.get("stderr_truncated") is True)
+                else False if source_facts else None
+            )
+            result["structured_content"] = projected
+            result["structured_content_truncated"] = True if wire_truncated or source_truncated is True else source_truncated
+        else:
+            result["structured_content"] = None
     row = {
         "id": entry.id,
         "role": message["role"],

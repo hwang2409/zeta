@@ -4,7 +4,31 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..protocol.types import StreamEvent, StreamEventType
-from .protocol import bounded
+from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
+
+
+def project_tool_value(value: object) -> tuple[object, bool]:
+    """Bound string leaves in tool wire data."""
+    if isinstance(value, str):
+        projected = bounded(value, TOOL_OUTPUT_MAX_BYTES)
+        return projected, projected != value
+    if isinstance(value, dict):
+        result: dict[object, object] = {}
+        truncated = False
+        for key, item in value.items():
+            projected, item_truncated = project_tool_value(item)
+            result[key] = projected
+            truncated |= item_truncated
+        return result, truncated
+    if isinstance(value, (list, tuple)):
+        result = []
+        truncated = False
+        for item in value:
+            projected, item_truncated = project_tool_value(item)
+            result.append(projected)
+            truncated |= item_truncated
+        return result, truncated
+    return value, False
 
 LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
 NOTIFICATION_WIRE_EVENTS = {
@@ -57,15 +81,22 @@ def assistant_message(event: StreamEvent) -> dict[str, object]:
     return {"message": message}
 
 
-def tool_start(event: StreamEvent) -> dict[str, object]:
-    return {"tool_call": _tool_call(event), "data": dict(event.data)}
+def tool_start(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    tool_call = _tool_call(event)
+    if fidelity and tool_call is not None:
+        arguments, truncated = project_tool_value(tool_call.get("arguments", {}))
+        tool_call = {**tool_call, "arguments": arguments, "arguments_truncated": truncated}
+    return {"tool_call": tool_call, "data": dict(event.data)}
 
 
-def tool_output(event: StreamEvent) -> dict[str, object]:
+def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    data = dict(event.data)
+    if fidelity:
+        data, _ = project_tool_value(data)
     return {
         "tool_call": _tool_call(event),
         "output": bounded(event.delta or _data_text(event.data)),
-        "data": dict(event.data),
+        "data": data,
     }
 
 
@@ -77,10 +108,14 @@ def approval_end(payload: Mapping[str, object]) -> dict[str, object]:
     return dict(payload)
 
 
-def tool_end(event: StreamEvent) -> dict[str, object]:
+def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    result = event.tool_result.to_dict() if event.tool_result else None
+    if fidelity and result is not None:
+        projected, truncated = project_tool_value(result)
+        result = {**projected, "structured_content_truncated": truncated}
     return {
         "tool_call": _tool_call(event),
-        "tool_result": event.tool_result.to_dict() if event.tool_result else None,
+        "tool_result": result,
         "data": dict(event.data),
     }
 
