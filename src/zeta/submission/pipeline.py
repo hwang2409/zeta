@@ -65,14 +65,6 @@ class _PreprocessingDone:
 
 
 @dataclass(frozen=True, slots=True)
-class _AttachmentDone:
-    submission: Submission
-    pending_tokens: dict[str, Path]
-    message: Message | None = None
-    error: BaseException | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class _CommandDone:
     submission: Submission
     receipt: str | None = None
@@ -433,9 +425,7 @@ class SubmissionPipeline:
                 elif isinstance(message, _Retry):
                     self._on_retry(message)
                 elif isinstance(message, _PreprocessingDone):
-                    self._on_preprocessing_done(message)
-                elif isinstance(message, _AttachmentDone):
-                    self._on_attachment_done(message)
+                    await self._on_preprocessing_done(message)
                 elif isinstance(message, _CommandDone):
                     self._on_command_done(message)
                 elif isinstance(message, _ProviderDone):
@@ -493,7 +483,7 @@ class SubmissionPipeline:
                 elif isinstance(slash_output, ModelInputEnvelope):
                     entry.model_input = slash_output
                     entry.attachment_value = entry.submission.text
-                    self._start_attachment_preparation(entry, parsed)
+                    await self._prepare_submission(entry, parsed)
                 elif slash_output is not None:
                     self._host._release_attachment_paths(
                         entry.submission.attachment_paths
@@ -502,7 +492,7 @@ class SubmissionPipeline:
                     self._host._handle_slash_output(slash_output)
                     self._finish_entry(entry, SubmissionState.CANCELED)
                 else:
-                    self._start_attachment_preparation(entry, parsed)
+                    await self._prepare_submission(entry, parsed)
         if entry.state in {
             SubmissionState.CANCELED,
             SubmissionState.READY,
@@ -663,7 +653,7 @@ class SubmissionPipeline:
                 result = _CommandDone(submission, error=exc)
         self._send(result)
 
-    def _start_attachment_preparation(self, entry: _Entry, parsed: str) -> None:
+    async def _prepare_submission(self, entry: _Entry, parsed: str) -> None:
         envelope = (
             entry.model_input
             if entry.model_input is not None
@@ -672,61 +662,16 @@ class SubmissionPipeline:
         entry.model_input = envelope
         pending_attachments = list(entry.submission.attachment_paths)
         pending_tokens = dict(entry.submission.attachment_tokens)
-        entry.state = SubmissionState.PREPROCESSING
-        entry.preprocessing = True
-        entry.completion = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            self._host._prepare_user_message(
-                envelope.text,
-                pending_attachments=pending_attachments,
-                pending_attachment_tokens=pending_tokens,
-                attachment_value=entry.attachment_value,
-            )
+        message = await self._host._prepare_user_message(
+            envelope.text,
+            pending_attachments=pending_attachments,
+            pending_attachment_tokens=pending_tokens,
+            attachment_value=entry.attachment_value,
         )
-        entry.child_task = task
-        self._track_waiter(entry, task)
-        task.add_done_callback(
-            lambda completed, submission=entry.submission: self._attachment_done(
-                submission, pending_tokens, completed
-            )
-        )
-
-    def _attachment_done(
-        self,
-        submission: Submission,
-        pending_tokens: dict[str, Path],
-        task: asyncio.Task[Message | None],
-    ) -> None:
-        if task.cancelled():
-            result = _AttachmentDone(submission, pending_tokens)
-        else:
-            try:
-                result = _AttachmentDone(
-                    submission, pending_tokens, message=task.result()
-                )
-            except BaseException as exc:
-                result = _AttachmentDone(submission, pending_tokens, error=exc)
-        self._send(result)
-
-    def _on_attachment_done(self, result: _AttachmentDone) -> None:
-        entry = self._entry_for(result.submission)
-        if entry is None:
-            return
-        entry.child_task = None
-        if entry.state is SubmissionState.CANCELED:
-            self._cancel_or_restore(entry)
-            return
-        if result.error is not None:
-            self._host._print_system(f"submission failed: {result.error}")
-            self._cancel_or_restore(entry)
-            return
-        message = result.message
         if message is None:
             self._host._restore_pending_submission(entry.submission)
             self._finish_entry(entry, SubmissionState.CANCELED)
             return
-        envelope = entry.model_input
-        assert envelope is not None
         metadata = dict(message.metadata)
         metadata[USER_DISPLAY_TEXT_METADATA] = envelope.display_text
         metadata[MESSAGE_ORIGIN_METADATA] = envelope.origin.value
@@ -736,7 +681,7 @@ class SubmissionPipeline:
         entry.candidate = UndoCandidate.from_message(
             entry.submission.text,
             message,
-            result.pending_tokens,
+            pending_tokens,
             entry.submission.next_image_token,
             submission_id=entry.submission.id,
         )
@@ -744,7 +689,7 @@ class SubmissionPipeline:
         entry.signal = entry.signal or self._new_signal()
         entry.state = SubmissionState.READY
 
-    def _on_preprocessing_done(self, message: _PreprocessingDone) -> None:
+    async def _on_preprocessing_done(self, message: _PreprocessingDone) -> None:
         entry = self._entry_for(message.submission)
         if entry is None:
             return
@@ -763,7 +708,7 @@ class SubmissionPipeline:
             self._cancel_or_restore(entry)
         else:
             entry.model_input = message.model_input
-            self._start_attachment_preparation(entry, entry.parsed)
+            await self._prepare_submission(entry, entry.parsed)
 
     def _on_command_done(self, message: _CommandDone) -> None:
         self._command_results[message.submission.id] = message.receipt

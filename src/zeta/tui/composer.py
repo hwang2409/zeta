@@ -46,7 +46,7 @@ from ._attachments import (
     _attachment_path,
     _image_media_type,  # noqa: F401 - preserve the composer import
     _read_attachment,  # noqa: F401 - preserve the composer import
-    attachment_refs,  # noqa: F401 - preserve the composer import
+    attachment_refs,
     build_user_message,
     paste_image,  # noqa: F401 - preserve the composer import
 )
@@ -585,6 +585,14 @@ class ComposerAttachmentMixin:
         attachment_value: str | None = None,
     ) -> Message | None:
         source = value if attachment_value is None else attachment_value
+        pending_paths = self._pending_paths_for(
+            source,
+            pending_attachments=pending_attachments,
+            pending_attachment_tokens=pending_attachment_tokens,
+        )
+        if not pending_paths and not attachment_refs(source, self.loop.store.cwd):
+            return build_user_message(value, self.loop.store.cwd)
+
         notices: list[str] = []
         try:
             message = await asyncio.to_thread(
@@ -604,11 +612,7 @@ class ComposerAttachmentMixin:
 
         valid_pending: list[Path] = []
         pending_blocks = []
-        for path in self._pending_paths_for(
-            source,
-            pending_attachments=pending_attachments,
-            pending_attachment_tokens=pending_attachment_tokens,
-        ):
+        for path in pending_paths:
             try:
                 pending = await asyncio.to_thread(
                     build_user_message,
