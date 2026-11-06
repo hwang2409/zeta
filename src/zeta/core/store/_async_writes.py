@@ -39,17 +39,6 @@ class _PublicationFence:
     agent_lifecycle: dict[str, Any] | None
 
 
-_STEP_DELIVERY_WRITES = frozenset(
-    {
-        "_warm_step_delivery_writer",
-        "_commit_delivery_input",
-        "_stage_delivery_request",
-        "_acknowledge_staged_delivery",
-        "_admit_step_delivery_terminal",
-    }
-)
-
-
 class AsyncDurableWritesMixin:
     """Track, drain, and cancellation-shield writes running in worker threads."""
 
@@ -108,43 +97,24 @@ class AsyncDurableWritesMixin:
     ) -> Any:
         """Run a write against isolated state; the resident store stays loop-owned."""
         try:
-            persistent = method_name in _STEP_DELIVERY_WRITES
-            writer = self._durable_writer if persistent else None
+            writer = self._durable_writer
             if writer is None:
-                writer = (
-                    self._new_persistent_durable_writer()
-                    if persistent
-                    else type(self)(
-                        self.root_dir,
-                        session_id=self.session_id,
-                        _must_exist=True,
-                        _collect_persisted_appends=True,
-                    )
-                )
-                if persistent:
-                    self._durable_writer = writer
-            try:
-                writer_baseline = (
-                    len(writer._entries),
-                    writer._entry_prefix_digest,
-                )
-                full_reload_count = writer._full_reload_count
-                result = getattr(writer, method_name)(*args, **kwargs)
-                state = (
-                    writer._snapshot_log_state()
-                    if persistent
-                    else writer._detach_log_state()
-                )
-                return (
-                    result,
-                    state,
-                    writer.take_persisted_appends(),
-                    writer_baseline,
-                    writer._full_reload_count != full_reload_count,
-                )
-            finally:
-                if not persistent:
-                    writer.close()
+                writer = self._new_persistent_durable_writer()
+                self._durable_writer = writer
+            writer_baseline = (
+                len(writer._entries),
+                writer._entry_prefix_digest,
+            )
+            full_reload_count = writer._full_reload_count
+            result = getattr(writer, method_name)(*args, **kwargs)
+            state = writer._snapshot_log_state()
+            return (
+                result,
+                state,
+                writer.take_persisted_appends(),
+                writer_baseline,
+                writer._full_reload_count != full_reload_count,
+            )
         finally:
             with self._durable_write_condition:
                 self._durable_writes_in_flight -= 1

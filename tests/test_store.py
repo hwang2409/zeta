@@ -1710,6 +1710,101 @@ async def test_off_loop_refresh_cancellation_is_prompt(
 
 
 @pytest.mark.asyncio
+async def test_all_async_writes_reuse_one_persistent_writer(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="persistent-writer")
+
+    await store._to_thread_durable(store.append_pending_prompt, "follow up")
+    writer = store._durable_writer
+    assert writer is not None
+    reload_count = writer._full_reload_count
+    await store._to_thread_durable(
+        store.append_agent_notification,
+        "root:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+
+    assert store._durable_writer is writer
+    assert writer._full_reload_count == reload_count
+
+
+@pytest.mark.asyncio
+async def test_mixed_async_writes_keep_fifo_order(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="persistent-fifo")
+
+    await asyncio.gather(
+        store.append_message_async(
+            with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER)
+        ),
+        store._to_thread_durable(store.append_pending_prompt, "second"),
+        store.append_message_async(
+            with_message_origin(message(MessageRole.USER, "third"), MessageOrigin.USER)
+        ),
+    )
+
+    assert [entry.seq for entry in store._entries] == [1, 2, 3]
+    assert store._durable_writer is not None
+
+
+@pytest.mark.asyncio
+async def test_async_write_cancelled_before_worker_start_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="cancel-before-writer")
+    started = asyncio.Event()
+
+    def block_start(*args: object, **kwargs: object) -> asyncio.Future[object]:
+        started.set()
+        raise AssertionError("worker started")
+
+    monkeypatch.setattr(store, "_start_durable_write", block_start)
+    task = asyncio.create_task(store._to_thread_durable(store.append_pending_prompt, "nope"))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not started.is_set()
+    assert store._entries == []
+
+
+@pytest.mark.asyncio
+async def test_async_write_cancelled_after_worker_start_is_durable(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="cancel-after-writer")
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        task = asyncio.create_task(store._to_thread_durable(store.append_pending_prompt, "durable"))
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        task.cancel()
+        release_fsync.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert store._durable_writer is not None
+    assert store._entries
+
+
+@pytest.mark.asyncio
+async def test_close_drains_and_releases_persistent_writer(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="close-writer")
+    await store._to_thread_durable(store.append_pending_prompt, "durable")
+    assert store._durable_writer is not None
+
+    store.close()
+
+    assert store._durable_writer is None
+    assert store._closed
+
+
+@pytest.mark.asyncio
 async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     tmp_path: Path,
 ) -> None:
