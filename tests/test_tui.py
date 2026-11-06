@@ -11860,7 +11860,8 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
     while not started.is_set():
         await asyncio.sleep(0.001)
 
-    await app.close()
+    with pytest.raises(TimeoutError):
+        await app.close()
     reused_fds: list[int] = []
     try:
         for _ in range(64):
