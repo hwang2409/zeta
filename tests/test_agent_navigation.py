@@ -669,6 +669,16 @@ def test_registered_child_is_discovered_when_agents_directory_stat_is_unchanged(
         return original_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", fixed_agents_stat)
+    scans = 0
+    original_scandir = os.scandir
+
+    def count_scandir(path: object):
+        nonlocal scans
+        if Path(path) == agents:
+            scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
     child = _child(store, 1, description="new child")
     store.register_agent_child(
         ToolCall("child-1", "agent", {"prompt": "work"}),
@@ -679,6 +689,7 @@ def test_registered_child_is_discovered_when_agents_directory_stat_is_unchanged(
 
     assert navigation.refresh()
     assert [entry.path for entry in navigation.entries] == [store.session_dir, child]
+    assert scans == 0
     store.close()
 
 
@@ -733,10 +744,12 @@ def test_refresh_rescans_after_lifecycle_replaced_during_tree_read(
     replaced = False
 
     def children_with_replacement(
-        path: Path, fallback: dict[Path, dict[str, object]]
+        path: Path,
+        fallback: dict[Path, dict[str, object]],
+        **kwargs: object,
     ) -> list[agent_card.AgentEntry]:
         nonlocal replaced
-        entries = original_children(path, fallback)
+        entries = original_children(path, fallback, **kwargs)
         if not replaced:
             child.joinpath("agent_lifecycle.json").write_text(
                 json.dumps({"description": "Live", "state": "completed"})
@@ -765,10 +778,12 @@ def test_refresh_rescans_after_child_created_during_tree_read(
     created = False
 
     def children_with_creation(
-        path: Path, fallback: dict[Path, dict[str, object]]
+        path: Path,
+        fallback: dict[Path, dict[str, object]],
+        **kwargs: object,
     ) -> list[agent_card.AgentEntry]:
         nonlocal created
-        entries = original_children(path, fallback)
+        entries = original_children(path, fallback, **kwargs)
         if not created:
             _child(store, 1, description="New child")
             os.utime(store.session_dir / "agents", None)

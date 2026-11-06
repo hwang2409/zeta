@@ -932,6 +932,8 @@ class AgentNavigation:
         return stat.st_mtime_ns, stat.st_size
 
     def _child_registration_signature(self) -> tuple[object, ...]:
+        """Use the atomically replaced parent state as the registration token."""
+
         state_path = self.current_path / "session_state.json"
         try:
             state = state_path.stat()
@@ -1017,11 +1019,32 @@ class AgentNavigation:
         previous_index = self.selected_index
         fallback: dict[Path, dict[str, Any]] = {}
         if self.current_path == self.root_path:
-            for marker in self.store.agent_children().values():
-                child_path = marker.get("child_session_path")
-                if isinstance(child_path, str):
-                    fallback[Path(child_path)] = marker
-        children = self._children(self.current_path, fallback)
+            markers = self.store.agent_children().values()
+        else:
+            state = _read_json(self.current_path / "session_state.json")
+            children_state = state.get("agent_children")
+            markers = children_state.values() if isinstance(children_state, dict) else ()
+        for marker in markers:
+            if not isinstance(marker, dict):
+                continue
+            child_path = marker.get("child_session_path")
+            if isinstance(child_path, str):
+                fallback[Path(child_path)] = marker
+        scan_all = force or self._refresh_signature is None
+        if not scan_all:
+            previous_registration = self._refresh_signature[2]
+            current_registration = signature[2]
+            scan_all = (
+                current_registration[0] == previous_registration[0]
+                and current_registration[1] != previous_registration[1]
+            )
+        known = {
+            entry.path
+            for entry in self.entries
+            if entry.path.parent == self.current_path / "agents"
+        }
+        candidates = None if scan_all else known | set(fallback)
+        children = self._children(self.current_path, fallback, candidates=candidates)
         at_root = self.current_path == self.root_path
         main_entry = (
             [self._main_entry()] if self._fork_main_path is not None and at_root else []
@@ -1057,17 +1080,31 @@ class AgentNavigation:
             max=MAX_AGENT_LIST_ROWS,
         )
 
-    def _children(self, path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
+    def _children(
+        self,
+        path: Path,
+        fallback: dict[Path, dict[str, Any]],
+        *,
+        candidates: set[Path] | None = None,
+    ) -> list[AgentEntry]:
         agents = path / "agents"
-        try:
-            candidates = sorted(
-                (child for child in agents.iterdir() if child.is_dir() and not child.is_symlink()),
-                key=lambda child: (not child.name.isdigit(), child.name),
-            )
-        except OSError:
-            return []
+        if candidates is None:
+            try:
+                candidates = {
+                    child
+                    for child in agents.iterdir()
+                    if child.is_dir() and not child.is_symlink()
+                }
+            except OSError:
+                return []
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda child: (not child.name.isdigit(), child.name),
+        )
         entries: list[AgentEntry] = []
-        for child in candidates:
+        for child in ordered_candidates:
+            if not child.is_dir() or child.is_symlink():
+                continue
             metadata = self._cached_agent_metadata(child, fallback.get(child))
             entries.append(
                 AgentEntry(
