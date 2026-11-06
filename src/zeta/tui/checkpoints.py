@@ -44,7 +44,6 @@ from ..protocol.types import (
 from .cards.base import strip_terminal_controls
 from .render import (
     is_retryable_error,
-    render_agent_notification,
     render_event,
     render_markdown,
     render_thought,
@@ -681,7 +680,7 @@ class CheckpointTranscriptMixin:
                     and entry.id not in presented_notifications
                 ):
                     data = {"notification_id": entry.id, **entry.data}
-                    rendered = render_agent_notification(
+                    rendered = self._presenter.render_event(
                         StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
                     )
                     if rendered is not None:

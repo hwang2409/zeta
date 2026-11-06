@@ -35,6 +35,7 @@ from .agent_sync import (
 )
 from .base import compact_tool_card
 
+AGENT_TOOL_NAME = "agent"
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TAIL_LINES = 20

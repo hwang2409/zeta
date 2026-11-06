@@ -12,6 +12,7 @@ from rich.text import Text
 
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
+from ..cards.agent_message import AgentIdentityIndex
 from ..cards.agent_sync import refresh_agent_cards
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
@@ -40,11 +41,13 @@ class TranscriptPresenter:
         console: Console,
         full_screen_active: Callable[[], bool],
         print_callback: Callable[[RenderableType | None], None],
+        agent_markers: Callable[[], dict[str, dict[str, object]]] | None = None,
     ) -> None:
         self.transcript = transcript
         self.console = console
         self._full_screen_active = full_screen_active
         self._print_callback = print_callback
+        self._agent_identities = AgentIdentityIndex(agent_markers)
         self._printed_units = False
         self._active_tool_calls: set[ToolLifecycleKey] = set()
         self._background_tool_ids: set[ToolLifecycleKey] = set()
@@ -331,8 +334,12 @@ class TranscriptPresenter:
         self._thinking_stream = None
         self.reset_assistant_unit()
 
+    def render_event(self, event: StreamEvent) -> RenderableType | None:
+        self._agent_identities.observe(event)
+        return render_event(event, self._agent_identities)
+
     def update_tool_region(self, event: StreamEvent) -> bool:
-        rendered = render_event(event)
+        rendered = self.render_event(event)
         if not isinstance(rendered, Text):
             return False
         if self._full_screen_active():
@@ -406,7 +413,7 @@ class TranscriptPresenter:
             lifecycle_key = _event_tool_lifecycle_key(event)
             if lifecycle_key is not None:
                 self._active_tool_calls.add(lifecycle_key)
-            rendered = render_event(event)
+            rendered = self.render_event(event)
             if rendered is None:
                 return ToolEventPresentation()
             if self._full_screen_active() and event.tool_call is not None:
@@ -464,7 +471,7 @@ class TranscriptPresenter:
                         if unit is not None:
                             unit.card.set_child_session_path(path)
                 return ToolEventPresentation(visible_output=True)
-        rendered = render_event(event)
+        rendered = self.render_event(event)
         if not self._full_screen_active() and event.tool_call is not None:
             lifecycle_key = _event_tool_lifecycle_key(event)
             unit = self._tool_region_units.get(lifecycle_key)
@@ -501,10 +508,10 @@ class TranscriptPresenter:
 
         call = event.tool_call
         if not self._full_screen_active():
-            self.print_unit(render_event(event))
+            self.print_unit(self.render_event(event))
             return
         if call is None:
-            self.print_unit(render_event(event))
+            self.print_unit(self.render_event(event))
             return
         start_event = StreamEvent(
             StreamEventType.TOOL_EXECUTION_START,
@@ -514,7 +521,7 @@ class TranscriptPresenter:
         lifecycle_key = _event_tool_lifecycle_key(event)
         if lifecycle_key not in self.transcript._tools:
             self.replay_tool_start(start_event)
-        rendered = render_event(event)
+        rendered = self.render_event(event)
         if rendered is not None:
             self.transcript.finish_tool(call.id, rendered, event)
 
@@ -524,7 +531,7 @@ class TranscriptPresenter:
         call = event.tool_call
         if call is None:
             return
-        rendered = render_event(event)
+        rendered = self.render_event(event)
         if rendered is None:
             return
         if not self._full_screen_active():
