@@ -69,26 +69,25 @@ def detach_completion_menus(container: Container) -> None:
 
 
 class CommandMenuFloat(Float):
-    """Completion menu pinned to the rows directly above the composer chrome.
+    """Completion menu pinned to the rows directly above the composer.
 
     prompt-toolkit's cursor-anchored float opens below the cursor whenever
     the rows fit, which here means over the composer and footer. Anchoring
-    the float's bottom edge to the chrome's live height keeps the menu above
-    the composer however many rows it needs, still aligned to the cursor
-    column so it grows out of the `/` that opened it.
+    the float's bottom edge to the composer's live position keeps the menu
+    touching the composer while it covers any rows above it.
     """
 
-    def __init__(self, chrome_height: Callable[[], int], **kwargs: object) -> None:
-        self._chrome_height = chrome_height
+    def __init__(self, composer_top: Callable[[], int], **kwargs: object) -> None:
+        self._composer_top = composer_top
         super().__init__(**kwargs)  # type: ignore[arg-type]
 
     @property
-    def bottom(self) -> int:
-        return self._chrome_height()
+    def top(self) -> int:
+        return max(0, self._composer_top() - (self.get_height() or 0))
 
-    @bottom.setter
-    def bottom(self, value: int | None) -> None:
-        # Float.__init__ stores its argument here; the live height wins.
+    @top.setter
+    def top(self, value: int | None) -> None:
+        # Float.__init__ stores its argument here; the live position wins.
         del value
 
 
@@ -98,6 +97,12 @@ class ComposerPadding(Container):
     def __init__(self, content: AnyContainer) -> None:
         self.content = to_container(content)
         self._pad = Window(char=" ", style="class:text-area")
+        self._ypos = 0
+
+    def menu_top(self) -> int:
+        """Return the composer's top row for its completion menu."""
+
+        return self._ypos
 
     def reset(self) -> None:
         self.content.reset()
@@ -123,6 +128,7 @@ class ComposerPadding(Container):
         erase_bg: bool,
         z_index: int | None,
     ) -> None:
+        self._ypos = write_position.ypos
         content_height = self.content.preferred_height(
             write_position.width, write_position.height
         ).preferred
@@ -273,15 +279,13 @@ def queued_lines(panel: QueuedPanel, terminal_width: int) -> StyleAndTextTuples:
     return fragments
 
 
-def command_menu_float(chrome_height: Callable[[], int]) -> Float:
-    """The completion menu, constrained to the rows above the bottom chrome.
+def command_menu_float(composer_top: Callable[[], int]) -> Float:
+    """The completion menu, constrained to the rows above the composer.
 
-    A cursor-anchored float with only a bottom offset is allowed to extend past
-    the top edge when its preferred height is larger than the available space.
-    In a short terminal prompt-toolkit then paints the menu over the TODO,
-    composer, and footer.  Limit the menu height to the space that its bottom
-    anchor actually leaves; one row is still useful for keyboard completion and
-    keeps the menu from corrupting the bottom chrome.
+    A fixed-height float is allowed to extend past the top edge when its
+    preferred height is larger than the available space. Limit the menu height
+    to the space that its live composer anchor leaves;
+    one row is still useful for keyboard completion in a short terminal.
     """
 
     menu = CompletionsMenu(
@@ -294,11 +298,11 @@ def command_menu_float(chrome_height: Callable[[], int]) -> Float:
         output = get_app().output
         size = output.get_size()
         natural_height = menu.preferred_height(size.columns, size.rows).preferred
-        available_height = size.rows - chrome_height()
+        available_height = composer_top()
         return max(1, min(natural_height, COMMAND_MENU_ROWS, available_height))
 
     return CommandMenuFloat(
-        chrome_height,
+        composer_top,
         xcursor=True,
         height=menu_height,
         transparent=True,
@@ -598,7 +602,9 @@ def full_screen_content(
             Window(width=COMPOSER_CONTENT_PADDING, char=" "),
         ]
     )
-    padded_composer_rows = [ComposerPadding(HSplit(list(composer_rows)))] if composer_rows else []
+    composer = ComposerPadding(HSplit(list(composer_rows)))
+    padded_composer_rows = [composer] if composer_rows else []
+
     def viewed_queue() -> QueuedPanel:
         return queued_panel(agent_navigation, queued_messages())
 
@@ -632,7 +638,7 @@ def full_screen_content(
     content = HSplit([transcript_content, bottom])
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
-    floats = [command_menu_float(lambda: max(0, bottom.height - 1))]
+    floats = [command_menu_float(composer.menu_top)]
     if status_window is not None and status_active is not None:
         floats.append(status_card_float(status_window, status_active))
     if tasks_window is not None and tasks_active is not None:

@@ -3182,9 +3182,9 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
     class Response:
         status_code = 200
 
-        async def aiter_lines(self) -> AsyncIterator[str]:
+        async def aiter_bytes(self) -> AsyncIterator[bytes]:
             stream_started.set()
-            yield '{"message":{"content":"partial"}}'
+            yield b'{"message":{"content":"partial"}}\n'
             await asyncio.Event().wait()
 
     class StreamContext:
