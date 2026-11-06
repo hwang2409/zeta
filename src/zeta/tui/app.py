@@ -1133,7 +1133,7 @@ class TUIApp(
             self._active_session = session
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
-                await start_prompt_during_activation(self, session)
+                await start_prompt_during_activation(self, session, run_prompt_toolkit)
             )
             try:
                 if exited:
