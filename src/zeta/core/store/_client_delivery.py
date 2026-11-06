@@ -74,21 +74,6 @@ def valid_client_delivery_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and DELIVERY_ID_PATTERN.fullmatch(value) is not None
 
 
-def validate_accepted_steering_data(data: Mapping[str, object]) -> None:
-    if data.get("kind") != ACCEPTED_STEERING_WARNING_KIND:
-        return
-    accepted_message = data.get("accepted_message")
-    if (
-        set(data)
-        != {"message", "kind", "delivery_id", "accepted_message"}
-        or data.get("message") != "accepted client steering"
-        or not valid_client_delivery_id(data.get("delivery_id"))
-        or not isinstance(accepted_message, dict)
-    ):
-        raise ValueError("invalid accepted steering message")
-    require_new_message_origin(Message.from_dict(accepted_message))
-
-
 def validate_client_delivery_data(
     data: Mapping[str, object], session_id: str
 ) -> None:
