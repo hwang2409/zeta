@@ -1787,7 +1787,7 @@ def test_incremental_transcript_state_equals_full_scan_after_many_appends(
 
 @pytest.mark.parametrize("change", ["truncate", "replace", "rotate"])
 def test_transcript_state_falls_back_after_file_reset(
-    tmp_path: Path, change: str
+    tmp_path: Path, change: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=5)
     path = runner.session_dir / "conversation.jsonl"
@@ -1812,7 +1812,18 @@ def test_transcript_state_falls_back_after_file_reset(
         path.rename(path.with_suffix(".rotated"))
         path.write_bytes(replacement)
 
-    assert runner._transcript_state() == _fresh_transcript_state(runner)
+    parsed = 0
+    real_loads = json.loads
+
+    def counting_loads(value: object, *args: object, **kwargs: object) -> object:
+        nonlocal parsed
+        parsed += 1
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr("zeta.memory.auto.json.loads", counting_loads)
+    reset = runner._transcript_state()
+    assert parsed == 3
+    assert reset == _fresh_transcript_state(runner)
 
 
 def test_transcript_state_waits_for_complete_last_line(tmp_path: Path) -> None:
