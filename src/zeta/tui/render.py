@@ -713,9 +713,11 @@ def render_event(
         if not isinstance(preview, str):
             return Text("delivered child message unavailable", style=theme.ERROR)
         answer_to = answer_question_id(preview)
+        if answer_to is None:
+            label = event.data.get("child_label", "child")
+            return Text(f"delivered to {label}: {preview}", style=theme.DIM)
         header = Text("receive ← parent", style=theme.AGENT_MAIN)
-        if answer_to is not None:
-            header.append(f" · answer to {answer_to}", style=theme.NOTICE)
+        header.append(f" · answer to {answer_to}", style=theme.NOTICE)
         header.append(" · delivered", style=theme.SUCCESS)
         return render_agent_message(header, body=preview)
     if event.type is StreamEventType.ACCOUNT_LIMIT:

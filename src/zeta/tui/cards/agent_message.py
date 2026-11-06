@@ -13,6 +13,7 @@ from rich.text import Text
 
 from ...protocol.types import StreamEvent, ToolCall
 from .. import theme
+from .agent import AGENT_TOOL_NAME
 from .base import render_tool_output, safe_text, tool_panel
 from .shared import MAX_CARD_LINES, MAX_TOOL_SCAN_BYTES, scan_tool_output
 
@@ -51,7 +52,7 @@ class AgentIdentityIndex:
         ):
             return
         name = call.name.casefold()
-        if name == "agent":
+        if name == AGENT_TOOL_NAME:
             item = dict(result.structured_content)
             item.setdefault("model", call.arguments.get("model"))
             self._observe_item(item)
