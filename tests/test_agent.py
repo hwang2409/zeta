@@ -4405,12 +4405,6 @@ def test_child_without_explicit_finish_has_no_finish_guidance() -> None:
     assert "this run ends only when you call the `finish` tool" not in prompt
 
 
-def test_top_level_session_prompt_has_no_finish_guidance() -> None:
-    prompt = "top-level instructions"
-
-    assert "this run ends only when you call the `finish` tool" not in prompt
-
-
 @pytest.mark.asyncio
 async def test_typed_preamble_composes_with_child_system_prompt(tmp_path: Path) -> None:
     backend = FakeBackend(
