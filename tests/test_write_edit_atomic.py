@@ -76,7 +76,7 @@ async def test_file_work_does_not_block_event_loop(
         fd: int, mode: str = "r", *args: object, **kwargs: object
     ) -> Any:
         handle = original_fdopen(fd, mode, *args, **kwargs)
-        return BlockingWriter(handle) if "w" in mode else handle
+        return BlockingWriter(handle) if "w" in mode or "+" in mode else handle
 
     monkeypatch.setattr(os, "fdopen", blocking_fdopen)
 
