@@ -229,7 +229,7 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
         live = await event(reader, "delivery_status")
         assert live["status"] == "dropped"
         assert live["reason"] == "abort"
-        assert live["content"] == [{"type": "text", "text": "also inspect tests"}]
+        assert live["content"] == [{"type": "text", "text": "steer dropped: abort"}]
         status = (await request(reader, writer, 6, "status"))[-1]["result"]
         assert status["state"] == "idle"
 

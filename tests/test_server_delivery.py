@@ -994,22 +994,18 @@ async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> No
         await _close(server, writer)
 
 
-def test_steer_acceptance_keeps_legacy_delivery_shape_and_separate_text(
+def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="compat-session")
-    accepted = with_message_origin(
-        Message(MessageRole.USER, [TextContent("keep me")]), MessageOrigin.USER
-    )
     store.append_client_delivery(
         "compat-steer",
         "steer",
         "queued",
         {"accepted": True},
-        accepted_message=accepted,
     )
 
-    delivery, retained = store.replay()
+    (delivery,) = store.replay()
     assert delivery.type == "client_delivery"
     assert delivery.data == {
         "delivery_id": "compat-steer",
@@ -1017,10 +1013,7 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_and_separate_text(
         "status": "queued",
         "outcome": {"accepted": True},
     }
-    assert retained.type == "warning"
-    assert retained.data["delivery_id"] == "compat-steer"
-    assert retained.data["accepted_message"] == accepted.to_dict()
-    assert all(entry.type != "message" for entry in store.replay())
+    assert all(entry.type not in {"message", "warning"} for entry in store.replay())
     store.close()
 
 
@@ -1033,15 +1026,11 @@ def test_new_steer_acceptance_opens_with_origin_main_reader(tmp_path: Path) -> N
 
     session_root = tmp_path / "sessions"
     store = ConversationStore(session_root, session_id="compat-session")
-    accepted = with_message_origin(
-        Message(MessageRole.USER, [TextContent("keep me")]), MessageOrigin.USER
-    )
     store.append_client_delivery(
         "compat-steer",
         "steer",
         "queued",
         {"accepted": True},
-        accepted_message=accepted,
     )
     store.close()
 

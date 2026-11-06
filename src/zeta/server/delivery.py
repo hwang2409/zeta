@@ -212,7 +212,6 @@ class DeliveryRequests:
                 "steer",
                 "queued",
                 outcome,
-                accepted_message=message,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -275,8 +274,8 @@ class DeliveryRequests:
             dropped = await state.opened.store.drop_client_steering_async(reason)
             connections = control.server.connections
             if connections is not None:
-                for entry, message in dropped:
-                    row = event_contract.delivery_status_row(entry, message)
+                for entry in dropped:
+                    row = event_contract.delivery_status_row(entry)
                     await connections.publish_controller(
                         "delivery_status",
                         session_id,

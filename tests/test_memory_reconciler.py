@@ -5,6 +5,7 @@ from datetime import date
 
 import pytest
 
+from zeta.core.store import ConversationStore
 from zeta.memory.reconciler import (
     ReconciliationError,
     Transcript,
@@ -12,7 +13,13 @@ from zeta.memory.reconciler import (
     parse_proposal,
     prepare_request,
 )
-from zeta.protocol.types import MessageOrigin
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 
 TODAY = date(2026, 10, 6)
 SESSION = "a" * 32
@@ -357,6 +364,28 @@ def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
 
     assert [row["authorship"] for row in rows] == ["agent_prompt", "agent_send"]
     assert all(row["authorship"] != "user" for row in rows)
+
+
+def test_dropped_steer_text_never_reaches_memory_reconciler(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    message = with_message_origin(
+        Message(MessageRole.USER, [TextContent("private dropped steer")]),
+        MessageOrigin.USER,
+    )
+    store.append_client_delivery(
+        "dropped-steer",
+        "steer",
+        "queued",
+        {"accepted": True},
+    )
+    store.queue_client_steering(message, "dropped-steer")
+    store.drop_client_steering("abort")
+    transcript = Transcript(SESSION, tuple(entry.to_dict() for entry in store.replay()))
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+
+    assert "private dropped steer" not in request.prompt
+    store.close()
 
 
 def test_request_excludes_client_delivery_bookkeeping() -> None:

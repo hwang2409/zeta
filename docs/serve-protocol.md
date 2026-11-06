@@ -466,13 +466,15 @@ where status is:
   `delivered`, or `dropped`;
 - `unknown`: the ID was never accepted in this session.
 
-With `session_history_fidelity`, a queued steer that becomes terminal also emits
-a live `delivery_status` event after the terminal row commits. The event has
-`id`, `role: "system"`, `event: "delivery_status"`, `delivery_id`,
-`method: "steer"`, `status` (`delivered` or `dropped`), `content` with the
-accepted steer text when retained, and `reason` for a drop (`restart`, `abort`,
-`clear`, `disconnect`, `turn_end`, or `failed`). The same row appears in
-`session_history`. Missing text or reason in an old session means unknown.
+With `session_history_fidelity`, a queued steer that is dropped emits a live
+`delivery_status` event after the terminal row commits. Terminal `delivered` and
+`dropped` rows both appear in `session_history`. Each row has `id`,
+`role: "system"`, `event: "delivery_status"`, `delivery_id`, `method: "steer"`,
+`status`, and renderable `content` such as `steer dropped: abort`. A dropped row
+also has `reason` (`restart`, `abort`, `clear`, `disconnect`, `turn_end`, or
+`failed`). Accepted steer text is not included yet; it requires a new stored row
+type after the stored-format gate is available. A missing reason in an old
+session means unknown.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
@@ -1150,8 +1152,8 @@ error code and message. Provider status and origin remain internal.
   `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, and `cwd_after`.
   These fields describe retained output; spill paths and spill bytes are never
   sent. Tool-result image blocks become metadata stubs with `type`, `mimeType`,
-  optional `caption`, `width`, and `height`, `size`, and
-  `data_omitted: true`.
+  and `data_omitted: true`. Optional fields are `caption`, `width`, `height`, and
+  `size`; unknown image size is omitted.
 
   The feature also adds terminal steer `delivery_status` rows as described
   above and durable served-turn rows shaped as
@@ -1316,7 +1318,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
-| `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds terminal steer `delivery_status` events/history rows, durable served-turn end reasons, and tool-result image metadata stubs |
+| `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, durable served-turn end reasons, and tool-result image metadata stubs |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends

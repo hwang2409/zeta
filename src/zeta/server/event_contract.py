@@ -4,36 +4,29 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
-from ..protocol.types import Message, StreamEvent, StreamEventType
+from ..protocol.types import StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
 
 
-def delivery_status_row(
-    entry: ConversationEntry, accepted_message: Message | None
-) -> dict[str, object]:
+def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
     """Project one committed steer terminal transition."""
     data = entry.data
+    status = data["status"]
+    text = f"steer {status}"
     row: dict[str, object] = {
         "id": entry.id,
         "role": "system",
         "event": "delivery_status",
         "delivery_id": data["delivery_id"],
         "method": "steer",
-        "status": data["status"],
-        "content": [],
+        "status": status,
+        "content": [{"type": "text", "text": text}],
     }
     if "reason" in data:
         row["reason"] = data["reason"]
-    if accepted_message is not None:
-        text = next(
-            (
-                block.text
-                for block in accepted_message.content
-                if hasattr(block, "text")
-            ),
-            "",
-        )
-        row["content"] = [{"type": "text", "text": bounded(text)}]
+        row["content"] = [
+            {"type": "text", "text": f"{text}: {data['reason']}"}
+        ]
     return row
 
 

@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 CLIENT_DELIVERY_METADATA = "zeta_client_delivery_id"
-ACCEPTED_STEERING_WARNING_KIND = "client_steering_accepted"
 MAX_RECENT_CLIENT_DELIVERIES = 1_000
 DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -228,16 +227,9 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
-        accepted_message: Message | None = None,
     ) -> ClientDelivery:
         """Atomically append one acceptance and its optional user message."""
 
-        if message is not None and accepted_message is not None:
-            raise ValueError("message and accepted_message are mutually exclusive")
-        if accepted_message is not None and (
-            method != "steer" or status != "queued" or accepted_message.role is not MessageRole.USER
-        ):
-            raise ValueError("invalid accepted steering message")
         with self._append_lock():
             if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
@@ -252,18 +244,6 @@ class ClientDeliveryMixin:
                     },
                 )
             ]
-            if accepted_message is not None:
-                rows.append(
-                    (
-                        "warning",
-                        {
-                            "message": "accepted client steering",
-                            "kind": ACCEPTED_STEERING_WARNING_KIND,
-                            "delivery_id": delivery_id,
-                            "accepted_message": accepted_message.to_dict(),
-                        },
-                    )
-                )
             if message is not None:
                 rows.append(
                     (
@@ -284,7 +264,6 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
-        accepted_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
@@ -296,7 +275,6 @@ class ClientDeliveryMixin:
             status,
             outcome,
             message=message,
-            accepted_message=accepted_message,
             _on_persisted=on_persisted,
         )
 
@@ -396,24 +374,18 @@ class ClientDeliveryMixin:
 
     async def drop_client_steering_async(
         self: ConversationStore, reason: DeliveryDropReason
-    ) -> tuple[tuple[ConversationEntry, Message], ...]:
+    ) -> tuple[ConversationEntry, ...]:
         """Commit queued drops off-loop, then release their queue ownership."""
 
         queued = tuple(self._client_steering)
         entries = await self._to_thread_durable(
             self._drop_client_steering, queued, reason
         )
-        by_id = {entry.data["delivery_id"]: entry for entry in entries}
-        committed = tuple(
-            (by_id[item.delivery_id], item.message)
-            for item in queued
-            if item.delivery_id in by_id
-        )
         for expected in queued:
             if not self._client_steering or self._client_steering[0] != expected:
                 raise RuntimeError("client steering queue changed during drop")
             self._client_steering.popleft()
-        return committed
+        return tuple(entries)
 
 
 def image_payload_digest(

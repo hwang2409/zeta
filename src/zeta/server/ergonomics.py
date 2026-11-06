@@ -18,10 +18,7 @@ from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
-from ..core.store._client_delivery import (
-    ACCEPTED_STEERING_WARNING_KIND,
-    CLIENT_DELIVERY_METADATA,
-)
+from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
@@ -188,7 +185,6 @@ class HistoryProjection:
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
-    accepted_messages: Mapping[str, dict[str, object]] = MappingProxyType({})
 
 
 @dataclass
@@ -359,16 +355,8 @@ def history_projection(
             break
 
     approval_calls: dict[str, object] = {}
-    accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     for entry in branch:
-        if (
-            entry.type == "warning"
-            and entry.data.get("kind") == ACCEPTED_STEERING_WARNING_KIND
-        ):
-            accepted_messages[entry.data["delivery_id"]] = entry.data[
-                "accepted_message"
-            ]
         if entry.type == "message":
             approval_calls.update(
                 {
@@ -393,7 +381,9 @@ def history_projection(
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
     built = HistoryProjection(
-        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index), accepted_messages=MappingProxyType(accepted_messages)
+        tuple(tuple(group) for group in entries),
+        MappingProxyType(approval_calls),
+        MappingProxyType(entry_index),
     )
     with _cache_creation_lock:
         cached = _cache(
@@ -439,7 +429,6 @@ def _project_tool_call_arguments(call: dict[str, object], *, fidelity: bool) -> 
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
-    accepted_messages: Mapping[str, dict[str, object]] = MappingProxyType({}),
     *,
     include_delivery_id: bool = False, fidelity: bool = False, content_read: bool = False,
 ) -> list[dict[str, object]]:
@@ -452,9 +441,7 @@ def _history_entry_rows(
         data = entry.data
         if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
             return []
-        accepted = accepted_messages.get(data.get("delivery_id"))
-        message = Message.from_dict(accepted) if isinstance(accepted, dict) else None
-        return [event_contract.delivery_status_row(entry, message)]
+        return [event_contract.delivery_status_row(entry)]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -614,7 +601,7 @@ def _history_group(
         row
         for entry in projection.entry_groups[index]
         for row in _history_entry_rows(
-            entry, projection.approval_calls, projection.accepted_messages,
+            entry, projection.approval_calls,
             include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read,
         )
     ]
@@ -656,7 +643,7 @@ def _history_group_fits(
         row
         for entry in raw_group
         for row in _history_entry_rows(
-            entry, projection.approval_calls, projection.accepted_messages,
+            entry, projection.approval_calls,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
