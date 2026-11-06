@@ -59,6 +59,59 @@ def _render(
     return Text.from_ansi(transcript.render(width)).plain
 
 
+def _render_sequence(
+    events: list[StreamEvent],
+    width: int,
+    *,
+    markers: dict[str, dict[str, object]] | None = None,
+) -> str:
+    transcript = TranscriptWidget()
+    output = StringIO()
+    console = Console(
+        file=output,
+        width=width,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=theme.RICH_THEME,
+    )
+    presenter = TranscriptPresenter(
+        transcript,
+        console,
+        lambda: True,
+        transcript.append,
+        lambda: markers or {},
+    )
+    for event in events:
+        if event.tool_call is not None and event.tool_result is not None:
+            presenter.replay_tool_result(event)
+        else:
+            rendered = presenter.render_event(event)
+            assert rendered is not None
+            presenter.print_unit(rendered)
+    return Text.from_ansi(transcript.render(width)).plain
+
+
+def _tool_result_event(
+    name: str,
+    arguments: dict[str, object],
+    content: str,
+    structured_content: dict[str, object],
+    *,
+    is_error: bool = False,
+) -> StreamEvent:
+    call = ToolCall(f"{name}-1", name, arguments)
+    return StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            content,
+            is_error=is_error,
+            structured_content=structured_content,
+        ),
+    )
+
+
 def _agent_send(message: str, *, handle: str = HANDLE) -> StreamEvent:
     call = ToolCall(
         "send-1",
@@ -188,3 +241,204 @@ def test_long_agent_message_is_bounded(width: int) -> None:
     assert "line 14" in output
     assert "line 15" not in output
     assert "… +185 lines" in output
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_agent_notifications_show_identity_verdict_and_summary(width: int) -> None:
+    summary = "the shutdown path preserves writer ownership until close completes"
+    idle_report = "waiting for the parent to choose the storage cutover window"
+    failure_reason = "child transcript ended before the required review completed"
+    completion = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "agent_completion",
+            "child_instance_id": HANDLE,
+            "description": DESCRIPTION,
+            "status": "completed",
+            "text": "done",
+            "summary": summary,
+            "verdict": "merge-ready",
+            "stats": {"elapsed": 42.1, "turns_used": 3},
+        },
+    )
+    failed = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "agent_completion",
+            "child_instance_id": HANDLE,
+            "description": DESCRIPTION,
+            "status": "error",
+            "text": failure_reason,
+            "stats": {
+                "elapsed": 4.2,
+                "turns_used": 1,
+                "error": True,
+                "canceled": False,
+            },
+        },
+    )
+    idle = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "child_idle",
+            "child_instance_id": HANDLE,
+            "description": DESCRIPTION,
+            "status": "child_idle",
+            "text": idle_report,
+        },
+    )
+
+    completion_output = _render(completion, width, markers=_markers())
+    failed_output = _render(failed, width, markers=_markers())
+    idle_output = _render(idle, width, markers=_markers())
+
+    assert all(
+        value in completion_output
+        for value in (DESCRIPTION, ":159", "completed", "3 turns", summary)
+    )
+    assert "verdict: merge-ready" in completion_output
+    assert all(
+        value in failed_output
+        for value in (DESCRIPTION, ":159", "failed", failure_reason)
+    )
+    assert all(
+        value in idle_output
+        for value in (DESCRIPTION, ":159", "idle", idle_report)
+    )
+    assert "{" not in completion_output + failed_output + idle_output
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
+    nested_handle = f"{HANDLE}:1"
+    spawn = _tool_result_event(
+        "agent",
+        {
+            "description": "storage worker",
+            "agent_type": "general",
+            "model": "gpt-5.6-luna",
+        },
+        "agent completed",
+        {
+            "child_instance_id": HANDLE,
+            "description": "storage worker",
+            "agent_type": "general",
+            "model": "gpt-5.6-luna",
+            "status": "completed",
+            "turns_used": 2,
+            "depth": 1,
+        },
+    )
+    status = _tool_result_event(
+        "agent_status",
+        {},
+        "raw child status serialization",
+        {
+            "children": [
+                {
+                    "handle": HANDLE,
+                    "description": DESCRIPTION,
+                    "agent_type": "planner",
+                    "model": "gpt-5.6-luna",
+                    "state": "running",
+                },
+                {
+                    "handle": "root:160",
+                    "description": "shutdown reviewer",
+                    "agent_type": "reviewer",
+                    "model": "claude-sonnet-5",
+                    "state": "idle",
+                },
+                {
+                    "handle": nested_handle,
+                    "description": "nested verifier",
+                    "agent_type": "worker",
+                    "model": "gpt-5.6-luna",
+                    "state": "completed",
+                },
+            ],
+            "total": 3,
+        },
+    )
+    output = _tool_result_event(
+        "agent_output",
+        {"handle": nested_handle, "offset": 0},
+        "assistant: nested verification passed",
+        {
+            "handle": nested_handle,
+            "offset": 0,
+            "total": 37,
+            "truncated": False,
+        },
+    )
+    cancel = _tool_result_event(
+        "agent_cancel",
+        {"handle": nested_handle},
+        f"agent cancellation confirmed: {nested_handle}",
+        {"handle": nested_handle, "status": "cancellation_confirmed"},
+    )
+
+    spawn_output = _render(spawn, width)
+    controls_output = _render_sequence([status, output, cancel], width)
+
+    assert all(
+        value in spawn_output
+        for value in (
+            "storage worker",
+            "general",
+            "gpt-5.6-luna",
+            ":159",
+            "completed",
+        )
+    )
+    assert all(
+        value in controls_output
+        for value in (
+            f"{DESCRIPTION} :159 · planner · gpt-5.6-luna · running",
+            "shutdown reviewer :160 · reviewer · claude-sonnet-5 · idle",
+            "nested verifier :159:1 · worker · gpt-5.6-luna · completed",
+            "output ← nested verifier :159:1",
+            "page 1-37 of 37",
+            "assistant: nested verification passed",
+            "cancel → nested verifier :159:1",
+            "canceled",
+        )
+    )
+    assert "raw child status serialization" not in controls_output
+    assert "{'children'" not in controls_output
+
+
+def test_unknown_identity_snapshot_is_cached_until_observed() -> None:
+    from zeta.tui.cards.agent_message import AgentIdentityIndex
+
+    snapshots = 0
+
+    def marker_snapshot() -> dict[str, dict[str, object]]:
+        nonlocal snapshots
+        snapshots += 1
+        return {}
+
+    index = AgentIdentityIndex(marker_snapshot)
+
+    assert index.resolve("root:404").label == "child :404"
+    assert index.resolve("root:404").label == "child :404"
+    assert snapshots == 1
+
+    observed = _tool_result_event(
+        "agent_status",
+        {},
+        "status",
+        {
+            "children": [
+                {
+                    "handle": "root:404",
+                    "description": "late child",
+                    "state": "running",
+                }
+            ]
+        },
+    )
+    index.observe(observed)
+
+    assert index.resolve("root:404").label == "late child :404"
+    assert snapshots == 1
