@@ -18,6 +18,7 @@ from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, ProjectDiscovery
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
+from ..mcp.envelope import MCPCallLimits
 from ..media.image_policy import image_policy_for_provider
 from ..memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from ..memory.provider import complete_reconciliation
@@ -257,6 +258,11 @@ def compose_runtime(
             tool_allow_layers=tool_policy.allow_layers,
             image_policy=image_policy_for_provider(provider),
             account_context=account_context,
+            mcp_limits=MCPCallLimits(
+                config.mcp_call_deadline_seconds,
+                config.mcp_max_wire_bytes,
+                config.mcp_spill_after_bytes,
+            ),
             required_tool_names=tuple(
                 dict.fromkeys(
                     (

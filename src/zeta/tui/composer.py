@@ -23,6 +23,7 @@ from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
 from ..core.abort import AbortSignal
+from ..media.image_policy import image_policy_for_provider
 from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
@@ -45,7 +46,7 @@ from ._attachments import (
     _attachment_path,
     _image_media_type,  # noqa: F401 - preserve the composer import
     _read_attachment,  # noqa: F401 - preserve the composer import
-    attachment_refs,  # noqa: F401 - preserve the composer import
+    attachment_refs,
     build_user_message,
     paste_image,  # noqa: F401 - preserve the composer import
 )
@@ -575,7 +576,7 @@ class ComposerAttachmentMixin:
         )
         return selected_paths
 
-    def _prepare_user_message(
+    async def _prepare_user_message(
         self,
         value: str,
         *,
@@ -584,26 +585,39 @@ class ComposerAttachmentMixin:
         attachment_value: str | None = None,
     ) -> Message | None:
         source = value if attachment_value is None else attachment_value
+        pending_paths = self._pending_paths_for(
+            source,
+            pending_attachments=pending_attachments,
+            pending_attachment_tokens=pending_attachment_tokens,
+        )
+        if not pending_paths and not attachment_refs(source, self.loop.store.cwd):
+            return build_user_message(
+                value, self.loop.store.cwd, attachment_value=source
+            )
+
+        notices: list[str] = []
         try:
-            message = build_user_message(
+            message = await asyncio.to_thread(
+                build_user_message,
                 value,
                 self.loop.store.cwd,
                 attachment_value=source,
                 session_store=self.loop.store,
-                on_reference_notice=self._print_system,
+                on_reference_notice=notices.append,
+                image_policy=image_policy_for_provider(self.provider),
             )
         except AttachmentError as exc:
             self._print_system(f"attachment rejected: {exc}")
             return None
+        for notice in notices:
+            self._print_system(notice)
 
         valid_pending: list[Path] = []
-        for path in self._pending_paths_for(
-            source,
-            pending_attachments=pending_attachments,
-            pending_attachment_tokens=pending_attachment_tokens,
-        ):
+        pending_blocks = []
+        for path in pending_paths:
             try:
-                build_user_message(
+                pending = await asyncio.to_thread(
+                    build_user_message,
                     value,
                     self.loop.store.cwd,
                     (path,),
@@ -614,20 +628,19 @@ class ComposerAttachmentMixin:
                 self._print_system(f"pending attachment dropped: {exc}")
             else:
                 valid_pending.append(path)
+                pending_blocks.extend(pending.content[1:])
         attachments = (
             self._pending_attachments
             if pending_attachments is None
             else pending_attachments
         )
         attachments[:] = valid_pending
-        if not valid_pending:
+        if not pending_blocks:
             return message
-        return build_user_message(
-            value,
-            self.loop.store.cwd,
-            tuple(valid_pending),
-            attachment_value=source,
-            session_store=self.loop.store,
+        return Message(
+            message.role,
+            [*message.content, *pending_blocks],
+            metadata=message.metadata,
         )
 
     def _clear_pending_attachments(self) -> None:

@@ -425,7 +425,7 @@ class SubmissionPipeline:
                 elif isinstance(message, _Retry):
                     self._on_retry(message)
                 elif isinstance(message, _PreprocessingDone):
-                    self._on_preprocessing_done(message)
+                    await self._on_preprocessing_done(message)
                 elif isinstance(message, _CommandDone):
                     self._on_command_done(message)
                 elif isinstance(message, _ProviderDone):
@@ -483,7 +483,7 @@ class SubmissionPipeline:
                 elif isinstance(slash_output, ModelInputEnvelope):
                     entry.model_input = slash_output
                     entry.attachment_value = entry.submission.text
-                    self._prepare_submission(entry, parsed)
+                    await self._prepare_submission(entry, parsed)
                 elif slash_output is not None:
                     self._host._release_attachment_paths(
                         entry.submission.attachment_paths
@@ -492,7 +492,7 @@ class SubmissionPipeline:
                     self._host._handle_slash_output(slash_output)
                     self._finish_entry(entry, SubmissionState.CANCELED)
                 else:
-                    self._prepare_submission(entry, parsed)
+                    await self._prepare_submission(entry, parsed)
         if entry.state in {
             SubmissionState.CANCELED,
             SubmissionState.READY,
@@ -653,7 +653,7 @@ class SubmissionPipeline:
                 result = _CommandDone(submission, error=exc)
         self._send(result)
 
-    def _prepare_submission(self, entry: _Entry, parsed: str) -> None:
+    async def _prepare_submission(self, entry: _Entry, parsed: str) -> None:
         envelope = (
             entry.model_input
             if entry.model_input is not None
@@ -662,7 +662,7 @@ class SubmissionPipeline:
         entry.model_input = envelope
         pending_attachments = list(entry.submission.attachment_paths)
         pending_tokens = dict(entry.submission.attachment_tokens)
-        message = self._host._prepare_user_message(
+        message = await self._host._prepare_user_message(
             envelope.text,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_tokens,
@@ -689,7 +689,7 @@ class SubmissionPipeline:
         entry.signal = entry.signal or self._new_signal()
         entry.state = SubmissionState.READY
 
-    def _on_preprocessing_done(self, message: _PreprocessingDone) -> None:
+    async def _on_preprocessing_done(self, message: _PreprocessingDone) -> None:
         entry = self._entry_for(message.submission)
         if entry is None:
             return
@@ -708,7 +708,7 @@ class SubmissionPipeline:
             self._cancel_or_restore(entry)
         else:
             entry.model_input = message.model_input
-            self._prepare_submission(entry, entry.parsed)
+            await self._prepare_submission(entry, entry.parsed)
 
     def _on_command_done(self, message: _CommandDone) -> None:
         self._command_results[message.submission.id] = message.receipt

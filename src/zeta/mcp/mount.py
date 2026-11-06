@@ -291,7 +291,13 @@ class MCPMount:
         return f"mcp: {mounted} mounted, {failed} failed"
 
     def render(self) -> str:
+        limits = self.registry.mcp_limits if self.registry is not None else None
         lines = [self.summary]
+        if limits is not None:
+            lines.append(
+                f"mcp limits: deadline {limits.deadline_seconds:g}s | "
+                f"wire {limits.max_wire_bytes} bytes | spill {limits.spill_after_bytes} bytes"
+            )
         for name in self.configs:
             status = self.statuses.get(name)
             if status is None:

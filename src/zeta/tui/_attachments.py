@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import platform
@@ -23,6 +24,8 @@ from ..core.session_files import (
     write_session_file,
 )
 from ..core.store import ConversationStore
+from ..media.image_normalization import normalize_image_bytes
+from ..media.image_policy import ImagePolicy
 from ..media.images import image_signature_matches
 from ..protocol.types import (
     ImageContent,
@@ -103,8 +106,35 @@ def _attachment_path(path: Path) -> Path:
     return path.absolute() if "sessions" in path.parts else path.resolve()
 
 
+def _prepare_image_attachment(
+    path: Path, data: bytes, media_type: str, image_policy: ImagePolicy | None
+) -> ImageContent:
+    if not image_signature_matches(media_type, data):
+        raise AttachmentError(
+            f"binary file is not an image: {path}", reason="not decodable"
+        )
+    if image_policy is not None:
+        try:
+            prepared = asyncio.run(normalize_image_bytes(data, image_policy))
+        except ValueError as exc:
+            raise AttachmentError(
+                f"image cannot be prepared: {path}: {exc}",
+                reason="not decodable",
+            ) from exc
+        data = prepared.data or b""
+        media_type = prepared.media_type
+    return ImageContent(
+        base64.b64encode(data).decode("ascii"),
+        media_type,
+        str(path),
+        len(data),
+    )
+
+
 def _read_attachment(
-    path: Path, session_store: ConversationStore | None = None
+    path: Path,
+    session_store: ConversationStore | None = None,
+    image_policy: ImagePolicy | None = None,
 ) -> TextContent | ImageContent:
     try:
         with ExitStack() as cleanup:
@@ -163,16 +193,7 @@ def _read_attachment(
         raise AttachmentError(f"cannot read {path}: {exc}") from exc
     media_type = _image_media_type(prefix)
     if media_type is not None:
-        if not image_signature_matches(media_type, data):
-            raise AttachmentError(
-                f"binary file is not an image: {path}", reason="not decodable"
-            )
-        return ImageContent(
-            base64.b64encode(data).decode("ascii"),
-            media_type,
-            str(path),
-            size,
-        )
+        return _prepare_image_attachment(path, data, media_type, image_policy)
     if b"\x00" in data:
         raise AttachmentError(
             f"binary file is not an image: {path}", reason="not decodable"
@@ -195,8 +216,9 @@ def build_user_message(
     attachment_value: str | None = None,
     session_store: ConversationStore | None = None,
     on_reference_notice: Callable[[str], None] | None = None,
+    image_policy: ImagePolicy | None = None,
 ) -> Message:
-    """Resolve readable references and pending paths into one message."""
+    """Resolve attachments; callers with an image policy must run off-loop."""
 
     paths: list[Path] = []
     reference_paths: set[Path] = set()
@@ -207,7 +229,7 @@ def build_user_message(
             continue
         reference_paths.add(ref.path)
         try:
-            attachment = _read_attachment(ref.path, session_store)
+            attachment = _read_attachment(ref.path, session_store, image_policy)
         except AttachmentError as exc:
             if exc.reason != "missing" and on_reference_notice is not None:
                 on_reference_notice(f"{ref.token} not attached: {exc.reason}")

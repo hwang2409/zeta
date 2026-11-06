@@ -52,6 +52,7 @@ class _OutputCapture:
         self._full = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close()
         self.full_size = 0
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.truncated = False
 
     @property
     def data(self) -> bytes:
@@ -84,6 +85,7 @@ class _OutputCapture:
         for character in text:
             encoded = character.encode("utf-8")
             if len(self._data) + len(encoded) > self.limit:
+                self.truncated = True
                 break
             self._data.extend(encoded)
 
@@ -371,6 +373,8 @@ async def _bash(
             "stderr": stderr,
             "exit_code": exit_code,
             "cwd_after": cwd_after,
+            "stdout_truncated": stdout_capture.truncated,
+            "stderr_truncated": stderr_capture.truncated,
         }
         if timed_out:
             structured_content.update({"timed_out": True, "timeout_seconds": float(timeout)})

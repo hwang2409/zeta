@@ -502,7 +502,11 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             input_id = result["input_id"]
             await _request(reader, writer, 4, "send", {"input_id": input_id})
         elif path == "serve send_images":
-            png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            png = bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "0000000d49444154789c6360f8cf00000004000101a2e0c4b0"
+                "0000000049454e44ae426082"
+            )
             await _request(
                 reader,
                 writer,

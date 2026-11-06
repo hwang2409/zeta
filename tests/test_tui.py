@@ -3610,6 +3610,44 @@ def test_render_event_preserves_multiline_tool_result_formatting() -> None:
     assert "third" in renderable_plain(rendered)
 
 
+def test_bash_card_unchanged_by_stream_truncation_facts() -> None:
+    call = ToolCall("bash-1", "bash", {"command": "printf output"})
+    base = {
+        "stdout": "output",
+        "stderr": "",
+        "exit_code": 0,
+        "cwd_after": "/repo",
+    }
+    without_facts = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id, "stdout:\noutput\nstderr:\n", structured_content=base
+            ),
+        )
+    )
+    with_facts = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "stdout:\noutput\nstderr:\n",
+                structured_content={
+                    **base,
+                    "stdout_truncated": False,
+                    "stderr_truncated": True,
+                },
+            ),
+        )
+    )
+
+    assert without_facts is not None
+    assert with_facts is not None
+    assert renderable_plain(with_facts) == renderable_plain(without_facts)
+
+
 def test_render_event_shows_tool_result_truncation_metadata() -> None:
     rendered = render_event(
         StreamEvent(
@@ -12326,6 +12364,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     assert backend.max_active == 1
     await app._submissions.close()
     await app.loop.close()
+
 
 
 def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:

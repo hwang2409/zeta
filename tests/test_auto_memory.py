@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.codex import CodexCredentialDriver
+from zeta.core.slash import create_slash_registry
+from zeta.core.store import ConversationStore
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import EntryReconciliationResult
 from zeta.memory.profiles import memory_profile
@@ -16,7 +20,21 @@ from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+    with_message_origin,
+)
 from zeta.providers.anthropic import AnthropicCredentialDriver
+from zeta.runtime.loop import AgentLoop
+from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
 
 SESSION = "a" * 32
 
@@ -43,6 +61,141 @@ def _write_transcript(session_dir: Path, count: int = 4) -> None:
 
 def _no_op_proposal(_prompt: str) -> str:
     return json.dumps({"changes": []})
+
+
+@pytest.mark.asyncio
+async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve(
+    tmp_path: Path,
+) -> None:
+    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner.session_dir.joinpath("conversation.jsonl").write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+    )
+    runner.activity(1)
+    await runner.drain()
+    expected = (
+        "automatic project-memory reconciliation blocked: malformed conversation row "
+        "(seq 2); reconciliation will resume only after the transcript is readable."
+    )
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "tui-sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.memory_reconciler = runner
+    app = TUIApp(loop, provider="codex", model="offline")
+    runtime = SimpleNamespace(
+        loop=loop,
+        opened=SimpleNamespace(
+            metadata=SimpleNamespace(
+                session_id=loop.store.session_id,
+                provider="codex",
+                model="offline",
+                context_files=(),
+                vim_mode=True,
+                plan_mode=False,
+            )
+        ),
+    )
+    try:
+        tui = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+        serve = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+            ServerSlashSession(runtime), "/status"
+        )
+        assert tui is not None and serve is not None
+        assert expected in tui and expected in serve
+        assert "will retry" not in tui and "will retry" not in serve
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal(prompt)
+
+    runner, _registry, _project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
+    )
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+    )
+    runner.activity(1)
+    await runner.drain()
+    runner.state.record_failure(
+        seq_start=1, seq_end=1, validation_summary="scheduled failure", reason="test",
+        usage={}, retry_backoff_seconds=0, now=0, occurred_at="2026-10-07T00:00:00+00:00"
+    )
+
+    assert runner.state.scanner_failure == (2, "malformed conversation row")
+    assert runner._ready_retries() == ()
+    runner.activity(1)
+    await runner.drain()
+    assert calls == 0
+    assert json.loads(runner.position_path.read_text(encoding="utf-8"))["pending_failures"]
+
+    path.unlink()
+    path.write_text(
+        json.dumps({"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+    runner.activity(1)
+    await runner.drain()
+    assert calls == 1
+
+
+def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
+    tmp_path: Path,
+) -> None:
+    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    runner.session_dir.joinpath("conversation.jsonl").unlink()
+    store = ConversationStore(runner.session_dir.parent, session_id=SESSION)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("bash-1", "bash", {"command": "exit 7"}))],
+        )
+    )
+    store.append_message(
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                tool_result=ToolResult(
+                    "bash-1",
+                    "failed",
+                    structured_content={"exit_code": 7},
+                    content_blocks=[
+                        {"type": "image", "data": "YWJj", "mimeType": "image/png"}
+                    ],
+                ),
+            ),
+            MessageOrigin.USER,
+        )
+    )
+    steering = with_message_origin(
+        Message(MessageRole.USER, [TextContent("drop me")]), MessageOrigin.USER
+    )
+    store.append_client_delivery(
+        "scan-steer", "steer", "queued", {"accepted": True}
+    )
+    store.queue_client_steering(steering, "scan-steer")
+    store.drop_client_steering("abort")
+    expected_seq = store.replay()[-1].seq
+    store.close()
+
+    latest, offset, _tokens = runner._transcript_state()
+
+    assert latest == expected_seq
+    assert offset == runner.session_dir.joinpath("conversation.jsonl").stat().st_size
+    assert runner._transcript_scan_error is None
 
 
 def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:

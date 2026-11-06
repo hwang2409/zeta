@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 CLIENT_DELIVERY_METADATA = "zeta_client_delivery_id"
+CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA = "zeta_client_delivery_payload_digest"
 MAX_RECENT_CLIENT_DELIVERIES = 1_000
 DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -95,10 +96,8 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        if (
-            set(data) != {"delivery_id", "method", "status", "outcome"}
-            or not valid_acceptance
-        ):
+        allowed = {"delivery_id", "method", "status", "outcome"}
+        if set(data) - allowed or not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
 
@@ -347,18 +346,47 @@ class ClientDeliveryMixin:
         """Durably drop every queued delivery before releasing queue ownership."""
 
         queued = tuple(self._client_steering)
-        delivery_ids = [item.delivery_id for item in queued if item.delivery_id is not None]
-        if delivery_ids:
-            with self._append_lock():
-                rows = [
-                    _transition_row(delivery_id, "dropped", reason)
-                    for delivery_id in delivery_ids
-                    if self.client_delivery_outcome(delivery_id) == "queued"
-                ]
-                if rows:
-                    self._append_many_unlocked(rows)
+        self._drop_client_steering(queued, reason)
         self._client_steering.clear()
         return len(queued)
+
+    def _drop_client_steering(
+        self: ConversationStore,
+        queued: tuple[_QueuedSteering, ...],
+        reason: DeliveryDropReason,
+    ) -> list[ConversationEntry]:
+        delivery_ids = [
+            item.delivery_id for item in queued if item.delivery_id is not None
+        ]
+        if not delivery_ids:
+            return []
+        with self._append_lock():
+            rows = [
+                _transition_row(delivery_id, "dropped", reason)
+                for delivery_id in delivery_ids
+                if self.client_delivery_outcome(delivery_id) == "queued"
+            ]
+            if not rows:
+                return []
+            return [
+                self._snapshot_entry(entry)
+                for entry in self._append_many_unlocked(rows)
+            ]
+
+    async def drop_client_steering_async(
+        self: ConversationStore, reason: DeliveryDropReason
+    ) -> tuple[ConversationEntry, ...]:
+        """Commit queued drops off-loop, then release their queue ownership."""
+
+        queued = tuple(self._client_steering)
+        entries = await self._to_thread_durable(
+            self._drop_client_steering, queued, reason
+        )
+        for expected in queued:
+            if not self._client_steering or self._client_steering[0] != expected:
+                raise RuntimeError("client steering queue changed during drop")
+            self._client_steering.popleft()
+        return tuple(entries)
 
 
 def image_payload_digest(
@@ -377,6 +405,9 @@ def image_payload_digest(
 
 
 def _message_image_payload_digest(message: Message) -> str | None:
+    stored_digest = message.metadata.get(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA)
+    if isinstance(stored_digest, str):
+        return stored_digest
     if (
         message.role is not MessageRole.USER
         or not message.content
@@ -416,14 +447,19 @@ def _transition_row(
     return "client_delivery", data
 
 
-def tag_client_delivery(message: Message, delivery_id: str) -> Message:
-    """Attach a private durable-delivery marker without changing message content."""
+def tag_client_delivery(
+    message: Message, delivery_id: str, payload_digest: str | None = None
+) -> Message:
+    """Attach private durable-delivery markers without changing message content."""
 
+    metadata = {**message.metadata, CLIENT_DELIVERY_METADATA: delivery_id}
+    if payload_digest is not None:
+        metadata[CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA] = payload_digest
     return Message(
         message.role,
         message.content,
         tool_result=message.tool_result,
-        metadata={**message.metadata, CLIENT_DELIVERY_METADATA: delivery_id},
+        metadata=metadata,
     )
 
 
@@ -434,6 +470,7 @@ def without_client_delivery_marker(message: Message) -> Message:
         return message
     metadata = dict(message.metadata)
     del metadata[CLIENT_DELIVERY_METADATA]
+    metadata.pop(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA, None)
     return Message(
         message.role,
         message.content,

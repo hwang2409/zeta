@@ -18,12 +18,12 @@ from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
-from ..core.store._client_delivery import (
-    CLIENT_DELIVERY_METADATA,
-)
+from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
+from ..media.image_normalization import normalize_image_bytes
+from ..media.image_policy import image_policy_for_provider
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
@@ -373,12 +373,19 @@ def history_projection(
         if entry.type in {"message", "notification"}:
             entries[-1].append(entry)
             entries.append([])
-        elif entry.type in {"approval_resolution", "approval_history"}:
+        elif entry.type in {
+            "client_delivery",
+            "approval_resolution",
+            "approval_history",
+            "turn_end",
+        }:
             entries[-1].append(entry)
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
     built = HistoryProjection(
-        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index)
+        tuple(tuple(group) for group in entries),
+        MappingProxyType(approval_calls),
+        MappingProxyType(entry_index),
     )
     with _cache_creation_lock:
         cached = _cache(
@@ -413,6 +420,14 @@ def _attach_row_handle(
     return block
 
 
+def _project_tool_call_arguments(call: dict[str, object], *, fidelity: bool) -> dict[str, object]:
+    arguments = call.get("arguments", {})
+    if not fidelity:
+        return {"arguments": {}}
+    projected, truncated = event_contract.project_tool_value(arguments)
+    return {"arguments": projected, "arguments_truncated": truncated}
+
+
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
@@ -422,6 +437,13 @@ def _history_entry_rows(
     """Project one durable entry to one atomic group of history rows."""
 
     entry_type = entry.type
+    if entry_type == "client_delivery":
+        if not fidelity:
+            return []
+        data = entry.data
+        if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
+            return []
+        return [event_contract.delivery_status_row(entry)]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -438,6 +460,12 @@ def _history_entry_rows(
             }
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
+    if entry_type == "turn_end":
+        data = entry.data if isinstance(entry.data, dict) else {}
+        row = {"id": entry.id, "role": "system", "event": "turn_end", "data": {}}
+        if "reason" in data:
+            row["data"] = {"reason": data["reason"]}
+        return [row]
     if entry_type == "notification":
         data = entry.data
         kind = data.get("kind", "agent_completion")
@@ -477,7 +505,7 @@ def _history_entry_rows(
                     "tool_call": {
                         "id": call["id"],
                         "name": call["name"],
-                        "arguments": {},
+                        **_project_tool_call_arguments(call, fidelity=fidelity),
                     },
                 }
             )
@@ -494,14 +522,23 @@ def _history_entry_rows(
         if fidelity:
             for index, block in enumerate(result.get("content_blocks") or []):
                 if isinstance(block, dict) and block.get("type") == "image":
-                    stub = {key: block[key] for key in ("type", "mimeType", "caption", "width", "height", "size") if key in block}
-                    stub["size"] = stub.get("size", 0)
-                    stub["data_omitted"] = True
+                    stub = event_contract.image_stub(block)
                     blocks.append(_attach_row_handle(
                         stub, entry.id, "message.tool_result.content_blocks", index,
                         fidelity=fidelity, content_read=content_read,
                     ))
-        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks, "structured_content": None}
+        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks}
+        structured = result.get("structured_content")
+        if fidelity and structured is not None:
+            projected, wire_truncated = event_contract.project_tool_value(structured)
+            result["structured_content"] = projected
+            result["structured_content_truncated"] = (
+                event_contract.structured_content_truncated(
+                    structured, wire_truncated=wire_truncated
+                )
+            )
+        else:
+            result["structured_content"] = None
     row = {
         "id": entry.id,
         "role": message["role"],
@@ -928,22 +965,41 @@ def _validated_image_payload(
     return text, decoded
 
 
-def image_payload_digest(params: dict) -> str:
+@dataclass(frozen=True, slots=True)
+class PreparedImageDelivery:
+    payload_digest: str
+    message: Message
+    attachments: list[dict[str, object]]
+    created_attachments_root: bool
+
+
+def prepare_image_delivery(
+    runtime: ServerRuntime, params: dict
+) -> PreparedImageDelivery:
+    """Decode, normalize, and publish images from an off-loop worker."""
+
     text, decoded = _validated_image_payload(params)
-    return _semantic_image_payload_digest(
+    payload_digest = _semantic_image_payload_digest(
         text, [(name, mime, raw) for name, mime, _data, raw in decoded]
     )
-
-
-def image_message(runtime: ServerRuntime, params: dict) -> Message:
-    text, decoded = _validated_image_payload(params)
+    provider = runtime.provider
+    if provider is None:
+        raise ProtocolError(-32003, "no active provider")
+    policy = image_policy_for_provider(provider)
     blocks = [TextContent(text)]
     store = runtime.opened.store
     attachments_existed = "attachments" in os.listdir(store.directory_fd)
     with child_directory(store.directory_fd, "attachments", create=True) as attachments_fd:
         directories = []
         try:
-            for name, mime, data, raw in decoded:
+            for name, _mime, _data, raw in decoded:
+                try:
+                    prepared = asyncio.run(normalize_image_bytes(raw, policy))
+                except ValueError as exc:
+                    raise ProtocolError(-32602, f"image cannot be prepared: {exc}") from exc
+                raw = prepared.data or b""
+                mime = prepared.media_type
+                data = base64.b64encode(raw).decode("ascii")
                 directory = uuid4().hex
                 os.mkdir(directory, mode=0o700, dir_fd=attachments_fd)
                 directories.append(directory)
@@ -957,9 +1013,29 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             if not attachments_existed:
                 os.rmdir("attachments", dir_fd=store.directory_fd)
             raise
-    return with_message_origin(
+    message = with_message_origin(
         Message(MessageRole.USER, blocks), MessageOrigin.USER
     )
+    return PreparedImageDelivery(
+        payload_digest,
+        message,
+        attachment_summary(message),
+        not attachments_existed,
+    )
+
+
+def cleanup_image_delivery(
+    runtime: ServerRuntime, prepared: PreparedImageDelivery
+) -> None:
+    """Remove files produced by a prepared delivery that will not publish."""
+
+    store = runtime.opened.store
+    with child_directory(store.directory_fd, "attachments") as attachments_fd:
+        for block in prepared.message.content:
+            if isinstance(block, ImageContent) and block.path is not None:
+                shutil.rmtree(Path(block.path).parent.name, dir_fd=attachments_fd)
+    if prepared.created_attachments_root:
+        os.rmdir("attachments", dir_fd=store.directory_fd)
 
 
 def attachment_summary(message: Message) -> list[dict[str, object]]:
