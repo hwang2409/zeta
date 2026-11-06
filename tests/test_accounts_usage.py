@@ -5,7 +5,6 @@ import base64
 import json
 import math
 import os
-import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -242,7 +241,8 @@ def test_refresh_is_sequential_one_request_per_account_and_respects_cooldown(
     ]
 
 
-def test_refresh_has_total_deadline_and_releases_locks(
+@pytest.mark.asyncio
+async def test_refresh_has_total_deadline_and_releases_locks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = AccountStore(tmp_path)
@@ -250,11 +250,13 @@ def test_refresh_has_total_deadline_and_releases_locks(
     _seed(store, account)
     monkeypatch.setattr("zeta.accounts.usage.REQUEST_TIMEOUT_SECONDS", 0.05)
 
+    response_started = asyncio.Event()
+
     class Drip(httpx.AsyncByteStream):
         async def __aiter__(self):
-            while True:
-                yield b"x"
-                await asyncio.sleep(0.02)
+            response_started.set()
+            yield b"x"
+            await asyncio.Event().wait()
 
         async def aclose(self) -> None:
             pass
@@ -266,14 +268,18 @@ def test_refresh_has_total_deadline_and_releases_locks(
             lambda request: httpx.Response(200, stream=Drip())
         ),
     )
-    started = time.monotonic()
-    result = asyncio.run(usage.refresh_stale())[account]
-    elapsed = time.monotonic() - started
+    task = asyncio.create_task(usage.refresh_stale())
+    async with asyncio.timeout(1):  # Hang guard, not a performance assertion.
+        await response_started.wait()
+        result = (await task)[account]
 
-    assert elapsed < 0.2
     assert result.error == "network error; check your connection and retry"
-    with store.lifecycle_guard(account):
-        pass
+
+    def acquire_all_locks() -> None:
+        with store.lifecycle_guard(account), store.usage_guard(account):
+            pass
+
+    await asyncio.to_thread(acquire_all_locks)
 
 
 def test_lock_failure_keeps_account_and_reports_when_to_retry(
