@@ -126,11 +126,8 @@ class ComposerPadding(Container):
         content_height = self.content.preferred_height(
             write_position.width, write_position.height
         ).preferred
-        pad_y = (
-            COMPOSER_PAD_Y
-            if write_position.height >= content_height + 2 * COMPOSER_PAD_Y
-            else 0
-        )
+        # preserve one blank row on each side while the input viewport scrolls
+        pad_y = COMPOSER_PAD_Y if write_position.height >= 1 + 2 * COMPOSER_PAD_Y else 0
         if pad_y:
             self._write_pad(
                 screen,
@@ -601,9 +598,7 @@ def full_screen_content(
             Window(width=COMPOSER_CONTENT_PADDING, char=" "),
         ]
     )
-    padded_composer_rows = list(composer_rows)
-    if padded_composer_rows:
-        padded_composer_rows[0] = ComposerPadding(padded_composer_rows[0])
+    padded_composer_rows = [ComposerPadding(HSplit(list(composer_rows)))] if composer_rows else []
     def viewed_queue() -> QueuedPanel:
         return queued_panel(agent_navigation, queued_messages())
 

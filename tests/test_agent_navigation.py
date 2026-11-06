@@ -694,12 +694,22 @@ def test_registered_child_is_discovered_when_agents_directory_stat_is_unchanged(
 
 
 def test_registered_child_from_another_store_is_discovered_at_root(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "sessions"
     navigation_store = ConversationStore(root, session_id="root")
     writer_store = ConversationStore(root, session_id="root")
     navigation = AgentNavigation(navigation_store)
+    scans = 0
+    original_scandir = os.scandir
+
+    def count_scandir(path: object):
+        nonlocal scans
+        if Path(path) == navigation_store.session_dir / "agents":
+            scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
     child = _child(writer_store, 1, description="cross-process child")
     writer_store.register_agent_child(
         ToolCall("child-1", "agent", {"prompt": "work"}),
@@ -710,6 +720,7 @@ def test_registered_child_from_another_store_is_discovered_at_root(
 
     assert navigation.refresh()
     assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    assert scans == 0
 
     navigation._last_refresh_at = float("-inf")
     navigation.refresh()

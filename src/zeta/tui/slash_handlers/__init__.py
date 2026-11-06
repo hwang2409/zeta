@@ -148,9 +148,8 @@ class SlashHandlerMixin:
             mcp_summary=self.loop.mcp_summary,
             explicit_finish=self.loop.explicit_finish,
             automatic_memory_failure=(
-                self.loop.memory_reconciler.last_failure.status_line()
+                self.loop.memory_reconciler.automatic_memory_status
                 if self.loop.memory_reconciler is not None
-                and self.loop.memory_reconciler.last_failure is not None
                 else None
             ),
         )

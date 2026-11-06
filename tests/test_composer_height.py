@@ -374,7 +374,7 @@ async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None
     assert 1 <= len(composer_rows) < WordWrapWindow.MAX_COMPOSER_ROWS
     assert cursor.y in composer_rows
     assert all(
-        any(screen.data_buffer[row][column].char.strip() for column in range(80))
+        not any(screen.data_buffer[row][column].char.strip() for column in range(80))
         for row in (composer_rows[0], composer_rows[-1])
     )
     assert "transcript row" in output

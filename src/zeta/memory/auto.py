@@ -15,6 +15,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..context_eviction import estimated_text_tokens
+from ..core.checkpoints import (
+    CONVERSATION_ENTRY_TYPES,
+    ConversationIntegrityError,
+    load_session_json,
+)
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -62,13 +67,19 @@ _MAX_FAILURE_LOG_BYTES = 64 * 1024
 
 
 def _failure_summary(error: Exception) -> str:
-    if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
+    if isinstance(
+        error, (ReconciliationError, UnsupportedMemoryFormatError, _TranscriptScanError)
+    ):
         return str(error)
     return type(error).__name__
 
 
 class _ConcurrentMemoryUpdate(Exception):
     """Signal that a pending range must remain queued for a later retry."""
+
+
+class _TranscriptScanError(ValueError):
+    """A completed transcript row is not safe evidence for memory."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +201,8 @@ class AutoMemoryReconciler:
         self._resume_catch_up = False
         self._retry_attempts_in_cycle: dict[str, int] = {}
         self._transcript_cursor: _TranscriptCursor | None = None
+        self._transcript_scan_error: str | None = None
+        self._transcript_scan_error_seq: int | None = None
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -198,6 +211,23 @@ class AutoMemoryReconciler:
     @property
     def last_failure(self) -> ReconciliationFailure | None:
         return self.state.last_failure
+
+    @property
+    def scanner_failure(self) -> tuple[int, str] | None:
+        return self.state.scanner_failure
+
+    @property
+    def automatic_memory_status(self) -> str | None:
+        scanner_failure = self.scanner_failure
+        if scanner_failure is not None:
+            seq, cause = scanner_failure
+            return (
+                "automatic project-memory reconciliation blocked: "
+                f"{cause} (seq {seq}); reconciliation will resume only after "
+                "the transcript is readable."
+            )
+        failure = self.last_failure
+        return failure.status_line() if failure is not None else None
 
     @property
     def _last_reconciled_bytes(self) -> int:
@@ -213,7 +243,7 @@ class AutoMemoryReconciler:
 
     def retry_terminal(self, key: str) -> bool:
         """Re-queue one terminal receipt for this session."""
-        if self._paused_for_login:
+        if self._paused_for_login or self.scanner_failure is not None:
             return False
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
@@ -299,6 +329,8 @@ class AutoMemoryReconciler:
             self._retry_attempts_in_cycle.clear()
 
     def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
+        if self.scanner_failure is not None:
+            return ()
         return tuple(
             work
             for work in self.state.ready_retries(self._retry_clock())
@@ -311,6 +343,8 @@ class AutoMemoryReconciler:
             self._worker_task = asyncio.create_task(self._worker())
 
     def _add_pending(self, start: int, end: int, *reasons: str) -> None:
+        if self.state.scanner_failure is not None:
+            return
         for uncovered_start, uncovered_end in self.state.uncovered_ranges(start, end):
             merged = _PendingRange(uncovered_start, uncovered_end, set(reasons))
             remaining: list[_PendingRange] = []
@@ -327,6 +361,8 @@ class AutoMemoryReconciler:
             self._pending = sorted(remaining, key=lambda item: item.start)
 
     def _queue_ready_retries(self) -> None:
+        if self.scanner_failure is not None:
+            return
         queued = {item.key for item in self._pending if item.key is not None}
         for work in self._ready_retries():
             if work.key in queued:
@@ -340,6 +376,22 @@ class AutoMemoryReconciler:
                 )
             )
         self._pending.sort(key=lambda item: item.start)
+
+    async def _scan_state(self) -> tuple[int, int, int]:
+        result = await asyncio.to_thread(self._transcript_state)
+        if self._transcript_scan_error is not None:
+            failure = await asyncio.to_thread(
+                self.state.record_scanner_failure,
+                seq=self._transcript_scan_error_seq or self.last_reconciled_seq + 1,
+                cause=self._transcript_scan_error,
+                occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            if failure is not None:
+                await asyncio.to_thread(self._append_failure_log, failure)
+                self._publish_failure_notice()
+        else:
+            await asyncio.to_thread(self.state.clear_scanner_failure)
+        return result
 
     async def _worker(self) -> None:
         while True:
@@ -362,16 +414,14 @@ class AutoMemoryReconciler:
                 self._early_window_started_at = None
             if self._resume_catch_up:
                 self._resume_catch_up = False
-                latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                latest_seq, _, _ = await self._scan_state()
                 if latest_seq > self.last_reconciled_seq:
                     self._add_pending(
                         self.last_reconciled_seq + 1, latest_seq, "resume"
                     )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
-                latest_seq, _transcript_bytes, transcript_tokens = await asyncio.to_thread(
-                    self._transcript_state
-                )
+                latest_seq, _transcript_bytes, transcript_tokens = await self._scan_state()
                 self._seen_activity_generation = generation
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
@@ -433,6 +483,8 @@ class AutoMemoryReconciler:
                         await asyncio.sleep(
                             min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
                         )
+                except _TranscriptScanError:
+                    await self._scan_state()
                 except Exception as exc:  # noqa: BLE001 - isolate background work
                     failure = await asyncio.to_thread(
                         self.state.record_failure,
@@ -480,7 +532,7 @@ class AutoMemoryReconciler:
             except TimeoutError:
                 now = self._clock()
                 if self._idle_deadline is not None and now >= self._idle_deadline:
-                    latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                    latest_seq, _, _ = await self._scan_state()
                     if latest_seq > self.last_reconciled_seq:
                         self._add_pending(
                             self.last_reconciled_seq + 1, latest_seq, "idle"
@@ -498,6 +550,9 @@ class AutoMemoryReconciler:
             rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
                 self._transcript_chunk, cursor, item.end
             )
+            if self._transcript_scan_error is not None:
+                self._reported_transcript_scan_error = self._transcript_scan_error
+                raise _TranscriptScanError(self._transcript_scan_error)
             if not rows:
                 if scanned_end < cursor:
                     break
@@ -780,12 +835,14 @@ class AutoMemoryReconciler:
             )
 
     def _publish_failure_notice(self) -> None:
-        if (
-            self.notice is not None
-            and not self._closing
-            and self.last_failure is not None
-        ):
-            self.notice(f"memory update failed: {self.last_failure.status_line()}")
+        if self.notice is not None and not self._closing:
+            status = self.automatic_memory_status
+            if status is not None:
+                self.notice(
+                    status
+                    if self.scanner_failure is not None
+                    else f"memory update failed: {status}"
+                )
 
     def _append_failure_log(self, failure: ReconciliationFailure) -> None:
         self._append_diagnostic_record(
@@ -921,6 +978,32 @@ class AutoMemoryReconciler:
         current = cls._transcript_evidence(handle, identity, stat.st_size, evidence.offset)
         return current.identity == evidence.identity and current.prefix_tail == evidence.prefix_tail
 
+    @staticmethod
+    def _row_seq(raw: bytes) -> int | None:
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        seq = value.get("seq") if isinstance(value, dict) else None
+        return seq if type(seq) is int else None
+
+    @staticmethod
+    def _parse_transcript_row(raw: bytes) -> dict[str, object]:
+        try:
+            value = load_session_json(raw)
+        except ConversationIntegrityError as exc:
+            raise _TranscriptScanError("malformed conversation row") from exc
+        if not isinstance(value, dict):
+            raise _TranscriptScanError("conversation row is not an object")
+        entry_type = value.get("type")
+        if entry_type == "header":
+            header = value.get("data")
+            if not isinstance(header, dict) or header.get("schema") != "zeta.conversation.v1":
+                raise _TranscriptScanError("unsupported conversation header")
+        elif entry_type not in CONVERSATION_ENTRY_TYPES:
+            raise _TranscriptScanError("unsupported conversation entry type")
+        return value
+
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
         try:
@@ -941,14 +1024,18 @@ class AutoMemoryReconciler:
                     tokens = 0
                     offset = 0
                     handle.seek(0)
+                self._transcript_scan_error = None
+                self._transcript_scan_error_seq = None
                 for raw in handle:
                     if not raw.endswith(b"\n"):
                         break
-                    offset = handle.tell()
                     try:
-                        value = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+                        value = self._parse_transcript_row(raw)
+                    except _TranscriptScanError as exc:
+                        self._transcript_scan_error = str(exc)
+                        self._transcript_scan_error_seq = self._row_seq(raw) or latest + 1
+                        break
+                    offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
                     if type(seq) is int:
                         latest = max(latest, seq)
@@ -995,11 +1082,15 @@ class AutoMemoryReconciler:
                 else:
                     handle.seek(0)
                 for raw in handle:
-                    offset = handle.tell()
+                    if not raw.endswith(b"\n"):
+                        break
                     try:
-                        value = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+                        value = self._parse_transcript_row(raw)
+                    except _TranscriptScanError as exc:
+                        self._transcript_scan_error = str(exc)
+                        self._transcript_scan_error_seq = self._row_seq(raw) or scanned_end + 1
+                        break
+                    offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
                     if type(seq) is not int:
                         continue
