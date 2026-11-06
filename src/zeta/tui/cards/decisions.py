@@ -45,8 +45,18 @@ def _wrap(text: str, width: int) -> list[str]:
                 if current:
                     lines.append(current)
                 while _cells(word) > width:
-                    lines.append(word[:width])
-                    word = word[width:]
+                    split = 0
+                    cells = 0
+                    for index, character in enumerate(word):
+                        step = max(0, get_cwidth(character))
+                        if cells + step > width:
+                            break
+                        cells += step
+                        split = index + 1
+                    if split == 0:
+                        split = 1
+                    lines.append(word[:split])
+                    word = word[split:]
                 current = word
         lines.append(current)
     return lines or [""]
@@ -173,12 +183,6 @@ class DecisionsPanel:
         if self._mode == "answer":
             lines.append(self._answer_line())
             lines.append(overlay.hint("enter send · esc cancel"))
-        else:
-            lines.append(
-                overlay.hint(
-                    "↑/↓ select · pgup/pgdn scroll · 1-9 answer · a type answer · enter discuss · esc close"
-                )
-            )
         return lines
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:

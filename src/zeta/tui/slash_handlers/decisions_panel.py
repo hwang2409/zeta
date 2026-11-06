@@ -219,7 +219,7 @@ class DecisionsMixin:
             if option is not None:
                 self._deliver_quick_answer(option)
                 return
-        self._refresh_decisions_panel()
+        self._refresh_decisions_panel(keep_offset=key in {"pageup", "pagedown"})
 
     def _decisions_answer_key(self, key: str) -> None:
         if key == "escape":
