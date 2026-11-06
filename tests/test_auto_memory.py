@@ -113,20 +113,25 @@ async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> Non
     runner, _registry, _project_id, _notices = _runner(
         tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
     )
-    runner.state.record_failure(
-        seq_start=1, seq_end=1, validation_summary="scheduled failure", reason="test",
-        usage={}, retry_backoff_seconds=0, now=0, occurred_at="2026-10-07T00:00:00+00:00"
-    )
-    runner.session_dir.joinpath("conversation.jsonl").write_bytes(
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_bytes(
         b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
         b"{not json}\n"
     )
     runner.activity(1)
     await runner.drain()
+    runner.state.record_failure(
+        seq_start=1, seq_end=1, validation_summary="scheduled failure", reason="test",
+        usage={}, retry_backoff_seconds=0, now=0, occurred_at="2026-10-07T00:00:00+00:00"
+    )
+
+    assert runner.state.scanner_failure == (2, "malformed conversation row")
+    assert runner._ready_retries() == ()
+    runner.activity(1)
     await runner.drain()
     assert calls == 0
     assert json.loads(runner.position_path.read_text(encoding="utf-8"))["pending_failures"]
-    path = runner.session_dir / "conversation.jsonl"
+
     path.unlink()
     path.write_text(
         json.dumps({"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}}) + "\n",
