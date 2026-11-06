@@ -451,12 +451,12 @@ class BackgroundTaskRegistry:
         except BaseException:
             record.notify_on_exit = False
             record.running = False
-            record.process = None
             await _terminate_process(
                 process,
                 self.term_grace,
                 close_stdin=lambda: self._close_stdin(record),
             )
+            record.process = None
             if record.monitor is not None:
                 record.monitor.cancel()
                 await asyncio.gather(record.monitor, return_exceptions=True)
