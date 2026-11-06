@@ -13,9 +13,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from prompt_toolkit.utils import get_cwidth
-
 from .. import overlay, theme
+from .shared import wrap_by_cells
 
 # A long command wraps at this content width so the float settles near, but not
 # beyond, the shared status-card cap. Rendering stays deterministic regardless
@@ -107,43 +106,6 @@ def _status_style(suffix: str) -> str:
         "failed": theme.ERROR,
         "killed": theme.DIM,
     }[suffix]
-
-
-def _wrap(text: str, width: int) -> list[str]:
-    """Wrap by cells, breaking long unbroken runs, never returning empty."""
-
-    width = max(1, width)
-    lines: list[str] = []
-    for paragraph in text.split("\n"):
-        current = ""
-        cells = 0
-        for word in paragraph.split(" "):
-            piece = word if not current else " " + word
-            piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            if current and cells + piece_cells > width:
-                lines.append(current)
-                current, cells = "", 0
-                piece = word
-                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            while piece_cells > width:
-                head, piece = _split_cells(piece, width)
-                lines.append((current + head) if current else head)
-                current, cells = "", 0
-                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
-            current += piece
-            cells += piece_cells
-        lines.append(current)
-    return lines or [""]
-
-
-def _split_cells(text: str, width: int) -> tuple[str, str]:
-    cells = 0
-    for index, ch in enumerate(text):
-        step = max(0, get_cwidth(ch))
-        if cells + step > width:
-            return text[:index], text[index:]
-        cells += step
-    return text, ""
 
 
 class BackgroundTasksPanel:
@@ -358,7 +320,7 @@ class BackgroundTasksPanel:
             lines.append(overlay.field("Note", task.note, width=8))
         lines.append(overlay.blank())
         lines.append([overlay.label("Command")])
-        for wrapped in _wrap(_one_line(task.command), CONTENT_WIDTH - 2):
+        for wrapped in wrap_by_cells(_one_line(task.command), CONTENT_WIDTH - 2):
             lines.append([overlay.value(f"  {wrapped}")])
         lines.append(overlay.blank())
         display = self._output_display_lines()
