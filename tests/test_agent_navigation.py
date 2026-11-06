@@ -629,6 +629,157 @@ def test_all_terminal_children_hide_the_list(tmp_path: Path) -> None:
     assert navigation.entries == []
 
 
+def test_idle_refresh_does_not_scan_historical_child_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(100):
+        _child(store, number, description=f"done {number}", state="completed")
+    navigation = AgentNavigation(store)
+    scans = 0
+    original_scandir = os.scandir
+
+    def count_scandir(path: object):
+        nonlocal scans
+        if Path(path) == store.session_dir / "agents":
+            scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
+    navigation._last_refresh_at = float("-inf")
+
+    assert not navigation.refresh()
+    assert scans == 0
+    store.close()
+
+
+def test_registered_child_is_discovered_when_agents_directory_stat_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    navigation = AgentNavigation(store)
+    agents = store.session_dir / "agents"
+    agents.mkdir(exist_ok=True)
+    original_stat = Path.stat
+    unchanged = original_stat(agents)
+
+    def fixed_agents_stat(path: Path, *args: object, **kwargs: object):
+        if path == agents:
+            return unchanged
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fixed_agents_stat)
+    scans = 0
+    original_scandir = os.scandir
+
+    def count_scandir(path: object):
+        nonlocal scans
+        if Path(path) == agents:
+            scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
+    child = _child(store, 1, description="new child")
+    store.register_agent_child(
+        ToolCall("child-1", "agent", {"prompt": "work"}),
+        child_session_path=str(child),
+        description="new child",
+    )
+    navigation._last_refresh_at = float("-inf")
+
+    assert navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [store.session_dir, child]
+    assert scans == 0
+    store.close()
+
+
+def test_registered_child_from_another_store_is_discovered_at_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    navigation_store = ConversationStore(root, session_id="root")
+    writer_store = ConversationStore(root, session_id="root")
+    navigation = AgentNavigation(navigation_store)
+    scans = 0
+    original_scandir = os.scandir
+
+    def count_scandir(path: object):
+        nonlocal scans
+        if Path(path) == navigation_store.session_dir / "agents":
+            scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
+    child = _child(writer_store, 1, description="cross-process child")
+    writer_store.register_agent_child(
+        ToolCall("child-1", "agent", {"prompt": "work"}),
+        child_session_path=str(child),
+        description="cross-process child",
+    )
+    navigation._last_refresh_at = float("-inf")
+
+    assert navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    assert scans == 0
+
+    navigation._last_refresh_at = float("-inf")
+    navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    writer_store.close()
+    navigation_store.close()
+
+
+def test_nested_registered_child_is_discovered(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    parent = _child(store, 1, description="parent")
+    navigation = AgentNavigation(store)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    parent_store = ConversationStore(parent.parent, session_id=parent.name)
+    nested = _child(parent_store, 1, description="nested")
+    parent_store.register_agent_child(
+        ToolCall("nested-1", "agent", {"prompt": "work"}),
+        child_session_path=str(nested),
+        description="nested",
+    )
+    navigation._last_refresh_at = float("-inf")
+
+    assert navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [store.session_dir, nested]
+    parent_store.close()
+    store.close()
+
+
+@pytest.mark.parametrize("change", ["finish", "remove"])
+def test_finished_or_removed_known_child_updates_without_registration_change(
+    tmp_path: Path, change: str
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(
+        store,
+        1,
+        description="running",
+        state="starting" if change == "finish" else "running",
+    )
+    navigation = AgentNavigation(store)
+    if change == "finish":
+        lifecycle = child / "agent_lifecycle.json"
+        original = lifecycle.stat()
+        replacement = child / "replacement.json"
+        replacement.write_bytes(lifecycle.read_bytes().replace(b"starting", b"canceled"))
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        os.replace(replacement, lifecycle)
+        assert lifecycle.stat().st_size == original.st_size
+        assert lifecycle.stat().st_mtime_ns == original.st_mtime_ns
+    else:
+        shutil.rmtree(child)
+    navigation._last_refresh_at = float("-inf")
+
+    assert navigation.refresh()
+    assert navigation.entries == []
+    store.close()
+
+
 def test_refresh_rescans_after_lifecycle_replaced_during_tree_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -639,10 +790,12 @@ def test_refresh_rescans_after_lifecycle_replaced_during_tree_read(
     replaced = False
 
     def children_with_replacement(
-        path: Path, fallback: dict[Path, dict[str, object]]
+        path: Path,
+        fallback: dict[Path, dict[str, object]],
+        **kwargs: object,
     ) -> list[agent_card.AgentEntry]:
         nonlocal replaced
-        entries = original_children(path, fallback)
+        entries = original_children(path, fallback, **kwargs)
         if not replaced:
             child.joinpath("agent_lifecycle.json").write_text(
                 json.dumps({"description": "Live", "state": "completed"})
@@ -671,10 +824,12 @@ def test_refresh_rescans_after_child_created_during_tree_read(
     created = False
 
     def children_with_creation(
-        path: Path, fallback: dict[Path, dict[str, object]]
+        path: Path,
+        fallback: dict[Path, dict[str, object]],
+        **kwargs: object,
     ) -> list[agent_card.AgentEntry]:
         nonlocal created
-        entries = original_children(path, fallback)
+        entries = original_children(path, fallback, **kwargs)
         if not created:
             _child(store, 1, description="New child")
             os.utime(store.session_dir / "agents", None)

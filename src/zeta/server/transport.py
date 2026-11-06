@@ -92,6 +92,8 @@ class WebSocketServer:
         self.path = path
         self.accept = accept
         self.token: str | None = None
+        self.controller_token: str | None = None
+        self.observer_token: str | None = None
         self.server: Server | None = None
         self._lock_fd: int | None = None
 
@@ -99,7 +101,9 @@ class WebSocketServer:
         self._lock_fd = await asyncio.to_thread(
             acquire_connection_lock, self.path.with_name("serve.ws.lock")
         )
-        self.token = secrets.token_urlsafe(32)
+        self.controller_token = secrets.token_urlsafe(32)
+        self.observer_token = secrets.token_urlsafe(32)
+        self.token = self.controller_token
         self.server = await serve(
             self._handle,
             "127.0.0.1",
@@ -121,13 +125,13 @@ class WebSocketServer:
             write_connection_file,
             self.path,
             port=self.port,
-            token=self.token,
+            controller_token=self.controller_token,
+            observer_token=self.observer_token,
             origins=self.origins,
         )
         await asyncio.to_thread(
             print,
-            "zeta serve: websocket ready: "
-            f"ws://127.0.0.1:{self.port}/?token={self.token}",
+            f"zeta serve: websocket ready: ws://127.0.0.1:{self.port}/",
             file=sys.stderr,
         )
 
@@ -139,19 +143,28 @@ class WebSocketServer:
         )
         if auth_kind == "invalid":
             return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
-        supplied = (
-            [bearer]
-            if auth_kind == "bearer"
-            else parse_qs(urlsplit(request.path).query, keep_blank_values=True).get(
-                "token", []
-            )
-        )
-        if (
-            self.token is None
-            or len(supplied) != 1
-            or not hmac.compare_digest(supplied[0], self.token)
-        ):
-            return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+        if auth_kind == "bearer":
+            if self.controller_token is not None and hmac.compare_digest(
+                bearer or "", self.controller_token
+            ):
+                connection.max_role = "controller"
+            elif self.observer_token is not None and hmac.compare_digest(
+                bearer or "", self.observer_token
+            ):
+                connection.max_role = "observer"
+            else:
+                return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+        else:
+            supplied = parse_qs(
+                urlsplit(request.path).query, keep_blank_values=True
+            ).get("token", [])
+            if (
+                self.controller_token is None
+                or len(supplied) != 1
+                or not hmac.compare_digest(supplied[0], self.controller_token)
+            ):
+                return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+            connection.max_role = "controller"
         try:
             origin = request.headers.get("Origin")
         except MultipleValuesError:
@@ -178,6 +191,8 @@ class WebSocketServer:
             )
             self._lock_fd = None
             self.token = None
+            self.controller_token = None
+            self.observer_token = None
 
 
 class WebSocketConnection:
@@ -188,6 +203,7 @@ class WebSocketConnection:
         self._pending: bytes | None = None
         self._close_task: asyncio.Task[None] | None = None
         self.transport = connection.transport
+        self.max_role = getattr(connection, "max_role", "controller")
 
     async def read(self, _size: int) -> bytes:
         try:
@@ -293,7 +309,12 @@ def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> N
 
 
 def write_connection_file(
-    path: Path, *, port: int, token: str, origins: tuple[str, ...]
+    path: Path,
+    *,
+    port: int,
+    controller_token: str,
+    observer_token: str,
+    origins: tuple[str, ...],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -301,7 +322,10 @@ def write_connection_file(
     payload = json.dumps(
         {
             "port": port,
-            "token": token,
+            # ``token`` remains the controller credential for existing clients.
+            "token": controller_token,
+            "controller_token": controller_token,
+            "observer_token": observer_token,
             "pid": os.getpid(),
             "origins": list(origins),
             "ws_auth": ["subprotocol", "query"],
