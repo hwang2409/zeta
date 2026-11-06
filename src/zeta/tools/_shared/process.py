@@ -444,7 +444,7 @@ class BackgroundTaskRegistry:
                 owner,
             )
         )
-        await self._persist()
+        await self._persist_async()
         return task_id, process.pid
 
     async def wait(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
@@ -722,7 +722,7 @@ class BackgroundTaskRegistry:
                             timeout=self.term_grace + self.stdin_drain_timeout,
                         )
                     )
-            await self._persist()
+            await self._persist_async()
             if killed:
                 self._notice(
                     BackgroundTaskShutdownNotice(
@@ -878,7 +878,7 @@ class BackgroundTaskRegistry:
                         record.owner,
                     )
                 )
-                await self._persist()
+                await self._persist_async()
                 if record.notify_on_exit:
                     await self._notify_exit(
                         record.task_id,
@@ -987,7 +987,7 @@ class BackgroundTaskRegistry:
                 record.owner,
             )
         )
-        await self._persist()
+        await self._persist_async()
         if record.notify_on_exit:
             await self._notify_exit(
                 record.task_id,
@@ -1123,10 +1123,10 @@ class BackgroundTaskRegistry:
             if was_running:
                 self._pending_recovery[task_id] = command
 
-    async def _persist(self) -> None:
+    def _persistence_rows(self) -> list[dict[str, Any]] | None:
         if self._directory_fd is None or self._temporary_log_root is not None:
-            return
-        rows = [
+            return None
+        return [
             {
                 "task_id": record.task_id,
                 "command": record.command,
@@ -1138,9 +1138,17 @@ class BackgroundTaskRegistry:
             }
             for record in self._records.values()
         ]
-        await asyncio.to_thread(
-            write_session_json, self._directory_fd, "background_tasks.json", rows
-        )
+    def _persist(self) -> None:
+        rows = self._persistence_rows()
+        if rows is not None:
+            write_session_json(self._directory_fd, "background_tasks.json", rows)
+
+    async def _persist_async(self) -> None:
+        rows = self._persistence_rows()
+        if rows is not None:
+            await asyncio.to_thread(
+                write_session_json, self._directory_fd, "background_tasks.json", rows
+            )
 
 
 def _command_headline(command: str, limit: int = 80) -> str:

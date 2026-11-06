@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -294,6 +295,16 @@ class ConversationStore(
             self._todo_dismissed = False
             self._write_session_state(self.bash_cwd, normalized)
 
+    async def set_todo_items_async(self, items: object) -> None:
+        """Replace todo state while publishing its file off the event loop."""
+
+        normalized = parse_todo_items(items)
+        with self._append_lock():
+            self._todo_items = [dict(item) for item in normalized]
+            self._todo_dismissed = False
+            state = self._todo_state(self.bash_cwd, normalized)
+        await asyncio.to_thread(self._write_session_state_data, state)
+
     def _load_session_state(self) -> None:
         try:
             value = load_session_json(
@@ -351,9 +362,9 @@ class ConversationStore(
                 )
             self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
 
-    def _write_session_state(
+    def _todo_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]
-    ) -> None:
+    ) -> dict[str, Any]:
         state: dict[str, Any] = {"bash_cwd": bash_cwd}
         normalized_items = [dict(item) for item in todo_items]
         if normalized_items:
@@ -367,7 +378,15 @@ class ConversationStore(
             agent_parent=self._agent_parent,
             agent_canceled=self._agent_canceled,
         )
+        return state
+
+    def _write_session_state_data(self, state: dict[str, Any]) -> None:
         write_session_json(self.directory_fd, "session_state.json", state)
+
+    def _write_session_state(
+        self, bash_cwd: str, todo_items: Iterable[TodoItem]
+    ) -> None:
+        self._write_session_state_data(self._todo_state(bash_cwd, todo_items))
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
