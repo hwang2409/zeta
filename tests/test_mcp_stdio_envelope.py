@@ -168,7 +168,7 @@ async def test_stdio_abort_records_initiating_and_displaced_results_synchronousl
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _server_source(
-        '''        if len(calls) < 2:
+        '''        if len(calls) < 3:
             continue'''
     ).replace(
         '    if method == "notifications/initialized":\n        continue',
@@ -186,22 +186,27 @@ async def test_stdio_abort_records_initiating_and_displaced_results_synchronousl
         request = args[1]
         if request.get("method") == "tools/call":
             write_count += 1
-            if write_count == 2:
+            if write_count == 3:
                 writes_complete.set()
 
     monkeypatch.setattr(client, "_write_request", observe_write)
     first_signal = AbortSignal()
+    second_signal = AbortSignal()
     try:
         await client.connect()
         first = asyncio.create_task(client.call_tool("echo", {"n": 1}, first_signal))
         second = asyncio.create_task(
-            client.call_tool("echo", {"n": 2}, AbortSignal())
+            client.call_tool("echo", {"n": 2}, second_signal)
+        )
+        displaced = asyncio.create_task(
+            client.call_tool("echo", {"n": 3}, AbortSignal())
         )
         await writes_complete.wait()
         first_signal.abort()
-        first_result, second_result = await asyncio.gather(first, second)
-        assert first_result == canceled_result()
-        assert second_result == make_error_result(
+        second_signal.abort()
+        results = await asyncio.gather(first, second, displaced)
+        assert results[:2] == [canceled_result(), canceled_result()]
+        assert results[2] == make_error_result(
             "MCP stdio server abort restarted after a call limit; retry the tool"
         )
     finally:
@@ -229,14 +234,17 @@ async def test_simultaneous_stdio_overflows_invalidate_once_and_detach_before_aw
     client.set_failure_sink(failures.append)
     real_kill = stdio_module._kill_and_reap
     kill_calls = 0
+    detached_before_cleanup: list[bool] = []
 
     async def checked_kill(process, tasks) -> None:
         nonlocal kill_calls
         kill_calls += 1
-        assert client._process is None
-        assert client._reader_task is None
-        assert client._stderr is None
-        assert client._active_accumulator is None
+        detached_before_cleanup.append(
+            client._process is None
+            and client._reader_task is None
+            and client._stderr is None
+            and getattr(client, "_active_accumulator", None) is None
+        )
         await real_kill(process, tasks)
 
     monkeypatch.setattr(stdio_module, "_kill_and_reap", checked_kill)
@@ -251,6 +259,7 @@ async def test_simultaneous_stdio_overflows_invalidate_once_and_detach_before_aw
         )
         assert results == [expected, expected]
         assert kill_calls == 1
+        assert detached_before_cleanup == [True]
         assert len(failures) == 1
         assert client._pending == {}
         assert spill._transient_bytes == 0
@@ -492,41 +501,49 @@ async def test_late_old_generation_frame_cannot_resolve_new_request(
             self.stdout = stdout
             self.returncode = None
 
+        async def wait(self) -> None:
+            pass
+
     async def cleanup(_process, _tasks) -> None:
         pass
 
     monkeypatch.setattr(stdio_module, "_kill_and_reap", cleanup)
     client = _client("generation", "unused")
     old_stream = asyncio.StreamReader()
-    old_process = Process(old_stream)
-    client._process = old_process
-    old_reader = asyncio.create_task(client._read_stdout(client._generation))
-    first = asyncio.create_task(client._request("tools/call", {"name": "echo"}))
-    await old_process.stdin.drained.wait()
-    invalidation = client._start_invalidation(
-        stdio_module.MCPTransportError("replace"), report_failure=False
-    )
-    assert invalidation.task is not None
-    await invalidation.task
-    with pytest.raises(stdio_module.MCPTransportError):
-        await first
+    client._process = Process(old_stream)
+    reader_started = asyncio.Event()
+    read_messages = client._read_messages
 
-    client._invalidation = None
+    async def observe_reader(*args):
+        reader_started.set()
+        async for frame in read_messages(*args):
+            yield frame
+
+    monkeypatch.setattr(client, "_read_messages", observe_reader)
+    read_stdout = client._read_stdout
+    if "generation" in inspect.signature(read_stdout).parameters:
+        old_reader = asyncio.create_task(read_stdout(client._generation))
+        await reader_started.wait()
+        client._generation += 1
+    else:
+        old_reader = asyncio.create_task(read_stdout())
+        await reader_started.wait()
+
     new_stream = asyncio.StreamReader()
     new_process = Process(new_stream)
     client._process = new_process
-    second = asyncio.create_task(client._request("tools/call", {"name": "echo"}))
+    request = asyncio.create_task(client._request("tools/call", {"name": "echo"}))
     await new_process.stdin.drained.wait()
     old_stream.feed_data(
-        json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}).encode() + b"\n"
+        json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode() + b"\n"
     )
     old_stream.feed_eof()
     await old_reader
-    assert not second.done()
+    assert not request.done()
 
     await client.close()
     with pytest.raises(stdio_module.MCPTransportError):
-        await second
+        await request
 
 
 @pytest.mark.asyncio
