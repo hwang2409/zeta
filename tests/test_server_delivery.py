@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -989,6 +992,82 @@ async def test_orphan_steer_is_rejected_without_acceptance(tmp_path: Path) -> No
         assert status[-1]["result"]["status"] == "unknown"
     finally:
         await _close(server, writer)
+
+
+def test_steer_acceptance_keeps_legacy_delivery_shape_and_separate_text(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="compat-session")
+    accepted = with_message_origin(
+        Message(MessageRole.USER, [TextContent("keep me")]), MessageOrigin.USER
+    )
+    store.append_client_delivery(
+        "compat-steer",
+        "steer",
+        "queued",
+        {"accepted": True},
+        accepted_message=accepted,
+    )
+
+    delivery, retained = store.replay()
+    assert delivery.type == "client_delivery"
+    assert delivery.data == {
+        "delivery_id": "compat-steer",
+        "method": "steer",
+        "status": "queued",
+        "outcome": {"accepted": True},
+    }
+    assert retained.type == "warning"
+    assert retained.data["delivery_id"] == "compat-steer"
+    assert retained.data["accepted_message"] == accepted.to_dict()
+    assert all(entry.type != "message" for entry in store.replay())
+    store.close()
+
+
+def test_new_steer_acceptance_opens_with_origin_main_reader(tmp_path: Path) -> None:
+    old_reader_src = os.environ.get("HISTORY_FIDELITY_ORIGIN_MAIN_SRC")
+    if old_reader_src is None:
+        pytest.skip(
+            "set HISTORY_FIDELITY_ORIGIN_MAIN_SRC to an origin/main worktree src directory"
+        )
+
+    session_root = tmp_path / "sessions"
+    store = ConversationStore(session_root, session_id="compat-session")
+    accepted = with_message_origin(
+        Message(MessageRole.USER, [TextContent("keep me")]), MessageOrigin.USER
+    )
+    store.append_client_delivery(
+        "compat-steer",
+        "steer",
+        "queued",
+        {"accepted": True},
+        accepted_message=accepted,
+    )
+    store.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import zeta; from pathlib import Path; "
+                "from zeta.core.store import ConversationStore; "
+                "print(zeta.__file__); "
+                "ConversationStore(Path(__import__('sys').argv[1]), "
+                "session_id='compat-session').close(); "
+                "print('old reader opened session')"
+            ),
+            str(session_root),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": old_reader_src},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "old reader opened session" in result.stdout
+    assert str(Path(old_reader_src) / "zeta" / "__init__.py") in result.stdout
 
 
 def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:

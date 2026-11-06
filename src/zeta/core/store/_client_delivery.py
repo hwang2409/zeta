@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 CLIENT_DELIVERY_METADATA = "zeta_client_delivery_id"
+ACCEPTED_STEERING_WARNING_KIND = "client_steering_accepted"
 MAX_RECENT_CLIENT_DELIVERIES = 1_000
 DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -73,6 +74,21 @@ def valid_client_delivery_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and DELIVERY_ID_PATTERN.fullmatch(value) is not None
 
 
+def validate_accepted_steering_data(data: Mapping[str, object]) -> None:
+    if data.get("kind") != ACCEPTED_STEERING_WARNING_KIND:
+        return
+    accepted_message = data.get("accepted_message")
+    if (
+        set(data)
+        != {"message", "kind", "delivery_id", "accepted_message"}
+        or data.get("message") != "accepted client steering"
+        or not valid_client_delivery_id(data.get("delivery_id"))
+        or not isinstance(accepted_message, dict)
+    ):
+        raise ValueError("invalid accepted steering message")
+    require_new_message_origin(Message.from_dict(accepted_message))
+
+
 def validate_client_delivery_data(
     data: Mapping[str, object], session_id: str
 ) -> None:
@@ -95,12 +111,7 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        accepted_message = data.get("accepted_message")
-        if accepted_message is not None:
-            if not (method == "steer" and status == "queued" and isinstance(accepted_message, dict)):
-                raise ValueError("invalid accepted steering message")
-            require_new_message_origin(Message.from_dict(accepted_message))
-        allowed = {"delivery_id", "method", "status", "outcome", "accepted_message"}
+        allowed = {"delivery_id", "method", "status", "outcome"}
         if set(data) - allowed or not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
@@ -253,10 +264,21 @@ class ClientDeliveryMixin:
                         "method": method,
                         "status": status,
                         "outcome": dict(outcome),
-                        **({"accepted_message": accepted_message.to_dict()} if accepted_message is not None else {}),
                     },
                 )
             ]
+            if accepted_message is not None:
+                rows.append(
+                    (
+                        "warning",
+                        {
+                            "message": "accepted client steering",
+                            "kind": ACCEPTED_STEERING_WARNING_KIND,
+                            "delivery_id": delivery_id,
+                            "accepted_message": accepted_message.to_dict(),
+                        },
+                    )
+                )
             if message is not None:
                 rows.append(
                     (

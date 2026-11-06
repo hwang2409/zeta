@@ -37,6 +37,21 @@ def delivery_status_row(
     return row
 
 
+def image_stub(block: Mapping[str, object]) -> dict[str, object]:
+    """Project stored image metadata without sending image bytes or paths."""
+    stub = {
+        key: block[key]
+        for key in ("type", "mimeType", "caption", "width", "height", "size")
+        if key in block
+    }
+    data = block.get("data")
+    if "size" not in stub and isinstance(data, str):
+        padding = len(data) - len(data.rstrip("="))
+        stub["size"] = len(data) * 3 // 4 - padding
+    stub["data_omitted"] = True
+    return stub
+
+
 def project_tool_value(value: object) -> tuple[object, bool]:
     """Bound string leaves in tool wire data."""
     if isinstance(value, str):

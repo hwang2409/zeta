@@ -156,6 +156,65 @@ async def test_session_history_fidelity_projects_bounded_tool_data_over_socket(
 
 
 @pytest.mark.asyncio
+async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path)
+    try:
+        image = {
+            "type": "image",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg==",
+            "mimeType": "image/png",
+        }
+        store = server.runtime.opened.store
+        store.append_message(
+            with_message_origin(
+                Message(
+                    MessageRole.USER,
+                    tool_result=ToolResult(
+                        "image-tool",
+                        "images",
+                        content_blocks=[dict(image), dict(image), dict(image)],
+                    ),
+                ),
+                MessageOrigin.USER,
+            )
+        )
+        blocks = store._entries[-1].data["message"]["tool_result"]["content_blocks"]
+        blocks[0].update({"size": 99, "caption": "known"})
+        blocks[1]["data"] = "YWJj"
+        blocks[1].update({"width": 2, "height": 3})
+        del blocks[2]["data"]
+        blocks[2].update({"path": "/private/image.png", "annotations": {}})
+
+        rows = await _history(reader, writer, session_id)
+        assert rows[0]["tool_result"]["content_blocks"] == [
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "caption": "known",
+                "size": 99,
+                "data_omitted": True,
+            },
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "width": 2,
+                "height": 3,
+                "size": 3,
+                "data_omitted": True,
+            },
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "data_omitted": True,
+            },
+        ]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
     tmp_path: Path,
 ) -> None:

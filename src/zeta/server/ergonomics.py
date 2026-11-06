@@ -19,6 +19,7 @@ from uuid import uuid4
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
 from ..core.store._client_delivery import (
+    ACCEPTED_STEERING_WARNING_KIND,
     CLIENT_DELIVERY_METADATA,
 )
 from ..core.store._client_delivery import (
@@ -361,8 +362,13 @@ def history_projection(
     accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     for entry in branch:
-        if entry.type == "client_delivery" and isinstance(entry.data.get("accepted_message"), dict):
-            accepted_messages[entry.data["delivery_id"]] = entry.data["accepted_message"]
+        if (
+            entry.type == "warning"
+            and entry.data.get("kind") == ACCEPTED_STEERING_WARNING_KIND
+        ):
+            accepted_messages[entry.data["delivery_id"]] = entry.data[
+                "accepted_message"
+            ]
         if entry.type == "message":
             approval_calls.update(
                 {
@@ -446,9 +452,7 @@ def _history_entry_rows(
         data = entry.data
         if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
             return []
-        accepted = data.get("accepted_message") or accepted_messages.get(
-            data.get("delivery_id")
-        )
+        accepted = accepted_messages.get(data.get("delivery_id"))
         message = Message.from_dict(accepted) if isinstance(accepted, dict) else None
         return [event_contract.delivery_status_row(entry, message)]
     if entry_type == "approval_history":
@@ -529,9 +533,7 @@ def _history_entry_rows(
         if fidelity:
             for index, block in enumerate(result.get("content_blocks") or []):
                 if isinstance(block, dict) and block.get("type") == "image":
-                    stub = {key: block[key] for key in ("type", "mimeType", "caption", "width", "height", "size") if key in block}
-                    stub["size"] = stub.get("size", 0)
-                    stub["data_omitted"] = True
+                    stub = event_contract.image_stub(block)
                     blocks.append(_attach_row_handle(
                         stub, entry.id, "message.tool_result.content_blocks", index,
                         fidelity=fidelity, content_read=content_read,

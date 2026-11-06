@@ -55,7 +55,11 @@ from ._approval_display import (
 from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_history_data
 from ._async_writes import AsyncDurableWritesMixin
 from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
-from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
+from ._client_delivery import (
+    ClientDeliveryMixin,
+    validate_accepted_steering_data,
+    validate_client_delivery_data,
+)
 from ._incremental_validation import (
     APPROVAL_RESOLUTION_REASONS,
     IncrementalValidationMixin,
@@ -551,6 +555,7 @@ class ConversationStore(
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
+                validate_accepted_steering_data(entry.data)
             elif entry.type in {"checkpoint", "fork"}:
                 self._validate_checkpoint_or_fork_payload(entry)
             elif entry.type == "approval_resolution":
