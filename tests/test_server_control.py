@@ -123,9 +123,8 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
     control._notify = lambda event, session_id=None, **fields: registry.publish_controller(event, session_id, **fields)
     control._publish_memory_notice("session", "updated")
     await asyncio.sleep(0)
-    registry.controller_ready(connection)
-    await registry.flush_controller(connection)
-    assert json.loads(connection.frames[0])["params"]["event"] == "memory_updated"
+    assert await registry.send(connection, b"hello\n")
+    assert json.loads(connection.frames[1])["params"]["event"] == "memory_updated"
     registry.release(connection)
     await registry.aclose()
 
@@ -159,9 +158,8 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     await registry.publish_controller("assistant_delta", "session", delta="x")
-    registry.controller_ready(connection)
-    await registry.flush_controller(connection)
-    assert json.loads(connection.frames[0])["params"]["event"] == "assistant_delta"
+    assert await registry.send(connection, b"hello\n")
+    assert json.loads(connection.frames[1])["params"]["event"] == "assistant_delta"
     registry.release(connection)
 
 
@@ -173,9 +171,8 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for value in ("a", "b", "c"):
         await registry.publish_controller("assistant_delta", "session", delta=value)
-    registry.controller_ready(connection)
-    await registry.flush_controller(connection)
-    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+    assert await registry.send(connection, b"hello\n")
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]] == [
         "a",
         "b",
         "c",
@@ -189,8 +186,8 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    registry.controller_ready(connection)
-    await registry.flush_controller(connection)
+    assert await registry.send(connection, b"hello\n")
+    connection.frames.clear()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     async def gated_write(frame: bytes) -> bool:
@@ -221,6 +218,40 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_observer_concurrent_outputs_keep_admission_order() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(
+        connection, "observer", "1.2", frozenset({"serve_observers"})
+    )
+    assert await registry.send(connection, b"hello\n")
+    connection.frames.clear()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    original_write = connection._write_physical
+
+    async def gated_write(frame: bytes) -> bool:
+        if not first_started.is_set():
+            first_started.set()
+            await release_first.wait()
+        return await original_write(frame)
+
+    connection._write_physical = gated_write  # type: ignore[method-assign]
+    first = asyncio.create_task(registry.send(connection, b"first\n"))
+    await first_started.wait()
+    second = asyncio.create_task(registry.send(connection, b"second\n"))
+    await asyncio.sleep(0)
+    assert connection.frames == []
+    release_first.set()
+    assert await first
+    assert await second
+    assert connection.frames == [b"first\n", b"second\n"]
+    registry.release(connection)
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
 async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     first = _ControllerConnection()
@@ -231,9 +262,8 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     second = _ControllerConnection()
     registry.register(second)
     registry.negotiate_role(second, "controller", "1.2", frozenset())
-    registry.controller_ready(second)
-    await registry.flush_controller(second)
-    assert second.frames == []
+    assert await registry.send(second, b"hello\n")
+    assert second.frames == [b"hello\n"]
     registry.release(second)
 
 
@@ -245,9 +275,8 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for _ in range(257):
         await registry.publish_controller("assistant_delta", "session", delta="x")
-    registry.controller_ready(connection)
-    assert not await registry.flush_controller(connection)
-    assert json.loads(connection.frames[0])["error"]["code"] == -32011
+    assert not await registry.send(connection, b"hello\n")
+    assert json.loads(connection.frames[1])["error"]["code"] == -32011
     registry.release(connection)
 
 
@@ -359,7 +388,9 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
-    server.connections.controller_ready(replacement)
+    assert await server.connections.send(replacement, b"hello\n")
+    writer.frames.clear()
+    writer.queue.get_nowait()
     return replacement, writer
 
 
