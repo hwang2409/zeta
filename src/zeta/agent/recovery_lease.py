@@ -119,12 +119,16 @@ async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
         raise
 
 
+def _has_recovery_work(loop: AgentLoopForRecovery) -> bool:
+    return bool(loop.store.agent_children()) or any(
+        entry.data.get("kind") == "child_question"
+        for entry in loop.store.agent_notifications()
+    )
+
+
 async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
     if not loop._children_recovered:
-        if loop.store.agent_children() or any(
-            entry.data.get("kind") == "child_question"
-            for entry in loop.store.agent_notifications()
-        ):
+        if _has_recovery_work(loop):
             await recover_agent_children_off_loop(loop)
         loop._children_recovered = True
     if loop._pending_child_recovery:
@@ -156,9 +160,17 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification)
                 )
 
-    deliveries = await root._to_thread_store(recover)
-    for item in deliveries:
-        await loop._background_owner.conversation_channel.produce_to(None, item)
-    await root._refresh_off_loop()
-    if notification is not root:
-        await notification._refresh_off_loop()
+    async def complete_recovery() -> None:
+        deliveries = await root._to_thread_store(recover)
+        for item in deliveries:
+            await loop._background_owner.conversation_channel.produce_to(None, item)
+        await root._refresh_off_loop()
+        if notification is not root:
+            await notification._refresh_off_loop()
+
+    recovery = asyncio.create_task(complete_recovery())
+    try:
+        await asyncio.shield(recovery)
+    except asyncio.CancelledError:
+        await recovery
+        raise

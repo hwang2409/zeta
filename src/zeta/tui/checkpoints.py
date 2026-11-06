@@ -518,23 +518,26 @@ class CheckpointTranscriptMixin:
             self._print_system(message)
 
     async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
-        if resume_ui:
-            replay_completed = True
-        else:
-            try:
-                replay_completed = await self._rebuild_transcript_async()
-            except BaseException:
+        try:
+            replay_completed = (
+                True if resume_ui else await self._rebuild_transcript_async()
+            )
+            if replay_completed is False or self._exit_requested:
+                if not resume_ui:
+                    self._finish_startup_replay(completed=False)
+                return False
+            await self.loop.ensure_mcp_servers()
+            if not self._startup_presented:
+                self._present_startup_output()
+                self._startup_presented = True
+            self._present_pending_approvals()
+            self.start_decisions_poll()
+        except BaseException:
+            if not resume_ui:
                 self._finish_startup_replay(completed=False)
-                raise
-            self._finish_startup_replay(completed=replay_completed is not False)
-        if replay_completed is False or self._exit_requested:
-            return False
-        await self.loop.ensure_mcp_servers()
-        if not self._startup_presented:
-            self._present_startup_output()
-            self._startup_presented = True
-        self._present_pending_approvals()
-        self.start_decisions_poll()
+            raise
+        if not resume_ui:
+            self._finish_startup_replay(completed=True)
         self._invalidate_prompt()
         submissions, self._startup_submissions = self._startup_submissions, []
         for value, internal in submissions:

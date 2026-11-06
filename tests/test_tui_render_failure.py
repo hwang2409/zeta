@@ -66,6 +66,7 @@ def test_render_failure_exits_without_input_and_restores_session(
     exception_prompts: list[object] = []
     startup_started = False
     startup_canceled = False
+    startup_canceled_before_close = False
     preferred_width = app._status_card.preferred_width
 
     def broken_width(width: int) -> int:
@@ -82,12 +83,13 @@ def test_render_failure_exits_without_input_and_restores_session(
             application.exit(exception=RuntimeError("unexpected exception prompt"))
 
     async def stalled_replay() -> None:
-        nonlocal startup_canceled, startup_started
+        nonlocal startup_canceled, startup_canceled_before_close, startup_started
         startup_started = True
         try:
             await asyncio.Event().wait()
         finally:
             startup_canceled = True
+            startup_canceled_before_close = not app._closed
 
     original_run = cli._run_tui
 
@@ -144,7 +146,7 @@ def test_render_failure_exits_without_input_and_restores_session(
     assert not store._release_lease.alive
     assert app._draft._scheduled is None
     if phase == "startup":
-        assert not startup_started or startup_canceled
+        assert not startup_started or startup_canceled_before_close
     if ephemeral:
         assert "resume with:" not in error
         assert not root.exists()
