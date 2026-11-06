@@ -658,6 +658,7 @@ class WorkspaceSnapshotStore:
             self._current_id = None
         self._is_corrupt = False
         try:
+            os.unlink(SNAPSHOT_STATE_FILE, dir_fd=self.directory_fd)
             self._persist()
         except OSError:
             self._is_corrupt = True

@@ -209,7 +209,8 @@ class BackgroundTaskRegistry:
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
-            self.bind_session_dir(session_dir, directory_fd)
+            assert storage_lease is not None
+            self.bind_session_dir(session_dir, directory_fd, storage_lease)
         else:
             self._temporary_log_root = Path(tempfile.mkdtemp(prefix="zeta-background-"))
             os.chmod(self._temporary_log_root, 0o700)
@@ -276,8 +277,15 @@ class BackgroundTaskRegistry:
         self._pending_recovery.clear()
         return recovered
 
-    def bind_session_dir(self, session_dir: str | Path, directory_fd: int) -> None:
+    def bind_session_dir(
+        self,
+        session_dir: str | Path,
+        directory_fd: int,
+        storage_lease: WriterLease | None = None,
+    ) -> None:
         self._require_open()
+        if storage_lease is None:
+            raise ValueError("stored-format writer lease is required")
         if self._directory_fd is not None and self._temporary_log_root is None:
             if not os.path.samestat(os.fstat(self._directory_fd), os.fstat(directory_fd)):
                 raise ValueError("background task registry is already bound")
@@ -289,6 +297,7 @@ class BackgroundTaskRegistry:
         if temporary_root is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
             self._temporary_log_root = None
+        self._storage_lease = storage_lease.retain()
         self._bind_storage(Path(session_dir), directory_fd)
         try:
             self._load_previous()
@@ -1097,6 +1106,8 @@ class BackgroundTaskRegistry:
             return
         try:
             rows = load_session_json(read_session_file(self._directory_fd, "background_tasks.json"))
+        except FileNotFoundError:
+            return
         except (OSError, ValueError):
             self._persistence_corrupt = True
             return

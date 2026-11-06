@@ -780,7 +780,9 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
+        self.background_tasks.bind_session_dir(
+            store.session_dir, store.directory_fd, store._storage_lease
+        )
         self.bash_cwd = store.bash_cwd
 
     @property
