@@ -29,6 +29,28 @@ class ConversationIntegrityError(ValueError):
 
 MAX_SESSION_JSON_DEPTH = 64
 
+# entry types accepted by ConversationStore._validate_entry_payload.
+CONVERSATION_ENTRY_TYPES = frozenset(
+    {
+        "message",
+        "child_run_started",
+        "compaction",
+        "client_delivery",
+        "warning",
+        "checkpoint",
+        "fork",
+        "approval_resolution",
+        "approval_history",
+        "notification",
+        "notification_ack",
+        "notification_tui_presented",
+        "pending_prompt",
+        "pending_prompt_ack",
+        "pending_queue_closed",
+        "terminal_transition",
+    }
+)
+
 
 def load_session_json(source: Path | bytes) -> Any:
     """Decode a session file or JSONL row with a bounded container depth."""
