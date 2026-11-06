@@ -86,7 +86,7 @@ def infer_language(path: str) -> str:
 def _cell_prefix(text: str, width: int) -> int:
     cells = 0
     for index, character in enumerate(text):
-        step = max(0, get_cwidth(character))
+        step = get_cwidth(character)
         if cells + step > width:
             return max(1, index)
         cells += step
@@ -102,12 +102,12 @@ def wrap_by_cells(text: str, width: int) -> list[str]:
         current = ""
         for word in paragraph.split() or [""]:
             piece = word if not current else f"{current} {word}"
-            if sum(max(0, get_cwidth(ch)) for ch in piece) <= width:
+            if get_cwidth(piece) <= width:
                 current = piece
                 continue
             if current:
                 lines.append(current)
-            while sum(max(0, get_cwidth(ch)) for ch in word) > width:
+            while get_cwidth(word) > width:
                 split = _cell_prefix(word, width)
                 lines.append(word[:split])
                 word = word[split:]
