@@ -192,7 +192,7 @@ class BackgroundTaskRegistry:
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
-        self._storage_lease = storage_lease.retain() if storage_lease is not None else None
+        self._storage_lease: WriterLease | None = None
         self._persistence_corrupt = False
         self._archive: _BackgroundOutputArchive | None = None
         self._archived_lengths: dict[str, int] = {}
@@ -297,12 +297,18 @@ class BackgroundTaskRegistry:
         if temporary_root is not None:
             shutil.rmtree(temporary_root, ignore_errors=True)
             self._temporary_log_root = None
-        self._storage_lease = storage_lease.retain()
-        self._bind_storage(Path(session_dir), directory_fd)
+        retained_lease = storage_lease.retain()
+        previous_lease = self._storage_lease
+        self._storage_lease = retained_lease
+        if previous_lease is not None:
+            previous_lease.close()
         try:
+            self._bind_storage(Path(session_dir), directory_fd)
             self._load_previous()
         except BaseException:
             self._close_storage()
+            retained_lease.close()
+            self._storage_lease = None
             raise
 
     def _bind_storage(self, directory: Path, directory_fd: int) -> None:

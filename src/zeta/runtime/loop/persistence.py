@@ -173,6 +173,8 @@ class DraftPersistence:
         directory_fd: int | None = None,
         storage_lease: WriterLease | None = None,
     ) -> None:
+        if directory_fd is not None and storage_lease is None:
+            raise ValueError("session draft persistence requires a stored-format lease")
         self.path = Path(path)
         self.directory_fd = directory_fd
         self.delay = delay

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import multiprocessing
@@ -10,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.checkpoints import ConversationIntegrityError
+from zeta.core.store import ConversationStore
 from zeta.storage_format import (
     DeleteValue,
     ReplaceSubtree,
@@ -20,6 +23,7 @@ from zeta.storage_format import (
     open_writer,
     verify,
 )
+from zeta.tools._shared.process import BackgroundTaskRegistry
 
 
 def _try_exclusive_lock(home: str, result: multiprocessing.Queue[str]) -> None:
@@ -33,6 +37,47 @@ def _try_exclusive_lock(home: str, result: multiprocessing.Queue[str]) -> None:
             result.put("exclusive lock acquired")
     finally:
         os.close(fd)
+
+
+def _closed_owner_allows_exclusive_lock(home: str, owner: str, result) -> None:
+    path = Path(home)
+    advance(path, expected_epoch=0)
+    root_lease = open_writer(path)
+    if owner == "background":
+        with ConversationStore(
+            path / "sessions", session_id="owner", _storage_lease=root_lease
+        ) as store:
+            registry = BackgroundTaskRegistry(
+                session_dir=store.session_dir,
+                directory_fd=store.directory_fd,
+                storage_lease=root_lease,
+            )
+            asyncio.run(registry.close())
+    else:
+        try:
+            ConversationStore(
+                path / "sessions", session_id="../unsafe", _storage_lease=root_lease
+            )
+        except ConversationIntegrityError:
+            pass
+    root_lease.close()
+    _try_exclusive_lock(home, result)
+
+
+def _assert_closed_owner_allows_exclusive_lock(tmp_path: Path, owner: str) -> None:
+    context = multiprocessing.get_context("spawn")
+    result = context.Queue()
+    process = context.Process(
+        target=_closed_owner_allows_exclusive_lock,
+        args=(str(tmp_path), owner, result),
+    )
+    process.start()
+    process.join(10)
+    assert process.exitcode == 0
+    assert result.get(timeout=1) == "exclusive lock acquired"
+    result.close()
+    result.join_thread()
+    process.close()
 
 
 def test_writer_refuses_missing_and_too_new_manifest(
@@ -72,6 +117,14 @@ def test_writer_lock_descriptor_is_not_inherited(tmp_path: Path) -> None:
     )
     assert str(lease._entry.fd) not in child_fds
     lease.close()
+
+
+def test_background_registry_releases_its_only_writer_lease(tmp_path: Path) -> None:
+    _assert_closed_owner_allows_exclusive_lock(tmp_path, "background")
+
+
+def test_failed_store_construction_releases_writer_lease(tmp_path: Path) -> None:
+    _assert_closed_owner_allows_exclusive_lock(tmp_path, "failed-store")
 
 
 def test_mutations_preserve_unknown_nested_keys_and_declare_deletes() -> None:

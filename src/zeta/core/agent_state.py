@@ -12,7 +12,12 @@ from typing import Any
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
-from ..storage_format import mapping_mutations
+from ..storage_format import (
+    DeleteValue,
+    Mutation,
+    SetValue,
+    mapping_mutations,
+)
 from .agent_progress import (
     live_agent_lifecycle,
     publish_live_agent_lifecycle,
@@ -22,6 +27,36 @@ from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_file
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+
+
+def _session_state_mutations(
+    state: dict[str, Any], deleted_children: tuple[str, ...]
+) -> tuple[Mutation, ...]:
+    children = state.pop("agent_children", {})
+    mutations = list(
+        mapping_mutations(
+            state,
+            delete=(
+                key
+                for key in (
+                    "todo_items",
+                    "todo_dismissed",
+                    "agent_counter",
+                    "agent_parent",
+                    "agent_canceled",
+                )
+                if key not in state
+            ),
+        )
+    )
+    mutations.extend(
+        SetValue(("agent_children", child_id), marker)
+        for child_id, marker in children.items()
+    )
+    mutations.extend(
+        DeleteValue(("agent_children", child_id)) for child_id in deleted_children
+    )
+    return tuple(mutations)
 
 
 def _validate_lifecycle_start(
@@ -310,7 +345,11 @@ class AgentStateMixin:
         if marker_key not in self._agent_children:
             return False
         self._agent_children.pop(marker_key)
-        self._write_session_state(self.bash_cwd, self._todo_items)
+        self._write_session_state(
+            self.bash_cwd,
+            self._todo_items,
+            deleted_agent_children=(marker_key,),
+        )
         return True
 
     def finish_agent_child(self, marker_key: str) -> None:

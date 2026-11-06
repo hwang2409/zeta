@@ -28,28 +28,6 @@ class ConversationIntegrityError(ValueError):
 
 
 MAX_SESSION_JSON_DEPTH = 64
-CONVERSATION_ENTRY_TYPES = frozenset(
-    {
-        "approval_history",
-        "approval_request",
-        "approval_resolution",
-        "checkpoint",
-        "child_run_started",
-        "client_delivery",
-        "compaction",
-        "fork",
-        "message",
-        "notification",
-        "notification_ack",
-        "notification_tui_presented",
-        "pending_prompt",
-        "pending_prompt_ack",
-        "pending_queue_closed",
-        "terminal_transition",
-        "warning",
-    }
-)
-
 # entry types accepted by ConversationStore._validate_entry_payload.
 CONVERSATION_ENTRY_TYPES = frozenset(
     {

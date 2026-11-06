@@ -101,6 +101,22 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
     return epoch
 
 
+def _bootstrap_test_manifest(home: Path) -> None:
+    if (
+        os.environ.get("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT") != "1"
+        or (home / _MANIFEST).exists()
+    ):
+        return
+    try:
+        advance(home, expected_epoch=0)
+    except StorageFormatError:
+        for _ in range(100):
+            if (home / _MANIFEST).exists():
+                return
+            time.sleep(0.01)
+        raise
+
+
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
 
@@ -122,19 +138,7 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
             raise StorageFormatError(
                 "stored-format lock acquisition must run off the event loop"
             )
-        if (
-            os.environ.get("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT") == "1"
-            and not (canonical / _MANIFEST).exists()
-        ):
-            try:
-                advance(canonical, expected_epoch=0)
-            except StorageFormatError:
-                for _ in range(100):
-                    if (canonical / _MANIFEST).exists():
-                        break
-                    time.sleep(0.01)
-                else:
-                    raise
+        _bootstrap_test_manifest(canonical)
         fd = _open_lock(canonical)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)

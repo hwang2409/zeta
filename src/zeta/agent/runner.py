@@ -650,6 +650,7 @@ async def run_agent_tool(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
+            _storage_lease=loop.store._storage_lease,
         )
     )
     try:
