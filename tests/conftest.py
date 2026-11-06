@@ -739,9 +739,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
-            registries.append(registry)
+        registries.append(registry)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
