@@ -280,6 +280,120 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
     registry.release(connection)
 
 
+async def _send_hello_and_flush(
+    registry: ConnectionRegistry, connection: _ControllerConnection
+) -> bool:
+    sent = await registry.send(connection, b"hello\n")
+    controller_ready = getattr(registry, "controller_ready", None)
+    if controller_ready is None:
+        return sent
+    controller_ready(connection)
+    return await registry.flush_controller(connection)
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_physical_write_reports_delivered_once() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    assert await _send_hello_and_flush(registry, connection)
+    connection.frames.clear()
+    publisher: asyncio.Task[bool]
+
+    async def write_then_cancel(frame: bytes) -> bool:
+        connection.frames.append(frame)
+        asyncio.get_running_loop().call_soon(publisher.cancel)
+        return True
+
+    connection._write_physical = write_then_cancel  # type: ignore[method-assign]
+    publisher = asyncio.create_task(
+        registry.publish_controller("assistant_delta", "session", delta="once")
+    )
+    try:
+        delivered = await publisher
+    except asyncio.CancelledError:
+        delivered = await registry.publish_controller(
+            "assistant_delta", "session", delta="once"
+        )
+
+    assert delivered
+    assert len(connection.frames) == 1
+    registry.release(connection)
+
+
+@pytest.mark.asyncio
+async def test_aclose_settles_queued_frames_false() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    assert await _send_hello_and_flush(registry, connection)
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def blocked_write(frame: bytes) -> bool:
+        async with connection._write_lock:
+            write_started.set()
+            await release_write.wait()
+            return False
+
+    async def close() -> None:
+        release_write.set()
+
+    connection._write_physical = blocked_write  # type: ignore[method-assign]
+    connection.close = close  # type: ignore[method-assign]
+    head = asyncio.create_task(registry.send(connection, b"head\n"))
+    await write_started.wait()
+    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    await asyncio.sleep(0)
+
+    await registry.aclose()
+    await asyncio.sleep(0)
+
+    assert head.done() and await head is False
+    assert tail.done() and await tail is False
+
+
+@pytest.mark.asyncio
+async def test_pre_hello_flush_overflow_drops_tail_keeps_connection() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    seed = connection.codec.notification("assistant_delta", "session", delta="seed")
+    assert await registry.publish_controller(
+        "assistant_delta", "session", delta="seed"
+    )
+    seed_started = asyncio.Event()
+    release_seed = asyncio.Event()
+    close_count = 0
+    original_write = connection._write_physical
+
+    async def gated_seed(frame: bytes) -> bool:
+        if frame == seed:
+            seed_started.set()
+            await release_seed.wait()
+        return await original_write(frame)
+
+    async def close() -> None:
+        nonlocal close_count
+        close_count += 1
+
+    connection._write_physical = gated_seed  # type: ignore[method-assign]
+    connection.close = close  # type: ignore[method-assign]
+    hello = asyncio.create_task(_send_hello_and_flush(registry, connection))
+    await seed_started.wait()
+    for _ in range(256):
+        await registry.publish_controller("assistant_delta", "session", delta="tail")
+    release_seed.set()
+
+    await asyncio.gather(hello, return_exceptions=True)
+    assert close_count == 0
+    assert connection.frames == [b"hello\n", seed]
+    registry.release(connection)
+
+
 class _RecordingWriter:
     def __init__(self) -> None:
         self.frames: list[bytes] = []

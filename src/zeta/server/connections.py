@@ -53,6 +53,7 @@ class _OutputState:
     pending_controller_bytes: int = 0
     pending_controller_frames: int = 0
     overflowed: bool = False
+    overflowed_before_flush: bool = False
 
 
 @dataclass
@@ -200,11 +201,7 @@ class ConnectionRegistry:
             self._observers.remove(state)
         output = state.output
         if output is not None:
-            self._clear_output(output)
-            if output.writer_task is not None:
-                output.writer_task.cancel()
-            self._finish_future(output.ready, False)
-            self._finish_future(output.overflow_done, False)
+            self._settle_output(output)
 
     async def send(self, connection: Any, frame: bytes) -> bool:
         state = self._connections.get(connection)
@@ -212,22 +209,7 @@ class ConnectionRegistry:
             return False
         output = state.output
         if output.phase == "claimed_buffering":
-            hello = _OutputFrame(frame)
-            output.queue.appendleft(hello)
-            output.queued_bytes += len(frame)
-            output.phase = "flushing"
-            output.wake.set()
-            assert output.ready is not None
-            self._begin_caller(output)
-            try:
-                return await asyncio.shield(output.ready)
-            except asyncio.CancelledError:
-                cancelled = await self._cancel_frame(output, hello)
-                if cancelled is not None:
-                    raise cancelled
-                raise
-            finally:
-                self._finish_caller(output)
+            return await self._send_hello(output, frame)
         if output.phase != "ready":
             return False
         if state.role == "observer" and (
@@ -237,6 +219,27 @@ class ConnectionRegistry:
             return await self._overflow(state)
         return await self._send_frame(output, frame)
 
+    async def _send_hello(self, output: _OutputState, frame: bytes) -> bool:
+        hello = _OutputFrame(frame)
+        output.queue.appendleft(hello)
+        output.queued_bytes += len(frame)
+        output.overflowed_before_flush = output.overflowed
+        output.phase = "flushing"
+        output.wake.set()
+        assert output.ready is not None
+        self._begin_caller(output)
+        try:
+            return await asyncio.shield(output.ready)
+        except asyncio.CancelledError:
+            _, cancelled = await self._cancel_frame(output, hello)
+            if cancelled is not None:
+                raise cancelled
+            if output.ready.done() and not output.ready.cancelled():
+                return output.ready.result()
+            raise
+        finally:
+            self._finish_caller(output)
+
     async def _send_frame(self, output: _OutputState, frame: bytes) -> bool:
         future = self.loop.create_future()
         item = _OutputFrame(frame, future)
@@ -245,9 +248,13 @@ class ConnectionRegistry:
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            cancelled = await self._cancel_frame(output, item)
+            result, cancelled = await self._cancel_frame(output, item)
             if cancelled is not None:
                 raise cancelled
+            if result is not None:
+                return result
+            if future.done() and not future.cancelled():
+                return future.result()
             raise
         finally:
             self._finish_caller(output)
@@ -286,62 +293,78 @@ class ConnectionRegistry:
             while True:
                 await output.wake.wait()
                 while output.queue:
-                    item = output.queue.popleft()
-                    output.current_frame = item
-                    try:
-                        output.current_write = asyncio.create_task(
-                            self._write_physical(state.connection, item.payload)
-                        )
-                        result, _ = await output.current_write
-                    except asyncio.CancelledError:
-                        self._finish_frame_accounting(output, item)
-                        self._finish_future(item.future, False)
-                        if output.phase == "overflowing":
-                            continue
-                        if asyncio.current_task().cancelling():
-                            self._finish_future(output.ready, False)
-                            raise
-                        if output.phase == "flushing":
-                            self._finish_future(output.ready, False)
-                            output.ready = self.loop.create_future()
-                            output.phase = "claimed_buffering"
-                        continue
-                    except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
-                        self._finish_frame_accounting(output, item)
-                        self._finish_future(item.future, error=exc)
-                        if output.phase == "flushing":
-                            self._clear_output(output)
-                            self._finish_future(output.ready, error=exc)
-                            output.ready = self.loop.create_future()
-                            output.phase = "claimed_buffering"
-                        continue
-                    finally:
-                        output.current_frame = None
-                        output.current_write = None
-                    self._finish_frame_accounting(output, item)
-                    self._finish_future(item.future, result)
-                    if not result and output.phase == "flushing":
-                        self._clear_output(output)
-                        self._finish_future(output.ready, False)
-                        output.ready = self.loop.create_future()
-                        output.phase = "claimed_buffering"
+                    await self._write_output_frame(state, output, output.queue.popleft())
                 output.wake.clear()
-                if output.phase == "flushing":
-                    if output.overflowed:
-                        output.phase = "overflowing"
-                        self._enqueue(
-                            output, _OutputFrame(self._overflow_frame("controller"))
-                        )
-                        continue
-                    output.phase = "ready"
-                    self._finish_future(output.ready, True)
-                elif output.phase == "overflowing":
-                    await state.connection.close()
-                    self._finish_future(output.ready, False)
-                    self._finish_future(output.overflow_done, False)
+                if await self._complete_output_phase(state, output):
                     return
         except asyncio.CancelledError:
             return
+
+    async def _write_output_frame(
+        self, state: _Connection, output: _OutputState, item: _OutputFrame
+    ) -> None:
+        output.current_frame = item
+        try:
+            output.current_write = asyncio.create_task(
+                self._write_physical(state.connection, item.payload)
+            )
+            result, _ = await output.current_write
+        except asyncio.CancelledError:
+            self._finish_frame_accounting(output, item)
+            self._finish_future(item.future, False)
+            if output.phase == "overflowing":
+                return
+            if asyncio.current_task().cancelling():
+                self._finish_future(output.ready, False)
+                raise
+            if output.phase == "flushing":
+                self._reset_flush(output, False)
+            return
+        except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
+            self._finish_frame_accounting(output, item)
+            self._finish_future(item.future, error=exc)
+            if output.phase == "flushing":
+                self._reset_flush(output, error=exc)
+            return
+        finally:
+            output.current_frame = None
+            output.current_write = None
+        self._finish_frame_accounting(output, item)
+        self._finish_future(item.future, result)
+        if not result and output.phase == "flushing":
+            self._reset_flush(output, False)
+
+    async def _complete_output_phase(
+        self, state: _Connection, output: _OutputState
+    ) -> bool:
+        if output.phase == "flushing":
+            if output.overflowed_before_flush:
+                output.phase = "overflowing"
+                self._enqueue(
+                    output, _OutputFrame(self._overflow_frame("controller"))
+                )
+                return False
+            output.phase = "ready"
+            self._finish_future(output.ready, True)
+            return False
+        if output.phase != "overflowing":
+            return False
+        await state.connection.close()
+        self._finish_future(output.ready, False)
+        self._finish_future(output.overflow_done, False)
+        return True
+
+    def _reset_flush(
+        self,
+        output: _OutputState,
+        result: bool | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self._clear_output(output)
+        self._finish_future(output.ready, result, error=error)
+        output.ready = self.loop.create_future()
+        output.phase = "claimed_buffering"
 
     async def _overflow(self, state: _Connection) -> bool:
         output = state.output
@@ -403,7 +426,7 @@ class ConnectionRegistry:
     @staticmethod
     async def _cancel_frame(
         output: _OutputState, item: _OutputFrame
-    ) -> FrameWriteCancelled | None:
+    ) -> tuple[bool | None, FrameWriteCancelled | None]:
         if output.current_frame is item:
             if output.current_write is not None:
                 output.current_write.cancel()
@@ -411,25 +434,32 @@ class ConnectionRegistry:
                     output.current_write, return_exceptions=True
                 )
                 if isinstance(settled[0], tuple):
-                    return settled[0][1]
-            return None
+                    return settled[0]
+            return None, None
         try:
             output.queue.remove(item)
         except ValueError:
-            return None
+            return None, None
         ConnectionRegistry._finish_frame_accounting(output, item)
         if item.future is not None and not item.future.done():
             item.future.cancel()
-        return None
+        return None, None
+
+    def _settle_output(self, output: _OutputState) -> None:
+        while output.queue:
+            item = output.queue.popleft()
+            self._finish_frame_accounting(output, item)
+            self._finish_future(item.future, False)
+        if output.writer_task is not None:
+            output.writer_task.cancel()
+        self._finish_future(output.ready, False)
+        self._finish_future(output.overflow_done, False)
 
     @staticmethod
     def _clear_output(output: _OutputState) -> None:
         while output.queue:
             item = output.queue.popleft()
-            output.queued_bytes -= len(item.payload)
-            if item.buffered_controller_event:
-                output.pending_controller_bytes -= len(item.payload)
-                output.pending_controller_frames -= 1
+            ConnectionRegistry._finish_frame_accounting(output, item)
             if item.future is not None and not item.future.done():
                 item.future.cancel()
 
@@ -582,8 +612,8 @@ class ConnectionRegistry:
             self._read_stopping = True
             self._read_condition.notify_all()
         for state in states:
-            if state.output is not None and state.output.writer_task is not None:
-                state.output.writer_task.cancel()
+            if state.output is not None:
+                self._settle_output(state.output)
         await asyncio.gather(
             *(state.connection.close() for state in states), return_exceptions=True
         )
