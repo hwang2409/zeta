@@ -157,10 +157,17 @@ class ConnectionRegistry:
         return ControllerMetadata(state.connection, state.protocol_version, state.features)
 
     async def publish_controller(
-        self, event: str, session_id: str | None, **fields: object
+        self,
+        event: str,
+        session_id: str | None,
+        *,
+        required_feature: str | None = None,
+        **fields: object,
     ) -> bool:
         state = self._controller
-        if state is None:
+        if state is None or (
+            required_feature is not None and required_feature not in state.features
+        ):
             return False
         if (
             event == "approval_end"

@@ -3,8 +3,70 @@
 from collections.abc import Mapping
 from enum import Enum, auto
 
+from ..core.checkpoints import ConversationEntry
 from ..protocol.types import StreamEvent, StreamEventType
-from .protocol import bounded
+from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
+
+
+def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
+    """Project one committed steer terminal transition."""
+    data = entry.data
+    status = data["status"]
+    text = f"steer {status}"
+    row: dict[str, object] = {
+        "id": entry.id,
+        "role": "system",
+        "event": "delivery_status",
+        "delivery_id": data["delivery_id"],
+        "method": "steer",
+        "status": status,
+        "content": [{"type": "text", "text": text}],
+    }
+    if "reason" in data:
+        row["reason"] = data["reason"]
+        row["content"] = [
+            {"type": "text", "text": f"{text}: {data['reason']}"}
+        ]
+    return row
+
+
+def image_stub(block: Mapping[str, object]) -> dict[str, object]:
+    """Project stored image metadata without sending image bytes or paths."""
+    stub = {
+        key: block[key]
+        for key in ("type", "mimeType", "caption", "width", "height", "size")
+        if key in block
+    }
+    data = block.get("data")
+    if "size" not in stub and isinstance(data, str):
+        padding = len(data) - len(data.rstrip("="))
+        stub["size"] = len(data) * 3 // 4 - padding
+    stub["data_omitted"] = True
+    return stub
+
+
+def project_tool_value(value: object) -> tuple[object, bool]:
+    """Bound string leaves in tool wire data."""
+    if isinstance(value, str):
+        projected = bounded(value, TOOL_OUTPUT_MAX_BYTES)
+        return projected, projected != value
+    if isinstance(value, dict):
+        result: dict[object, object] = {}
+        truncated = False
+        for key, item in value.items():
+            projected, item_truncated = project_tool_value(item)
+            result[key] = projected
+            truncated |= item_truncated
+        return result, truncated
+    if isinstance(value, (list, tuple)):
+        result = []
+        truncated = False
+        for item in value:
+            projected, item_truncated = project_tool_value(item)
+            result.append(projected)
+            truncated |= item_truncated
+        return result, truncated
+    return value, False
 
 LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
 NOTIFICATION_WIRE_EVENTS = {
@@ -57,15 +119,45 @@ def assistant_message(event: StreamEvent) -> dict[str, object]:
     return {"message": message}
 
 
-def tool_start(event: StreamEvent) -> dict[str, object]:
-    return {"tool_call": _tool_call(event), "data": dict(event.data)}
+def _project_tool_call(tool_call: dict[str, object] | None) -> dict[str, object] | None:
+    if tool_call is None:
+        return None
+    arguments, truncated = project_tool_value(tool_call.get("arguments", {}))
+    return {**tool_call, "arguments": arguments, "arguments_truncated": truncated}
 
 
-def tool_output(event: StreamEvent) -> dict[str, object]:
+def structured_content_truncated(
+    structured_content: object, *, wire_truncated: bool
+) -> bool | None:
+    if not isinstance(structured_content, dict):
+        return True if wire_truncated else None
+    stdout = structured_content.get("stdout_truncated")
+    stderr = structured_content.get("stderr_truncated")
+    if stdout is True or stderr is True or wire_truncated:
+        return True
+    if type(stdout) is bool and type(stderr) is bool:
+        return False
+    return None
+
+
+def tool_start(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    tool_call = _tool_call(event)
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
+    return {"tool_call": tool_call, "data": dict(event.data)}
+
+
+def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    data = dict(event.data)
+    if fidelity:
+        data, _ = project_tool_value(data)
+    tool_call = _tool_call(event)
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
     return {
-        "tool_call": _tool_call(event),
+        "tool_call": tool_call,
         "output": bounded(event.delta or _data_text(event.data)),
-        "data": dict(event.data),
+        "data": data,
     }
 
 
@@ -77,10 +169,24 @@ def approval_end(payload: Mapping[str, object]) -> dict[str, object]:
     return dict(payload)
 
 
-def tool_end(event: StreamEvent) -> dict[str, object]:
+def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    tool_call = _tool_call(event)
+    result = event.tool_result.to_dict() if event.tool_result else None
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
+        if result is not None:
+            structured = result.get("structured_content")
+            projected, _ = project_tool_value(result)
+            if structured is not None:
+                projected_structured, wire_truncated = project_tool_value(structured)
+                projected["structured_content"] = projected_structured
+                projected["structured_content_truncated"] = structured_content_truncated(
+                    structured, wire_truncated=wire_truncated
+                )
+            result = projected
     return {
-        "tool_call": _tool_call(event),
-        "tool_result": event.tool_result.to_dict() if event.tool_result else None,
+        "tool_call": tool_call,
+        "tool_result": result,
         "data": dict(event.data),
     }
 

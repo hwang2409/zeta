@@ -466,6 +466,16 @@ where status is:
   `delivered`, or `dropped`;
 - `unknown`: the ID was never accepted in this session.
 
+With `session_history_fidelity`, a queued steer that is dropped emits a live
+`delivery_status` event after the terminal row commits. Terminal `delivered` and
+`dropped` rows both appear in `session_history`. Each row has `id`,
+`role: "system"`, `event: "delivery_status"`, `delivery_id`, `method: "steer"`,
+`status`, and renderable `content` such as `steer dropped: abort`. A dropped row
+also has `reason` (`restart`, `abort`, `clear`, `disconnect`, `turn_end`, or
+`failed`). Accepted steer text is not included yet; it requires a new stored row
+type after the stored-format gate is available. A missing reason in an old
+session means unknown.
+
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
 ```
@@ -1129,7 +1139,27 @@ error code and message. Provider status and origin remain internal.
   `role`, `content`, and optional `tool_result`. Text and tool
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
-  response. Tool-use content retains the existing `tool_call` shape.
+  response. Without `session_history_fidelity`, tool-use arguments keep their
+  legacy empty object and tool results keep their legacy projection.
+
+  With `session_history_fidelity`, tool-use `tool_call` adds the stored
+  `arguments` and required `arguments_truncated` boolean. Each string leaf is
+  limited to 8,000 UTF-8 bytes. Tool results add retained `structured_content`
+  and `structured_content_truncated`. The latter is `true` when the wire cuts a
+  structured string or bash recorded `stdout_truncated` or `stderr_truncated`;
+  it is `false` only when both bash flags are explicitly false and the wire cuts
+  nothing; otherwise it is `null`. Bash structured content includes `exit_code`,
+  `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, and `cwd_after`.
+  These fields describe retained output; spill paths and spill bytes are never
+  sent. Tool-result image blocks become metadata stubs with `type`, `mimeType`,
+  and `data_omitted: true`. Optional fields are `caption`, `width`, `height`, and
+  `size`; unknown image size is omitted.
+
+  The feature also adds terminal steer `delivery_status` rows as described
+  above. Original dropped-steer text and durable served-turn reasons are
+  deferred until the stored-format gate can register new row types. History
+  therefore does not yet say whether a turn stopped, failed, completed, or
+  disconnected.
 - `content_read`: reads the raw bytes for an inline image row. The session is
   implicit: it is the attached session, so `session_id` must not be supplied.
   Params are `{ "handle": string, "offset"?: integer, "limit"?: integer }`.
@@ -1287,7 +1317,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
-| `session_history_fidelity` | preserves negotiated tool-result image metadata stubs in `session_history` |
+| `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
