@@ -32,33 +32,34 @@ messages, fragmentation, ping, pong, and the close handshake. It does not
 negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
 
-Every serve start creates a new random bearer token. New clients should supply
-it in `Sec-WebSocket-Protocol` as `zeta.bearer.<token>`, alongside
-`zeta.v1`. The server echoes only `zeta.v1`. The legacy `token` URL query
-parameter remains supported for existing clients, but is deprecated and will be
-removed after Gamma and Fulcrum switch to the subprotocol. Until then, the
-startup WebSocket URL still includes the query token for existing manual
-connect clients. Zeta does not print the token to logs. It atomically writes this
-discovery file with mode `0600` and
-removes it on clean shutdown:
+Every serve start creates separate random controller and observer bearer
+credentials. New clients should supply the credential in
+`Sec-WebSocket-Protocol` as `zeta.bearer.<token>`, alongside `zeta.v1`. The
+server echoes only `zeta.v1`. The observer credential is permanently read-only:
+it cannot claim a controller role, including after the controller disconnects.
+The legacy `token` URL query parameter remains supported for existing Fulcrum
+clients and authenticates only the controller credential. Zeta never prints a
+credential or a `token=` URL to stdout, stderr, or logs. It atomically writes
+this discovery file with mode `0600` and removes it on clean shutdown:
 
 ```text
 $ZETA_HOME/run/serve.ws.json
 ```
 
 ```json
-{"port":8765,"token":"<random bearer token>","pid":12345,"origins":["http://127.0.0.1:5173"],"ws_auth":["subprotocol","query"]}
+{"port":8765,"token":"<controller credential>","controller_token":"<controller credential>","observer_token":"<observer credential>","pid":12345,"origins":["http://127.0.0.1:5173"],"ws_auth":["subprotocol","query"]}
 ```
 
 A native launcher can read this file and deliver the connection details to its
 trusted frontend. `ws_auth` advertises the supported authentication methods;
-clients should prefer `subprotocol`. Treat the token as a secret.
+clients should prefer `subprotocol`. `token` is retained as an alias for
+`controller_token` for existing clients. Treat both credentials as secrets.
 
 Browser upgrades also require an exact allowed `Origin`. Add each origin with a
 repeatable `--ws-origin scheme://host:port` flag. Wildcards, omitted ports,
 paths, and partial matches are not accepted. With no `--ws-origin`, all browser
 origins are rejected. A non-browser client can omit `Origin`, but it must still
-supply the token. Token or origin failures are rejected during the HTTP upgrade,
+supply a credential. Credential or origin failures are rejected during the HTTP upgrade,
 before any serve protocol message is read.
 
 Minimal browser connection, where the launcher supplied `connection` from the
