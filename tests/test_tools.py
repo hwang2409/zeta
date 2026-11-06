@@ -1271,6 +1271,131 @@ async def test_registry_rejects_malformed_write_arguments(
     assert "invalid arguments" in result["content"][0]["text"]
 
 
+BASH_MAX_OUTPUT_BYTES = 10_000
+
+
+@pytest.mark.asyncio
+async def test_bash_accepts_max_output_at_host_cap(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall(
+            "bash-at-host-cap",
+            "bash",
+            {
+                "command": _python_command(
+                    f"import sys; sys.stdout.write('x' * {BASH_MAX_OUTPUT_BYTES})"
+                ),
+                "max_output": BASH_MAX_OUTPUT_BYTES,
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert len(result["structuredContent"]["stdout"].encode()) == BASH_MAX_OUTPUT_BYTES
+    schema = registry.definitions_by_name["bash"].parameters
+    assert schema["properties"]["max_output"].get("maximum") == BASH_MAX_OUTPUT_BYTES
+
+
+@pytest.mark.asyncio
+async def test_bash_rejects_max_output_above_host_cap_before_spawn_or_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "spawned"
+    captures = []
+    real_capture = bash_module._OutputCapture
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(bash_module, "_OutputCapture", TrackingCapture)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall(
+            "bash-above-host-cap",
+            "bash",
+            {
+                "command": _python_command(
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()"
+                ),
+                "max_output": BASH_MAX_OUTPUT_BYTES + 1,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid arguments: arguments.max_output is above the maximum"
+    )
+    with pytest.raises(
+        ValueError,
+        match=f"max_output must be an integer from 1 to {BASH_MAX_OUTPUT_BYTES}",
+    ):
+        await bash_module._bash(
+            registry,
+            {
+                "command": _python_command(
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()"
+                ),
+                "max_output": BASH_MAX_OUTPUT_BYTES + 1,
+            },
+            registry.abort_signal,
+        )
+    assert not marker.exists()
+    assert captures == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_rejected_bash_output_limits_retain_no_captures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "spawned"
+    captures = []
+    real_capture = bash_module._OutputCapture
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(bash_module, "_OutputCapture", TrackingCapture)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    for call_number in range(20):
+        result = await registry.execute(
+            ToolCall(
+                f"bash-above-host-cap-{call_number}",
+                "bash",
+                {
+                    "command": _python_command(
+                        f"from pathlib import Path; Path({str(marker)!r}).touch()"
+                    ),
+                    "max_output": BASH_MAX_OUTPUT_BYTES + 1,
+                },
+            )
+        )
+        assert result["isError"] is True
+
+    assert not marker.exists()
+    assert captures == []
+
+
+def test_bash_schema_advertises_max_output_host_cap(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    schema = registry.definitions_by_name["bash"].parameters
+
+    assert schema["properties"]["max_output"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": BASH_MAX_OUTPUT_BYTES,
+        "description": "Maximum retained output per stream in bytes.",
+    }
+
+
 @pytest.mark.asyncio
 async def test_bash_retains_only_bounded_output_from_large_command(
     tmp_path: Path,
