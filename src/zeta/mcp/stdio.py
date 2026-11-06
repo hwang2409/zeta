@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from functools import partial
 from typing import BinaryIO, Literal
 from weakref import WeakKeyDictionary
@@ -57,13 +57,18 @@ class _MalformedMessage:
     error: MCPProtocolError
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Frame:
-    value: object
-    arrivals: tuple[tuple[int, frozenset[int]], ...]
+    total_bytes: int = 0
+    bytes_by_pending_id: dict[int, int] = field(default_factory=dict)
+    value: object | None = None
 
-    def bytes_for(self, request_id: int) -> int:
-        return sum(size for size, pending in self.arrivals if request_id in pending)
+    def record(self, size: int, pending_ids: Iterable[int]) -> None:
+        self.total_bytes += size
+        for request_id in pending_ids:
+            self.bytes_by_pending_id[request_id] = (
+                self.bytes_by_pending_id.get(request_id, 0) + size
+            )
 
 
 @dataclass(slots=True)
@@ -74,9 +79,7 @@ class _PendingCall:
     wire_bytes: int = 0
 
 
-_Outcome = Literal[
-    "limit", "quota", "restart", "canceled", "transport", "closed"
-]
+_Outcome = Literal["limit", "quota", "restart", "canceled", "transport", "closed"]
 
 
 @dataclass(slots=True)
@@ -481,6 +484,29 @@ class StdioMCPClient(MCPClient):
         invalidation.task = asyncio.create_task(self._finish_invalidation(invalidation))
         return invalidation
 
+    def _outcome_values(
+        self, outcome: _Outcome, tool_name: str | None
+    ) -> tuple[StructuredToolResult | None, BaseException | None]:
+        if outcome == "limit":
+            result = self._limit_result(tool_name) if tool_name is not None else None
+            return result, _StdioCallLimit()
+        if outcome == "quota":
+            result = (
+                make_error_result(
+                    f"MCP tool {self.config.name}__{tool_name} could not buffer "
+                    "the response because the session spill budget is full"
+                )
+                if tool_name is not None
+                else None
+            )
+            return result, _StdioSpillQuota()
+        if outcome == "canceled":
+            return canceled_result() if tool_name is not None else None, MCPCanceled()
+        if outcome == "restart":
+            result = self._restart_result() if tool_name is not None else None
+            return result, _StdioRestart()
+        return None, None
+
     def _record_outcomes(
         self,
         invalidation: _Invalidation,
@@ -500,21 +526,11 @@ class StdioMCPClient(MCPClient):
         for request_id, pending in invalidation.pending.items():
             if pending.owner is None or pending.tool_name is None:
                 continue
-            outcome = invalidation.outcomes[request_id]
-            if outcome == "limit":
-                result = self._limit_result(pending.tool_name)
-            elif outcome == "quota":
-                result = make_error_result(
-                    f"MCP tool {self.config.name}__{pending.tool_name} could not buffer "
-                    "the response because the session spill budget is full"
-                )
-            elif outcome == "canceled":
-                result = canceled_result()
-            elif outcome == "restart":
-                result = self._restart_result()
-            else:
-                continue
-            self._invalidation_results[pending.owner] = result
+            result, _ = self._outcome_values(
+                invalidation.outcomes[request_id], pending.tool_name
+            )
+            if result is not None:
+                self._invalidation_results[pending.owner] = result
 
     async def _finish_invalidation(self, invalidation: _Invalidation) -> None:
         reader_tasks = (
@@ -538,18 +554,10 @@ class StdioMCPClient(MCPClient):
             for request_id, pending in invalidation.pending.items():
                 if pending.future.done():
                     continue
-                outcome = invalidation.outcomes[request_id]
-                if outcome == "limit":
-                    error: BaseException = _StdioCallLimit()
-                elif outcome == "quota":
-                    error = _StdioSpillQuota()
-                elif outcome == "canceled":
-                    error = MCPCanceled()
-                elif outcome == "restart":
-                    error = _StdioRestart()
-                else:
-                    error = invalidation.reason
-                pending.future.set_exception(error)
+                _, error = self._outcome_values(
+                    invalidation.outcomes[request_id], pending.tool_name
+                )
+                pending.future.set_exception(error or invalidation.reason)
             if self._reader_error is None:
                 self._reader_error = invalidation.reason
             if invalidation.report_failure:
@@ -562,11 +570,11 @@ class StdioMCPClient(MCPClient):
 
         generation = self._generation if generation is None else generation
         envelope = MCPCallEnvelope(self._limits, self._spill_store)
-        arrivals: list[tuple[int, frozenset[int]]] = []
+        frame = _Frame()
         self._active_accumulator = envelope
         try:
             while chunk := await stream.read(65_536):
-                pending_at_arrival = frozenset(self._pending)
+                pending_at_arrival = tuple(self._pending)
                 remaining = chunk
                 while remaining:
                     separator = remaining.find(b"\n")
@@ -576,15 +584,19 @@ class StdioMCPClient(MCPClient):
                     else:
                         part = remaining[: separator + 1]
                         remaining = remaining[separator + 1 :]
-                    arrivals.append((len(part), pending_at_arrival))
+                    frame.record(len(part), pending_at_arrival)
                     try:
                         await envelope.append(part)
                     except (MCPWireLimitError, MCPTransientQuotaError) as exc:
-                        charged = set().union(*(pending for _, pending in arrivals))
+                        charged = set(frame.bytes_by_pending_id)
                         invalidation = self._start_invalidation(
                             MCPTransportError("MCP stdio response exceeded its bounds"),
-                            limit_ids=charged if isinstance(exc, MCPWireLimitError) else None,
-                            quota_ids=charged if isinstance(exc, MCPTransientQuotaError) else None,
+                            limit_ids=charged
+                            if isinstance(exc, MCPWireLimitError)
+                            else None,
+                            quota_ids=charged
+                            if isinstance(exc, MCPTransientQuotaError)
+                            else None,
                             default_outcome="restart",
                         )
                         if invalidation.task is not None:
@@ -592,16 +604,19 @@ class StdioMCPClient(MCPClient):
                         return
                     if separator < 0:
                         break
-                    value = await self._finish_frame(envelope)
-                    yield _Frame(value, tuple(arrivals))
+                    frame.value = await self._finish_frame(envelope)
+                    if not await self._finish_read_frame(frame):
+                        return
+                    yield frame
                     if generation != self._generation:
                         return
                     envelope = MCPCallEnvelope(self._limits, self._spill_store)
-                    arrivals = []
+                    frame = _Frame()
                     self._active_accumulator = envelope
-            if arrivals:
-                value = await self._finish_frame(envelope)
-                yield _Frame(value, tuple(arrivals))
+            if frame.total_bytes:
+                frame.value = await self._finish_frame(envelope)
+                if await self._finish_read_frame(frame):
+                    yield frame
                 envelope = MCPCallEnvelope(self._limits, self._spill_store)
         finally:
             if self._active_accumulator is envelope:
@@ -612,9 +627,20 @@ class StdioMCPClient(MCPClient):
         try:
             return await envelope.finish_json()
         except json.JSONDecodeError as exc:
-            return _MalformedMessage(
-                MCPProtocolError(f"invalid MCP JSON: {exc.msg}")
-            )
+            return _MalformedMessage(MCPProtocolError(f"invalid MCP JSON: {exc.msg}"))
+
+    async def _finish_read_frame(self, frame: _Frame) -> bool:
+        overflow = self._charge_frame(frame)
+        if not overflow:
+            return True
+        invalidation = self._start_invalidation(
+            MCPTransportError("MCP stdio call exceeded its response limit"),
+            limit_ids=overflow,
+            default_outcome="restart",
+        )
+        if invalidation.task is not None:
+            await asyncio.shield(invalidation.task)
+        return False
 
     async def _read_stdout(self, generation: int | None = None) -> None:
         generation = self._generation if generation is None else generation
@@ -625,22 +651,14 @@ class StdioMCPClient(MCPClient):
             async for frame in self._read_messages(process.stdout, generation):
                 if generation != self._generation:
                     return
-                overflow = self._charge_frame(frame)
-                if overflow:
-                    invalidation = self._start_invalidation(
-                        MCPTransportError("MCP stdio call exceeded its response limit"),
-                        limit_ids=overflow,
-                        default_outcome="restart",
-                    )
-                    if invalidation.task is not None:
-                        await asyncio.shield(invalidation.task)
-                    return
                 value = frame.value
                 if isinstance(value, _MalformedMessage):
                     self._fail_pending(value.error)
                     continue
                 if type(value) is not dict:
-                    self._fail_pending(MCPProtocolError("MCP message must be an object"))
+                    self._fail_pending(
+                        MCPProtocolError("MCP message must be an object")
+                    )
                     continue
                 response_id = value.get("id")
                 if type(response_id) is int and response_id in self._pending:
@@ -676,18 +694,12 @@ class StdioMCPClient(MCPClient):
         owner = value.get("id") if type(value) is dict else None
         if type(owner) is int and owner in self._pending:
             pending = self._pending[owner]
-            pending.wire_bytes += frame.bytes_for(owner)
+            pending.wire_bytes += frame.bytes_by_pending_id.get(owner, 0)
             return (
-                {owner}
-                if pending.wire_bytes > self._limits.max_wire_bytes
-                else set()
+                {owner} if pending.wire_bytes > self._limits.max_wire_bytes else set()
             )
         overflow: set[int] = set()
-        charges: dict[int, int] = {}
-        for size, pending_ids in frame.arrivals:
-            for request_id in pending_ids:
-                charges[request_id] = charges.get(request_id, 0) + size
-        for request_id, byte_count in charges.items():
+        for request_id, byte_count in frame.bytes_by_pending_id.items():
             pending = self._pending.get(request_id)
             if pending is None:
                 continue

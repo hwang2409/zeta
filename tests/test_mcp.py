@@ -734,6 +734,7 @@ async def test_stdio_write_after_server_exit_preserves_protocol_error(
     try:
         await process.wait()
         await reader_task
+        assert client._reader_task is None
         with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
             await client._request("initialize", {})
     finally:
@@ -4622,23 +4623,28 @@ async def test_resource_read_abort_invalidates_stdio_transport(
     from zeta.mcp.resources import MCPResourceError
 
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    source = """
+    cancel_marker = tmp_path / "cancelled.txt"
+    source = f"""
 import json
+import pathlib
 import sys
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "notifications/initialized":
         continue
+    if method == "notifications/cancelled":
+        pathlib.Path({str(cancel_marker)!r}).write_text("cancelled")
+        continue
     if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "fake", "version": "1"}}
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}, "resources": {{}}}}, "serverInfo": {{"name": "fake", "version": "1"}}}}
     elif method == "tools/list":
-        result = {"tools": []}
+        result = {{"tools": []}}
     elif method == "resources/read":
         continue
     else:
-        result = {"content": [], "isError": False}
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+        result = {{"content": [], "isError": False}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
 """
     config = MCPServerConfig("srv", "stdio", sys.executable, ("-u", "-c", source))
     registry = ToolRegistry(
@@ -4654,8 +4660,9 @@ for line in sys.stdin:
         request_written = asyncio.Event()
         write_request = client._write_request
 
-        async def observe_write(process, request, response, request_id) -> None:
-            await write_request(process, request, response, request_id)
+        async def observe_write(*args) -> None:
+            await write_request(*args)
+            request = args[1]
             if request.get("method") == "resources/read":
                 request_written.set()
 
@@ -4669,6 +4676,7 @@ for line in sys.stdin:
         with pytest.raises(MCPResourceError, match="unavailable"):
             await read_task
         assert actor.status.state == "degraded"
+        assert not cancel_marker.exists()
     finally:
         await mount.close()
         await registry.close()

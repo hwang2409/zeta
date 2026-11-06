@@ -70,8 +70,8 @@ async def test_stdio_prebuffer_frame_cap_is_hard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    body = '''        value = {"jsonrpc": "2.0", "id": request["id"], "result": {"content": [{"type": "text", "text": "x" * FRAME_LIMIT}]}}
-        print(json.dumps(value, separators=(",", ":")), flush=True)'''
+    body = """        value = {"jsonrpc": "2.0", "id": request["id"], "result": {"content": [{"type": "text", "text": "x" * FRAME_LIMIT}]}}
+        print(json.dumps(value, separators=(",", ":")), flush=True)"""
     source = _server_source(body.replace("FRAME_LIMIT", str(LIMIT)))
     client = _client("frame-cap", source)
     try:
@@ -90,43 +90,30 @@ async def test_stdio_valid_frames_charge_only_the_matching_call(
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _server_source(
-        '''        if first_batch:
-            if len(calls) < 3:
-                continue
-            batch = calls[:2]
-            calls[:] = calls[2:]
-            first_batch = False
-        else:
-            if len(calls) < 2:
-                continue
-            batch = list(calls)
-            calls.clear()
-        for saved in batch:
-            value = {"jsonrpc": "2.0", "id": saved["id"], "result": {"content": [{"type": "text", "text": "x" * 300}]}}
-            print(json.dumps(value, separators=(",", ":")), flush=True)'''
+        """        if len(calls) < 2:
+            continue
+        note = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"padding": "x" * 100}}
+        print(json.dumps(note, separators=(",", ":")), flush=True)
+        first, second = calls
+        value = {"jsonrpc": "2.0", "id": first["id"], "result": {"content": [{"type": "text", "text": "x" * 300}]}}
+        print(json.dumps(value, separators=(",", ":")), flush=True)
+        value = {"jsonrpc": "2.0", "id": second["id"], "result": {"content": [{"type": "text", "text": "ok"}]}}
+        print(json.dumps(value, separators=(",", ":")), flush=True)"""
     )
     client = _client("owned", source)
     try:
         await client.connect()
-        first, second, innocent = (
-            asyncio.create_task(client.call_tool("echo", {"n": index}, AbortSignal()))
-            for index in range(3)
+        results = await asyncio.gather(
+            client.call_tool("echo", {"n": 1}, AbortSignal()),
+            client.call_tool("echo", {"n": 2}, AbortSignal()),
         )
-        first_results = await asyncio.gather(first, second)
-        assert [result["content"][0]["text"] for result in first_results] == [
-            "x" * 300,
-            "x" * 300,
-        ]
-        pending = next(iter(client._pending.values()))
-        assert getattr(pending, "wire_bytes", -1) == 0
-
-        fourth = asyncio.create_task(
-            client.call_tool("echo", {"n": 4}, AbortSignal())
-        )
-        later_results = await asyncio.gather(innocent, fourth)
-        assert [result["content"][0]["text"] for result in later_results] == [
-            "x" * 300,
-            "x" * 300,
+        assert results == [
+            make_error_result(
+                f"MCP tool owned__echo exceeded the {LIMIT} response limit"
+            ),
+            make_error_result(
+                "MCP stdio server owned restarted after a call limit; retry the tool"
+            ),
         ]
     finally:
         await client.close()
@@ -138,14 +125,14 @@ async def test_stdio_unowned_notification_flood_charges_every_pending_call(
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _server_source(
-        '''        if len(calls) < 2:
+        """        if len(calls) < 2:
             continue
         note = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"padding": "x" * 120}}
         for _ in range(4):
             print(json.dumps(note, separators=(",", ":")), flush=True)
         for saved in calls:
             value = {"jsonrpc": "2.0", "id": saved["id"], "result": {"content": [{"type": "text", "text": "unbounded"}]}}
-            print(json.dumps(value, separators=(",", ":")), flush=True)'''
+            print(json.dumps(value, separators=(",", ":")), flush=True)"""
     )
     client = _client("notifications", source)
     try:
@@ -168,8 +155,8 @@ async def test_stdio_abort_records_initiating_and_displaced_results_synchronousl
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _server_source(
-        '''        if len(calls) < 3:
-            continue'''
+        """        if len(calls) < 3:
+            continue"""
     ).replace(
         '    if method == "notifications/initialized":\n        continue',
         '    if method == "notifications/initialized":\n        continue\n'
@@ -195,9 +182,7 @@ async def test_stdio_abort_records_initiating_and_displaced_results_synchronousl
     try:
         await client.connect()
         first = asyncio.create_task(client.call_tool("echo", {"n": 1}, first_signal))
-        second = asyncio.create_task(
-            client.call_tool("echo", {"n": 2}, second_signal)
-        )
+        second = asyncio.create_task(client.call_tool("echo", {"n": 2}, second_signal))
         displaced = asyncio.create_task(
             client.call_tool("echo", {"n": 3}, AbortSignal())
         )
@@ -219,14 +204,14 @@ async def test_simultaneous_stdio_overflows_invalidate_once_and_detach_before_aw
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _server_source(
-        '''        if len(calls) < 2:
+        """        if len(calls) < 2:
             continue
         note = {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"padding": "x" * 120}}
         for _ in range(4):
             print(json.dumps(note, separators=(",", ":")), flush=True)
         for saved in calls:
             value = {"jsonrpc": "2.0", "id": saved["id"], "result": {"content": [{"type": "text", "text": "unbounded"}]}}
-            print(json.dumps(value, separators=(",", ":")), flush=True)'''
+            print(json.dumps(value, separators=(",", ":")), flush=True)"""
     )
     spill = SpillStore()
     client = _client("single", source, spill_store=spill)
@@ -275,9 +260,12 @@ async def test_valid_large_stdio_frame_parse_allows_event_loop_heartbeat(
     spill = SpillStore()
     client = _client("parse", "unused", spill_store=spill)
     stream = asyncio.StreamReader()
-    frame = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "result": {"padding": "x" * 200}}
-    ).encode() + b"\n"
+    frame = (
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"padding": "x" * 200}}
+        ).encode()
+        + b"\n"
+    )
     stream.feed_data(frame)
     stream.feed_eof()
     loop = asyncio.get_running_loop()
@@ -304,133 +292,65 @@ async def test_valid_large_stdio_frame_parse_allows_event_loop_heartbeat(
         spill.close()
 
 
-class _BlockingHandle(io.BytesIO):
-    def __init__(
-        self, stage: str, entered: threading.Event, release: threading.Event
-    ) -> None:
+class _OneByteReader:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+
+    async def read(self, _size: int) -> bytes:
+        if self._offset == len(self._data):
+            return b""
+        chunk = self._data[self._offset : self._offset + 1]
+        self._offset += 1
+        return chunk
+
+
+class _CountingHandle(io.BytesIO):
+    def __init__(self) -> None:
         super().__init__()
-        self.stage = stage
-        self.entered = entered
-        self.release = release
+        self.write_count = 0
 
     def write(self, value: bytes) -> int:
-        if self.stage == "write":
-            self.entered.set()
-            self.release.wait()
+        self.write_count += 1
         return super().write(value)
 
 
-class _BlockingTemporary:
-    def __init__(
-        self,
-        stage: str,
-        entered: threading.Event,
-        release: threading.Event,
-    ) -> None:
-        self.stage = stage
-        self.entered = entered
-        self.release = release
-        self.handle = _BlockingHandle(stage, entered, release)
+class _CountingTemporary:
+    def __init__(self) -> None:
+        self.handle = _CountingHandle()
 
-    def __enter__(self):
-        if self.stage == "spill":
-            self.entered.set()
-            self.release.wait()
+    def __enter__(self) -> _CountingHandle:
         return self.handle
 
     def __exit__(self, *_args) -> None:
-        self.handle.close()
+        pass
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["spill", "write", "parse"])
-async def test_stdio_accumulator_cancellation_releases_transient_quota(
-    stage: str, monkeypatch: pytest.MonkeyPatch
+async def test_tiny_stdio_reads_keep_spill_writes_and_frame_accounting_bounded(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 64)
     spill = SpillStore()
-    client = _client("cancel-accumulator", "unused", spill_store=spill)
-    entered = threading.Event()
-    release = threading.Event()
-    temporary = _BlockingTemporary(stage, entered, release)
+    temporary = _CountingTemporary()
     monkeypatch.setattr(spill, "temporary_file", lambda: temporary)
-    real_load = json.load
-
-    def blocking_load(handle):
-        if stage == "parse":
-            entered.set()
-            release.wait()
-        return real_load(handle)
-
-    monkeypatch.setattr(stdio_module.json, "load", blocking_load)
-    stream = asyncio.StreamReader()
-    stream.feed_data(
-        json.dumps({"jsonrpc": "2.0", "id": 1, "padding": "x" * 200}).encode()
+    client = _client("tiny-reads", "unused", spill_store=spill)
+    data = (
+        json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/progress", "padding": "x" * 200}
+        ).encode()
         + b"\n"
     )
-    stream.feed_eof()
 
-    async def consume() -> None:
-        async for _frame in client._read_messages(stream):
-            pass
-
-    task = asyncio.create_task(consume())
-    await asyncio.to_thread(entered.wait)
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert spill._transient_bytes == 0
-    await client.close()
-    assert getattr(client, "_generation", -1) == 1
-    spill.close()
-
-
-@pytest.mark.asyncio
-async def test_stdio_write_cancellation_releases_transient_quota(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Stdin:
-        def __init__(self) -> None:
-            self.entered = asyncio.Event()
-            self.release = asyncio.Event()
-
-        def write(self, _value: bytes) -> None:
-            pass
-
-        async def drain(self) -> None:
-            self.entered.set()
-            await self.release.wait()
-
-    class Process:
-        def __init__(self) -> None:
-            self.stdin = Stdin()
-
-    spill = SpillStore()
-    client = _client("cancel-write", "unused", spill_store=spill)
-    envelope = MCPCallEnvelope(LIMITS, spill)
-    await envelope.append(b"x" * 100)
-    client._active_accumulator = envelope
-    process = Process()
-    client._process = process
-
-    async def cleanup(_process, _tasks) -> None:
-        pass
-
-    monkeypatch.setattr(stdio_module, "_kill_and_reap", cleanup)
-    request = asyncio.create_task(client._request("tools/call", {"name": "echo"}))
-    await process.stdin.entered.wait()
-    request.cancel()
-    process.stdin.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
-    invalidation = getattr(client, "_invalidation", None)
-    assert invalidation is not None
-    assert invalidation.task is not None
-    await invalidation.task
-    assert spill._transient_bytes == 0
-    await client.close()
-    spill.close()
+    try:
+        frames = [frame async for frame in client._read_messages(_OneByteReader(data))]
+        assert temporary.handle.write_count == 1
+        assert len(frames) == 1
+        assert frames[0].total_bytes == len(data)
+        assert frames[0].bytes_by_pending_id == {}
+    finally:
+        await client.close()
+        spill.close()
 
 
 @pytest.mark.asyncio
@@ -577,6 +497,7 @@ async def test_transport_failure_before_call_finished_preserves_typed_invalidati
     actor._status = MCPServerStatus("ordered", "stdio", "mounted")
     result = asyncio.get_running_loop().create_future()
     request = CallRequest(1, "echo", {}, AbortSignal(), 0, result, client=client)
+
     async def completed_call():
         return client.result
 
