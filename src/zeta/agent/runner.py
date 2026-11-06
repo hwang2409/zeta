@@ -380,13 +380,25 @@ async def _build_child_loop(
         excluded_names = {"inbox", "request_attention", "resolve_attention"}
         if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
             excluded_names.add("agent")
-        if preset.tool_names is not None:
-            allowed_names = set(preset.tool_names)
+        staged_names = {"ask_parent"} if follow_up_loop else set()
+        resolvable_names = set(loop.tool_registry.registered_names) - excluded_names
+        resolvable_names.update(
+            name
+            for name in staged_names
+            if name not in excluded_names and loop.tool_registry.tool_is_allowed(name)
+        )
+        profile_tool_allow = preset.tool_names
+        if profile_tool_allow is not None:
+            unresolved_names = profile_tool_allow - resolvable_names
+            if unresolved_names:
+                unresolved = ", ".join(sorted(unresolved_names))
+                raise ValueError(
+                    f"profile {preset.name!r} requests unavailable tools: {unresolved}"
+                )
+            allowed_names = set(profile_tool_allow)
             if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
                 allowed_names.add("agent")
-            excluded_names.update(
-                set(loop.tool_registry.definitions_by_name) - allowed_names
-            )
+            profile_tool_allow = frozenset(allowed_names)
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
@@ -396,6 +408,7 @@ async def _build_child_loop(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            profile_tool_allow=profile_tool_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,
         )

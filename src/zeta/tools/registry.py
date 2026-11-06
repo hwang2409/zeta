@@ -249,6 +249,7 @@ class ToolRegistry:
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )
+        self._profile_tool_allow: frozenset[str] | None = None
         self._required_tool_names = (
             self.tool_policy.required_exact_names
             if required_tool_names is None
@@ -363,8 +364,15 @@ class ToolRegistry:
         return self.tool_policy.deny
 
     def tool_is_allowed(self, name: str) -> bool:
+        if (
+            self._profile_tool_allow is not None
+            and name not in self._profile_tool_allow
+        ):
+            return False
         definition = self._tools.get(name)
-        actions = tuple(definition.actions) if definition and definition.actions else None
+        actions = (
+            tuple(definition.actions) if definition and definition.actions else None
+        )
         return self.tool_policy.allows_tool(name, actions)
 
     @property
@@ -668,12 +676,15 @@ class ToolRegistry:
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        profile_tool_allow: Sequence[str] | None = None,
         cwd: str | Path | None = None,
         image_policy: ImagePolicy | None = None,
     ) -> ToolRegistry:
         if self._cwd_fd is None:
             raise RuntimeError("cannot clone a closed tool registry")
         clone = copy.copy(self)
+        if profile_tool_allow is not None:
+            clone._profile_tool_allow = frozenset(profile_tool_allow)
         if image_policy is not None:
             clone.image_policy = image_policy
         if cwd is not None:

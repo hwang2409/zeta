@@ -83,7 +83,7 @@ from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
-from zeta.skills.agent_catalog import AgentCatalog
+from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -4362,6 +4362,166 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
     assert result.content.startswith("child complete")
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_lifecycle()["turns_used"] == turns + 1
+
+
+@pytest.mark.asyncio
+async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_tools(
+    tmp_path: Path,
+) -> None:
+    async def available(arguments: dict[str, object]) -> str:
+        del arguments
+        return "available"
+
+    requested = frozenset(
+        {"session_clock", "ask_parent", "agent_send", "run_background"}
+    )
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    parent = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    for name in ("session_clock", "agent_send", "run_background", "inherited_hidden"):
+        parent.register(name, available)
+    parent._profile_tool_allow = requested
+    child = parent.clone_for_session(child_store)
+    child.register("ask_parent", available)
+    child.register("late_hidden", available)
+
+    assert {schema["name"] for schema in child.schemas} == requested
+    for name in requested:
+        assert not (await child.execute(ToolCall(f"call-{name}", name, {})))["isError"]
+    for name in ("inherited_hidden", "late_hidden"):
+        result = await child.execute(ToolCall(f"call-{name}", name, {}))
+        assert result["isError"]
+        assert "tool not allowed" in result["content"][0]["text"]
+
+    await child.close()
+    await parent.close()
+    child_store.close()
+    parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_shape_resolves_against_the_live_session_registry(
+    tmp_path: Path,
+) -> None:
+    slack_names = {
+        "slack__slack_read_channel",
+        "slack__slack_read_thread",
+        "slack__slack_search_channels",
+        "slack__slack_search_public_and_private",
+    }
+    requested = {"read", "write", "bash", "ask_parent", *slack_names}
+    home = tmp_path / "home"
+    profile = home / "agents" / "monitor.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: monitor\n"
+        "description: monitor session tools\n"
+        "allow_delegation: false\n"
+        "accepts_follow_ups: true\n"
+        "explicit_finish: true\n"
+        f"tools: [{', '.join(sorted(requested))}]\n"
+        "---\nmonitor\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("monitor")
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+
+    async def slack_tool(arguments: dict[str, object]) -> str:
+        del arguments
+        return "ok"
+
+    for name in slack_names:
+        registry.register(name, slack_tool)
+    parent_loop = AgentLoop(
+        FakeBackend([]),
+        parent_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1", cwd=tmp_path
+    )
+    child_loop, _ = await agent_runner_module._build_child_loop(
+        parent_loop,
+        child_backend=FakeBackend([]),
+        child_store=child_store,
+        child_instance_id=f"{parent_store.session_id}:1",
+        child_depth=1,
+        preset=preset,
+        model=None,
+        cwd_override=None,
+        follow_up_loop=True,
+        description="monitor",
+        child_account_context=None,
+    )
+
+    assert {schema["name"] for schema in child_loop.tool_registry.schemas} == requested
+
+    await child_loop.close()
+    child_store.close()
+    await parent_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_spawn_reports_every_unresolved_profile_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "external.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: external\n"
+        "description: external tools\n"
+        "tools: [present_external, missing_external]\n"
+        "---\nexternal\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("external")
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+    registry.register("present_external", lambda arguments: "present")
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_backend = FakeBackend([ScriptedTurn([TextContent("degraded")])])
+    monkeypatch.setattr(
+        agent_runner_module,
+        "resolve_child_backend",
+        lambda _loop, _model: (child_backend, None),
+    )
+    call = _agent_call(agent_type="external")
+
+    result = await loop._run_agent_tool(
+        call,
+        call.arguments,
+        AbortGenerationRegistry().new_generation(),
+        None,
+    )
+
+    assert result["isError"] is True
+    assert "external" in result["content"][0]["text"]
+    assert "missing_external" in result["content"][0]["text"]
+    assert child_backend.calls == []
+    await loop.close()
 
 
 @pytest.mark.asyncio
