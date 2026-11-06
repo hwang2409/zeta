@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -51,6 +52,13 @@ class TodoWidget(UIControl):
         store = self.store
         if self._is_terminal(store.todo_items()):
             store.dismiss_todo()
+
+    async def turn_boundary_async(self) -> None:
+        """Hide a completed receipt without blocking the TUI event loop."""
+
+        store = self.store
+        if self._is_terminal(store.todo_items()):
+            await asyncio.to_thread(store.dismiss_todo)
 
     @property
     def visible(self) -> bool:

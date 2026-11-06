@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TypedDict
 
 from ...core.todo import TODO_STATUSES, TodoItem, parse_todo_items, todo_counts
@@ -62,7 +63,7 @@ async def _todo(
         items = parse_todo_items(arguments["items"])
     except ValueError as exc:
         return _todo_error(str(exc))
-    store.set_todo_items(items)
+    await asyncio.to_thread(store.set_todo_items, items)
     return _todo_result(items)
 
 

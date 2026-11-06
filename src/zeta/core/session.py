@@ -642,10 +642,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         write_session_json(
                             directory_fd, "project_link_pending.json", link
                         )
-                        # Durably land the intent's directory entry before the
-                        # registry is published; write_session_json only fsyncs
-                        # the file and its rename, not the containing directory.
-                        os.fsync(directory_fd)
                 except (SessionError, OSError) as exc:
                     logger.warning("could not persist project linkage intent: %s", exc)
                 self._reconcile_project_link(session_id)
