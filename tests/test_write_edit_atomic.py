@@ -178,6 +178,23 @@ async def test_tools_preserve_existing_file_mode(
 
 
 @pytest.mark.asyncio
+async def test_write_keeps_default_mode_for_new_file(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    reference.touch()
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    try:
+        result = await _write(registry, "target.txt")
+
+        assert result["isError"] is False
+        assert stat.S_IMODE((tmp_path / "target.txt").stat().st_mode) == stat.S_IMODE(
+            reference.stat().st_mode
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["write", "edit"])
 @pytest.mark.parametrize("target_kind", ["symlink", "fifo", "hardlink"])
 async def test_tools_reject_unsafe_target_types(
