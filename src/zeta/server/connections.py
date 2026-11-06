@@ -666,7 +666,7 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
         return runtime.session_id, store
     if method == "status":
         if runtime.opened is None:
-            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
+            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "transcript_index_failure": None, "compaction_markers": 0}
         return runtime.session_id, {
             "session": client._session_snapshot(),
             "state": (
@@ -675,7 +675,13 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
                 else runtime.state.status
             ),
             "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
-            "pending_approvals": [], "usage": dict(runtime.usage), "store": runtime.opened.store,
+            "pending_approvals": [], "usage": dict(runtime.usage),
+            "transcript_index_failure": (
+                runtime.loop.transcript_index_failure(runtime.session_id)
+                if runtime.loop is not None
+                else None
+            ),
+            "store": runtime.opened.store,
         }
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)

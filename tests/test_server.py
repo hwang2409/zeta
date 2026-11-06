@@ -1879,6 +1879,36 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
 
 
 @pytest.mark.asyncio
+async def test_status_surfaces_transcript_index_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+    )
+    reader, writer = await _ready(server)
+    try:
+        loop = server.runtime.loop
+        assert loop is not None
+        requested: list[str] = []
+
+        def failure(session_id: str) -> str:
+            requested.append(session_id)
+            return "disk full; pending changes will retry"
+
+        monkeypatch.setattr(loop, "transcript_index_failure", failure, raising=False)
+        status = (await _request(reader, writer, 3, "status"))[-1]["result"]
+
+        assert requested == [server.runtime.session_id]
+        assert status.get("transcript_index_failure") == (
+            "disk full; pending changes will retry"
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
