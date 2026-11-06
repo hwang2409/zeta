@@ -102,7 +102,7 @@ class _OrderedFileWriter:
                 self._report_failure(exc)
             self._deliver(item, result, failure)
             with self._lock:
-                if item.stop or self._queue.empty():
+                if self._queue.empty():
                     self._thread = None
                     return
 
@@ -115,13 +115,25 @@ class _OrderedFileWriter:
         except Exception as exc:  # noqa: BLE001 - completion must not stop the writer
             failure = exc
             self._report_failure(exc)
-        self._mark_applied(item.watermark, failure)
+        self._mark_applied(item.watermark, failure, supersedes=not item.stop)
 
-    def _mark_applied(self, watermark: int, failure: BaseException | None) -> None:
+    def _mark_applied(
+        self,
+        watermark: int,
+        failure: BaseException | None,
+        *,
+        supersedes: bool,
+    ) -> None:
         with self._completed:
             self._processed = max(self._processed, watermark)
             if failure is None:
                 self._applied = max(self._applied, watermark)
+                if supersedes:
+                    self._failures = {
+                        failed_watermark: stored_failure
+                        for failed_watermark, stored_failure in self._failures.items()
+                        if failed_watermark > watermark
+                    }
             else:
                 self._failures[watermark] = failure
             ready = [waiter for waiter in self._waiters if waiter[0] <= self._processed]
@@ -184,6 +196,7 @@ class _OrderedFileWriter:
             with self._lock:
                 self._waiters = [waiter for waiter in self._waiters if waiter[2] is not future]
             self._report_failure(exc)
+            raise
 
     async def shutdown(
         self,

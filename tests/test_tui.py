@@ -12099,7 +12099,7 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
         await app.close()
     await asyncio.sleep(0)
 
-    rendered = "".join(app._transcript_lines)
+    rendered = Text.from_ansi("".join(app._transcript_lines)).plain
     assert "composer draft was not saved" in rendered
     assert "your text remains unsaved" in rendered
     assert "copy it before exiting" in rendered
