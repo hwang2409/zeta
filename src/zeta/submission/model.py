@@ -79,7 +79,7 @@ class SubmissionHost(Protocol):
 
     def _handle_tool_event(self, event: StreamEvent) -> bool: ...
     def _present_pending_approvals(self) -> None: ...
-    def _prepare_user_message(
+    async def _prepare_user_message(
         self,
         value: str,
         *,

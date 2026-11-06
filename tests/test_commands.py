@@ -973,7 +973,7 @@ async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
     image.write_bytes(
         bytes.fromhex(
             "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-            "0000000d49444154789c6360606000000004000000a6f645"
+            "0000000d49444154789c6360f8cf00000004000101a2e0c4b0"
             "0000000049454e44ae426082"
         )
     )

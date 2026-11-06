@@ -4620,7 +4620,10 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
     server = ZetaServer(provider="codex", home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
     reader, writer, sid = await _ready_extensions(server)
-    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+    )
     image = {"name": "test.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
     async def send(images, session_id=sid):
         return (await _request(reader, writer, "images", "send_images", {"session_id": session_id, "text": "inspect", "images": images}))[-1]
@@ -4794,32 +4797,45 @@ async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_image_names_match_verified_types(tmp_path):
     import base64
+    import io
 
-    from zeta.server.ergonomics import DIRECTION_CONTROLS, image_message
+    from PIL import Image
+
+    from zeta.server.ergonomics import DIRECTION_CONTROLS, prepare_image_delivery
     from zeta.server.protocol import ProtocolError
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, provider="codex")
     await runtime.create_session()
-    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+
+    def image_bytes(format_name):
+        output = io.BytesIO()
+        Image.new("RGB", (1, 1), "white").save(output, format=format_name)
+        return output.getvalue()
+
+    png = image_bytes("PNG")
     item = {"name": "safe.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
     invalid_names = ["../bad.png", "..\\bad.png", "bad/path.png", "bad\\path.png", "bad.jpg", "bad", "bad.png.exe", "bad\x7f.png"]
     invalid_names += [f"bad{control}.png" for control in DIRECTION_CONTROLS]
     try:
         for name in invalid_names:
             with pytest.raises(ProtocolError):
-                image_message(runtime, {"images": [{**item, "name": name}]})
+                prepare_image_delivery(runtime, {"images": [{**item, "name": name}]})
         attachments = runtime.opened.store.session_dir / "attachments"
         assert not attachments.exists()
         for mime, raw, names in [
             ("image/png", png, ["safe.PNG", "写真.png"]),
-            ("image/jpeg", b"\xff\xd8\xff\xe0", ["safe.jpg", "safe.JPEG"]),
-            ("image/gif", b"GIF89a\x01\x00\x01\x00", ["safe.gif"]),
-            ("image/webp", b"RIFF" + (22).to_bytes(4, "little") + b"WEBPVP8X" + (10).to_bytes(4, "little") + bytes(10), ["safe.webp"]),
+            ("image/jpeg", image_bytes("JPEG"), ["safe.jpg", "safe.JPEG"]),
+            ("image/gif", image_bytes("GIF"), ["safe.gif"]),
+            ("image/webp", image_bytes("WEBP"), ["safe.webp"]),
         ]:
             for name in names:
-                message = image_message(runtime, {"images": [{"name": name, "mime_type": mime, "data": base64.b64encode(raw).decode()}]})
-                assert Path(message.content[1].path).name == name
+                message = await asyncio.to_thread(
+                    prepare_image_delivery,
+                    runtime,
+                    {"images": [{"name": name, "mime_type": mime, "data": base64.b64encode(raw).decode()}]},
+                )
+                assert Path(message.message.content[1].path).name == name
     finally:
         await runtime.close()
 
@@ -4830,18 +4846,25 @@ async def test_image_names_match_verified_types(tmp_path):
 @pytest.mark.parametrize("existing", [False, True])
 async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, failure, fail_at, existing):
     import base64
+    import io
     from contextlib import contextmanager
+
+    from PIL import Image
 
     from zeta.server import ergonomics
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, provider="codex")
     await runtime.create_session()
-    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    output = io.BytesIO()
+    Image.new("RGB", (1, 1), "white").save(output, format="PNG")
+    png = output.getvalue()
     item = {"name": "same.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
     attachments = runtime.opened.store.session_dir / "attachments"
     if existing:
-        ergonomics.image_message(runtime, {"images": [item]})
+        await asyncio.to_thread(
+            ergonomics.prepare_image_delivery, runtime, {"images": [item]}
+        )
     before = set(attachments.rglob("*"))
     original_open = os.fdopen
     original_replace = ergonomics.os.replace
@@ -4886,7 +4909,11 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
             patch.setattr(os, "fdopen", failing_open)
             patch.setattr(ergonomics.os, "replace", failing_replace)
             with pytest.raises(OSError):
-                ergonomics.image_message(runtime, {"images": [item, item]})
+                await asyncio.to_thread(
+                    ergonomics.prepare_image_delivery,
+                    runtime,
+                    {"images": [item, item]}
+                )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
         assert all(path.read_bytes() == png for path in before if path.is_file())
@@ -6138,7 +6165,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
 async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     import base64
 
-    from zeta.server.ergonomics import image_message
+    from zeta.server.ergonomics import prepare_image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")
@@ -6149,7 +6176,7 @@ async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     try:
         with pytest.raises(OSError):
-            image_message(runtime, {"images": [{"name": "x.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}]})
+            prepare_image_delivery(runtime, {"images": [{"name": "x.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}]})
         assert list(outside.iterdir()) == []
     finally:
         await runtime.close()

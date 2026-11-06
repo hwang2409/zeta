@@ -24,6 +24,8 @@ from ..core.store._client_delivery import (
 from ..core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
+from ..media.image_normalization import normalize_image_bytes
+from ..media.image_policy import image_policy_for_provider
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
@@ -928,22 +930,41 @@ def _validated_image_payload(
     return text, decoded
 
 
-def image_payload_digest(params: dict) -> str:
+@dataclass(frozen=True, slots=True)
+class PreparedImageDelivery:
+    payload_digest: str
+    message: Message
+    attachments: list[dict[str, object]]
+    created_attachments_root: bool
+
+
+def prepare_image_delivery(
+    runtime: ServerRuntime, params: dict
+) -> PreparedImageDelivery:
+    """Decode, normalize, and publish images from an off-loop worker."""
+
     text, decoded = _validated_image_payload(params)
-    return _semantic_image_payload_digest(
+    payload_digest = _semantic_image_payload_digest(
         text, [(name, mime, raw) for name, mime, _data, raw in decoded]
     )
-
-
-def image_message(runtime: ServerRuntime, params: dict) -> Message:
-    text, decoded = _validated_image_payload(params)
+    provider = runtime.provider
+    if provider is None:
+        raise ProtocolError(-32003, "no active provider")
+    policy = image_policy_for_provider(provider)
     blocks = [TextContent(text)]
     store = runtime.opened.store
     attachments_existed = "attachments" in os.listdir(store.directory_fd)
     with child_directory(store.directory_fd, "attachments", create=True) as attachments_fd:
         directories = []
         try:
-            for name, mime, data, raw in decoded:
+            for name, _mime, _data, raw in decoded:
+                try:
+                    prepared = asyncio.run(normalize_image_bytes(raw, policy))
+                except ValueError as exc:
+                    raise ProtocolError(-32602, f"image cannot be prepared: {exc}") from exc
+                raw = prepared.data or b""
+                mime = prepared.media_type
+                data = base64.b64encode(raw).decode("ascii")
                 directory = uuid4().hex
                 os.mkdir(directory, mode=0o700, dir_fd=attachments_fd)
                 directories.append(directory)
@@ -957,9 +978,29 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             if not attachments_existed:
                 os.rmdir("attachments", dir_fd=store.directory_fd)
             raise
-    return with_message_origin(
+    message = with_message_origin(
         Message(MessageRole.USER, blocks), MessageOrigin.USER
     )
+    return PreparedImageDelivery(
+        payload_digest,
+        message,
+        attachment_summary(message),
+        not attachments_existed,
+    )
+
+
+def cleanup_image_delivery(
+    runtime: ServerRuntime, prepared: PreparedImageDelivery
+) -> None:
+    """Remove files produced by a prepared delivery that will not publish."""
+
+    store = runtime.opened.store
+    with child_directory(store.directory_fd, "attachments") as attachments_fd:
+        for block in prepared.message.content:
+            if isinstance(block, ImageContent) and block.path is not None:
+                shutil.rmtree(Path(block.path).parent.name, dir_fd=attachments_fd)
+    if prepared.created_attachments_root:
+        os.rmdir("attachments", dir_fd=store.directory_fd)
 
 
 def attachment_summary(message: Message) -> list[dict[str, object]]:

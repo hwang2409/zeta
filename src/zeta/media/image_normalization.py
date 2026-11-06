@@ -89,9 +89,8 @@ def _fits(
     policy: ImagePolicy,
 ) -> bool:
     raw_limit = policy.max_raw_bytes(media_type)
-    return (
-        (raw_limit is None or file_size <= raw_limit)
-        and (policy.max_dimension is None or max(dimensions) <= policy.max_dimension)
+    return (raw_limit is None or file_size <= raw_limit) and (
+        policy.max_dimension is None or max(dimensions) <= policy.max_dimension
     )
 
 
@@ -104,7 +103,9 @@ def _header(file_descriptor: int, file_size: int) -> _ImageHeader | None:
         {"type": "image", "data": "", "mimeType": media_type}, prefix
     )
     if dimensions is None and media_type == "image/jpeg":
-        dimensions = jpeg_dimensions(os.pread(file_descriptor, min(file_size, 8 * 1024 * 1024), 0))
+        dimensions = jpeg_dimensions(
+            os.pread(file_descriptor, min(file_size, 8 * 1024 * 1024), 0)
+        )
     if dimensions is None:
         return None
     fallback = _ImageHeader(
@@ -119,7 +120,10 @@ def _header(file_descriptor: int, file_size: int) -> _ImageHeader | None:
     try:
         from PIL import Image
 
-        with os.fdopen(os.dup(file_descriptor), "rb") as handle, Image.open(handle) as image:
+        with (
+            os.fdopen(os.dup(file_descriptor), "rb") as handle,
+            Image.open(handle) as image,
+        ):
             format_name = _FORMAT_NAMES.get(image.format or "")
             if format_name is None:
                 return fallback
@@ -240,6 +244,21 @@ async def _watch_worker(process: asyncio.subprocess.Process) -> str | None:
     return None
 
 
+async def normalize_image_bytes(data: bytes, policy: ImagePolicy) -> PreparedImage:
+    """Normalize an in-memory image through the isolated worker."""
+
+    with tempfile.TemporaryFile() as handle:
+        handle.write(data)
+        handle.flush()
+        result = await prepare_image(
+            os.dup(handle.fileno()), file_size=len(data), policy=policy
+        )
+    if result.image is None or result.image.data is None:
+        detail = result.error or (result.image.note if result.image else None)
+        raise ValueError(detail or "image normalization failed")
+    return result.image
+
+
 async def prepare_image(
     file_descriptor: int,
     *,
@@ -256,8 +275,7 @@ async def prepare_image(
         header = _header(file_descriptor, file_size)
         if (
             header is not None
-            and header.dimensions[0] * header.dimensions[1]
-            > MAX_NORMALIZABLE_PIXELS
+            and header.dimensions[0] * header.dimensions[1] > MAX_NORMALIZABLE_PIXELS
         ):
             return _omitted(
                 file_descriptor,
@@ -314,9 +332,7 @@ async def prepare_image(
                         f"Pixels were not sent because normalization hit the {limit}; "
                         "the original remains available at the reported path.",
                     )
-                return NormalizationResult(
-                    error=f"image normalization hit the {limit}"
-                )
+                return NormalizationResult(error=f"image normalization hit the {limit}")
             output.seek(0)
             if process.returncode != 0:
                 detail = stderr.decode("utf-8", "replace").strip()

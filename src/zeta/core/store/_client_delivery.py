@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 CLIENT_DELIVERY_METADATA = "zeta_client_delivery_id"
+CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA = "zeta_client_delivery_payload_digest"
 MAX_RECENT_CLIENT_DELIVERIES = 1_000
 DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -377,6 +378,9 @@ def image_payload_digest(
 
 
 def _message_image_payload_digest(message: Message) -> str | None:
+    stored_digest = message.metadata.get(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA)
+    if isinstance(stored_digest, str):
+        return stored_digest
     if (
         message.role is not MessageRole.USER
         or not message.content
@@ -416,14 +420,19 @@ def _transition_row(
     return "client_delivery", data
 
 
-def tag_client_delivery(message: Message, delivery_id: str) -> Message:
-    """Attach a private durable-delivery marker without changing message content."""
+def tag_client_delivery(
+    message: Message, delivery_id: str, payload_digest: str | None = None
+) -> Message:
+    """Attach private durable-delivery markers without changing message content."""
 
+    metadata = {**message.metadata, CLIENT_DELIVERY_METADATA: delivery_id}
+    if payload_digest is not None:
+        metadata[CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA] = payload_digest
     return Message(
         message.role,
         message.content,
         tool_result=message.tool_result,
-        metadata={**message.metadata, CLIENT_DELIVERY_METADATA: delivery_id},
+        metadata=metadata,
     )
 
 
@@ -434,6 +443,7 @@ def without_client_delivery_marker(message: Message) -> Message:
         return message
     metadata = dict(message.metadata)
     del metadata[CLIENT_DELIVERY_METADATA]
+    metadata.pop(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA, None)
     return Message(
         message.role,
         message.content,
