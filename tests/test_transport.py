@@ -83,6 +83,8 @@ async def test_response_error_body_is_bounded_and_keeps_response_metadata() -> N
         lambda status, body, headers: RuntimeError(
             f"{status}:{len(body)}:{headers['retry-after']}"
         ),
+        stall_seconds=5.0,
+        on_stall=lambda elapsed: RuntimeError(f"stalled {elapsed}"),
     )
 
     assert str(error) == "503:8192:2"

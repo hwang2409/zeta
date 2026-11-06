@@ -123,6 +123,11 @@ class _PartialErrorBody(httpx.AsyncByteStream):
         self.closed.set()
 
 
+async def _drain(events) -> None:
+    async for _event in events:
+        pass
+
+
 @pytest.mark.asyncio
 async def test_partial_anthropic_error_body_stalls_and_closes(
     tmp_path: Path,
@@ -139,7 +144,8 @@ async def test_partial_anthropic_error_body_stalls_and_closes(
         client=client, token_store=store, stall_seconds=0.01
     )
     with pytest.raises(AnthropicStreamError, match="error body stalled"):
-        _ = [event async for event in backend._complete_once([], [])]
+        # bounded: a missing watchdog fails with TimeoutError instead of hanging
+        await asyncio.wait_for(_drain(backend._complete_once([], [])), timeout=5)
     assert stream.closed.is_set()
     await client.aclose()
 
