@@ -213,6 +213,23 @@ class AutoMemoryReconciler:
         return self.state.last_failure
 
     @property
+    def scanner_failure(self) -> tuple[int, str] | None:
+        return self.state.scanner_failure
+
+    @property
+    def automatic_memory_status(self) -> str | None:
+        scanner_failure = self.scanner_failure
+        if scanner_failure is not None:
+            seq, cause = scanner_failure
+            return (
+                "automatic project-memory reconciliation blocked: "
+                f"{cause} (seq {seq}); reconciliation will resume only after "
+                "the transcript is readable."
+            )
+        failure = self.last_failure
+        return failure.status_line() if failure is not None else None
+
+    @property
     def _last_reconciled_bytes(self) -> int:
         return self.state.transcript_bytes
 
@@ -226,7 +243,7 @@ class AutoMemoryReconciler:
 
     def retry_terminal(self, key: str) -> bool:
         """Re-queue one terminal receipt for this session."""
-        if self._paused_for_login:
+        if self._paused_for_login or self.scanner_failure is not None:
             return False
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
@@ -312,6 +329,8 @@ class AutoMemoryReconciler:
             self._retry_attempts_in_cycle.clear()
 
     def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
+        if self.scanner_failure is not None:
+            return ()
         return tuple(
             work
             for work in self.state.ready_retries(self._retry_clock())
@@ -342,6 +361,8 @@ class AutoMemoryReconciler:
             self._pending = sorted(remaining, key=lambda item: item.start)
 
     def _queue_ready_retries(self) -> None:
+        if self.scanner_failure is not None:
+            return
         queued = {item.key for item in self._pending if item.key is not None}
         for work in self._ready_retries():
             if work.key in queued:
@@ -814,12 +835,14 @@ class AutoMemoryReconciler:
             )
 
     def _publish_failure_notice(self) -> None:
-        if (
-            self.notice is not None
-            and not self._closing
-            and self.last_failure is not None
-        ):
-            self.notice(f"memory update failed: {self.last_failure.status_line()}")
+        if self.notice is not None and not self._closing:
+            status = self.automatic_memory_status
+            if status is not None:
+                self.notice(
+                    status
+                    if self.scanner_failure is not None
+                    else f"memory update failed: {status}"
+                )
 
     def _append_failure_log(self, failure: ReconciliationFailure) -> None:
         self._append_diagnostic_record(

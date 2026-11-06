@@ -139,9 +139,18 @@ class ReconciliationState:
         return failure
 
     def clear_scanner_failure(self) -> None:
-        if self.scanner_failure is None:
+        scanner_failure = self.scanner_failure
+        if scanner_failure is None:
             return
         self._value["scanner_failure"] = None
+        last_failure = self.last_failure
+        if (
+            last_failure is not None
+            and last_failure.seq_start == scanner_failure[0]
+            and last_failure.seq_end == scanner_failure[0]
+            and last_failure.message == scanner_failure[1]
+        ):
+            self._value["last_failure"] = None
         self._publish("transcript-scan-recovered")
 
     def reconciliation_key(self, seq_start: int, seq_end: int) -> str:
