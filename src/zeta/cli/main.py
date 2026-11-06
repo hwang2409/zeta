@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
@@ -750,10 +751,34 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
-def _print_unsaved_draft(app: object) -> None:
-    if app._draft.pending_text:
-        print("unsaved composer draft:", file=sys.stderr)
-        print(app._draft.pending_text, file=sys.stderr)
+@dataclass(frozen=True, slots=True)
+class _UnsavedDraft:
+    session_id: str
+    text: str
+    attachment_names: tuple[str, ...]
+
+
+def _unsaved_draft(app: object) -> _UnsavedDraft | None:
+    text = app._draft.pending_text
+    if text is None:
+        return None
+    return _UnsavedDraft(
+        session_id=app.loop.store.session_id,
+        text=text,
+        attachment_names=tuple(path.name for path in app._pending_attachments),
+    )
+
+
+def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> None:
+    print("unsaved composer draft:", file=sys.stderr)
+    if draft.session_id != current_session_id:
+        print(f"session: {draft.session_id}", file=sys.stderr)
+    if draft.text:
+        print(draft.text, file=sys.stderr)
+    if draft.attachment_names:
+        print("attachments:", file=sys.stderr)
+        for name in draft.attachment_names:
+            print(f"- {name}", file=sys.stderr)
 
 
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
@@ -960,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
+    replaced_drafts: list[_UnsavedDraft] = []
     while True:
         try:
             if args.continue_session or args.resume is not None:
@@ -974,21 +1000,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         restart_requested = False
         restart_cancels_work = False
+        new_session_requested = False
         try:
             with patch_stdout(raw=True):
                 restart_requested, restart_cancels_work = asyncio.run(
                     _run_tui(app, args)
                 )
-            if app.new_session_requested:
+            new_session_requested = app.new_session_requested
+            if new_session_requested:
+                draft = _unsaved_draft(app)
+                if draft is not None:
+                    replaced_drafts.append(draft)
                 args.continue_session = False
                 args.resume = None
-                continue
         except TerminalRenderError as exc:
             print(f"zeta: {exc}", file=sys.stderr)
             _print_exit_hint(app)
             return 1
         finally:
             _cleanup_ephemeral(app)
+        if new_session_requested:
+            del app
+            continue
         if restart_requested:
             if restart_cancels_work:
                 print(
@@ -996,7 +1029,15 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             return _exec_restart(entrypoint, original_argv, app.loop.store.session_id)
-        _print_unsaved_draft(app)
+        current_session_id = app.loop.store.session_id
+        draft = _unsaved_draft(app)
+        if draft is not None:
+            replaced_drafts.append(draft)
+        for replaced_draft in replaced_drafts:
+            _print_unsaved_draft(
+                replaced_draft,
+                current_session_id=current_session_id,
+            )
         _print_exit_hint(app)
         return 0
 

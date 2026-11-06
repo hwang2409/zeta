@@ -11963,7 +11963,9 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
 
 
 def test_new_session_continues_after_failed_draft_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     names = iter(("old", "new"))
     old_app: weakref.ReferenceType[TUIApp] | None = None
@@ -12006,6 +12008,8 @@ def test_new_session_continues_after_failed_draft_save(
         return False, False
 
     monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    # Pytest's log record would retain the failure traceback and the old app.
+    monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
