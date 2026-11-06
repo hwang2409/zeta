@@ -275,6 +275,7 @@ class TUIApp(
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
+            notice_sink=lambda message: app._handle_background_notice(message),
         )
         self._draft_session: PromptSession[str] | None = None
         self._undo_candidate: UndoCandidate | None = None
@@ -1117,6 +1118,9 @@ class TUIApp(
         Re-entrant: the fork controller re-shows a suspended main runtime by
         calling this again without replaying its transcript.
         """
+        set_notice_loop = getattr(self._draft, "set_notice_loop", None)
+        if set_notice_loop is not None:
+            set_notice_loop(asyncio.get_running_loop())
         self._exit_requested = False
         self._run_result = RuntimeResult.EXIT
         self._decisions_switching = False
@@ -1184,7 +1188,10 @@ class TUIApp(
                 # Suspending for a discussion fork keeps the runtime's work
                 # alive: do not cancel the turn or drop the session reference.
                 if self._suspending_for_fork:
-                    await self._draft.flush_pending()
+                    try:
+                        await self._draft.flush_pending()
+                    except Exception:  # noqa: S110 - notice already reported
+                        pass
                     self._session = None
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
