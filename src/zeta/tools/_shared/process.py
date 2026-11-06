@@ -193,6 +193,7 @@ class BackgroundTaskRegistry:
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
         self._storage_lease = storage_lease.retain() if storage_lease is not None else None
+        self._persistence_corrupt = False
         self._archive: _BackgroundOutputArchive | None = None
         self._archived_lengths: dict[str, int] = {}
         self._archive_workers: set[asyncio.Task[None]] = set()
@@ -1097,8 +1098,10 @@ class BackgroundTaskRegistry:
         try:
             rows = load_session_json(read_session_file(self._directory_fd, "background_tasks.json"))
         except (OSError, ValueError):
+            self._persistence_corrupt = True
             return
         if type(rows) is not list:
+            self._persistence_corrupt = True
             return
         for row in rows:
             if type(row) is not dict:
@@ -1130,7 +1133,11 @@ class BackgroundTaskRegistry:
                 self._pending_recovery[task_id] = command
 
     def _persist(self) -> None:
-        if self._directory_fd is None or self._temporary_log_root is not None:
+        if (
+            self._directory_fd is None
+            or self._temporary_log_root is not None
+            or self._persistence_corrupt
+        ):
             return
         rows = [
             {

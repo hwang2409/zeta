@@ -631,7 +631,8 @@ async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
-        root = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        root_value = args[0] if args else kwargs.get("session_dir")
+        root = Path(root_value) if root_value is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
@@ -696,7 +697,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
-        root = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        root_value = args[0] if args else kwargs.get("session_dir")
+        root = Path(root_value) if root_value is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
