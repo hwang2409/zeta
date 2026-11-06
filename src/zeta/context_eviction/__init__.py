@@ -27,6 +27,7 @@ from .receipt_constructors import (
 from .receipt_constructors import (
     _assistant_receipt,
     _collapsed_assistant_receipt,
+    _generic_result_receipt,
     _notification_receipt_from_fields,
     _one_line,
     _semantic_result_receipt,
@@ -34,6 +35,7 @@ from .receipt_constructors import (
     _tool_call_receipt,
 )
 from .token_estimates import estimated_text_tokens, estimated_tokens  # noqa: F401
+from .tool_exchange_fold import fold_consumed_tool_exchanges
 
 EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
@@ -395,8 +397,10 @@ def _evict_deterministic(
 
     if source_messages is not None and running_total > target_tokens:
         records = list(zip((seq for seq, _ in records), messages, strict=True))
-        folded, folded_seqs = _fold_consumed_tool_exchanges(
-            records, eligibility, token_counter
+        folded, folded_seqs = fold_consumed_tool_exchanges(
+            records,
+            allows=eligibility.allows,
+            token_counter=token_counter,
         )
         if folded_seqs:
             records = folded
@@ -405,81 +409,6 @@ def _evict_deterministic(
             running_total = fixed_tokens + sum(map(token_counter, messages))
 
     return finish(target_reached())
-
-
-def _fold_consumed_tool_exchanges(
-    records: Sequence[tuple[int, Message]],
-    eligibility: _EvictionEligibility,
-    token_counter: Callable[[Message], int],
-) -> tuple[list[tuple[int, Message]], set[int]]:
-    """Receiptize complete old exchanges only when their final fold is smaller."""
-    from .range_receipts import range_receipt_candidate
-
-    messages = [message for _, message in records]
-    calls = _tool_calls(messages)
-    result_indexes: dict[str, list[int]] = defaultdict(list)
-    for index, message in enumerate(messages):
-        if message.tool_result is not None:
-            result_indexes[message.tool_result.tool_call_id].append(index)
-
-    converted = list(records)
-    converted_seqs: set[int] = set()
-    for call_index, (call_seq, message) in enumerate(records):
-        tool_calls = [block.tool_call for block in _tool_uses(message)]
-        if not tool_calls:
-            continue
-        indexes = [call_index]
-        for call in tool_calls:
-            matches = result_indexes.get(call.id, ())
-            if not matches:
-                indexes = []
-                break
-            indexes.extend(matches)
-        if not indexes or not all(
-            eligibility.allows(records[index][0]) for index in indexes
-        ):
-            continue
-        if not message.metadata.get("context_evicted"):
-            converted[call_index] = (
-                call_seq,
-                _tool_call_receipt(message, call_seq),
-            )
-            converted_seqs.add(call_seq)
-        for index in indexes[1:]:
-            seq, result_message = records[index]
-            result = result_message.tool_result
-            call = calls.get(result.tool_call_id) if result is not None else None
-            if call is not None and not result_message.metadata.get("context_evicted"):
-                converted[index] = (
-                    seq,
-                    _generic_result_receipt(result_message, call, seq),
-                )
-                converted_seqs.add(seq)
-
-    def smaller(
-        originals: Sequence[tuple[int, Message]], candidates: Sequence[Message]
-    ) -> bool:
-        return _strictly_smaller(
-            sum(token_counter(message) for _, message in originals),
-            sum(map(token_counter, candidates)),
-        )
-
-    fine = range_receipt_candidate(
-        converted, allows=eligibility.allows, is_smaller=smaller
-    )
-    coarse = range_receipt_candidate(
-        fine.records,
-        allows=eligibility.allows,
-        is_smaller=smaller,
-        coarse=True,
-    )
-    candidate = coarse if coarse.coalesced_source_seqs else fine
-    if not candidate.coalesced_source_seqs or not _strictly_smaller(
-        sum(token_counter(message) for _, message in records),
-        sum(token_counter(message) for _, message in candidate.records),
-    ):
-        return list(records), set()
-    return candidate.records, converted_seqs | set(candidate.coalesced_source_seqs)
 
 
 def _evict_persisted_records(
@@ -841,30 +770,6 @@ def _digest_result(
         digest = _bash_digest(call, result)
     else:
         digest = _search_digest(call, result.content)
-    return _semantic_result_receipt(
-        role=message.role,
-        tool_name=call.name,
-        tool_call_id=result.tool_call_id,
-        seq=seq,
-        digest=digest,
-        content_digest=_content_digest(result.content),
-        is_error=result.is_error,
-        is_canceled=result.is_canceled,
-        metadata=message.metadata,
-    )
-
-
-def _generic_result_receipt(message: Message, call: ToolCall, seq: int) -> Message:
-    result = message.tool_result
-    if result is None:
-        return message
-    status = (
-        "canceled" if result.is_canceled else "error" if result.is_error else "success"
-    )
-    tail = _one_line(result.content[-240:], limit=240)
-    digest = f"status={status}; sha256={_content_digest(result.content)[:16]}"
-    if tail:
-        digest += f"; tail={tail}"
     return _semantic_result_receipt(
         role=message.role,
         tool_name=call.name,
