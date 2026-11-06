@@ -14,7 +14,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -54,18 +54,16 @@ BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
-OUTPUT_CUTOFF_NOTE = (
-    "background output was cut off because a process outside the task still held its output"
-)
+OUTPUT_CUTOFF_NOTE = "background output was cut off because a process outside the task still held its output"
+
+
 @dataclass(frozen=True, slots=True)
 class BackgroundTaskNotice:
     """Structured lifecycle notice emitted by a background task owner."""
 
     message: str
     task_id: str
-    phase: Literal[
-        "started", "natural_exit", "task_kill", "session_shutdown"
-    ]
+    phase: Literal["started", "natural_exit", "task_kill", "session_shutdown"]
     owner: str
 
 
@@ -147,9 +145,9 @@ class _BackgroundRecord:
     storage_lock: asyncio.Lock | None = None
     notify_on_exit: bool = True
     owner: str = "run_background"
-    terminal_phase: Literal[
-        "natural_exit", "task_kill", "session_shutdown"
-    ] | None = None
+    terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (
+        None
+    )
     monitor: asyncio.Task[None] | None = None
 
 
@@ -200,6 +198,9 @@ class BackgroundTaskRegistry:
         self._close_failure_generation = 0
         self._pending_starts: set[asyncio.Future[None]] = set()
         self._transition_lock = asyncio.Lock()
+        self._pending_terminals: dict[
+            str, tuple[_BackgroundRecord, BackgroundTaskNotice]
+        ] = {}
         self._task_start_generation = 0
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
@@ -255,7 +256,9 @@ class BackgroundTaskRegistry:
             for record in self._records.values()
         )
 
-    def set_notice_sink(self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None) -> None:
+    def set_notice_sink(
+        self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None
+    ) -> None:
         self._notice_sink = sink
 
     def set_notification_sink(
@@ -280,11 +283,15 @@ class BackgroundTaskRegistry:
     def bind_session_dir(self, session_dir: str | Path, directory_fd: int) -> None:
         self._require_open()
         if self._directory_fd is not None and self._temporary_log_root is None:
-            if not os.path.samestat(os.fstat(self._directory_fd), os.fstat(directory_fd)):
+            if not os.path.samestat(
+                os.fstat(self._directory_fd), os.fstat(directory_fd)
+            ):
                 raise ValueError("background task registry is already bound")
             return
         if self._records:
-            raise ValueError("cannot bind a registry after background tasks have started")
+            raise ValueError(
+                "cannot bind a registry after background tasks have started"
+            )
         temporary_root = self._temporary_log_root
         self._close_storage()
         if temporary_root is not None:
@@ -307,9 +314,7 @@ class BackgroundTaskRegistry:
     def _open_task_log(self, task_id: str) -> IO[bytes]:
         if self._archive is None:
             raise RuntimeError("background output storage is unavailable")
-        return os.fdopen(
-            self._archive.open_task_log(task_id), "w+b", buffering=0
-        )
+        return os.fdopen(self._archive.open_task_log(task_id), "w+b", buffering=0)
 
     def open_log(self, path: str | Path) -> IO[bytes]:
         self._require_open()
@@ -402,7 +407,8 @@ class BackgroundTaskRegistry:
                         command, cwd_fd, **spawn_kwargs
                     )
                 process = await spawn_background(
-                    spawn, require_open=self._require_open,
+                    spawn,
+                    require_open=self._require_open,
                     term_grace=self.term_grace,
                     cleanup_timeout=self.term_grace + self.stdin_drain_timeout,
                 )
@@ -438,31 +444,37 @@ class BackgroundTaskRegistry:
             notify_on_exit=notify_on_exit,
             owner=owner,
         )
-        self._records[task_id] = record
-        record.monitor = asyncio.create_task(self._monitor(record, log_handle))
         try:
             async with self._transition_lock:
-                await self._commit_notice(None)
-                self._task_start_generation += 1
-                self._notice(
+                rows = self._persistence_rows((*self._records.values(), record))
+
+                def publish_start() -> None:
+                    self._records[task_id] = record
+                    record.monitor = asyncio.create_task(
+                        self._monitor(record, log_handle)
+                    )
+                    self._task_start_generation += 1
+
+                await self._commit_transition(
+                    rows,
+                    publish_start,
                     BackgroundTaskNotice(
                         f"background task {task_id} started: {_command_headline(command)}",
                         task_id,
                         "started",
                         owner,
-                    )
+                    ),
                 )
         except BaseException:
-            record.notify_on_exit = False
-            record.running = False
             await _terminate_process(
                 process,
                 self.term_grace,
                 close_stdin=lambda: self._close_stdin(record),
             )
-            record.process = None
-            if record.monitor is not None:
-                record.monitor.cancel()
+            if record.monitor is None:
+                record.running = False
+                record.process = None
+            else:
                 await asyncio.gather(record.monitor, return_exceptions=True)
             self._records.pop(task_id, None)
             raise
@@ -496,9 +508,7 @@ class BackgroundTaskRegistry:
         requested = 0 if since is None else min(since, record.total_bytes)
         start = requested
         if requested < record.base_cursor:
-            available = await self._read_durable(
-                record, start, self.call_limit + 1
-            )
+            available = await self._read_durable(record, start, self.call_limit + 1)
         else:
             output = bytes(record.output or b"")
             offset = start - record.base_cursor
@@ -600,7 +610,9 @@ class BackgroundTaskRegistry:
             )
             await self._terminate(
                 record,
-                reason="task killed on session exit" if phase == "session_shutdown" else "task killed",
+                reason="task killed on session exit"
+                if phase == "session_shutdown"
+                else "task killed",
                 phase=phase,
             )
         return self._status(record)
@@ -666,6 +678,9 @@ class BackgroundTaskRegistry:
             # not gain a scheduling boundary before completion is persisted.
             if self._pending_starts:
                 await finish(asyncio.gather(*self._pending_starts))
+            if self._pending_terminals:
+                async with self._transition_lock:
+                    await finish(self._retry_pending_terminals())
             entries = [
                 (record, record.process)
                 for record in self._records.values()
@@ -681,9 +696,7 @@ class BackgroundTaskRegistry:
                 record.terminal_phase = "session_shutdown"
                 record.note = "task killed on session exit"
             await finish(
-                asyncio.gather(
-                    *(self._close_stdin(record) for record in records)
-                )
+                asyncio.gather(*(self._close_stdin(record) for record in records))
             )
             await finish(
                 _terminate_processes(
@@ -698,9 +711,7 @@ class BackgroundTaskRegistry:
                 try:
                     await finish(
                         asyncio.wait_for(
-                            asyncio.gather(
-                                *(process.wait() for _, process in entries)
-                            ),
+                            asyncio.gather(*(process.wait() for _, process in entries)),
                             timeout=cleanup_timeout,
                         )
                     )
@@ -710,9 +721,7 @@ class BackgroundTaskRegistry:
                 async def wait_for_groups_to_exit() -> bool:
                     loop = asyncio.get_running_loop()
                     deadline = loop.time() + cleanup_timeout
-                    while any(
-                        _group_exists(process.pid) for _, process in entries
-                    ):
+                    while any(_group_exists(process.pid) for _, process in entries):
                         if loop.time() >= deadline:
                             return False
                         await asyncio.sleep(0.01)
@@ -850,11 +859,11 @@ class BackgroundTaskRegistry:
 
     async def _wait_for_archive_workers(self) -> None:
         while self._archive_workers:
-            await asyncio.gather(
-                *tuple(self._archive_workers), return_exceptions=True
-            )
+            await asyncio.gather(*tuple(self._archive_workers), return_exceptions=True)
 
-    async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
+    async def _monitor(
+        self, record: _BackgroundRecord, log_handle: Any | None = None
+    ) -> None:
         process = record.process
         if process is None or process.stdout is None:
             return
@@ -881,11 +890,10 @@ class BackgroundTaskRegistry:
                     await self._archive_record(record, log_handle)
                 except BaseException as exc:
                     archive_error = exc
-                    record.note = (
-                        "background output archive failed; recovery will retry the retained log"
-                    )
+                    record.note = "background output archive failed; recovery will retry the retained log"
                     logger.exception(
-                        "failed to archive background task output for %s", record.task_id
+                        "failed to archive background task output for %s",
+                        record.task_id,
                     )
             committed = await self._commit_terminal(record, process.returncode)
             if committed and record.notify_on_exit:
@@ -908,21 +916,67 @@ class BackgroundTaskRegistry:
         async with self._transition_lock:
             if not record.running:
                 return False
-            record.running = False
-            record.exit_code = exit_code
-            record.ended_at = time.monotonic()
-            record.process = None
-            record.terminal_phase = record.terminal_phase or "natural_exit"
-            await self._commit_notice(
-                BackgroundTaskNotice(
-                    f"background task {record.task_id} exited ({record.exit_code}): "
-                    f"{_command_headline(record.command)}",
-                    record.task_id,
-                    record.terminal_phase,
-                    record.owner,
+            candidate = replace(
+                record,
+                running=False,
+                exit_code=exit_code,
+                ended_at=time.monotonic(),
+                process=None,
+                terminal_phase=record.terminal_phase or "natural_exit",
+            )
+            rows = self._persistence_rows(
+                tuple(
+                    candidate if item is record else item
+                    for item in self._records.values()
                 )
             )
+
+            notice = BackgroundTaskNotice(
+                f"background task {record.task_id} exited ({candidate.exit_code}): "
+                f"{_command_headline(record.command)}",
+                record.task_id,
+                candidate.terminal_phase,
+                record.owner,
+            )
+            try:
+                await self._commit_transition(
+                    rows,
+                    lambda: self._publish_terminal(record, candidate),
+                    notice,
+                )
+            except Exception:
+                self._pending_terminals[record.task_id] = candidate, notice
+                raise
             return True
+
+    @staticmethod
+    def _publish_terminal(
+        record: _BackgroundRecord, candidate: _BackgroundRecord
+    ) -> None:
+        record.running = candidate.running
+        record.exit_code = candidate.exit_code
+        record.ended_at = candidate.ended_at
+        record.process = candidate.process
+        record.terminal_phase = candidate.terminal_phase
+
+    async def _retry_pending_terminals(self) -> None:
+        pending = tuple(self._pending_terminals.items())
+        candidates = {task_id: value[0] for task_id, value in pending}
+        rows = self._persistence_rows(
+            tuple(
+                candidates.get(record.task_id, record)
+                for record in self._records.values()
+            )
+        )
+
+        def publish() -> None:
+            for task_id, (candidate, notice) in pending:
+                record = self._records[task_id]
+                self._publish_terminal(record, candidate)
+                self._notice(notice)
+                self._pending_terminals.pop(task_id, None)
+
+        await self._commit_transition(rows, publish, None)
 
     async def _read_output(
         self,
@@ -1111,7 +1165,9 @@ class BackgroundTaskRegistry:
         if self._directory_fd is None:
             return
         try:
-            rows = load_session_json(read_session_file(self._directory_fd, "background_tasks.json"))
+            rows = load_session_json(
+                read_session_file(self._directory_fd, "background_tasks.json")
+            )
         except (OSError, ValueError):
             return
         if type(rows) is not list:
@@ -1138,7 +1194,9 @@ class BackgroundTaskRegistry:
                 total_bytes=archived_length,
                 base_cursor=archived_length,
                 running=False,
-                exit_code=row.get("exit_code") if type(row.get("exit_code")) is int else None,
+                exit_code=row.get("exit_code")
+                if type(row.get("exit_code")) is int
+                else None,
                 note="task exited when the previous session ended",
                 storage_lock=asyncio.Lock(),
             )
@@ -1148,12 +1206,31 @@ class BackgroundTaskRegistry:
     async def _commit_notice(
         self, notice: BackgroundTaskNoticeSinkValue | None
     ) -> None:
-        rows = self._persistence_rows()
-        await asyncio.to_thread(self._persist, rows)
+        await self._commit_transition(self._persistence_rows(), lambda: None, notice)
+
+    async def _commit_transition(
+        self,
+        rows: tuple[dict[str, object], ...],
+        publish: Callable[[], None],
+        notice: BackgroundTaskNoticeSinkValue | None,
+    ) -> None:
+        worker = asyncio.create_task(asyncio.to_thread(self._persist, rows))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        worker.result()
+        publish()
         if notice is not None:
             self._notice(notice)
+        if cancelled:
+            raise asyncio.CancelledError
 
-    def _persistence_rows(self) -> tuple[dict[str, object], ...]:
+    def _persistence_rows(
+        self, records: Sequence[_BackgroundRecord] | None = None
+    ) -> tuple[dict[str, object], ...]:
         return tuple(
             {
                 "task_id": record.task_id,
@@ -1164,7 +1241,7 @@ class BackgroundTaskRegistry:
                 "started_at": record.started_at,
                 "ended_at": record.ended_at,
             }
-            for record in self._records.values()
+            for record in (self._records.values() if records is None else records)
         )
 
     def _persist(self, rows: Sequence[dict[str, object]] | None = None) -> None:

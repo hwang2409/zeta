@@ -228,7 +228,9 @@ class ServerRuntime:
         if account is not None:
             credential_kwargs["account"] = account
         elif self._state is not None:
-            credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
+            credential_kwargs = self._state.loop.account_context.backend_kwargs(
+                provider
+            )
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
             provider,
@@ -378,7 +380,9 @@ class ServerRuntime:
         )
         session_project = associated.project if registry is not None else None
         cwd_project = (
-            resolve_project_context(discovery, registry) if registry is not None else None
+            resolve_project_context(discovery, registry)
+            if registry is not None
+            else None
         )
         context = load_project_context(
             cwd=session_cwd,
@@ -409,7 +413,9 @@ class ServerRuntime:
             except (OSError, ValueError):
                 pass
         cwd_project = (
-            resolve_project_context(discovery, registry) if registry is not None else None
+            resolve_project_context(discovery, registry)
+            if registry is not None
+            else None
         )
         resumed_prompt = resume_prompt(
             opened.metadata,
@@ -479,7 +485,9 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = prepared
+                    config, skill_catalog, agent_catalog, context, session_project = (
+                        prepared
+                    )
                     kwargs = {
                         "config": config,
                         "provider": config.provider,
@@ -531,43 +539,55 @@ class ServerRuntime:
     async def close(self) -> None:
         state = self._state
         if state is not None:
-            background_tasks = state.loop.tool_registry.background_tasks
-            close_failure_generation = background_tasks.close_failure_generation()
-            close_task = asyncio.create_task(self._close_state(state))
+            await self._close_active_state(state)
+        await self._wait_for_setup_reapers()
+
+    async def _close_active_state(self, state: SessionState) -> None:
+        background_tasks = state.loop.tool_registry.background_tasks
+        failure_generation = background_tasks.close_failure_generation()
+        close_task = asyncio.create_task(self._close_state(state))
+        cancelled = False
+        try:
             try:
                 await asyncio.shield(close_task)
             except asyncio.CancelledError:
-                try:
-                    await close_task
-                finally:
-                    if (
-                        background_tasks.close_failure_generation()
-                        == close_failure_generation
-                        and self._state is state
-                    ):
-                        self._state = None
-                raise
-            except BaseException:
-                if (
-                    background_tasks.close_failure_generation()
-                    == close_failure_generation
-                    and self._state is state
-                ):
-                    self._state = None
-                raise
-            if self._state is state:
-                self._state = None
-        if self._setup_reapers:
-            pending = asyncio.gather(*self._setup_reapers)
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
-                )
-            except TimeoutError:
-                logger.error(
-                    "%d abandoned session setup task(s) still running at shutdown",
-                    len(self._setup_reapers),
-                )
+                cancelled = True
+                await close_task
+        except BaseException:
+            self._release_state_without_close_failure(
+                state, background_tasks, failure_generation
+            )
+            raise
+        if cancelled:
+            self._release_state_without_close_failure(
+                state, background_tasks, failure_generation
+            )
+            raise asyncio.CancelledError
+        if self._state is state:
+            self._state = None
+
+    def _release_state_without_close_failure(
+        self, state: SessionState, background_tasks: Any, failure_generation: int
+    ) -> None:
+        if (
+            background_tasks.close_failure_generation() == failure_generation
+            and self._state is state
+        ):
+            self._state = None
+
+    async def _wait_for_setup_reapers(self) -> None:
+        if not self._setup_reapers:
+            return
+        pending = asyncio.gather(*self._setup_reapers)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
+            )
+        except TimeoutError:
+            logger.error(
+                "%d abandoned session setup task(s) still running at shutdown",
+                len(self._setup_reapers),
+            )
 
     async def _replace(self, composition: RuntimeComposition) -> None:
         state = SessionState.from_composition(composition)

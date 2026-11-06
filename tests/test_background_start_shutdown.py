@@ -25,7 +25,8 @@ from zeta.tools._shared.process import (
 
 @pytest.mark.asyncio
 async def test_start_state_and_notice_follow_off_loop_durable_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
     registry = BackgroundTaskRegistry(
@@ -69,7 +70,8 @@ async def test_start_state_and_notice_follow_off_loop_durable_record(
 
 @pytest.mark.asyncio
 async def test_terminal_state_and_notice_follow_off_loop_durable_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
     registry = BackgroundTaskRegistry(
@@ -110,7 +112,8 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
 
 @pytest.mark.asyncio
 async def test_start_persistence_failure_reaps_before_returning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
     registry = BackgroundTaskRegistry(
@@ -129,7 +132,9 @@ async def test_start_persistence_failure_reaps_before_returning(
     monkeypatch.setattr(process_module, "spawn_background", capture_spawn)
     original_persist = registry._persist
     monkeypatch.setattr(
-        registry, "_persist", lambda rows=None: (_ for _ in ()).throw(OSError("disk full"))
+        registry,
+        "_persist",
+        lambda rows=None: (_ for _ in ()).throw(OSError("disk full")),
     )
 
     with pytest.raises(OSError, match="disk full"):
@@ -146,7 +151,8 @@ async def test_start_persistence_failure_reaps_before_returning(
 
 @pytest.mark.asyncio
 async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
@@ -199,7 +205,8 @@ async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
 
 @pytest.mark.asyncio
 async def test_terminal_notice_follows_durable_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
     registry = BackgroundTaskRegistry(
@@ -210,16 +217,20 @@ async def test_terminal_notice_follows_durable_record(
     notices.clear()
     original_persist = registry._persist
     monkeypatch.setattr(
-        registry, "_persist", lambda rows=None: (_ for _ in ()).throw(OSError("disk full"))
+        registry,
+        "_persist",
+        lambda rows=None: (_ for _ in ()).throw(OSError("disk full")),
     )
 
     with pytest.raises(OSError, match="disk full"):
         await registry.kill(task_id)
 
-    assert not registry.snapshot()[0].running
+    assert registry.snapshot()[0].running
     assert notices == []
     monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.close()
+    assert not registry.snapshot()[0].running
+    assert [notice.phase for notice in notices] == ["task_kill"]
 
 
 @pytest.mark.asyncio
@@ -253,9 +264,13 @@ async def test_failed_registry_close_can_retry(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.parametrize("interruption", [None, "spawn", "cleanup", "cleanup_failure"])
 async def test_shutdown_joins_inflight_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str | None,
 ) -> None:
-    registry = BackgroundTaskRegistry(term_grace=5 if interruption == "cleanup" else 0.03)
+    registry = BackgroundTaskRegistry(
+        term_grace=5 if interruption == "cleanup" else 0.03
+    )
     spawn_ready = asyncio.Event()
     release_spawn = asyncio.Event()
     shutdown_started = asyncio.Event()
@@ -265,7 +280,8 @@ async def test_shutdown_joins_inflight_start(
     use_fd = interruption == "spawn"
     spawn = (
         process_module.create_subprocess_shell_in_fd
-        if use_fd else process_module.create_tool_subprocess_shell
+        if use_fd
+        else process_module.create_tool_subprocess_shell
     )
     close = registry._shutdown
 
@@ -287,14 +303,24 @@ async def test_shutdown_joins_inflight_start(
     if interruption == "cleanup_failure":
         monkeypatch.setattr(background_spawn, "_terminate_unregistered", failed_cleanup)
     if use_fd:
-        monkeypatch.setattr(process_module, "create_subprocess_shell_in_fd", paused_spawn)
+        monkeypatch.setattr(
+            process_module, "create_subprocess_shell_in_fd", paused_spawn
+        )
     else:
-        monkeypatch.setattr(process_module, "create_tool_subprocess_shell", paused_spawn)
+        monkeypatch.setattr(
+            process_module, "create_tool_subprocess_shell", paused_spawn
+        )
     monkeypatch.setattr(registry, "_shutdown", shutdown)
-    command = "exec " + shlex.join((sys.executable, "-c", (
-        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "print('ready', flush=True); time.sleep(30)"
-    )))
+    command = "exec " + shlex.join(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(30)"
+            ),
+        )
+    )
     cwd_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY) if use_fd else None
     starting = asyncio.create_task(registry.start(command, tmp_path, cwd_fd=cwd_fd))
     closing = None
@@ -332,7 +358,9 @@ async def test_shutdown_joins_inflight_start(
                 assert _group_exists(process.pid)
                 release_wait.set()
             result, close_result = await asyncio.gather(
-                starting, closing, return_exceptions=True,
+                starting,
+                closing,
+                return_exceptions=True,
             )
             if interruption == "cleanup_failure":
                 assert isinstance(result, background_spawn.BackgroundSpawnCleanupError)
@@ -366,7 +394,9 @@ async def test_shutdown_joins_inflight_start(
         await asyncio.gather(starting, return_exceptions=True)
         if closing is not None:
             await asyncio.gather(closing, return_exceptions=True)
-        monitors = [record.monitor for record in registry.records if record.monitor is not None]
+        monitors = [
+            record.monitor for record in registry.records if record.monitor is not None
+        ]
         await asyncio.gather(*monitors, return_exceptions=True)
         for process in spawned:
             await process.communicate()
