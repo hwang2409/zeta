@@ -540,10 +540,6 @@ class ServeControl:
                 )
             )
         finally:
-            if self._turn_cancel_outcome is not None:
-                outcome = self._turn_cancel_outcome
-                terminal_events.clear()
-                agent_end = None
             if not started and loop.notification_turn_state == "scheduled":
                 loop.cancel_scheduled_notification_turn()
             if (
