@@ -173,6 +173,9 @@ class ConnectionRegistry:
         output = state.output
         assert output is not None
         if output.phase in {"claimed_buffering", "flushing"}:
+            if output.phase == "flushing" and output.overflowed:
+                # Honest rejection with -32011 belongs to phase B.
+                return True
             if (
                 output.pending_controller_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT
                 or output.pending_controller_frames >= _CONTROLLER_BUFFER_FRAMES
