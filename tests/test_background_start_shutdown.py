@@ -36,7 +36,7 @@ async def test_start_notice_follows_off_loop_durable_record(
     writer_threads: list[int] = []
     original_persist = registry._persist
 
-    def gated_persist(rows) -> None:
+    def gated_persist(rows=None) -> None:
         writer_threads.append(threading.get_ident())
         entered.set()
         assert release.wait(10)
