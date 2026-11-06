@@ -719,12 +719,22 @@ def test_finished_or_removed_known_child_updates_without_registration_change(
     tmp_path: Path, change: str
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="running")
+    child = _child(
+        store,
+        1,
+        description="running",
+        state="starting" if change == "finish" else "running",
+    )
     navigation = AgentNavigation(store)
     if change == "finish":
-        child.joinpath("agent_lifecycle.json").write_text(
-            json.dumps({"description": "running", "state": "completed"})
-        )
+        lifecycle = child / "agent_lifecycle.json"
+        original = lifecycle.stat()
+        replacement = child / "replacement.json"
+        replacement.write_bytes(lifecycle.read_bytes().replace(b"starting", b"canceled"))
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        os.replace(replacement, lifecycle)
+        assert lifecycle.stat().st_size == original.st_size
+        assert lifecycle.stat().st_mtime_ns == original.st_mtime_ns
     else:
         shutil.rmtree(child)
     navigation._last_refresh_at = float("-inf")

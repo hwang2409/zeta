@@ -800,7 +800,7 @@ class AgentNavigation:
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
         self._todo_control = AgentTodoControl(cwd=self.store.cwd)
-        self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+        self._metadata_cache: dict[Path, tuple[tuple[int, ...], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
@@ -924,12 +924,12 @@ class AgentNavigation:
             self._transcript_layout.children[0] = replacement
 
     @staticmethod
-    def _path_signature(path: Path) -> tuple[int, int] | None:
+    def _path_signature(path: Path) -> tuple[int, int, int] | None:
         try:
             stat = path.stat()
         except OSError:
             return None
-        return stat.st_mtime_ns, stat.st_size
+        return stat.st_mtime_ns, stat.st_size, stat.st_ino
 
     def _child_registration_signature(self) -> tuple[object, ...]:
         """Use the atomically replaced parent state as the registration token."""
@@ -1130,13 +1130,13 @@ class AgentNavigation:
         lifecycle_path = path / "agent_lifecycle.json"
         try:
             stat = lifecycle_path.stat()
-            key = (1, stat.st_mtime_ns, stat.st_size)
+            key = (1, stat.st_mtime_ns, stat.st_size, stat.st_ino)
         except OSError:
             try:
                 stat = (path / "session_state.json").stat()
-                key = (0, stat.st_mtime_ns, stat.st_size)
+                key = (0, stat.st_mtime_ns, stat.st_size, stat.st_ino)
             except OSError:
-                key = (0, 0, 0)
+                key = (0, 0, 0, 0)
         cached = self._metadata_cache.get(path)
         if cached is not None and cached[0] == key:
             return cached[1]
