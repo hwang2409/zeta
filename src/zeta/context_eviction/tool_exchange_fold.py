@@ -44,13 +44,9 @@ def fold_consumed_tool_exchanges(
     best_tokens = original_tokens
 
     for indexes in _exchange_indexes(records, result_indexes, allows):
-        for index in indexes:
-            seq, message = records[index]
-            replacement = _exchange_receipt(message, seq, calls)
-            if replacement is not message:
-                converted[index] = (seq, replacement)
-                converted_seqs.add(seq)
-
+        converted_seqs.update(
+            _convert_exchange(records, converted, indexes=indexes, calls=calls)
+        )
         candidate, coalesced = _fold_candidate(
             converted,
             selected_until=max(records[index][0] for index in indexes),
@@ -77,22 +73,44 @@ def _exchange_indexes(
     allows: Callable[[int], bool],
 ) -> Iterator[list[int]]:
     for call_index, (_, message) in enumerate(records):
-        tool_calls = [
-            block.tool_call
+        call_ids = [
+            block.tool_call.id
             for block in message.content
             if isinstance(block, ToolUseContent)
         ]
-        if not tool_calls:
-            continue
-        indexes = [call_index]
-        for call in tool_calls:
-            matches = result_indexes.get(call.id, ())
-            if not matches:
-                indexes = []
-                break
-            indexes.extend(matches)
+        indexes = _complete_exchange_indexes(call_index, call_ids, result_indexes)
         if indexes and all(allows(records[index][0]) for index in indexes):
             yield indexes
+
+
+def _complete_exchange_indexes(
+    call_index: int,
+    call_ids: Sequence[str],
+    result_indexes: dict[str, list[int]],
+) -> list[int]:
+    if not call_ids or any(call_id not in result_indexes for call_id in call_ids):
+        return []
+    return [
+        call_index,
+        *(index for call_id in call_ids for index in result_indexes[call_id]),
+    ]
+
+
+def _convert_exchange(
+    records: Sequence[Record],
+    converted: list[Record],
+    *,
+    indexes: Sequence[int],
+    calls: dict[str, ToolCall],
+) -> set[int]:
+    changed: set[int] = set()
+    for index in indexes:
+        seq, message = records[index]
+        replacement = _exchange_receipt(message, seq, calls)
+        if replacement is not message:
+            converted[index] = (seq, replacement)
+            changed.add(seq)
+    return changed
 
 
 def _exchange_receipt(
