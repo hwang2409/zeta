@@ -12016,6 +12016,7 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
     assert notices == [
         "composer draft was not saved; your text remains unsaved. copy it before exiting."
     ]
+    app.loop.store.close()
 
 
 @pytest.mark.asyncio
