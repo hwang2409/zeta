@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -7805,11 +7805,23 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     )
     mcp_calls: list[None] = []
     freeze_calls: list[None] = []
+    replay_started = asyncio.Event()
+    replay_completed: list[None] = []
+    rebuild_steps = app._rebuild_transcript_steps
 
     async def ensure_mcp() -> None:
         mcp_calls.append(None)
 
+    def observed_rebuild_steps(
+        rendered_notifications: list[str],
+    ) -> Iterator[None]:
+        for step in rebuild_steps(rendered_notifications):
+            replay_started.set()
+            yield step
+        replay_completed.append(None)
+
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
     monkeypatch.setattr(
         "zeta.tui.checkpoints.freeze_long_lived_heap",
         lambda: freeze_calls.append(None),
@@ -7817,14 +7829,11 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
     with create_pipe_input() as pipe:
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
-        for _ in range(100):
-            if app._startup_replay_active:
-                break
-            await asyncio.sleep(0)
-        assert app._startup_replay_active
+        await replay_started.wait()
         app.request_exit()
-        await asyncio.wait_for(run_task, timeout=0.25)
+        await asyncio.wait_for(run_task, timeout=1)
 
+    assert replay_completed == []
     assert mcp_calls == []
     assert freeze_calls == []
 
