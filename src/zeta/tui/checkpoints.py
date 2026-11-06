@@ -517,6 +517,18 @@ class CheckpointTranscriptMixin:
         for message in rejections:
             self._print_system(message)
 
+    def _restore_startup_submissions(self) -> None:
+        if not self._startup_submissions:
+            return
+        session = self._active_session
+        if session is None:
+            return
+        values = [value for value, _internal in self._startup_submissions]
+        if session.default_buffer.text:
+            values.append(session.default_buffer.text)
+        session.default_buffer.text = "\n".join(values)
+        self._startup_submissions = []
+
     async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
         try:
             replay_completed = (
@@ -525,6 +537,7 @@ class CheckpointTranscriptMixin:
             if replay_completed is False or self._exit_requested:
                 if not resume_ui:
                     self._finish_startup_replay(completed=False)
+                self._restore_startup_submissions()
                 return False
             await self.loop.ensure_mcp_servers()
             if not self._startup_presented:
@@ -535,6 +548,7 @@ class CheckpointTranscriptMixin:
         except BaseException:
             if not resume_ui:
                 self._finish_startup_replay(completed=False)
+            self._restore_startup_submissions()
             raise
         if not resume_ui:
             self._finish_startup_replay(completed=True)

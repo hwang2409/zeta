@@ -7732,6 +7732,60 @@ async def test_startup_submissions_keep_order_through_mcp_setup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["replay", "mcp"])
+async def test_startup_failure_restores_accepted_input_to_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_phase: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._attach_draft(session)
+    failure_ready = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        if failure_phase == "replay":
+            failure_ready.set()
+            await release_failure.wait()
+            raise RuntimeError("replay failed")
+        return True
+
+    async def ensure_mcp() -> None:
+        if failure_phase == "mcp":
+            failure_ready.set()
+            await release_failure.wait()
+            raise RuntimeError("mcp failed")
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", replay)
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    app._input_loop_active = True
+    app._begin_startup_replay()
+    preparation = asyncio.create_task(app._prepare_prompt(resume_ui=False))
+    await failure_ready.wait()
+
+    assert app._submit_input("do not lose me")
+    session.default_buffer.reset()
+    release_failure.set()
+    with pytest.raises(RuntimeError, match=f"{failure_phase} failed"):
+        await preparation
+
+    assert session.default_buffer.text == "do not lose me", (
+        "accepted startup input was not restored after startup failed"
+    )
+    await app.close()
+    assert DraftPersistence(app._draft.path).load() == "do not lose me"
+
+
+@pytest.mark.asyncio
 async def test_ctrl_v_paste_waits_for_startup_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7854,36 +7908,37 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     from zeta.tui import app as tui_app
 
     root = ConversationStore(tmp_path / "sessions")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
-    call = ToolCall(
-        "agent-1",
-        "agent",
-        {"prompt": "work", "description": "worker", "background": True},
-    )
-    child.mark_agent_parent(call.id, agent_type="worker")
-    child.start_agent_lifecycle(
-        handle=f"{root.session_id}:1",
-        started_at="2026-01-01T00:00:00+00:00",
-        depth=1,
-        agent_type="worker",
-        description="work",
-    )
-    root.register_agent_child(
-        call,
-        child_session_path=str(child.session_dir),
-        description="worker",
-        agent_type="worker",
-        background=True,
-        child_instance_id=f"{root.session_id}:1",
-        accepts_follow_ups=True,
-        explicit_finish=True,
-    )
-    child.close()
+    for number in range(1, 4):
+        child = ConversationStore(root.session_dir / "agents", session_id=str(number))
+        call = ToolCall(
+            f"agent-{number}",
+            "agent",
+            {"prompt": "work", "description": "worker", "background": True},
+        )
+        child.mark_agent_parent(call.id, agent_type="worker")
+        child.start_agent_lifecycle(
+            handle=f"{root.session_id}:{number}",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="work",
+        )
+        root.register_agent_child(
+            call,
+            child_session_path=str(child.session_dir),
+            description="worker",
+            agent_type="worker",
+            background=True,
+            child_instance_id=f"{root.session_id}:{number}",
+            accepts_follow_ups=True,
+            explicit_finish=True,
+        )
+        child.close()
 
     recovery_mutated = threading.Event()
     recovery_release = threading.Event()
     activation_cancelled = asyncio.Event()
-    recover_agent_children = background.recover_agent_children
+    recover_agent_children = background._recover_agent_children
     cancel_activation = tui_app.cancel_activation
 
     async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
@@ -7892,13 +7947,18 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
 
     monkeypatch.setattr(tui_app, "cancel_activation", observed_cancel_activation)
 
-    def gated_recovery(loop: AgentLoop) -> object:
-        deliveries = recover_agent_children(loop)
-        recovery_mutated.set()
-        assert recovery_release.wait(timeout=5)
+    recovery_steps = 0
+
+    def gated_recovery(loop: AgentLoop, **kwargs: object) -> object:
+        nonlocal recovery_steps
+        deliveries = recover_agent_children(loop, **kwargs)
+        recovery_steps += 1
+        if recovery_steps == 1:
+            recovery_mutated.set()
+            assert recovery_release.wait(timeout=5)
         return deliveries
 
-    monkeypatch.setattr(background, "recover_agent_children", gated_recovery)
+    monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
     app = TUIApp(
         AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -7919,6 +7979,15 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         recovery_release.set()
         await run_task
 
+    interrupted_store = ConversationStore(
+        tmp_path / "sessions", session_id=root.session_id
+    )
+    assert len(interrupted_store.agent_children()) == 2, (
+        "exit recovered more than the current child-atomic step"
+    )
+    interrupted_store.close()
+    assert recovery_steps == 1, "exit did not stop between child-atomic recovery steps"
+
     resumed_store = ConversationStore(tmp_path / "sessions", session_id=root.session_id)
     resumed_loop = AgentLoop(
         FakeBackend([]), resumed_store, skill_catalog=SkillCatalog.empty()
@@ -7928,9 +7997,13 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         entry
         for entry in resumed_store.agent_notifications(pending_only=False)
         if entry.data.get("kind") == "agent_completion"
-        and entry.data.get("child_instance_id") == f"{root.session_id}:1"
     ]
-    assert len(completions) == 1, "committed recovery completion was lost or duplicated"
+    assert recovery_steps == 3, "next resume did not recover each remaining child once"
+    assert sorted(entry.data["child_instance_id"] for entry in completions) == [
+        f"{root.session_id}:1",
+        f"{root.session_id}:2",
+        f"{root.session_id}:3",
+    ], "recovery completion was lost or duplicated across resume"
     await resumed_loop.close()
 
 
