@@ -16,6 +16,23 @@ from zeta.protocol.types import (
 )
 
 
+class StopThenFailBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+
+    async def complete(
+        self, messages: Sequence[Message], tool_schemas: Sequence[dict[str, Any]]
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            await asyncio.Event().wait()
+        raise RuntimeError("compatibility error turn")
+        yield  # pragma: no cover - make this an async generator
+
+
 class ServerFakeBackend(CompletionBackend):
     def __init__(self, *, delay: float = 0.01, model: str = "offline") -> None:
         self.delay = delay
@@ -45,4 +62,4 @@ class ServerFakeBackend(CompletionBackend):
         )
 
 
-__all__ = ["ServerFakeBackend"]
+__all__ = ["ServerFakeBackend", "StopThenFailBackend"]

@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as _event
 from tests.support.server_client import frames_until_event as _frames_until_event
 from tests.support.server_client import request as _request
@@ -1028,20 +1029,6 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
         pytest.skip(
             "set HISTORY_FIDELITY_ORIGIN_MAIN_SRC to an origin/main worktree src directory"
         )
-
-    class StopThenFailBackend:
-        def __init__(self) -> None:
-            self.calls = 0
-            self.started = asyncio.Event()
-
-        async def complete(self, messages, tool_schemas):
-            del messages, tool_schemas
-            self.calls += 1
-            if self.calls == 1:
-                self.started.set()
-                await asyncio.Event().wait()
-            raise RuntimeError("compatibility error turn")
-            yield  # pragma: no cover - make this an async generator
 
     backend = StopThenFailBackend()
     server = ZetaServer(
