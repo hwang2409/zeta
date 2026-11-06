@@ -158,6 +158,7 @@ class CheckpointTranscriptMixin:
     _startup_replay_active: bool = False
     _startup_rejections: list[str]
     _startup_runtime_events: list[tuple[str, Any]]
+    _startup_submissions: list[tuple[str, bool]]
     _startup_wake_pending: bool
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
@@ -515,6 +516,47 @@ class CheckpointTranscriptMixin:
             self._schedule_background_wake()
         for message in rejections:
             self._print_system(message)
+
+    def _restore_startup_submissions(self) -> None:
+        if not self._startup_submissions:
+            return
+        session = self._active_session
+        if session is None:
+            return
+        values = [value for value, _internal in self._startup_submissions]
+        if session.default_buffer.text:
+            values.append(session.default_buffer.text)
+        session.default_buffer.text = "\n".join(values)
+        self._startup_submissions = []
+
+    async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
+        try:
+            replay_completed = (
+                True if resume_ui else await self._rebuild_transcript_async()
+            )
+            if replay_completed is False or self._exit_requested:
+                if not resume_ui:
+                    self._finish_startup_replay(completed=False)
+                self._restore_startup_submissions()
+                return False
+            await self.loop.ensure_mcp_servers()
+            if not self._startup_presented:
+                self._present_startup_output()
+                self._startup_presented = True
+            self._present_pending_approvals()
+            self.start_decisions_poll()
+        except BaseException:
+            if not resume_ui:
+                self._finish_startup_replay(completed=False)
+            self._restore_startup_submissions()
+            raise
+        if not resume_ui:
+            self._finish_startup_replay(completed=True)
+        self._invalidate_prompt()
+        submissions, self._startup_submissions = self._startup_submissions, []
+        for value, internal in submissions:
+            self._submit_input(value, internal=internal)
+        return True
 
     def _persist_rendered_notifications(
         self, rendered_notifications: list[str], *, asynchronous: bool = False

@@ -13008,6 +13008,8 @@ async def test_recovery_refresh_never_runs_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
+    child = _seed_recoverable_child(store)
+    child.close()
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     owner_thread = threading.get_ident()
     refresh_threads: list[int] = []

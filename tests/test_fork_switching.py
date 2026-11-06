@@ -215,6 +215,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         app._open_fork_target = None
         app._input_loop_active = False
         app._startup_presented = True
+        app._startup_submissions = []
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
         app._rebuild_transcript_async = rebuild
@@ -254,6 +255,7 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
     async def driver() -> None:
         app = object.__new__(TUIApp)
         app._paste_runtime = PasteRuntime(weakref.proxy(app))
+        app._startup_submissions = []
         at_restore: list[tuple[object, int]] = []
 
         class Watchdog:

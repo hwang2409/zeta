@@ -6,6 +6,7 @@ import multiprocessing
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -595,6 +596,46 @@ def client_for(stream: str):
         )
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class _PartialErrorBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.finished = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"partial provider error"
+        await self.finished.wait()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+async def _drain(events) -> None:
+    async for _event in events:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_partial_codex_error_body_stalls_and_closes(
+    tmp_path: Path,
+) -> None:
+    stream = _PartialErrorBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, stream=stream, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        stall_seconds=0.01,
+    )
+    with pytest.raises(CodexStreamError, match="error body stalled"):
+        # bounded: a missing watchdog fails with TimeoutError instead of hanging
+        await asyncio.wait_for(_drain(backend._complete_once([], [])), timeout=5)
+    assert stream.closed.is_set()
+    await client.aclose()
 
 
 def store_for(path: Path, token: str | None = None) -> AccountCredentials:

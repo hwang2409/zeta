@@ -122,9 +122,16 @@ def read_session_file(directory_fd: int, name: str) -> bytes:
 
 
 def write_session_file(
-    directory_fd: int, name: str, data: bytes, *, sync: bool = True
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    *,
+    sync: bool = True,
+    sync_directory: bool | None = None,
 ) -> None:
     """Publish bytes atomically within a pinned directory."""
+    if sync_directory is None:
+        sync_directory = sync
     _component(name)
     temporary = f".{name}.{uuid.uuid4().hex}.tmp"
     fd = open_session_file(
@@ -142,6 +149,8 @@ def write_session_file(
             if sync:
                 os.fsync(handle.fileno())
         os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        if sync_directory:
+            os.fsync(directory_fd)
     finally:
         try:
             os.unlink(temporary, dir_fd=directory_fd)
@@ -162,11 +171,11 @@ def write_session_json(
 
 # Registry records use the same pinned atomic primitive as session metadata.
 def atomic_publish_file(
-    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = False
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = True
 ) -> None:
-    write_session_file(directory_fd, name, data)
-    if sync_directory:
-        os.fsync(directory_fd)
+    write_session_file(
+        directory_fd, name, data, sync_directory=sync_directory
+    )
 
 
 def open_session_file(directory_fd: int, name: str, flags: int) -> int:

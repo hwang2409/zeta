@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import re
+import stat
+import threading
 from pathlib import Path
 
 import pytest
 
+import zeta.project_inbox as project_inbox_module
 from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
@@ -59,6 +62,58 @@ def _provider_text(provider: str, result: dict) -> str:
         payload = build_responses_payload(messages, [], model="codex-test")
         return payload["input"][1]["output"]
     return ollama_messages(messages)[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_publications_are_off_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    beta = projects.create_project("beta", "beta")
+    beta_store = ConversationStore(
+        projects.root.parent / "sessions", session_id="b" * 32, cwd=tmp_path
+    )
+    beta_registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=beta.project_id,
+        project_registry=projects,
+        inbox_enabled=True,
+    )
+    beta_registry.bind_session_store(beta_store)
+    directory_threads: list[int] = []
+    original_fsync = project_inbox_module.os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(project_inbox_module.os.fstat(fd).st_mode):
+            directory_threads.append(threading.get_ident())
+        original_fsync(fd)
+
+    monkeypatch.setattr(project_inbox_module.os, "fsync", record_fsync)
+    try:
+        sent = await _inbox(
+            registry,
+            {
+                "action": "send",
+                "project": beta.project_id,
+                "kind": "question",
+                "title": "title",
+                "body": "body",
+            },
+        )
+        message_id = sent["structuredContent"]["id"]
+        await _inbox(beta_registry, {"action": "claim", "id": message_id})
+        await _inbox(
+            beta_registry,
+            {"action": "done", "id": message_id, "outcome": "done"},
+        )
+        assert directory_threads
+        assert set(directory_threads).isdisjoint({threading.get_ident()})
+    finally:
+        await beta_registry.close()
+        beta_store.close()
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio

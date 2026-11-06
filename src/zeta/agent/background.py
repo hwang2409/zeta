@@ -97,6 +97,8 @@ class BackgroundAgentOwner:
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
+        self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
+        self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -257,22 +259,34 @@ class BackgroundAgentOwner:
         that descendant's own completion.
         """
 
-        retained: list[ConversationStore] = []
         referenced = set(self._parent_stores.values())
         for stores in self._active_stores.values():
             referenced.update(stores)
         for store in self._stores:
             if store not in self._pending_stores or store in referenced:
-                retained.append(store)
-            else:
-                close_task = asyncio.create_task(
-                    store._to_thread_store(store.close),
-                    name=f"close child store {store.session_id}",
-                )
-                self._store_close_tasks.add(close_task)
-                close_task.add_done_callback(self._store_close_tasks.discard)
-                self._pending_stores.discard(store)
-        self._stores = retained
+                continue
+            existing = next(
+                (
+                    task
+                    for task, task_store in self._store_close_stores.items()
+                    if task_store is store
+                ),
+                None,
+            )
+            if existing is not None:
+                # Retry only a failure that wait_for_store_closes already raised;
+                # an unobserved failure must still reach its waiter.
+                if existing not in self._observed_close_failures:
+                    continue
+                self._observed_close_failures.discard(existing)
+                self._store_close_tasks.discard(existing)
+                self._store_close_stores.pop(existing, None)
+            close_task = asyncio.create_task(
+                store._to_thread_store(store.close),
+                name=f"close child store {store.session_id}",
+            )
+            self._store_close_tasks.add(close_task)
+            self._store_close_stores[close_task] = store
 
     def register(
         self,
@@ -366,8 +380,21 @@ class BackgroundAgentOwner:
 
         while self._store_close_tasks:
             close_tasks = tuple(self._store_close_tasks)
-            await asyncio.gather(*close_tasks, return_exceptions=False)
-            self._store_close_tasks.difference_update(close_tasks)
+            try:
+                await asyncio.gather(*close_tasks, return_exceptions=False)
+            except Exception:
+                self._observed_close_failures.update(
+                    task
+                    for task in close_tasks
+                    if task.done() and not task.cancelled() and task.exception() is not None
+                )
+                raise
+            for task in close_tasks:
+                store = self._store_close_stores.pop(task, None)
+                self._store_close_tasks.discard(task)
+                if store is not None:
+                    self._pending_stores.discard(store)
+                    self._stores.remove(store)
 
     async def wait(self) -> None:
         current = asyncio.current_task()
@@ -780,6 +807,14 @@ def recover_agent_children(
 ) -> tuple[NotificationInput, ...]:
     """Resolve child markers left by a process exit before resuming."""
 
+    return _recover_agent_children(loop)
+
+
+def _recover_agent_children(
+    loop: AgentLoopForRecovery,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[NotificationInput, ...]:
     child_markers = loop.store.agent_children()
     if not child_markers:
         recover_orphaned_questions(loop.store)
@@ -794,6 +829,8 @@ def recover_agent_children(
     busy_child_subtrees: set[str] = set()
     deliveries: list[NotificationInput] = []
     for marker_key, marker in child_markers.items():
+        if should_stop is not None and should_stop():
+            return tuple(deliveries)
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_instance_id = marker.get(

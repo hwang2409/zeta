@@ -52,6 +52,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.credentials import (
     anthropic_credentials,
@@ -7676,6 +7677,278 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
 
 
 @pytest.mark.asyncio
+async def test_startup_submissions_keep_order_through_mcp_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    replay_started = asyncio.Event()
+    replay_release = asyncio.Event()
+    mcp_started = asyncio.Event()
+    mcp_release = asyncio.Event()
+    submitted: list[str] = []
+    submit_input = app._submit_input
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        replay_started.set()
+        await replay_release.wait()
+        return True
+
+    async def delayed_mcp() -> None:
+        mcp_started.set()
+        await mcp_release.wait()
+
+    def observed_submit(value: str, *, internal: bool = False) -> bool:
+        if app._startup_replay_active and app._input_loop_active:
+            return submit_input(value, internal=internal)
+        submitted.append(value)
+        return True
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", delayed_mcp)
+    monkeypatch.setattr(app, "_submit_input", observed_submit)
+    app._input_loop_active = True
+    app._begin_startup_replay()
+
+    preparation = asyncio.create_task(app._prepare_prompt(resume_ui=False))
+    await replay_started.wait()
+    app._submit_input("first")
+    replay_release.set()
+    await mcp_started.wait()
+    app._submit_input("second")
+    assert submitted == [], "startup input reached the pipeline before setup completed"
+    mcp_release.set()
+    assert await preparation
+
+    assert submitted == ["first", "second"], "startup input order changed"
+    await app.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["replay", "mcp"])
+async def test_startup_failure_restores_accepted_input_to_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_phase: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._attach_draft(session)
+    failure_ready = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        if failure_phase == "replay":
+            failure_ready.set()
+            await release_failure.wait()
+            raise RuntimeError("replay failed")
+        return True
+
+    async def ensure_mcp() -> None:
+        if failure_phase == "mcp":
+            failure_ready.set()
+            await release_failure.wait()
+            raise RuntimeError("mcp failed")
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", replay)
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    app._input_loop_active = True
+    app._begin_startup_replay()
+    preparation = asyncio.create_task(app._prepare_prompt(resume_ui=False))
+    await failure_ready.wait()
+
+    assert app._submit_input("do not lose me")
+    session.default_buffer.reset()
+    release_failure.set()
+    with pytest.raises(RuntimeError, match=f"{failure_phase} failed"):
+        await preparation
+
+    assert session.default_buffer.text == "do not lose me", (
+        "accepted startup input was not restored after startup failed"
+    )
+    await app.close()
+    assert DraftPersistence(app._draft.path).load() == "do not lose me"
+
+
+@pytest.mark.asyncio
+async def test_exit_during_activation_keeps_accepted_input_in_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        await asyncio.Event().wait()
+
+    async def type_then_exit(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        await activation_started.wait()
+        assert app._submit_input("do not lose me")
+        app.request_exit()
+        return None
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_exit)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        await asyncio.wait_for(app.run(session), timeout=10)
+    await app.close()
+
+    assert DraftPersistence(app._draft.path).load() == "do not lose me", (
+        "input accepted during activation was lost when the user exited"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        await asyncio.Event().wait()
+
+    async def type_then_crash(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        await activation_started.wait()
+        assert app._submit_input("queued before render crash")
+        raise RuntimeError("render crash")
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_crash)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        with pytest.raises(RuntimeError, match="render crash"):
+            await asyncio.wait_for(app.run(session), timeout=10)
+
+    assert DraftPersistence(app._draft.path).load() == "queued before render crash", (
+        "input accepted during activation was lost when the prompt crashed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_during_activation_stops_prompt_and_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+    prompt_started = asyncio.Event()
+    activation_cancelled = asyncio.Event()
+    prompt_cancelled = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            activation_cancelled.set()
+            raise
+
+    async def waiting_prompt(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        prompt_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            prompt_cancelled.set()
+            raise
+        return None
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", waiting_prompt)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run = asyncio.create_task(app.run(session))
+        await asyncio.wait_for(activation_started.wait(), timeout=5)
+        await asyncio.wait_for(prompt_started.wait(), timeout=5)
+        assert app._submit_input("accepted before cancel")
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    assert prompt_cancelled.is_set(), "prompt task outlived the cancelled run"
+    assert activation_cancelled.is_set(), "activation task outlived the cancelled run"
+    assert app._input_loop_active is False
+    assert DraftPersistence(app._draft.path).load() == "accepted before cancel"
+
+
+@pytest.mark.asyncio
 async def test_ctrl_v_paste_waits_for_startup_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7788,6 +8061,167 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
     ]
     assert queued[1].delta == "999"
     app.loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_exit_during_committed_recovery_persists_child_completion_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import background
+    from zeta.tui import app as tui_app
+
+    root = ConversationStore(tmp_path / "sessions")
+    for number in range(1, 4):
+        child = ConversationStore(root.session_dir / "agents", session_id=str(number))
+        call = ToolCall(
+            f"agent-{number}",
+            "agent",
+            {"prompt": "work", "description": "worker", "background": True},
+        )
+        child.mark_agent_parent(call.id, agent_type="worker")
+        child.start_agent_lifecycle(
+            handle=f"{root.session_id}:{number}",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="work",
+        )
+        root.register_agent_child(
+            call,
+            child_session_path=str(child.session_dir),
+            description="worker",
+            agent_type="worker",
+            background=True,
+            child_instance_id=f"{root.session_id}:{number}",
+            accepts_follow_ups=True,
+            explicit_finish=True,
+        )
+        child.close()
+
+    recovery_mutated = threading.Event()
+    recovery_release = threading.Event()
+    activation_cancelled = asyncio.Event()
+    recover_agent_children = background._recover_agent_children
+    cancel_activation = tui_app.cancel_activation
+
+    async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
+        activation_cancelled.set()
+        await cancel_activation(task)
+
+    monkeypatch.setattr(tui_app, "cancel_activation", observed_cancel_activation)
+
+    recovery_steps = 0
+    gated_once = False
+
+    def gated_recovery(loop: AgentLoop, **kwargs: object) -> object:
+        nonlocal gated_once, recovery_steps
+        children_before = len(loop.store.agent_children())
+        should_stop = kwargs.get("should_stop")
+        stop_checks = 0
+
+        def observed_stop() -> bool:
+            nonlocal gated_once, stop_checks
+            stop_checks += 1
+            if not gated_once and stop_checks == 2:
+                gated_once = True
+                recovery_mutated.set()
+                assert recovery_release.wait(timeout=5)
+                assert callable(should_stop)
+                deadline = time.monotonic() + 5
+                while not should_stop() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return bool(should_stop and should_stop())
+
+        deliveries = recover_agent_children(loop, should_stop=observed_stop)
+        recovery_steps += children_before - len(loop.store.agent_children())
+        return deliveries
+
+    monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    monkeypatch.setattr(
+        "zeta.tui.app.start_tui_stall_watchdog", lambda *args, **kwargs: None
+    )
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput())
+        run_task = asyncio.create_task(app.run(session))
+        assert await asyncio.to_thread(recovery_mutated.wait, 5)
+        assert app._input_loop_active, "TUI input did not start during activation recovery"
+        app.request_exit()
+        await activation_cancelled.wait()
+        recovery_release.set()
+        await run_task
+
+    interrupted_store = ConversationStore(
+        tmp_path / "sessions", session_id=root.session_id
+    )
+    assert len(interrupted_store.agent_children()) == 2, (
+        "exit recovered more than the current child-atomic step"
+    )
+    interrupted_store.close()
+    assert recovery_steps == 1, "exit did not stop between child-atomic recovery steps"
+
+    resumed_store = ConversationStore(tmp_path / "sessions", session_id=root.session_id)
+    resumed_loop = AgentLoop(
+        FakeBackend([]), resumed_store, skill_catalog=SkillCatalog.empty()
+    )
+    await resumed_loop.activate()
+    completions = [
+        entry
+        for entry in resumed_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "agent_completion"
+    ]
+    assert recovery_steps == 3, "next resume did not recover each remaining child once"
+    assert sorted(entry.data["child_instance_id"] for entry in completions) == [
+        f"{root.session_id}:1",
+        f"{root.session_id}:2",
+        f"{root.session_id}:3",
+    ], "recovery completion was lost or duplicated across resume"
+    await resumed_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_session_activation_does_not_construct_recovery_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import recovery_lease
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    constructions = 0
+    store_type = recovery_lease.ConversationStore
+
+    def counted_store(*args: object, **kwargs: object) -> ConversationStore:
+        nonlocal constructions
+        constructions += 1
+        return store_type(*args, **kwargs)
+
+    monkeypatch.setattr(recovery_lease, "ConversationStore", counted_store)
+
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        run_task = asyncio.create_task(app.run(session))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if app._input_loop_active:
+                break
+        app.request_exit()
+        await run_task
+
+    assert constructions == 0, "empty recovery constructed a detached full store"
 
 
 @pytest.mark.asyncio
