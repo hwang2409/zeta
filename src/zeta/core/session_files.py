@@ -169,6 +169,25 @@ def write_session_json(
     )
 
 
+def unlink_session_file(
+    directory_fd: int,
+    name: str,
+    *,
+    missing_ok: bool = True,
+    sync_directory: bool = True,
+) -> None:
+    """Unlink one session file and durably publish the directory change."""
+    _component(name)
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+        return
+    if sync_directory:
+        os.fsync(directory_fd)
+
+
 # Registry records use the same pinned atomic primitive as session metadata.
 def atomic_publish_file(
     directory_fd: int, name: str, data: bytes, *, sync_directory: bool = True
