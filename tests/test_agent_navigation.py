@@ -693,6 +693,31 @@ def test_registered_child_is_discovered_when_agents_directory_stat_is_unchanged(
     store.close()
 
 
+def test_registered_child_from_another_store_is_discovered_at_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    navigation_store = ConversationStore(root, session_id="root")
+    writer_store = ConversationStore(root, session_id="root")
+    navigation = AgentNavigation(navigation_store)
+    child = _child(writer_store, 1, description="cross-process child")
+    writer_store.register_agent_child(
+        ToolCall("child-1", "agent", {"prompt": "work"}),
+        child_session_path=str(child),
+        description="cross-process child",
+    )
+    navigation._last_refresh_at = float("-inf")
+
+    assert navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+
+    navigation._last_refresh_at = float("-inf")
+    navigation.refresh()
+    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    writer_store.close()
+    navigation_store.close()
+
+
 def test_nested_registered_child_is_discovered(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     parent = _child(store, 1, description="parent")
