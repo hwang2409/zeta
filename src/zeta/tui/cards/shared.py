@@ -101,7 +101,7 @@ def wrap_by_cells(text: str, width: int) -> list[str]:
     for paragraph in text.splitlines() or [""]:
         current = ""
         for word in paragraph.split() or [""]:
-            piece = word if not current else f"{current} {word}"
+            piece = f"{current} {word}".strip()
             if get_cwidth(piece) <= width:
                 current = piece
                 continue
@@ -113,4 +113,4 @@ def wrap_by_cells(text: str, width: int) -> list[str]:
                 word = word[split:]
             current = word
         lines.append(current)
-    return lines or [""]
+    return lines
