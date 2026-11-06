@@ -22,6 +22,7 @@ from typing import Any, Literal, Self
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store import PersistedAppend
+from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
 from zeta.memory.safety import redact_secrets
 from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.source import (
@@ -1140,6 +1141,8 @@ def _merge_refresh_sources(
         if earlier.append_receipts is not None and later.append_receipts is not None
         else None
     )
+    if receipts is not None and len(receipts) >= MAX_PENDING_APPEND_RECEIPTS:
+        receipts = None
     return replace(later, append_receipts=receipts)
 
 

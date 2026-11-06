@@ -1887,7 +1887,7 @@ async def test_status_surfaces_transcript_index_failure(
         socket_path=_socket_path(tmp_path),
         provider="codex",
     )
-    reader, writer = await _ready(server)
+    reader, writer = await _ready(server, "1.1")
     try:
         loop = server.runtime.loop
         assert loop is not None

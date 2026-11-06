@@ -815,6 +815,69 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
 
 
 @pytest.mark.asyncio
+async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import PersistedAppend
+    from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
+
+    projects_root = tmp_path / "projects"
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "boundedretrycanary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    (source.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
+    )
+    original_refresh = index_module._refresh_sources
+
+    def fail(*args) -> None:
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(index_module, "_refresh_sources", fail)
+    for offset in range(MAX_PENDING_APPEND_RECEIPTS + 1):
+        receipt = PersistedAppend(
+            start_offset=offset,
+            end_offset=offset + 1,
+            digest=f"{offset:064x}",
+            source_device=1,
+            source_inode=1,
+            before_mtime_ns=offset,
+            before_ctime_ns=offset,
+            after_mtime_ns=offset + 1,
+            after_ctime_ns=offset + 1,
+        )
+        with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
+            await refresh_transcript_index(
+                projects_root,
+                PROJECT_A,
+                source.session_id,
+                source.session_dir,
+                (receipt,),
+            )
+
+    states = index_module._REFRESH_STATES[asyncio.get_running_loop()]
+    pending = states[(projects_root.resolve(), PROJECT_A)].pending[source.session_id]
+    assert pending.append_receipts is None
+
+    monkeypatch.setattr(index_module, "_refresh_sources", original_refresh)
+    await refresh_transcript_index(
+        projects_root,
+        PROJECT_A,
+        source.session_id,
+        source.session_dir,
+        (receipt,),
+    )
+
+    index = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    assert len(index.search("boundedretrycanary")) == 1
+
+
+@pytest.mark.asyncio
 async def test_append_runs_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

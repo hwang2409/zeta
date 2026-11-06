@@ -778,7 +778,7 @@ class _Client:
             truncated = False
         transcript_index_failure = (
             runtime.loop.transcript_index_failure(runtime.session_id)
-            if runtime.loop is not None
+            if self.protocol_version != "1.0" and runtime.loop is not None
             else None
         )
         return {

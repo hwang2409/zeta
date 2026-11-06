@@ -669,7 +669,7 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
             return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
         transcript_index_failure = (
             runtime.loop.transcript_index_failure(runtime.session_id)
-            if runtime.loop is not None
+            if client.protocol_version != "1.0" and runtime.loop is not None
             else None
         )
         return runtime.session_id, {
