@@ -6742,7 +6742,7 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
                     }
                 ],
                 "last_attempt_at": "2026-10-22T12:00:00Z",
-                "last_error": None,
+                "last_error": "internal refresh error; retry or restart zeta",
             }
         ).encode(),
     )
@@ -6781,6 +6781,7 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         assert row["account"] == "codex:work"
         assert row["current"] is True
         assert row["default"] is True
+        assert row["usage"]["error"] == "internal refresh error; retry or restart zeta"
         assert row["usage"]["snapshot"]["windows"] == [
             {
                 "kind": "primary",
@@ -6803,6 +6804,49 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         assert refreshed_list == listed
         assert off_loop_reads == 2
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_account_refresh_reports_busy_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("codex", "work")
+    await asyncio.to_thread(
+        named_account_credentials(home, "codex", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(account):
+            locked.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert locked.wait(1)
+    try:
+        refreshed = (
+            await _request(
+                reader,
+                writer,
+                "accounts-refresh-busy",
+                "account_refresh",
+                {"session_id": sid},
+            )
+        )[-1]["result"]
+        assert refreshed["accounts"][0]["usage"]["error"] == (
+            "account busy; retry after the other account operation finishes"
+        )
+    finally:
+        release.set()
+        holder.join()
         await _close(server, writer)
 
 
