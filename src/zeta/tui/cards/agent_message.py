@@ -116,9 +116,9 @@ def _identity_description(value: str) -> str:
 
 
 def _state_style(state: str) -> str:
-    if state == "error":
+    if state in {"error", "failed", "canceled"}:
         return theme.ERROR
-    if state in {"queued", "delivered", "sent"}:
+    if state in {"queued", "delivered", "sent", "completed"}:
         return theme.SUCCESS
     return theme.NOTICE
 

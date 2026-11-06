@@ -311,6 +311,18 @@ def test_agent_notifications_show_identity_verdict_and_summary(width: int) -> No
 @pytest.mark.parametrize("width", [80, 160])
 def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
     nested_handle = f"{HANDLE}:1"
+    spawn_start = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START,
+        tool_call=ToolCall(
+            "agent-start",
+            "agent",
+            {
+                "description": "storage worker",
+                "agent_type": "general",
+                "model": "gpt-5.6-luna",
+            },
+        ),
+    )
     spawn = _tool_result_event(
         "agent",
         {
@@ -378,9 +390,14 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
         {"handle": nested_handle, "status": "cancellation_confirmed"},
     )
 
+    spawn_start_output = _render(spawn_start, width)
     spawn_output = _render(spawn, width)
     controls_output = _render_sequence([status, output, cancel], width)
 
+    assert all(
+        value in spawn_start_output
+        for value in ("storage worker", "general", "gpt-5.6-luna", "running")
+    )
     assert all(
         value in spawn_output
         for value in (
