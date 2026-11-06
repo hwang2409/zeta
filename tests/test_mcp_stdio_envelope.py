@@ -12,11 +12,12 @@ import pytest
 
 import zeta.mcp.stdio as stdio_module
 from zeta.core.abort import AbortSignal
-from zeta.mcp import MCPServerConfig, StdioMCPClient
+from zeta.mcp import MCPConfig, MCPServerConfig, StdioMCPClient
 from zeta.mcp.actors.prompt import CallFinished, CallRequest
 from zeta.mcp.client import canceled_result, make_error_result
 from zeta.mcp.connection import build_mcp_client
 from zeta.mcp.envelope import MCPCallEnvelope, MCPCallLimits
+from zeta.mcp.mount import mount_mcp_servers
 from zeta.mcp.server_actor import (
     MCPServerActor,
     MCPServerStatus,
@@ -97,6 +98,117 @@ async def test_constructed_stdio_client_uses_resolved_wire_limit(
         )
     finally:
         await client.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stdio_deadlines_share_invalidation_and_reconnect_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    launches = tmp_path / "launches"
+    source = f"""
+import json
+import pathlib
+import sys
+path = pathlib.Path({str(launches)!r})
+launch = int(path.read_text()) + 1 if path.exists() else 1
+path.write_text(str(launch))
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "initialize":
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}}}}}
+    elif method == "tools/list":
+        result = {{"tools": [{{"name": "echo", "description": "", "inputSchema": {{"type": "object"}}}}]}}
+    elif method == "tools/call" and launch == 1:
+        note = {{"jsonrpc": "2.0", "method": "notifications/progress", "params": {{}}}}
+        while True:
+            print(json.dumps(note, separators=(",", ":")), flush=True)
+    elif method == "tools/call":
+        result = {{"content": [{{"type": "text", "text": "ok"}}]}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}, separators=(",", ":")), flush=True)
+"""
+    limits = MCPCallLimits(
+        deadline_seconds=300.0,
+        max_wire_bytes=64 * 1024 * 1024,
+        spill_after_bytes=64 * 1024,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("deadline__echo",),
+        mcp_limits=limits,
+    )
+    config = MCPServerConfig("deadline", "stdio", sys.executable, ("-u", "-c", source))
+    kill_calls = 0
+    real_kill = stdio_module._kill_and_reap
+
+    async def counted_kill(process, tasks) -> None:
+        nonlocal kill_calls
+        kill_calls += 1
+        await real_kill(process, tasks)
+
+    monkeypatch.setattr(stdio_module, "_kill_and_reap", counted_kill)
+    notification_seen = asyncio.Event()
+    abort_on_base: asyncio.Task[None] | None = None
+    signals = (AbortSignal(), AbortSignal())
+    if hasattr(MCPServerActor, "_wait_for_call_deadline"):
+        real_deadline_waiter = MCPServerActor._wait_for_call_deadline
+        deadline_waits = 0
+
+        async def wait_for_notification_deadline(actor) -> None:
+            nonlocal deadline_waits
+            deadline_waits += 1
+            if deadline_waits <= 2:
+                await notification_seen.wait()
+            else:
+                await real_deadline_waiter(actor)
+
+        monkeypatch.setattr(
+            MCPServerActor,
+            "_wait_for_call_deadline",
+            wait_for_notification_deadline,
+        )
+    else:
+
+        async def abort_calls_on_base() -> None:
+            await notification_seen.wait()
+            for signal in signals:
+                signal.abort()
+
+        abort_on_base = asyncio.create_task(abort_calls_on_base())
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"deadline": config}),
+    )
+    expected = make_error_result("MCP tool deadline__echo exceeded the 300s deadline")
+    try:
+        mount._clients["deadline"].set_notification_sink(
+            lambda _method: notification_seen.set()
+        )
+        results = await asyncio.gather(
+            mount.call_tool("deadline", "echo", {"call": 1}, signals[0]),
+            mount.call_tool("deadline", "echo", {"call": 2}, signals[1]),
+        )
+        assert results == [expected, expected]
+        client = mount._clients["deadline"]
+        assert client._invalidation is not None
+        await asyncio.shield(client._invalidation.task)
+        follow_up = await mount.call_tool("deadline", "echo", {})
+        assert follow_up["content"][0]["text"] == "ok"
+        assert mount.statuses["deadline"].state == "mounted"
+        assert launches.read_text() == "2"
+        assert kill_calls == 1
+    finally:
+        if abort_on_base is not None:
+            await abort_on_base
+        await mount.close()
         await registry.close()
 
 

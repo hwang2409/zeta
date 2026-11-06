@@ -230,6 +230,10 @@ class StreamableHTTPMCPClient(MCPClient):
                 await asyncio.gather(request_task, return_exceptions=True)
                 raise MCPCanceled()
             return await request_task
+        except asyncio.CancelledError:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            raise
         finally:
             if not abort_task.done():
                 abort_task.cancel()
@@ -417,9 +421,7 @@ class StreamableHTTPMCPClient(MCPClient):
             ) as response:
                 if response.status_code >= 400:
                     detail = await _response_detail(response)
-                    raise MCPHTTPError(
-                        response.status_code, detail or "request failed"
-                    )
+                    raise MCPHTTPError(response.status_code, detail or "request failed")
                 started = asyncio.get_running_loop().time()
                 delivered = False
                 async for value in _iter_sse_events(
@@ -480,9 +482,7 @@ class StreamableHTTPMCPClient(MCPClient):
 
             return _ENV_PATTERN.sub(replace, value)
 
-        headers = {
-            name: resolve(value) for name, value in self.config.headers.items()
-        }
+        headers = {name: resolve(value) for name, value in self.config.headers.items()}
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         elif self.config.auth_type == "oauth" and self._current_token is not None:
@@ -492,14 +492,22 @@ class StreamableHTTPMCPClient(MCPClient):
 
 
 async def _drain_pages(
-    request, method: str, parser, label: str,
-    *, abort_signal: AbortSignal | None = None,
+    request,
+    method: str,
+    parser,
+    label: str,
+    *,
+    abort_signal: AbortSignal | None = None,
 ) -> list:
     if abort_signal is not None:
         request = partial(request, abort_signal=abort_signal)
     return await drain_pages(
-        request, method, parser, label,
-        max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+        request,
+        method,
+        parser,
+        label,
+        max_pages=MAX_LIST_PAGES,
+        max_items=MAX_LIST_ITEMS,
     )
 
 

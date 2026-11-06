@@ -102,7 +102,9 @@ async def _append_frame_part(
     return frame
 
 
-_Outcome = Literal["limit", "quota", "restart", "canceled", "transport", "closed"]
+_Outcome = Literal[
+    "limit", "quota", "deadline", "restart", "canceled", "transport", "closed"
+]
 
 
 @dataclass(slots=True)
@@ -315,6 +317,20 @@ class StdioMCPClient(MCPClient):
             "retry the tool"
         )
 
+    def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
+        """Start or join invalidation before the timed-out call can resume."""
+
+        invalidation = self._start_invalidation(
+            MCPTransportError("MCP stdio server terminated after a call deadline"),
+            default_outcome="restart",
+        )
+        deadline_ids = {
+            request_id
+            for request_id, pending in invalidation.pending.items()
+            if pending.owner is owner
+        }
+        self._record_outcomes(invalidation, set(), set(), set(), deadline_ids)
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -523,6 +539,8 @@ class StdioMCPClient(MCPClient):
                 else None
             )
             return result, _StdioSpillQuota()
+        if outcome == "deadline":
+            return None, None
         if outcome == "canceled":
             return canceled_result() if tool_name is not None else None, MCPCanceled()
         if outcome == "restart":
@@ -536,6 +554,7 @@ class StdioMCPClient(MCPClient):
         limit_ids: set[int],
         quota_ids: set[int],
         cancel_ids: set[int],
+        deadline_ids: set[int] | None = None,
     ) -> None:
         for request_id in limit_ids:
             if request_id in invalidation.pending:
@@ -546,6 +565,9 @@ class StdioMCPClient(MCPClient):
         for request_id in cancel_ids:
             if request_id in invalidation.pending:
                 invalidation.outcomes[request_id] = "canceled"
+        for request_id in deadline_ids or ():
+            if request_id in invalidation.pending:
+                invalidation.outcomes[request_id] = "deadline"
         for request_id, pending in invalidation.pending.items():
             if pending.owner is None or pending.tool_name is None:
                 continue
@@ -577,9 +599,11 @@ class StdioMCPClient(MCPClient):
             for request_id, pending in invalidation.pending.items():
                 if pending.future.done():
                     continue
-                _, error = self._outcome_values(
-                    invalidation.outcomes[request_id], pending.tool_name
-                )
+                outcome = invalidation.outcomes[request_id]
+                if outcome == "deadline":
+                    pending.future.cancel()
+                    continue
+                _, error = self._outcome_values(outcome, pending.tool_name)
                 pending.future.set_exception(error or invalidation.reason)
             if self._reader_error is None:
                 self._reader_error = invalidation.reason

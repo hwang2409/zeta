@@ -28,6 +28,7 @@ from .client import (
     unavailable_result as _unavailable_result,
 )
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
+from .envelope import MCPCallLimits, _format_deadline
 from .definition_publisher import MCPDefinitionPublisher
 from .actors.resource import (
     ResourceFinished as _ResourceFinished,
@@ -201,6 +202,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._build_client = build_client
         self._connect_and_list = connect_and_list
         self._setup_timeout = setup_timeout
+        limits = registry.mcp_limits if registry is not None else MCPCallLimits()
+        self._call_deadline_seconds = limits.deadline_seconds
         self._auto_base_delay = auto_base_delay
         self._auto_max_delay = auto_max_delay
         self._queue: asyncio.Queue[object] = asyncio.Queue()
@@ -664,9 +667,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(self.name)),
         )
         _notice(notice_sink, f"mcp · {self.name} mounted ({len(tools)} tools)")
-        if not tools and (
-            config.allowed_tools is not None or config.disallowed_tools
-        ):
+        if not tools and (config.allowed_tools is not None or config.disallowed_tools):
             _notice(notice_sink, f"mcp · {self.name} mounted with zero tools")
         failure_reason = failure_future.result() if failure_future.done() else None
         return _SetupOutcome(status, client, tuple(tools), prompts, failure_reason)
@@ -927,11 +928,63 @@ class MCPServerActor(MCPDefinitionPublisher):
         request: _CallRequest,
         client: MCPClient,
     ) -> StructuredToolResult:
-        return await client.call_tool(
-            request.tool_name,
-            request.arguments,
-            request.abort_signal,
+        call = asyncio.create_task(
+            client.call_tool(
+                request.tool_name,
+                request.arguments,
+                request.abort_signal,
+            )
         )
+        deadline = asyncio.create_task(self._wait_for_call_deadline())
+        try:
+            done, _ = await asyncio.wait(
+                (call, deadline), return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            call.cancel()
+            deadline.cancel()
+            await asyncio.gather(call, deadline, return_exceptions=True)
+            raise
+        if call in done:
+            deadline.cancel()
+            await asyncio.gather(deadline, return_exceptions=True)
+            return call.result()
+
+        await asyncio.gather(deadline, return_exceptions=True)
+        deadline_exceeded = getattr(client, "deadline_exceeded", None)
+        if deadline_exceeded is not None:
+            deadline_exceeded(call)
+        call.cancel()
+        cleanup = asyncio.create_task(
+            self._finish_deadline_cleanup(call),
+        )
+        self._children.add(cleanup)
+        cleanup.add_done_callback(
+            lambda done: self._queue.put_nowait(_ChildFinished(done))
+        )
+        return make_error_result(
+            f"MCP tool {self.name}__{request.tool_name} exceeded the "
+            f"{_format_deadline(self._call_deadline_seconds)} deadline"
+        )
+
+    async def _wait_for_call_deadline(self) -> None:
+        loop = asyncio.get_running_loop()
+        async with asyncio.timeout_at(loop.time() + self._call_deadline_seconds):
+            await asyncio.Future()
+
+    async def _finish_deadline_cleanup(
+        self, call: asyncio.Task[StructuredToolResult]
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(call, return_exceptions=True)),
+                CLIENT_CLOSE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "timed out cleaning up MCP tool call for %s; abandoning call task",
+                self.name,
+            )
 
     def _queue_call_result(
         self,
@@ -954,9 +1007,10 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._children.discard(message.task)
         request = self._requests.pop(message.request.identifier, message.request)
         take_result = getattr(request.client, "take_invalidation_result", None)
-        if take_result is not None and (
-            recorded_result := take_result(message.task)
-        ) is not None:
+        if (
+            take_result is not None
+            and (recorded_result := take_result(message.task)) is not None
+        ):
             _set_result(request.result, recorded_result)
             return
         if isinstance(message.error, asyncio.CancelledError):
@@ -1206,7 +1260,9 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._children.discard(message.task)
                 if message.outcome is not None and message.outcome.client is not None:
                     self._schedule_close(message.outcome.client)
-            elif isinstance(message, (_CallFinished, _PromptFinished, _ResourceFinished)):
+            elif isinstance(
+                message, (_CallFinished, _PromptFinished, _ResourceFinished)
+            ):
                 self._children.discard(message.task)
                 self._resolve_message(message)
             elif isinstance(message, _ChildFinished):
