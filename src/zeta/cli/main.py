@@ -788,6 +788,21 @@ def _retain_active_draft(
         retained_drafts.append(draft)
 
 
+def _create_tui_app(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> object | None:
+    try:
+        if args.continue_session or args.resume is not None:
+            print("Loading session…", flush=True)
+            return asyncio.run(asyncio.to_thread(create_app, args))
+        return create_app(args)
+    except SessionError as exc:
+        parser.error(str(exc))
+    except ValueError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return None
+
+
 def _run_tui_lifecycle(
     args: argparse.Namespace, parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
@@ -798,20 +813,12 @@ def _run_tui_lifecycle(
     app: object | None = None
     try:
         while True:
-            try:
-                if args.continue_session or args.resume is not None:
-                    print("Loading session…", flush=True)
-                    app = asyncio.run(asyncio.to_thread(create_app, args))
-                else:
-                    app = create_app(args)
-                current_session_id = app.loop.store.session_id
-                run_app = app
-            except SessionError as exc:
-                parser.error(str(exc))
-            except ValueError as exc:
-                print(f"zeta: {exc}", file=sys.stderr)
+            app = _create_tui_app(args, parser)
+            if app is None:
                 exit_status = 1
                 break
+            current_session_id = app.loop.store.session_id
+            run_app = app
             restart_requested = False
             restart_cancels_work = False
             new_session_requested = False
