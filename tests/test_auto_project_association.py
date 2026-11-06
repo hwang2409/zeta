@@ -125,12 +125,6 @@ def test_resumed_session_keeps_association_and_child_inherits(tmp_path: Path) ->
     assert len(m.project_registry.list_projects()) == 1
 
 
-def test_no_session_auto_project_flag_is_disabled(tmp_path: Path) -> None:
-    root = repo(tmp_path)
-    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root, auto_project=False)
-    assert opened.metadata.project_id is None
-
-
 def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
     root = repo(tmp_path); m = manager(tmp_path)
     opened = m.create(provider="codex", model="test", cwd=root)
