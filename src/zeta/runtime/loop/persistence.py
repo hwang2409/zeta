@@ -35,8 +35,9 @@ class _FileAction:
 class _OrderedFileWriter:
     """Own one ordered daemon thread and expose bounded completion waits."""
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, failure_sink: Callable[[str], None] | None = None) -> None:
         self._label = label
+        self._failure_sink = failure_sink
         self._queue: queue.Queue[_FileAction] = queue.Queue()
         self._lock = threading.Lock()
         self._completed = threading.Condition(self._lock)
@@ -45,6 +46,7 @@ class _OrderedFileWriter:
         self._applied = 0
         self._accepting = True
         self._waiters: list[tuple[int, asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
+        self._outcomes: dict[int, BaseException | None] = {}
         self._reported_failure = False
 
     def submit(
@@ -83,49 +85,62 @@ class _OrderedFileWriter:
         while True:
             item = self._queue.get()
             result: object | None = None
-            failed = False
+            failure: BaseException | None = None
             try:
                 result = item.action()
             except Exception as exc:  # noqa: BLE001 - persistence must not crash the TUI
-                failed = True
+                failure = exc
                 self._report_failure(exc)
-            self._deliver(item, result, failed)
+            self._deliver(item, result, failure)
             with self._lock:
                 if item.stop or self._queue.empty():
                     self._thread = None
                     return
 
-    def _deliver(self, item: _FileAction, result: object | None, failed: bool) -> None:
+    def _deliver(
+        self, item: _FileAction, result: object | None, failure: BaseException | None,
+    ) -> None:
         try:
-            if not failed and item.completed is not None:
+            if failure is None and item.completed is not None:
                 item.completed(result)
         except Exception as exc:  # noqa: BLE001 - completion must not stop the writer
+            failure = exc
             self._report_failure(exc)
-        finally:
-            self._mark_applied(item.watermark)
+        self._mark_applied(item.watermark, failure)
 
-    def _mark_applied(self, watermark: int) -> None:
+    def _mark_applied(self, watermark: int, failure: BaseException | None) -> None:
         with self._completed:
+            self._outcomes[watermark] = failure
             self._applied = max(self._applied, watermark)
             ready = [waiter for waiter in self._waiters if waiter[0] <= self._applied]
             self._waiters = [waiter for waiter in self._waiters if waiter[0] > self._applied]
             self._completed.notify_all()
-        for _, loop, future in ready:
+        for target, loop, future in ready:
             try:
-                loop.call_soon_threadsafe(self._finish_waiter, future)
+                loop.call_soon_threadsafe(
+                    self._finish_waiter, future, self._outcomes.get(target),
+                )
             except RuntimeError:
                 pass
 
     @staticmethod
-    def _finish_waiter(future: asyncio.Future[None]) -> None:
+    def _finish_waiter(
+        future: asyncio.Future[None], failure: BaseException | None,
+    ) -> None:
         if not future.done():
-            future.set_result(None)
+            if failure is None:
+                future.set_result(None)
+            else:
+                future.set_exception(failure)
 
     async def flush(self, *, timeout: float) -> None:
         loop = asyncio.get_running_loop()
         with self._lock:
             watermark = self._submitted
             if self._applied >= watermark:
+                failure = self._outcomes.get(watermark)
+                if failure is not None:
+                    raise failure
                 return
             future = loop.create_future()
             self._waiters.append((watermark, loop, future))
@@ -154,12 +169,24 @@ class _OrderedFileWriter:
                 return
             self._reported_failure = True
         _LOGGER.warning("failed to persist %s: %s", self._label, exc)
+        if self._failure_sink is not None:
+            self._failure_sink(
+                "composer draft was not saved; your text remains unsaved. "
+                "copy it before exiting."
+            )
 
 
 class DraftPersistence:
     """Persist the current composer text after a short idle delay."""
 
-    def __init__(self, path: str | Path, *, delay: float = DRAFT_WRITE_DELAY, directory_fd: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        delay: float = DRAFT_WRITE_DELAY,
+        directory_fd: int | None = None,
+        notice_sink: Callable[[str], None] | None = None,
+    ) -> None:
         self.path = Path(path)
         self.directory_fd = directory_fd
         self.delay = delay
@@ -173,7 +200,7 @@ class DraftPersistence:
         self._changed: Callable[[Buffer], None] | None = None
         self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
         self._pending_next_image_token = 1
-        self._writer = _OrderedFileWriter("composer draft")
+        self._writer = _OrderedFileWriter("composer draft", notice_sink)
 
     def load(self) -> str:
         return self.load_state().text
@@ -244,29 +271,60 @@ class DraftPersistence:
         revision = self._pending_revision
         attachment_tokens = self._pending_attachment_tokens
         next_image_token = self._pending_next_image_token
-        self._pending_text = None
-        self._pending_revision = None
-        self._pending_attachment_tokens = ()
-        self._pending_next_image_token = 1
         if text is None:
             return
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            event_loop = None
+
+        def persisted(_result: object) -> None:
+            if event_loop is None:
+                self._mark_persisted(revision)
+            else:
+                try:
+                    event_loop.call_soon_threadsafe(self._mark_persisted, revision)
+                except RuntimeError:
+                    pass
+
         submitted = self._submit(
             lambda directory_fd: self._persist(
                 text,
                 attachment_tokens=attachment_tokens,
                 next_image_token=next_image_token,
                 directory_fd=directory_fd,
-            )
+            ),
+            completed=persisted,
         )
-        if submitted:
-            self._persisted_revision = revision
-        else:
-            self._pending_text = text
-            self._pending_revision = revision
-            self._pending_attachment_tokens = attachment_tokens
-            self._pending_next_image_token = next_image_token
+        if not submitted:
+            self._restore_pending(text, revision, attachment_tokens, next_image_token)
 
-    def _submit(self, action: Callable[[int | None], None]) -> bool:
+    def _mark_persisted(self, revision: int) -> None:
+        if self._pending_revision == revision:
+            self._pending_text = None
+            self._pending_revision = None
+            self._pending_attachment_tokens = ()
+            self._pending_next_image_token = 1
+        self._persisted_revision = revision
+
+    def _restore_pending(
+        self,
+        text: str,
+        revision: int,
+        attachment_tokens: tuple[tuple[str, str], ...],
+        next_image_token: int,
+    ) -> None:
+        self._pending_text = text
+        self._pending_revision = revision
+        self._pending_attachment_tokens = attachment_tokens
+        self._pending_next_image_token = next_image_token
+
+    def _submit(
+        self,
+        action: Callable[[int | None], None],
+        *,
+        completed: Callable[[object], None] | None = None,
+    ) -> bool:
         try:
             owned_fd = os.dup(self.directory_fd) if self.directory_fd is not None else None
         except OSError as exc:
@@ -281,7 +339,7 @@ class DraftPersistence:
                     os.close(owned_fd)
 
         try:
-            self._writer.submit(run)
+            self._writer.submit(run, completed=completed)
         except Exception:
             if owned_fd is not None:
                 os.close(owned_fd)

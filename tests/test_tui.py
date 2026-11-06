@@ -11277,6 +11277,39 @@ async def test_draft_write_runs_off_loop_and_flushes(
 
 
 @pytest.mark.asyncio
+async def test_failed_draft_write_keeps_pending_text_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+    persistence.schedule("old draft")
+    await persistence.flush_pending()
+
+    original = persistence_module.write_session_json
+    failed = True
+    writes = 0
+
+    def write(directory_fd: int, *args, **kwargs) -> None:
+        nonlocal failed, writes
+        writes += 1
+        if failed:
+            failed = False
+            raise OSError(errno.ENOSPC, "disk full")
+        original(directory_fd, *args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    persistence.schedule("new draft")
+    with pytest.raises(OSError, match="disk full"):
+        await persistence.flush_pending()
+    assert persistence.load() == "old draft"
+    assert persistence._pending_text == "new draft"
+
+    await persistence.flush_pending()
+    await persistence.shutdown_pending()
+    assert persistence.load() == "new draft"
+    assert writes == 2
+
+
+@pytest.mark.asyncio
 async def test_runtime_close_draft_writer_owns_its_directory_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

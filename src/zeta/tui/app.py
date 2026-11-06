@@ -270,6 +270,7 @@ class TUIApp(
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
+            notice_sink=lambda message: app._handle_background_notice(message),
         )
         self._draft_session: PromptSession[str] | None = None
         self._undo_candidate: UndoCandidate | None = None
