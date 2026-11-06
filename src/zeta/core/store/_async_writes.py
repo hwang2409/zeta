@@ -9,6 +9,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from ._pending_prompts import PendingPromptWriterReloadedError
+
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._log import InstalledEntriesDelta, _DetachedLogState
@@ -116,6 +118,8 @@ class AsyncDurableWritesMixin:
                 writer_baseline,
                 writer._full_reload_count != full_reload_count,
             )
+        except PendingPromptWriterReloadedError:
+            raise
         except BaseException:
             if writer is not None:
                 writer.close()
