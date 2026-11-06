@@ -62,6 +62,29 @@ def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_corrupt_transcript_stays_blocked_after_scheduled_retries(tmp_path: Path) -> None:
+    runner, _registry, _project_id, notices = _runner(
+        tmp_path, transcript_count=0, retry_backoff_seconds=0
+    )
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+        b'{"seq": 3, "id": "m3", "parent_id": null, "type": "message", "data": {}}\n'
+    )
+
+    runner.before_eviction(1, 3)
+    await runner.drain()
+    runner.activity(3)
+    await runner.drain()
+
+    assert runner.last_reconciled_seq == 0
+    assert runner.terminal_receipts() == ()
+    assert len(notices) == 1
+    assert len(runner.failure_log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.asyncio
 async def test_corrupt_transcript_publishes_one_bounded_failure(tmp_path: Path) -> None:
     runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
     path = runner.session_dir / "conversation.jsonl"
@@ -81,6 +104,23 @@ async def test_corrupt_transcript_publishes_one_bounded_failure(tmp_path: Path) 
     assert "malformed conversation row" in notices[0]
     assert len(runner.failure_log_path.read_text(encoding="utf-8").splitlines()) == 1
 
+
+@pytest.mark.asyncio
+async def test_unsupported_transcript_row_keeps_its_cause(tmp_path: Path) -> None:
+    runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
+    (runner.session_dir / "conversation.jsonl").write_text(
+        '{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        '{"seq": 2, "id": "m2", "parent_id": null, "type": "future", "data": {}}\n'
+        '{"seq": 3, "id": "m3", "parent_id": null, "type": "message", "data": {}}\n',
+        encoding="utf-8",
+    )
+
+    runner.before_eviction(1, 3)
+    await runner.drain()
+
+    assert len(notices) == 1
+    assert "unsupported conversation entry type" in notices[0]
+    assert "malformed conversation row" not in notices[0]
 
 
 def test_transcript_scanner_stops_at_unknown_type(tmp_path: Path) -> None:

@@ -119,6 +119,31 @@ class ReconciliationState:
     def last_failure(self) -> ReconciliationFailure | None:
         return self._parse_failure(self._value.get("last_failure"))
 
+    @property
+    def scanner_failure(self) -> tuple[int, str] | None:
+        value = self._value.get("scanner_failure")
+        if not isinstance(value, dict) or type(value.get("seq")) is not int:
+            return None
+        cause = value.get("cause")
+        return (value["seq"], cause) if isinstance(cause, str) else None
+
+    def record_scanner_failure(
+        self, *, seq: int, cause: str, occurred_at: str
+    ) -> ReconciliationFailure | None:
+        if self.scanner_failure == (seq, cause):
+            return None
+        self._value["scanner_failure"] = {"seq": seq, "cause": cause}
+        failure = ReconciliationFailure(occurred_at, cause, seq, seq, False)
+        self._value["last_failure"] = self._failure_dict(failure)
+        self._publish("transcript-scan")
+        return failure
+
+    def clear_scanner_failure(self) -> None:
+        if self.scanner_failure is None:
+            return
+        self._value["scanner_failure"] = None
+        self._publish("transcript-scan-recovered")
+
     def reconciliation_key(self, seq_start: int, seq_end: int) -> str:
         digest = hashlib.sha256()
         for value in (
@@ -661,6 +686,7 @@ class ReconciliationState:
             "completed_ranges": [],
             "terminal_receipts": [],
             "last_failure": None,
+            "scanner_failure": None,
         }
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
@@ -687,6 +713,12 @@ class ReconciliationState:
             if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
+        scanner_failure = value.get("scanner_failure")
+        if isinstance(scanner_failure, dict):
+            seq = scanner_failure.get("seq")
+            cause = scanner_failure.get("cause")
+            if type(seq) is int and seq >= 0 and isinstance(cause, str):
+                empty["scanner_failure"] = {"seq": seq, "cause": cause}
         return empty
 
     def _write_outcome_diagnostics(

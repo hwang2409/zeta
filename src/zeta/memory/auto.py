@@ -202,7 +202,7 @@ class AutoMemoryReconciler:
         self._retry_attempts_in_cycle: dict[str, int] = {}
         self._transcript_cursor: _TranscriptCursor | None = None
         self._transcript_scan_error: str | None = None
-        self._reported_transcript_scan_error: str | None = None
+        self._transcript_scan_error_seq: int | None = None
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -324,6 +324,8 @@ class AutoMemoryReconciler:
             self._worker_task = asyncio.create_task(self._worker())
 
     def _add_pending(self, start: int, end: int, *reasons: str) -> None:
+        if self.state.scanner_failure is not None:
+            return
         for uncovered_start, uncovered_end in self.state.uncovered_ranges(start, end):
             merged = _PendingRange(uncovered_start, uncovered_end, set(reasons))
             remaining: list[_PendingRange] = []
@@ -356,24 +358,18 @@ class AutoMemoryReconciler:
 
     async def _scan_state(self) -> tuple[int, int, int]:
         result = await asyncio.to_thread(self._transcript_state)
-        if (
-            self._transcript_scan_error is not None
-            and self._transcript_scan_error != self._reported_transcript_scan_error
-        ):
-            self._reported_transcript_scan_error = self._transcript_scan_error
+        if self._transcript_scan_error is not None:
             failure = await asyncio.to_thread(
-                self.state.record_failure,
-                seq_start=self.last_reconciled_seq + 1,
-                seq_end=self.last_reconciled_seq + 1,
-                validation_summary=self._transcript_scan_error,
-                reason="transcript-scan",
-                usage={},
-                retry_backoff_seconds=self.config.retry_backoff_seconds,
-                now=self._retry_clock(),
+                self.state.record_scanner_failure,
+                seq=self._transcript_scan_error_seq or self.last_reconciled_seq + 1,
+                cause=self._transcript_scan_error,
                 occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
             )
-            await asyncio.to_thread(self._append_failure_log, failure)
-            self._publish_failure_notice()
+            if failure is not None:
+                await asyncio.to_thread(self._append_failure_log, failure)
+                self._publish_failure_notice()
+        else:
+            await asyncio.to_thread(self.state.clear_scanner_failure)
         return result
 
     async def _worker(self) -> None:
@@ -466,6 +462,8 @@ class AutoMemoryReconciler:
                         await asyncio.sleep(
                             min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
                         )
+                except _TranscriptScanError:
+                    await self._scan_state()
                 except Exception as exc:  # noqa: BLE001 - isolate background work
                     failure = await asyncio.to_thread(
                         self.state.record_failure,
@@ -958,6 +956,15 @@ class AutoMemoryReconciler:
         return current.identity == evidence.identity and current.prefix_tail == evidence.prefix_tail
 
     @staticmethod
+    def _row_seq(raw: bytes) -> int | None:
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        seq = value.get("seq") if isinstance(value, dict) else None
+        return seq if type(seq) is int else None
+
+    @staticmethod
     def _parse_transcript_row(raw: bytes) -> dict[str, object]:
         try:
             value = load_session_json(raw)
@@ -995,6 +1002,7 @@ class AutoMemoryReconciler:
                     offset = 0
                     handle.seek(0)
                 self._transcript_scan_error = None
+                self._transcript_scan_error_seq = None
                 for raw in handle:
                     if not raw.endswith(b"\n"):
                         break
@@ -1002,6 +1010,7 @@ class AutoMemoryReconciler:
                         value = self._parse_transcript_row(raw)
                     except _TranscriptScanError as exc:
                         self._transcript_scan_error = str(exc)
+                        self._transcript_scan_error_seq = self._row_seq(raw) or latest + 1
                         break
                     offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
@@ -1054,8 +1063,9 @@ class AutoMemoryReconciler:
                         break
                     try:
                         value = self._parse_transcript_row(raw)
-                    except _TranscriptScanError:
-                        self._transcript_scan_error = "malformed conversation row"
+                    except _TranscriptScanError as exc:
+                        self._transcript_scan_error = str(exc)
+                        self._transcript_scan_error_seq = self._row_seq(raw) or scanned_end + 1
                         break
                     offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
