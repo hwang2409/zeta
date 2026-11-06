@@ -559,7 +559,9 @@ async def _read_sse_response(
     limits: MCPCallLimits,
     notification_sink: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    async for value in _iter_sse_events(response, spill_store, limits):
+    async for value in _iter_sse_events(
+        response, spill_store, limits, aggregate_call=True
+    ):
         if type(value) is dict and value.get("id") == request_id:
             return parse_rpc_response(value, request_id)
         _dispatch_sse_notification(value, notification_sink)
@@ -581,6 +583,8 @@ async def _iter_sse_events(
     response: httpx.Response,
     spill_store: SpillStore,
     limits: MCPCallLimits,
+    *,
+    aggregate_call: bool = False,
 ) -> AsyncIterator[object]:
     """Parse SSE JSON events without materializing oversized data fields."""
 
@@ -589,9 +593,24 @@ async def _iter_sse_events(
     has_data_line = False
     temporary = None
     handle: BinaryIO | None = None
+    reserved = 0
+    event_wire_bytes = 0
+    call_wire_bytes = 0
+
+    def charge(byte_count: int) -> None:
+        nonlocal event_wire_bytes, call_wire_bytes
+        event_wire_bytes += byte_count
+        if event_wire_bytes > limits.max_wire_bytes:
+            raise MCPWireLimitError(
+                f"MCP HTTP notification event exceeded the {limits.max_wire_bytes} response limit"
+            )
+        if aggregate_call:
+            call_wire_bytes += byte_count
+            if call_wire_bytes > limits.max_wire_bytes:
+                raise MCPWireLimitError
 
     async def append_data(data: bytes, *, start_line: bool = False) -> None:
-        nonlocal temporary, handle, total, data_parts, has_data_line
+        nonlocal temporary, handle, total, data_parts, has_data_line, reserved
         separator = b"\n" if start_line and has_data_line else b""
         if start_line:
             has_data_line = True
@@ -603,25 +622,42 @@ async def _iter_sse_events(
                 data_parts.append(data)
             return
         if handle is None:
+            try:
+                spill_store.reserve_transient(total)
+            except RuntimeError as exc:
+                raise MCPTransientQuotaError from exc
+            reserved = total
             temporary = spill_store.temporary_file()
             handle = await asyncio.to_thread(temporary.__enter__)
             initial = b"".join(data_parts)
             data_parts = []
             if initial:
                 await asyncio.to_thread(handle.write, initial)
+        extra = total - reserved
+        if extra:
+            try:
+                spill_store.reserve_transient(extra)
+            except RuntimeError as exc:
+                raise MCPTransientQuotaError from exc
+            reserved += extra
         if separator:
             await asyncio.to_thread(handle.write, separator)
         if data:
             await asyncio.to_thread(handle.write, data)
 
     async def parse_event() -> object:
-        nonlocal temporary, handle, total, data_parts, has_data_line
-        if handle is None:
-            value = json.loads(b"".join(data_parts))
-        else:
-            await asyncio.to_thread(handle.seek, 0)
-            value = await asyncio.to_thread(json.load, handle)
-            await asyncio.to_thread(temporary.__exit__, None, None, None)
+        nonlocal temporary, handle, total, data_parts, has_data_line, reserved
+        try:
+            if handle is None:
+                value = await asyncio.to_thread(json.loads, b"".join(data_parts))
+            else:
+                await asyncio.to_thread(handle.seek, 0)
+                value = await asyncio.to_thread(json.load, handle)
+                await asyncio.to_thread(temporary.__exit__, None, None, None)
+        finally:
+            if reserved:
+                spill_store.release_transient(reserved)
+                reserved = 0
         data_parts = []
         total = 0
         has_data_line = False
@@ -672,13 +708,10 @@ async def _iter_sse_events(
         stripping_whitespace = True
 
     pending_cr = False
+    pending_blank = False
 
     try:
-        chunks = (
-            response.aiter_bytes(chunk_size=65_536)
-            if response.is_stream_consumed
-            else response.aiter_raw()
-        )
+        chunks = response.aiter_bytes(chunk_size=65_536)
         async for raw_chunk in chunks:
             for offset in range(0, len(raw_chunk), 65_536):
                 window = raw_chunk[offset : offset + 65_536]
@@ -686,25 +719,43 @@ async def _iter_sse_events(
                 if pending_cr:
                     pending_cr = False
                     if window.startswith(b"\n"):
+                        charge(1)
                         position = 1
+                    if pending_blank:
+                        pending_blank = False
+                        if has_data_line:
+                            yield await parse_event()
+                        event_wire_bytes = 0
                 while position < len(window):
                     cr = window.find(b"\r", position)
                     lf = window.find(b"\n", position)
                     delimiters = [index for index in (cr, lf) if index >= 0]
                     if not delimiters:
+                        charge(len(window) - position)
                         await feed_line(window[position:], end_line=False)
                         break
                     delimiter = min(delimiters)
+                    next_position = delimiter + 1
+                    if window[delimiter] == 13:
+                        if next_position < len(window) and window[next_position] == 10:
+                            next_position += 1
+                        elif next_position == len(window):
+                            pending_cr = True
+                    charge(next_position - position)
                     blank = await feed_line(window[position:delimiter], end_line=True)
                     reset_line()
-                    position = delimiter + 1
-                    if window[delimiter] == 13:
-                        if position < len(window) and window[position] == 10:
-                            position += 1
-                        elif position == len(window):
-                            pending_cr = True
-                    if blank and has_data_line:
-                        yield await parse_event()
+                    position = next_position
+                    if blank:
+                        if pending_cr:
+                            pending_blank = True
+                        else:
+                            if has_data_line:
+                                yield await parse_event()
+                            event_wire_bytes = 0
+        if pending_blank:
+            if has_data_line:
+                yield await parse_event()
+            event_wire_bytes = 0
         if line_prefix or line_is_data or line_ignored:
             await feed_line(b"", end_line=True)
         if has_data_line:
@@ -712,6 +763,8 @@ async def _iter_sse_events(
     finally:
         if temporary is not None:
             await asyncio.to_thread(temporary.__exit__, None, None, None)
+        if reserved:
+            spill_store.release_transient(reserved)
 
 
 __all__ = ["StreamableHTTPMCPClient"]

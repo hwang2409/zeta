@@ -11,23 +11,20 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
-from zeta.config.settings import ResolvedConfig
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp.commands import render_mcp_status
-from zeta.mcp.config import MCPServerConfig
+from zeta.mcp.config import MCPConfig, MCPServerConfig
 from zeta.mcp.http import StreamableHTTPMCPClient, _read_json_body
-from zeta.mcp.mount import MCPMount
+from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.runtime.loop import AgentLoop
 from zeta.server.slash_commands import run_command
 from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
 from zeta.tools.registry import ToolRegistry
 from zeta.tui.app import TUIApp
-
 
 _REAL_ASYNC_HTTP = httpx.AsyncHTTPTransport.handle_async_request
 
@@ -52,11 +49,11 @@ def _http_client(url: str, *, spill_store: SpillStore | None = None):
 
 
 class _MCPHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.0"
     calls = 0
     mode = "json"
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
         request_id = request.get("id")
@@ -74,12 +71,22 @@ class _MCPHandler(BaseHTTPRequestHandler):
             return
         if type(self).mode == "sse":
             notification = b'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n'
-            result = (
+            remainder = LIMIT + 1 - len(notification) * 5
+            final_value = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"padding": ""},
+            }
+            final = b"data: " + json.dumps(final_value, separators=(",", ":")).encode() + b"\n\n"
+            final_value["params"]["padding"] = "x" * (remainder - len(final))
+            final = b"data: " + json.dumps(final_value, separators=(",", ":")).encode() + b"\n\n"
+            body = notification * 5 + final
+            assert len(body) == LIMIT + 1
+            body += (
                 b"data: "
                 + json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {"content": []}}).encode()
                 + b"\n\n"
             )
-            body = notification * ((LIMIT // len(notification)) + 2) + result
             self._reply(body, content_type="text/event-stream")
             return
         value = {"jsonrpc": "2.0", "id": request_id, "result": {"content": [], "padding": ""}}
@@ -174,31 +181,71 @@ async def test_http_gzip_counts_decoded_bytes(mcp_http_server: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_notification_get_event_overflow_degrades_once() -> None:
+async def test_notification_get_event_overflow_degrades_once(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     body = b"data: " + b" " * LIMIT + b"{}\n\n"
+    get_requests = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body, request=request)
+        nonlocal get_requests
+        if request.method == "GET":
+            get_requests += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+                request=request,
+            )
+        payload = json.loads(request.content)
+        if "id" not in payload:
+            return httpx.Response(202, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                },
+            },
+            headers={"mcp-session-id": "session"},
+            request=request,
+        )
 
     client = StreamableHTTPMCPClient(
         MCPServerConfig("local", "streamable-http", url="https://mcp.test"),
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         **({"limits": _limits()} if "limits" in inspect.signature(StreamableHTTPMCPClient).parameters else {}),
     )
-    failures: list[str] = []
-    notifications: list[str] = []
-    client.set_failure_sink(failures.append)
-    client.set_notification_sink(notifications.append)
-    client._session_id = "session"
-    listener = asyncio.create_task(client._listen_notifications())
-    await asyncio.sleep(0.05)
-    listener.cancel()
-    await asyncio.gather(listener, return_exceptions=True)
-    assert len(failures) == 1
-    assert "response limit" in failures[0]
-    assert notifications == []
-    assert failures, "mount must receive one transport failure and degrade"
-    await client.close()
+    monkeypatch.setattr("zeta.mcp.mount._build_client", lambda _config: client)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    registry_kwargs: dict[str, object] = {}
+    if "mcp_limits" in inspect.signature(ToolRegistry).parameters:
+        registry_kwargs["mcp_limits"] = _limits()
+    registry = ToolRegistry(
+        tools,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        **registry_kwargs,
+    )
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"local": client.config}),
+    )
+    try:
+        for _ in range(100):
+            if mount.statuses["local"].state == "degraded":
+                break
+            await asyncio.sleep(0.001)
+        assert mount.statuses["local"].state == "degraded"
+        assert get_requests == 1
+        assert mount._actors["local"]._requests == {}
+    finally:
+        await mount.close()
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -272,23 +319,33 @@ async def test_large_http_parse_stays_off_loop(monkeypatch: pytest.MonkeyPatch) 
 
 def _status_mount(tmp_path) -> MCPMount:
     tmp_path.mkdir(parents=True, exist_ok=True)
+    kwargs: dict[str, object] = {}
+    if "mcp_limits" in inspect.signature(ToolRegistry).parameters:
+        kwargs["mcp_limits"] = _limits()
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
-        mcp_limits=_limits(),
+        **kwargs,
     )
     return MCPMount(registry)
 
 
-def test_mcp_status_shows_effective_limits_tui(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_mcp_status_shows_effective_limits_tui(tmp_path) -> None:
     loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="codex", model="offline")
+    mount = _status_mount(tmp_path / "tools")
     rendered = []
     app._presenter.print_unit = rendered.append
-    output = render_mcp_status(_status_mount(tmp_path / "tools"), home=None)
-    app._handle_slash_output(output)
-    assert "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes" in rendered[0].plain
+    try:
+        output = render_mcp_status(mount, home=None)
+        app._handle_slash_output(output)
+        assert "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes" in rendered[0].plain
+    finally:
+        await mount.close()
+        await mount.registry.close()
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -308,5 +365,9 @@ async def test_mcp_status_shows_effective_limits_serve(tmp_path, monkeypatch: py
     monkeypatch.setattr("zeta.server.slash_commands.build_registry", lambda _runtime: SimpleNamespace(notices=()))
     response = await run_command(runtime, "/mcp status")
 
-    assert response == {"kind": "text", "text": output}
-    assert "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes" in response["text"]
+    try:
+        assert response == {"kind": "text", "text": output}
+        assert "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes" in response["text"]
+    finally:
+        await mount.close()
+        await mount.registry.close()

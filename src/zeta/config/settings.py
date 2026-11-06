@@ -218,10 +218,25 @@ def load_settings(
     if not isinstance(project_mcp, Mapping):
         project_mcp = {}
     defaults = MCPCallLimits()
+    global_deadline = float(
+        global_mcp.get("call_deadline_seconds", defaults.deadline_seconds)
+    )
+    global_wire = int(global_mcp.get("max_wire_bytes", defaults.max_wire_bytes))
+    global_spill = int(
+        global_mcp.get("spill_after_bytes", defaults.spill_after_bytes)
+    )
     merged["mcp"] = {
-        "call_deadline_seconds": min(float(global_mcp.get("call_deadline_seconds", defaults.deadline_seconds)), float(project_mcp.get("call_deadline_seconds", defaults.deadline_seconds))),
-        "max_wire_bytes": min(int(global_mcp.get("max_wire_bytes", defaults.max_wire_bytes)), int(project_mcp.get("max_wire_bytes", defaults.max_wire_bytes))),
-        "spill_after_bytes": min(int(global_mcp.get("spill_after_bytes", defaults.spill_after_bytes)), int(project_mcp.get("spill_after_bytes", defaults.spill_after_bytes))),
+        "call_deadline_seconds": min(
+            global_deadline,
+            float(project_mcp.get("call_deadline_seconds", global_deadline)),
+        ),
+        "max_wire_bytes": min(
+            global_wire, int(project_mcp.get("max_wire_bytes", global_wire))
+        ),
+        "spill_after_bytes": min(
+            global_spill,
+            int(project_mcp.get("spill_after_bytes", global_spill)),
+        ),
     }
     tool_allow, tool_allow_layers, tool_deny = _merge_tool_policy(
         global_data=global_data,

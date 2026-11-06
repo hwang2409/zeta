@@ -441,6 +441,10 @@ async def run_command(
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
+    if name == "mcp" and tail.strip() == "status":
+        if runtime.loop is None:
+            raise ProtocolError(-32003, "no active session")
+        return {"kind": "text", "text": await runtime.loop.slash_mcp("status")}
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}
     # Prompt macros expand to user input rather than dispatch through a handler.

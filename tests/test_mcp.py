@@ -44,6 +44,7 @@ from zeta.mcp.client import (
     translate_call_result,
 )
 from zeta.mcp.commands import rewrite_mcp_file
+from zeta.mcp.envelope import MCPCallLimits
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -1109,7 +1110,12 @@ async def test_http_sse_large_single_line_is_framed_with_bounded_memory() -> Non
     spill = SpillStore()
     try:
         tracemalloc.start()
-        result = await _read_sse_response(response, 7, spill, 1024)
+        result = await _read_sse_response(
+            response,
+            7,
+            spill,
+            MCPCallLimits(max_wire_bytes=len(body), spill_after_bytes=1024),
+        )
         _current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         assert result == {"ok": True}
@@ -1151,7 +1157,12 @@ async def test_sse_bare_cr_all_splits() -> None:
                     headers={"content-type": "text/event-stream"},
                     stream=SplitStream(body, split),
                 )
-                result = await _read_sse_response(response, 7, spill, 32)
+                result = await _read_sse_response(
+                    response,
+                    7,
+                    spill,
+                    MCPCallLimits(max_wire_bytes=1024, spill_after_bytes=32),
+                )
                 assert result == {"ok": True}, (ending, split)
     finally:
         spill.close()
