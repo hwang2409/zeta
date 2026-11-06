@@ -2137,13 +2137,17 @@ async def test_lifecycle_prunes_ended_approvals(
     reader, writer = await _ready(server)
     tool_end_written = asyncio.Event()
     controller = server.connections.controller_metadata().connection
+    original_send = server.connections.send
     original_write = controller._write_physical
 
-    async def gated_write(payload: bytes) -> bool:
-        frame = json.loads(payload)
-        if frame.get("id") == 4:
+    async def gated_send(connection: object, payload: bytes) -> bool:
+        if connection is controller and json.loads(payload).get("id") == 4:
             await tool_end_written.wait()
+        return await original_send(connection, payload)
+
+    async def record_write(payload: bytes) -> bool:
         written = await original_write(payload)
+        frame = json.loads(payload)
         if (
             frame.get("method") == "event"
             and frame["params"].get("event") == "tool_end"
@@ -2151,7 +2155,8 @@ async def test_lifecycle_prunes_ended_approvals(
             tool_end_written.set()
         return written
 
-    monkeypatch.setattr(controller, "_write_physical", gated_write)
+    monkeypatch.setattr(server.connections, "send", gated_send)
+    monkeypatch.setattr(controller, "_write_physical", record_write)
     try:
         for index in range(turns):
             await _request(reader, writer, 3 + index * 2, "send", {"text": "read it"})
@@ -2435,19 +2440,19 @@ async def test_abort_captures_turn_before_approval_end_write(
         await _event(reader, "approval_request")
 
         assert server._client is not None
-        client = server._client
-        original_write = client._write_physical
+        original_publish = server.connections.publish_controller
         approval_end_started = asyncio.Event()
         allow_approval_end = asyncio.Event()
 
-        async def pause_approval_end(payload: bytes) -> None:
-            frame = json.loads(payload)
-            if frame.get("params", {}).get("event") == "approval_end":
+        async def pause_approval_end(
+            event: str, session_id: str | None, **fields: object
+        ) -> bool:
+            if event == "approval_end":
                 approval_end_started.set()
                 await allow_approval_end.wait()
-            await original_write(payload)
+            return await original_publish(event, session_id, **fields)
 
-        client._write_physical = pause_approval_end  # type: ignore[method-assign]
+        server.connections.publish_controller = pause_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )

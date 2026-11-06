@@ -185,13 +185,17 @@ async def test_resume_runs_tools_in_the_session_cwd(
         await _legacy_hello(reader, writer)
         tool_end_written = asyncio.Event()
         controller = server.connections.controller_metadata().connection
+        original_send = server.connections.send
         original_write = controller._write_physical
 
-        async def gated_write(payload: bytes) -> bool:
-            frame = json.loads(payload)
-            if frame.get("id") == 4:
+        async def gated_send(connection: object, payload: bytes) -> bool:
+            if connection is controller and json.loads(payload).get("id") == 4:
                 await tool_end_written.wait()
+            return await original_send(connection, payload)
+
+        async def record_write(payload: bytes) -> bool:
             written = await original_write(payload)
+            frame = json.loads(payload)
             if (
                 frame.get("method") == "event"
                 and frame["params"].get("event") == "tool_end"
@@ -199,7 +203,8 @@ async def test_resume_runs_tools_in_the_session_cwd(
                 tool_end_written.set()
             return written
 
-        monkeypatch.setattr(controller, "_write_physical", gated_write)
+        monkeypatch.setattr(server.connections, "send", gated_send)
+        monkeypatch.setattr(controller, "_write_physical", record_write)
         resumed = await _request(
             reader, writer, 2, "resume", {"session_id": session_id}
         )
