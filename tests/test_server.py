@@ -7302,7 +7302,7 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("abort_count", [2, 5])
-async def test_immediate_foreground_aborts_keep_one_notification_retry(
+async def test_foreground_aborts_after_notification_retry_report_idle(
     tmp_path: Path,
     abort_count: int,
 ) -> None:
@@ -7335,7 +7335,15 @@ async def test_immediate_foreground_aborts_keep_one_notification_retry(
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
-        for offset in range(abort_count):
+        frames = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
+        assert frames[-1]["result"]["aborted"] is True
+        retry_task = server.control._turn_task
+        assert retry_task is not None
+        await asyncio.wait_for(asyncio.shield(retry_task), TIMEOUT)
+
+        for offset in range(1, abort_count):
             frames = await _request(
                 reader,
                 writer,
@@ -7343,7 +7351,7 @@ async def test_immediate_foreground_aborts_keep_one_notification_retry(
                 "abort",
                 {"scope": "foreground"},
             )
-            assert frames[-1]["result"]["aborted"] is True
+            assert frames[-1]["result"]["aborted"] is False
 
         await _frames_until_event(reader, "agent_end")
         while server.runtime.loop.notification_turn_state != "idle":
