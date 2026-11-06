@@ -5981,6 +5981,30 @@ async def test_session_delete_rpc_rejects_unsafe_ids(tmp_path, session_id):
 
 
 @pytest.mark.asyncio
+async def test_empty_server_session_skips_detached_recovery_store(
+    tmp_path, monkeypatch
+):
+    from zeta.agent import recovery_lease
+    from zeta.server.runtime import ServerRuntime
+
+    constructions = 0
+    store_type = recovery_lease.ConversationStore
+
+    def counted_store(*args, **kwargs):
+        nonlocal constructions
+        constructions += 1
+        return store_type(*args, **kwargs)
+
+    monkeypatch.setattr(recovery_lease, "ConversationStore", counted_store)
+    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="codex")
+    try:
+        await runtime.create_session()
+        assert constructions == 0, "empty server recovery constructed a detached store"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_does_not_bump_updated_at(tmp_path):
     """ZETA-134 A5: selecting a session must not rewrite its updated_at.
 

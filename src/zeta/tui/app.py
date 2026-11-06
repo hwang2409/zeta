@@ -1142,15 +1142,27 @@ class TUIApp(
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
-            await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)
             prompt_task: asyncio.Task[object] | None = None
+            activation_task: asyncio.Task[None] | None = None
             if isinstance(session, FullScreenPromptSession):
                 self._install_full_screen_layout(session)
                 prompt_task = asyncio.create_task(run_prompt_toolkit(session, self))
+                self._input_loop_active = True
+                await asyncio.sleep(0)
             try:
+                activation_task = asyncio.create_task(self.loop.activate())
+                if prompt_task is not None:
+                    done, _ = await asyncio.wait(
+                        (prompt_task, activation_task),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if prompt_task in done:
+                        await self._run_full_screen(session, prompt_task)
+                        return self._run_result
+                await activation_task
                 startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
                 try:
                     if prompt_task is not None:
@@ -1184,6 +1196,9 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
+                if activation_task is not None and not activation_task.done():
+                    activation_task.cancel()
+                    await asyncio.gather(activation_task, return_exceptions=True)
                 await self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():

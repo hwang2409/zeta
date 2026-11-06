@@ -7791,6 +7791,105 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
 
 
 @pytest.mark.asyncio
+async def test_exit_during_activation_recovery_does_not_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    recovery_started = asyncio.Event()
+    recovery_release = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+
+    async def gated_recovery(_loop: AgentLoop) -> None:
+        recovery_started.set()
+        try:
+            await recovery_release.wait()
+        finally:
+            recovery_cancelled.set()
+
+    monkeypatch.setattr(
+        "zeta.agent.recovery_lease.recover_agent_children_off_loop",
+        gated_recovery,
+    )
+    monkeypatch.setattr(app.loop.store, "agent_children", lambda: {"child": {}})
+    monkeypatch.setattr(
+        "zeta.tui.app.start_tui_stall_watchdog", lambda *args, **kwargs: None
+    )
+    original_close = app.close
+
+    async def defer_close() -> None:
+        return None
+
+    monkeypatch.setattr(app, "close", defer_close)
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput())
+        run_task = asyncio.create_task(app.run(session))
+        await recovery_started.wait()
+        assert session.app.future is not None
+        app.request_exit()
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if run_task.done():
+                break
+        exited = run_task.done()
+        recovery_release.set()
+        if not exited:
+            await run_task
+
+    assert exited, "TUI exit waited for activation recovery"
+    assert recovery_cancelled.is_set()
+    await original_close()
+
+
+@pytest.mark.asyncio
+async def test_empty_session_activation_does_not_construct_recovery_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import recovery_lease
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    constructions = 0
+    store_type = recovery_lease.ConversationStore
+
+    def counted_store(*args: object, **kwargs: object) -> ConversationStore:
+        nonlocal constructions
+        constructions += 1
+        return store_type(*args, **kwargs)
+
+    monkeypatch.setattr(recovery_lease, "ConversationStore", counted_store)
+
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        run_task = asyncio.create_task(app.run(session))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if app._input_loop_active:
+                break
+        app.request_exit()
+        await run_task
+
+    assert constructions == 0, "empty recovery constructed a detached full store"
+
+
+@pytest.mark.asyncio
 async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

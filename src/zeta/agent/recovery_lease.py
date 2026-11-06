@@ -121,7 +121,8 @@ async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
 
 async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
     if not loop._children_recovered:
-        await recover_agent_children_off_loop(loop)
+        if loop.store.agent_children():
+            await recover_agent_children_off_loop(loop)
         loop._children_recovered = True
     if loop._pending_child_recovery:
         await publish_recovered_children(loop)
