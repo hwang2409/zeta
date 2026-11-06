@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import io
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from prompt_toolkit import PromptSession
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -40,6 +42,17 @@ PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
+
+
+def png_bytes(width: int, height: int) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(output, format="PNG")
+    return output.getvalue()
+
+
+def image_size(content: ImageContent) -> tuple[int, int]:
+    with Image.open(io.BytesIO(base64.b64decode(content.data))) as image:
+        return image.size
 
 
 async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
@@ -766,7 +779,8 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
     assert notices == []
 
 
-def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
+@pytest.mark.asyncio
+async def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
     tmp_path: Path,
 ) -> None:
     first = tmp_path / "first.png"
@@ -785,7 +799,7 @@ def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
     notices: list[str] = []
     app._print_system = notices.append
 
-    message = app._prepare_user_message("look [Image #2], not [Image #1]")
+    message = await app._prepare_user_message("look [Image #2], not [Image #1]")
 
     assert message is not None
     assert message.content[0] == TextContent("look [Image #2], not [Image #1]")
@@ -793,7 +807,7 @@ def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
         block.path for block in message.content[1:] if isinstance(block, ImageContent)
     ] == [str(second.resolve()), str(first.resolve())]
 
-    message = app._prepare_user_message("look [Image #2]")
+    message = await app._prepare_user_message("look [Image #2]")
 
     assert message is not None
     assert [
@@ -803,14 +817,15 @@ def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
     assert notices == []
 
 
-def test_unknown_image_token_is_plain_text(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_unknown_image_token_is_plain_text(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
     )
 
-    message = app._prepare_user_message("look at [Image #7]")
+    message = await app._prepare_user_message("look at [Image #7]")
 
     assert message is not None
     assert message.content == [TextContent("look at [Image #7]")]
@@ -990,6 +1005,96 @@ async def test_ctrl_v_non_macos_uses_paste_notice(
     assert notices == [
         "paste unavailable: image paste is only available on macOS"
     ]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_clipboard_image_is_normalized_before_provider_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = png_bytes(3318, 180)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="anthropic",
+        model="offline",
+    )
+
+    def paste_image(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        path = store.session_dir / "clipboard-oversized.png"
+        path.write_bytes(oversized)
+        return path
+
+    monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
+    token = await app.paste_from_clipboard()
+    await app._handle_prompt_value(f"inspect {token}")
+    assert app._active_task is not None
+    await app._active_task
+
+    image = next(
+        block
+        for block in backend.calls[0][0][-1].content
+        if isinstance(block, ImageContent)
+    )
+    assert max(image_size(image)) <= 3000
+    payload = build_messages_payload(
+        backend.calls[0][0], [], model="claude", max_tokens=4096, thinking_budget=1024
+    )
+    assert payload["messages"][-1]["content"][0]["type"] == "image"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_file_image_is_normalized_before_provider_request(tmp_path: Path) -> None:
+    (tmp_path / "wide.png").write_bytes(png_bytes(3318, 180))
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="anthropic",
+        model="offline",
+    )
+
+    await app._handle_prompt_value("inspect @./wide.png")
+    assert app._active_task is not None
+    await app._active_task
+
+    image = next(
+        block
+        for block in backend.calls[0][0][-1].content
+        if isinstance(block, ImageContent)
+    )
+    assert max(image_size(image)) <= 3000
+    payload = build_messages_payload(
+        backend.calls[0][0], [], model="claude", max_tokens=4096, thinking_budget=1024
+    )
+    assert payload["messages"][-1]["content"][0]["type"] == "image"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_image_reference_reports_one_visible_notice(tmp_path: Path) -> None:
+    (tmp_path / "broken.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="anthropic",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    await app._handle_prompt_value("inspect @./broken.png")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert notices == ["@./broken.png not attached: not decodable"]
+    assert backend.calls[0][0][-1].content == [TextContent("inspect @./broken.png")]
     await app.loop.close()
 
 

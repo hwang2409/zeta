@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any
 
 from prompt_toolkit.buffer import Buffer
 
+from ...media.image_normalization import normalize_image_bytes
+from ...media.image_policy import image_policy_for_provider
 from ...protocol.types import ImageContent
 from .._attachments import AttachmentError, _read_attachment, paste_image
 
@@ -102,7 +105,13 @@ class PasteRuntime:
         store = host.loop.store
         session_dir = store.session_dir
         directory_fd = store.directory_fd
-        worker = asyncio.create_task(asyncio.to_thread(self._stage, store))
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._stage,
+                store,
+                image_policy_for_provider(getattr(host, "provider", "anthropic")),
+            )
+        )
         staged: StagedImage | None = None
         try:
             if previous is not None:
@@ -162,17 +171,26 @@ class PasteRuntime:
                 await asyncio.wait({previous})
 
     @staticmethod
-    def _stage(store: Any) -> StagedImage:
+    def _stage(store: Any, policy: Any) -> StagedImage:
         path = paste_image(store.session_dir, directory_fd=store.directory_fd)
         try:
             content = _read_attachment(path, store)
             if not isinstance(content, ImageContent):
                 raise AttachmentError("clipboard image could not be decoded")
+            prepared = asyncio.run(
+                normalize_image_bytes(base64.b64decode(content.data), policy)
+            )
+            with open(path, "wb") as handle:
+                handle.write(prepared.data or b"")
+            content = ImageContent(
+                base64.b64encode(prepared.data or b"").decode("ascii"),
+                prepared.media_type,
+                str(path),
+                len(prepared.data or b""),
+            )
             return StagedImage(path, content)
         except (AttachmentError, OSError):
-            PasteRuntime._delete_staged(
-                path, store.session_dir, store.directory_fd
-            )
+            PasteRuntime._delete_staged(path, store.session_dir, store.directory_fd)
             raise
 
     def _is_current(
@@ -194,7 +212,9 @@ class PasteRuntime:
 
     def _insert(self, buffer: Buffer, position: int, token: str) -> None:
         insertions = self._insertions.setdefault(id(buffer), [])
-        adjusted = position + sum(length for start, length in insertions if start <= position)
+        adjusted = position + sum(
+            length for start, length in insertions if start <= position
+        )
         current_position = buffer.cursor_position
         buffer.cursor_position = min(adjusted, len(buffer.text))
         buffer.insert_text(token)
@@ -207,9 +227,7 @@ class PasteRuntime:
             self._host._print_system(result)
 
     @staticmethod
-    def _delete_staged(
-        path: Path, session_dir: Path, directory_fd: int | None
-    ) -> None:
+    def _delete_staged(path: Path, session_dir: Path, directory_fd: int | None) -> None:
         if (
             path.parent == session_dir
             and path.name.startswith("clipboard-")

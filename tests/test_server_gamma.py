@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import re
 import shutil
@@ -11,6 +12,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
@@ -23,7 +25,7 @@ from tests.test_server import (
     _socket_path,
 )
 from zeta.core.session import SessionMetadata
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.server import ZetaServer, ergonomics
@@ -37,15 +39,24 @@ FEATURES = [
     "ping",
     "assistant_reset",
 ]
-PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+)
 
 
-def _server(tmp_path: Path, backend: FakeBackend | None, cwd: Path) -> ZetaServer:
+def _server(
+    tmp_path: Path,
+    backend: FakeBackend | None,
+    cwd: Path,
+    *,
+    provider: str = "codex",
+) -> ZetaServer:
     backend = backend or FakeBackend([])
     return ZetaServer(
         home=tmp_path / "home",
         cwd=cwd,
-        provider="codex",
+        provider=provider,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -680,11 +691,123 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
 
 
 @pytest.mark.asyncio
+async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heartbeat = asyncio.Event()
+    heartbeat_reached_thread = threading.Event()
+    decoded_after_heartbeat: list[bool] = []
+    original_decode = ergonomics.base64.b64decode
+
+    def record_decode(*args, **kwargs):
+        if threading.get_ident() != threading.main_thread().ident:
+            heartbeat_reached_thread.wait()
+        decoded_after_heartbeat.append(heartbeat.is_set())
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(ergonomics.base64, "b64decode", record_decode)
+    output = io.BytesIO()
+    Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path), provider="anthropic")
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        request = asyncio.create_task(
+            server.control.deliveries.send_images(
+                {
+                    "session_id": session_id,
+                    "text": "look",
+                    "images": [
+                        {
+                            "name": "shot.png",
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(output.getvalue()).decode(),
+                        }
+                    ],
+                    "delivery_id": "responsive-image",
+                },
+                frozenset({"delivery_id", "send_images_delivery_id"}),
+            )
+        )
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        asyncio.get_running_loop().call_soon(heartbeat_reached_thread.set)
+        await heartbeat.wait()
+        assert await request == {"accepted": True, "session_id": session_id}
+        assert decoded_after_heartbeat and all(decoded_after_heartbeat)
+        await _event(reader, "agent_end")
+    finally:
+        heartbeat_reached_thread.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_send_images_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+    original_normalize = ergonomics.normalize_image_bytes
+
+    async def gated_normalize(*args, **kwargs):
+        worker_started.set()
+        release_worker.wait()
+        try:
+            return await original_normalize(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(ergonomics, "normalize_image_bytes", gated_normalize)
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        request = asyncio.create_task(
+            server.control.deliveries.send_images(
+                {
+                    "session_id": session_id,
+                    "text": "look",
+                    "images": [
+                        {
+                            "name": "shot.png",
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(PNG).decode(),
+                        }
+                    ],
+                },
+                frozenset(),
+            )
+        )
+        await asyncio.to_thread(worker_started.wait)
+        request.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await asyncio.to_thread(worker_finished.wait)
+
+        assert server.runtime.opened.store.messages() == []
+        assert not (server.runtime.opened.store.session_dir / "attachments").exists()
+    finally:
+        release_worker.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publication_threads: list[int] = []
     original_publish = ergonomics.write_session_file
+    output = io.BytesIO()
+    Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
+    oversized = output.getvalue()
 
     def record_publish(*args, **kwargs) -> None:
         publication_threads.append(threading.get_ident())
@@ -692,7 +815,9 @@ async def test_send_images_publication_is_off_event_loop(
 
     monkeypatch.setattr(ergonomics, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
-    server = _server(tmp_path, backend, _launch(tmp_path))
+    server = _server(
+        tmp_path, backend, _launch(tmp_path), provider="anthropic"
+    )
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["user_message_event"])
@@ -703,7 +828,7 @@ async def test_send_images_publication_is_off_event_loop(
         image = {
             "name": "shot.png",
             "mime_type": "image/png",
-            "data": base64.b64encode(PNG).decode(),
+            "data": base64.b64encode(oversized).decode(),
         }
         await _request(
             reader,
@@ -716,6 +841,13 @@ async def test_send_images_publication_is_off_event_loop(
         await _event(reader, "agent_end")
         assert publication_threads
         assert set(publication_threads).isdisjoint({threading.get_ident()})
+        attached = next(
+            block
+            for block in backend.calls[0][0][-1].content
+            if isinstance(block, ImageContent)
+        )
+        with Image.open(io.BytesIO(base64.b64decode(attached.data))) as sent:
+            assert max(sent.size) <= 3000
     finally:
         await _close(server, writer)
 
@@ -2201,6 +2333,8 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
         }
         await _request(reader, writer, 3, "send_images", params)
         await _event(reader, "agent_end")
+        attachments = server.runtime.opened.store.session_dir / "attachments"
+        published = set(attachments.iterdir())
         conflict = await _request(
             reader,
             writer,
@@ -2209,6 +2343,7 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
             {**params, "text": "different"},
         )
         assert conflict[-1].get("error", {}).get("code") == -32010
+        assert set(attachments.iterdir()) == published
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
@@ -2226,7 +2361,9 @@ async def test_send_images_delivery_id_uses_semantic_image_payload(
         session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
             "result"
         ]["session"]["session_id"]
-        encoded = base64.b64encode(PNG).decode()
+        output = io.BytesIO()
+        Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode()
         params = {
             "session_id": session_id,
             "text": "look",
