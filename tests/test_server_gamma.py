@@ -7,6 +7,7 @@ import base64
 import json
 import re
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, ergonomics
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 FEATURES = [
@@ -674,6 +675,47 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
         ]
         assert len(messages) == 1
         assert messages[0]["text"] == "next"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_publication_is_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication_threads: list[int] = []
+    original_publish = ergonomics.write_session_file
+
+    def record_publish(*args, **kwargs) -> None:
+        publication_threads.append(threading.get_ident())
+        original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(ergonomics, "write_session_file", record_publish)
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["user_message_event"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        publication_threads.clear()
+        image = {
+            "name": "shot.png",
+            "mime_type": "image/png",
+            "data": base64.b64encode(PNG).decode(),
+        }
+        await _request(
+            reader,
+            writer,
+            3,
+            "send_images",
+            {"session_id": session_id, "text": "look", "images": [image]},
+        )
+        await _event(reader, "user_message")
+        await _event(reader, "agent_end")
+        assert publication_threads
+        assert set(publication_threads).isdisjoint({threading.get_ident()})
     finally:
         await _close(server, writer)
 

@@ -313,7 +313,7 @@ async def _bash(
         stderr = stderr_capture.data.decode(errors="replace")
         cwd_after = reported_cwd if Path(reported_cwd).is_absolute() else start_cwd
         if cwd_after != start_cwd:
-            await asyncio.to_thread(registry.update_bash_cwd, cwd_after)
+            registry.update_bash_cwd(cwd_after)
         exit_code = process.returncode if process.returncode is not None else 1
         marker = (
             f"[timed out after {timeout:g}s; process group killed]"
