@@ -87,6 +87,7 @@ from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
+from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui import loop_errors as loop_errors_module
@@ -11729,6 +11730,35 @@ async def test_many_flushed_writers_leave_no_live_threads() -> None:
 
 
 
+def _patch_draft_publish(
+    monkeypatch: pytest.MonkeyPatch, write: Callable[..., None]
+) -> None:
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
+    original_publish = WriterLease.publish_json
+
+    def publish(
+        lease: WriterLease,
+        directory_fd: int,
+        name: str,
+        mutations: object,
+        publisher: Callable[[int, str, bytes], None],
+        *,
+        initial: object | None = None,
+    ) -> object:
+        if name == "draft":
+            write(directory_fd, name, b"")
+        return original_publish(
+            lease,
+            directory_fd,
+            name,
+            mutations,
+            publisher,
+            initial=initial,
+        )
+
+    monkeypatch.setattr(WriterLease, "publish_json", publish)
+
+
 @pytest.mark.asyncio
 async def test_draft_write_runs_off_loop_and_flushes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -11759,7 +11789,7 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
     persistence.schedule("old draft")
     await persistence.flush_pending()
 
-    original = persistence_module.write_session_json
+    original = persistence_module.write_json_file
     failures = 2
     writes = 0
 
@@ -11771,7 +11801,7 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
             raise OSError(errno.ENOSPC, "disk full")
         original(directory_fd, *args, **kwargs)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
     persistence.schedule("new draft")
     with pytest.raises(OSError, match="disk full"):
         await persistence.flush_pending()
@@ -11790,22 +11820,26 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
+    storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
     persistence = DraftPersistence(
-        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+        tmp_path / "draft",
+        directory_fd=directory_fd,
+        storage_lease=storage_lease,
+        delay=0,
     )
     baseline = _fd_count()
     stop_delivered = threading.Event()
     release_worker = threading.Event()
     original_deliver = persistence._writer._deliver
     writes = 0
-    original_write = persistence_module.write_session_json
+    original_write = WriterLease.publish_json
 
-    def write(*args: object, **kwargs: object) -> None:
+    def write(lease: WriterLease, *args: object, **kwargs: object) -> None:
         nonlocal writes
         writes += 1
         if writes == 1:
             raise OSError(errno.ENOSPC, "disk full")
-        original_write(*args, **kwargs)
+        original_write(lease, *args, **kwargs)
 
     def gated_deliver(
         item: persistence_module._FileAction,
@@ -11817,7 +11851,7 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
             stop_delivered.set()
             assert release_worker.wait(1)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(WriterLease, "publish_json", write)
     monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
     persistence.schedule("new draft")
     shutdown = asyncio.create_task(persistence.shutdown_pending())
@@ -11837,6 +11871,7 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
     finally:
         release_worker.set()
         os.close(directory_fd)
+        storage_lease.close()
 
 
 @pytest.mark.asyncio
@@ -11846,7 +11881,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     first_finished = threading.Event()
     writes = 0
-    original_write = persistence_module.write_session_json
+    original_write = persistence_module.write_json_file
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -11858,7 +11893,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
         finally:
             first_finished.set()
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
     persistence.schedule("first")
     assert await asyncio.to_thread(first_finished.wait, 1)
     persistence.schedule("second")
@@ -11927,8 +11962,12 @@ async def test_dup_failure_is_reported_not_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
+    storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
     persistence = DraftPersistence(
-        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+        tmp_path / "draft",
+        directory_fd=directory_fd,
+        storage_lease=storage_lease,
+        delay=0,
     )
     original_dup = persistence_module.os.dup
     fail_dup = True
@@ -11954,6 +11993,7 @@ async def test_dup_failure_is_reported_not_success(
     finally:
         os.close(directory_fd)
         await persistence.shutdown_pending()
+        storage_lease.close()
 
     assert exceptions == []
     assert caplog.messages.count(
@@ -11988,7 +12028,7 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
             errors.append(exc)
         return False, False
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
@@ -12045,7 +12085,7 @@ def test_new_session_continues_after_failed_draft_save(
             errors.append(exc)
         return False, False
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
@@ -12133,7 +12173,7 @@ def test_failed_active_draft_is_printed_on_every_exit(
         restart_called.set()
         return 0
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
@@ -12213,7 +12253,7 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         restart_called.set()
         return 0
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
@@ -12423,7 +12463,7 @@ async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    _patch_draft_publish(monkeypatch, fail)
     persistence.schedule("first")
     with pytest.raises(OSError, match="disk unavailable"):
         await persistence.flush_pending()
@@ -12443,7 +12483,7 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    _patch_draft_publish(monkeypatch, fail)
     app._draft.schedule("must not disappear")
     await app.close()
     await asyncio.sleep(0)

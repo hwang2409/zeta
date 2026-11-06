@@ -7,9 +7,9 @@ import copy
 import fcntl
 import json
 import os
+import secrets
 import threading
 import time
-import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,7 +156,7 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
 
 
 def _publish_manifest(home: Path, epoch: int) -> None:
-    temporary = home / f".{_MANIFEST}.{uuid.uuid4().hex}.tmp"
+    temporary = home / f".{_MANIFEST}.{secrets.token_hex(16)}.tmp"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
