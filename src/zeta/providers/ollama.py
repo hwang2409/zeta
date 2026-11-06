@@ -68,11 +68,7 @@ class OllamaError(RuntimeError):
 
 async def _bounded_stream_lines(response: httpx.Response) -> AsyncIterator[bytes]:
     buffer = bytearray()
-    chunks = (
-        response.aiter_bytes()
-        if hasattr(response, "aiter_bytes")
-        else (line.encode() + b"\n" async for line in response.aiter_lines())
-    )
+    chunks = response.aiter_bytes()
     async for chunk in chunks:
         start = 0
         while start < len(chunk):
