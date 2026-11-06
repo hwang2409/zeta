@@ -323,6 +323,85 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_after_physical_write_reports_delivered() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    assert await _send_hello_and_flush(registry, connection)
+    connection.frames.clear()
+
+    async def write_then_release(frame: bytes) -> bool:
+        connection.frames.append(frame)
+        registry.release(connection)
+        return True
+
+    connection._write_physical = write_then_release  # type: ignore[method-assign]
+
+    assert await registry.send(connection, b"delivered\n")
+    assert connection.frames == [b"delivered\n"]
+
+
+@pytest.mark.asyncio
+async def test_controller_release_completes_queued_frames_like_base() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    assert await _send_hello_and_flush(registry, connection)
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def blocked_write(frame: bytes) -> bool:
+        write_started.set()
+        await release_write.wait()
+        return True
+
+    connection._write_physical = blocked_write  # type: ignore[method-assign]
+    head = asyncio.create_task(registry.send(connection, b"head\n"))
+    await write_started.wait()
+    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    await asyncio.sleep(0)
+
+    registry.release(connection)
+    release_write.set()
+
+    assert await asyncio.gather(head, tail) == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_observer_release_matches_base() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(
+        connection, "observer", "1.2", frozenset({"serve_observers"})
+    )
+    assert await registry.send(connection, b"hello\n")
+    write_started = asyncio.Event()
+
+    async def blocked_write(frame: bytes) -> bool:
+        write_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    connection._write_physical = blocked_write  # type: ignore[method-assign]
+    current = asyncio.create_task(registry.send(connection, b"current\n"))
+    await write_started.wait()
+    queued = asyncio.create_task(registry.send(connection, b"queued\n"))
+    await asyncio.sleep(0)
+
+    registry.release(connection)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not current.done()
+    assert queued.cancelled()
+    current.cancel()
+    await asyncio.gather(current, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_aclose_settles_queued_frames_false() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()

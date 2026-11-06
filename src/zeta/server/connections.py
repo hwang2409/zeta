@@ -54,6 +54,7 @@ class _OutputState:
     pending_controller_frames: int = 0
     overflowed: bool = False
     overflowed_before_flush: bool = False
+    released: bool = False
 
 
 @dataclass
@@ -201,7 +202,7 @@ class ConnectionRegistry:
             self._observers.remove(state)
         output = state.output
         if output is not None:
-            self._settle_output(output)
+            self._release_output(output, state.role)
 
     async def send(self, connection: Any, frame: bytes) -> bool:
         state = self._connections.get(connection)
@@ -311,7 +312,8 @@ class ConnectionRegistry:
             result, _ = await output.current_write
         except asyncio.CancelledError:
             self._finish_frame_accounting(output, item)
-            self._finish_future(item.future, False)
+            if not output.released:
+                self._finish_future(item.future, False)
             if output.phase == "overflowing":
                 return
             if asyncio.current_task().cancelling():
@@ -337,6 +339,8 @@ class ConnectionRegistry:
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
     ) -> bool:
+        if output.released:
+            return True
         if output.phase == "flushing":
             if output.overflowed_before_flush:
                 output.phase = "overflowing"
@@ -444,6 +448,20 @@ class ConnectionRegistry:
         if item.future is not None and not item.future.done():
             item.future.cancel()
         return None, None
+
+    def _release_output(self, output: _OutputState, role: str | None) -> None:
+        output.released = True
+        if role == "observer":
+            self._clear_output(output)
+            if output.writer_task is not None:
+                output.writer_task.cancel()
+            return
+        if (
+            output.current_frame is None
+            and not output.queue
+            and output.writer_task is not None
+        ):
+            output.writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:
