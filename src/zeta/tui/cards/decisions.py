@@ -17,6 +17,7 @@ from prompt_toolkit.utils import get_cwidth
 
 from ...attention_decisions import DecisionItem
 from .. import overlay, theme
+from .shared import wrap_by_cells
 
 # The popup settles near, but not beyond, the shared overlay cap so the text
 # screenshots stay stable regardless of the live terminal size.
@@ -28,38 +29,6 @@ FragmentLine = list[Fragment]
 
 def _cells(text: str) -> int:
     return sum(max(0, get_cwidth(character)) for character in text)
-
-
-def _wrap(text: str, width: int) -> list[str]:
-    """Wrap text without dropping any content."""
-
-    width = max(1, width)
-    lines: list[str] = []
-    for paragraph in text.splitlines() or [""]:
-        current = ""
-        for word in paragraph.split() or [""]:
-            piece = word if not current else f"{current} {word}"
-            if _cells(piece) <= width:
-                current = piece
-            else:
-                if current:
-                    lines.append(current)
-                while _cells(word) > width:
-                    split = 0
-                    cells = 0
-                    for index, character in enumerate(word):
-                        step = max(0, get_cwidth(character))
-                        if cells + step > width:
-                            break
-                        cells += step
-                        split = index + 1
-                    if split == 0:
-                        split = 1
-                    lines.append(word[:split])
-                    word = word[split:]
-                current = word
-        lines.append(current)
-    return lines or [""]
 
 
 def _truncate_text(text: str, width: int) -> str:
@@ -74,7 +43,7 @@ def _truncate_text(text: str, width: int) -> str:
 
 
 def _labelled_text(label: str, text: str, width: int, style: str) -> list[FragmentLine]:
-    lines = _wrap(text, width - len(label) - 2)
+    lines = wrap_by_cells(text, width - len(label) - 2)
     return [
         [overlay.value(f"{label}: ", style), overlay.value(line)]
         if index == 0
@@ -87,7 +56,7 @@ def _option_lines(index: int, text: str, width: int) -> list[FragmentLine]:
     prefix = f"{index}. "
     return [
         [overlay.value(prefix if line_index == 0 else " " * len(prefix), theme.ACCENT), overlay.value(line)]
-        for line_index, line in enumerate(_wrap(text, width - len(prefix)))
+        for line_index, line in enumerate(wrap_by_cells(text, width - len(prefix)))
     ]
 
 

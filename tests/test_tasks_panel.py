@@ -18,6 +18,7 @@ from zeta.skills import SkillCatalog
 from zeta.tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
 from zeta.tui import theme
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.shared import wrap_by_cells
 from zeta.tui.cards.tasks_panel import (
     MAX_OUTPUT_LINES,
     BackgroundTasksPanel,
@@ -70,6 +71,13 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
 
 
 # -- pure view model --------------------------------------------------------
+
+
+def test_wrap_by_cells_handles_words_tokens_wide_text_and_empty_input() -> None:
+    assert wrap_by_cells("plain words", 6) == ["plain", "words"]
+    assert wrap_by_cells("abcdefgh", 3) == ["abc", "def", "gh"]
+    assert wrap_by_cells("你好世界", 4) == ["你好", "世界"]
+    assert wrap_by_cells("", 4) == [""]
 
 
 def test_format_runtime_is_compact() -> None:

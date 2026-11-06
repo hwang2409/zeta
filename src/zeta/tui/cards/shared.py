@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import PurePath
 from typing import NamedTuple
 
+from prompt_toolkit.utils import get_cwidth
+
 MAX_RESULT = 180
 MAX_CARD_LINES = 15
 MAX_CARD_COLUMNS = 240
@@ -79,3 +81,40 @@ def infer_language(path: str) -> str:
     """Return the syntax lexer for a path, with text as the safe fallback."""
 
     return LANGUAGE_BY_EXTENSION.get(PurePath(path).suffix.lower(), "text")
+
+
+def wrap_by_cells(text: str, width: int) -> list[str]:
+    """Wrap text by terminal cells, splitting words that exceed the width."""
+
+    width = max(1, width)
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        current = ""
+        cells = 0
+        for word in paragraph.split(" "):
+            piece = word if not current else " " + word
+            piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            if current and cells + piece_cells > width:
+                lines.append(current)
+                current, cells = "", 0
+                piece = word
+                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            while piece_cells > width:
+                split = 0
+                used = 0
+                for index, ch in enumerate(piece):
+                    step = max(0, get_cwidth(ch))
+                    if used + step > width:
+                        break
+                    used += step
+                    split = index + 1
+                if split == 0:
+                    split = 1
+                lines.append((current + piece[:split]) if current else piece[:split])
+                current, cells = "", 0
+                piece = piece[split:]
+                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            current += piece
+            cells += piece_cells
+        lines.append(current)
+    return lines or [""]
