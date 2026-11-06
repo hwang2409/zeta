@@ -297,7 +297,7 @@ def test_repeated_tool_heavy_evictions_keep_floor_bounded() -> None:
     def token_count(message: Message) -> int:
         if message.metadata.get("eviction_range"):
             return 1
-        return 5 if message.metadata.get("context_evicted") else 100
+        return 100 if message.metadata.get("context_evicted") else 10
 
     for batch in range(5):
         for offset in range(3):
