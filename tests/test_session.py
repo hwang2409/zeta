@@ -1479,6 +1479,30 @@ async def test_metadata_lock_rejects_event_loop_thread(tmp_path: Path) -> None:
         opened.store.close()
 
 
+def test_shared_atomic_write_syncs_containing_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    from zeta.core.session_files import session_root, write_session_file
+
+    directory_syncs: list[int] = []
+    original_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_syncs.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr("zeta.core.session_files.os.fsync", record_fsync)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    with session_root(sessions) as directory_fd:
+        write_session_file(directory_fd, "state", b"state")
+
+    assert directory_syncs
+
+
 def test_create_syncs_session_directory_and_sessions_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
