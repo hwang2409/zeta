@@ -12026,6 +12026,81 @@ def test_new_session_continues_after_failed_draft_save(
     assert old_app is not None and old_app() is None
 
 
+@pytest.mark.parametrize(
+    ("exit_kind", "expected_status"),
+    (("render_error", 1), ("restart", 0), ("unexpected_error", None)),
+)
+def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exit_kind: str,
+    expected_status: int | None,
+) -> None:
+    names = iter(("old", "new"))
+    runs = 0
+    write_failed = threading.Event()
+    restart_called = threading.Event()
+    stderr_before_restart = ""
+
+    def create(_args: object) -> TUIApp:
+        return TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / next(names)),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        write_failed.set()
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            app._new_session_requested = True
+            app._draft.schedule("draft one")
+            await app.close()
+            assert write_failed.is_set()
+            return False, False
+        await app.close()
+        if exit_kind == "render_error":
+            raise cli_main_module.TerminalRenderError("render broke")
+        if exit_kind == "unexpected_error":
+            raise RuntimeError("unexpected failure")
+        return True, False
+
+    def exec_restart(*_args: object) -> int:
+        nonlocal stderr_before_restart
+        stderr_before_restart = capsys.readouterr().err
+        assert "unsaved composer draft:" in stderr_before_restart
+        restart_called.set()
+        return 0
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    if exit_kind == "unexpected_error":
+        with pytest.raises(RuntimeError, match="unexpected failure"):
+            cli_main_module.main([])
+    else:
+        assert cli_main_module.main([]) == expected_status
+    stderr = stderr_before_restart + capsys.readouterr().err
+    assert "unsaved composer draft:" in stderr
+    assert stderr.count("unsaved composer draft:") == 1
+    assert "draft one" in stderr
+    assert restart_called.is_set() is (exit_kind == "restart")
+
+
 def test_new_session_with_successful_draft_prints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
