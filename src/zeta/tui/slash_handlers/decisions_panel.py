@@ -134,7 +134,7 @@ class DecisionsMixin:
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
-                self._decisions_panel.render_lines(), keep_offset=True
+                self._decisions_panel.render_lines(), keep_offset=True, overflow_hint=True
             )
             self._invalidate_prompt()
         elif changed:
@@ -154,7 +154,9 @@ class DecisionsMixin:
             self._decisions_restore_text = ""
             self._decisions_restore_cursor = 0
         self._decisions_panel_open = True
-        self._decisions_panel_control.set_lines(self._decisions_panel.render_lines())
+        self._decisions_panel_control.set_lines(
+            self._decisions_panel.render_lines(), overflow_hint=True
+        )
         session.layout.focus(self._decisions_panel_window)
         self._start_decisions_refresh()
         self._invalidate_prompt()
@@ -246,7 +248,9 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_control.set_lines(
-            self._decisions_panel.render_lines(), keep_offset=keep_offset
+            self._decisions_panel.render_lines(),
+            keep_offset=keep_offset,
+            overflow_hint=True,
         )
         self._invalidate_prompt()
 
