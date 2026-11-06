@@ -74,10 +74,14 @@ class ConnectionRegistry:
         requested_role: object,
         protocol_version: str,
         features: frozenset[str],
+        *,
+        max_role: str = "controller",
     ) -> str:
         if requested_role not in {"controller", "observer"}:
             raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
         role = str(requested_role)
+        if max_role == "observer" and role == "controller":
+            raise ProtocolError(-32602, "credential permits observer role only")
         if role == "observer" and (
             protocol_version == "1.0" or "serve_observers" not in features
         ):

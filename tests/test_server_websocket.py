@@ -11,7 +11,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlencode
 
 import pytest
 
@@ -517,7 +517,9 @@ async def test_websocket_token_file_lifecycle_and_loopback_bind(tmp_path: Path) 
         value = json.loads(token_path.read_text())
         assert value == {
             "port": server._websocket.port,
-            "token": server._websocket.token,
+            "token": server._websocket.controller_token,
+            "controller_token": server._websocket.controller_token,
+            "observer_token": server._websocket.observer_token,
             "pid": os.getpid(),
             "origins": ["http://127.0.0.1:5173"],
             "ws_auth": ["subprotocol", "query"],
@@ -546,16 +548,82 @@ async def test_websocket_prints_connect_url_once_without_logging_token(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert token is not None
-    expected = f"zeta serve: websocket ready: ws://127.0.0.1:{port}/?token={token}\n"
+    expected = f"zeta serve: websocket ready: ws://127.0.0.1:{port}/\n"
     assert captured.err == expected
-    startup_url = captured.err.removeprefix("zeta serve: websocket ready: ").removesuffix("\n")
-    parsed = urlsplit(startup_url)
-    assert parsed.scheme == "ws"
-    assert parsed.hostname == "127.0.0.1"
-    assert parsed.port == port
-    assert parsed.path == "/"
-    assert parse_qs(parsed.query) == {"token": [token]}
+    assert token not in captured.out + captured.err
+    assert "token=" not in captured.out + captured.err
     assert all(token not in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_observer_credential_cannot_claim_controller_before_or_after_disconnect(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    assert server._websocket is not None
+    observer = await _connect(
+        server, token=None, protocol_token=server._websocket.observer_token
+    )
+    controller = None
+    try:
+        assert observer[2] == 101
+        await _send_json(
+            observer[1],
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {
+                    "protocol_version": "1.1",
+                    "role": "controller",
+                    "features": ["serve_observers"],
+                },
+            },
+        )
+        assert (await _read_json(observer[0]))["error"][
+            "message"
+        ] == "credential permits observer role only"
+        observer[1].close()
+        await observer[1].wait_closed()
+        controller = await _connect(
+            server, token=None, protocol_token=server._websocket.controller_token
+        )
+        await _send_json(
+            controller[1],
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hello",
+                "params": {"protocol_version": "1.0"},
+            },
+        )
+        assert (await _read_json(controller[0]))["result"]["server"] == "zeta"
+        controller[1].close()
+        await controller[1].wait_closed()
+        observer = await _connect(
+            server, token=None, protocol_token=server._websocket.observer_token
+        )
+        await _send_json(
+            observer[1],
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "hello",
+                "params": {
+                    "protocol_version": "1.1",
+                    "role": "controller",
+                    "features": ["serve_observers"],
+                },
+            },
+        )
+        assert (await _read_json(observer[0]))["error"][
+            "message"
+        ] == "credential permits observer role only"
+    finally:
+        observer[1].close()
+        await observer[1].wait_closed()
+        await _close(server)
 
 
 @pytest.mark.asyncio
