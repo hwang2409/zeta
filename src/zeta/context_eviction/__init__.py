@@ -524,9 +524,9 @@ def _evict_persisted_records(
         if message.tool_result is not None:
             result_indexes[message.tool_result.tool_call_id].append(index)
     def is_current(index: int) -> bool:
-        return current_receipt(*records[index])
+        return current_receipt(*output[index])
     def can_regenerate(index: int) -> bool:
-        seq, message = records[index]
+        seq, message = output[index]
         replacement = generated_by_seq.get(seq)
         return (
             eligibility.allows(seq)
@@ -554,12 +554,12 @@ def _evict_persisted_records(
             is_current(index) or can_regenerate(index) for index in indexes
         ):
             continue
-        original_tokens = sum(token_counter(records[index][1]) for index in indexes)
+        original_tokens = sum(token_counter(output[index][1]) for index in indexes)
         replacement_tokens = sum(
             token_counter(
-                generated_by_seq[records[index][0]]
+                generated_by_seq[output[index][0]]
                 if can_regenerate(index)
-                else records[index][1]
+                else output[index][1]
             )
             for index in indexes
         )
