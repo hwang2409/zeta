@@ -10602,10 +10602,13 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path
     app.undo_sent_turn()
     app._submit_input("same")
     await asyncio.sleep(0)
-    await asyncio.gather(app._active_task, return_exceptions=True)
-    await asyncio.sleep(0)
+    async with asyncio.timeout(5):
+        while app._submissions.has_pending or (
+            app._active_task is not None and not app._active_task.done()
+        ):
+            await asyncio.sleep(0)
     if app._active_task is not None:
-        await app._active_task
+        await asyncio.gather(app._active_task, return_exceptions=True)
 
     user_texts = [
         block.text
