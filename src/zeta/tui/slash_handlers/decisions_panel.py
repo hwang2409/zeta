@@ -200,7 +200,11 @@ class DecisionsMixin:
         if key == "escape":
             self.close_decisions_panel()
             return
-        if key in {"up", "k"}:
+        if key == "pageup":
+            self._decisions_panel_control.page(-1)
+        elif key == "pagedown":
+            self._decisions_panel_control.page(1)
+        elif key in {"up", "k"}:
             panel.move(-1)
         elif key in {"down", "j"}:
             panel.move(1)

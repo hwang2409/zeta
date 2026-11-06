@@ -240,7 +240,7 @@ def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
 # -- popup rendering --------------------------------------------------------
 
 
-def _item(session_id: str, title: str, why: str, options=()) -> DecisionItem:
+def _item(session_id: str, title: str, why: str, options=(), recommendation=None) -> DecisionItem:
     from zeta.attention_records import AttentionRecord
 
     record = AttentionRecord(
@@ -254,7 +254,7 @@ def _item(session_id: str, title: str, why: str, options=()) -> DecisionItem:
         title=title,
         why=why,
         options=tuple(options),
-        recommendation=None,
+        recommendation=recommendation,
         status="open",
     )
     return DecisionItem(session_id, "p", "proj", record)
@@ -463,3 +463,19 @@ def test_zeta_panel_command_is_removed(monkeypatch, tmp_path: Path) -> None:
 
     assert not (Path(zeta.__file__).parent / "attention_panel.py").exists()
     assert not (Path(zeta.__file__).parent / "cli" / "panel.py").exists()
+
+
+def test_decisions_detail_keeps_full_text_and_recommendation() -> None:
+    panel = DecisionsPanel()
+    panel.set_items([_item(
+        "1" * 32,
+        "A very long decision title that must remain readable in the detail view",
+        "A long explanation that should wrap across multiple rows instead of being truncated.",
+        ["The first option has enough text to wrap too."],
+        recommendation="Prefer the first option because it is safer.",
+    )])
+    text = _plain(panel.render_lines())
+    assert "A very long decision title that must remain readable" in text
+    assert "truncated" in text
+    assert "Recommendation:" in text
+    assert "Prefer the first option" in text
