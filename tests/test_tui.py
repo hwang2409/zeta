@@ -11745,6 +11745,94 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
 
 
 @pytest.mark.asyncio
+async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    persistence = DraftPersistence(
+        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+    )
+    baseline = _fd_count()
+    stop_delivered = threading.Event()
+    release_worker = threading.Event()
+    original_deliver = persistence._writer._deliver
+    writes = 0
+    original_write = persistence_module.write_session_json
+
+    def write(*args: object, **kwargs: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError(errno.ENOSPC, "disk full")
+        original_write(*args, **kwargs)
+
+    def gated_deliver(
+        item: persistence_module._FileAction,
+        result: object | None,
+        failure: BaseException | None,
+    ) -> None:
+        original_deliver(item, result, failure)
+        if item.stop:
+            stop_delivered.set()
+            assert release_worker.wait(1)
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
+    persistence.schedule("new draft")
+    shutdown = asyncio.create_task(persistence.shutdown_pending())
+    assert await asyncio.to_thread(stop_delivered.wait, 1)
+    with pytest.raises(OSError, match="disk full"):
+        await shutdown
+
+    persistence.flush()
+    assert persistence._writer._queue.qsize() == 1
+    release_worker.set()
+    await persistence._writer.flush(timeout=0.05)
+
+    try:
+        assert persistence.load() == "new draft"
+        assert writes == 2
+        assert _fd_count() <= baseline
+    finally:
+        release_worker.set()
+        os.close(directory_fd)
+
+
+@pytest.mark.asyncio
+async def test_later_successful_snapshot_clears_earlier_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+    first_finished = threading.Event()
+    writes = 0
+    original_write = persistence_module.write_session_json
+
+    def write(*args: object, **kwargs: object) -> None:
+        nonlocal writes
+        writes += 1
+        try:
+            if writes == 1:
+                raise OSError(errno.ENOSPC, "disk full")
+            original_write(*args, **kwargs)
+        finally:
+            first_finished.set()
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    persistence.schedule("first")
+    assert await asyncio.to_thread(first_finished.wait, 1)
+    persistence.schedule("second")
+    error: OSError | None = None
+    try:
+        await persistence.flush_pending()
+    except OSError as exc:
+        error = exc
+
+    assert error is None, "a successful newer snapshot retained the earlier write failure"
+    assert persistence.load() == "second"
+    assert persistence._pending_text is None
+
+
+@pytest.mark.asyncio
 async def test_runtime_close_draft_writer_owns_its_directory_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12001,8 +12089,6 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, _session = _agent_list_session(tmp_path, 0)
-    notices: list[object] = []
-    monkeypatch.setattr(app, "_handle_background_notice", notices.append)
 
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
@@ -12013,9 +12099,10 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
         await app.close()
     await asyncio.sleep(0)
 
-    assert notices == [
-        "composer draft was not saved; your text remains unsaved. copy it before exiting."
-    ]
+    rendered = "".join(app._transcript_lines)
+    assert "composer draft was not saved" in rendered
+    assert "your text remains unsaved" in rendered
+    assert "copy it before exiting" in rendered
     app.loop.store.close()
 
 
