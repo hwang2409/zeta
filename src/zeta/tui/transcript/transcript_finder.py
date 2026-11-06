@@ -190,12 +190,14 @@ class TranscriptFinderMixin:
     def finder_needs_ranking(self) -> bool:
         return self._finder is not None and self._finder.needs_ranking
 
-    def finder_rank(self) -> RankingResult | None:
+    def finder_rank(
+        self, *, candidate_limit: int | None = None
+    ) -> RankingResult | None:
         """Compute the current query result; callers run this off the UI thread."""
 
         if self._finder is None:
             return None
-        return self._finder.rank()
+        return self._finder.rank(candidate_limit=candidate_limit)
 
     def finder_publish(self, result: RankingResult) -> bool:
         """Publish a current result and reject stale query generations."""

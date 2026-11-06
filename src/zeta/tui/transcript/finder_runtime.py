@@ -7,6 +7,8 @@ from typing import Any
 
 from prompt_toolkit.buffer import Buffer
 
+_RANK_BATCH_SIZE = 16
+
 
 class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
@@ -84,12 +86,15 @@ class FinderRuntimeMixin:
         finder = self._finder_target()
         try:
             while finder is self._finder_target() and finder.finder_active:
-                result = await asyncio.to_thread(finder.finder_rank)
+                result = await asyncio.to_thread(
+                    finder.finder_rank, candidate_limit=_RANK_BATCH_SIZE
+                )
                 if result is None:
                     return
                 if finder.finder_publish(result):
                     self._invalidate_prompt()
-                    return
+                    if not finder.finder_needs_ranking():
+                        return
         finally:
             if self._finder_rank_task is task:
                 self._finder_rank_task = None

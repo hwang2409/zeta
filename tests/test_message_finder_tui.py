@@ -456,9 +456,9 @@ async def test_pathological_query_ranks_off_the_ui_thread(
     ranking_threads: list[int] = []
     rank = transcript.finder_rank
 
-    def record_rank() -> Any:
+    def record_rank(*, candidate_limit: int | None = None) -> Any:
         ranking_threads.append(threading.get_ident())
-        return rank()
+        return rank(candidate_limit=candidate_limit)
 
     monkeypatch.setattr(transcript, "finder_rank", record_rank)
     app._finder_input("a" * 50)
@@ -751,3 +751,59 @@ def test_candidate_request_does_not_carry_transcript_data() -> None:
     assert isinstance(request.generation, int)
     assert not hasattr(request, "sources")
     assert not hasattr(request, "units")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rank_stops_after_one_candidate_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.tui.transcript import message_finder
+    from zeta.tui.transcript.message_finder import Candidate, MessageFinder
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    errors: list[AssertionError] = []
+    call_count = 0
+    original_match_query = message_finder.match_query
+
+    def counted_match_query(query: Any, text: str) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        assert call_count <= 16, (
+            "ranking continued beyond one candidate batch after cancellation"
+        )
+        return original_match_query(query, text)
+
+    candidates = tuple(
+        Candidate(index, index, Role.ASSISTANT, "#0", f"candidate {index}")
+        for index in range(3_016)
+    )
+    transcript = TranscriptWidget()
+    transcript._finder = MessageFinder(candidates)
+    original_rank = transcript.finder_rank
+
+    def recording_rank(*, candidate_limit: int | None = None) -> Any:
+        try:
+            return original_rank(candidate_limit=candidate_limit)
+        except AssertionError as exc:
+            errors.append(exc)
+            return None
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(message_finder, "match_query", counted_match_query)
+    monkeypatch.setattr(transcript, "finder_rank", recording_rank)
+    app = _app_for_finder(transcript)
+
+    app._finder_input("candidate")
+    assert await asyncio.to_thread(entered.wait, 2)
+    app._finder_cancel()
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 2)
+
+    assert not errors, str(errors[0]) if errors else ""
+    assert call_count == 16

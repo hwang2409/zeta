@@ -170,11 +170,12 @@ class MessageFinder:
             self._reset_visible_rows()
             return self._generation
 
-    def rank(self) -> RankingResult:
+    def rank(self, *, candidate_limit: int | None = None) -> RankingResult:
         """Compute the current generation without mutating visible state.
 
         The caller must run this method away from the event-loop thread, then
-        pass its result to :meth:`publish` on the owner thread.
+        pass its result to :meth:`publish` on the owner thread. UI callers use
+        ``candidate_limit`` to keep cancellation latency bounded.
         """
 
         with self._lock:
@@ -184,7 +185,7 @@ class MessageFinder:
                 candidates = self._candidates
                 current_rows: tuple[FinderRow, ...] = ()
             else:
-                candidates = tuple(self._pending)
+                candidates = tuple(self._pending[:candidate_limit])
                 current_rows = self._rows
         if query.is_empty:
             rows = self._empty_rows(candidates)
