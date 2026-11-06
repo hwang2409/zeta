@@ -126,27 +126,46 @@ class DeliveryRequests:
         delivery_id = self._delivery_id(
             params, features, feature="send_images_delivery_id"
         )
-        payload_digest = (
-            ergonomics.image_payload_digest(params) if delivery_id is not None else None
-        )
-        duplicate = self._duplicate(delivery_id, payload_digest=payload_digest)
-        if duplicate is not None:
-            return duplicate
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         ergonomics.require_mutable(runtime, control.has_pending_approvals())
-        message = await asyncio.to_thread(ergonomics.image_message, runtime, params)
+        worker = asyncio.create_task(
+            asyncio.to_thread(ergonomics.prepare_image_delivery, runtime, params)
+        )
+        try:
+            prepared = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await _cleanup_canceled_image_delivery(worker, runtime)
+            raise
+        duplicate = self._duplicate(
+            delivery_id, payload_digest=prepared.payload_digest
+        )
+        if duplicate is not None:
+            await asyncio.to_thread(
+                ergonomics.cleanup_image_delivery, runtime, prepared
+            )
+            return duplicate
+        message = prepared.message
         text = params.get("text", "")
         assert isinstance(text, str)
-        attachments = ergonomics.attachment_summary(message)
         if delivery_id is None:
-            await control.user_message(text, "send", features, attachments)
+            try:
+                await control.user_message(
+                    text, "send", features, prepared.attachments
+                )
+            except asyncio.CancelledError:
+                await asyncio.to_thread(
+                    ergonomics.cleanup_image_delivery, runtime, prepared
+                )
+                raise
             control.start_turn(text, message)
             return {"accepted": True, "session_id": runtime.session_id}
 
-        tagged = tag_client_delivery(message, delivery_id)
+        tagged = tag_client_delivery(
+            message, delivery_id, prepared.payload_digest
+        )
         outcome: dict[str, object] = {
             "accepted": True,
             "session_id": runtime.session_id,
@@ -162,6 +181,9 @@ class DeliveryRequests:
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
+                await asyncio.to_thread(
+                    ergonomics.cleanup_image_delivery, runtime, prepared
+                )
                 raise
             canceled_after_commit = True
 
@@ -170,7 +192,7 @@ class DeliveryRequests:
                 text,
                 "send",
                 features,
-                attachments,
+                prepared.attachments,
                 delivery_id=delivery_id,
             ),
             lambda: control.start_turn(
@@ -327,6 +349,31 @@ class DeliveryRequests:
                 {"outcome": outcome},
             )
         return None
+
+
+async def _cleanup_canceled_image_delivery(
+    worker: asyncio.Task[Any], runtime: Any
+) -> None:
+    from . import ergonomics
+
+    settled = asyncio.Event()
+    worker.add_done_callback(lambda _: settled.set())
+    while not settled.is_set():
+        try:
+            await asyncio.shield(settled.wait())
+        except asyncio.CancelledError:
+            continue
+    if worker.cancelled() or worker.exception() is not None:
+        return
+    cleanup = asyncio.create_task(
+        asyncio.to_thread(ergonomics.cleanup_image_delivery, runtime, worker.result())
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    cleanup.result()
 
 
 async def _deliver_after_commit(

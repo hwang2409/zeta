@@ -106,6 +106,31 @@ def _attachment_path(path: Path) -> Path:
     return path.absolute() if "sessions" in path.parts else path.resolve()
 
 
+def _prepare_image_attachment(
+    path: Path, data: bytes, media_type: str, image_policy: ImagePolicy | None
+) -> ImageContent:
+    if not image_signature_matches(media_type, data):
+        raise AttachmentError(
+            f"binary file is not an image: {path}", reason="not decodable"
+        )
+    if image_policy is not None:
+        try:
+            prepared = asyncio.run(normalize_image_bytes(data, image_policy))
+        except ValueError as exc:
+            raise AttachmentError(
+                f"image cannot be prepared: {path}: {exc}",
+                reason="not decodable",
+            ) from exc
+        data = prepared.data or b""
+        media_type = prepared.media_type
+    return ImageContent(
+        base64.b64encode(data).decode("ascii"),
+        media_type,
+        str(path),
+        len(data),
+    )
+
+
 def _read_attachment(
     path: Path,
     session_store: ConversationStore | None = None,
@@ -168,27 +193,7 @@ def _read_attachment(
         raise AttachmentError(f"cannot read {path}: {exc}") from exc
     media_type = _image_media_type(prefix)
     if media_type is not None:
-        if not image_signature_matches(media_type, data):
-            raise AttachmentError(
-                f"binary file is not an image: {path}", reason="not decodable"
-            )
-        if image_policy is not None:
-            try:
-                prepared = asyncio.run(normalize_image_bytes(data, image_policy))
-            except ValueError as exc:
-                raise AttachmentError(
-                    f"image cannot be prepared: {path}: {exc}",
-                    reason="not decodable",
-                ) from exc
-            data = prepared.data or b""
-            media_type = prepared.media_type
-            size = len(data)
-        return ImageContent(
-            base64.b64encode(data).decode("ascii"),
-            media_type,
-            str(path),
-            size,
-        )
+        return _prepare_image_attachment(path, data, media_type, image_policy)
     if b"\x00" in data:
         raise AttachmentError(
             f"binary file is not an image: {path}", reason="not decodable"

@@ -2358,7 +2358,9 @@ async def test_send_images_delivery_id_uses_semantic_image_payload(
         session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
             "result"
         ]["session"]["session_id"]
-        encoded = base64.b64encode(PNG).decode()
+        output = io.BytesIO()
+        Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode()
         params = {
             "session_id": session_id,
             "text": "look",

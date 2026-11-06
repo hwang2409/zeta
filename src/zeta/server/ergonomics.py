@@ -930,17 +930,23 @@ def _validated_image_payload(
     return text, decoded
 
 
-def image_payload_digest(params: dict) -> str:
-    text, decoded = _validated_image_payload(params)
-    return _semantic_image_payload_digest(
-        text, [(name, mime, raw) for name, mime, _data, raw in decoded]
-    )
+@dataclass(frozen=True, slots=True)
+class PreparedImageDelivery:
+    payload_digest: str
+    message: Message
+    attachments: list[dict[str, object]]
+    created_attachments_root: bool
 
 
-def image_message(runtime: ServerRuntime, params: dict) -> Message:
+def prepare_image_delivery(
+    runtime: ServerRuntime, params: dict
+) -> PreparedImageDelivery:
     """Decode, normalize, and publish images from an off-loop worker."""
 
     text, decoded = _validated_image_payload(params)
+    payload_digest = _semantic_image_payload_digest(
+        text, [(name, mime, raw) for name, mime, _data, raw in decoded]
+    )
     provider = runtime.provider
     if provider is None:
         raise ProtocolError(-32003, "no active provider")
@@ -972,9 +978,29 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             if not attachments_existed:
                 os.rmdir("attachments", dir_fd=store.directory_fd)
             raise
-    return with_message_origin(
+    message = with_message_origin(
         Message(MessageRole.USER, blocks), MessageOrigin.USER
     )
+    return PreparedImageDelivery(
+        payload_digest,
+        message,
+        attachment_summary(message),
+        not attachments_existed,
+    )
+
+
+def cleanup_image_delivery(
+    runtime: ServerRuntime, prepared: PreparedImageDelivery
+) -> None:
+    """Remove files produced by a prepared delivery that will not publish."""
+
+    store = runtime.opened.store
+    with child_directory(store.directory_fd, "attachments") as attachments_fd:
+        for block in prepared.message.content:
+            if isinstance(block, ImageContent) and block.path is not None:
+                shutil.rmtree(Path(block.path).parent.name, dir_fd=attachments_fd)
+    if prepared.created_attachments_root:
+        os.rmdir("attachments", dir_fd=store.directory_fd)
 
 
 def attachment_summary(message: Message) -> list[dict[str, object]]:
