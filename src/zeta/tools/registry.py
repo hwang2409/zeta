@@ -232,6 +232,7 @@ class ToolRegistry:
         required_tool_names: Sequence[str] | None = None,
         image_policy: ImagePolicy = ANTHROPIC_IMAGE_POLICY,
         account_context: Any = None,
+        mcp_limits: Any = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -244,6 +245,7 @@ class ToolRegistry:
             raise ValueError("enforced approvals require a policy")
         self.image_policy = image_policy
         self.account_context = account_context
+        self.mcp_limits = mcp_limits
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )
@@ -298,6 +300,8 @@ class ToolRegistry:
             if session_store is not None
             else None,
         )
+        if mcp_limits is not None:
+            self.spills.configure_transient_limit(mcp_limits.max_wire_bytes)
         self.policy = SandboxPolicy(
             self.cwd,
             allow_outside=not self.tool_policy.restricted,

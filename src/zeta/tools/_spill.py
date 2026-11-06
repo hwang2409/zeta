@@ -43,6 +43,7 @@ class SpillStore:
     ) -> None:
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
+        self._transient_lock = threading.Lock()
         self._directory_fd: int | None = None
         self._parent_fd: int | None = None
         self._temporary_root: Path | None = None
@@ -58,6 +59,30 @@ class SpillStore:
             self._parent_fd = directory_fd
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
+        self._transient_bytes = 0
+        self._transient_max_bytes = 64 * 1024 * 1024
+
+    def configure_transient_limit(self, max_bytes: int) -> None:
+        if max_bytes <= 0:
+            raise ValueError("transient spill limit must be positive")
+        with self._transient_lock:
+            self._transient_max_bytes = max_bytes
+
+    def reserve_transient(self, byte_count: int) -> None:
+        if byte_count < 0:
+            raise ValueError("byte_count must not be negative")
+        with self._transient_lock:
+            if self._transient_bytes + byte_count > self._transient_max_bytes:
+                raise RuntimeError("transient spill budget is full")
+            self._transient_bytes += byte_count
+
+    def release_transient(self, byte_count: int) -> None:
+        if byte_count < 0:
+            raise ValueError("transient spill release must not be negative")
+        with self._transient_lock:
+            if byte_count > self._transient_bytes:
+                raise ValueError("transient spill release exceeds its reservation")
+            self._transient_bytes -= byte_count
 
 
     async def awrite_text_group(
