@@ -1,6 +1,7 @@
 from zeta.skills import SkillCatalog
 
 import asyncio
+import json
 from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
@@ -42,6 +43,9 @@ from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import ComposerCompleter, DollarSkillCompleter, SlashCompleter
 from zeta.tui.user import displayed_user_text
+from zeta.memory.user_authorization import MemoryMutationAuthorization
+from zeta.project_memory_commands import run_memory_command
+from tests.test_auto_memory import _proposal, _runner
 from zeta.protocol.types import (
     with_message_origin,
     MESSAGE_ORIGIN_METADATA,
@@ -647,6 +651,64 @@ def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
     assert output is not None
     assert len(tracker.history) == 8
     assert "estimated_cost_usd: $27.000000" in output
+
+
+@pytest.mark.asyncio
+async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal(prompt)
+
+    runner, registry, project_id, _notices = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
+    )
+    runner.state.record_failure(
+        seq_start=1, seq_end=1, validation_summary="terminal failure", reason="test",
+        usage={}, retry_backoff_seconds=0, now=0,
+        occurred_at="2026-10-07T00:00:00+00:00", terminal=True,
+    )
+    receipt = runner.terminal_receipts()[0]
+    runner.session_dir.joinpath("conversation.jsonl").write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+    )
+    runner.activity(1)
+    await runner.drain()
+    before = runner.position_path.read_bytes()
+
+    refused = run_memory_command(
+        registry,
+        project_id,
+        f"retry {receipt.key}",
+        runner,
+        MemoryMutationAuthorization.direct_slash(),
+    )
+    assert "memory retry refused" in refused
+    assert "malformed conversation row" in refused
+    assert "seq 2" in refused
+    assert runner.position_path.read_bytes() == before
+
+    path = runner.session_dir / "conversation.jsonl"
+    path.unlink()
+    path.write_text(
+        json.dumps({"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}}) + "\n",
+        encoding="utf-8",
+    )
+    runner.activity(1)
+    await runner.drain()
+    queued = run_memory_command(
+        registry,
+        project_id,
+        f"retry {receipt.key}",
+        runner,
+        MemoryMutationAuthorization.direct_slash(),
+    )
+    assert queued == f"memory retry queued: {receipt.key}"
+    await runner.drain()
+    assert calls == 1
 
 
 def test_status_shows_last_automatic_memory_failure() -> None:
