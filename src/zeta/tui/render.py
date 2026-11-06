@@ -26,6 +26,13 @@ from ..protocol.types import (
 )
 from . import theme
 from .cards.agent import AgentCard
+from .cards.agent_message import (
+    AgentIdentityIndex,
+    agent_header,
+    answer_question_id,
+    render_agent_message,
+    render_agent_tool_message,
+)
 from .cards.approval_card import render_approval_card as _render_approval_card
 from .cards.base import (
     MAX_TOOL_LINES,
@@ -560,7 +567,10 @@ STREAM_EVENTS_HANDLED_ELSEWHERE = frozenset({
 STREAM_EVENTS_HIDDEN = frozenset()
 
 
-def render_agent_notification(event: StreamEvent) -> Text | None:
+def render_agent_notification(
+    event: StreamEvent,
+    identity_index: AgentIdentityIndex | None = None,
+) -> RenderableType | None:
     """Render durable notifications unless a tool card or prior TUI owns them."""
     if event.data.get("tui_presented") is True:
         return None
@@ -575,13 +585,24 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
     if kind == "child_question":
         child_instance_id = event.data.get("child_instance_id")
         question = event.data.get("question")
-        if not isinstance(child_instance_id, str) or not isinstance(question, str):
+        question_id = event.data.get("question_id")
+        options = event.data.get("options", ())
+        if (
+            not isinstance(child_instance_id, str)
+            or not isinstance(question, str)
+            or not isinstance(question_id, str)
+            or not isinstance(options, (list, tuple))
+            or any(not isinstance(option, str) for option in options)
+        ):
             return Text("background agent notification unavailable", style=theme.ERROR)
-        prefix = f"? {child_instance_id} asks: "
-        message = prefix + _compact_notification_text(
-            question, MAX_AGENT_NOTIFICATION_LINE - cell_len(prefix)
+        identity = (identity_index or AgentIdentityIndex()).resolve(child_instance_id)
+        return render_agent_message(
+            agent_header("ask", "←", identity, state="pending"),
+            body=question,
+            options=options,
+            result=f"question {question_id}",
+            state="pending",
         )
-        return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "child_idle":
         description = event.data.get("description")
         if not isinstance(description, str) or not description:
@@ -594,14 +615,15 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
         ) + suffix
         return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "child_question_withdrawn":
-        text = event.data.get("text")
-        if not isinstance(text, str):
+        child_instance_id = event.data.get("child_instance_id")
+        question_id = event.data.get("question_id")
+        if not isinstance(child_instance_id, str) or not isinstance(question_id, str):
             return Text("background agent notification unavailable", style=theme.ERROR)
-        return Text(
-            _compact_notification_text(text, MAX_AGENT_NOTIFICATION_LINE),
-            style=theme.NOTICE,
-            overflow="ellipsis",
-            no_wrap=True,
+        identity = (identity_index or AgentIdentityIndex()).resolve(child_instance_id)
+        return render_agent_message(
+            agent_header("withdraw", "←", identity, state="withdrawn"),
+            result=f"question {question_id}",
+            state="withdrawn",
         )
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
@@ -663,7 +685,10 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
     return rendered
 
 
-def render_event(event: StreamEvent) -> RenderableType | None:
+def render_event(
+    event: StreamEvent,
+    identity_index: AgentIdentityIndex | None = None,
+) -> RenderableType | None:
     """Render one event that belongs in scrollback.
 
     Text deltas return None. The app owns their newline buffer and status bar.
@@ -682,11 +707,19 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
-        return render_agent_notification(event)
+        return render_agent_notification(event, identity_index)
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
-        label = event.data.get("child_label", "child")
         preview = event.data.get("preview", "")
-        return Text(f"delivered to {label}: {preview}", style=theme.DIM)
+        if not isinstance(preview, str):
+            return Text("delivered child message unavailable", style=theme.ERROR)
+        answer_to = answer_question_id(preview)
+        if answer_to is None:
+            label = event.data.get("child_label", "child")
+            return Text(f"delivered to {label}: {preview}", style=theme.DIM)
+        header = Text("receive ← parent", style=theme.AGENT_MAIN)
+        header.append(f" · answer to {answer_to}", style=theme.NOTICE)
+        header.append(" · delivered", style=theme.SUCCESS)
+        return render_agent_message(header, body=preview)
     if event.type is StreamEventType.ACCOUNT_LIMIT:
         account = event.data.get("account", "account")
         reset = event.data.get("reset_local", event.data.get("resets_at", "unknown"))
@@ -699,6 +732,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             style=theme.WARNING,
         )
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
+        message_render = render_agent_tool_message(event, True, identity_index)
+        if message_render is not None:
+            return message_render
         agent_render = AgentCard.render_start(event)
         if agent_render is not None:
             return agent_render
@@ -723,6 +759,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return _safe_text(f"  ↳ {label}{event.delta}", style=theme.DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
+        message_render = render_agent_tool_message(event, False, identity_index)
+        if message_render is not None:
+            return message_render
         agent_render = AgentCard.render_receipt(event)
         if agent_render is not None:
             return agent_render

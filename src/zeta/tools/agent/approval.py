@@ -376,12 +376,19 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         return self.child_store.resolve_approval(request_id, "abort", reason="child_cleanup")
 
     def _request_serve_abort(
-        self, request_id: str
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
     ) -> Awaitable[dict[str, str] | None] | None:
+        if child_instance_id is None:
+            child_instance_id = self.child_instance_id
+            reason = "child_cleanup"
         return self.parent._request_serve_abort(
             request_id,
-            child_instance_id=self.child_instance_id,
-            reason="child_cleanup",
+            child_instance_id=child_instance_id,
+            reason=reason,
         )
 
     def abort_or_winner(
