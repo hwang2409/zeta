@@ -54,6 +54,17 @@ def test_every_notification_kind_has_a_validator() -> None:
         validate_notification_data(payloads[kind])
 
 
+def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store._prepare_durable_writer_snapshot()
+    writer = store._new_persistent_durable_writer()
+    try:
+        assert writer._storage_lease._entry is store._storage_lease._entry
+    finally:
+        writer.close()
+        store.close()
+
+
 def test_store_rejects_unknown_notification_kind_on_write(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
