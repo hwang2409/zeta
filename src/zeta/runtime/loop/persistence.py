@@ -38,6 +38,7 @@ class _OrderedFileWriter:
     def __init__(self, label: str, failure_sink: Callable[[str], None] | None = None) -> None:
         self._label = label
         self._failure_sink = failure_sink
+        self._notice_loop: asyncio.AbstractEventLoop | None = None
         try:
             self._notice_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -48,9 +49,14 @@ class _OrderedFileWriter:
         self._thread: threading.Thread | None = None
         self._submitted = 0
         self._applied = 0
+        self._processed = 0
+        self._failures: dict[int, BaseException] = {}
         self._accepting = True
         self._waiters: list[tuple[int, asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
         self._reported_failure = False
+
+    def set_notice_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._notice_loop = loop
 
     def submit(
         self,
@@ -81,7 +87,7 @@ class _OrderedFileWriter:
                 self._thread.start()
         if wait:
             with self._completed:
-                self._completed.wait_for(lambda: self._applied >= watermark)
+                self._completed.wait_for(lambda: self._processed >= watermark)
         return watermark
 
     def _run(self) -> None:
@@ -109,31 +115,67 @@ class _OrderedFileWriter:
         except Exception as exc:  # noqa: BLE001 - completion must not stop the writer
             failure = exc
             self._report_failure(exc)
-        self._mark_applied(item.watermark)
+        self._mark_applied(item.watermark, failure)
 
-    def _mark_applied(self, watermark: int) -> None:
+    def _mark_applied(self, watermark: int, failure: BaseException | None) -> None:
         with self._completed:
-            self._applied = max(self._applied, watermark)
-            ready = [waiter for waiter in self._waiters if waiter[0] <= self._applied]
-            self._waiters = [waiter for waiter in self._waiters if waiter[0] > self._applied]
+            self._processed = max(self._processed, watermark)
+            if failure is None:
+                self._applied = max(self._applied, watermark)
+            else:
+                self._failures[watermark] = failure
+            ready = [waiter for waiter in self._waiters if waiter[0] <= self._processed]
+            self._waiters = [waiter for waiter in self._waiters if waiter[0] > self._processed]
+            failures = {
+                waiter_watermark: self._failure_through(waiter_watermark, None)
+                for waiter_watermark, _, _ in ready
+            }
+            if ready:
+                self._failures = {
+                    failed_watermark: failure
+                    for failed_watermark, failure in self._failures.items()
+                    if failed_watermark > self._processed
+                }
             self._completed.notify_all()
-        for _, loop, future in ready:
+        for waiter_watermark, loop, future in ready:
             try:
-                loop.call_soon_threadsafe(self._finish_waiter, future)
+                loop.call_soon_threadsafe(
+                    self._finish_waiter, future, failures[waiter_watermark]
+                )
             except RuntimeError:
                 pass
 
+    def _failure_through(
+        self, watermark: int, current: BaseException | None,
+    ) -> BaseException | None:
+        if current is not None:
+            return current
+        return next(
+            (failure for failed_watermark, failure in self._failures.items()
+             if failed_watermark <= watermark),
+            None,
+        )
+
     @staticmethod
-    def _finish_waiter(future: asyncio.Future[None]) -> None:
-        if not future.done():
+    def _finish_waiter(
+        future: asyncio.Future[None], failure: BaseException | None,
+    ) -> None:
+        if future.done():
+            return
+        if failure is None:
             future.set_result(None)
+        else:
+            future.set_exception(failure)
 
     async def flush(self, *, timeout: float) -> None:
         loop = asyncio.get_running_loop()
         with self._lock:
             watermark = self._submitted
-            if self._applied >= watermark:
-                return
+            if self._processed >= watermark:
+                failure = self._failure_through(watermark, None)
+                if failure is None:
+                    return
+                raise failure
             future = loop.create_future()
             self._waiters.append((watermark, loop, future))
         try:
@@ -153,7 +195,12 @@ class _OrderedFileWriter:
             accepting = self._accepting
         if accepting:
             self.submit(finalizer, stop=True)
-        await self.flush(timeout=timeout)
+        try:
+            await self.flush(timeout=timeout)
+        except BaseException:
+            with self._lock:
+                self._accepting = True
+            raise
 
     def _report_failure(self, exc: BaseException) -> None:
         with self._lock:
@@ -166,9 +213,7 @@ class _OrderedFileWriter:
                 "composer draft was not saved; your text remains unsaved. "
                 "copy it before exiting."
             )
-            if self._notice_loop is None:
-                self._failure_sink(notice)
-            else:
+            if self._notice_loop is not None:
                 try:
                     self._notice_loop.call_soon_threadsafe(self._failure_sink, notice)
                 except RuntimeError:
@@ -276,6 +321,8 @@ class DraftPersistence:
             event_loop = asyncio.get_running_loop()
         except RuntimeError:
             event_loop = None
+        if event_loop is not None:
+            self._writer.set_notice_loop(event_loop)
 
         def persisted(_result: object) -> None:
             if event_loop is None:

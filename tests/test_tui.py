@@ -11719,27 +11719,29 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
     await persistence.flush_pending()
 
     original = persistence_module.write_session_json
-    failed = True
+    failures = 2
     writes = 0
 
     def write(directory_fd: int, *args, **kwargs) -> None:
-        nonlocal failed, writes
+        nonlocal failures, writes
         writes += 1
-        if failed:
-            failed = False
+        if failures:
+            failures -= 1
             raise OSError(errno.ENOSPC, "disk full")
         original(directory_fd, *args, **kwargs)
 
     monkeypatch.setattr(persistence_module, "write_session_json", write)
     persistence.schedule("new draft")
-    await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk full"):
+        await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk full"):
+        await persistence.shutdown_pending()
     assert persistence.load() == "old draft"
     assert persistence._pending_text == "new draft"
 
     await persistence.flush_pending()
-    await persistence.shutdown_pending()
     assert persistence.load() == "new draft"
-    assert writes == 2
+    assert writes == 3
 
 
 @pytest.mark.asyncio
@@ -11969,6 +11971,54 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[tuple[str, int]] = []
+    persistence = DraftPersistence(
+        tmp_path / "draft",
+        delay=0,
+        notice_sink=lambda message: notices.append((message, threading.get_ident())),
+    )
+    loop_thread = threading.get_ident()
+
+    def fail(*_args, **_kwargs) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    persistence.schedule("first")
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
+
+    assert notices == [(
+        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+        loop_thread,
+    )]
+
+
+@pytest.mark.asyncio
+async def test_failed_final_draft_flush_is_visible_during_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _session = _agent_list_session(tmp_path, 0)
+    notices: list[object] = []
+    monkeypatch.setattr(app, "_handle_background_notice", notices.append)
+
+    def fail(*_args, **_kwargs) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    app._draft.schedule("must not disappear")
+    with pytest.raises(OSError, match="disk unavailable"):
+        await app.close()
+    await asyncio.sleep(0)
+
+    assert notices == [
+        "composer draft was not saved; your text remains unsaved. copy it before exiting."
+    ]
+
+
+@pytest.mark.asyncio
 async def test_draft_write_failure_is_reported_once_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -11979,9 +12029,11 @@ async def test_draft_write_failure_is_reported_once_without_raising(
 
     monkeypatch.setattr(persistence_module, "write_session_json", fail)
     persistence.schedule("first")
-    await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
     persistence.schedule("second")
-    await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
 
     assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
     assert persistence._pending_text == "second"

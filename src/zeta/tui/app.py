@@ -1118,6 +1118,7 @@ class TUIApp(
         Re-entrant: the fork controller re-shows a suspended main runtime by
         calling this again without replaying its transcript.
         """
+        self._draft.set_notice_loop(asyncio.get_running_loop())
         self._exit_requested = False
         self._run_result = RuntimeResult.EXIT
         self._decisions_switching = False
