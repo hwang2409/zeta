@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -615,23 +616,24 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
     from zeta.storage_format import advance, open_writer
+    from zeta.tools import ToolRegistry
 
-    leases = {}
+    stores = []
+    managers = []
+    registries = []
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    registry_init = ToolRegistry.__init__
 
-    def ensure(home: Path) -> None:
+    def open_test_writer(home: Path):
         home.mkdir(parents=True, exist_ok=True)
         if not (home / "storage-format.json").exists():
             advance(home, expected_epoch=0)
-        canonical = home.resolve()
-        if canonical in leases:
-            return
         result = []
         thread = threading.Thread(target=lambda: result.append(open_writer(home)))
         thread.start()
         thread.join()
-        leases[canonical] = result[0]
+        return result[0]
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
@@ -640,20 +642,40 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
-        ensure(home.parent if home.name == "sessions" else root.parent)
-        store_init(store, *args, **kwargs)
+        lease = open_test_writer(home.parent if home.name == "sessions" else root.parent)
+        try:
+            store_init(store, *args, **kwargs)
+            stores.append(store)
+        finally:
+            lease.close()
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
         home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
-        ensure(home)
-        manager_init(manager, *args, **kwargs)
+        lease = open_test_writer(home)
+        try:
+            manager_init(manager, *args, **kwargs)
+            managers.append(manager)
+        finally:
+            lease.close()
+
+    @wraps(registry_init)
+    def tracked_registry_init(registry, *args, **kwargs):
+        registry_init(registry, *args, **kwargs)
+        registries.append(registry)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
-    for lease in leases.values():
-        lease.close()
+    for registry in reversed(registries):
+        if not registry._closed:
+            asyncio.run(registry.close())
+    for store in reversed(stores):
+        if not store._closed:
+            store.close()
+    for manager in reversed(managers):
+        manager._release_storage_lease()
 
 
 @pytest.fixture
