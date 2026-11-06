@@ -435,10 +435,15 @@ def _fold_consumed_tool_exchanges(
                 indexes = []
                 break
             indexes.extend(matches)
-        if not indexes or not all(eligibility.allows(records[index][0]) for index in indexes):
+        if not indexes or not all(
+            eligibility.allows(records[index][0]) for index in indexes
+        ):
             continue
         if not message.metadata.get("context_evicted"):
-            converted[call_index] = (call_seq, _tool_call_receipt(message, call_seq))
+            converted[call_index] = (
+                call_seq,
+                _tool_call_receipt(message, call_seq),
+            )
             converted_seqs.add(call_seq)
         for index in indexes[1:]:
             seq, result_message = records[index]
@@ -451,11 +456,17 @@ def _fold_consumed_tool_exchanges(
                 )
                 converted_seqs.add(seq)
 
-    smaller = lambda originals, candidates: _strictly_smaller(
-        sum(token_counter(message) for _, message in originals),
-        sum(map(token_counter, candidates)),
+    def smaller(
+        originals: Sequence[tuple[int, Message]], candidates: Sequence[Message]
+    ) -> bool:
+        return _strictly_smaller(
+            sum(token_counter(message) for _, message in originals),
+            sum(map(token_counter, candidates)),
+        )
+
+    fine = range_receipt_candidate(
+        converted, allows=eligibility.allows, is_smaller=smaller
     )
-    fine = range_receipt_candidate(converted, allows=eligibility.allows, is_smaller=smaller)
     coarse = range_receipt_candidate(
         fine.records,
         allows=eligibility.allows,
@@ -525,6 +536,7 @@ def _evict_persisted_records(
             result_indexes[message.tool_result.tool_call_id].append(index)
     def is_current(index: int) -> bool:
         return current_receipt(*output[index])
+
     def can_regenerate(index: int) -> bool:
         seq, message = output[index]
         replacement = generated_by_seq.get(seq)
@@ -846,7 +858,9 @@ def _generic_result_receipt(message: Message, call: ToolCall, seq: int) -> Messa
     result = message.tool_result
     if result is None:
         return message
-    status = "canceled" if result.is_canceled else "error" if result.is_error else "success"
+    status = (
+        "canceled" if result.is_canceled else "error" if result.is_error else "success"
+    )
     tail = _one_line(result.content[-240:], limit=240)
     digest = f"status={status}; sha256={_content_digest(result.content)[:16]}"
     if tail:
