@@ -4231,7 +4231,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
         message.tool_result for message in child_messages if message.tool_result
     )
     assert child_result.is_error
-    assert child_result.content == "unknown tool: bash"
+    assert child_result.content == "tool not allowed by session tool policy: bash"
 
 
 @pytest.mark.asyncio
@@ -4298,7 +4298,10 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
         if message.tool_result
     )
     assert child_result.is_error
-    assert child_result.content == "unknown tool: remote:write"
+    assert (
+        child_result.content
+        == "tool not allowed by session tool policy: remote:write"
+    )
 
 
 @pytest.mark.asyncio
