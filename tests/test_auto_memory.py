@@ -9,6 +9,9 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.server_backend import StopThenFailBackend
+from tests.support.server_client import event as server_event
+from tests.support.server_client import request as server_request
 from zeta.codex import CodexCredentialDriver
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -20,18 +23,9 @@ from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.oauth import ProviderLoginRequiredError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
-from zeta.protocol.types import (
-    Message,
-    MessageOrigin,
-    MessageRole,
-    TextContent,
-    ToolCall,
-    ToolResult,
-    ToolUseContent,
-    with_message_origin,
-)
 from zeta.providers.anthropic import AnthropicCredentialDriver
 from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -152,50 +146,50 @@ async def test_scheduled_retry_waits_for_scanner_recovery(tmp_path: Path) -> Non
     assert calls == 1
 
 
-def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
+@pytest.mark.asyncio
+async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
     tmp_path: Path,
 ) -> None:
     runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
-    runner.session_dir.joinpath("conversation.jsonl").unlink()
-    store = ConversationStore(runner.session_dir.parent, session_id=SESSION)
-    store.append_message(
-        Message(
-            MessageRole.ASSISTANT,
-            [ToolUseContent(ToolCall("bash-1", "bash", {"command": "exit 7"}))],
+    target = runner.session_dir / "conversation.jsonl"
+    target.unlink()
+    backend = StopThenFailBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=runner.session_dir.parents[1],
+        socket_path=Path("/tmp") / f"zeta-memory-fidelity-{tmp_path.name}.sock",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        await server_request(
+            reader, writer, 1, "hello", {"protocol_version": "1.2"}
         )
-    )
-    store.append_message(
-        with_message_origin(
-            Message(
-                MessageRole.USER,
-                tool_result=ToolResult(
-                    "bash-1",
-                    "failed",
-                    structured_content={"exit_code": 7},
-                    content_blocks=[
-                        {"type": "image", "data": "YWJj", "mimeType": "image/png"}
-                    ],
-                ),
-            ),
-            MessageOrigin.USER,
+        created = await server_request(
+            reader, writer, 2, "new_session", {"provider": "codex"}
         )
-    )
-    steering = with_message_origin(
-        Message(MessageRole.USER, [TextContent("drop me")]), MessageOrigin.USER
-    )
-    store.append_client_delivery(
-        "scan-steer", "steer", "queued", {"accepted": True}
-    )
-    store.queue_client_steering(steering, "scan-steer")
-    store.drop_client_steering("abort")
-    expected_seq = store.replay()[-1].seq
-    store.close()
+        session_id = created[-1]["result"]["session"]["session_id"]
+        await server_request(reader, writer, 3, "send", {"text": "stop this turn"})
+        await backend.started.wait()
+        await server_request(reader, writer, 4, "abort")
+        await server_event(reader, "turn_aborted")
+        await server_request(reader, writer, 5, "send", {"text": "fail this turn"})
+        await server_event(reader, "error")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+
+    source = runner.session_dir.parent / session_id / "conversation.jsonl"
+    target.write_bytes(source.read_bytes())
+    expected_seq = json.loads(target.read_text(encoding="utf-8").splitlines()[-1])["seq"]
 
     latest, offset, _tokens = runner._transcript_state()
 
-    assert latest == expected_seq
-    assert offset == runner.session_dir.joinpath("conversation.jsonl").stat().st_size
     assert runner._transcript_scan_error is None
+    assert latest == expected_seq
+    assert offset == target.stat().st_size
 
 
 def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:

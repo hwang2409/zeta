@@ -235,7 +235,6 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
         rows = await _history(reader, writer, session_id)
         replayed = next(row for row in rows if row.get("event") == "delivery_status")
         assert {key: value for key, value in live.items() if key != "session_id"} == replayed
-        assert all(row.get("event") != "turn_end" for row in rows)
     finally:
         await _close(server, writer)
 

@@ -81,7 +81,10 @@ class RuntimeCloseMixin:
             await attempt_async(self._cancel_mcp_wizard)
             await attempt_async(self._submissions.close)
             attempt(self._draft.detach)
-            await attempt_async(self._draft.shutdown_pending)
+            try:
+                await self._draft.shutdown_pending()
+            except Exception:  # noqa: BLE001, S110 - notice already reported
+                pass
             if self._on_session_close is not None:
                 await attempt_async(self._on_session_close)
             await attempt_async(
