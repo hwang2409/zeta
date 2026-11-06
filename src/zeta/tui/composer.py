@@ -591,7 +591,9 @@ class ComposerAttachmentMixin:
             pending_attachment_tokens=pending_attachment_tokens,
         )
         if not pending_paths and not attachment_refs(source, self.loop.store.cwd):
-            return build_user_message(value, self.loop.store.cwd)
+            return build_user_message(
+                value, self.loop.store.cwd, attachment_value=source
+            )
 
         notices: list[str] = []
         try:
