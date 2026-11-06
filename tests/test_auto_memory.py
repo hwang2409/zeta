@@ -1768,8 +1768,9 @@ def test_transcript_state_reads_only_appended_rows(
 
     monkeypatch.setattr("zeta.memory.auto.json.loads", counting_loads)
 
-    assert runner._transcript_state() == _fresh_transcript_state(runner)
-    assert parsed == 22  # one incremental parse plus a 21-row reference full scan
+    incremental = runner._transcript_state()
+    assert parsed == 1
+    assert incremental == _fresh_transcript_state(runner)
 
 
 def test_incremental_transcript_state_equals_full_scan_after_many_appends(
