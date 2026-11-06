@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -121,6 +122,19 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
             raise StorageFormatError(
                 "stored-format lock acquisition must run off the event loop"
             )
+        if (
+            os.environ.get("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT") == "1"
+            and not (canonical / _MANIFEST).exists()
+        ):
+            try:
+                advance(canonical, expected_epoch=0)
+            except StorageFormatError:
+                for _ in range(100):
+                    if (canonical / _MANIFEST).exists():
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise
         fd = _open_lock(canonical)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
