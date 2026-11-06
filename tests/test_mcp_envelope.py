@@ -203,12 +203,14 @@ async def test_notification_get_event_overflow_degrades_once(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = b"data: " + b" " * LIMIT + b"{}\n\n"
+    allow_get_response = asyncio.Event()
     get_requests = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal get_requests
         if request.method == "GET":
             get_requests += 1
+            await allow_get_response.wait()
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
@@ -254,11 +256,24 @@ async def test_notification_get_event_overflow_degrades_once(
         MCPConfig(tmp_path / "mcp.json", {"local": client.config}),
     )
     try:
+        failures: list[str] = []
+        actor_failure_sink = client._failure_sink
+        assert actor_failure_sink is not None
+
+        def record_failure(reason: str) -> None:
+            failures.append(reason)
+            actor_failure_sink(reason)
+
+        client.set_failure_sink(record_failure)
+        allow_get_response.set()
         for _ in range(100):
             if mount.statuses["local"].state == "degraded":
                 break
             await asyncio.sleep(0.001)
         assert mount.statuses["local"].state == "degraded"
+        assert failures == [
+            f"MCP HTTP notification event exceeded the {LIMIT} response limit"
+        ]
         assert get_requests == 1
         assert mount._actors["local"]._requests == {}
     finally:
