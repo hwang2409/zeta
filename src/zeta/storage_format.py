@@ -362,6 +362,3 @@ class WriterLease:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
-
-    def __del__(self) -> None:
-        self.close()
