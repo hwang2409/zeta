@@ -290,6 +290,35 @@ def test_unknown_consumed_tool_result_gets_bounded_generic_receipt() -> None:
     assert len(receipt.tool_result.content) <= 440
 
 
+def test_exchange_fold_stops_at_target_and_keeps_newest_consumed_exchange() -> None:
+    source: dict[int, Message] = {}
+    for offset in range(3):
+        call, result = tool_pair(
+            "paper__get_guide",
+            f"targeted-fold-{offset}",
+            "short output",
+        )
+        source.update({offset * 2 + 1: call, offset * 2 + 2: result})
+
+    def token_count(message: Message) -> int:
+        if message.metadata.get("eviction_range"):
+            return 1
+        return 110 if message.metadata.get("context_evicted") else 100
+
+    evicted = evict_messages(
+        list(source.items()),
+        fixed_tokens=0,
+        target_tokens=410,
+        token_counter=token_count,
+        source_messages=source,
+    )
+
+    assert evicted.reached_target is True
+    assert evicted.tokens_after <= 410
+    assert evicted.source_seqs[-2:] == (5, 6)
+    assert evicted.messages[-2:] == [source[5], source[6]]
+
+
 def test_repeated_tool_heavy_evictions_keep_floor_bounded() -> None:
     records: list[tuple[int, Message]] = []
     sources: dict[int, Message] = {}

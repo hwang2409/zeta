@@ -401,6 +401,7 @@ def _evict_deterministic(
             records,
             allows=eligibility.allows,
             token_counter=token_counter,
+            target_tokens=max(0, target_tokens - fixed_tokens),
         )
         if folded_seqs:
             records = folded
