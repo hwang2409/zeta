@@ -15,13 +15,16 @@ from zeta.core.abort import AbortSignal
 from zeta.mcp import MCPServerConfig, StdioMCPClient
 from zeta.mcp.actors.prompt import CallFinished, CallRequest
 from zeta.mcp.client import canceled_result, make_error_result
+from zeta.mcp.connection import build_mcp_client
 from zeta.mcp.envelope import MCPCallEnvelope, MCPCallLimits
 from zeta.mcp.server_actor import (
     MCPServerActor,
     MCPServerStatus,
     _TransportFailure,
 )
+from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
+from zeta.tools.registry import ToolRegistry
 
 LIMIT = 512
 LIMITS = MCPCallLimits(max_wire_bytes=LIMIT, spill_after_bytes=64)
@@ -66,6 +69,38 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_constructed_stdio_client_uses_resolved_wire_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    one_mib = 1024 * 1024
+    limits = MCPCallLimits(max_wire_bytes=one_mib, spill_after_bytes=64 * 1024)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        mcp_limits=limits,
+    )
+    source = _server_source(
+        f"""        value = {{"jsonrpc": "2.0", "id": request["id"], "result": {{"content": [{{"type": "text", "text": "x" * {one_mib}}}]}}}}
+        print(json.dumps(value, separators=(",", ":")), flush=True)"""
+    )
+    client = build_mcp_client(
+        MCPServerConfig("configured", "stdio", sys.executable, ("-u", "-c", source)),
+        registry=registry,
+    )
+    try:
+        await client.connect()
+        result = await client.call_tool("echo", {}, AbortSignal())
+        assert result == make_error_result(
+            "MCP tool configured__echo exceeded the 1 MiB response limit"
+        )
+    finally:
+        await client.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_prebuffer_frame_cap_is_hard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -78,7 +113,7 @@ async def test_stdio_prebuffer_frame_cap_is_hard(
         await client.connect()
         result = await client.call_tool("echo", {}, AbortSignal())
         assert result == make_error_result(
-            f"MCP tool frame-cap__echo exceeded the {LIMIT} response limit"
+            f"MCP tool frame-cap__echo exceeded the {LIMIT} bytes response limit"
         )
     finally:
         await client.close()
@@ -109,7 +144,7 @@ async def test_stdio_valid_frames_charge_only_the_matching_call(
         )
         assert results == [
             make_error_result(
-                f"MCP tool owned__echo exceeded the {LIMIT} response limit"
+                f"MCP tool owned__echo exceeded the {LIMIT} bytes response limit"
             ),
             make_error_result(
                 "MCP stdio server owned restarted after a call limit; retry the tool"
@@ -142,7 +177,7 @@ async def test_stdio_unowned_notification_flood_charges_every_pending_call(
             client.call_tool("echo", {"n": 2}, AbortSignal()),
         )
         expected = make_error_result(
-            f"MCP tool notifications__echo exceeded the {LIMIT} response limit"
+            f"MCP tool notifications__echo exceeded the {LIMIT} bytes response limit"
         )
         assert results == [expected, expected]
     finally:
@@ -240,7 +275,7 @@ async def test_simultaneous_stdio_overflows_invalidate_once_and_detach_before_aw
             client.call_tool("echo", {"n": 2}, AbortSignal()),
         )
         expected = make_error_result(
-            f"MCP tool single__echo exceeded the {LIMIT} response limit"
+            f"MCP tool single__echo exceeded the {LIMIT} bytes response limit"
         )
         assert results == [expected, expected]
         assert kill_calls == 1
@@ -467,7 +502,7 @@ async def test_transport_failure_before_call_finished_preserves_typed_invalidati
     class Client:
         def __init__(self) -> None:
             self.result = make_error_result(
-                f"MCP tool ordered__echo exceeded the {LIMIT} response limit"
+                f"MCP tool ordered__echo exceeded the {LIMIT} bytes response limit"
             )
 
         def take_invalidation_result(self, _task):
@@ -511,6 +546,6 @@ async def test_transport_failure_before_call_finished_preserves_typed_invalidati
     actor._handle_call_finished(CallFinished(request, task, client.result, None))
 
     assert await result == make_error_result(
-        f"MCP tool ordered__echo exceeded the {LIMIT} response limit"
+        f"MCP tool ordered__echo exceeded the {LIMIT} bytes response limit"
     )
     await asyncio.gather(*actor._children, return_exceptions=True)

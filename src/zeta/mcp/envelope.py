@@ -11,6 +11,13 @@ from typing import BinaryIO
 from ..tools._spill import SpillStore
 
 _SPILL_WRITE_SIZE = 64 * 1024
+_MEBIBYTE = 1024 * 1024
+
+
+def _format_wire_limit(size: int) -> str:
+    if size % _MEBIBYTE == 0:
+        return f"{size // _MEBIBYTE} MiB"
+    return f"{size} bytes"
 
 
 @dataclass(frozen=True, slots=True)

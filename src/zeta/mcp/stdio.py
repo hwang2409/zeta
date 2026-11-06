@@ -42,6 +42,7 @@ from .envelope import (
     MCPCallLimits,
     MCPTransientQuotaError,
     MCPWireLimitError,
+    _format_wire_limit,
 )
 from .pagination import drain_pages
 
@@ -77,6 +78,28 @@ class _PendingCall:
     owner: asyncio.Task[object] | None
     tool_name: str | None
     wire_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _FrameInvalidation:
+    limit_ids: set[int] | None = None
+    quota_ids: set[int] | None = None
+
+
+async def _append_frame_part(
+    envelope: MCPCallEnvelope,
+    frame: _Frame,
+    part: bytes,
+    pending_ids: Iterable[int],
+) -> _Frame | _FrameInvalidation:
+    frame.record(len(part), pending_ids)
+    try:
+        await envelope.append(part)
+    except MCPWireLimitError:
+        return _FrameInvalidation(limit_ids=set(frame.bytes_by_pending_id))
+    except MCPTransientQuotaError:
+        return _FrameInvalidation(quota_ids=set(frame.bytes_by_pending_id))
+    return frame
 
 
 _Outcome = Literal["limit", "quota", "restart", "canceled", "transport", "closed"]
@@ -283,7 +306,7 @@ class StdioMCPClient(MCPClient):
     def _limit_result(self, tool_name: str) -> StructuredToolResult:
         return make_error_result(
             f"MCP tool {self.config.name}__{tool_name} exceeded the "
-            f"{self._limits.max_wire_bytes} response limit"
+            f"{_format_wire_limit(self._limits.max_wire_bytes)} response limit"
         )
 
     def _restart_result(self) -> StructuredToolResult:
@@ -584,24 +607,20 @@ class StdioMCPClient(MCPClient):
                     else:
                         part = remaining[: separator + 1]
                         remaining = remaining[separator + 1 :]
-                    frame.record(len(part), pending_at_arrival)
-                    try:
-                        await envelope.append(part)
-                    except (MCPWireLimitError, MCPTransientQuotaError) as exc:
-                        charged = set(frame.bytes_by_pending_id)
+                    append_result = await _append_frame_part(
+                        envelope, frame, part, pending_at_arrival
+                    )
+                    if isinstance(append_result, _FrameInvalidation):
                         invalidation = self._start_invalidation(
                             MCPTransportError("MCP stdio response exceeded its bounds"),
-                            limit_ids=charged
-                            if isinstance(exc, MCPWireLimitError)
-                            else None,
-                            quota_ids=charged
-                            if isinstance(exc, MCPTransientQuotaError)
-                            else None,
+                            limit_ids=append_result.limit_ids,
+                            quota_ids=append_result.quota_ids,
                             default_outcome="restart",
                         )
                         if invalidation.task is not None:
                             await asyncio.shield(invalidation.task)
                         return
+                    frame = append_result
                     if separator < 0:
                         break
                     frame.value = await self._finish_frame(envelope)
