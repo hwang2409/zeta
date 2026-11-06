@@ -1751,6 +1751,46 @@ def _fresh_transcript_state(runner: AutoMemoryReconciler) -> tuple[int, int, int
     return fresh._transcript_state()
 
 
+@pytest.mark.parametrize("change", ["replace", "same_size", "inode_reuse"])
+def test_transcript_chunk_validates_durable_offset_after_rewrite(
+    tmp_path: Path, change: str
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=0)
+    path = runner.session_dir / "conversation.jsonl"
+
+    def row(seq: int, text: str) -> bytes:
+        return (
+            json.dumps({"seq": seq, "type": "message", "data": {"text": text}})
+            + "\n"
+        ).encode()
+
+    initial = b"".join((row(1, "a" * 600), row(2, "b"), row(3, "c"), row(4, "d")))
+    path.write_bytes(initial)
+    _latest, durable_offset, durable_tokens = runner._transcript_state()
+    row_one_end = len(row(1, "a" * 600))
+    assert durable_offset == len(initial)
+    runner.state.record_success(
+        seq_start=1,
+        seq_end=1,
+        reason="test",
+        end_offset=row_one_end,
+        end_tokens=durable_tokens,
+    )
+
+    replacement = b"".join((row(1, "a"), row(2, "b"), row(3, "c" * 600), row(4, "d")))
+    if change == "replace":
+        temporary = path.with_suffix(".replacement")
+        temporary.write_bytes(replacement)
+        temporary.replace(path)
+    else:
+        assert len(initial) == len(replacement)
+        path.write_bytes(replacement)
+
+    runner._transcript_state()
+    rows, _end_offset, _end_tokens, _scanned_end = runner._transcript_chunk(2, 4)
+    assert [row["seq"] for row in rows] == [2, 3, 4]
+
+
 def test_transcript_state_reads_only_appended_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

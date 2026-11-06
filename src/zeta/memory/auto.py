@@ -113,12 +113,19 @@ class AutoMemoryConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class _TranscriptCursor:
+class _TranscriptEvidence:
     identity: tuple[int, int]
+    size: int
     offset: int
+    prefix_tail: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _TranscriptCursor:
+    evidence: _TranscriptEvidence
     latest_seq: int
     tokens: int
-    prefix_tail: bytes
+    durable: _TranscriptEvidence | None
 
 
 @dataclass(slots=True)
@@ -890,27 +897,44 @@ class AutoMemoryReconciler:
             return None
         return newest_completion, debounce, max_wait
 
+    @staticmethod
+    def _transcript_evidence(
+        handle: object, identity: tuple[int, int], size: int, offset: int
+    ) -> _TranscriptEvidence:
+        assert offset <= size
+        prefix_start = max(0, offset - 64)
+        handle.seek(prefix_start)
+        return _TranscriptEvidence(
+            identity, size, offset, handle.read(offset - prefix_start)
+        )
+
+    @classmethod
+    def _valid_transcript_evidence(
+        cls,
+        handle: object,
+        stat: os.stat_result,
+        evidence: _TranscriptEvidence | None,
+    ) -> bool:
+        if evidence is None or evidence.offset > stat.st_size:
+            return False
+        identity = (stat.st_dev, stat.st_ino)
+        current = cls._transcript_evidence(handle, identity, stat.st_size, evidence.offset)
+        return current.identity == evidence.identity and current.prefix_tail == evidence.prefix_tail
+
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
         try:
             with path.open("rb") as handle:
                 stat = os.fstat(handle.fileno())
-                identity = (stat.st_dev, stat.st_ino)
                 cursor = self._transcript_cursor
-                incremental = (
-                    cursor is not None
-                    and cursor.identity == identity
-                    and stat.st_size >= cursor.offset
+                incremental = cursor is not None and self._valid_transcript_evidence(
+                    handle, stat, cursor.evidence
                 )
-                if incremental and cursor.prefix_tail:
-                    handle.seek(cursor.offset - len(cursor.prefix_tail))
-                    incremental = (
-                        handle.read(len(cursor.prefix_tail)) == cursor.prefix_tail
-                    )
+                durable = cursor.durable if incremental and cursor is not None else None
                 if incremental and cursor is not None:
                     latest = cursor.latest_seq
                     tokens = cursor.tokens
-                    offset = cursor.offset
+                    offset = cursor.evidence.offset
                     handle.seek(offset)
                 else:
                     latest = 0
@@ -929,11 +953,14 @@ class AutoMemoryReconciler:
                     if type(seq) is int:
                         latest = max(latest, seq)
                         tokens += estimated_text_tokens(raw.decode("utf-8"))
-                prefix_start = max(0, offset - 64)
-                handle.seek(prefix_start)
-                prefix_tail = handle.read(offset - prefix_start)
+                identity = (stat.st_dev, stat.st_ino)
+                evidence = self._transcript_evidence(handle, identity, stat.st_size, offset)
+                if incremental and durable is None and self._last_reconciled_bytes <= offset:
+                    durable = self._transcript_evidence(
+                        handle, identity, stat.st_size, self._last_reconciled_bytes
+                    )
                 self._transcript_cursor = _TranscriptCursor(
-                    identity, offset, latest, tokens, prefix_tail
+                    evidence, latest, tokens, durable
                 )
                 return latest, offset, tokens
         except FileNotFoundError:
@@ -956,14 +983,11 @@ class AutoMemoryReconciler:
                 cursor = self._transcript_cursor
                 resume = (
                     cursor is not None
-                    and cursor.identity == (stat.st_dev, stat.st_ino)
-                    and cursor.offset <= stat.st_size
+                    and self._valid_transcript_evidence(handle, stat, cursor.evidence)
+                    and self._valid_transcript_evidence(handle, stat, cursor.durable)
                     and self.last_reconciled_seq < start
                     and self._last_reconciled_bytes <= stat.st_size
                 )
-                if resume and cursor is not None and cursor.prefix_tail:
-                    handle.seek(cursor.offset - len(cursor.prefix_tail))
-                    resume = handle.read(len(cursor.prefix_tail)) == cursor.prefix_tail
                 if resume:
                     handle.seek(self._last_reconciled_bytes)
                     tokens = self._last_reconciled_tokens
