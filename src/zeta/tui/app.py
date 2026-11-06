@@ -1172,7 +1172,8 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
-                # Any exit before startup drained its queue keeps accepted input as the draft.
+                # Any exit before startup drained its queue keeps accepted input as
+                # the draft; this runs before cleanup detaches the session.
                 self._restore_startup_submissions()
                 await cancel_activation(activation_task)
                 await self._prepare_ui_session_change()
@@ -1201,6 +1202,9 @@ class TUIApp(
                         self._active_session = None
                         self._terminal_restored = True
         finally:
+            # Covers failures before the inner cleanup (a prompt crash during
+            # activation); a no-op once the inner cleanup restored the queue.
+            self._restore_startup_submissions()
             if watchdog is not None:
                 await watchdog.close()
             if not self._suspending_for_fork:

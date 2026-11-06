@@ -7836,6 +7836,54 @@ async def test_exit_during_activation_keeps_accepted_input_in_draft(
 
 
 @pytest.mark.asyncio
+async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        await asyncio.Event().wait()
+
+    async def type_then_crash(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        await activation_started.wait()
+        assert app._submit_input("queued before render crash")
+        raise RuntimeError("render crash")
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_crash)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        with pytest.raises(RuntimeError, match="render crash"):
+            await asyncio.wait_for(app.run(session), timeout=10)
+
+    assert DraftPersistence(app._draft.path).load() == "queued before render crash", (
+        "input accepted during activation was lost when the prompt crashed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ctrl_v_paste_waits_for_startup_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
