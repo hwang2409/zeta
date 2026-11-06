@@ -38,6 +38,12 @@ from .client import (
     translate_call_result,
 )
 from .config import MCPServerConfig
+from .envelope import (
+    MCPCallEnvelope,
+    MCPCallLimits,
+    MCPTransientQuotaError,
+    MCPWireLimitError,
+)
 from .oauth import (
     MCPOAuthError,
     refresh_access_token,
@@ -74,6 +80,7 @@ class StreamableHTTPMCPClient(MCPClient):
         client: httpx.AsyncClient | None = None,
         home: str | None = None,
         spill_store: SpillStore | None = None,
+        limits: MCPCallLimits | None = None,
     ) -> None:
         self.config = config
         self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
@@ -88,6 +95,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._notification_task: asyncio.Task[None] | None = None
         self._home = home
         self._spill_store = spill_store or SpillStore()
+        self._limits = limits or MCPCallLimits()
+        self._spill_store.configure_transient_limit(self._limits.max_wire_bytes)
         self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
         self._current_token: MCPOAuthToken | None = None
@@ -158,6 +167,16 @@ class StreamableHTTPMCPClient(MCPClient):
             )
         except MCPCanceled:
             return canceled_result()
+        except MCPWireLimitError:
+            return make_error_result(
+                f"MCP tool {self.config.name}__{name} exceeded the "
+                f"{self._limits.max_wire_bytes} response limit"
+            )
+        except MCPTransientQuotaError:
+            return make_error_result(
+                f"MCP tool {self.config.name}__{name} could not buffer the response "
+                "because the session spill budget is full"
+            )
         except MCPError as exc:
             if self._failure_sink is not None:
                 self._failure_sink(str(exc))
@@ -341,12 +360,12 @@ class StreamableHTTPMCPClient(MCPClient):
                         response,
                         request_id,
                         self._spill_store,
-                        MAX_RESPONSE_BYTES,
+                        self._limits,
                         self._notification_sink,
                     )
                 try:
                     value = await _read_json_body(
-                        response, self._spill_store, MAX_RESPONSE_BYTES
+                        response, self._spill_store, self._limits
                     )
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
@@ -403,7 +422,7 @@ class StreamableHTTPMCPClient(MCPClient):
                 started = asyncio.get_running_loop().time()
                 delivered = False
                 async for value in _iter_sse_events(
-                    response, self._spill_store, MAX_RESPONSE_BYTES
+                    response, self._spill_store, self._limits
                 ):
                     delivered = True
                     _dispatch_sse_notification(value, self._notification_sink)
@@ -486,34 +505,17 @@ async def _drain_pages(
 async def _read_json_body(
     response: httpx.Response,
     spill_store: SpillStore,
-    memory_bound: int,
+    limits: MCPCallLimits,
 ) -> object:
-    """Stream JSON, moving oversized wire bytes to a private spill file."""
-
-    chunks: list[bytes] = []
-    total = 0
-    temporary = None
-    handle: BinaryIO | None = None
+    """Read decoded JSON bytes with a hard aggregate cap."""
+    envelope = MCPCallEnvelope(limits, spill_store)
     try:
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
-            if handle is None and total <= memory_bound:
-                chunks.append(chunk)
-                continue
-            if handle is None:
-                temporary = spill_store.temporary_file()
-                handle = await asyncio.to_thread(temporary.__enter__)
-                buffered = chunks
-                chunks = []
-                await asyncio.to_thread(handle.writelines, buffered)
-            await asyncio.to_thread(handle.write, chunk)
-        if handle is None:
-            return json.loads(b"".join(chunks))
-        await asyncio.to_thread(handle.seek, 0)
-        return await asyncio.to_thread(json.load, handle)
-    finally:
-        if temporary is not None:
-            await asyncio.to_thread(temporary.__exit__, None, None, None)
+        async for chunk in response.aiter_bytes(chunk_size=65_536):
+            await envelope.append(chunk)
+        return await envelope.finish_json()
+    except BaseException:
+        await envelope.close()
+        raise
 
 
 async def _response_detail(response: httpx.Response) -> str:
@@ -554,10 +556,10 @@ async def _read_sse_response(
     response: httpx.Response,
     request_id: int,
     spill_store: SpillStore,
-    memory_bound: int,
+    limits: MCPCallLimits,
     notification_sink: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
-    async for value in _iter_sse_events(response, spill_store, memory_bound):
+    async for value in _iter_sse_events(response, spill_store, limits):
         if type(value) is dict and value.get("id") == request_id:
             return parse_rpc_response(value, request_id)
         _dispatch_sse_notification(value, notification_sink)
@@ -578,7 +580,7 @@ def _dispatch_sse_notification(
 async def _iter_sse_events(
     response: httpx.Response,
     spill_store: SpillStore,
-    memory_bound: int,
+    limits: MCPCallLimits,
 ) -> AsyncIterator[object]:
     """Parse SSE JSON events without materializing oversized data fields."""
 
@@ -594,7 +596,7 @@ async def _iter_sse_events(
         if start_line:
             has_data_line = True
         total += len(separator) + len(data)
-        if handle is None and total <= memory_bound:
+        if handle is None and total <= limits.spill_after_bytes:
             if separator:
                 data_parts.append(separator)
             if data:

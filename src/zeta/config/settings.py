@@ -51,6 +51,7 @@ from types import MappingProxyType
 from typing import Any
 
 from ..core.approval import parse_approval_rule
+from ..mcp.envelope import MCPCallLimits
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_model
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
@@ -87,6 +88,7 @@ _TOP_KEYS = frozenset(
         # Parsed by zeta.remote_sync; global only.
         "remotes",
         "agents",
+        "mcp",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -98,6 +100,7 @@ _PROJECT_SAFE_KEYS = frozenset(
         "workspace_snapshot_cap",
         "tools",
         "disallowed_tools",
+        "mcp",
     }
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
@@ -137,6 +140,9 @@ class Settings:
     memory_token_threshold: int | None = None
     memory_idle_minutes: int | None = None
     command_niceness: int = 10
+    mcp_call_deadline_seconds: float = 300.0
+    mcp_max_wire_bytes: int = 64 * 1024 * 1024
+    mcp_spill_after_bytes: int = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +174,9 @@ class ResolvedConfig:
     memory_token_threshold: int = 50_000
     memory_idle_minutes: int = 10
     command_niceness: int = 10
+    mcp_call_deadline_seconds: float = 300.0
+    mcp_max_wire_bytes: int = 64 * 1024 * 1024
+    mcp_spill_after_bytes: int = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +211,18 @@ def load_settings(
     global_allow, global_deny = _validate_policy_layer(global_data, global_path)
     project_allow, project_deny = _validate_policy_layer(project_data, project_path)
     merged = _deep_merge(global_data, project_data)
+    global_mcp = global_data.get("mcp", {})
+    project_mcp = project_data.get("mcp", {})
+    if not isinstance(global_mcp, Mapping):
+        global_mcp = {}
+    if not isinstance(project_mcp, Mapping):
+        project_mcp = {}
+    defaults = MCPCallLimits()
+    merged["mcp"] = {
+        "call_deadline_seconds": min(float(global_mcp.get("call_deadline_seconds", defaults.deadline_seconds)), float(project_mcp.get("call_deadline_seconds", defaults.deadline_seconds))),
+        "max_wire_bytes": min(int(global_mcp.get("max_wire_bytes", defaults.max_wire_bytes)), int(project_mcp.get("max_wire_bytes", defaults.max_wire_bytes))),
+        "spill_after_bytes": min(int(global_mcp.get("spill_after_bytes", defaults.spill_after_bytes)), int(project_mcp.get("spill_after_bytes", defaults.spill_after_bytes))),
+    }
     tool_allow, tool_allow_layers, tool_deny = _merge_tool_policy(
         global_data=global_data,
         project_data=project_data,
@@ -304,6 +325,9 @@ def resolve(
         memory_token_threshold=settings.memory_token_threshold or 50_000,
         memory_idle_minutes=settings.memory_idle_minutes or 10,
         command_niceness=settings.command_niceness,
+        mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
+        mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
+        mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
     )
 
 
@@ -523,6 +547,19 @@ def _validate(
     command_niceness = _validated_int_range(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
+    mcp = data.get("mcp", {})
+    if not isinstance(mcp, Mapping):
+        raise SettingsError("mcp settings must be a table")
+    for key in mcp.keys() - {"call_deadline_seconds", "max_wire_bytes", "spill_after_bytes"}:
+        notices.append(f"settings · ignored unknown key 'mcp.{key}'")
+    try:
+        mcp_limits = MCPCallLimits(
+            deadline_seconds=float(mcp.get("call_deadline_seconds", 300.0)),
+            max_wire_bytes=int(mcp.get("max_wire_bytes", 64 * 1024 * 1024)),
+            spill_after_bytes=int(mcp.get("spill_after_bytes", 256 * 1024)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"invalid mcp settings: {exc}") from exc
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False
@@ -556,6 +593,9 @@ def _validate(
         memory_token_threshold=memory_token_threshold,
         memory_idle_minutes=memory_idle_minutes,
         command_niceness=10 if command_niceness is None else command_niceness,
+        mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
+        mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
+        mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
     )
 
 
