@@ -174,15 +174,7 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
         if outcome is not None and outcome not in {"in_flight", "succeeded", "failed"}:
             raise ValueError
         error = value.get("last_error")
-        legacy_errors = {
-            "authentication failed": "authentication failed; log in again",
-            "rate limited": "rate limited; retry later",
-            "invalid usage response": "invalid usage response; retry later",
-            "usage request failed": "network error; check your connection and retry",
-        }
-        if error in legacy_errors:
-            error = legacy_errors[error]
-        elif error is not None and error not in {
+        if error is not None and error not in {
             "authentication failed; log in again",
             "rate limited; retry later",
             "invalid usage response; retry later",
