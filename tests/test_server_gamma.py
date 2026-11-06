@@ -23,6 +23,8 @@ from tests.test_server import (
 )
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.providers.anthropic_payload import build_messages_payload
+from zeta.providers.codex_payload import build_responses_payload
 from zeta.server import ZetaServer
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
@@ -708,6 +710,66 @@ async def test_send_images_emits_user_message_with_attachment_summary(
             {"name": "shot.png", "mime_type": "image/png", "size": len(PNG)}
         ]
         await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_model_switch_keeps_image_before_prompt_in_provider_request(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["user_message_event"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        settings = await _request(
+            reader,
+            writer,
+            3,
+            "set_settings",
+            {
+                "session_id": session_id,
+                "model": "claude-sonnet-5",
+                "approval_mode": "ask",
+            },
+        )
+        assert settings[-1]["result"]["model"] == "claude-sonnet-5"
+        image = {
+            "name": "circle.png",
+            "mime_type": "image/png",
+            "data": base64.b64encode(PNG).decode(),
+        }
+        await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {"session_id": session_id, "text": "what shape is this?", "images": [image]},
+        )
+        await _event(reader, "agent_end")
+
+        messages = backend.calls[0][0]
+        anthropic = build_messages_payload(
+            messages,
+            [],
+            model="claude-sonnet-5",
+            max_tokens=4096,
+            thinking_budget=2048,
+        )
+        codex = build_responses_payload(messages, [], model="gpt-5.6-luna")
+
+        assert [block["type"] for block in anthropic["messages"][-1]["content"]] == [
+            "image",
+            "text",
+        ]
+        assert [block["type"] for block in codex["input"][-1]["content"]] == [
+            "input_image",
+            "input_text",
+        ]
     finally:
         await _close(server, writer)
 
@@ -1952,5 +2014,238 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
 
         monkeypatch.setattr(server.control, "unhealthy", lambda: False)
         monkeypatch.setattr(server.runtime, "resume_session", real_resume)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_reaches_echo_and_history(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        hello = await _hello(
+            reader,
+            writer,
+            [
+                "user_message_event",
+                "user_message_delivery_id",
+                "delivery_id",
+                "send_images_delivery_id",
+            ],
+        )
+        assert "send_images_delivery_id" in hello["capabilities"]["features"]
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        image = {
+            "name": "shot.png",
+            "mime_type": "image/png",
+            "data": base64.b64encode(PNG).decode(),
+        }
+        await _request(
+            reader,
+            writer,
+            3,
+            "send_images",
+            {
+                "session_id": session_id,
+                "text": "look",
+                "images": [image],
+                "delivery_id": "image-3",
+            },
+        )
+        event = await _event(reader, "user_message")
+        assert event.get("delivery_id") == "image-3"
+        await _event(reader, "agent_end")
+        history = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        user_rows = [row for row in history if row["role"] == "user"]
+        assert user_rows[0].get("delivery_id") == "image-3"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_retry_is_idempotent(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("seen")]), ScriptedTurn([TextContent("again")])]
+    )
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(PNG).decode(),
+                }
+            ],
+            "delivery_id": "image-retry",
+        }
+        first = await _request(reader, writer, 3, "send_images", params)
+        assert first[-1].get("result", {}).get("accepted") is True, first
+        rows = [
+            json.loads(line)
+            for line in (
+                tmp_path / "home" / "sessions" / session_id / "conversation.jsonl"
+            )
+            .read_text()
+            .splitlines()[1:]
+        ]
+        delivery_row = next(row for row in rows if row.get("type") == "client_delivery")
+        assert set(delivery_row["data"]) == {
+            "delivery_id",
+            "method",
+            "status",
+            "outcome",
+        }
+        await _event(reader, "agent_end")
+    finally:
+        await _close(server, writer)
+
+    restarted = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(restarted)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        duplicate = await _request(reader, writer, 5, "send_images", params)
+        assert duplicate[-1].get("result") == {
+            **first[-1]["result"],
+            "duplicate": True,
+        }
+        assert len(backend.calls) == 1
+    finally:
+        await _close(restarted, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(PNG).decode(),
+                }
+            ],
+            "delivery_id": "image-conflict",
+        }
+        await _request(reader, writer, 3, "send_images", params)
+        await _event(reader, "agent_end")
+        conflict = await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {**params, "text": "different"},
+        )
+        assert conflict[-1].get("error", {}).get("code") == -32010
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_uses_semantic_image_payload(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        encoded = base64.b64encode(PNG).decode()
+        params = {
+            "session_id": session_id,
+            "text": "look",
+            "images": [
+                {
+                    "name": "shot.png",
+                    "mime_type": "image/png",
+                    "data": encoded,
+                }
+            ],
+            "delivery_id": "image-semantic",
+        }
+        first = await _request(reader, writer, 3, "send_images", params)
+        await _event(reader, "agent_end")
+        wrapped = "\n".join(encoded[index : index + 20] for index in range(0, len(encoded), 20))
+        duplicate = await _request(
+            reader,
+            writer,
+            4,
+            "send_images",
+            {
+                **params,
+                "images": [{**params["images"][0], "data": wrapped, "ignored": True}],
+            },
+        )
+        assert duplicate[-1].get("result") == {
+            **first[-1]["result"],
+            "duplicate": True,
+        }
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_images_delivery_id_requires_its_feature(tmp_path: Path) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        frames = await _request(
+            reader,
+            writer,
+            3,
+            "send_images",
+            {
+                "session_id": session_id,
+                "text": "look",
+                "images": [
+                    {
+                        "name": "shot.png",
+                        "mime_type": "image/png",
+                        "data": base64.b64encode(PNG).decode(),
+                    }
+                ],
+                "delivery_id": "image-no-feature",
+            },
+        )
+        assert frames[-1].get("error", {}).get("code") == -32602
     finally:
         await _close(server, writer)

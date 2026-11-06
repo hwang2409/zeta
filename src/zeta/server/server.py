@@ -60,7 +60,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "switch_branch",
     }
 )
-_DELIVERY_MUTATIONS = frozenset({"send", "steer"})
+_DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
 
 
 class ZetaServer:
@@ -712,14 +712,16 @@ class _Client:
         if method == "model_catalog":
             return ergonomics.catalog(runtime)
         store = ergonomics.active(runtime, params)
+        if method == "send_images":
+            return await self.server.control.deliveries.send_images(
+                params, self.features
+            )
         if method == "session_settings":
             return ergonomics.settings(runtime)
         if method in slash_commands.READ_REQUESTS:
             return await slash_commands.read_request(
                 method, runtime, self.server.control.require_idle, params, self
             )
-        if method == "send_images":
-            self.server.control.reject_client_turn_if_detached()
         await self.server.control.require_idle()
         if method == "slash_run":
             register = self.server.control.model_input_registrar(self.features)
@@ -730,16 +732,6 @@ class _Client:
                 approval_control=self.server.control,
             )
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
-        if method == "send_images":
-            message = ergonomics.image_message(runtime, params)
-            await self.server.control.user_message(
-                params.get("text", ""),
-                "send",
-                self.features,
-                ergonomics.attachment_summary(message),
-            )
-            self.server.control.start_turn(params.get("text", ""), message)
-            return {"accepted": True, "session_id": runtime.session_id}
         if method == "set_settings":
             model = _required_string(params, "model")
             mode = _required_string(params, "approval_mode")
