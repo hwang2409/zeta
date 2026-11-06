@@ -92,30 +92,17 @@ class _HangingByteStream(httpx.AsyncByteStream):
         self._closed.set()
 
 
-class _KeepaliveStream(httpx.AsyncByteStream):
-    """Emit ``preface``, drip a keepalive line, then emit the tail."""
+class _ClockedByteStream(httpx.AsyncByteStream):
+    """Emit controlled chunks while advancing a fake monotonic clock."""
 
-    def __init__(
-        self,
-        preface: bytes,
-        keepalive: bytes,
-        keepalive_after: float,
-        tail: bytes,
-        tail_after: float,
-    ) -> None:
-        self._preface = preface
-        self._keepalive = keepalive
-        self._keepalive_after = keepalive_after
-        self._tail = tail
-        self._tail_after = tail_after
+    def __init__(self, clock: list[float], chunks: list[tuple[float, bytes]]) -> None:
+        self._clock = clock
+        self._chunks = chunks
 
     async def __aiter__(self):
-        if self._preface:
-            yield self._preface
-        await asyncio.sleep(self._keepalive_after)
-        yield self._keepalive
-        await asyncio.sleep(self._tail_after)
-        yield self._tail
+        for elapsed, chunk in self._chunks:
+            self._clock[0] += elapsed
+            yield chunk
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
@@ -450,39 +437,64 @@ async def test_anthropic_backend_stall_budget_exhausts(
     await client.aclose()
 
 
-async def test_anthropic_backend_keepalive_lines_reset_watchdog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_keepalives_reset_transport_but_not_progress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(anthropic_module.asyncio, "sleep", _no_op_sleep)
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
-    preface = ANTHROPIC_SSE.encode()[: ANTHROPIC_SSE.encode().index(b"content_block_delta")]
+    clock = [0.0]
+    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
+    progress = transport_module.StreamProgress()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            stream=_KeepaliveStream(
-                preface,
-                b": ping\n\n",
-                keepalive_after=0.05,
-                tail=ANTHROPIC_SSE.encode()[len(preface):],
-                tail_after=0.05,
-            ),
-            request=request,
-        )
+    async def source():
+        for _ in range(20):
+            clock[0] += 60.0
+            yield "keepalive"
 
-    client = _mock_client(handler)
-    backend = AnthropicBackend(
-        client=client,
-        token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=0.15,
-        stall_retries=2,
+    watched = stall_watchdog(
+        source(),
+        seconds=90.0,
+        on_stall=lambda elapsed: _StubError(f"transport stalled after {elapsed}"),
+        on_model_stall=lambda elapsed: _StubError(
+            f"model progress stalled after {elapsed}", is_stall=True
+        ),
+        progress=progress,
     )
-    events = [event async for event in backend.complete([], [])]
+    seen = []
+    with pytest.raises(_StubError, match="model progress stalled after 900.0"):
+        async for item in watched:
+            seen.append(item)
+            progress.observe(("ping", {"type": "ping"}))
 
-    assert [event for event in events if event.type is StreamEventType.RETRY] == []
-    assert events[-1].type is StreamEventType.MESSAGE_END
-    await client.aclose()
+    assert len(seen) == 15
+    assert clock == [900.0]
+
+
+async def test_decoded_progress_resets_progress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
+    progress = transport_module.StreamProgress()
+
+    async def source():
+        for index in range(20):
+            clock[0] += 60.0
+            yield index
+
+    watched = stall_watchdog(
+        source(),
+        seconds=90.0,
+        on_stall=lambda elapsed: _StubError(f"stalled after {elapsed}", is_stall=True),
+        progress=progress,
+    )
+    seen = []
+    async for item in watched:
+        seen.append(item)
+        event_type = "message_start" if item in {4, 14} else "ping"
+        progress.observe((event_type, {"type": event_type}))
+
+    assert seen == list(range(20))
+    assert clock == [1200.0]
+    assert progress.maximum_gap_s() == 600.0
 
 
 async def _no_op_sleep(_delay: float) -> None:
@@ -643,6 +655,42 @@ async def test_oauth_credential_lock_wait_is_bounded(
         assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
             _codex_access_token()
         )
+
+
+async def test_codex_keepalives_do_not_reset_progress_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_ClockedByteStream(
+                clock,
+                [
+                    (60.0, b'event: keepalive\ndata: {"type":"keepalive"}\n\n')
+                    for _ in range(15)
+                ],
+            ),
+            request=request,
+        )
+
+    client = _mock_client(handler)
+    backend = CodexBackend(
+        client=client,
+        token_store=_codex_store(tmp_path / "codex.json"),
+        base_url="https://test.invalid/codex/responses",
+        stall_seconds=90.0,
+        stall_retries=0,
+    )
+    with pytest.raises(CodexStreamError, match="model progress stalled for 900s") as excinfo:
+        [event async for event in backend.complete([], [])]
+
+    assert excinfo.value.is_stall is True
+    await client.aclose()
 
 
 async def test_codex_backend_stalls_and_retries_mid_stream(

@@ -457,7 +457,7 @@ async def test_transport_defers_failures_after_stream_output_to_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stall_retries_ignore_shared_retry_window(
+async def test_stall_retries_honor_explicit_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempts = 0
@@ -497,7 +497,7 @@ async def test_stall_retries_ignore_shared_retry_window(
             pass
 
     assert attempts == 5
-    assert now == 120.0
+    assert now == 160.0
 
 
 @pytest.mark.asyncio
@@ -583,7 +583,9 @@ async def test_stall_retries_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_stall_retry_window_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_non_stall_retry_after_stops_at_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = 0
     now = 0.0
     monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
@@ -606,7 +608,7 @@ async def test_non_stall_retry_window_unchanged(monkeypatch: pytest.MonkeyPatch)
         ):
             pass
     assert attempts == 2
-    assert now == 60.0
+    assert now == 40.0
 
 
 @pytest.mark.asyncio

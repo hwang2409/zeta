@@ -48,6 +48,7 @@ from .transport import (
     HTTPClientLease,
     SSEEventAccumulator,
     StreamFinished,
+    StreamProgress,
     build_response_error,
     cleanup_transport,
     close_resource,
@@ -620,6 +621,7 @@ async def _decode_response(
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
     finished = StreamFinished()
+    progress = StreamProgress()
     message_state = "not-started"
     started_at = time.monotonic() if stream_started_at is None else stream_started_at
     last_event_at = started_at
@@ -653,6 +655,7 @@ async def _decode_response(
                 bytes_received=bytes_received,
                 sse_events_received=sse_events_received,
                 last_event_at=last_event_at,
+                max_progress_gap_s=progress.maximum_gap_s(),
                 open_blocks=open_block_count,
                 closed_blocks=closed_block_count,
                 stop_reason=stop_reason,
@@ -722,6 +725,7 @@ async def _decode_response(
                     bytes_received=bytes_received,
                     sse_events_received=sse_events_received,
                     last_event_at=last_event_at,
+                    max_progress_gap_s=progress.maximum_gap_s(),
                     open_blocks=open_count,
                     closed_blocks=closed_count,
                     stop_reason=stop_reason,
@@ -751,11 +755,13 @@ async def _decode_response(
             "Anthropic",
             AnthropicStreamError,
             finished=finished,
+            progress=progress,
         ):
             bytes_received += len(line.encode()) + 1
             record = decoder.feed(line)
             if record is None:
                 continue
+            progress.observe(record)
             sse_events_received += 1
             last_event_at = time.monotonic()
             translated, provider_error = process_provider_error(record)
@@ -785,6 +791,7 @@ async def _decode_response(
 
     record = decoder.finish()
     if record is not None:
+        progress.observe(record)
         sse_events_received += 1
         last_event_at = time.monotonic()
         translated, provider_error = process_provider_error(record)
