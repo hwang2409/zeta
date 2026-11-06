@@ -112,6 +112,15 @@ class AutoMemoryConfig:
             raise ValueError("memory early-trigger maximum wait must be positive")
 
 
+@dataclass(frozen=True, slots=True)
+class _TranscriptCursor:
+    identity: tuple[int, int]
+    offset: int
+    latest_seq: int
+    tokens: int
+    prefix_tail: bytes
+
+
 @dataclass(slots=True)
 class _PendingRange:
     start: int
@@ -173,6 +182,7 @@ class AutoMemoryReconciler:
         self._conflict_retries = 0
         self._resume_catch_up = False
         self._retry_attempts_in_cycle: dict[str, int] = {}
+        self._transcript_cursor: _TranscriptCursor | None = None
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -882,11 +892,35 @@ class AutoMemoryReconciler:
 
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
-        latest = 0
-        tokens = 0
         try:
             with path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                cursor = self._transcript_cursor
+                incremental = (
+                    cursor is not None
+                    and cursor.identity == identity
+                    and stat.st_size >= cursor.offset
+                )
+                if incremental and cursor.prefix_tail:
+                    handle.seek(cursor.offset - len(cursor.prefix_tail))
+                    incremental = (
+                        handle.read(len(cursor.prefix_tail)) == cursor.prefix_tail
+                    )
+                if incremental and cursor is not None:
+                    latest = cursor.latest_seq
+                    tokens = cursor.tokens
+                    offset = cursor.offset
+                    handle.seek(offset)
+                else:
+                    latest = 0
+                    tokens = 0
+                    offset = 0
+                    handle.seek(0)
                 for raw in handle:
+                    if not raw.endswith(b"\n"):
+                        break
+                    offset = handle.tell()
                     try:
                         value = json.loads(raw)
                     except json.JSONDecodeError:
@@ -895,8 +929,15 @@ class AutoMemoryReconciler:
                     if type(seq) is int:
                         latest = max(latest, seq)
                         tokens += estimated_text_tokens(raw.decode("utf-8"))
-                return latest, handle.tell(), tokens
+                prefix_start = max(0, offset - 64)
+                handle.seek(prefix_start)
+                prefix_tail = handle.read(offset - prefix_start)
+                self._transcript_cursor = _TranscriptCursor(
+                    identity, offset, latest, tokens, prefix_tail
+                )
+                return latest, offset, tokens
         except FileNotFoundError:
+            self._transcript_cursor = None
             return 0, 0, 0
 
     def _transcript_chunk(

@@ -1730,6 +1730,108 @@ async def test_drain_bounds_attempts_when_retry_key_stays_due(
     await runner.close()
 
 
+def _append_transcript_row(path: Path, seq: int) -> bytes:
+    raw = (
+        json.dumps({"seq": seq, "type": "message", "data": {"text": f"fact {seq}"}})
+        + "\n"
+    ).encode()
+    with path.open("ab") as handle:
+        handle.write(raw)
+    return raw
+
+
+def _fresh_transcript_state(runner: AutoMemoryReconciler) -> tuple[int, int, int]:
+    fresh = AutoMemoryReconciler(
+        registry=runner.registry,
+        project_id=runner.project_id,
+        session_id=runner.session_id,
+        session_dir=runner.session_dir,
+        invoke=_no_op_proposal,
+    )
+    return fresh._transcript_state()
+
+
+def test_transcript_state_reads_only_appended_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=20)
+    path = runner.session_dir / "conversation.jsonl"
+    runner._transcript_state()
+    _append_transcript_row(path, 21)
+    parsed = 0
+    real_loads = json.loads
+
+    def counting_loads(value: object, *args: object, **kwargs: object) -> object:
+        nonlocal parsed
+        parsed += 1
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr("zeta.memory.auto.json.loads", counting_loads)
+
+    assert runner._transcript_state() == _fresh_transcript_state(runner)
+    assert parsed == 22  # one incremental parse plus a 21-row reference full scan
+
+
+def test_incremental_transcript_state_equals_full_scan_after_many_appends(
+    tmp_path: Path,
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=1)
+    path = runner.session_dir / "conversation.jsonl"
+    assert runner._transcript_state() == _fresh_transcript_state(runner)
+
+    for seq in range(2, 52):
+        _append_transcript_row(path, seq)
+        assert runner._transcript_state() == _fresh_transcript_state(runner)
+
+
+@pytest.mark.parametrize("change", ["truncate", "replace", "rotate"])
+def test_transcript_state_falls_back_after_file_reset(
+    tmp_path: Path, change: str
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=5)
+    path = runner.session_dir / "conversation.jsonl"
+    runner._transcript_state()
+    replacement = b"".join(
+        (
+            json.dumps(
+                {"seq": seq, "type": "message", "data": {"text": f"new {seq}"}}
+            )
+            + "\n"
+        ).encode()
+        for seq in range(10, 13)
+    )
+
+    if change == "truncate":
+        path.write_bytes(replacement)
+    elif change == "replace":
+        temporary = path.with_suffix(".replacement")
+        temporary.write_bytes(replacement)
+        temporary.replace(path)
+    else:
+        path.rename(path.with_suffix(".rotated"))
+        path.write_bytes(replacement)
+
+    assert runner._transcript_state() == _fresh_transcript_state(runner)
+
+
+def test_transcript_state_waits_for_complete_last_line(tmp_path: Path) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=1)
+    path = runner.session_dir / "conversation.jsonl"
+    initial = runner._transcript_state()
+    raw = (
+        json.dumps({"seq": 2, "type": "message", "data": {"text": "later"}})
+        + "\n"
+    ).encode()
+
+    with path.open("ab") as handle:
+        handle.write(raw[:-1])
+    assert runner._transcript_state() == initial
+
+    with path.open("ab") as handle:
+        handle.write(raw[-1:])
+    assert runner._transcript_state() == _fresh_transcript_state(runner)
+
+
 def test_transcript_chunk_skips_delivery_rows_but_advances_offset(tmp_path: Path) -> None:
     runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=1)
     path = runner.session_dir / "conversation.jsonl"
