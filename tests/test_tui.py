@@ -5,6 +5,7 @@ import asyncio
 import base64
 import errno
 import fcntl
+import gc
 import json
 import os
 import pty
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -11961,10 +11963,18 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
 
 
 def test_new_session_continues_after_failed_draft_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    apps = [
-        TUIApp(
+    names = iter(("old", "new"))
+    old_app: weakref.ReferenceType[TUIApp] | None = None
+    old_session_id = ""
+    runs = 0
+    errors: list[BaseException] = []
+
+    def create(_args: object) -> TUIApp:
+        nonlocal old_app, old_session_id
+        name = next(names)
+        app = TUIApp(
             AgentLoop(
                 FakeBackend([]),
                 ConversationStore(tmp_path / name),
@@ -11974,11 +11984,10 @@ def test_new_session_continues_after_failed_draft_save(
             provider="codex",
             model="offline",
         )
-        for name in ("old", "new")
-    ]
-    created = iter(apps)
-    runs = 0
-    errors: list[BaseException] = []
+        if name == "old":
+            old_app = weakref.ref(app)
+            old_session_id = app.loop.store.session_id
+        return app
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
         raise OSError(errno.ENOSPC, "disk full")
@@ -11986,8 +11995,9 @@ def test_new_session_continues_after_failed_draft_save(
     async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
         nonlocal runs
         runs += 1
-        if app is apps[0]:
+        if runs == 1:
             app._new_session_requested = True
+            app._pending_attachments.append(tmp_path / "diagram.png")
             app._draft.schedule("old session draft")
         try:
             await app.close()
@@ -11996,14 +12006,56 @@ def test_new_session_continues_after_failed_draft_save(
         return False, False
 
     monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
-    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: next(created))
+    monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
 
     assert cli_main_module.main([]) == 0
+    stderr = capsys.readouterr().err
     assert errors == [], "new-session transition leaked the draft persistence error"
     assert runs == 2
-    assert apps[0]._draft.pending_text == "old session draft"
+    assert "unsaved composer draft:" in stderr
+    assert old_session_id in stderr
+    assert "old session draft" in stderr
+    assert "diagram.png" in stderr
+    gc.collect()
+    assert old_app is not None and old_app() is None
+
+
+def test_new_session_with_successful_draft_prints_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    names = iter(("old", "new"))
+    runs = 0
+
+    def create(_args: object) -> TUIApp:
+        return TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / next(names)),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            app._new_session_requested = True
+            app._draft.schedule("saved draft")
+        await app.close()
+        return False, False
+
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    assert runs == 2
+    assert "unsaved composer draft:" not in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
