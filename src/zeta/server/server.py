@@ -296,6 +296,7 @@ class _Client:
                 line = await self._read_frame()
                 if not line:
                     break
+                await self.connections.wait_until_settled(self)
                 try:
                     request = self.codec.parse_request(line)
                 except ProtocolError as exc:
@@ -355,13 +356,9 @@ class _Client:
                         written
                         and request["method"] == "hello"
                         and self.role == "controller"
+                        and "approval_reconnect" in self.features
                     ):
-                        self.connections.controller_ready(self)
-                        if (
-                            await self.connections.flush_controller(self)
-                            and "approval_reconnect" in self.features
-                        ):
-                            await self.server.control.controller_ready(reconnect=True)
+                        await self.server.control.controller_ready(reconnect=True)
                 if not self.handshaken:
                     break
         finally:
