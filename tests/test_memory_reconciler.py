@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 
-from zeta.core.store import ConversationStore
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_client import event, request
 from zeta.memory.reconciler import (
     ReconciliationError,
     Transcript,
@@ -13,13 +16,8 @@ from zeta.memory.reconciler import (
     parse_proposal,
     prepare_request,
 )
-from zeta.protocol.types import (
-    Message,
-    MessageOrigin,
-    MessageRole,
-    TextContent,
-    with_message_origin,
-)
+from zeta.protocol.types import MessageOrigin, ToolCall
+from zeta.server import ZetaServer
 
 TODAY = date(2026, 10, 6)
 SESSION = "a" * 32
@@ -366,26 +364,53 @@ def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
     assert all(row["authorship"] != "user" for row in rows)
 
 
-def test_dropped_steer_text_never_reaches_memory_reconciler(tmp_path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    message = with_message_origin(
-        Message(MessageRole.USER, [TextContent("private dropped steer")]),
-        MessageOrigin.USER,
+@pytest.mark.asyncio
+async def test_dropped_steer_text_never_reaches_memory_reconciler(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": "missing"})])]
     )
-    store.append_client_delivery(
-        "dropped-steer",
-        "steer",
-        "queued",
-        {"accepted": True},
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=Path("/tmp") / f"zeta-memory-steer-{tmp_path.name}.sock",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    store.queue_client_steering(message, "dropped-steer")
-    store.drop_client_steering("abort")
-    transcript = Transcript(SESSION, tuple(entry.to_dict() for entry in store.replay()))
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        await request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["delivery_id"]},
+        )
+        await request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await request(reader, writer, 3, "send", {"text": "run"})
+        await event(reader, "approval_request")
+        await request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "private dropped steer", "delivery_id": "dropped-steer"},
+        )
+        await request(reader, writer, 5, "abort")
+        await event(reader, "turn_aborted")
+        transcript = Transcript(
+            SESSION,
+            tuple(entry.to_dict() for entry in server.runtime.opened.store.replay()),
+        )
 
-    request = prepare_request(transcript, {}, as_of=TODAY)
+        reconciliation = prepare_request(transcript, {}, as_of=TODAY)
 
-    assert "private dropped steer" not in request.prompt
-    store.close()
+        assert "private dropped steer" not in reconciliation.prompt
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
 
 
 def test_request_excludes_client_delivery_bookkeeping() -> None:

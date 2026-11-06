@@ -12366,27 +12366,6 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     await app.loop.close()
 
 
-@pytest.mark.asyncio
-async def test_durable_turn_end_reasons_render_in_tui_replay(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    for reason in ("user_stop", "error", "disconnect"):
-        store._append_row("turn_end", {"reason": reason})
-    output = StringIO()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=output, force_terminal=False),
-    )
-
-    app._rebuild_transcript()
-
-    rendered = Text.from_ansi(output.getvalue()).plain
-    assert "turn stopped by the user" in rendered
-    assert "turn ended with an error" in rendered
-    assert "turn ended when the controller disconnected" in rendered
-    await app.close()
-
 
 def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message

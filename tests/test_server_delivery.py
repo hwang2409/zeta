@@ -27,6 +27,8 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
+    ToolUseContent,
     with_message_origin,
 )
 from zeta.server import ZetaServer
@@ -1017,24 +1019,150 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
     store.close()
 
 
-def test_new_steer_acceptance_opens_with_origin_main_reader(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader(
+    tmp_path: Path,
+) -> None:
     old_reader_src = os.environ.get("HISTORY_FIDELITY_ORIGIN_MAIN_SRC")
     if old_reader_src is None:
         pytest.skip(
             "set HISTORY_FIDELITY_ORIGIN_MAIN_SRC to an origin/main worktree src directory"
         )
 
-    session_root = tmp_path / "sessions"
-    store = ConversationStore(session_root, session_id="compat-session")
-    store.append_client_delivery(
-        "compat-steer",
-        "steer",
-        "queued",
-        {"accepted": True},
-    )
-    store.close()
+    class StopThenFailBackend:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
 
-    result = subprocess.run(
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                await asyncio.Event().wait()
+            raise RuntimeError("compatibility error turn")
+            yield  # pragma: no cover - make this an async generator
+
+    backend = StopThenFailBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-origin-main-compat"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    session_id = ""
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": [
+                    "abort_scope",
+                    "delivery_id",
+                    "session_history_fidelity",
+                ],
+            },
+        )
+        created = await _request(
+            reader, writer, 2, "new_session", {"provider": "codex"}
+        )
+        session_id = created[-1]["result"]["session"]["session_id"]
+        store = server.runtime.opened.store
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("bash-compat", "bash", {"command": "exit 7"}))],
+            )
+        )
+        store.append_message(
+            with_message_origin(
+                Message(
+                    MessageRole.USER,
+                    tool_result=ToolResult(
+                        "bash-compat",
+                        "failed",
+                        is_error=True,
+                        structured_content={
+                            "exit_code": 7,
+                            "stdout": "",
+                            "stderr": "failed",
+                            "stdout_truncated": False,
+                            "stderr_truncated": False,
+                            "cwd_after": str(tmp_path),
+                        },
+                        content_blocks=[
+                            {
+                                "type": "image",
+                                "data": "YWJj",
+                                "mimeType": "image/png",
+                            }
+                        ],
+                    ),
+                ),
+                MessageOrigin.USER,
+            )
+        )
+        for delivery_id, terminal in (
+            ("compat-delivered", "delivered"),
+            ("compat-dropped", "dropped"),
+        ):
+            steering = with_message_origin(
+                Message(MessageRole.USER, [TextContent(delivery_id)]),
+                MessageOrigin.USER,
+            )
+            store.append_client_delivery(
+                delivery_id, "steer", "queued", {"accepted": True}
+            )
+            store.queue_client_steering(steering, delivery_id)
+            if terminal == "delivered":
+                batch = store.pending_client_steering()
+                assert batch is not None
+                await store.deliver_client_steering(batch)
+            else:
+                store.drop_client_steering("abort")
+
+        history = await _request(
+            reader,
+            writer,
+            30,
+            "session_history",
+            {"session_id": session_id},
+        )
+        rows = history[-1]["result"]["messages"]
+        assert rows[0]["content"][0]["tool_call"]["arguments"] == {
+            "command": "exit 7"
+        }
+        assert rows[1]["tool_result"]["structured_content"]["exit_code"] == 7
+        assert rows[1]["tool_result"]["content_blocks"] == [
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "size": 3,
+                "data_omitted": True,
+            }
+        ]
+        delivery_rows = [row for row in rows if row.get("event") == "delivery_status"]
+        assert {row["status"] for row in delivery_rows} == {"delivered", "dropped"}
+        assert next(row for row in delivery_rows if row["status"] == "dropped")[
+            "content"
+        ] == [{"type": "text", "text": "steer dropped: abort"}]
+
+        await _request(reader, writer, 3, "send", {"text": "stop this turn"})
+        await backend.started.wait()
+        await _request(reader, writer, 4, "abort")
+        await _event(reader, "turn_aborted")
+        await _request(reader, writer, 5, "send", {"text": "fail this turn"})
+        await _event(reader, "error")
+    finally:
+        await _close(server, writer)
+
+    session_root = tmp_path / "sessions"
+    result = await asyncio.to_thread(
+        subprocess.run,
         [
             sys.executable,
             "-c",
@@ -1042,11 +1170,13 @@ def test_new_steer_acceptance_opens_with_origin_main_reader(tmp_path: Path) -> N
                 "import zeta; from pathlib import Path; "
                 "from zeta.core.store import ConversationStore; "
                 "print(zeta.__file__); "
-                "ConversationStore(Path(__import__('sys').argv[1]), "
-                "session_id='compat-session').close(); "
-                "print('old reader opened session')"
+                "store = ConversationStore(Path(__import__('sys').argv[1]), "
+                "session_id=__import__('sys').argv[2]); "
+                "rows = store.replay(); store.close(); "
+                "print('old reader replayed', len(rows), 'rows')"
             ),
             str(session_root),
+            session_id,
         ],
         cwd=tmp_path,
         env={**os.environ, "PYTHONPATH": old_reader_src},
@@ -1055,7 +1185,7 @@ def test_new_steer_acceptance_opens_with_origin_main_reader(tmp_path: Path) -> N
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "old reader opened session" in result.stdout
+    assert "old reader replayed" in result.stdout
     assert str(Path(old_reader_src) / "zeta" / "__init__.py") in result.stdout
 
 

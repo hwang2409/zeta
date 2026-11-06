@@ -674,17 +674,6 @@ class CheckpointTranscriptMixin:
                 )
                 yield
                 continue
-            if entry.type == "turn_end":
-                reason = entry.data.get("reason")
-                text = {
-                    "user_stop": "turn stopped by the user",
-                    "error": "turn ended with an error",
-                    "disconnect": "turn ended when the controller disconnected",
-                }.get(reason)
-                if text is not None:
-                    self._print_system(text)
-                yield
-                continue
             if entry.type != "message":
                 if (
                     entry.type == "notification"

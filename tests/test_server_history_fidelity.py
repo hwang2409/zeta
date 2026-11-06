@@ -13,7 +13,6 @@ from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -236,92 +235,7 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
         rows = await _history(reader, writer, session_id)
         replayed = next(row for row in rows if row.get("event") == "delivery_status")
         assert {key: value for key, value in live.items() if key != "session_id"} == replayed
-        assert next(row for row in rows if row.get("event") == "turn_end")["data"] == {
-            "reason": "user_stop"
-        }
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("close_error", "terminal_event", "reason"),
-    [(None, "agent_end", "completed"), (RuntimeError("boom"), "error", "error")],
-)
-async def test_session_history_records_completed_and_error_turn_reasons(
-    tmp_path: Path,
-    close_error: Exception | None,
-    terminal_event: str,
-    reason: str,
-) -> None:
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("answer")])], close_error=close_error
-    )
-    server, reader, writer, session_id = await _open(tmp_path, backend)
-    try:
-        await request(reader, writer, 3, "send", {"text": "hello"})
-        await event(reader, terminal_event)
-        if terminal_event == "error":
-            await event(reader, "agent_end")
-        status = (await request(reader, writer, 4, "status"))[-1]["result"]
-        assert status["state"] == "idle"
-        rows = await _history(reader, writer, session_id)
-        assert next(row for row in rows if row.get("event") == "turn_end")[
-            "data"
-        ] == {"reason": reason}
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_session_history_records_disconnect_turn_reason(tmp_path: Path) -> None:
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("first"), TextContent("second")], delay=1)]
-    )
-    server, reader, writer, session_id = await _open(tmp_path, backend)
-    await request(reader, writer, 3, "send", {"text": "hello"})
-    await event(reader, "assistant_delta")
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.1)
-
-    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-    try:
-        await request(
-            reader,
-            writer,
-            4,
-            "hello",
-            {"protocol_version": "1.2", "features": ["session_history_fidelity"]},
-        )
-        rows = await _history(reader, writer, session_id)
-        assert next(row for row in rows if row.get("event") == "turn_end")[
-            "data"
-        ] == {"reason": "disconnect"}
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_session_history_projects_all_turn_end_reasons_and_legacy_unknown(
-    tmp_path: Path,
-) -> None:
-    server, reader, writer, session_id = await _open(tmp_path)
-    try:
-        store = server.runtime.opened.store
-        for reason in ("user_stop", "error", "disconnect", "completed"):
-            store._append_row("turn_end", {"reason": reason})
-        store._append_row("turn_end", {})
-
-        rows = await _history(reader, writer, session_id)
-        turn_ends = [row for row in rows if row.get("event") == "turn_end"]
-        assert [row["data"].get("reason") for row in turn_ends] == [
-            "user_stop",
-            "error",
-            "disconnect",
-            "completed",
-            None,
-        ]
+        assert all(row.get("event") != "turn_end" for row in rows)
     finally:
         await _close(server, writer)
 

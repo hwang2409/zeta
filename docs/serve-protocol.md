@@ -1156,11 +1156,10 @@ error code and message. Provider status and origin remain internal.
   `size`; unknown image size is omitted.
 
   The feature also adds terminal steer `delivery_status` rows as described
-  above and durable served-turn rows shaped as
-  `{"role":"system","event":"turn_end","data":{"reason":"..."}}`.
-  Reasons are `completed`, `user_stop`, `error`, or `disconnect`. A missing row
-  or reason in an old session means unknown. These durable rows are separate
-  from live provider-segment `turn_end` events.
+  above. Original dropped-steer text and durable served-turn reasons are
+  deferred until the stored-format gate can register new row types. History
+  therefore does not yet say whether a turn stopped, failed, completed, or
+  disconnected.
 - `content_read`: reads the raw bytes for an inline image row. The session is
   implicit: it is the attached session, so `session_id` must not be supplied.
   Params are `{ "handle": string, "offset"?: integer, "limit"?: integer }`.
@@ -1318,7 +1317,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
-| `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, durable served-turn end reasons, and tool-result image metadata stubs |
+| `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends

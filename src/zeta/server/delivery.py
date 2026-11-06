@@ -282,14 +282,6 @@ class DeliveryRequests:
                         required_feature="session_history_fidelity",
                         **{key: value for key, value in row.items() if key != "event"},
                     )
-        turn_reason = {
-            TurnOutcome.COMPLETED: "completed",
-            TurnOutcome.FOREGROUND_CANCELED: "user_stop",
-            TurnOutcome.SESSION_CANCELED: "user_stop",
-            TurnOutcome.FAILED: "error",
-            TurnOutcome.DISCONNECTED: "disconnect",
-        }[outcome]
-        await state.opened.store.append_turn_end_async(turn_reason)
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()
