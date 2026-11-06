@@ -737,7 +737,7 @@ def build_key_bindings(
 
     if on_decisions_key is not None:
         for decisions_key_name in (
-            "up", "down", "j", "k", "enter", "a", "backspace",
+            "up", "down", "j", "k", "pageup", "pagedown", "enter", "a", "backspace",
             "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ):
 
