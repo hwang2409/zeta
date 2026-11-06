@@ -246,6 +246,9 @@ class DraftPersistence:
         self._pending_next_image_token = 1
         self._writer = _OrderedFileWriter("composer draft", notice_sink)
 
+    def set_notice_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._writer.set_notice_loop(loop)
+
     def load(self) -> str:
         return self.load_state().text
 
