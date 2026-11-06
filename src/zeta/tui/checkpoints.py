@@ -158,6 +158,7 @@ class CheckpointTranscriptMixin:
     _startup_replay_active: bool = False
     _startup_rejections: list[str]
     _startup_runtime_events: list[tuple[str, Any]]
+    _startup_submissions: list[tuple[str, bool]]
     _startup_wake_pending: bool
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
@@ -515,6 +516,30 @@ class CheckpointTranscriptMixin:
             self._schedule_background_wake()
         for message in rejections:
             self._print_system(message)
+
+    async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
+        if resume_ui:
+            replay_completed = True
+        else:
+            try:
+                replay_completed = await self._rebuild_transcript_async()
+            except BaseException:
+                self._finish_startup_replay(completed=False)
+                raise
+            self._finish_startup_replay(completed=replay_completed is not False)
+        if replay_completed is False or self._exit_requested:
+            return False
+        await self.loop.ensure_mcp_servers()
+        if not self._startup_presented:
+            self._present_startup_output()
+            self._startup_presented = True
+        self._present_pending_approvals()
+        self.start_decisions_poll()
+        self._invalidate_prompt()
+        submissions, self._startup_submissions = self._startup_submissions, []
+        for value, internal in submissions:
+            self._submit_input(value, internal=internal)
+        return True
 
     def _persist_rendered_notifications(
         self, rendered_notifications: list[str], *, asynchronous: bool = False

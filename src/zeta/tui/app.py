@@ -80,7 +80,11 @@ from .layout import (
     full_screen_content,
     status_toolbar,
 )
-from .loop_errors import run_prompt_toolkit
+from .loop_errors import (
+    cancel_activation,
+    run_prompt_toolkit,
+    start_prompt_during_activation,
+)
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
@@ -1102,30 +1106,6 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
-    async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
-        if resume_ui:
-            replay_completed = True
-        else:
-            try:
-                replay_completed = await self._rebuild_transcript_async()
-            except BaseException:
-                self._finish_startup_replay(completed=False)
-                raise
-            self._finish_startup_replay(completed=replay_completed is not False)
-        if replay_completed is False or self._exit_requested:
-            return False
-        await self.loop.ensure_mcp_servers()
-        if not self._startup_presented:
-            self._present_startup_output()
-            self._startup_presented = True
-        self._present_pending_approvals()
-        self.start_decisions_poll()
-        self._invalidate_prompt()
-        submissions, self._startup_submissions = self._startup_submissions, []
-        for value, internal in submissions:
-            self._submit_input(value, internal=internal)
-        return True
-
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1152,23 +1132,12 @@ class TUIApp(
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)
-            prompt_task: asyncio.Task[object] | None = None
-            activation_task: asyncio.Task[None] | None = None
-            if isinstance(session, FullScreenPromptSession):
-                self._install_full_screen_layout(session)
-                prompt_task = asyncio.create_task(run_prompt_toolkit(session, self))
-                self._input_loop_active = True
-                await asyncio.sleep(0)
+            activation_task, prompt_task, exited = (
+                await start_prompt_during_activation(self, session)
+            )
             try:
-                activation_task = asyncio.create_task(self.loop.activate())
-                if prompt_task is not None:
-                    done, _ = await asyncio.wait(
-                        (prompt_task, activation_task),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if prompt_task in done:
-                        await self._run_full_screen(session, prompt_task)
-                        return self._run_result
+                if exited:
+                    return self._run_result
                 await activation_task
                 startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
                 try:
@@ -1203,9 +1172,7 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
-                if activation_task is not None and not activation_task.done():
-                    activation_task.cancel()
-                    await asyncio.gather(activation_task, return_exceptions=True)
+                await cancel_activation(activation_task)
                 await self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():

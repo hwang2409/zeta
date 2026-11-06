@@ -14,6 +14,7 @@ from prompt_toolkit import PromptSession
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import write_tui_diagnostic
 from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
+from ..composer import FullScreenPromptSession
 from ..render import render_event
 
 _TUI_ERROR_LOG = "tui-errors.jsonl"
@@ -45,6 +46,35 @@ def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
         _DIAGNOSTIC_QUEUE.put_nowait((path, record))
     except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
         return
+
+
+async def start_prompt_during_activation(
+    app: Any, session: PromptSession[Any]
+) -> tuple[asyncio.Task[None], asyncio.Task[object] | None, bool]:
+    """Start TUI input first and report whether it exited during activation."""
+
+    prompt_task: asyncio.Task[object] | None = None
+    if isinstance(session, FullScreenPromptSession):
+        app._install_full_screen_layout(session)
+        prompt_task = asyncio.create_task(run_prompt_toolkit(session, app))
+        app._input_loop_active = True
+        await asyncio.sleep(0)
+    activation_task = asyncio.create_task(app.loop.activate())
+    if prompt_task is None:
+        return activation_task, None, False
+    done, _ = await asyncio.wait(
+        (prompt_task, activation_task), return_when=asyncio.FIRST_COMPLETED
+    )
+    if prompt_task not in done:
+        return activation_task, prompt_task, False
+    await app._run_full_screen(session, prompt_task)
+    return activation_task, prompt_task, True
+
+
+async def cancel_activation(task: asyncio.Task[None]) -> None:
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def run_prompt_toolkit(
