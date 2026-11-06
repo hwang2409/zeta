@@ -2333,6 +2333,8 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
         }
         await _request(reader, writer, 3, "send_images", params)
         await _event(reader, "agent_end")
+        attachments = server.runtime.opened.store.session_dir / "attachments"
+        published = set(attachments.iterdir())
         conflict = await _request(
             reader,
             writer,
@@ -2341,6 +2343,7 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
             {**params, "text": "different"},
         )
         assert conflict[-1].get("error", {}).get("code") == -32010
+        assert set(attachments.iterdir()) == published
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)

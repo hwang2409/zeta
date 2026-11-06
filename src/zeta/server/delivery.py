@@ -139,9 +139,15 @@ class DeliveryRequests:
         except asyncio.CancelledError:
             await _cleanup_canceled_image_delivery(worker, runtime)
             raise
-        duplicate = self._duplicate(
-            delivery_id, payload_digest=prepared.payload_digest
-        )
+        try:
+            duplicate = self._duplicate(
+                delivery_id, payload_digest=prepared.payload_digest
+            )
+        except ProtocolError:
+            await asyncio.to_thread(
+                ergonomics.cleanup_image_delivery, runtime, prepared
+            )
+            raise
         if duplicate is not None:
             await asyncio.to_thread(
                 ergonomics.cleanup_image_delivery, runtime, prepared
