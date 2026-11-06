@@ -7834,7 +7834,7 @@ async def test_exit_during_activation_recovery_does_not_wait(
         session = FullScreenPromptSession(input=pipe, output=DummyOutput())
         run_task = asyncio.create_task(app.run(session))
         await recovery_started.wait()
-        assert session.app.future is not None
+        assert session.app.future is not None, "TUI input did not start during activation recovery"
         app.request_exit()
         for _ in range(200):
             await asyncio.sleep(0)
