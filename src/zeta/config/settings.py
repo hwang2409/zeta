@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from ..core.approval import parse_approval_rule
 from ..mcp.envelope import MCPCallLimits
@@ -213,29 +213,31 @@ def load_settings(
     merged = _deep_merge(global_data, project_data)
     global_mcp = global_data.get("mcp", {})
     project_mcp = project_data.get("mcp", {})
-    if not isinstance(global_mcp, Mapping):
-        global_mcp = {}
-    if not isinstance(project_mcp, Mapping):
-        project_mcp = {}
-    defaults = MCPCallLimits()
-    global_deadline = float(
-        global_mcp.get("call_deadline_seconds", defaults.deadline_seconds)
-    )
-    global_wire = int(global_mcp.get("max_wire_bytes", defaults.max_wire_bytes))
-    global_spill = int(
-        global_mcp.get("spill_after_bytes", defaults.spill_after_bytes)
-    )
+    global_limits = _validated_mcp_limits(global_mcp)
+    project_limits = _validated_mcp_limits(project_mcp)
+    global_mcp = cast(Mapping[str, Any], global_mcp)
+    project_mcp = cast(Mapping[str, Any], project_mcp)
+    global_deadline = global_limits.deadline_seconds
+    global_wire = global_limits.max_wire_bytes
+    global_spill = global_limits.spill_after_bytes
     merged["mcp"] = {
         "call_deadline_seconds": min(
             global_deadline,
-            float(project_mcp.get("call_deadline_seconds", global_deadline)),
+            project_limits.deadline_seconds
+            if "call_deadline_seconds" in project_mcp
+            else global_deadline,
         ),
         "max_wire_bytes": min(
-            global_wire, int(project_mcp.get("max_wire_bytes", global_wire))
+            global_wire,
+            project_limits.max_wire_bytes
+            if "max_wire_bytes" in project_mcp
+            else global_wire,
         ),
         "spill_after_bytes": min(
             global_spill,
-            int(project_mcp.get("spill_after_bytes", global_spill)),
+            project_limits.spill_after_bytes
+            if "spill_after_bytes" in project_mcp
+            else global_spill,
         ),
     }
     tool_allow, tool_allow_layers, tool_deny = _merge_tool_policy(
@@ -507,6 +509,19 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
     return merged
 
 
+def _validated_mcp_limits(value: object) -> MCPCallLimits:
+    if not isinstance(value, Mapping):
+        raise SettingsError("mcp settings must be a table")
+    try:
+        return MCPCallLimits(
+            deadline_seconds=float(value.get("call_deadline_seconds", 300.0)),
+            max_wire_bytes=int(value.get("max_wire_bytes", 64 * 1024 * 1024)),
+            spill_after_bytes=int(value.get("spill_after_bytes", 256 * 1024)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"invalid mcp settings: {exc}") from exc
+
+
 def _validate(
     data: Mapping[str, Any], notices: list[str], warnings: list[str]
 ) -> Settings:
@@ -563,18 +578,10 @@ def _validate(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
     mcp = data.get("mcp", {})
-    if not isinstance(mcp, Mapping):
-        raise SettingsError("mcp settings must be a table")
+    mcp_limits = _validated_mcp_limits(mcp)
+    mcp = cast(Mapping[str, Any], mcp)
     for key in mcp.keys() - {"call_deadline_seconds", "max_wire_bytes", "spill_after_bytes"}:
         notices.append(f"settings · ignored unknown key 'mcp.{key}'")
-    try:
-        mcp_limits = MCPCallLimits(
-            deadline_seconds=float(mcp.get("call_deadline_seconds", 300.0)),
-            max_wire_bytes=int(mcp.get("max_wire_bytes", 64 * 1024 * 1024)),
-            spill_after_bytes=int(mcp.get("spill_after_bytes", 256 * 1024)),
-        )
-    except (TypeError, ValueError) as exc:
-        raise SettingsError(f"invalid mcp settings: {exc}") from exc
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False

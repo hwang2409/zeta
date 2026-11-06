@@ -62,6 +62,8 @@ class SpillStore:
         self._transient_max_bytes = 64 * 1024 * 1024
 
     def configure_transient_limit(self, max_bytes: int) -> None:
+        if max_bytes <= 0:
+            raise ValueError("transient spill limit must be positive")
         with self._lock:
             self._transient_max_bytes = max_bytes
 
@@ -74,8 +76,12 @@ class SpillStore:
             self._transient_bytes += byte_count
 
     def release_transient(self, byte_count: int) -> None:
+        if byte_count < 0:
+            raise ValueError("transient spill release must not be negative")
         with self._lock:
-            self._transient_bytes = max(0, self._transient_bytes - byte_count)
+            if byte_count > self._transient_bytes:
+                raise ValueError("transient spill release exceeds its reservation")
+            self._transient_bytes -= byte_count
 
 
     async def awrite_text_group(

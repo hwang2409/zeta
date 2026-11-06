@@ -295,6 +295,8 @@ async def test_spill_reservation_rejects_before_cap_and_releases() -> None:
         await task
     reserve(10)
     release(10)
+    with pytest.raises(ValueError, match="exceeds its reservation"):
+        release(1)
     spill.close()
 
 
