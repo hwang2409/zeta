@@ -339,6 +339,21 @@ def _evict_deterministic(
         if target_reached():
             return finish(True)
 
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        result = message.tool_result
+        call = calls.get(result.tool_call_id) if result is not None else None
+        if (
+            not eligibility.allows(seq)
+            or result is None
+            or call is None
+            or message.metadata.get("context_evicted")
+        ):
+            continue
+        replace(index, _generic_result_receipt(message, call, seq))
+        if target_reached():
+            return finish(True)
+
     if source_messages is not None:
         # Normal per-row eviction can finish a group that persisted regeneration
         # intentionally retained; give the range pass the updated receipt rows.
@@ -391,14 +406,27 @@ def _evict_persisted_records(
     from . import receipt_constructors as rc
     from .range_receipts import _is_receipt_kind
 
+    source_calls = _tool_calls(source_messages.values())
+
+    def current_receipt(seq: int, message: Message) -> bool:
+        marker = message.metadata.get(rc.RECEIPT_KIND_METADATA)
+        result = message.tool_result
+        tool_name = None
+        if result is not None and (call := source_calls.get(result.tool_call_id)):
+            tool_name = call.name
+        return (
+            isinstance(marker, str)
+            and marker != "range"
+            and _is_receipt_kind(message, seq, marker, tool_name=tool_name)
+        )
+
     source_records = [
-        (seq, source_messages[seq])
+        (seq, message if current_receipt(seq, message) else source_messages[seq])
         for seq, message in records
         if seq in source_messages and not message.metadata.get("eviction_range")
     ]
     if not source_records:
         return list(records), set()
-    source_calls = _tool_calls(source_messages.values())
     protected = {seq for seq, _ in records if not eligibility.allows(seq)}
     generated = evict_messages(
         source_records,
@@ -421,17 +449,7 @@ def _evict_persisted_records(
         if message.tool_result is not None:
             result_indexes[message.tool_result.tool_call_id].append(index)
     def is_current(index: int) -> bool:
-        seq, message = records[index]
-        marker = message.metadata.get(rc.RECEIPT_KIND_METADATA)
-        result = message.tool_result
-        tool_name = None
-        if result is not None and (call := source_calls.get(result.tool_call_id)):
-            tool_name = call.name
-        return (
-            isinstance(marker, str)
-            and marker != "range"
-            and _is_receipt_kind(message, seq, marker, tool_name=tool_name)
-        )
+        return current_receipt(*records[index])
     def can_regenerate(index: int) -> bool:
         seq, message = records[index]
         replacement = generated_by_seq.get(seq)
@@ -454,11 +472,12 @@ def _evict_persisted_records(
         indexes = [call_index]
         for call_id in call_ids:
             indexes.extend(result_indexes.get(call_id, ()))
-        # Keep every member out of the per-row fallback. An exchange is one
-        # unit: source regeneration is allowed only when every member is stale
-        # and can be regenerated from the active source rows.
+        # Keep every member out of the per-row fallback. Upgrade stale members
+        # only when the complete exchange is current or source-regenerable.
         blocked.update(indexes)
-        if not all(can_regenerate(index) for index in indexes):
+        if not any(can_regenerate(index) for index in indexes) or not all(
+            is_current(index) or can_regenerate(index) for index in indexes
+        ):
             continue
         original_tokens = sum(token_counter(records[index][1]) for index in indexes)
         replacement_tokens = sum(
@@ -735,6 +754,28 @@ def _digest_result(
         digest = _bash_digest(call, result)
     else:
         digest = _search_digest(call, result.content)
+    return _semantic_result_receipt(
+        role=message.role,
+        tool_name=call.name,
+        tool_call_id=result.tool_call_id,
+        seq=seq,
+        digest=digest,
+        content_digest=_content_digest(result.content),
+        is_error=result.is_error,
+        is_canceled=result.is_canceled,
+        metadata=message.metadata,
+    )
+
+
+def _generic_result_receipt(message: Message, call: ToolCall, seq: int) -> Message:
+    result = message.tool_result
+    if result is None:
+        return message
+    status = "canceled" if result.is_canceled else "error" if result.is_error else "success"
+    tail = _one_line(result.content[-240:], limit=240)
+    digest = f"status={status}; sha256={_content_digest(result.content)[:16]}"
+    if tail:
+        digest += f"; tail={tail}"
     return _semantic_result_receipt(
         role=message.role,
         tool_name=call.name,
