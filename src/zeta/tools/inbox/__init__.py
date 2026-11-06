@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -182,7 +183,8 @@ async def _inbox(
             return _result("projects", project_id, {"projects": known_projects})
         if action == "send":
             target_id = arguments["project"]
-            message_id = inbox.send(
+            message_id = await asyncio.to_thread(
+                inbox.send,
                 from_project=project_id,
                 from_session=session_id,
                 to_project=target_id,
@@ -212,11 +214,14 @@ async def _inbox(
             )
             return _result("sent", project_id, page)
         if action == "claim":
-            message = inbox.claim(project_id, arguments["id"], session_id)
+            message = await asyncio.to_thread(
+                inbox.claim, project_id, arguments["id"], session_id
+            )
             if message is None:
                 raise InboxError("message is not new or was claimed by another session")
             return _result("claim", project_id, {"message": message})
-        message = inbox.done(
+        message = await asyncio.to_thread(
+            inbox.done,
             project_id,
             arguments["id"],
             session_id,

@@ -43,6 +43,35 @@ def _projects(tmp_path: Path):
     return home, registry, project_a, project_b
 
 
+def test_claim_syncs_both_inbox_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="bug_report",
+        title="test",
+        body="test",
+    )
+    synced: list[int] = []
+    original_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced.append(os.fstat(fd).st_ino)
+        original_fsync(fd)
+
+    monkeypatch.setattr(project_inbox_module.os, "fsync", record_fsync)
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+
+    assert len(set(synced)) >= 2
+
+
 def _sent_status_message(
     message_id: str,
     status: str = "done",

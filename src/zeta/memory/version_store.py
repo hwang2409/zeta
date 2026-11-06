@@ -113,7 +113,7 @@ def _publish_payloads(
         try:
             os.stat(digest, dir_fd=blobs_fd, follow_symlinks=False)
         except FileNotFoundError:
-            atomic_publish_file(blobs_fd, digest, payload)
+            atomic_publish_file(blobs_fd, digest, payload, sync_directory=False)
     if scalar:
         if len(digests) != 1:
             raise AssertionError("scalar project-memory payload must contain one blob")
@@ -173,7 +173,6 @@ def publish_version[T](
             f"{version}.json",
             json.dumps(manifest, sort_keys=True).encode(),
         )
-        os.fsync(versions_fd)
         transaction_step("manifest")
         atomic_publish_file(
             directory_fd,
