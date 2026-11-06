@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 
@@ -175,6 +176,31 @@ def _semantic_result_receipt(
             "source_seq": seq,
             "eviction_content_digest": content_digest,
         },
+    )
+
+
+def _generic_result_receipt(message: Message, call: ToolCall, seq: int) -> Message:
+    result = message.tool_result
+    if result is None:
+        return message
+    status = (
+        "canceled" if result.is_canceled else "error" if result.is_error else "success"
+    )
+    tail = _one_line(result.content[-240:], limit=240)
+    content_digest = hashlib.sha256(result.content.encode()).hexdigest()
+    digest = f"status={status}; sha256={content_digest[:16]}"
+    if tail:
+        digest += f"; tail={tail}"
+    return _semantic_result_receipt(
+        role=message.role,
+        tool_name=call.name,
+        tool_call_id=result.tool_call_id,
+        seq=seq,
+        digest=digest,
+        content_digest=content_digest,
+        is_error=result.is_error,
+        is_canceled=result.is_canceled,
+        metadata=message.metadata,
     )
 
 

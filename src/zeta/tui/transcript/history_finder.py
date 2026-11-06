@@ -118,8 +118,12 @@ class HistoryFinder:
     def finder_set_query(self, query: str) -> int | None:
         return None if self._finder is None else self._finder.set_query(query)
 
-    def finder_rank(self) -> RankingResult | None:
-        return None if self._finder is None else self._finder.rank()
+    def finder_rank(
+        self, *, candidate_limit: int | None = None
+    ) -> RankingResult | None:
+        if self._finder is None:
+            return None
+        return self._finder.rank(candidate_limit=candidate_limit)
 
     def finder_publish(self, result: RankingResult) -> bool:
         return self._finder is not None and self._finder.publish(result)

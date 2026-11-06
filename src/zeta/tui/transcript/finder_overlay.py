@@ -157,7 +157,10 @@ class FinderControl(UIControl):
         lines.append([(theme.DIM, "─" * content_width)])
         # Result rows.
         if not state.rows:
-            empty = state.empty_text if not state.query else "no matches"
+            if not state.complete:
+                empty = "searching…"
+            else:
+                empty = state.empty_text if not state.query else "no matches"
             lines.append([(theme.DIM, empty)])
         else:
             window = _list_window(state.selected, len(state.rows), _VISIBLE_ROWS)
