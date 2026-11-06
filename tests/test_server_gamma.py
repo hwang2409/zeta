@@ -691,6 +691,115 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
 
 
 @pytest.mark.asyncio
+async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heartbeat = asyncio.Event()
+    heartbeat_reached_thread = threading.Event()
+    decoded_after_heartbeat: list[bool] = []
+    original_decode = ergonomics.base64.b64decode
+
+    def record_decode(*args, **kwargs):
+        if threading.get_ident() != threading.main_thread().ident:
+            heartbeat_reached_thread.wait()
+        decoded_after_heartbeat.append(heartbeat.is_set())
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(ergonomics.base64, "b64decode", record_decode)
+    output = io.BytesIO()
+    Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
+    backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
+    server = _server(tmp_path, backend, _launch(tmp_path), provider="anthropic")
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["delivery_id", "send_images_delivery_id"])
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        request = asyncio.create_task(
+            server.control.deliveries.send_images(
+                {
+                    "session_id": session_id,
+                    "text": "look",
+                    "images": [
+                        {
+                            "name": "shot.png",
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(output.getvalue()).decode(),
+                        }
+                    ],
+                    "delivery_id": "responsive-image",
+                },
+                frozenset({"delivery_id", "send_images_delivery_id"}),
+            )
+        )
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        asyncio.get_running_loop().call_soon(heartbeat_reached_thread.set)
+        await heartbeat.wait()
+        assert await request == {"accepted": True, "session_id": session_id}
+        assert decoded_after_heartbeat and all(decoded_after_heartbeat)
+        await _event(reader, "agent_end")
+    finally:
+        heartbeat_reached_thread.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_send_images_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+    original_normalize = ergonomics.normalize_image_bytes
+
+    async def gated_normalize(*args, **kwargs):
+        worker_started.set()
+        release_worker.wait()
+        try:
+            return await original_normalize(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(ergonomics, "normalize_image_bytes", gated_normalize)
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        session_id = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]["session"]["session_id"]
+        request = asyncio.create_task(
+            server.control.deliveries.send_images(
+                {
+                    "session_id": session_id,
+                    "text": "look",
+                    "images": [
+                        {
+                            "name": "shot.png",
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(PNG).decode(),
+                        }
+                    ],
+                },
+                frozenset(),
+            )
+        )
+        await asyncio.to_thread(worker_started.wait)
+        request.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await asyncio.to_thread(worker_finished.wait)
+
+        assert server.runtime.opened.store.messages() == []
+        assert not (server.runtime.opened.store.session_dir / "attachments").exists()
+    finally:
+        release_worker.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
