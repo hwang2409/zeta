@@ -23,6 +23,7 @@ from ..protocol.types import (
     user_message_for_turn,
     with_message_origin,
 )
+from . import event_contract
 from .protocol import ProtocolError
 
 if TYPE_CHECKING:
@@ -190,8 +191,8 @@ class DeliveryRequests:
         loop = runtime.loop
         if loop is None or runtime.opened is None:
             raise ProtocolError(-32003, "no active session")
-        delivery_id = self._delivery_id(params, features)
-        duplicate = self._duplicate(delivery_id)
+        requested_delivery_id = self._delivery_id(params, features)
+        duplicate = self._duplicate(requested_delivery_id)
         if duplicate is not None:
             return duplicate
         control._reject_if_unhealthy()
@@ -201,11 +202,7 @@ class DeliveryRequests:
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
-        if delivery_id is None:
-            await control.user_message(text, "steer", features)
-            loop.steer(message)
-            return {"accepted": True}
-
+        delivery_id = requested_delivery_id or secrets.token_hex(16)
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
         canceled_after_commit = False
@@ -224,7 +221,7 @@ class DeliveryRequests:
 
         await _deliver_after_commit(
             lambda: control.user_message(
-                text, "steer", features, delivery_id=delivery_id
+                text, "steer", features, delivery_id=requested_delivery_id
             ),
             lambda: loop.steer(tagged),
             canceled=canceled_after_commit,
@@ -239,8 +236,34 @@ class DeliveryRequests:
         *,
         schedule_wake: bool,
     ) -> None:
-        """Apply all lifecycle effects for one explicit terminal outcome."""
+        """Finish durable lifecycle work despite cancellation of the turn task."""
 
+        owner_task = asyncio.current_task()
+        task = asyncio.create_task(
+            self._finalize_turn(
+                session_id,
+                state,
+                outcome,
+                schedule_wake=schedule_wake,
+                owner_task=owner_task,
+            )
+        )
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        task.result()
+
+    async def _finalize_turn(
+        self,
+        session_id: str,
+        state: SessionState,
+        outcome: TurnOutcome,
+        *,
+        schedule_wake: bool,
+        owner_task: asyncio.Task[Any] | None,
+    ) -> None:
         control = self._control
         reason = {
             TurnOutcome.COMPLETED: "turn_end",
@@ -249,7 +272,17 @@ class DeliveryRequests:
             TurnOutcome.DISCONNECTED: "disconnect",
         }.get(outcome)
         if reason is not None:
-            state.loop.drop_pending_steering(reason)
+            dropped = await state.opened.store.drop_client_steering_async(reason)
+            connections = control.server.connections
+            if connections is not None:
+                for entry, message in dropped:
+                    row = event_contract.delivery_status_row(entry, message)
+                    await connections.publish_controller(
+                        "delivery_status",
+                        session_id,
+                        required_feature="session_history_fidelity",
+                        **{key: value for key, value in row.items() if key != "event"},
+                    )
         turn_reason = {
             TurnOutcome.COMPLETED: "completed",
             TurnOutcome.FOREGROUND_CANCELED: "user_stop",
@@ -261,7 +294,7 @@ class DeliveryRequests:
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()
-        if control._turn_task is asyncio.current_task():
+        if control._turn_task is owner_task:
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (

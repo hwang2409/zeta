@@ -377,7 +377,12 @@ def history_projection(
         if entry.type in {"message", "notification"}:
             entries[-1].append(entry)
             entries.append([])
-        elif entry.type == "client_delivery" or entry.type in {"approval_resolution", "approval_history"}:
+        elif entry.type in {
+            "client_delivery",
+            "approval_resolution",
+            "approval_history",
+            "turn_end",
+        }:
             entries[-1].append(entry)
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
@@ -436,16 +441,16 @@ def _history_entry_rows(
 
     entry_type = entry.type
     if entry_type == "client_delivery":
+        if not fidelity:
+            return []
         data = entry.data
         if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
             return []
-        row = {"id": entry.id, "role": "system", "event": "delivery_status", "delivery_id": data.get("delivery_id"), "method": "steer", "status": data.get("status"), "content": []}
-        if "reason" in data:
-            row["reason"] = data["reason"]
-        accepted = data.get("accepted_message") or accepted_messages.get(data.get("delivery_id"))
-        if isinstance(accepted, dict):
-            row["content"] = [{"type": "text", "text": bounded(next((b.get("text", "") for b in accepted.get("content", []) if isinstance(b, dict) and b.get("type") == "text"), ""), 8000)}]
-        return [row]
+        accepted = data.get("accepted_message") or accepted_messages.get(
+            data.get("delivery_id")
+        )
+        message = Message.from_dict(accepted) if isinstance(accepted, dict) else None
+        return [event_contract.delivery_status_row(entry, message)]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -535,17 +540,12 @@ def _history_entry_rows(
         structured = result.get("structured_content")
         if fidelity and structured is not None:
             projected, wire_truncated = event_contract.project_tool_value(structured)
-            source_facts = (
-                isinstance(structured, dict)
-                and type(structured.get("stdout_truncated")) is bool
-                and type(structured.get("stderr_truncated")) is bool
-            )
-            source_truncated = (
-                True if isinstance(structured, dict) and (structured.get("stdout_truncated") is True or structured.get("stderr_truncated") is True)
-                else False if source_facts else None
-            )
             result["structured_content"] = projected
-            result["structured_content_truncated"] = True if wire_truncated or source_truncated is True else source_truncated
+            result["structured_content_truncated"] = (
+                event_contract.structured_content_truncated(
+                    structured, wire_truncated=wire_truncated
+                )
+            )
         else:
             result["structured_content"] = None
     row = {

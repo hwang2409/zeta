@@ -406,6 +406,9 @@ class ServeControl:
         session_id = state.session_id
         state.turn_started()
         outcome = TurnOutcome.COMPLETED
+        terminal_events: list[StreamEvent] = []
+        pending_turn_end: StreamEvent | None = None
+        terminal_error: dict[str, object] | None = None
         agent_end: StreamEvent | None = None
         try:
             async for event in loop.run_turn(
@@ -420,9 +423,18 @@ class ServeControl:
                 if host_commands is None
                 else host_commands.instruction,
             ):
-                if event.type is StreamEventType.ERROR:
+                if pending_turn_end is not None:
+                    if event.type is StreamEventType.AGENT_END:
+                        terminal_events.append(pending_turn_end)
+                    else:
+                        await self._event(pending_turn_end, session_id=session_id)
+                    pending_turn_end = None
+                if event.type is StreamEventType.TURN_END:
+                    pending_turn_end = event
+                elif event.type is StreamEventType.ERROR:
                     outcome = TurnOutcome.FAILED
-                if event.type is StreamEventType.AGENT_END:
+                    terminal_events.append(event)
+                elif event.type is StreamEventType.AGENT_END:
                     agent_end = event
                 else:
                     await self._event(event, session_id=session_id)
@@ -431,16 +443,20 @@ class ServeControl:
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
             outcome = TurnOutcome.FAILED
-            await self._notify(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                session_id,
-                error={"code": "server_error", "message": str(exc)},
-                data={},
-            )
+            terminal_error = {"code": "server_error", "message": str(exc)}
         finally:
             await self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
+        if terminal_error is not None:
+            await self._notify(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                session_id,
+                error=terminal_error,
+                data={},
+            )
+        for event in terminal_events:
+            await self._event(event, session_id=session_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:
@@ -626,8 +642,12 @@ class ServeControl:
                     wire_event, session_id, **event_contract.assistant_message(event)
                 )
             return
-        controller = self.server.connections.controller_metadata()
-        fidelity = controller is not None and "session_history_fidelity" in controller.features
+        connections = getattr(self.server, "connections", None)
+        controller = connections.controller_metadata() if connections is not None else None
+        fidelity = (
+            controller is not None
+            and "session_history_fidelity" in controller.features
+        )
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,

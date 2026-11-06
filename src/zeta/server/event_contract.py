@@ -3,8 +3,38 @@
 from collections.abc import Mapping
 from enum import Enum, auto
 
-from ..protocol.types import StreamEvent, StreamEventType
+from ..core.checkpoints import ConversationEntry
+from ..protocol.types import Message, StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
+
+
+def delivery_status_row(
+    entry: ConversationEntry, accepted_message: Message | None
+) -> dict[str, object]:
+    """Project one committed steer terminal transition."""
+    data = entry.data
+    row: dict[str, object] = {
+        "id": entry.id,
+        "role": "system",
+        "event": "delivery_status",
+        "delivery_id": data["delivery_id"],
+        "method": "steer",
+        "status": data["status"],
+        "content": [],
+    }
+    if "reason" in data:
+        row["reason"] = data["reason"]
+    if accepted_message is not None:
+        text = next(
+            (
+                block.text
+                for block in accepted_message.content
+                if hasattr(block, "text")
+            ),
+            "",
+        )
+        row["content"] = [{"type": "text", "text": bounded(text)}]
+    return row
 
 
 def project_tool_value(value: object) -> tuple[object, bool]:
@@ -81,11 +111,31 @@ def assistant_message(event: StreamEvent) -> dict[str, object]:
     return {"message": message}
 
 
+def _project_tool_call(tool_call: dict[str, object] | None) -> dict[str, object] | None:
+    if tool_call is None:
+        return None
+    arguments, truncated = project_tool_value(tool_call.get("arguments", {}))
+    return {**tool_call, "arguments": arguments, "arguments_truncated": truncated}
+
+
+def structured_content_truncated(
+    structured_content: object, *, wire_truncated: bool
+) -> bool | None:
+    if not isinstance(structured_content, dict):
+        return True if wire_truncated else None
+    stdout = structured_content.get("stdout_truncated")
+    stderr = structured_content.get("stderr_truncated")
+    if stdout is True or stderr is True or wire_truncated:
+        return True
+    if type(stdout) is bool and type(stderr) is bool:
+        return False
+    return None
+
+
 def tool_start(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
     tool_call = _tool_call(event)
-    if fidelity and tool_call is not None:
-        arguments, truncated = project_tool_value(tool_call.get("arguments", {}))
-        tool_call = {**tool_call, "arguments": arguments, "arguments_truncated": truncated}
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
     return {"tool_call": tool_call, "data": dict(event.data)}
 
 
@@ -93,8 +143,11 @@ def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, obje
     data = dict(event.data)
     if fidelity:
         data, _ = project_tool_value(data)
+    tool_call = _tool_call(event)
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
     return {
-        "tool_call": _tool_call(event),
+        "tool_call": tool_call,
         "output": bounded(event.delta or _data_text(event.data)),
         "data": data,
     }
@@ -109,12 +162,22 @@ def approval_end(payload: Mapping[str, object]) -> dict[str, object]:
 
 
 def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    tool_call = _tool_call(event)
     result = event.tool_result.to_dict() if event.tool_result else None
-    if fidelity and result is not None:
-        projected, truncated = project_tool_value(result)
-        result = {**projected, "structured_content_truncated": truncated}
+    if fidelity:
+        tool_call = _project_tool_call(tool_call)
+        if result is not None:
+            structured = result.get("structured_content")
+            projected, _ = project_tool_value(result)
+            if structured is not None:
+                projected_structured, wire_truncated = project_tool_value(structured)
+                projected["structured_content"] = projected_structured
+                projected["structured_content_truncated"] = structured_content_truncated(
+                    structured, wire_truncated=wire_truncated
+                )
+            result = projected
     return {
-        "tool_call": _tool_call(event),
+        "tool_call": tool_call,
         "tool_result": result,
         "data": dict(event.data),
     }
