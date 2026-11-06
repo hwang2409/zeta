@@ -69,6 +69,95 @@ def _seeded_transcript() -> tuple[TranscriptWidget, dict[str, int]]:
     return transcript, indices
 
 
+class _ThreadRecordingRenderable:
+    def __init__(
+        self,
+        threads: list[int],
+        *,
+        entered: threading.Event | None = None,
+        release: threading.Event | None = None,
+    ) -> None:
+        self._threads = threads
+        self._entered = entered
+        self._release = release
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _ThreadRecordingRenderable:
+        del memo
+        return self
+
+    def __rich_console__(self, console: Any, options: Any) -> Any:
+        del console, options
+        self._threads.append(threading.get_ident())
+        if self._entered is not None:
+            self._entered.set()
+        if self._release is not None:
+            assert self._release.wait(timeout=5)
+        yield Text("older rendered candidate")
+
+
+@pytest.mark.asyncio
+async def test_newest_candidates_publish_before_older_render_finishes() -> None:
+    ui_thread = threading.get_ident()
+    render_threads: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    transcript = TranscriptWidget()
+    transcript.append(
+        _ThreadRecordingRenderable(
+            render_threads,
+            entered=entered,
+            release=release,
+        )
+    )
+    for index in range(40):
+        transcript.append(Text(f"new candidate {index}"))
+    app = _app_for_finder(transcript)
+    partial_states: list[tuple[str, ...]] = []
+
+    def record_state() -> None:
+        state = transcript.finder_state()
+        if state is not None and state.rows and not state.complete:
+            partial_states.append(tuple(row.candidate.text for row in state.rows))
+
+    app._invalidate_prompt = record_state
+    safety_release = threading.Timer(1.0, release.set)
+    safety_release.start()
+    app._finder_open()
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+    initial_content = FinderControl(transcript.finder_state).create_content(80, 20)
+    initial_paint = "".join(
+        fragment[1]
+        for line_index in range(initial_content.line_count)
+        for fragment in initial_content.get_line(line_index)
+    )
+    assert "searching…" in initial_paint
+    assert "no matches" not in initial_paint
+    await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), timeout=3)
+
+    assert partial_states
+    assert partial_states[0][0] == "new candidate 39"
+    assert ui_thread not in render_threads
+    content = FinderControl(transcript.finder_state).create_content(80, 20)
+    painted = "".join(
+        fragment[1]
+        for line_index in range(content.line_count)
+        for fragment in content.get_line(line_index)
+    )
+    assert "no matches" not in painted
+
+    app._finder_input("candidate 3")
+    app._finder_input("candidate 39")
+    release.set()
+    safety_release.cancel()
+    await prepare_task
+    while app._finder_rank_task is not None:
+        await app._finder_rank_task
+    state = transcript.finder_state()
+    assert state is not None and state.complete
+    assert [row.candidate.text for row in state.rows] == ["new candidate 39"]
+
+
 def test_open_finder_lists_messages_with_roles() -> None:
     transcript, _ = _seeded_transcript()
     _open_finder(transcript)

@@ -62,6 +62,7 @@ class RankingResult:
 
     generation: int
     rows: tuple[FinderRow, ...]
+    consumed: int = 0
 
 
 def _excerpt(text: str, positions: Sequence[int], width: int) -> tuple[str, tuple[int, ...]]:
@@ -94,6 +95,7 @@ class MessageFinder:
         *,
         max_results: int = 200,
         excerpt_width: int = 160,
+        complete: bool = True,
     ) -> None:
         self._lock = Lock()
         self._candidates = tuple(candidates)
@@ -104,7 +106,9 @@ class MessageFinder:
         self._generation = 0
         self._rows: tuple[FinderRow, ...] = ()
         self._selected = 0
-        self._complete = True
+        self._complete = complete
+        self._indexing_complete = complete
+        self._pending: list[Candidate] = []
         self._rebuild_empty_rows()
 
     @property
@@ -119,6 +123,11 @@ class MessageFinder:
     def complete(self) -> bool:
         return self._complete
 
+    @property
+    def needs_ranking(self) -> bool:
+        with self._lock:
+            return not self._query.is_empty and bool(self._pending)
+
     def set_query(self, query: str) -> int:
         """Start a query and return its generation for off-thread ranking."""
 
@@ -128,6 +137,22 @@ class MessageFinder:
             self._query = parse_query(query)
             self._reset_visible_rows()
             return self._generation
+
+    def extend_candidates(
+        self, candidates: Sequence[Candidate], *, complete: bool
+    ) -> None:
+        """Add one prepared batch while preserving exact final ranking semantics."""
+
+        with self._lock:
+            batch = tuple(candidates)
+            self._candidates += batch
+            self._indexing_complete = complete
+            if self._query.is_empty:
+                self._rebuild_empty_rows()
+                self._complete = complete
+            else:
+                self._pending.extend(batch)
+                self._complete = complete and not self._pending
 
     def load_candidates(self, candidates: Sequence[Candidate]) -> int:
         """Replace candidates while preserving the current query.
@@ -140,6 +165,8 @@ class MessageFinder:
         with self._lock:
             self._generation += 1
             self._candidates = tuple(candidates)
+            self._indexing_complete = True
+            self._pending.clear()
             self._reset_visible_rows()
             return self._generation
 
@@ -153,12 +180,18 @@ class MessageFinder:
         with self._lock:
             generation = self._generation
             query = self._query
-            candidates = self._candidates
+            if query.is_empty:
+                candidates = self._candidates
+                current_rows: tuple[FinderRow, ...] = ()
+            else:
+                candidates = tuple(self._pending)
+                current_rows = self._rows
         if query.is_empty:
             rows = self._empty_rows(candidates)
         else:
-            rows = self._rank_rows(query, candidates)
-        return RankingResult(generation, rows)
+            new_rows = self._rank_rows(query, candidates)
+            rows = self._merge_ranked_rows(current_rows, new_rows)
+        return RankingResult(generation, rows, len(candidates) if not query.is_empty else 0)
 
     def publish(self, result: RankingResult) -> bool:
         """Publish ``result`` only if it belongs to the current generation."""
@@ -167,7 +200,9 @@ class MessageFinder:
             if result.generation != self._generation:
                 return False
             self._rows = result.rows
-            self._complete = True
+            if result.consumed:
+                del self._pending[: result.consumed]
+            self._complete = self._indexing_complete and not self._pending
             self._clamp_selection()
             return True
 
@@ -207,12 +242,14 @@ class MessageFinder:
 
     def _reset_visible_rows(self) -> None:
         self._selected = 0
+        self._pending.clear()
         if self._query.is_empty:
             self._rebuild_empty_rows()
-            self._complete = True
+            self._complete = self._indexing_complete
         else:
             self._rows = ()
-            self._complete = False
+            self._pending.extend(self._candidates)
+            self._complete = self._indexing_complete and not self._pending
 
     def _empty_rows(
         self, candidates: Sequence[Candidate] | None = None
@@ -227,6 +264,19 @@ class MessageFinder:
     def _rebuild_empty_rows(self) -> None:
         self._rows = self._empty_rows()
         self._clamp_selection()
+
+    def _merge_ranked_rows(
+        self,
+        current: Sequence[FinderRow],
+        added: Sequence[FinderRow],
+    ) -> tuple[FinderRow, ...]:
+        return tuple(
+            sorted(
+                (*current, *added),
+                key=lambda row: (row.score, row.candidate.index),
+                reverse=True,
+            )[: self._max_results]
+        )
 
     def _rank_rows(
         self, query: Query, candidates: Sequence[Candidate]

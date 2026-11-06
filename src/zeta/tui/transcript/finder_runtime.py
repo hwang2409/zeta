@@ -39,13 +39,26 @@ class FinderRuntimeMixin:
 
         task = asyncio.current_task()
         try:
-            candidates = await finder.build_finder_candidates(request)
-            if finder is self._finder_target() and finder.finder_publish_candidates(
-                request, candidates
-            ):
+            progressive = getattr(finder, "build_finder_candidate_batches", None)
+            if progressive is None:
+                candidates = await finder.build_finder_candidates(request)
+                if finder is self._finder_target() and finder.finder_publish_candidates(
+                    request, candidates
+                ):
+                    self._invalidate_prompt()
+                    state = finder.finder_state()
+                    if state is not None and not state.complete:
+                        self._start_finder_ranking()
+                return
+            async for candidates, complete in progressive(request):
+                if finder is not self._finder_target():
+                    return
+                if not finder.finder_publish_candidate_batch(
+                    request, candidates, complete=complete
+                ):
+                    return
                 self._invalidate_prompt()
-                state = finder.finder_state()
-                if state is not None and not state.complete:
+                if finder.finder_needs_ranking():
                     self._start_finder_ranking()
         finally:
             if self._finder_prepare_task is task:
@@ -80,6 +93,11 @@ class FinderRuntimeMixin:
         finally:
             if self._finder_rank_task is task:
                 self._finder_rank_task = None
+                finder = self._finder_target()
+                if finder.finder_active and getattr(
+                    finder, "finder_needs_ranking", lambda: False
+                )():
+                    self._start_finder_ranking()
 
     def _cancel_finder_workers(self) -> None:
         for task in (self._finder_prepare_task, self._finder_rank_task):

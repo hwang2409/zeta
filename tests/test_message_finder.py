@@ -129,6 +129,36 @@ def test_results_are_capped() -> None:
     assert finder.rows[0].candidate.index == 499
 
 
+def test_progressive_batches_equal_all_at_once_results() -> None:
+    candidates = [
+        _candidate(index, text, tuple(Role)[index % len(Role)])
+        for index, text in enumerate(
+            [
+                "run the pytest suite",
+                "docs about python",
+                "a mid py thing snappy",
+                "unrelated release notes",
+                "python pytest fixtures",
+                "pytest and python",
+            ]
+        )
+    ]
+    eager = MessageFinder(candidates)
+    _query(eager, "py")
+
+    progressive = MessageFinder((), complete=False)
+    progressive.set_query("py")
+    for offset in range(len(candidates), 0, -2):
+        progressive.extend_candidates(
+            candidates[max(0, offset - 2) : offset],
+            complete=offset <= 2,
+        )
+        assert progressive.publish(progressive.rank())
+
+    assert progressive.complete
+    assert progressive.rows == eager.rows
+
+
 def test_extended_syntax_flows_through() -> None:
     finder = _finder(["src/app.py", "src/app.js", "lib/app.py"])
     _query(finder, "py$ !lib")
