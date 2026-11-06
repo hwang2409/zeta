@@ -788,6 +788,8 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
     outer = store.append_message(message(MessageRole.ASSISTANT, "outer"))
 
     assert outer.id != observed[0]
+    monkeypatch.undo()
+    store.close()
     assert [row.data["message"]["content"][0]["text"] for row in store._entries] == [
         "outer",
         "inner",

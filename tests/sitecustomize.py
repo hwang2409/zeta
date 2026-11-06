@@ -69,3 +69,26 @@ def _audit(event: str, args: tuple[object, ...]) -> None:
 
 
 sys.addaudithook(_audit)
+
+
+def _install_storage_format_bootstrap() -> None:
+    parent_pid = os.environ.get("ZETA_TEST_PARENT_PID")
+    if parent_pid is None or parent_pid == str(os.getpid()):
+        return
+    from zeta import storage_format
+
+    real_open_writer = storage_format.open_writer
+
+    def open_test_writer(home, *, capability=storage_format.WRITER_EPOCH):
+        path = Path(home)
+        if not (path / "storage-format.json").exists():
+            storage_format.advance(path, expected_epoch=0)
+        return real_open_writer(path, capability=capability)
+
+    storage_format.open_writer = open_test_writer
+    for module in tuple(sys.modules.values()):
+        if module is not None and getattr(module, "open_writer", None) is real_open_writer:
+            module.open_writer = open_test_writer
+
+
+_install_storage_format_bootstrap()

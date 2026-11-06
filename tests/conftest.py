@@ -24,6 +24,7 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
 
 
 def _is_repository_test_path(path: Path) -> bool:
@@ -613,6 +614,8 @@ async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.storage_format import advance, open_writer
 
     leases = {}
+    stores = []
+    managers = []
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
 
@@ -638,16 +641,23 @@ async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
+        stores.append(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
         home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
         ensure(home)
         manager_init(manager, *args, **kwargs)
+        managers.append(manager)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     yield
+    for store in reversed(stores):
+        if not store._closed:
+            store.close()
+    for manager in reversed(managers):
+        manager._release_storage_lease()
     for lease in leases.values():
         lease.close()
 
@@ -663,6 +673,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     stores: list[ConversationStore] = []
+    managers: list[SessionManager] = []
+    workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
     test_home_leases = {}
     store_init = ConversationStore.__init__
@@ -713,6 +725,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
         ensure_format(home)
         manager_init(manager, *args, **kwargs)
+        managers.append(manager)
 
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
@@ -722,6 +735,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else session_dir.parent)
         workspace_init(workspace, *args, **kwargs)
+        workspaces.append(workspace)
 
     @wraps(background_init)
     def tracked_background_init(background, *args, **kwargs):
@@ -753,6 +767,10 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     for store in reversed(stores):
         if not store._closed:
             store_close(store)
+    for workspace in reversed(workspaces):
+        workspace.close()
+    for manager in reversed(managers):
+        manager._release_storage_lease()
     for lease in test_home_leases.values():
         lease.close()
 
