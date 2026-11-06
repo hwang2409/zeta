@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import signal
@@ -22,7 +23,7 @@ from zeta.tools._shared.process import (
 
 
 @pytest.mark.asyncio
-async def test_start_notice_follows_off_loop_durable_record(
+async def test_start_state_and_notice_follow_off_loop_durable_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
@@ -32,7 +33,6 @@ async def test_start_notice_follows_off_loop_durable_record(
     )
     entered = threading.Event()
     release = threading.Event()
-    observations: list[bool] = []
     writer_threads: list[int] = []
     original_persist = registry._persist
 
@@ -41,22 +41,63 @@ async def test_start_notice_follows_off_loop_durable_record(
         entered.set()
         assert release.wait(10)
 
-    def observe_before_commit() -> None:
-        assert entered.wait(10)
-        observations.append(notices == [])
-        release.set()
-
     monkeypatch.setattr(registry, "_persist", gated_persist)
-    observer = threading.Thread(target=observe_before_commit)
-    observer.start()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    observer.join()
+    starting = asyncio.create_task(registry.start("sleep 30", tmp_path))
+    assert await asyncio.to_thread(entered.wait, 10)
 
-    assert observations == [True]
+    # snapshot() feeds the TUI tasks panel, while records feeds serve-owned work.
+    assert registry.snapshot() == ()
+    assert registry.running_count == 0
+    assert registry.records == ()
+    assert notices == []
+
+    release.set()
+    task_id, _ = await starting
+    assert [task.task_id for task in registry.snapshot()] == [task_id]
+    assert registry.running_count == 1
+    assert [record.task_id for record in registry.records] == [task_id]
     assert writer_threads != [threading.get_ident()]
     assert [notice.phase for notice in notices] == ["started"]
     monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.kill(task_id)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_state_and_notice_follow_off_loop_durable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    registry = BackgroundTaskRegistry(
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+    )
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    notices.clear()
+    entered = threading.Event()
+    release = threading.Event()
+    original_persist = registry._persist
+
+    def gated_persist(rows=None) -> None:
+        entered.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr(registry, "_persist", gated_persist)
+    killing = asyncio.create_task(registry.kill(task_id))
+    assert await asyncio.to_thread(entered.wait, 10)
+
+    assert registry.snapshot()[0].running
+    assert registry.running_count == 1
+    assert registry.records[0].running
+    assert notices == []
+
+    release.set()
+    await killing
+    assert not registry.snapshot()[0].running
+    assert registry.running_count == 0
+    assert not registry.records[0].running
+    assert [notice.phase for notice in notices] == ["task_kill"]
+    monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.close()
 
 
@@ -81,7 +122,7 @@ async def test_start_persistence_failure_reaps_before_returning(
     monkeypatch.setattr(process_module, "spawn_background", capture_spawn)
     original_persist = registry._persist
     monkeypatch.setattr(
-        registry, "_persist", lambda rows: (_ for _ in ()).throw(OSError("disk full"))
+        registry, "_persist", lambda rows=None: (_ for _ in ()).throw(OSError("disk full"))
     )
 
     with pytest.raises(OSError, match="disk full"):
@@ -93,6 +134,56 @@ async def test_start_persistence_failure_reaps_before_returning(
     assert registry.records == ()
     assert notices == []
     monkeypatch.setattr(registry, "_persist", original_persist)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    registry = BackgroundTaskRegistry(
+        session_dir=tmp_path,
+        directory_fd=directory_fd,
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+    )
+    os.close(directory_fd)
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    original_persist = registry._persist
+    persist_calls = 0
+
+    def gated_first_persist(rows=None) -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 1:
+            entered.set()
+            assert release.wait(10)
+        original_persist(rows)
+        completed.set()
+
+    monkeypatch.setattr(registry, "_persist", gated_first_persist)
+    starting = asyncio.create_task(registry.start("sleep 30", tmp_path))
+    assert await asyncio.to_thread(entered.wait, 10)
+    starting.cancel()
+    await asyncio.sleep(0)
+    returned_before_persist = starting.done()
+
+    release.set()
+    result = await asyncio.gather(starting, return_exceptions=True)
+    assert await asyncio.to_thread(completed.wait, 10)
+
+    assert not returned_before_persist
+    assert isinstance(result[0], asyncio.CancelledError)
+    rows = json.loads((tmp_path / "background_tasks.json").read_text())
+    assert len(rows) == 1
+    assert rows[0]["running"] is False
+    assert not _group_exists(rows[0]["pid"])
+    assert len([notice for notice in notices if notice.phase != "started"]) == 1
+    assert notices[-1].phase == "natural_exit"
     await registry.close()
 
 
@@ -109,7 +200,7 @@ async def test_terminal_notice_follows_durable_record(
     notices.clear()
     original_persist = registry._persist
     monkeypatch.setattr(
-        registry, "_persist", lambda rows: (_ for _ in ()).throw(OSError("disk full"))
+        registry, "_persist", lambda rows=None: (_ for _ in ()).throw(OSError("disk full"))
     )
 
     with pytest.raises(OSError, match="disk full"):
@@ -129,7 +220,7 @@ async def test_failed_registry_close_can_retry(monkeypatch: pytest.MonkeyPatch) 
     original_persist = registry._persist
     attempts = 0
 
-    def flaky_persist(rows) -> None:
+    def flaky_persist(rows=None) -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
