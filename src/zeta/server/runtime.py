@@ -228,9 +228,7 @@ class ServerRuntime:
         if account is not None:
             credential_kwargs["account"] = account
         elif self._state is not None:
-            credential_kwargs = self._state.loop.account_context.backend_kwargs(
-                provider
-            )
+            credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
             provider,
@@ -380,9 +378,7 @@ class ServerRuntime:
         )
         session_project = associated.project if registry is not None else None
         cwd_project = (
-            resolve_project_context(discovery, registry)
-            if registry is not None
-            else None
+            resolve_project_context(discovery, registry) if registry is not None else None
         )
         context = load_project_context(
             cwd=session_cwd,
@@ -413,9 +409,7 @@ class ServerRuntime:
             except (OSError, ValueError):
                 pass
         cwd_project = (
-            resolve_project_context(discovery, registry)
-            if registry is not None
-            else None
+            resolve_project_context(discovery, registry) if registry is not None else None
         )
         resumed_prompt = resume_prompt(
             opened.metadata,
@@ -485,9 +479,7 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = (
-                        prepared
-                    )
+                    config, skill_catalog, agent_catalog, context, session_project = prepared
                     kwargs = {
                         "config": config,
                         "provider": config.provider,
