@@ -7,6 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.data_structures import Size
+from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
@@ -240,7 +246,7 @@ def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
 # -- popup rendering --------------------------------------------------------
 
 
-def _item(session_id: str, title: str, why: str, options=()) -> DecisionItem:
+def _item(session_id: str, title: str, why: str, options=(), recommendation=None) -> DecisionItem:
     from zeta.attention_records import AttentionRecord
 
     record = AttentionRecord(
@@ -254,7 +260,7 @@ def _item(session_id: str, title: str, why: str, options=()) -> DecisionItem:
         title=title,
         why=why,
         options=tuple(options),
-        recommendation=None,
+        recommendation=recommendation,
         status="open",
     )
     return DecisionItem(session_id, "p", "proj", record)
@@ -463,3 +469,110 @@ def test_zeta_panel_command_is_removed(monkeypatch, tmp_path: Path) -> None:
 
     assert not (Path(zeta.__file__).parent / "attention_panel.py").exists()
     assert not (Path(zeta.__file__).parent / "cli" / "panel.py").exists()
+
+
+class _FixedSizeOutput(DummyOutput):
+    def __init__(self, width: int, height: int) -> None:
+        self._size = Size(rows=height, columns=width)
+
+    def get_size(self) -> Size:
+        return self._size
+
+
+def _screen_text(screen: Screen, width: int, height: int) -> str:
+    return "\n".join(
+        "".join(screen.data_buffer[y][x].char for x in range(width))
+        for y in range(height)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("width", "height"), [(80, 24), (200, 50)])
+async def test_decisions_overflow_indicator_uses_real_float_render(
+    tmp_path: Path, width: int, height: int
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    try:
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        why = "\n".join(
+            f"why paragraph {index} has useful context " + "useful context " * 12
+            for index in range(17)
+        )
+        item = _item(
+            "1" * 32,
+            "Which deployment should we use?",
+            why,
+            options=["first option with enough detail to wrap", "second option with enough detail to wrap", "third option with enough detail to wrap"],
+            recommendation="Use the first option because it is safest.",
+        )
+        app._decisions_panel.set_items([item])
+        app.open_decisions_panel()
+
+        async def render() -> str:
+            session.app.output = _FixedSizeOutput(width, height)
+            screen = Screen()
+            handlers = MouseHandlers()
+            session.layout.update_parents_relations()
+            with set_app(session.app):
+                session.layout.container.write_to_screen(
+                    screen, handlers, WritePosition(0, 0, width, height), "", False, None
+                )
+                screen.draw_all_floats()
+            return _screen_text(screen, width, height)
+
+        first = await render()
+        assert "↓ more · pgdn" in first
+        for _ in range(20):
+            app._decisions_key("pagedown")
+        bottom = await render()
+        assert "Recommendation:" in bottom
+        assert "↓ more · pgdn" not in bottom
+        assert "↑ more · pgup" in bottom
+        app._decisions_key("pageup")
+        returned = await render()
+        assert "more" in returned
+    finally:
+        await app.close()
+
+
+def test_decisions_short_detail_has_no_overflow_indicator() -> None:
+    panel = DecisionsPanel()
+    panel.set_items([_item("1" * 32, "Short", "Why", ["One"])])
+    control = OverlayControl()
+    control.set_lines(panel.render_lines())
+    content = control.create_content(width=80, height=24)
+    text = "\\n".join("".join(fragment[1] for fragment in content.get_line(i)) for i in range(content.line_count))
+    assert "more" not in text
+
+
+def test_decisions_wraps_wide_unbroken_tokens_by_cells() -> None:
+    panel = DecisionsPanel()
+    panel.set_items([_item("1" * 32, "界界界界界界界界", "Why")])
+    lines = panel.render_lines()
+    question = [line for line in lines if "界" in _plain([line])]
+    assert question
+    assert all(sum(max(0, get_cwidth(c)) for c in _plain([line])) <= 66 for line in question)
+
+
+def test_decisions_detail_keeps_full_text_and_recommendation() -> None:
+    panel = DecisionsPanel()
+    panel.set_items([_item(
+        "1" * 32,
+        "A very long decision title that must remain readable in the detail view",
+        "A long explanation that should wrap across multiple rows instead of being truncated.",
+        ["The first option has enough text to wrap too."],
+        recommendation="Prefer the first option because it is safer.",
+    )])
+    text = _plain(panel.render_lines())
+    assert "A very long decision title that must remain readable" in text
+    assert "truncated" in text
+    assert "Recommendation:" in text
+    assert "Prefer the first option" in text

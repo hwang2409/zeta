@@ -183,6 +183,7 @@ class OverlayControl(UIControl):
         self._lines: tuple[FragmentLine, ...] = ()
         self._offset = 0
         self._capacity = 1
+        self._overflow_hint = False
 
     @property
     def is_focusable(self) -> bool:
@@ -196,8 +197,15 @@ class OverlayControl(UIControl):
     def line_count(self) -> int:
         return len(self._lines)
 
-    def set_lines(self, lines: Sequence[FragmentLine], *, keep_offset: bool = False) -> None:
+    def set_lines(
+        self,
+        lines: Sequence[FragmentLine],
+        *,
+        keep_offset: bool = False,
+        overflow_hint: bool = False,
+    ) -> None:
         self._lines = tuple(lines)
+        self._overflow_hint = overflow_hint
         if not keep_offset:
             self._offset = 0
         self._clamp()
@@ -235,7 +243,11 @@ class OverlayControl(UIControl):
         return len(self._lines) + 2
 
     def create_content(self, width: int, height: int | None) -> UIContent:
-        self._capacity = max(1, (height or (len(self._lines) + 2)) - 2)
+        capacity = max(1, (height or (len(self._lines) + 2)) - 2)
+        has_overflow = self._overflow_hint and len(self._lines) > capacity
+        if has_overflow:
+            capacity = max(1, capacity - 1)
+        self._capacity = capacity
         self._clamp()
         border = _s(theme.DIM)
         content_width = max(1, width - 2)
@@ -243,7 +255,15 @@ class OverlayControl(UIControl):
         rows: list[FragmentLine] = [[(border, "┌" + "─" * content_width + "┐")]]
         for line in window:
             rows.append(frame_line(line, content_width=content_width, border=border))
-        for _ in range(self._capacity - len(window)):
+        if has_overflow:
+            if self._offset == 0:
+                text = "↓ more · pgdn"
+            elif self._offset >= self._max_offset():
+                text = "↑ more · pgup"
+            else:
+                text = "↑↓ more · pgup/pgdn"
+            rows.append(frame_line(hint(text), content_width=content_width, border=border))
+        for _ in range(capacity - len(window)):
             rows.append(
                 [(border, "│"), (_s(theme.BODY), " " * content_width), (border, "│")]
             )
