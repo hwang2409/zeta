@@ -83,16 +83,18 @@ class MCPCallEnvelope:
             await self.close()
 
     async def close(self) -> None:
+        temporary = self._temporary
+        reserved = self._reserved
+        self._temporary = None
+        self._handle = None
+        self._reserved = 0
+        self._parts.clear()
         try:
-            if self._temporary is not None:
-                await asyncio.to_thread(self._temporary.__exit__, None, None, None)
+            if temporary is not None:
+                await asyncio.to_thread(temporary.__exit__, None, None, None)
         finally:
-            if self._reserved:
-                self.spill_store.release_transient(self._reserved)
-                self._reserved = 0
-            self._temporary = None
-            self._handle = None
-            self._parts.clear()
+            if reserved:
+                self.spill_store.release_transient(reserved)
 
 
 __all__ = ["MCPCallEnvelope", "MCPCallLimits", "MCPTransientQuotaError", "MCPWireLimitError"]

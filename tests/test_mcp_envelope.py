@@ -18,7 +18,8 @@ from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp.commands import render_mcp_status
 from zeta.mcp.config import MCPConfig, MCPServerConfig
-from zeta.mcp.http import StreamableHTTPMCPClient, _read_json_body
+from zeta.mcp.envelope import MCPCallEnvelope, MCPTransientQuotaError
+from zeta.mcp.http import StreamableHTTPMCPClient, _iter_sse_events, _read_json_body
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.runtime.loop import AgentLoop
 from zeta.server.slash_commands import run_command
@@ -313,6 +314,111 @@ async def test_spill_reservation_rejects_before_cap_and_releases() -> None:
     with pytest.raises(ValueError, match="exceeds its reservation"):
         release(1)
     spill.close()
+
+
+@pytest.mark.asyncio
+async def test_spill_reservation_does_not_wait_for_spill_write() -> None:
+    spill = SpillStore()
+    spill.configure_transient_limit(64)
+    write_started = threading.Event()
+    release_write = threading.Event()
+    heartbeat_advanced = threading.Event()
+
+    class BlockingPart:
+        released_after_heartbeat = False
+
+        def seek(self, _offset: int) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            write_started.set()
+            release_write.wait(timeout=10)
+            self.released_after_heartbeat = heartbeat_advanced.is_set()
+            return b""
+
+    part = BlockingPart()
+    write = asyncio.create_task(spill.awrite_parts("tool", "call", 0, [part]))
+    assert await asyncio.to_thread(write_started.wait, 10)
+
+    envelope = MCPCallEnvelope(_limits(spill_after=1), spill)
+
+    async def heartbeat() -> None:
+        heartbeat_advanced.set()
+        release_write.set()
+
+    reserve = asyncio.create_task(envelope.append(b"{}"))
+    beat = asyncio.create_task(heartbeat())
+    guard = threading.Timer(10, release_write.set)
+    guard.start()
+    try:
+        await reserve
+        await beat
+        await write
+        assert part.released_after_heartbeat
+    finally:
+        guard.cancel()
+        release_write.set()
+        await envelope.close()
+        await write
+        spill.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_cleanup_failure_still_releases_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spill = SpillStore()
+    spill.configure_transient_limit(64)
+    real_temporary_file = spill.temporary_file
+    temporary_calls = 0
+
+    class FailingClose:
+        def __init__(self) -> None:
+            self._context = real_temporary_file()
+            self._closed = False
+
+        def __enter__(self):
+            return self._context.__enter__()
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            if not self._closed:
+                self._closed = True
+                self._context.__exit__(exc_type, exc, traceback)
+            raise OSError("injected close failure")
+
+    def temporary_file():
+        nonlocal temporary_calls
+        temporary_calls += 1
+        if temporary_calls == 1:
+            return FailingClose()
+        return real_temporary_file()
+
+    monkeypatch.setattr(spill, "temporary_file", temporary_file)
+    limits = _limits(spill_after=8)
+    value = "x" * 40
+    class BrokenResponse:
+        async def aiter_bytes(self, *, chunk_size: int):
+            assert chunk_size == 65_536
+            yield b"data: " + json.dumps({"value": value}).encode()
+            raise OSError("injected stream failure")
+
+    response = BrokenResponse()
+
+    with pytest.raises(OSError, match="injected close failure"):
+        async for _event in _iter_sse_events(response, spill, limits):
+            pass
+
+    follow_up = httpx.Response(
+        200,
+        content=json.dumps({"value": value}, separators=(",", ":")).encode(),
+    )
+    try:
+        result = await _read_json_body(follow_up, spill, limits)
+    except MCPTransientQuotaError:
+        result = None
+    finally:
+        spill.close()
+    assert result == {"value": value}
 
 
 @pytest.mark.asyncio

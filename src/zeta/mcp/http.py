@@ -10,7 +10,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
-from typing import BinaryIO, TypeVar
+from typing import TypeVar
 
 import httpx
 
@@ -588,12 +588,8 @@ async def _iter_sse_events(
 ) -> AsyncIterator[object]:
     """Parse SSE JSON events without materializing oversized data fields."""
 
-    data_parts: list[bytes] = []
-    total = 0
+    envelope = MCPCallEnvelope(limits, spill_store)
     has_data_line = False
-    temporary = None
-    handle: BinaryIO | None = None
-    reserved = 0
     event_wire_bytes = 0
     call_wire_bytes = 0
 
@@ -610,63 +606,19 @@ async def _iter_sse_events(
                 raise MCPWireLimitError
 
     async def append_data(data: bytes, *, start_line: bool = False) -> None:
-        nonlocal temporary, handle, total, data_parts, has_data_line, reserved
-        separator = b"\n" if start_line and has_data_line else b""
+        nonlocal has_data_line
         if start_line:
+            if has_data_line:
+                await envelope.append(b"\n")
             has_data_line = True
-        total += len(separator) + len(data)
-        if handle is None and total <= limits.spill_after_bytes:
-            if separator:
-                data_parts.append(separator)
-            if data:
-                data_parts.append(data)
-            return
-        if handle is None:
-            try:
-                spill_store.reserve_transient(total)
-            except RuntimeError as exc:
-                raise MCPTransientQuotaError(
-                    "MCP HTTP notification event could not buffer because the session spill budget is full"
-                ) from exc
-            reserved = total
-            temporary = spill_store.temporary_file()
-            handle = await asyncio.to_thread(temporary.__enter__)
-            initial = b"".join(data_parts)
-            data_parts = []
-            if initial:
-                await asyncio.to_thread(handle.write, initial)
-        extra = total - reserved
-        if extra:
-            try:
-                spill_store.reserve_transient(extra)
-            except RuntimeError as exc:
-                raise MCPTransientQuotaError(
-                    "MCP HTTP notification event could not buffer because the session spill budget is full"
-                ) from exc
-            reserved += extra
-        if separator:
-            await asyncio.to_thread(handle.write, separator)
         if data:
-            await asyncio.to_thread(handle.write, data)
+            await envelope.append(data)
 
     async def parse_event() -> object:
-        nonlocal temporary, handle, total, data_parts, has_data_line, reserved
-        try:
-            if handle is None:
-                value = await asyncio.to_thread(json.loads, b"".join(data_parts))
-            else:
-                await asyncio.to_thread(handle.seek, 0)
-                value = await asyncio.to_thread(json.load, handle)
-                await asyncio.to_thread(temporary.__exit__, None, None, None)
-        finally:
-            if reserved:
-                spill_store.release_transient(reserved)
-                reserved = 0
-        data_parts = []
-        total = 0
+        nonlocal envelope, has_data_line
+        value = await envelope.finish_json()
+        envelope = MCPCallEnvelope(limits, spill_store)
         has_data_line = False
-        temporary = None
-        handle = None
         return value
 
     line_prefix = bytearray()
@@ -765,10 +717,7 @@ async def _iter_sse_events(
         if has_data_line:
             yield await parse_event()
     finally:
-        if temporary is not None:
-            await asyncio.to_thread(temporary.__exit__, None, None, None)
-        if reserved:
-            spill_store.release_transient(reserved)
+        await envelope.close()
 
 
 __all__ = ["StreamableHTTPMCPClient"]
