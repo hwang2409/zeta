@@ -807,6 +807,14 @@ def recover_agent_children(
 ) -> tuple[NotificationInput, ...]:
     """Resolve child markers left by a process exit before resuming."""
 
+    return _recover_agent_children(loop)
+
+
+def _recover_agent_children(
+    loop: AgentLoopForRecovery,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[NotificationInput, ...]:
     child_markers = loop.store.agent_children()
     if not child_markers:
         recover_orphaned_questions(loop.store)
@@ -821,6 +829,8 @@ def recover_agent_children(
     busy_child_subtrees: set[str] = set()
     deliveries: list[NotificationInput] = []
     for marker_key, marker in child_markers.items():
+        if should_stop is not None and should_stop():
+            return tuple(deliveries)
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_instance_id = marker.get(
