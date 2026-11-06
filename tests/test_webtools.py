@@ -387,6 +387,78 @@ async def test_fetch_temp_file_write_does_not_block_loop_and_cleans_up_on_cancel
 
 
 @pytest.mark.asyncio
+async def test_fetch_temp_file_read_does_not_block_loop_and_cleans_up_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    progressed = threading.Event()
+    cancelled = threading.Event()
+    outcomes: list[bool] = []
+    cancel_requested = threading.Event()
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    paths: list[Path] = []
+
+    class HeldRead:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def read(self, *args):
+            entered.set()
+            assert release.wait(timeout=15)
+            return self.handle.read(*args)
+
+        def __getattr__(self, name: str):
+            return getattr(self.handle, name)
+
+    @contextmanager
+    def temporary_file():
+        path = tmp_path / f"held-{len(paths)}.tmp"
+        paths.append(path)
+        with path.open("w+b") as handle:
+            yield HeldRead(handle) if len(paths) == 3 else handle
+        path.unlink()
+
+    monkeypatch.setattr(registry.spills, "temporary_file", temporary_file)
+    _mock_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"body",
+            request=request,
+        ),
+    )
+    fetch = asyncio.create_task(
+        registry.execute(ToolCall("fetch-1", "fetch", {"url": "example.com"}))
+    )
+    fetch.add_done_callback(lambda _task: cancelled.set())
+    loop = asyncio.get_running_loop()
+
+    def release_after_progress() -> None:
+        assert entered.wait(timeout=5)
+        asyncio.run_coroutine_threadsafe(_tick_heartbeat(progressed), loop)
+        heartbeat_progressed = progressed.wait(timeout=5)
+        if heartbeat_progressed:
+            assert cancel_requested.wait(timeout=5)
+        outcomes.append(heartbeat_progressed)
+        release.set()
+
+    worker = threading.Thread(target=release_after_progress)
+    worker.start()
+    await asyncio.to_thread(entered.wait)
+    fetch.cancel()
+    cancel_requested.set()
+
+    await asyncio.gather(fetch, return_exceptions=True)
+    await asyncio.to_thread(worker.join)
+
+    assert outcomes == [True]
+    assert cancelled.is_set()
+    assert not any(path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
 async def test_fetch_decodes_gzip_response_from_raw_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -846,7 +846,8 @@ async def _fetch(
             notice = "\n".join(notices)
             if notice:
                 notice += "\n\n"
-            page, page_end = _read_utf8_page(
+            page, page_end = await _run_worker(
+                _read_utf8_page,
                 readable_body,
                 offset=offset,
                 char_limit=max(0, effective_limit - len(notice)),
