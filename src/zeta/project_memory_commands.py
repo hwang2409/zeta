@@ -12,6 +12,8 @@ SUPPORTED_MEMORY_FORMATS = frozenset({1, 2})
 
 
 class MemoryReconciler(Protocol):
+    @property
+    def scanner_failure(self) -> tuple[int, str] | None: ...
     def terminal_receipts(self) -> tuple[TerminalReceipt, ...]: ...
     def retry_terminal(self, key: str) -> bool: ...
 
@@ -76,6 +78,13 @@ def run_memory_command(
             ]
             if len(matches) != 1:
                 return "memory retry: receipt not found or prefix is ambiguous"
+            scanner_failure = getattr(reconciler, "scanner_failure", None)
+            if scanner_failure is not None:
+                seq, cause = scanner_failure
+                return (
+                    "memory retry refused: automatic project-memory reconciliation "
+                    f"is blocked by {cause} (seq {seq}); repair the transcript first"
+                )
             _authorize(authorization, "retry", matches[0])
             if not reconciler.retry_terminal(matches[0]):
                 return "memory retry: receipt not found"

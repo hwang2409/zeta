@@ -45,6 +45,99 @@ def _no_op_proposal(_prompt: str) -> str:
     return json.dumps({"changes": []})
 
 
+def test_transcript_scanner_stops_at_corrupt_rows(tmp_path: Path) -> None:
+    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    rows = [
+        {"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}},
+        b"{not json}\n",
+        {"seq": 3, "id": "m3", "parent_id": None, "type": "message", "data": {}},
+    ]
+    (runner.session_dir / "conversation.jsonl").write_bytes(
+        b"".join(row if isinstance(row, bytes) else json.dumps(row).encode() + b"\n" for row in rows)
+    )
+
+    latest, offset, _tokens = runner._transcript_state()
+    assert latest == 1
+    assert offset == len(json.dumps(rows[0]).encode()) + 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_transcript_stays_blocked_after_scheduled_retries(tmp_path: Path) -> None:
+    runner, _registry, _project_id, notices = _runner(
+        tmp_path, transcript_count=0, retry_backoff_seconds=0
+    )
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+        b'{"seq": 3, "id": "m3", "parent_id": null, "type": "message", "data": {}}\n'
+    )
+
+    runner.before_eviction(1, 3)
+    await runner.drain()
+    runner.activity(3)
+    await runner.drain()
+
+    assert runner.last_reconciled_seq == 0
+    assert runner.terminal_receipts() == ()
+    assert len(notices) == 1
+    assert len(runner.failure_log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_transcript_publishes_one_bounded_failure(tmp_path: Path) -> None:
+    runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_bytes(
+        b'{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        b"{not json}\n"
+        b'{"seq": 3, "id": "m3", "parent_id": null, "type": "message", "data": {}}\n'
+    )
+
+    runner.before_eviction(1, 3)
+    await runner.drain()
+    runner.activity(3)
+    await runner.drain()
+
+    assert runner.last_reconciled_seq == 0
+    assert len(notices) == 1
+    assert "malformed conversation row" in notices[0]
+    assert len(runner.failure_log_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.asyncio
+async def test_unsupported_transcript_row_keeps_its_cause(tmp_path: Path) -> None:
+    runner, _registry, _project_id, notices = _runner(tmp_path, transcript_count=0)
+    (runner.session_dir / "conversation.jsonl").write_text(
+        '{"seq": 1, "id": "m1", "parent_id": null, "type": "message", "data": {}}\n'
+        '{"seq": 2, "id": "m2", "parent_id": null, "type": "future", "data": {}}\n'
+        '{"seq": 3, "id": "m3", "parent_id": null, "type": "message", "data": {}}\n',
+        encoding="utf-8",
+    )
+
+    runner.before_eviction(1, 3)
+    await runner.drain()
+
+    assert len(notices) == 1
+    assert "unsupported conversation entry type" in notices[0]
+    assert "malformed conversation row" not in notices[0]
+
+
+def test_transcript_scanner_stops_at_unknown_type(tmp_path: Path) -> None:
+    runner, _registry, _project_id, _notices = _runner(tmp_path, transcript_count=0)
+    rows = [
+        {"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}},
+        {"seq": 2, "id": "m2", "parent_id": None, "type": "future", "data": {}},
+        {"seq": 3, "id": "m3", "parent_id": None, "type": "message", "data": {}},
+    ]
+    path = runner.session_dir / "conversation.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    latest, offset, _tokens = runner._transcript_state()
+    assert latest == 1
+    assert offset == len(json.dumps(rows[0]).encode()) + 1
+
+
 def _proposal(prompt: str) -> str:
     marker = 'Completed transcript rows:'
     assert marker in prompt

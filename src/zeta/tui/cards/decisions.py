@@ -21,7 +21,6 @@ from .. import overlay, theme
 # The popup settles near, but not beyond, the shared overlay cap so the text
 # screenshots stay stable regardless of the live terminal size.
 CONTENT_WIDTH = 68
-_WHY_LINES = 2
 
 Fragment = tuple[str, str]
 FragmentLine = list[Fragment]
@@ -31,35 +30,65 @@ def _cells(text: str) -> int:
     return sum(max(0, get_cwidth(character)) for character in text)
 
 
-def _wrap(text: str, width: int, limit: int) -> list[str]:
-    """Wrap ``text`` to at most ``limit`` lines of ``width`` cells, ellipsised."""
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap text without dropping any content."""
 
     width = max(1, width)
-    words = " ".join(text.split()).split(" ")
     lines: list[str] = []
-    current = ""
-    for word in words:
-        piece = word if not current else f"{current} {word}"
-        if _cells(piece) <= width:
-            current = piece
-            continue
-        if current:
-            lines.append(current)
-        current = word
-        if len(lines) == limit:
-            break
-    if len(lines) < limit and current:
+    for paragraph in text.splitlines() or [""]:
+        current = ""
+        for word in paragraph.split() or [""]:
+            piece = word if not current else f"{current} {word}"
+            if _cells(piece) <= width:
+                current = piece
+            else:
+                if current:
+                    lines.append(current)
+                while _cells(word) > width:
+                    split = 0
+                    cells = 0
+                    for index, character in enumerate(word):
+                        step = max(0, get_cwidth(character))
+                        if cells + step > width:
+                            break
+                        cells += step
+                        split = index + 1
+                    if split == 0:
+                        split = 1
+                    lines.append(word[:split])
+                    word = word[split:]
+                current = word
         lines.append(current)
-    if not lines:
-        return [""]
-    if (len(lines) == limit and current and lines[-1] != current) or _cells(
-        lines[-1]
-    ) > width:
-        last = lines[-1]
-        while last and _cells(f"{last}…") > width:
-            last = last[:-1]
-        lines[-1] = f"{last}…"
-    return lines
+    return lines or [""]
+
+
+def _truncate_text(text: str, width: int) -> str:
+    if width <= 1:
+        return "…"[:width]
+    result = ""
+    for character in text:
+        if _cells(result + character + "…") > width:
+            break
+        result += character
+    return result + "…"
+
+
+def _labelled_text(label: str, text: str, width: int, style: str) -> list[FragmentLine]:
+    lines = _wrap(text, width - len(label) - 2)
+    return [
+        [overlay.value(f"{label}: ", style), overlay.value(line)]
+        if index == 0
+        else [overlay.value(" " * (len(label) + 2)), overlay.value(line)]
+        for index, line in enumerate(lines)
+    ]
+
+
+def _option_lines(index: int, text: str, width: int) -> list[FragmentLine]:
+    prefix = f"{index}. "
+    return [
+        [overlay.value(prefix if line_index == 0 else " " * len(prefix), theme.ACCENT), overlay.value(line)]
+        for line_index, line in enumerate(_wrap(text, width - len(prefix)))
+    ]
 
 
 class DecisionsPanel:
@@ -154,35 +183,39 @@ class DecisionsPanel:
         if self._mode == "answer":
             lines.append(self._answer_line())
             lines.append(overlay.hint("enter send · esc cancel"))
-        else:
-            lines.append(
-                overlay.hint(
-                    "↑/↓ select · 1-9 answer · a type answer · enter discuss · esc close"
-                )
-            )
         return lines
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:
         selected = item.record.id == self._selected_id
         label = f"{item.project_name} · {item.session_id[:8]}"
+        title = item.record.title
+        available = CONTENT_WIDTH - len(label) - 4
+        if _cells(title) > available:
+            title = _truncate_text(title, available)
         return overlay.row(
             [
-                (theme.BODY, item.record.title),
+                (theme.BODY, title),
                 (theme.DIM, f"  {label}"),
             ],
             selected=selected,
         )
 
     def _detail(self, item: DecisionItem) -> list[FragmentLine]:
-        lines: list[FragmentLine] = []
-        for wrapped in _wrap(item.record.why, CONTENT_WIDTH - 2, _WHY_LINES):
-            lines.append([overlay.value(f"  {wrapped}", theme.DIM)])
+        width = CONTENT_WIDTH - 2
+        lines: list[FragmentLine] = [overlay.blank()]
+        lines.extend(_labelled_text("Question", item.record.title, width, theme.ACCENT))
+        lines.append(overlay.blank())
+        lines.extend(_labelled_text("Why", item.record.why, width, theme.DIM))
+        lines.append(overlay.blank())
+        lines.append([overlay.value("Options", theme.ACCENT)])
         for index, option in enumerate(item.record.options, start=1):
-            lines.append(
-                [
-                    overlay.value(f"  {index}. ", theme.ACCENT),
-                    overlay.value(option),
-                ]
+            lines.extend(_option_lines(index, option, width))
+        if item.record.recommendation:
+            lines.append(overlay.blank())
+            lines.extend(
+                _labelled_text(
+                    "Recommendation", item.record.recommendation, width, theme.SUCCESS
+                )
             )
         lines.append(overlay.rule())
         return lines
