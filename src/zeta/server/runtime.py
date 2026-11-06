@@ -531,12 +531,28 @@ class ServerRuntime:
     async def close(self) -> None:
         state = self._state
         if state is not None:
+            background_tasks = state.loop.tool_registry.background_tasks
+            close_failure_generation = background_tasks.close_failure_generation()
             close_task = asyncio.create_task(self._close_state(state))
             try:
                 await asyncio.shield(close_task)
             except asyncio.CancelledError:
-                await close_task
-                if self._state is state:
+                try:
+                    await close_task
+                finally:
+                    if (
+                        background_tasks.close_failure_generation()
+                        == close_failure_generation
+                        and self._state is state
+                    ):
+                        self._state = None
+                raise
+            except BaseException:
+                if (
+                    background_tasks.close_failure_generation()
+                    == close_failure_generation
+                    and self._state is state
+                ):
                     self._state = None
                 raise
             if self._state is state:

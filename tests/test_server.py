@@ -4799,37 +4799,6 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
 
 
 @pytest.mark.asyncio
-async def test_runtime_retains_state_after_close_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from zeta.server.runtime import ServerRuntime
-
-    runtime = ServerRuntime(tmp_path, provider="codex")
-    state = object()
-    runtime._state = state  # type: ignore[assignment]
-    failure = OSError("registry close failed")
-    attempts = 0
-
-    async def flaky_close(candidate: object) -> None:
-        nonlocal attempts
-        assert candidate is state
-        attempts += 1
-        if attempts == 1:
-            raise failure
-
-    monkeypatch.setattr(runtime, "_close_state", flaky_close)
-
-    with pytest.raises(OSError) as raised:
-        await runtime.close()
-    assert raised.value is failure
-    assert runtime._state is state
-
-    await runtime.close()
-    assert runtime._state is None
-    assert attempts == 2
-
-
-@pytest.mark.asyncio
 async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
     from zeta.server.runtime import ServerRuntime
 
@@ -6110,15 +6079,47 @@ async def test_resume_does_not_bump_updated_at(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_retains_registry_after_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="codex")
+    await runtime.create_session()
+    state = runtime.state
+    registry = runtime.loop.tool_registry.background_tasks
+    original_shutdown = registry._shutdown
+    failure = OSError("registry close failed")
+    attempts = 0
+
+    async def flaky_shutdown() -> tuple[str, ...]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise failure
+        return await original_shutdown()
+
+    monkeypatch.setattr(registry, "_shutdown", flaky_shutdown)
+
+    with pytest.raises(OSError) as raised:
+        await runtime.close()
+    assert raised.value is failure
+    assert runtime.state is state
+    assert attempts == 2
+
+    await runtime.close()
+    assert runtime.state is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["close", "replace-close", "activate", "resume-compose"])
-async def test_runtime_failure_preserves_failed_close_for_retry(tmp_path, monkeypatch, failure):
+async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch, failure):
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="codex")
     await runtime.create_session()
     old_id = runtime.session_id
     old_store = runtime.opened.store
-    original_close = runtime.loop.close
     incoming = []
     compose = runtime._compose
 
@@ -6152,14 +6153,8 @@ async def test_runtime_failure_preserves_failed_close_for_retry(tmp_path, monkey
             operation = runtime.create_session()
         with pytest.raises(RuntimeError, match="failed"):
             await operation
-        if failure in {"close", "replace-close"}:
-            assert runtime.session_id == old_id
-            assert old_store._closed
-            monkeypatch.setattr(runtime.loop, "close", original_close)
-            await runtime.close()
-        else:
-            assert runtime.state is None
-            assert old_store._closed
+        assert runtime.state is None
+        assert old_store._closed
         assert all(composition.opened.store._closed for composition in incoming)
         # Keep the runtime and exception-producing store alive while deleting.
         sessions = runtime.manager.list_sessions()
@@ -6168,8 +6163,6 @@ async def test_runtime_failure_preserves_failed_close_for_retry(tmp_path, monkey
             runtime.manager.delete(metadata.session_id)
         assert runtime.manager.list_sessions() == []
     finally:
-        if failure in {"close", "replace-close"} and runtime.state is not None:
-            monkeypatch.setattr(runtime.loop, "close", original_close)
         await runtime.close()
 
 

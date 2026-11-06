@@ -197,6 +197,7 @@ class BackgroundTaskRegistry:
         self._closing = False
         self._closed = False
         self._close_done: asyncio.Future[tuple[str, ...]] | None = None
+        self._close_failure_generation = 0
         self._pending_starts: set[asyncio.Future[None]] = set()
         self._transition_lock = asyncio.Lock()
         self._task_start_generation = 0
@@ -225,6 +226,9 @@ class BackgroundTaskRegistry:
         """Return the monotonic count of tasks that reached running state."""
 
         return self._task_start_generation
+
+    def close_failure_generation(self) -> int:
+        return self._close_failure_generation
 
     @property
     def records(self) -> tuple[_BackgroundRecord, ...]:
@@ -624,6 +628,7 @@ class BackgroundTaskRegistry:
                     done.set_exception(exc)
                     done.exception()  # retrieved here; awaiting callers re-raise it
                 self._close_done = None
+                self._close_failure_generation += 1
                 raise
             done.set_result(result)
             return result
@@ -1162,9 +1167,7 @@ class BackgroundTaskRegistry:
             for record in self._records.values()
         )
 
-    def _persist(
-        self, rows: Sequence[dict[str, object]] | None = None
-    ) -> None:
+    def _persist(self, rows: Sequence[dict[str, object]] | None = None) -> None:
         if self._directory_fd is None or self._temporary_log_root is not None:
             return
         write_session_json(
