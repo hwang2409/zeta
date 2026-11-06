@@ -8,7 +8,7 @@ import json
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from email.utils import parsedate_to_datetime
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 import httpx
 
@@ -181,6 +181,24 @@ class StreamFinished:
         self.value = False
 
 
+class StreamProgress:
+    """Track decoded model progress without counting transport keepalives."""
+
+    __slots__ = ("version",)
+
+    _NON_PROGRESS_EVENTS: ClassVar[frozenset[str]] = frozenset(
+        {"keepalive", "ping", "response.in_progress", "response.metadata"}
+    )
+
+    def __init__(self) -> None:
+        self.version = 0
+
+    def observe(self, record: tuple[str, dict[str, Any]]) -> None:
+        event, payload = record
+        if payload.get("type", event) not in self._NON_PROGRESS_EVENTS:
+            self.version += 1
+
+
 async def wait_for_response_headers[E: RuntimeError](
     enter: Awaitable[httpx.Response],
     seconds: float,
@@ -205,6 +223,7 @@ def sse_lines[E: RuntimeError](
     provider: str,
     error_class: type[E],
     finished: StreamFinished | None = None,
+    progress: StreamProgress | None = None,
 ) -> AsyncIterator[str]:
     """Yield SSE lines from ``response`` and raise ``error_class`` on stall.
 
@@ -225,6 +244,7 @@ def sse_lines[E: RuntimeError](
         seconds=seconds,
         on_stall=on_stall,
         is_finished=is_finished,
+        progress=progress,
     )
 
 
@@ -361,24 +381,33 @@ async def stall_watchdog[T](
     seconds: float,
     on_stall: Callable[[float], BaseException],
     is_finished: Callable[[], bool] | None = None,
+    progress: StreamProgress | None = None,
 ) -> AsyncIterator[T]:
-    """Yield from ``source`` and raise ``on_stall(elapsed)`` when no item
-    arrives within ``seconds``. A non-positive ``seconds`` disables the
-    watchdog. Every item resets the timer, so keepalives count as activity.
+    """Raise when ``source`` stops making progress for ``seconds``.
 
-    ``is_finished`` lets the caller mark the stream complete; when set, a
-    timeout returns cleanly (EOF) instead of raising a stall — protecting
-    already-completed responses from a spurious post-sentinel retry."""
+    Without an explicit progress tracker, every source item is progress.
+    ``is_finished`` makes post-completion silence a clean EOF.
+    """
 
     if seconds <= 0:
         async for item in source:
             yield item
         return
     iterator = source.__aiter__()
+    deadline = time.monotonic() + seconds
+    progress_version = progress.version if progress is not None else 0
     try:
         while True:
+            if progress is not None and progress.version != progress_version:
+                progress_version = progress.version
+                deadline = time.monotonic() + seconds
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if is_finished is not None and is_finished():
+                    return
+                raise on_stall(seconds)
             try:
-                item = await asyncio.wait_for(iterator.__anext__(), timeout=seconds)
+                item = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
             except StopAsyncIteration:
                 return
             except TimeoutError as exc:
@@ -386,6 +415,8 @@ async def stall_watchdog[T](
                     return
                 raise on_stall(seconds) from exc
             yield item
+            if progress is None:
+                deadline = time.monotonic() + seconds
     finally:
         close = getattr(iterator, "aclose", None)
         if close is not None:

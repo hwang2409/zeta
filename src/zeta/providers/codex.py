@@ -42,6 +42,7 @@ from .transport import (
     HTTPClientLease,
     SSEEventAccumulator,
     StreamFinished,
+    StreamProgress,
     build_response_error,
     cleanup_transport,
     close_resource,
@@ -363,16 +364,19 @@ async def _decode_response(
     response_data: dict[str, Any] = {"stream_started_at": monotonic()}
     reassembly = _ReassemblyState()
     finished = StreamFinished()
+    progress = StreamProgress()
     async for line in sse_lines(
         response,
         stall_seconds,
         "Codex",
         CodexStreamError,
         finished=finished,
+        progress=progress,
     ):
         record = decoder.feed(line)
         if record is None:
             continue
+        progress.observe(record)
         event, payload = record
         response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
