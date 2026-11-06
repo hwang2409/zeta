@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from zeta.config.settings import load_settings
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp.commands import render_mcp_status
@@ -40,11 +41,22 @@ def _limits(*, spill_after: int = 64) -> SimpleNamespace:
     )
 
 
-def _http_client(url: str, *, spill_store: SpillStore | None = None):
+def _http_client(
+    url: str, settings_home, *, spill_store: SpillStore | None = None
+):
+    settings_home.mkdir(parents=True, exist_ok=True)
+    (settings_home / "settings.toml").write_text(
+        "[mcp]\nmax_wire_bytes = 512\nspill_after_bytes = 64\n"
+    )
+    settings = load_settings(home=settings_home).settings
     config = MCPServerConfig("local", "streamable-http", url=url)
     kwargs: dict[str, object] = {"spill_store": spill_store}
     if "limits" in inspect.signature(StreamableHTTPMCPClient).parameters:
-        kwargs["limits"] = _limits()
+        kwargs["limits"] = SimpleNamespace(
+            deadline_seconds=getattr(settings, "mcp_call_deadline_seconds", 300.0),
+            max_wire_bytes=getattr(settings, "mcp_max_wire_bytes", 64 * 1024 * 1024),
+            spill_after_bytes=getattr(settings, "mcp_spill_after_bytes", 256 * 1024),
+        )
     return StreamableHTTPMCPClient(config, **kwargs)
 
 
@@ -139,8 +151,10 @@ def mcp_http_server(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_http_json_call_rejected_at_limit_plus_one(mcp_http_server: str) -> None:
-    client = _http_client(mcp_http_server)
+async def test_http_json_call_rejected_at_limit_plus_one(
+    mcp_http_server: str, tmp_path
+) -> None:
+    client = _http_client(mcp_http_server, tmp_path / "home")
     try:
         await client.connect()
         result = await client.call_tool("echo", {}, AbortSignal())
@@ -153,9 +167,11 @@ async def test_http_json_call_rejected_at_limit_plus_one(mcp_http_server: str) -
 
 
 @pytest.mark.asyncio
-async def test_http_sse_call_counts_pre_result_notifications(mcp_http_server: str) -> None:
+async def test_http_sse_call_counts_pre_result_notifications(
+    mcp_http_server: str, tmp_path
+) -> None:
     _MCPHandler.mode = "sse"
-    client = _http_client(mcp_http_server)
+    client = _http_client(mcp_http_server, tmp_path / "home")
     try:
         await client.connect()
         result = await client.call_tool("echo", {}, AbortSignal())
@@ -168,9 +184,11 @@ async def test_http_sse_call_counts_pre_result_notifications(mcp_http_server: st
 
 
 @pytest.mark.asyncio
-async def test_http_gzip_counts_decoded_bytes(mcp_http_server: str) -> None:
+async def test_http_gzip_counts_decoded_bytes(
+    mcp_http_server: str, tmp_path
+) -> None:
     _MCPHandler.mode = "gzip"
-    client = _http_client(mcp_http_server)
+    client = _http_client(mcp_http_server, tmp_path / "home")
     try:
         await client.connect()
         result = await client.call_tool("echo", {}, AbortSignal())
@@ -258,7 +276,8 @@ async def test_spill_reservation_rejects_before_cap_and_releases() -> None:
     reserve(6)
     with pytest.raises(RuntimeError, match="spill budget"):
         reserve(5)
-    release(6)
+    reserve(4)
+    release(10)
     reserve(10)
     release(10)
 

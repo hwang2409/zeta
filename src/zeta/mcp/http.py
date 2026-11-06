@@ -625,7 +625,9 @@ async def _iter_sse_events(
             try:
                 spill_store.reserve_transient(total)
             except RuntimeError as exc:
-                raise MCPTransientQuotaError from exc
+                raise MCPTransientQuotaError(
+                    "MCP HTTP notification event could not buffer because the session spill budget is full"
+                ) from exc
             reserved = total
             temporary = spill_store.temporary_file()
             handle = await asyncio.to_thread(temporary.__enter__)
@@ -638,7 +640,9 @@ async def _iter_sse_events(
             try:
                 spill_store.reserve_transient(extra)
             except RuntimeError as exc:
-                raise MCPTransientQuotaError from exc
+                raise MCPTransientQuotaError(
+                    "MCP HTTP notification event could not buffer because the session spill budget is full"
+                ) from exc
             reserved += extra
         if separator:
             await asyncio.to_thread(handle.write, separator)
