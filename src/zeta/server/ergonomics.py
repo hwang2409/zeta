@@ -187,6 +187,7 @@ class HistoryProjection:
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
+    accepted_messages: Mapping[str, dict[str, object]] = MappingProxyType({})
 
 
 @dataclass
@@ -357,8 +358,11 @@ def history_projection(
             break
 
     approval_calls: dict[str, object] = {}
+    accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     for entry in branch:
+        if entry.type == "client_delivery" and isinstance(entry.data.get("accepted_message"), dict):
+            accepted_messages[entry.data["delivery_id"]] = entry.data["accepted_message"]
         if entry.type == "message":
             approval_calls.update(
                 {
@@ -378,7 +382,7 @@ def history_projection(
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
     built = HistoryProjection(
-        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index)
+        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index), accepted_messages=MappingProxyType(accepted_messages)
     )
     with _cache_creation_lock:
         cached = _cache(
@@ -424,6 +428,7 @@ def _project_tool_call_arguments(call: dict[str, object], *, fidelity: bool) -> 
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
+    accepted_messages: Mapping[str, dict[str, object]] = MappingProxyType({}),
     *,
     include_delivery_id: bool = False, fidelity: bool = False, content_read: bool = False,
 ) -> list[dict[str, object]]:
@@ -437,7 +442,7 @@ def _history_entry_rows(
         row = {"id": entry.id, "role": "system", "event": "delivery_status", "delivery_id": data.get("delivery_id"), "method": "steer", "status": data.get("status"), "content": []}
         if "reason" in data:
             row["reason"] = data["reason"]
-        accepted = data.get("accepted_message")
+        accepted = data.get("accepted_message") or accepted_messages.get(data.get("delivery_id"))
         if isinstance(accepted, dict):
             row["content"] = [{"type": "text", "text": bounded(next((b.get("text", "") for b in accepted.get("content", []) if isinstance(b, dict) and b.get("type") == "text"), ""), 8000)}]
         return [row]
@@ -607,7 +612,7 @@ def _history_group(
         row
         for entry in projection.entry_groups[index]
         for row in _history_entry_rows(
-            entry, projection.approval_calls,
+            entry, projection.approval_calls, projection.accepted_messages,
             include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read,
         )
     ]
@@ -649,7 +654,7 @@ def _history_group_fits(
         row
         for entry in raw_group
         for row in _history_entry_rows(
-            entry, projection.approval_calls,
+            entry, projection.approval_calls, projection.accepted_messages,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
