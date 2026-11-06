@@ -34,6 +34,7 @@ from ..registry import (
 )
 
 MAX_TIMEOUT_SECONDS = 3600.0
+MAX_OUTPUT_BYTES = 1_048_576
 
 
 class BashArguments(TypedDict, total=False):
@@ -185,7 +186,11 @@ async def _bash(
         else _start_cwd(registry, arguments)
     )
     timeout = arguments.get("timeout", 30.0)
-    output_limit = arguments.get("max_output", registry.max_output_chars)
+    output_limit = arguments.get(
+        "max_output", min(registry.max_output_chars, MAX_OUTPUT_BYTES)
+    )
+    if type(output_limit) is not int or not 1 <= output_limit <= MAX_OUTPUT_BYTES:
+        raise ValueError(f"max_output must be an integer from 1 to {MAX_OUTPUT_BYTES}")
     log_path = arguments.get("_log_path")
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
@@ -435,7 +440,12 @@ def register(registry: ToolRegistry) -> None:
                         "can outlive the timeout."
                     ),
                 },
-                "max_output": {"type": "integer", "minimum": 1},
+                "max_output": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_OUTPUT_BYTES,
+                    "description": "Maximum retained output per stream in bytes, up to 1 MiB.",
+                },
             },
             "additionalProperties": False,
         },
