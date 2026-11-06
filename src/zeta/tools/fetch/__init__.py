@@ -8,7 +8,8 @@ import io
 import os
 import socket
 import zlib
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from typing import Any, BinaryIO
@@ -61,6 +62,31 @@ class _DecompressionFailed(Exception):
         self.original = original
 
 
+async def _run_worker(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await worker
+        raise
+
+
+@asynccontextmanager
+async def _temporary_file(spills: Any) -> AsyncIterator[BinaryIO]:
+    manager = spills.temporary_file()
+    entry = asyncio.create_task(asyncio.to_thread(manager.__enter__))
+    try:
+        handle = await asyncio.shield(entry)
+    except asyncio.CancelledError:
+        await entry
+        await _run_worker(manager.__exit__, None, None, None)
+        raise
+    try:
+        yield handle
+    finally:
+        await _run_worker(manager.__exit__, None, None, None)
+
+
 async def _raw_response_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
     if response.is_stream_consumed:
         yield response.content
@@ -84,7 +110,9 @@ def _normalize_address(
     return address
 
 
-def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
+async def _target_addresses(
+    url: str,
+) -> tuple[IPv4Address | IPv6Address, ...]:
     hostname = urlsplit(url).hostname
     if hostname is None:
         raise ValueError("URL must use http or https and include a host")
@@ -93,11 +121,14 @@ def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
     except ValueError:
         parsed = urlsplit(url)
         try:
-            infos = socket.getaddrinfo(
-                hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
+            async with asyncio.timeout(HTTP_TIMEOUT_SECONDS):
+                infos = await asyncio.get_running_loop().getaddrinfo(
+                    hostname,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+        except TimeoutError as exc:
+            raise ValueError("request failed: request timed out") from exc
         except socket.gaierror as exc:
             raise ValueError(f"request failed: could not resolve host {hostname}") from exc
         return tuple(_normalize_address(ip_address(info[4][0])) for info in infos)
@@ -111,10 +142,6 @@ def _classify_target(
     return any(
         address in network for address in addresses for network in _PRIVATE_NETWORKS
     )
-
-
-def _validate_target(url: str) -> bool:
-    return _classify_target(_target_addresses(url))
 
 
 def _host_header(url: str) -> str:
@@ -162,6 +189,24 @@ async def get_response(
         )
 
 
+def _reset_destinations(
+    destination: BinaryIO, received_destination: BinaryIO | None
+) -> None:
+    destination.seek(0)
+    destination.truncate()
+    if received_destination is not None:
+        received_destination.seek(0)
+        received_destination.truncate()
+
+
+def _flush_destinations(
+    destination: BinaryIO, received_destination: BinaryIO | None
+) -> None:
+    destination.flush()
+    if received_destination is not None:
+        received_destination.flush()
+
+
 async def _get_response_to_file(
     url: str,
     *,
@@ -180,11 +225,7 @@ async def _get_response_to_file(
     if headers is not None:
         request_headers.update(headers)
     for attempt in range(2):
-        destination.seek(0)
-        destination.truncate()
-        if received_destination is not None:
-            received_destination.seek(0)
-            received_destination.truncate()
+        await _run_worker(_reset_destinations, destination, received_destination)
         try:
             return await _request_and_decode(
                 url,
@@ -235,7 +276,7 @@ async def _request_and_decode(
             redirects_followed = 0
             while True:
                 _validate_url(current_url)
-                addresses = _target_addresses(current_url)
+                addresses = await _target_addresses(current_url)
                 private_target = _classify_target(addresses)
                 address = addresses[0]
                 async with client.stream(
@@ -273,9 +314,9 @@ async def _request_and_decode(
                         received_destination=received_destination,
                         max_bytes=max_bytes,
                     )
-                    destination.flush()
-                    if received_destination is not None:
-                        received_destination.flush()
+                    await _run_worker(
+                        _flush_destinations, destination, received_destination
+                    )
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
@@ -300,6 +341,111 @@ async def _request_and_decode(
         raise ValueError(f"request failed: {exc}") from exc
 
 
+class _BodyDecoder:
+    def __init__(
+        self,
+        *,
+        encoding: str,
+        destination: BinaryIO,
+        received_destination: BinaryIO | None,
+        max_bytes: int,
+    ) -> None:
+        self.destination = destination
+        self.received_destination = received_destination
+        self.max_bytes = max_bytes
+        self.decoder = (
+            zlib.decompressobj(wbits=47)
+            if encoding in {"gzip", "deflate"}
+            else None
+        )
+        self.compressed_prefix = bytearray() if encoding == "deflate" else None
+        self.received = 0
+        self.decompressed = 0
+        self.partial_notice: str | None = None
+
+    def consume(self, raw_chunk: bytes) -> None:
+        received_remaining = self.max_bytes - self.received
+        chunk = raw_chunk[:received_remaining]
+        self.received += len(chunk)
+        if self.received_destination is not None and chunk:
+            self.received_destination.write(chunk)
+        received_limited = len(chunk) < len(raw_chunk)
+        if self.decoder is None:
+            if chunk:
+                self.destination.write(chunk)
+            if received_limited:
+                self.partial_notice = (
+                    f"stopped at {_format_safety_ceiling(self.max_bytes)}: response exceeded the "
+                    "received safety limit"
+                )
+            return
+        if self.compressed_prefix is not None:
+            self.compressed_prefix.extend(chunk)
+        pending = chunk
+        retried_raw_deflate = False
+        produced_output = False
+        while pending:
+            remaining = self.max_bytes - self.decompressed
+            try:
+                decoded = self.decoder.decompress(pending, max_length=remaining + 1)
+            except zlib.error as exc:
+                if self.compressed_prefix is None:
+                    raise _DecompressionFailed(str(exc)) from exc
+                self.decoder = zlib.decompressobj(wbits=-15)
+                self.destination.seek(0)
+                self.destination.truncate()
+                self.decompressed = 0
+                pending = bytes(self.compressed_prefix)
+                self.compressed_prefix = None
+                retried_raw_deflate = True
+                continue
+            if len(decoded) > remaining:
+                self.destination.write(decoded[:remaining])
+                self.decompressed += remaining
+                self.partial_notice = (
+                    f"stopped at {_format_safety_ceiling(self.max_bytes)}: response exceeded the "
+                    "decompressed safety limit"
+                )
+                break
+            self.decompressed += len(decoded)
+            if decoded:
+                self.destination.write(decoded)
+                produced_output = True
+            pending = self.decoder.unconsumed_tail
+        if (
+            self.compressed_prefix is not None
+            and not retried_raw_deflate
+            and produced_output
+        ):
+            self.compressed_prefix = None
+        if self.partial_notice is None and received_limited:
+            self.partial_notice = (
+                f"stopped at {_format_safety_ceiling(self.max_bytes)}: response exceeded the "
+                "received safety limit"
+            )
+
+    def finish(self) -> str | None:
+        if self.decoder is not None and self.partial_notice is None:
+            remaining = self.max_bytes - self.decompressed
+            try:
+                decoded = self.decoder.flush(remaining + 1)
+            except zlib.error as exc:
+                raise _DecompressionFailed(str(exc)) from exc
+            if len(decoded) > remaining:
+                self.destination.write(decoded[:remaining])
+                self.partial_notice = (
+                    f"stopped at {_format_safety_ceiling(self.max_bytes)}: response exceeded the "
+                    "decompressed safety limit"
+                )
+            elif decoded:
+                self.destination.write(decoded)
+            if self.partial_notice is None and not self.decoder.eof:
+                self.partial_notice = (
+                    "compressed stream ended early; returned decoded prefix"
+                )
+        return self.partial_notice
+
+
 async def _decode_body_to_file(
     response: httpx.Response,
     *,
@@ -317,97 +463,17 @@ async def _decode_body_to_file(
         raise ValueError(
             "request failed: multiple content encodings are not supported"
         )
-    encoding = encodings[0] if encodings else "identity"
-    decoder = (
-        zlib.decompressobj(wbits=47)
-        if encoding in {"gzip", "deflate"}
-        else None
+    decoder = _BodyDecoder(
+        encoding=encodings[0] if encodings else "identity",
+        destination=destination,
+        received_destination=received_destination,
+        max_bytes=max_bytes,
     )
-    compressed_prefix = bytearray() if encoding == "deflate" else None
-    received = 0
-    decompressed = 0
-    partial_notice: str | None = None
     async for raw_chunk in _raw_response_chunks(response):
-        received_remaining = max_bytes - received
-        chunk = raw_chunk[:received_remaining]
-        received += len(chunk)
-        if received_destination is not None and chunk:
-            received_destination.write(chunk)
-        received_limited = len(chunk) < len(raw_chunk)
-        if decoder is None:
-            if chunk:
-                destination.write(chunk)
-            if received_limited:
-                partial_notice = (
-                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
-                    "received safety limit"
-                )
-                break
-            continue
-        if compressed_prefix is not None:
-            compressed_prefix.extend(chunk)
-        pending = chunk
-        retried_raw_deflate = False
-        produced_output = False
-        while pending:
-            remaining = max_bytes - decompressed
-            try:
-                decoded = decoder.decompress(pending, max_length=remaining + 1)
-            except zlib.error as exc:
-                if compressed_prefix is None:
-                    raise _DecompressionFailed(str(exc)) from exc
-                decoder = zlib.decompressobj(wbits=-15)
-                destination.seek(0)
-                destination.truncate()
-                decompressed = 0
-                pending = bytes(compressed_prefix)
-                compressed_prefix = None
-                retried_raw_deflate = True
-                continue
-            if len(decoded) > remaining:
-                destination.write(decoded[:remaining])
-                decompressed += remaining
-                partial_notice = (
-                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
-                    "decompressed safety limit"
-                )
-                break
-            decompressed += len(decoded)
-            if decoded:
-                destination.write(decoded)
-                produced_output = True
-            pending = decoder.unconsumed_tail
-        if (
-            compressed_prefix is not None
-            and not retried_raw_deflate
-            and produced_output
-        ):
-            compressed_prefix = None
-        if partial_notice is not None:
+        await _run_worker(decoder.consume, raw_chunk)
+        if decoder.partial_notice is not None:
             break
-        if received_limited:
-            partial_notice = (
-                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
-                "received safety limit"
-            )
-            break
-    if decoder is not None and partial_notice is None:
-        remaining = max_bytes - decompressed
-        try:
-            decoded = decoder.flush(remaining + 1)
-        except zlib.error as exc:
-            raise _DecompressionFailed(str(exc)) from exc
-        if len(decoded) > remaining:
-            destination.write(decoded[:remaining])
-            partial_notice = (
-                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
-                "decompressed safety limit"
-            )
-        elif decoded:
-            destination.write(decoded)
-        if partial_notice is None and not decoder.eof:
-            partial_notice = "compressed stream ended early; returned decoded prefix"
-    return partial_notice
+    return await _run_worker(decoder.finish)
 
 
 def response_text(response: httpx.Response) -> str:
@@ -686,9 +752,9 @@ async def _fetch(
     if abort_signal.is_set():
         raise asyncio.CancelledError()
 
-    with (
-        registry.spills.temporary_file() as received_body,
-        registry.spills.temporary_file() as raw_body,
+    async with (
+        _temporary_file(registry.spills) as received_body,
+        _temporary_file(registry.spills) as raw_body,
     ):
         response = await _get_response_to_file(
             url,
@@ -700,8 +766,8 @@ async def _fetch(
         if abort_signal.is_set():
             raise asyncio.CancelledError()
         final_url = str(response.request.url) if response.request is not None else url
-        with registry.spills.temporary_file() as readable_body:
-            full_size_chars, full_size = await asyncio.to_thread(
+        async with _temporary_file(registry.spills) as readable_body:
+            full_size_chars, full_size = await _run_worker(
                 _stream_readable_text,
                 raw_body,
                 readable_body,
@@ -709,7 +775,7 @@ async def _fetch(
                 content_type=response.headers.get("content-type", ""),
                 encoding=response.encoding or "utf-8",
             )
-            readable_body.flush()
+            await _run_worker(readable_body.flush)
 
             notices: list[str] = []
             partial_notice = response.extensions.get(
@@ -762,7 +828,9 @@ async def _fetch(
                         {
                             "name": "raw",
                             "path": str(raw_path),
-                            "full_size": os.fstat(received_body.fileno()).st_size,
+                            "full_size": (
+                                await _run_worker(os.fstat, received_body.fileno())
+                            ).st_size,
                         }
                     )
                     raw_notice = (
@@ -778,7 +846,8 @@ async def _fetch(
             notice = "\n".join(notices)
             if notice:
                 notice += "\n\n"
-            page, page_end = _read_utf8_page(
+            page, page_end = await _run_worker(
+                _read_utf8_page,
                 readable_body,
                 offset=offset,
                 char_limit=max(0, effective_limit - len(notice)),

@@ -5,6 +5,7 @@ import asyncio
 import base64
 import errno
 import fcntl
+import gc
 import json
 import os
 import pty
@@ -18,8 +19,9 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -52,6 +54,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.cli.main as cli_main_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.credentials import (
@@ -11749,6 +11752,128 @@ async def test_draft_write_runs_off_loop_and_flushes(
 
 
 @pytest.mark.asyncio
+async def test_failed_draft_write_keeps_pending_text_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+    persistence.schedule("old draft")
+    await persistence.flush_pending()
+
+    original = persistence_module.write_session_json
+    failures = 2
+    writes = 0
+
+    def write(directory_fd: int, *args, **kwargs) -> None:
+        nonlocal failures, writes
+        writes += 1
+        if failures:
+            failures -= 1
+            raise OSError(errno.ENOSPC, "disk full")
+        original(directory_fd, *args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    persistence.schedule("new draft")
+    with pytest.raises(OSError, match="disk full"):
+        await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk full"):
+        await persistence.shutdown_pending()
+    assert persistence.load() == "old draft"
+    assert persistence._pending_text == "new draft"
+
+    await persistence.flush_pending()
+    assert persistence.load() == "new draft"
+    assert writes == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    persistence = DraftPersistence(
+        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+    )
+    baseline = _fd_count()
+    stop_delivered = threading.Event()
+    release_worker = threading.Event()
+    original_deliver = persistence._writer._deliver
+    writes = 0
+    original_write = persistence_module.write_session_json
+
+    def write(*args: object, **kwargs: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError(errno.ENOSPC, "disk full")
+        original_write(*args, **kwargs)
+
+    def gated_deliver(
+        item: persistence_module._FileAction,
+        result: object | None,
+        failure: BaseException | None,
+    ) -> None:
+        original_deliver(item, result, failure)
+        if item.stop:
+            stop_delivered.set()
+            assert release_worker.wait(1)
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
+    persistence.schedule("new draft")
+    shutdown = asyncio.create_task(persistence.shutdown_pending())
+    assert await asyncio.to_thread(stop_delivered.wait, 1)
+    with pytest.raises(OSError, match="disk full"):
+        await shutdown
+
+    persistence.flush()
+    assert persistence._writer._queue.qsize() == 1
+    release_worker.set()
+    await persistence._writer.flush(timeout=0.05)
+
+    try:
+        assert persistence.load() == "new draft"
+        assert writes == 2
+        assert _fd_count() <= baseline
+    finally:
+        release_worker.set()
+        os.close(directory_fd)
+
+
+@pytest.mark.asyncio
+async def test_later_successful_snapshot_clears_earlier_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0)
+    first_finished = threading.Event()
+    writes = 0
+    original_write = persistence_module.write_session_json
+
+    def write(*args: object, **kwargs: object) -> None:
+        nonlocal writes
+        writes += 1
+        try:
+            if writes == 1:
+                raise OSError(errno.ENOSPC, "disk full")
+            original_write(*args, **kwargs)
+        finally:
+            first_finished.set()
+
+    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    persistence.schedule("first")
+    assert await asyncio.to_thread(first_finished.wait, 1)
+    persistence.schedule("second")
+    error: OSError | None = None
+    try:
+        await persistence.flush_pending()
+    except OSError as exc:
+        error = exc
+
+    assert error is None, "a successful newer snapshot retained the earlier write failure"
+    assert persistence.load() == "second"
+    assert persistence._pending_text is None
+
+
+@pytest.mark.asyncio
 async def test_runtime_close_draft_writer_owns_its_directory_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11798,7 +11923,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
 
 
 @pytest.mark.asyncio
-async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
+async def test_dup_failure_is_reported_not_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
@@ -11820,7 +11945,10 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
     try:
         persistence.schedule("first")
         await asyncio.sleep(0)
-        await persistence.flush_pending()
+        with pytest.raises(OSError, match="Too many open files"):
+            await persistence.flush_pending()
+        assert DraftPersistence(tmp_path / "draft").load() == ""
+        assert persistence.pending_text == "first"
         fail_dup = False
         await persistence.flush_pending()
     finally:
@@ -11832,6 +11960,312 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
         "failed to persist composer draft: [Errno 24] Too many open files"
     ) == 1
     assert DraftPersistence(tmp_path / "draft").load() == "first"
+
+
+def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+    )
+    errors: list[BaseException] = []
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(_app: object, _args: object) -> tuple[bool, bool]:
+        app._draft.schedule("copy this unsaved draft")
+        try:
+            await app.close()
+        except BaseException as exc:  # noqa: BLE001 - behavior probe
+            errors.append(exc)
+        return False, False
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    stderr = capsys.readouterr().err
+    assert errors == [], "normal exit leaked the draft persistence error"
+    assert "unsaved composer draft:" in stderr
+    assert "copy this unsaved draft" in stderr
+
+
+def test_new_session_continues_after_failed_draft_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    names = iter(("old", "new"))
+    old_app: weakref.ReferenceType[TUIApp] | None = None
+    old_session_id = ""
+    runs = 0
+    errors: list[BaseException] = []
+
+    def create(_args: object) -> TUIApp:
+        nonlocal old_app, old_session_id
+        name = next(names)
+        app = TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / name),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+        if name == "old":
+            old_app = weakref.ref(app)
+            old_session_id = app.loop.store.session_id
+        return app
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            app._new_session_requested = True
+            app._pending_attachments.append(tmp_path / "diagram.png")
+            app._draft.schedule("old session draft")
+        try:
+            await app.close()
+        except BaseException as exc:  # noqa: BLE001 - behavior probe
+            errors.append(exc)
+        return False, False
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    # Pytest's log record would retain the failure traceback and the old app.
+    monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    stderr = capsys.readouterr().err
+    assert errors == [], "new-session transition leaked the draft persistence error"
+    assert runs == 2
+    assert "unsaved composer draft:" in stderr
+    assert old_session_id in stderr
+    assert "old session draft" in stderr
+    assert "diagram.png" in stderr
+    gc.collect()
+    assert old_app is not None and old_app() is None
+
+
+@pytest.mark.parametrize(
+    ("exit_kind", "with_replaced_draft", "expected_status"),
+    (
+        ("render_error", False, 1),
+        ("restart", False, 0),
+        ("keyboard_interrupt", False, None),
+        ("unexpected_error", False, None),
+        ("render_error", True, 1),
+        ("restart", True, 0),
+    ),
+)
+def test_failed_active_draft_is_printed_on_every_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exit_kind: str,
+    with_replaced_draft: bool,
+    expected_status: int | None,
+) -> None:
+    names = iter(("old", "new")) if with_replaced_draft else iter(("active",))
+    runs = 0
+    write_failed = threading.Event()
+    restart_called = threading.Event()
+    stderr_before_restart = ""
+
+    def create(_args: object) -> TUIApp:
+        return TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / next(names)),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        write_failed.set()
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if with_replaced_draft and runs == 1:
+            app._new_session_requested = True
+            app._draft.schedule("old draft payload")
+            await app.close()
+            assert write_failed.is_set()
+            write_failed.clear()
+            return False, False
+        app._draft.schedule("active draft payload")
+        await app.close()
+        assert write_failed.is_set()
+        if exit_kind == "render_error":
+            raise cli_main_module.TerminalRenderError("render broke")
+        if exit_kind == "keyboard_interrupt":
+            raise KeyboardInterrupt
+        if exit_kind == "unexpected_error":
+            raise RuntimeError("unexpected failure")
+        return True, False
+
+    def exec_restart(*_args: object) -> int:
+        nonlocal stderr_before_restart
+        stderr_before_restart = capsys.readouterr().err
+        assert "unsaved composer draft:" in stderr_before_restart
+        restart_called.set()
+        return 0
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    if exit_kind == "keyboard_interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            cli_main_module.main([])
+    elif exit_kind == "unexpected_error":
+        with pytest.raises(RuntimeError, match="unexpected failure"):
+            cli_main_module.main([])
+    else:
+        assert cli_main_module.main([]) == expected_status
+    stderr = stderr_before_restart + capsys.readouterr().err
+    expected_drafts = 2 if with_replaced_draft else 1
+    assert "unsaved composer draft:" in stderr
+    assert stderr.count("unsaved composer draft:") == expected_drafts
+    assert stderr.count("active draft payload") == 1
+    assert stderr.count("old draft payload") == int(with_replaced_draft)
+    assert restart_called.is_set() is (exit_kind == "restart")
+
+
+@pytest.mark.parametrize(
+    ("exit_kind", "expected_status"),
+    (("render_error", 1), ("restart", 0), ("unexpected_error", None)),
+)
+def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exit_kind: str,
+    expected_status: int | None,
+) -> None:
+    names = iter(("old", "new"))
+    runs = 0
+    write_failed = threading.Event()
+    restart_called = threading.Event()
+    stderr_before_restart = ""
+
+    def create(_args: object) -> TUIApp:
+        return TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / next(names)),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        write_failed.set()
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            app._new_session_requested = True
+            app._draft.schedule("draft one")
+            await app.close()
+            assert write_failed.is_set()
+            return False, False
+        await app.close()
+        if exit_kind == "render_error":
+            raise cli_main_module.TerminalRenderError("render broke")
+        if exit_kind == "unexpected_error":
+            raise RuntimeError("unexpected failure")
+        return True, False
+
+    def exec_restart(*_args: object) -> int:
+        nonlocal stderr_before_restart
+        stderr_before_restart = capsys.readouterr().err
+        assert "unsaved composer draft:" in stderr_before_restart
+        restart_called.set()
+        return 0
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    if exit_kind == "unexpected_error":
+        with pytest.raises(RuntimeError, match="unexpected failure"):
+            cli_main_module.main([])
+    else:
+        assert cli_main_module.main([]) == expected_status
+    stderr = stderr_before_restart + capsys.readouterr().err
+    assert "unsaved composer draft:" in stderr
+    assert stderr.count("unsaved composer draft:") == 1
+    assert "draft one" in stderr
+    assert restart_called.is_set() is (exit_kind == "restart")
+
+
+def test_new_session_with_successful_draft_prints_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    names = iter(("old", "new"))
+    runs = 0
+
+    def create(_args: object) -> TUIApp:
+        return TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / next(names)),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            app._new_session_requested = True
+            app._draft.schedule("saved draft")
+        await app.close()
+        return False, False
+
+    monkeypatch.setattr(cli_main_module, "create_app", create)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    assert runs == 2
+    assert "unsaved composer draft:" not in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
@@ -11975,6 +12409,53 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[tuple[str, int]] = []
+    persistence = DraftPersistence(
+        tmp_path / "draft",
+        delay=0,
+        notice_sink=lambda message: notices.append((message, threading.get_ident())),
+    )
+    loop_thread = threading.get_ident()
+
+    def fail(*_args, **_kwargs) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    persistence.schedule("first")
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
+
+    assert notices == [(
+        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+        loop_thread,
+    )]
+
+
+@pytest.mark.asyncio
+async def test_failed_final_draft_flush_is_visible_during_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _session = _agent_list_session(tmp_path, 0)
+
+    def fail(*_args, **_kwargs) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    app._draft.schedule("must not disappear")
+    await app.close()
+    await asyncio.sleep(0)
+
+    rendered = Text.from_ansi("".join(app._transcript_lines)).plain
+    assert "composer draft was not saved" in rendered
+    assert "your text remains unsaved" in rendered
+    assert "copy it before exiting" in rendered
+    app.loop.store.close()
+
+
+@pytest.mark.asyncio
 async def test_draft_write_failure_is_reported_once_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -11985,11 +12466,14 @@ async def test_draft_write_failure_is_reported_once_without_raising(
 
     monkeypatch.setattr(persistence_module, "write_json_file", fail)
     persistence.schedule("first")
-    await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
     persistence.schedule("second")
-    await persistence.flush_pending()
+    with pytest.raises(OSError, match="disk unavailable"):
+        await persistence.flush_pending()
 
     assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
+    assert persistence._pending_text == "second"
 
 
 
