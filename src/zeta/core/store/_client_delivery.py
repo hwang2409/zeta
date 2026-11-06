@@ -96,10 +96,8 @@ def validate_client_delivery_data(
             and status == "queued"
             and outcome == {"accepted": True}
         )
-        if (
-            set(data) != {"delivery_id", "method", "status", "outcome"}
-            or not valid_acceptance
-        ):
+        allowed = {"delivery_id", "method", "status", "outcome"}
+        if set(data) - allowed or not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
 
@@ -348,18 +346,47 @@ class ClientDeliveryMixin:
         """Durably drop every queued delivery before releasing queue ownership."""
 
         queued = tuple(self._client_steering)
-        delivery_ids = [item.delivery_id for item in queued if item.delivery_id is not None]
-        if delivery_ids:
-            with self._append_lock():
-                rows = [
-                    _transition_row(delivery_id, "dropped", reason)
-                    for delivery_id in delivery_ids
-                    if self.client_delivery_outcome(delivery_id) == "queued"
-                ]
-                if rows:
-                    self._append_many_unlocked(rows)
+        self._drop_client_steering(queued, reason)
         self._client_steering.clear()
         return len(queued)
+
+    def _drop_client_steering(
+        self: ConversationStore,
+        queued: tuple[_QueuedSteering, ...],
+        reason: DeliveryDropReason,
+    ) -> list[ConversationEntry]:
+        delivery_ids = [
+            item.delivery_id for item in queued if item.delivery_id is not None
+        ]
+        if not delivery_ids:
+            return []
+        with self._append_lock():
+            rows = [
+                _transition_row(delivery_id, "dropped", reason)
+                for delivery_id in delivery_ids
+                if self.client_delivery_outcome(delivery_id) == "queued"
+            ]
+            if not rows:
+                return []
+            return [
+                self._snapshot_entry(entry)
+                for entry in self._append_many_unlocked(rows)
+            ]
+
+    async def drop_client_steering_async(
+        self: ConversationStore, reason: DeliveryDropReason
+    ) -> tuple[ConversationEntry, ...]:
+        """Commit queued drops off-loop, then release their queue ownership."""
+
+        queued = tuple(self._client_steering)
+        entries = await self._to_thread_durable(
+            self._drop_client_steering, queued, reason
+        )
+        for expected in queued:
+            if not self._client_steering or self._client_steering[0] != expected:
+                raise RuntimeError("client steering queue changed during drop")
+            self._client_steering.popleft()
+        return tuple(entries)
 
 
 def image_payload_digest(

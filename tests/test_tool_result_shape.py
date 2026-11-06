@@ -424,10 +424,14 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
         "stderr": "",
         "exit_code": 0,
         "cwd_after": str(tmp_path),
+        "stdout_truncated": False,
+        "stderr_truncated": False,
     }
     assert bash_success["structuredContent"] == {
         "stdout": "",
         "stderr": "",
         "exit_code": 0,
         "cwd_after": str(tmp_path),
+        "stdout_truncated": False,
+        "stderr_truncated": False,
     }

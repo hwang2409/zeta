@@ -18,9 +18,7 @@ from uuid import uuid4
 
 from ..core.checkpoints import list_branches_from_entries
 from ..core.session_files import child_directory, write_session_file
-from ..core.store._client_delivery import (
-    CLIENT_DELIVERY_METADATA,
-)
+from ..core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ..core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
@@ -375,12 +373,19 @@ def history_projection(
         if entry.type in {"message", "notification"}:
             entries[-1].append(entry)
             entries.append([])
-        elif entry.type in {"approval_resolution", "approval_history"}:
+        elif entry.type in {
+            "client_delivery",
+            "approval_resolution",
+            "approval_history",
+            "turn_end",
+        }:
             entries[-1].append(entry)
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
     built = HistoryProjection(
-        tuple(tuple(group) for group in entries), MappingProxyType(approval_calls), MappingProxyType(entry_index)
+        tuple(tuple(group) for group in entries),
+        MappingProxyType(approval_calls),
+        MappingProxyType(entry_index),
     )
     with _cache_creation_lock:
         cached = _cache(
@@ -415,6 +420,14 @@ def _attach_row_handle(
     return block
 
 
+def _project_tool_call_arguments(call: dict[str, object], *, fidelity: bool) -> dict[str, object]:
+    arguments = call.get("arguments", {})
+    if not fidelity:
+        return {"arguments": {}}
+    projected, truncated = event_contract.project_tool_value(arguments)
+    return {"arguments": projected, "arguments_truncated": truncated}
+
+
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
@@ -424,6 +437,13 @@ def _history_entry_rows(
     """Project one durable entry to one atomic group of history rows."""
 
     entry_type = entry.type
+    if entry_type == "client_delivery":
+        if not fidelity:
+            return []
+        data = entry.data
+        if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
+            return []
+        return [event_contract.delivery_status_row(entry)]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -440,6 +460,12 @@ def _history_entry_rows(
             }
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
+    if entry_type == "turn_end":
+        data = entry.data if isinstance(entry.data, dict) else {}
+        row = {"id": entry.id, "role": "system", "event": "turn_end", "data": {}}
+        if "reason" in data:
+            row["data"] = {"reason": data["reason"]}
+        return [row]
     if entry_type == "notification":
         data = entry.data
         kind = data.get("kind", "agent_completion")
@@ -479,7 +505,7 @@ def _history_entry_rows(
                     "tool_call": {
                         "id": call["id"],
                         "name": call["name"],
-                        "arguments": {},
+                        **_project_tool_call_arguments(call, fidelity=fidelity),
                     },
                 }
             )
@@ -496,14 +522,23 @@ def _history_entry_rows(
         if fidelity:
             for index, block in enumerate(result.get("content_blocks") or []):
                 if isinstance(block, dict) and block.get("type") == "image":
-                    stub = {key: block[key] for key in ("type", "mimeType", "caption", "width", "height", "size") if key in block}
-                    stub["size"] = stub.get("size", 0)
-                    stub["data_omitted"] = True
+                    stub = event_contract.image_stub(block)
                     blocks.append(_attach_row_handle(
                         stub, entry.id, "message.tool_result.content_blocks", index,
                         fidelity=fidelity, content_read=content_read,
                     ))
-        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks, "structured_content": None}
+        result = {**result, "content": bounded(result.get("content", ""), 8000), "content_blocks": blocks}
+        structured = result.get("structured_content")
+        if fidelity and structured is not None:
+            projected, wire_truncated = event_contract.project_tool_value(structured)
+            result["structured_content"] = projected
+            result["structured_content_truncated"] = (
+                event_contract.structured_content_truncated(
+                    structured, wire_truncated=wire_truncated
+                )
+            )
+        else:
+            result["structured_content"] = None
     row = {
         "id": entry.id,
         "role": message["role"],
