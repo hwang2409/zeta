@@ -7948,14 +7948,29 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     monkeypatch.setattr(tui_app, "cancel_activation", observed_cancel_activation)
 
     recovery_steps = 0
+    gated_once = False
 
     def gated_recovery(loop: AgentLoop, **kwargs: object) -> object:
-        nonlocal recovery_steps
-        deliveries = recover_agent_children(loop, **kwargs)
-        recovery_steps += 1
-        if recovery_steps == 1:
-            recovery_mutated.set()
-            assert recovery_release.wait(timeout=5)
+        nonlocal gated_once, recovery_steps
+        children_before = len(loop.store.agent_children())
+        should_stop = kwargs.get("should_stop")
+        stop_checks = 0
+
+        def observed_stop() -> bool:
+            nonlocal gated_once, stop_checks
+            stop_checks += 1
+            if not gated_once and stop_checks == 2:
+                gated_once = True
+                recovery_mutated.set()
+                assert recovery_release.wait(timeout=5)
+                assert callable(should_stop)
+                deadline = time.monotonic() + 5
+                while not should_stop() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return bool(should_stop and should_stop())
+
+        deliveries = recover_agent_children(loop, should_stop=observed_stop)
+        recovery_steps += children_before - len(loop.store.agent_children())
         return deliveries
 
     monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)

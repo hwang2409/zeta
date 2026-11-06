@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -141,6 +142,8 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     root = loop.store
     notification = loop._background_owner.notification_store
 
+    stop_recovery = threading.Event()
+
     def recover() -> tuple[NotificationInput, ...]:
         from .background import _recover_agent_children
 
@@ -150,7 +153,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             if notification is root:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_root),
-                    max_children=1,
+                    should_stop=stop_recovery.is_set,
                 )
             with ConversationStore(
                 notification.root_dir,
@@ -159,29 +162,21 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             ) as worker_notification:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification),
-                    max_children=1,
+                    should_stop=stop_recovery.is_set,
                 )
 
-    async def complete_recovery() -> bool:
-        children_before = set(root.agent_children())
-        questions_before = len(root.agent_notifications())
+    async def complete_recovery() -> None:
         deliveries = await root._to_thread_store(recover)
         for item in deliveries:
             await loop._background_owner.conversation_channel.produce_to(None, item)
         await root._refresh_off_loop()
         if notification is not root:
             await notification._refresh_off_loop()
-        return children_before != set(root.agent_children()) or questions_before != len(
-            root.agent_notifications()
-        )
 
-    while _has_recovery_work(loop):
-        recovery = asyncio.create_task(complete_recovery())
-        try:
-            progressed = await asyncio.shield(recovery)
-        except asyncio.CancelledError:
-            await recovery
-            raise
-        if not progressed:
-            return
-        await asyncio.sleep(0)
+    recovery = asyncio.create_task(complete_recovery())
+    try:
+        await asyncio.shield(recovery)
+    except asyncio.CancelledError:
+        stop_recovery.set()
+        await recovery
+        raise
