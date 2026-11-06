@@ -931,14 +931,14 @@ class AgentNavigation:
             return None
         return stat.st_mtime_ns, stat.st_size
 
-    def _agents_directory_signature(self) -> tuple[object, ...]:
-        agents = self.current_path / "agents"
-        signature = self._path_signature(agents)
+    def _child_registration_signature(self) -> tuple[object, ...]:
+        state_path = self.current_path / "session_state.json"
         try:
-            entry_count = sum(1 for _ in os.scandir(agents))
+            state = state_path.stat()
+            registration = (state.st_mtime_ns, state.st_size, state.st_ino)
         except OSError:
-            entry_count = 0
-        return signature, entry_count
+            registration = None
+        return registration, self._path_signature(self.current_path / "agents")
 
     def _agent_tree_signature(self) -> tuple[object, ...]:
         """Detect tree changes while statting lifecycle only for live children."""
@@ -952,7 +952,7 @@ class AgentNavigation:
         return (
             self.current_path,
             self.selected_index,
-            self._agents_directory_signature(),
+            self._child_registration_signature(),
             running,
         )
 
