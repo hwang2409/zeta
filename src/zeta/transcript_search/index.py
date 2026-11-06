@@ -1047,28 +1047,18 @@ def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
 
 
 def transcript_index_refresh_failure(
-    projects_root: Path,
-    project_id: str,
-    session_id: str,
+    projects_root: Path, project_id: str, session_id: str
 ) -> str | None:
     """Return this loop's refresh failure for one indexed session."""
-
     try:
         states = _REFRESH_STATES.get(asyncio.get_running_loop(), {})
     except RuntimeError:
         return None
-    root = Path(projects_root)
-    return next(
-        (
-            state.failure
-            for (state_root, state_project_id), state in states.items()
-            if state.failure is not None
-            and state_project_id == project_id
-            and state_root == root
-            and session_id in state.pending
-        ),
-        None,
-    )
+    key = (Path(projects_root), project_id)
+    state = states.get(key)
+    if state is None or session_id not in state.pending:
+        return None
+    return state.failure
 
 
 async def refresh_transcript_index(
