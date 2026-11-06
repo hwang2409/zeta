@@ -1271,27 +1271,39 @@ async def test_registry_rejects_malformed_write_arguments(
     assert "invalid arguments" in result["content"][0]["text"]
 
 
-BASH_MAX_OUTPUT_BYTES = 10_000
+BASH_MAX_OUTPUT_BYTES = 1_048_576
 
 
 @pytest.mark.asyncio
-async def test_bash_accepts_max_output_at_host_cap(tmp_path: Path) -> None:
+async def test_bash_accepts_host_cap_without_preallocating_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures = []
+    real_capture = bash_module._OutputCapture
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(bash_module, "_OutputCapture", TrackingCapture)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
         ToolCall(
             "bash-at-host-cap",
             "bash",
-            {
-                "command": _python_command(
-                    f"import sys; sys.stdout.write('x' * {BASH_MAX_OUTPUT_BYTES})"
-                ),
-                "max_output": BASH_MAX_OUTPUT_BYTES,
-            },
+            {"command": "printf x", "max_output": BASH_MAX_OUTPUT_BYTES},
         )
     )
 
     assert result["isError"] is False
-    assert len(result["structuredContent"]["stdout"].encode()) == BASH_MAX_OUTPUT_BYTES
+    assert result["structuredContent"]["stdout"] == "x"
+    assert [capture.limit for capture in captures] == [
+        BASH_MAX_OUTPUT_BYTES,
+        BASH_MAX_OUTPUT_BYTES,
+    ]
+    assert [len(capture.data) for capture in captures] == [1, 0]
     schema = registry.definitions_by_name["bash"].parameters
     assert schema["properties"]["max_output"].get("maximum") == BASH_MAX_OUTPUT_BYTES
 
@@ -1392,7 +1404,7 @@ def test_bash_schema_advertises_max_output_host_cap(tmp_path: Path) -> None:
         "type": "integer",
         "minimum": 1,
         "maximum": BASH_MAX_OUTPUT_BYTES,
-        "description": "Maximum retained output per stream in bytes.",
+        "description": "Maximum retained output per stream in bytes, up to 1 MiB.",
     }
 
 

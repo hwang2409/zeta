@@ -34,7 +34,7 @@ from ..registry import (
 )
 
 MAX_TIMEOUT_SECONDS = 3600.0
-MAX_OUTPUT_BYTES = 10_000
+MAX_OUTPUT_BYTES = 1_048_576
 
 
 class BashArguments(TypedDict, total=False):
@@ -444,7 +444,7 @@ def register(registry: ToolRegistry) -> None:
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_OUTPUT_BYTES,
-                    "description": "Maximum retained output per stream in bytes.",
+                    "description": "Maximum retained output per stream in bytes, up to 1 MiB.",
                 },
             },
             "additionalProperties": False,
