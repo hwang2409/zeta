@@ -489,11 +489,12 @@ async def test_decoded_progress_resets_progress_deadline(
     seen = []
     async for item in watched:
         seen.append(item)
-        event_type = "message_start" if item == 9 else "ping"
+        event_type = "message_start" if item in {4, 14} else "ping"
         progress.observe((event_type, {"type": event_type}))
 
     assert seen == list(range(20))
     assert clock == [1200.0]
+    assert progress.maximum_gap_s() == 600.0
 
 
 async def _no_op_sleep(_delay: float) -> None:
