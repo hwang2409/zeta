@@ -235,6 +235,7 @@ class TUIApp(
         self._init_fork_runtime()
         self._resumed_session = resumed
         self._startup_replay_active = False
+        self._startup_submissions: list[tuple[str, bool]] = []
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -661,6 +662,9 @@ class TUIApp(
             self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
+        if self._startup_replay_active and self._input_loop_active:
+            self._startup_submissions.append((value, internal))
+            return True
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
@@ -1117,6 +1121,9 @@ class TUIApp(
         self._present_pending_approvals()
         self.start_decisions_poll()
         self._invalidate_prompt()
+        submissions, self._startup_submissions = self._startup_submissions, []
+        for value, internal in submissions:
+            self._submit_input(value, internal=internal)
         return True
 
     async def run(
