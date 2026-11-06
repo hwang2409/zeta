@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import threading
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -37,6 +39,23 @@ async def owned_tool_registries(monkeypatch: pytest.MonkeyPatch):
     yield
     for registry in reversed(registries):
         await registry.close()
+
+
+def _release_gate_after_loop_progress(
+    loop: asyncio.AbstractEventLoop,
+    entered: threading.Event,
+    release: threading.Event,
+    progressed: threading.Event,
+    outcomes: list[bool],
+    *required: threading.Event,
+) -> None:
+    assert entered.wait(timeout=5)
+    loop.call_soon_threadsafe(progressed.set)
+    all_progressed = progressed.wait(timeout=5)
+    for event in required:
+        all_progressed = event.wait(timeout=5) and all_progressed
+    outcomes.append(all_progressed)
+    release.set()
 
 
 class _ChunkedByteStream(httpx.AsyncByteStream):
@@ -204,6 +223,163 @@ async def test_fetch_streams_body_and_ignores_lying_content_length(
     assert result["isError"] is False
     assert "received safety limit" in result["content"][0]["text"]
     assert Path(result["content"][0]["spill_path"]).read_text() == "12345"
+
+
+@pytest.mark.asyncio
+async def test_fetch_dns_resolution_does_not_block_loop_or_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    progressed = threading.Event()
+    cancelled = threading.Event()
+    outcomes: list[bool] = []
+
+    def held_getaddrinfo(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return [
+            (fetch_tool.socket.AF_INET, fetch_tool.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
+
+    monkeypatch.setattr(fetch_tool.socket, "getaddrinfo", held_getaddrinfo)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    fetch = asyncio.create_task(
+        registry.execute(ToolCall("fetch-1", "fetch", {"url": "example.com"}))
+    )
+    fetch.add_done_callback(lambda _task: cancelled.set())
+    worker = threading.Thread(
+        target=_release_gate_after_loop_progress,
+        args=(
+            asyncio.get_running_loop(),
+            entered,
+            release,
+            progressed,
+            outcomes,
+            cancelled,
+        ),
+    )
+    worker.start()
+    await asyncio.to_thread(entered.wait)
+    fetch.cancel()
+
+    await asyncio.gather(fetch, return_exceptions=True)
+    await asyncio.to_thread(worker.join)
+
+    assert outcomes == [True]
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_fetch_decompression_does_not_block_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    progressed = threading.Event()
+    outcomes: list[bool] = []
+    original_decompressobj = zlib.decompressobj
+
+    class HeldDecoder:
+        def __init__(self, *args, **kwargs) -> None:
+            self.decoder = original_decompressobj(*args, **kwargs)
+
+        def decompress(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return self.decoder.decompress(*args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self.decoder, name)
+
+    monkeypatch.setattr(fetch_tool.zlib, "decompressobj", HeldDecoder)
+    worker = threading.Thread(
+        target=_release_gate_after_loop_progress,
+        args=(asyncio.get_running_loop(), entered, release, progressed, outcomes),
+    )
+    worker.start()
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+            stream=_ChunkedByteStream(gzip.compress(b"x" * (1024 * 1024))),
+        ),
+        arguments={"url": "example.com", "max_bytes": 2 * 1024 * 1024},
+    )
+    await asyncio.to_thread(worker.join)
+
+    assert outcomes == [True]
+    assert result["isError"] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_temp_file_write_does_not_block_loop_and_cleans_up_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    progressed = threading.Event()
+    cancelled = threading.Event()
+    outcomes: list[bool] = []
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    paths: list[Path] = []
+
+    class HeldWrite:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def write(self, value: bytes) -> int:
+            entered.set()
+            assert release.wait(timeout=5)
+            return self.handle.write(value)
+
+        def __getattr__(self, name: str):
+            return getattr(self.handle, name)
+
+    @contextmanager
+    def temporary_file():
+        path = tmp_path / f"held-{len(paths)}.tmp"
+        paths.append(path)
+        with path.open("w+b") as handle:
+            yield HeldWrite(handle)
+        path.unlink()
+
+    monkeypatch.setattr(registry.spills, "temporary_file", temporary_file)
+    _mock_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=_ChunkedByteStream(b"body"),
+            request=request,
+        ),
+    )
+    fetch = asyncio.create_task(
+        registry.execute(ToolCall("fetch-1", "fetch", {"url": "example.com"}))
+    )
+    fetch.add_done_callback(lambda _task: cancelled.set())
+    worker = threading.Thread(
+        target=_release_gate_after_loop_progress,
+        args=(
+            asyncio.get_running_loop(),
+            entered,
+            release,
+            progressed,
+            outcomes,
+        ),
+    )
+    worker.start()
+    await asyncio.to_thread(entered.wait)
+    fetch.cancel()
+
+    await asyncio.gather(fetch, return_exceptions=True)
+    await asyncio.to_thread(worker.join)
+
+    assert outcomes == [True]
+    assert cancelled.is_set()
+    assert not any(path.exists() for path in paths)
 
 
 @pytest.mark.asyncio
@@ -460,6 +636,8 @@ async def test_parallel_fetches_cancel_on_production_dispatch_abort(
 async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    resolved_hosts: list[str] = []
+    requested_addresses: list[str] = []
     responses = {
         "https://example.com/start": httpx.Response(
             302, headers={"location": "http://example.com/final"}
@@ -470,6 +648,7 @@ async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requested_addresses.append(request.url.host)
         requested_url = (
             f"{request.url.scheme}://{request.headers['host']}{request.url.path}"
         )
@@ -478,11 +657,22 @@ async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
         return response
 
     _mock_client(monkeypatch, handler)
+
+    def getaddrinfo(host: str, *args, **kwargs):
+        resolved_hosts.append(host)
+        address = f"93.184.216.{33 + len(resolved_hosts)}"
+        return [
+            (fetch_tool.socket.AF_INET, fetch_tool.socket.SOCK_STREAM, 6, "", (address, 0))
+        ]
+
+    monkeypatch.setattr(fetch_tool.socket, "getaddrinfo", getaddrinfo)
     result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/start"})
     )
 
     assert result["isError"] is False
+    assert resolved_hosts == ["example.com", "example.com"]
+    assert requested_addresses == ["93.184.216.34", "93.184.216.35"]
     assert result["content"][0]["text"].startswith(
         "notice: http URL is not encrypted\n\ndone"
     )
@@ -606,6 +796,7 @@ async def test_fetch_allows_private_target_with_notice_and_blocks_metadata(
     assert "cloud metadata" in blocked["content"][0]["text"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "url",
     [
@@ -613,9 +804,18 @@ async def test_fetch_allows_private_target_with_notice_and_blocks_metadata(
         "http://[::169.254.169.254]/",
     ],
 )
-def test_fetch_blocks_mapped_cloud_metadata_addresses(url: str) -> None:
-    with pytest.raises(ValueError, match="cloud metadata"):
-        fetch_tool._validate_target(url)
+async def test_fetch_blocks_mapped_cloud_metadata_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(200, headers={"content-type": "text/plain"}, text="no"),
+        arguments={"url": url},
+    )
+
+    assert result["isError"] is True
+    assert "cloud metadata" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
