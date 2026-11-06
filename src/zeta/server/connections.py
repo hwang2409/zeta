@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from . import content, ergonomics
-from .protocol import ProtocolError
+from .protocol import FrameWriteCancelled, ProtocolError
 
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history", "content_read",
@@ -30,19 +29,41 @@ class ControllerMetadata:
 
 
 @dataclass
+class _OutputFrame:
+    payload: bytes
+    future: asyncio.Future[bool] | None = None
+    buffered_controller_event: bool = False
+
+
+@dataclass
+class _OutputState:
+    phase: Literal[
+        "claimed_buffering", "flushing", "ready", "overflowing"
+    ] = "claimed_buffering"
+    queue: deque[_OutputFrame] = field(default_factory=deque)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    writer_task: asyncio.Task[None] | None = None
+    current_frame: _OutputFrame | None = None
+    current_write: asyncio.Task[tuple[bool, FrameWriteCancelled | None]] | None = None
+    ready: asyncio.Future[bool] | None = None
+    callers_settled: asyncio.Event = field(default_factory=asyncio.Event)
+    pending_callers: int = 0
+    overflow_done: asyncio.Future[bool] | None = None
+    queued_bytes: int = 0
+    pending_controller_bytes: int = 0
+    pending_controller_frames: int = 0
+    overflowed: bool = False
+    overflowed_before_flush: bool = False
+    released: bool = False
+
+
+@dataclass
 class _Connection:
     connection: Any
     role: str | None = None
     protocol_version: str = "1.0"
     features: frozenset[str] = frozenset()
-    queue: asyncio.Queue[tuple[bytes, asyncio.Future[bool]]] | None = None
-    writer_task: asyncio.Task[None] | None = None
-    queued_bytes: int = 0
-    ready: bool = False
-    flushing: bool = False
-    buffered_frames: deque[bytes] = field(default_factory=deque)
-    buffered_bytes: int = 0
-    overflowed: bool = False
+    output: _OutputState | None = None
 
 
 class ConnectionRegistry:
@@ -66,7 +87,13 @@ class ConnectionRegistry:
             raise RuntimeError("connection registry is closed")
         if len(self._connections) >= MAX_CONNECTIONS:
             raise RuntimeError("connection limit reached")
-        self._connections[connection] = _Connection(connection)
+        state = _Connection(connection)
+        output = _OutputState()
+        output.ready = self.loop.create_future()
+        output.callers_settled.set()
+        state.output = output
+        self._connections[connection] = state
+        output.writer_task = asyncio.create_task(self._output_writer(state))
 
     def negotiate_role(
         self,
@@ -114,8 +141,6 @@ class ConnectionRegistry:
         else:
             if len(self._observers) >= 8:
                 raise RuntimeError("observer limit reached")
-            state.queue = asyncio.Queue(maxsize=256)
-            state.writer_task = asyncio.create_task(self._observer_writer(state))
             self._observers.append(state)
         state.role = role
         state.protocol_version = protocol_version
@@ -124,37 +149,6 @@ class ConnectionRegistry:
     def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
         return state is not None and state is self._controller
-
-    def controller_ready(self, connection: Any) -> None:
-        if not self.is_controller(connection):
-            raise RuntimeError("connection does not own the controller claim")
-        state = self._connections[connection]
-        state.ready = True
-        state.flushing = bool(state.buffered_frames)
-
-    async def flush_controller(self, connection: Any) -> bool:
-        state = self._connections.get(connection)
-        if state is None or state is not self._controller:
-            return False
-        if state.overflowed:
-            error = json.dumps(
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "controller output overflow"}},
-                separators=(",", ":"),
-            ).encode() + b"\n"
-            with contextlib.suppress(ConnectionError, OSError, RuntimeError):
-                await connection._write_physical(error)
-            await connection.close()
-            return False
-        try:
-            while state.buffered_frames:
-                frame = state.buffered_frames[0]
-                if not await connection._write_physical(frame):
-                    return False
-                state.buffered_frames.popleft()
-                state.buffered_bytes -= len(frame)
-            return True
-        finally:
-            state.flushing = False
 
     def controller_metadata(self) -> ControllerMetadata | None:
         state = self._controller
@@ -183,16 +177,30 @@ class ConnectionRegistry:
         ):
             return False
         frame = state.connection.codec.notification(event, session_id, **fields)
-        if not state.ready or state.flushing:
-            if state.buffered_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT or len(state.buffered_frames) >= _CONTROLLER_BUFFER_FRAMES:
-                state.overflowed = True
-                state.buffered_frames.clear()
-                state.buffered_bytes = 0
+        output = state.output
+        assert output is not None
+        if output.phase in {"claimed_buffering", "flushing"}:
+            if output.phase == "flushing" and output.overflowed:
+                # Honest rejection with -32011 belongs to phase B.
+                return True
+            if (
+                output.pending_controller_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT
+                or output.pending_controller_frames >= _CONTROLLER_BUFFER_FRAMES
+            ):
+                output.overflowed = True
+                self._clear_output(output)
                 return False
-            state.buffered_frames.append(frame)
-            state.buffered_bytes += len(frame)
+            output.pending_controller_bytes += len(frame)
+            output.pending_controller_frames += 1
+            self._enqueue(
+                output,
+                _OutputFrame(frame, buffered_controller_event=True),
+                wake=output.phase == "flushing",
+            )
             return True
-        return await state.connection._write_physical(frame)
+        if output.phase != "ready":
+            return False
+        return await self._send_frame(output, frame)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
@@ -200,68 +208,288 @@ class ConnectionRegistry:
             return
         if state is self._controller:
             self._controller = None
-        state.buffered_frames.clear()
-        state.buffered_bytes = 0
         if state in self._observers:
             self._observers.remove(state)
-        if state.writer_task is not None:
-            state.writer_task.cancel()
-        if state.queue is not None:
-            while not state.queue.empty():
-                _, future = state.queue.get_nowait()
-                future.cancel()
+        output = state.output
+        if output is not None:
+            self._release_output(output, state.role)
 
     async def send(self, connection: Any, frame: bytes) -> bool:
         state = self._connections.get(connection)
-        if state is None:
+        if state is None or state.output is None:
             return False
-        if state.role != "observer":
-            return await connection._write_physical(frame)
-        assert state.queue is not None
-        if state.queued_bytes + len(frame) > 4 * 1024 * 1024 or state.queue.full():
-            await self._overflow(state)
+        output = state.output
+        if output.phase == "claimed_buffering":
+            return await self._send_hello(output, frame)
+        if output.phase != "ready":
             return False
-        future = self.loop.create_future()
-        state.queue.put_nowait((frame, future))
-        state.queued_bytes += len(frame)
-        return await future
+        if state.role == "observer" and (
+            output.queued_bytes + len(frame) > 4 * 1024 * 1024
+            or len(output.queue) >= 256
+        ):
+            return await self._overflow(state)
+        return await self._send_frame(output, frame)
 
-    async def _observer_writer(self, state: _Connection) -> None:
-        assert state.queue is not None
+    async def _send_hello(self, output: _OutputState, frame: bytes) -> bool:
+        hello = _OutputFrame(frame)
+        output.queue.appendleft(hello)
+        output.queued_bytes += len(frame)
+        output.overflowed_before_flush = output.overflowed
+        output.phase = "flushing"
+        output.wake.set()
+        assert output.ready is not None
+        self._begin_caller(output)
+        try:
+            return await asyncio.shield(output.ready)
+        except asyncio.CancelledError:
+            _, cancelled = await self._cancel_frame(output, hello)
+            if cancelled is not None:
+                raise cancelled
+            if output.ready.done() and not output.ready.cancelled():
+                return output.ready.result()
+            raise
+        finally:
+            self._finish_caller(output)
+
+    async def _send_frame(self, output: _OutputState, frame: bytes) -> bool:
+        future = self.loop.create_future()
+        item = _OutputFrame(frame, future)
+        self._enqueue(output, item)
+        self._begin_caller(output)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            result, cancelled = await self._cancel_frame(output, item)
+            if cancelled is not None:
+                raise cancelled
+            if result is not None:
+                return result
+            if future.done() and not future.cancelled():
+                return future.result()
+            raise
+        finally:
+            self._finish_caller(output)
+
+    async def wait_until_settled(self, connection: Any) -> None:
+        state = self._connections.get(connection)
+        if state is not None and state.output is not None:
+            await state.output.callers_settled.wait()
+
+    @staticmethod
+    def _begin_caller(output: _OutputState) -> None:
+        output.pending_callers += 1
+        output.callers_settled.clear()
+
+    def _finish_caller(self, output: _OutputState) -> None:
+        self.loop.call_later(0, self._settle_caller, output)
+
+    @staticmethod
+    def _settle_caller(output: _OutputState) -> None:
+        output.pending_callers -= 1
+        if output.pending_callers == 0:
+            output.callers_settled.set()
+
+    def _enqueue(
+        self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
+    ) -> None:
+        output.queue.append(frame)
+        output.queued_bytes += len(frame.payload)
+        if wake:
+            output.wake.set()
+
+    async def _output_writer(self, state: _Connection) -> None:
+        output = state.output
+        assert output is not None
         try:
             while True:
-                frame, future = await state.queue.get()
-                if future.cancelled():
-                    state.queued_bytes -= len(frame)
-                    continue
-                try:
-                    result = await state.connection._write_physical(frame)
-                except (ConnectionError, OSError, RuntimeError) as exc:
-                    if not future.done():
-                        future.set_exception(exc)
+                await output.wake.wait()
+                while output.queue:
+                    await self._write_output_frame(state, output, output.queue.popleft())
+                output.wake.clear()
+                if await self._complete_output_phase(state, output):
                     return
-                state.queued_bytes -= len(frame)
-                if not future.done():
-                    future.set_result(result)
         except asyncio.CancelledError:
             return
 
-    async def _overflow(self, state: _Connection) -> None:
-        if state.connection not in self._connections:
+    async def _write_output_frame(
+        self, state: _Connection, output: _OutputState, item: _OutputFrame
+    ) -> None:
+        output.current_frame = item
+        try:
+            output.current_write = asyncio.create_task(
+                self._write_physical(state.connection, item.payload)
+            )
+            result, _ = await output.current_write
+        except asyncio.CancelledError:
+            self._finish_frame_accounting(output, item)
+            if not output.released:
+                self._finish_future(item.future, False)
+            if output.phase == "overflowing":
+                return
+            if asyncio.current_task().cancelling():
+                self._finish_future(output.ready, False)
+                raise
+            if output.phase == "flushing":
+                self._reset_flush(output, False)
             return
-        if state.queue is not None:
-            while not state.queue.empty():
-                frame, future = state.queue.get_nowait()
-                state.queued_bytes -= len(frame)
-                future.cancel()
-        if state.writer_task is not None:
-            state.writer_task.cancel()
-            await asyncio.gather(state.writer_task, return_exceptions=True)
-            state.writer_task = None
-        error = json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32011, "message": "observer output overflow"}}, separators=(",", ":")).encode() + b"\n"
-        with contextlib.suppress(ConnectionError, OSError, RuntimeError):
-            await state.connection._write_physical(error)
+        except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
+            self._finish_frame_accounting(output, item)
+            self._finish_future(item.future, error=exc)
+            if output.phase == "flushing":
+                self._reset_flush(output, error=exc)
+            return
+        finally:
+            output.current_frame = None
+            output.current_write = None
+        self._finish_frame_accounting(output, item)
+        self._finish_future(item.future, result)
+        if not result and output.phase == "flushing":
+            self._reset_flush(output, False)
+
+    async def _complete_output_phase(
+        self, state: _Connection, output: _OutputState
+    ) -> bool:
+        if output.released:
+            return True
+        if output.phase == "flushing":
+            if output.overflowed_before_flush:
+                output.phase = "overflowing"
+                self._enqueue(
+                    output, _OutputFrame(self._overflow_frame("controller"))
+                )
+                return False
+            output.phase = "ready"
+            self._finish_future(output.ready, True)
+            return False
+        if output.phase != "overflowing":
+            return False
         await state.connection.close()
+        self._finish_future(output.ready, False)
+        self._finish_future(output.overflow_done, False)
+        return True
+
+    def _reset_flush(
+        self,
+        output: _OutputState,
+        result: bool | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self._clear_output(output)
+        self._finish_future(output.ready, result, error=error)
+        output.ready = self.loop.create_future()
+        output.phase = "claimed_buffering"
+
+    async def _overflow(self, state: _Connection) -> bool:
+        output = state.output
+        assert output is not None
+        if state.connection not in self._connections:
+            return False
+        output.phase = "overflowing"
+        self._clear_output(output)
+        if output.current_write is not None:
+            output.current_write.cancel()
+        output.overflow_done = self.loop.create_future()
+        self._enqueue(output, _OutputFrame(self._overflow_frame("observer")))
+        return await output.overflow_done
+
+    @staticmethod
+    def _overflow_frame(role: str) -> bytes:
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32011, "message": f"{role} output overflow"},
+            },
+            separators=(",", ":"),
+        ).encode() + b"\n"
+
+    @staticmethod
+    async def _write_physical(
+        connection: Any, payload: bytes
+    ) -> tuple[bool, FrameWriteCancelled | None]:
+        try:
+            return await connection._write_physical(payload), None
+        except FrameWriteCancelled as cancelled:
+            return cancelled.written, cancelled
+
+    @staticmethod
+    def _finish_future(
+        future: asyncio.Future[bool] | None,
+        result: bool | None = None,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        if future is None or future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            assert result is not None
+            future.set_result(result)
+
+    @staticmethod
+    def _finish_frame_accounting(
+        output: _OutputState, item: _OutputFrame
+    ) -> None:
+        output.queued_bytes -= len(item.payload)
+        if item.buffered_controller_event:
+            output.pending_controller_bytes -= len(item.payload)
+            output.pending_controller_frames -= 1
+
+    @staticmethod
+    async def _cancel_frame(
+        output: _OutputState, item: _OutputFrame
+    ) -> tuple[bool | None, FrameWriteCancelled | None]:
+        if output.current_frame is item:
+            if output.current_write is not None:
+                output.current_write.cancel()
+                settled = await asyncio.gather(
+                    output.current_write, return_exceptions=True
+                )
+                if isinstance(settled[0], tuple):
+                    return settled[0]
+            return None, None
+        try:
+            output.queue.remove(item)
+        except ValueError:
+            return None, None
+        ConnectionRegistry._finish_frame_accounting(output, item)
+        if item.future is not None and not item.future.done():
+            item.future.cancel()
+        return None, None
+
+    def _release_output(self, output: _OutputState, role: str | None) -> None:
+        output.released = True
+        if role == "observer":
+            self._clear_output(output)
+            if output.writer_task is not None:
+                output.writer_task.cancel()
+            return
+        if (
+            output.current_frame is None
+            and not output.queue
+            and output.writer_task is not None
+        ):
+            output.writer_task.cancel()
+
+    def _settle_output(self, output: _OutputState) -> None:
+        while output.queue:
+            item = output.queue.popleft()
+            self._finish_frame_accounting(output, item)
+            self._finish_future(item.future, False)
+        if output.writer_task is not None:
+            output.writer_task.cancel()
+        self._finish_future(output.ready, False)
+        self._finish_future(output.overflow_done, False)
+
+    @staticmethod
+    def _clear_output(output: _OutputState) -> None:
+        while output.queue:
+            item = output.queue.popleft()
+            ConnectionRegistry._finish_frame_accounting(output, item)
+            if item.future is not None and not item.future.done():
+                item.future.cancel()
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""
@@ -412,8 +640,8 @@ class ConnectionRegistry:
             self._read_stopping = True
             self._read_condition.notify_all()
         for state in states:
-            if state.writer_task is not None:
-                state.writer_task.cancel()
+            if state.output is not None:
+                self._settle_output(state.output)
         await asyncio.gather(
             *(state.connection.close() for state in states), return_exceptions=True
         )

@@ -324,6 +324,72 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
     asyncio.run(driver())
 
 
+def test_fork_suspend_continues_after_failed_draft_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def driver() -> None:
+        app = object.__new__(TUIApp)
+        errors: list[BaseException] = []
+
+        class Watchdog:
+            async def close(self) -> None:
+                pass
+
+        class Loop:
+            store = SimpleNamespace(session_id="test-session")
+
+            async def activate(self) -> None:
+                pass
+
+            def set_mcp_notice_sink(self, sink: object) -> None:
+                del sink
+
+        class Draft:
+            pending_text = "fork draft"
+
+            async def flush_pending(self) -> None:
+                raise OSError("disk full")
+
+        async def nothing(*_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def read_prompt(_session: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "zeta.tui.app.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
+        )
+        app.loop = Loop()
+        app._zeta_home = None
+        app._session = None
+        app._active_session = None
+        app._active_task = None
+        app._draft = Draft()
+        app._history = None
+        app._fork_controller = None
+        app._open_fork_target = "fork-1"
+        app._input_loop_active = False
+        app._startup_submissions = []
+        app._begin_startup_replay = lambda: None
+        app._attach_draft = lambda session: None
+        app._prepare_prompt = lambda *, resume_ui: nothing()
+        app._read_prompt = read_prompt
+        app._prepare_ui_session_change = nothing
+        app.close = nothing
+
+        try:
+            result = await TUIApp.run(app, SimpleNamespace())
+        except BaseException as exc:  # noqa: BLE001 - behavior probe
+            errors.append(exc)
+            result = None
+
+        assert errors == [], "fork suspension leaked the draft persistence error"
+        assert getattr(result, "name", None) == "EXIT"
+        assert app._draft.pending_text == "fork draft"
+
+    asyncio.run(driver())
+
+
 def test_approval_shortcut_submits_owner_qualified_handle() -> None:
     submitted: list[tuple[str, bool]] = []
     app = object.__new__(TUIApp)
