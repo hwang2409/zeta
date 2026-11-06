@@ -244,6 +244,11 @@ class CodexBackend(CompletionBackend):
                         lambda status, body, headers: _http_error(
                             status, body, headers, account=account
                         ),
+                        stall_seconds=self.stall_seconds,
+                        on_stall=lambda elapsed: CodexStreamError(
+                            f"Codex error body stalled for {elapsed:.0f}s",
+                            is_stall=True,
+                        ),
                     )
                 async for event in _decode_response(
                     response,

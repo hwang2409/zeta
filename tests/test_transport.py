@@ -28,6 +28,46 @@ from zeta.providers.transport import (
 )
 
 
+class _PartialErrorBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.finished = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"partial provider error"
+        await self.finished.wait()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_response_error_body_stall_raises_and_closes_response() -> None:
+    stream = _PartialErrorBody()
+    response = httpx.Response(
+        503,
+        headers={"retry-after": "2"},
+        stream=stream,
+        request=httpx.Request("POST", "https://test.invalid"),
+    )
+
+    with pytest.raises(RuntimeError, match="error body stalled") as raised:
+        await build_response_error(
+            response,
+            lambda status, body, headers: RuntimeError(
+                f"{status}:{len(body)}:{headers['retry-after']}"
+            ),
+            stall_seconds=0.01,
+            on_stall=lambda elapsed: RuntimeError(
+                f"provider error body stalled for {elapsed:.2f}s"
+            ),
+        )
+
+    assert "provider error body stalled" in str(raised.value)
+    await response.aclose()
+    assert stream.closed.is_set()
+
+
 @pytest.mark.asyncio
 async def test_response_error_body_is_bounded_and_keeps_response_metadata() -> None:
     request = httpx.Request("POST", "https://test.invalid")

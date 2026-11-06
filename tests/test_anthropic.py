@@ -2,6 +2,7 @@ from zeta.skills import SkillCatalog
 
 import asyncio
 import base64
+from collections.abc import AsyncIterator
 import json
 import subprocess
 import sys
@@ -107,6 +108,40 @@ def request_bytes(payload: dict[str, object]) -> bytes:
 
 def client_for(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class _PartialErrorBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.finished = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b"partial provider error"
+        await self.finished.wait()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_partial_anthropic_error_body_stalls_and_closes(
+    tmp_path: Path,
+) -> None:
+    stream = _PartialErrorBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, stream=stream, request=request)
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        client=client, token_store=store, stall_seconds=0.01
+    )
+    with pytest.raises(AnthropicStreamError, match="error body stalled"):
+        _ = [event async for event in backend._complete_once([], [])]
+    assert stream.closed.is_set()
+    await client.aclose()
 
 
 def png_block(*, caption: str | None = None, data: bytes | None = None) -> dict[str, object]:
