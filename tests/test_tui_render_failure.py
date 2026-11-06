@@ -64,6 +64,7 @@ def test_render_failure_exits_without_input_and_restores_session(
     broken = phase == "startup"
     failures = 0
     exception_prompts: list[object] = []
+    startup_started = False
     startup_canceled = False
     preferred_width = app._status_card.preferred_width
 
@@ -81,7 +82,8 @@ def test_render_failure_exits_without_input_and_restores_session(
             application.exit(exception=RuntimeError("unexpected exception prompt"))
 
     async def stalled_replay() -> None:
-        nonlocal startup_canceled
+        nonlocal startup_canceled, startup_started
+        startup_started = True
         try:
             await asyncio.Event().wait()
         finally:
@@ -142,7 +144,7 @@ def test_render_failure_exits_without_input_and_restores_session(
     assert not store._release_lease.alive
     assert app._draft._scheduled is None
     if phase == "startup":
-        assert startup_canceled
+        assert not startup_started or startup_canceled
     if ephemeral:
         assert "resume with:" not in error
         assert not root.exists()

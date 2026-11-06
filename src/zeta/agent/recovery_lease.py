@@ -121,7 +121,10 @@ async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
 
 async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
     if not loop._children_recovered:
-        if loop.store.agent_children():
+        if loop.store.agent_children() or any(
+            entry.data.get("kind") == "child_question"
+            for entry in loop.store.agent_notifications()
+        ):
             await recover_agent_children_off_loop(loop)
         loop._children_recovered = True
     if loop._pending_child_recovery:
