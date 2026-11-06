@@ -155,11 +155,15 @@ async def build_response_error[ErrorT: RuntimeError](
     response: httpx.Response,
     build: Callable[[int, bytes, Mapping[str, str]], ErrorT],
     limit: int = 8192,
+    *,
+    stall_seconds: float,
+    on_stall: Callable[[float], BaseException],
 ) -> ErrorT:
     """Build a provider error from a bounded streaming response body."""
 
     body = bytearray()
-    async for chunk in response.aiter_bytes():
+    source = stall_watchdog(response.aiter_bytes(), seconds=stall_seconds, on_stall=on_stall)
+    async for chunk in source:
         body.extend(chunk[: limit - len(body)])
         if len(body) >= limit:
             break
