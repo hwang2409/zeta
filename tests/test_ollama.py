@@ -67,6 +67,17 @@ def _use_real_ollama_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ZETA_TEST_SCRIPTED_PROVIDER")
 
 
+class _ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded = 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+
+
 class _ClosingStream(httpx.AsyncByteStream):
     def __init__(
         self, stream: httpx.AsyncByteStream, transport: _LoopbackAsyncHTTPTransport
@@ -213,10 +224,10 @@ class _DelayedLinesResponse:
     def __init__(self, rows: list[tuple[float, str]]) -> None:
         self.rows = rows
 
-    async def aiter_lines(self):
+    async def aiter_bytes(self):
         for delay, line in self.rows:
             await asyncio.sleep(delay)
-            yield line
+            yield line.encode() + b"\n"
 
 
 class _StreamContext:
@@ -718,6 +729,7 @@ async def test_ollama_preserves_multiple_frame_calls_and_usage() -> None:
             "done": True,
             "done_reason": "tool_calls",
             "prompt_eval_count": 3,
+            "prompt_eval_cached_count": 1,
             "eval_count": 4,
         },
     ]
@@ -736,7 +748,45 @@ async def test_ollama_preserves_multiple_frame_calls_and_usage() -> None:
     assert len({call.id for call in calls}) == 2
     assert all(call.id.startswith("ollama-") for call in calls)
     assert events[-1].data["stop_reason"] == "tool_use"
-    assert events[-1].data["usage"]["input_tokens"] == 3
+    assert events[-1].data["usage"] == {
+        "prompt_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 1},
+        "completion_tokens": 4,
+        "input_tokens": 2,
+        "output_tokens": 4,
+        "cache_read_input_tokens": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ollama_rejects_stream_line_over_one_mibibyte() -> None:
+    chunk = b"x" * (256 * 1024)
+    stream = _ChunkStream([chunk] * 8)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream)
+        )
+    ) as client:
+        with pytest.raises(OllamaError, match="stream line exceeded 1048576 bytes"):
+            [event async for event in OllamaBackend(client=client).complete([], [])]
+    assert stream.yielded == 5
+
+
+@pytest.mark.asyncio
+async def test_ollama_accepts_stream_line_at_one_mibibyte() -> None:
+    row = json.dumps({"message": {"content": "ok"}, "done": True}).encode()
+    stream = _ChunkStream([row + b" " * (1024 * 1024 - len(row)), b"\n"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream)
+        )
+    ) as client:
+        events = [
+            event async for event in OllamaBackend(client=client).complete([], [])
+        ]
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [TextContent("ok")]
+    )
 
 
 @pytest.mark.asyncio
@@ -1342,8 +1392,8 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
             self.release = asyncio.Event()
             self.exited = False
 
-        async def aiter_lines(self):
-            yield json.dumps({"message": {"content": "hello"}})
+        async def aiter_bytes(self):
+            yield json.dumps({"message": {"content": "hello"}}).encode() + b"\n"
             self.started.set()
             await self.release.wait()
 
