@@ -23,7 +23,14 @@ def is_retention_pinned(directory_fd: int) -> bool:
     try:
         fd = open_session_file(directory_fd, RETENTION_PIN_FILENAME, os.O_RDONLY)
     except FileNotFoundError:
-        return False
+        try:
+            return any(
+                name.startswith(f".{RETENTION_PIN_FILENAME}.")
+                and name.endswith(".tmp")
+                for name in os.listdir(directory_fd)
+            )
+        except OSError:
+            return True
     except (OSError, SessionError):
         return True
     try:
@@ -38,10 +45,10 @@ def is_retention_pinned(directory_fd: int) -> bool:
         with os.fdopen(fd, "rb") as stream:
             fd = -1
             try:
-                value = json.loads(stream.read(_MAX_PIN_BYTES + 1))
+                json.loads(stream.read(_MAX_PIN_BYTES + 1))
             except (UnicodeDecodeError, json.JSONDecodeError, OSError):
                 return True
-        return value == {"pinned": True, "schema_version": 1}
+        return True
     except (OSError, ValueError):
         return True
     finally:
