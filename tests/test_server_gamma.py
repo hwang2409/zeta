@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import re
 import shutil
@@ -11,6 +12,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
@@ -23,7 +25,7 @@ from tests.test_server import (
     _socket_path,
 )
 from zeta.core.session import SessionMetadata
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.server import ZetaServer, ergonomics
@@ -37,15 +39,24 @@ FEATURES = [
     "ping",
     "assistant_reset",
 ]
-PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+)
 
 
-def _server(tmp_path: Path, backend: FakeBackend | None, cwd: Path) -> ZetaServer:
+def _server(
+    tmp_path: Path,
+    backend: FakeBackend | None,
+    cwd: Path,
+    *,
+    provider: str = "codex",
+) -> ZetaServer:
     backend = backend or FakeBackend([])
     return ZetaServer(
         home=tmp_path / "home",
         cwd=cwd,
-        provider="codex",
+        provider=provider,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -685,6 +696,9 @@ async def test_send_images_publication_is_off_event_loop(
 ) -> None:
     publication_threads: list[int] = []
     original_publish = ergonomics.write_session_file
+    output = io.BytesIO()
+    Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
+    oversized = output.getvalue()
 
     def record_publish(*args, **kwargs) -> None:
         publication_threads.append(threading.get_ident())
@@ -692,7 +706,9 @@ async def test_send_images_publication_is_off_event_loop(
 
     monkeypatch.setattr(ergonomics, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
-    server = _server(tmp_path, backend, _launch(tmp_path))
+    server = _server(
+        tmp_path, backend, _launch(tmp_path), provider="anthropic"
+    )
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["user_message_event"])
@@ -703,7 +719,7 @@ async def test_send_images_publication_is_off_event_loop(
         image = {
             "name": "shot.png",
             "mime_type": "image/png",
-            "data": base64.b64encode(PNG).decode(),
+            "data": base64.b64encode(oversized).decode(),
         }
         await _request(
             reader,
@@ -716,6 +732,13 @@ async def test_send_images_publication_is_off_event_loop(
         await _event(reader, "agent_end")
         assert publication_threads
         assert set(publication_threads).isdisjoint({threading.get_ident()})
+        attached = next(
+            block
+            for block in backend.calls[0][0][-1].content
+            if isinstance(block, ImageContent)
+        )
+        with Image.open(io.BytesIO(base64.b64decode(attached.data))) as sent:
+            assert max(sent.size) <= 3000
     finally:
         await _close(server, writer)
 

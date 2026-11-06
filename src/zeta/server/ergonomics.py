@@ -24,6 +24,8 @@ from ..core.store._client_delivery import (
 from ..core.store._client_delivery import (
     image_payload_digest as _semantic_image_payload_digest,
 )
+from ..media.image_normalization import normalize_image_bytes
+from ..media.image_policy import image_policy_for_provider
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
@@ -936,14 +938,27 @@ def image_payload_digest(params: dict) -> str:
 
 
 def image_message(runtime: ServerRuntime, params: dict) -> Message:
+    """Decode, normalize, and publish images from an off-loop worker."""
+
     text, decoded = _validated_image_payload(params)
+    provider = runtime.provider
+    if provider is None:
+        raise ProtocolError(-32003, "no active provider")
+    policy = image_policy_for_provider(provider)
     blocks = [TextContent(text)]
     store = runtime.opened.store
     attachments_existed = "attachments" in os.listdir(store.directory_fd)
     with child_directory(store.directory_fd, "attachments", create=True) as attachments_fd:
         directories = []
         try:
-            for name, mime, data, raw in decoded:
+            for name, _mime, _data, raw in decoded:
+                try:
+                    prepared = asyncio.run(normalize_image_bytes(raw, policy))
+                except ValueError as exc:
+                    raise ProtocolError(-32602, f"image cannot be prepared: {exc}") from exc
+                raw = prepared.data or b""
+                mime = prepared.media_type
+                data = base64.b64encode(raw).decode("ascii")
                 directory = uuid4().hex
                 os.mkdir(directory, mode=0o700, dir_fd=attachments_fd)
                 directories.append(directory)
