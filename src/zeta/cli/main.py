@@ -781,6 +781,80 @@ def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> No
             print(f"- {name}", file=sys.stderr)
 
 
+def _retain_active_draft(
+    app: object | None, retained_drafts: list[_UnsavedDraft],
+) -> None:
+    if app is not None and (draft := _unsaved_draft(app)) is not None:
+        retained_drafts.append(draft)
+
+
+def _run_tui_lifecycle(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> tuple[int, str | None]:
+    retained_drafts: list[_UnsavedDraft] = []
+    current_session_id = ""
+    restart_session_id: str | None = None
+    exit_status = 0
+    app: object | None = None
+    try:
+        while True:
+            try:
+                if args.continue_session or args.resume is not None:
+                    print("Loading session…", flush=True)
+                    app = asyncio.run(asyncio.to_thread(create_app, args))
+                else:
+                    app = create_app(args)
+                current_session_id = app.loop.store.session_id
+                run_app = app
+            except SessionError as exc:
+                parser.error(str(exc))
+            except ValueError as exc:
+                print(f"zeta: {exc}", file=sys.stderr)
+                exit_status = 1
+                break
+            restart_requested = False
+            restart_cancels_work = False
+            new_session_requested = False
+            try:
+                with patch_stdout(raw=True):
+                    restart_requested, restart_cancels_work = asyncio.run(
+                        _run_tui(run_app, args)
+                    )
+                new_session_requested = run_app.new_session_requested
+                if new_session_requested:
+                    _retain_active_draft(app, retained_drafts)
+                    app = None
+                    args.continue_session = False
+                    args.resume = None
+            except TerminalRenderError as exc:
+                print(f"zeta: {exc}", file=sys.stderr)
+                _print_exit_hint(app)
+                exit_status = 1
+                break
+            finally:
+                _cleanup_ephemeral(run_app)
+            if new_session_requested:
+                continue
+            if restart_requested:
+                if restart_cancels_work:
+                    print(
+                        "restart · running children or background tasks will be cancelled",
+                        file=sys.stderr,
+                    )
+                restart_session_id = current_session_id
+                break
+            _print_exit_hint(app)
+            break
+    finally:
+        _retain_active_draft(app, retained_drafts)
+        for retained_draft in retained_drafts:
+            _print_unsaved_draft(
+                retained_draft,
+                current_session_id=current_session_id,
+            )
+    return exit_status, restart_session_id
+
+
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
     """Replace the original session selector while preserving all other flags."""
 
@@ -985,69 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    replaced_drafts: list[_UnsavedDraft] = []
-    current_session_id = ""
-    restart_session_id: str | None = None
-    exit_status = 0
-    try:
-        while True:
-            try:
-                if args.continue_session or args.resume is not None:
-                    print("Loading session…", flush=True)
-                    app = asyncio.run(asyncio.to_thread(create_app, args))
-                else:
-                    app = create_app(args)
-                current_session_id = app.loop.store.session_id
-            except SessionError as exc:
-                parser.error(str(exc))
-            except ValueError as exc:
-                print(f"zeta: {exc}", file=sys.stderr)
-                exit_status = 1
-                break
-            restart_requested = False
-            restart_cancels_work = False
-            new_session_requested = False
-            try:
-                with patch_stdout(raw=True):
-                    restart_requested, restart_cancels_work = asyncio.run(
-                        _run_tui(app, args)
-                    )
-                new_session_requested = app.new_session_requested
-                if new_session_requested:
-                    draft = _unsaved_draft(app)
-                    if draft is not None:
-                        replaced_drafts.append(draft)
-                    args.continue_session = False
-                    args.resume = None
-            except TerminalRenderError as exc:
-                print(f"zeta: {exc}", file=sys.stderr)
-                _print_exit_hint(app)
-                exit_status = 1
-                break
-            finally:
-                _cleanup_ephemeral(app)
-            if new_session_requested:
-                del app
-                continue
-            if restart_requested:
-                if restart_cancels_work:
-                    print(
-                        "restart · running children or background tasks will be cancelled",
-                        file=sys.stderr,
-                    )
-                restart_session_id = current_session_id
-                break
-            draft = _unsaved_draft(app)
-            if draft is not None:
-                replaced_drafts.append(draft)
-            _print_exit_hint(app)
-            break
-    finally:
-        for replaced_draft in replaced_drafts:
-            _print_unsaved_draft(
-                replaced_draft,
-                current_session_id=current_session_id,
-            )
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status
