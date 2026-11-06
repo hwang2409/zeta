@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shlex
@@ -46,13 +47,16 @@ async def test_start_state_and_notice_follow_off_loop_durable_record(
     assert await asyncio.to_thread(entered.wait, 10)
 
     # snapshot() feeds the TUI tasks panel, while records feeds serve-owned work.
-    assert registry.snapshot() == ()
-    assert registry.running_count == 0
-    assert registry.records == ()
-    assert notices == []
-
+    before_commit = (
+        registry.snapshot(),
+        registry.running_count,
+        registry.records,
+        tuple(notices),
+    )
     release.set()
     task_id, _ = await starting
+
+    assert before_commit == ((), 0, (), ())
     assert [task.task_id for task in registry.snapshot()] == [task_id]
     assert registry.running_count == 1
     assert [record.task_id for record in registry.records] == [task_id]
@@ -86,13 +90,16 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
     killing = asyncio.create_task(registry.kill(task_id))
     assert await asyncio.to_thread(entered.wait, 10)
 
-    assert registry.snapshot()[0].running
-    assert registry.running_count == 1
-    assert registry.records[0].running
-    assert notices == []
-
+    before_commit = (
+        registry.snapshot()[0].running,
+        registry.running_count,
+        registry.records[0].running,
+        tuple(notices),
+    )
     release.set()
     await killing
+
+    assert before_commit == (True, 1, True, ())
     assert not registry.snapshot()[0].running
     assert registry.running_count == 0
     assert not registry.records[0].running
@@ -162,7 +169,10 @@ async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
         if persist_calls == 1:
             entered.set()
             assert release.wait(10)
-        original_persist(rows)
+        if len(inspect.signature(original_persist).parameters) == 0:
+            original_persist()
+        else:
+            original_persist(rows)
         completed.set()
 
     monkeypatch.setattr(registry, "_persist", gated_first_persist)
