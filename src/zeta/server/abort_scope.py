@@ -47,6 +47,7 @@ async def abort_active_turn(
     loop: AgentLoop | None,
     terminate_approvals: Callable[..., Awaitable[None]],
     before_cancel: Callable[[], None],
+    cancel_task: bool = True,
 ) -> bool:
     """Cancel the captured turn using the selected ownership scope."""
 
@@ -57,6 +58,7 @@ async def abort_active_turn(
     if loop is not None:
         loop.abort(foreground_only=foreground_only, steering_drop_reason=None)
     before_cancel()
-    task.cancel()
+    if cancel_task:
+        task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     return True

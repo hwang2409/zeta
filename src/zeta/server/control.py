@@ -381,6 +381,9 @@ class ServeControl:
                 self._terminate_pending_approvals, reason="turn_canceled"
             ),
             before_cancel=mark_canceled,
+            cancel_task=not any(
+                isinstance(key, str) for key in self._approvals.active_keys()
+            ),
         )
         if aborted:
             await self._notify(
