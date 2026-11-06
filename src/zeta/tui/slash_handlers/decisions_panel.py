@@ -134,7 +134,7 @@ class DecisionsMixin:
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
-                self._decisions_panel.render_lines(), keep_offset=True
+                self._decisions_panel.render_lines(), keep_offset=True, overflow_hint=True
             )
             self._invalidate_prompt()
         elif changed:
@@ -154,7 +154,9 @@ class DecisionsMixin:
             self._decisions_restore_text = ""
             self._decisions_restore_cursor = 0
         self._decisions_panel_open = True
-        self._decisions_panel_control.set_lines(self._decisions_panel.render_lines())
+        self._decisions_panel_control.set_lines(
+            self._decisions_panel.render_lines(), overflow_hint=True
+        )
         session.layout.focus(self._decisions_panel_window)
         self._start_decisions_refresh()
         self._invalidate_prompt()
@@ -200,7 +202,11 @@ class DecisionsMixin:
         if key == "escape":
             self.close_decisions_panel()
             return
-        if key in {"up", "k"}:
+        if key == "pageup":
+            self._decisions_panel_control.page(-1)
+        elif key == "pagedown":
+            self._decisions_panel_control.page(1)
+        elif key in {"up", "k"}:
             panel.move(-1)
         elif key in {"down", "j"}:
             panel.move(1)
@@ -215,7 +221,7 @@ class DecisionsMixin:
             if option is not None:
                 self._deliver_quick_answer(option)
                 return
-        self._refresh_decisions_panel()
+        self._refresh_decisions_panel(keep_offset=key in {"pageup", "pagedown"})
 
     def _decisions_answer_key(self, key: str) -> None:
         if key == "escape":
@@ -242,7 +248,9 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_control.set_lines(
-            self._decisions_panel.render_lines(), keep_offset=keep_offset
+            self._decisions_panel.render_lines(),
+            keep_offset=keep_offset,
+            overflow_hint=True,
         )
         self._invalidate_prompt()
 
