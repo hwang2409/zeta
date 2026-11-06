@@ -35,7 +35,10 @@ def _try_exclusive_lock(home: str, result: multiprocessing.Queue[str]) -> None:
         os.close(fd)
 
 
-def test_writer_refuses_missing_and_too_new_manifest(tmp_path: Path) -> None:
+def test_writer_refuses_missing_and_too_new_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT")
     with pytest.raises(StorageFormatError, match="manifest is missing"):
         open_writer(tmp_path)
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
