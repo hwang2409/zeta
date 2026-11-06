@@ -363,17 +363,20 @@ class ToolRegistry:
     def tool_deny(self) -> tuple[str, ...]:
         return self.tool_policy.deny
 
+    def tool_is_allowed_by_policy(self, name: str) -> bool:
+        definition = self._tools.get(name)
+        actions = (
+            tuple(definition.actions) if definition and definition.actions else None
+        )
+        return self.tool_policy.allows_tool(name, actions)
+
     def tool_is_allowed(self, name: str) -> bool:
         if (
             self._profile_tool_allow is not None
             and name not in self._profile_tool_allow
         ):
             return False
-        definition = self._tools.get(name)
-        actions = (
-            tuple(definition.actions) if definition and definition.actions else None
-        )
-        return self.tool_policy.allows_tool(name, actions)
+        return self.tool_is_allowed_by_policy(name)
 
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
@@ -463,6 +466,14 @@ class ToolRegistry:
 
         return frozenset(
             name for name in self._tools if self.tool_is_allowed(name)
+        )
+
+    @property
+    def policy_allowed_registered_names(self) -> frozenset[str]:
+        """Return registered names allowed before applying a profile layer."""
+
+        return frozenset(
+            name for name in self._tools if self.tool_is_allowed_by_policy(name)
         )
 
     def register(
@@ -683,8 +694,11 @@ class ToolRegistry:
         if self._cwd_fd is None:
             raise RuntimeError("cannot clone a closed tool registry")
         clone = copy.copy(self)
-        if profile_tool_allow is not None:
-            clone._profile_tool_allow = frozenset(profile_tool_allow)
+        clone._profile_tool_allow = (
+            frozenset(profile_tool_allow)
+            if profile_tool_allow is not None
+            else None
+        )
         if image_policy is not None:
             clone.image_policy = image_policy
         if cwd is not None:

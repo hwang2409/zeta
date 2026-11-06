@@ -4371,37 +4371,144 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
 async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_tools(
     tmp_path: Path,
 ) -> None:
+    requested = frozenset({"read", "ask_parent", "agent_send", "run_background"})
+    home = tmp_path / "home"
+    profile = home / "agents" / "bounded.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: bounded\n"
+        "description: bounded session tools\n"
+        "accepts_follow_ups: true\n"
+        f"tools: [{', '.join(sorted(requested))}]\n"
+        "---\nbounded\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("bounded")
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+
     async def available(arguments: dict[str, object]) -> str:
         del arguments
         return "available"
 
-    requested = frozenset(
-        {"session_clock", "ask_parent", "agent_send", "run_background"}
+    for name in ("agent_send", "run_background", "inherited_hidden"):
+        registry.register(name, available)
+    parent_loop = AgentLoop(
+        FakeBackend([]),
+        parent_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
     )
-    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
-    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
-    parent = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1", cwd=tmp_path
     )
-    for name in ("session_clock", "agent_send", "run_background", "inherited_hidden"):
-        parent.register(name, available)
-    parent._profile_tool_allow = requested
-    child = parent.clone_for_session(child_store)
-    child.register("ask_parent", available)
-    child.register("late_hidden", available)
+    child_loop, _ = await agent_runner_module._build_child_loop(
+        parent_loop,
+        child_backend=FakeBackend([]),
+        child_store=child_store,
+        child_instance_id=f"{parent_store.session_id}:1",
+        child_depth=1,
+        preset=preset,
+        model=None,
+        cwd_override=None,
+        follow_up_loop=True,
+        description="bounded",
+        child_account_context=None,
+    )
+    child_loop.tool_registry.register("late_hidden", available)
 
-    assert {schema["name"] for schema in child.schemas} == requested
-    for name in requested:
-        assert not (await child.execute(ToolCall(f"call-{name}", name, {})))["isError"]
+    assert {schema["name"] for schema in child_loop.tool_registry.schemas} == requested
+    allowed = await child_loop.tool_registry.execute(
+        ToolCall("call-agent-send", "agent_send", {})
+    )
+    assert not allowed["isError"]
+    assert allowed["content"][0]["text"] == "available"
     for name in ("inherited_hidden", "late_hidden"):
-        result = await child.execute(ToolCall(f"call-{name}", name, {}))
+        result = await child_loop.tool_registry.execute(
+            ToolCall(f"call-{name}", name, {})
+        )
         assert result["isError"]
         assert "tool not allowed" in result["content"][0]["text"]
 
-    await child.close()
-    await parent.close()
+    await child_loop.close()
     child_store.close()
-    parent_store.close()
+    await parent_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    profiles = {
+        "orchestrator": "tools: [agent, read]\n",
+        "lead": "tools: [bash]\n",
+    }
+    for name, settings in profiles.items():
+        profile = home / "agents" / f"{name}.md"
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text(
+            "---\n"
+            f"name: {name}\n"
+            f"description: {name} profile\n"
+            f"{settings}"
+            "---\n"
+            f"{name}\n",
+            encoding="utf-8",
+        )
+    catalog = discover_session_agents(home=home)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("root-agent", "orchestrator")]),
+            ScriptedTurn(tool_calls=[_agent_call("nested-agent", "lead")]),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("lead-bash", "bash", {"command": "printf nested-ok"})
+                ]
+            ),
+            ScriptedTurn([TextContent("lead complete")]),
+            ScriptedTurn([TextContent("orchestrator complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+        tool_allow=("agent", "bash", "read"),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    orchestrator_tools = {schema["name"] for schema in backend.calls[1][1]}
+    lead_tools = {schema["name"] for schema in backend.calls[2][1]}
+    assert "bash" not in orchestrator_tools
+    assert lead_tools == {"bash"}
+    lead_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    bash_result = next(
+        message.tool_result for message in lead_store.messages() if message.tool_result
+    )
+    assert not bash_result.is_error
+    assert "nested-ok" in bash_result.content
+
+    lead_store.close()
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -4485,7 +4592,7 @@ async def test_child_spawn_reports_every_unresolved_profile_tool(
         "---\n"
         "name: external\n"
         "description: external tools\n"
-        "tools: [present_external, missing_external]\n"
+        "tools: [present_external, denied_external]\n"
         "---\nexternal\n",
         encoding="utf-8",
     )
@@ -4496,8 +4603,10 @@ async def test_child_spawn_reports_every_unresolved_profile_tool(
         session_store=store,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog((preset,)),
+        tool_deny=("denied_external",),
     )
     registry.register("present_external", lambda arguments: "present")
+    registry.register("denied_external", lambda arguments: "denied")
     loop = AgentLoop(
         FakeBackend([]),
         store,
@@ -4522,7 +4631,7 @@ async def test_child_spawn_reports_every_unresolved_profile_tool(
 
     assert result["isError"] is True
     assert "external" in result["content"][0]["text"]
-    assert "missing_external" in result["content"][0]["text"]
+    assert "denied_external" in result["content"][0]["text"]
     assert child_backend.calls == []
     await loop.close()
 
@@ -5215,7 +5324,9 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
+async def test_nested_child_uses_selected_profile_not_parent_profile(
+    tmp_path: Path,
+) -> None:
     nested = _agent_call("grandchild")
     child = _agent_call("child", "explore")
     backend = FakeBackend(
@@ -5251,14 +5362,8 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
         "skill",
         "websearch",
     }
-    assert grandchild_tools == {
-        "agent_status",
-        "agent_output",
-        "fetch",
-        "read",
-        "skill",
-        "websearch",
-    }
+    assert "bash" in grandchild_tools
+    assert "agent" not in grandchild_tools
 
 
 @pytest.mark.asyncio
