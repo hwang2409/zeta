@@ -2363,6 +2363,9 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
         )
         assert approved[-1]["result"]["decision"] == "approve"
         await _event(reader, "tool_end")
+        turn_task = server.control._turn_task
+        assert turn_task is not None
+        await turn_task
         status = await _request(reader, writer, 4, "status")
         assert status[-1]["result"]["state"] == "idle"
     finally:
