@@ -387,6 +387,8 @@ class ConversationStore(
                     for key in (
                         "todo_items",
                         "todo_dismissed",
+                        "agent_counter",
+                        "agent_children",
                         "agent_parent",
                         "agent_canceled",
                     )
