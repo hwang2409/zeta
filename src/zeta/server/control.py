@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import (
+    ErrorInfo,
     Message,
     MessageOrigin,
     StreamEvent,
@@ -488,6 +489,21 @@ class ServeControl:
         outcome = TurnOutcome.FAILED
         started = False
         agent_end: StreamEvent | None = None
+        terminal_events: list[StreamEvent] = []
+
+        async def publish(
+            event: StreamEvent,
+            *,
+            session_id: str | None = None,
+            background: bool = False,
+        ) -> None:
+            if event.type in {StreamEventType.TURN_END, StreamEventType.ERROR}:
+                terminal_events.append(event)
+            else:
+                await self._event(
+                    event, session_id=session_id, background=background
+                )
+
         try:
             await asyncio.sleep(0.01)
             state.turn_started()
@@ -495,7 +511,7 @@ class ServeControl:
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
-                self._event,
+                publish,
                 host_environment=None
                 if host_commands is None
                 else host_commands.environment,
@@ -509,11 +525,11 @@ class ServeControl:
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
             outcome = TurnOutcome.FAILED
-            await self._notify(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                session_id,
-                error={"code": "server_error", "message": str(exc)},
-                data={},
+            terminal_events.append(
+                StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("server_error", str(exc)),
+                )
             )
         finally:
             if not started and loop.notification_turn_state == "scheduled":
@@ -526,6 +542,8 @@ class ServeControl:
             await self.deliveries.finalize_turn(
                 session_id, state, outcome, schedule_wake=agent_end is None
             )
+        for event in terminal_events:
+            await self._event(event, session_id=session_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id)
             if outcome is TurnOutcome.COMPLETED:

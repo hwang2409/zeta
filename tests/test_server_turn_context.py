@@ -62,8 +62,12 @@ async def _notify(
         status="completed",
         text=f"{notification_id} done",
     )
-    server.control._schedule_background_wake(server.runtime.session_id)
-    await _frames_until_event(reader, "agent_end")
+    session_id = server.runtime.session_id
+    server.control._schedule_background_wake(session_id)
+    while True:
+        frames = await _frames_until_event(reader, "agent_end")
+        if frames[-1]["params"]["session_id"] == session_id:
+            break
     while server.runtime.loop.notification_turn_state != "idle":
         await asyncio.sleep(0)
 
