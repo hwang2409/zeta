@@ -28,6 +28,27 @@ class ConversationIntegrityError(ValueError):
 
 
 MAX_SESSION_JSON_DEPTH = 64
+CONVERSATION_ENTRY_TYPES = frozenset(
+    {
+        "approval_history",
+        "approval_request",
+        "approval_resolution",
+        "checkpoint",
+        "child_run_started",
+        "client_delivery",
+        "compaction",
+        "fork",
+        "message",
+        "notification",
+        "notification_ack",
+        "notification_tui_presented",
+        "pending_prompt",
+        "pending_prompt_ack",
+        "pending_queue_closed",
+        "terminal_transition",
+        "warning",
+    }
+)
 
 
 def load_session_json(source: Path | bytes) -> Any:
@@ -97,8 +118,10 @@ class ConversationEntry:
             )
         if type(lane) is not str or lane != "main":
             raise ConversationIntegrityError("conversation lane must be 'main'")
-        if type(entry_type) is not str or not entry_type:
-            raise ConversationIntegrityError("conversation type must be a nonempty string")
+        if type(entry_type) is not str or entry_type not in CONVERSATION_ENTRY_TYPES:
+            raise ConversationIntegrityError(
+                f"unsupported conversation entry type: {entry_type!r}"
+            )
         if type(data) is not dict:
             raise ConversationIntegrityError("conversation data must be an object")
         normalized_data = dict(data)

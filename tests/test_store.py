@@ -386,13 +386,13 @@ def test_live_lifecycle_updates_do_not_write_and_finish_persists_final_stats(
     store = ConversationStore(tmp_path)
     _start_agent_lifecycle(store)
     writes: list[str] = []
-    write_session_json = agent_state.write_session_json
+    write_session_file = agent_state.write_session_file
 
-    def record_write(directory_fd: int, name: str, value: object) -> None:
+    def record_write(directory_fd: int, name: str, value: bytes) -> None:
         writes.append(name)
-        write_session_json(directory_fd, name, value)
+        write_session_file(directory_fd, name, value)
 
-    monkeypatch.setattr(agent_state, "write_session_json", record_write)
+    monkeypatch.setattr(agent_state, "write_session_file", record_write)
 
     store.update_agent_lifecycle(current_step="turn 2: running")
     store.update_agent_lifecycle(turns_used=2)

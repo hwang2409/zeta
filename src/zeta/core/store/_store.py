@@ -30,6 +30,7 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
+from ...storage_format import WriterLease, mapping_mutations, open_writer
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -44,7 +45,7 @@ from ..session_files import (
     read_session_file,
     session_directory,
     session_root,
-    write_session_json,
+    write_session_file,
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import (
@@ -125,9 +126,17 @@ class ConversationStore(
         _must_exist: bool = False,
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
+        _storage_lease: WriterLease | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
+        home = self.root_dir
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        home = home.parent if home.name == "sessions" else self.root_dir.parent
+        self._storage_lease = (
+            _storage_lease.retain() if _storage_lease is not None else open_writer(home)
+        )
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         self.on_persisted_activity: Callable[[int], None] | None = None
         self._initialize_entries_installed()
@@ -214,6 +223,7 @@ class ConversationStore(
                 close_store_leases,
                 self._runtime_lease,
                 lease.pop_all(),
+                self._storage_lease,
             )
 
     def bind_owner_thread(self) -> None:
@@ -367,7 +377,24 @@ class ConversationStore(
             agent_parent=self._agent_parent,
             agent_canceled=self._agent_canceled,
         )
-        write_session_json(self.directory_fd, "session_state.json", state)
+        self._storage_lease.publish_json(
+            self.directory_fd,
+            "session_state.json",
+            mapping_mutations(
+                state,
+                delete=(
+                    key
+                    for key in (
+                        "todo_items",
+                        "todo_dismissed",
+                        "agent_parent",
+                        "agent_canceled",
+                    )
+                    if key not in state
+                ),
+            ),
+            write_session_file,
+        )
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()

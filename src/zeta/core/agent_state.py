@@ -12,13 +12,14 @@ from typing import Any
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
+from ..storage_format import mapping_mutations
 from .agent_progress import (
     live_agent_lifecycle,
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
 from .checkpoints import ConversationIntegrityError, _now
-from .session_files import child_directory, write_session_json
+from .session_files import child_directory, write_session_file
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 
@@ -632,6 +633,10 @@ class AgentStateMixin:
             and type(self._agent_lifecycle["final_result_is_receipt"]) is not bool
         ):
             raise ValueError("agent lifecycle receipt marker must be boolean")
-        write_session_json(
-            self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle
+        value = self._agent_lifecycle or {}
+        self._storage_lease.publish_json(
+            self.directory_fd,
+            "agent_lifecycle.json",
+            mapping_mutations(value),
+            write_session_file,
         )

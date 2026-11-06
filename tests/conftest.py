@@ -609,22 +609,41 @@ def pytest_testnodedown(node, error) -> None:
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close stores and registries constructed directly by repository tests."""
+    from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.storage_format import advance
     from zeta.tools import ToolRegistry
 
     stores: list[ConversationStore] = []
     registries: list[ToolRegistry] = []
     store_init = ConversationStore.__init__
+    manager_init = SessionManager.__init__
     registry_init = ToolRegistry.__init__
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
+    def ensure_format(home: Path) -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        if not (home / "storage-format.json").exists():
+            advance(home, expected_epoch=0)
+
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
+        root = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        home = root
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
         if _is_repository_test_path(caller):
             stores.append(store)
+
+    @wraps(manager_init)
+    def tracked_manager_init(manager, *args, **kwargs):
+        home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
+        ensure_format(home)
+        manager_init(manager, *args, **kwargs)
 
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
@@ -634,6 +653,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             registries.append(registry)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
     for registry in reversed(registries):
