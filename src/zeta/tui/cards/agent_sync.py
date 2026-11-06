@@ -39,6 +39,38 @@ _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
 
 
+def agent_path_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
+def agent_child_paths(path: Path, candidates: set[Path] | None) -> tuple[Path, ...]:
+    if candidates is None:
+        try:
+            candidates = set((path / "agents").iterdir())
+        except OSError:
+            return ()
+    children = (child for child in candidates if child.is_dir() and not child.is_symlink())
+    return tuple(sorted(children, key=lambda child: (not child.name.isdigit(), child.name)))
+
+
+def agent_tree_signature(
+    path: Path,
+    selected_index: int,
+    running: Iterable[Path],
+    path_signature: Callable[[Path], tuple[int, int, int] | None],
+) -> tuple[object, ...]:
+    state = path_signature(path / "session_state.json")
+    registration = state, path_signature(path / "agents")
+    lifecycles = tuple(
+        (child, path_signature(child / "agent_lifecycle.json")) for child in running
+    )
+    return path, selected_index, registration, lifecycles
+
+
 def _message_display_text(message: dict[str, Any]) -> str:
     metadata = message.get("metadata")
     if isinstance(metadata, dict) and isinstance(metadata.get("zeta.user_display_text"), str):

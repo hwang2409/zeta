@@ -43,6 +43,9 @@ from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
     AgentTranscriptSnapshot,
+    agent_child_paths,
+    agent_path_signature,
+    agent_tree_signature,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -923,39 +926,16 @@ class AgentNavigation:
         else:
             self._transcript_layout.children[0] = replacement
 
-    @staticmethod
-    def _path_signature(path: Path) -> tuple[int, int, int] | None:
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        return stat.st_mtime_ns, stat.st_size, stat.st_ino
-
-    def _child_registration_signature(self) -> tuple[object, ...]:
-        """Use the atomically replaced parent state as the registration token."""
-
-        state_path = self.current_path / "session_state.json"
-        try:
-            state = state_path.stat()
-            registration = (state.st_mtime_ns, state.st_size, state.st_ino)
-        except OSError:
-            registration = None
-        return registration, self._path_signature(self.current_path / "agents")
+    _path_signature = staticmethod(agent_path_signature)
 
     def _agent_tree_signature(self) -> tuple[object, ...]:
-        """Detect tree changes while statting lifecycle only for live children."""
-
-        running = tuple(
-            (entry.path, self._path_signature(entry.path / "agent_lifecycle.json"))
-            for entry in self.entries
+        running = (
+            entry.path for entry in self.entries
             if entry.state not in _TERMINAL_AGENT_STATES
             and (entry.path != self.root_path or self.child_view_active)
         )
-        return (
-            self.current_path,
-            self.selected_index,
-            self._child_registration_signature(),
-            running,
+        return agent_tree_signature(
+            self.current_path, self.selected_index, running, self._path_signature
         )
 
     def _schedule_refresh(self, delay: float) -> None:
@@ -1038,11 +1018,7 @@ class AgentNavigation:
                 current_registration[0] == previous_registration[0]
                 and current_registration[1] != previous_registration[1]
             )
-        known = {
-            entry.path
-            for entry in self.entries
-            if entry.path.parent == self.current_path / "agents"
-        }
+        known = {entry.path for entry in self.entries if entry.path.parent == self.current_path / "agents"}
         candidates = None if scan_all else known | set(fallback)
         children = self._children(self.current_path, fallback, candidates=candidates)
         at_root = self.current_path == self.root_path
@@ -1081,30 +1057,12 @@ class AgentNavigation:
         )
 
     def _children(
-        self,
-        path: Path,
-        fallback: dict[Path, dict[str, Any]],
-        *,
+        self, path: Path, fallback: dict[Path, dict[str, Any]], *,
         candidates: set[Path] | None = None,
     ) -> list[AgentEntry]:
-        agents = path / "agents"
-        if candidates is None:
-            try:
-                candidates = {
-                    child
-                    for child in agents.iterdir()
-                    if child.is_dir() and not child.is_symlink()
-                }
-            except OSError:
-                return []
-        ordered_candidates = sorted(
-            candidates,
-            key=lambda child: (not child.name.isdigit(), child.name),
-        )
+        children = agent_child_paths(path, candidates)
         entries: list[AgentEntry] = []
-        for child in ordered_candidates:
-            if not child.is_dir() or child.is_symlink():
-                continue
+        for child in children:
             metadata = self._cached_agent_metadata(child, fallback.get(child))
             entries.append(
                 AgentEntry(
@@ -1114,7 +1072,7 @@ class AgentNavigation:
                     str(metadata.get("state") or "running"),
                 )
             )
-        candidate_set = set(candidates)
+        candidate_set = set(children)
         self._metadata_cache = {
             child: cached
             for child, cached in self._metadata_cache.items()
