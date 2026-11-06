@@ -14,6 +14,7 @@ widget's private state through ``self`` the same way the virtual mixin does.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +29,7 @@ from .transcript_search import find_matches
 _FINDER_TEXT_LIMIT = 2_000
 _FINDER_PREVIEW_LINES = 60
 _FINDER_PREVIEW_TEXT_LIMIT = 12_000
-_FINDER_PREPARE_BATCH_SIZE = 32
+_FINDER_PREPARE_BATCH_SIZE = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,47 +73,102 @@ class TranscriptFinderMixin:
             self._anchor,
             self._virtual_start,
         )
-        self._finder = MessageFinder(())
+        self._finder = MessageFinder((), complete=False)
         self._finder_generation += 1
         return FinderCandidateRequest(generation=self._finder_generation)
+
+    async def build_finder_candidate_batches(
+        self, request: FinderCandidateRequest
+    ) -> AsyncIterator[tuple[tuple[Candidate, ...], bool]]:
+        """Prepare expensive text off-loop and yield newest candidates first."""
+
+        del request
+        units = tuple(self._units)
+        user_unit_ids = {id(unit) for unit in self._user_units}
+        metadata: list[tuple[int, Any, Role, str]] = []
+        turn = 0
+        for index, unit in enumerate(units):
+            if unit is None or unit.value is None:
+                continue
+            role = self._finder_role(unit, user_unit_ids)
+            if role is Role.USER:
+                turn += 1
+            metadata.append((index, unit, role, f"#{turn}" if turn else "#0"))
+            if index % 256 == 255:
+                await asyncio.sleep(0)
+
+        for batch_end in range(len(metadata), 0, -_FINDER_PREPARE_BATCH_SIZE):
+            batch_start = max(0, batch_end - _FINDER_PREPARE_BATCH_SIZE)
+            prepared = []
+            for index, unit, role, marker in metadata[batch_start:batch_end]:
+                prepared.append(
+                    await self._prepare_finder_candidate(index, unit, role, marker)
+                )
+            candidates = tuple(candidate for candidate in prepared if candidate)
+            yield candidates, batch_start == 0
+            await asyncio.sleep(0)
+
+        if not metadata:
+            yield (), True
 
     async def build_finder_candidates(
         self, request: FinderCandidateRequest
     ) -> tuple[Candidate, ...]:
-        """Build a stable-key snapshot in batches that keep the UI responsive."""
+        """Build the complete snapshot for tests and non-progressive callers."""
 
-        units = tuple(self._units)
-        user_units = tuple(self._user_units)
-        user_unit_ids: set[int] = set()
-        for batch_start in range(0, len(user_units), _FINDER_PREPARE_BATCH_SIZE):
-            batch = user_units[batch_start : batch_start + _FINDER_PREPARE_BATCH_SIZE]
-            user_unit_ids.update(id(unit) for unit in batch)
-            await asyncio.sleep(0)
+        batches = [
+            batch async for batch, _complete in self.build_finder_candidate_batches(request)
+        ]
+        return tuple(sorted((item for batch in batches for item in batch), key=lambda item: item.index))
 
-        candidates: list[Candidate] = []
-        turn = 0
-        for batch_start in range(0, len(units), _FINDER_PREPARE_BATCH_SIZE):
-            batch = units[batch_start : batch_start + _FINDER_PREPARE_BATCH_SIZE]
-            for index, unit in enumerate(batch, start=batch_start):
-                if unit is None or unit.value is None:
-                    continue
-                role = self._finder_role(unit, user_unit_ids)
-                if role is Role.USER:
-                    turn += 1
-                text, preview = self._finder_text(self._finder_source_parts(unit))
-                if text:
-                    candidates.append(
-                        Candidate(
-                            key=unit.key,
-                            index=index,
-                            role=role,
-                            marker=f"#{turn}" if turn else "#0",
-                            text=text,
-                            preview=preview,
-                        )
-                    )
-            await asyncio.sleep(0)
-        return tuple(candidates)
+    async def _prepare_finder_candidate(
+        self, index: int, unit: Any, role: Role, marker: str
+    ) -> Candidate | None:
+        parts = await self._finder_source_parts_async(unit)
+        text, preview = self._finder_text(parts)
+        if not text:
+            return None
+        return Candidate(
+            key=unit.key,
+            index=index,
+            role=role,
+            marker=marker,
+            text=text,
+            preview=preview,
+        )
+
+    async def _finder_source_parts_async(self, unit: Any) -> tuple[str, ...]:
+        value = unit.value
+        if _is_tool_unit(value) or isinstance(getattr(value, "plain", None), str):
+            return self._finder_source_parts(unit)
+        width = self._content_width
+        if not self._search_unit_needs_worker(unit):
+            return (self._searchable_text(unit, width)[:_FINDER_PREVIEW_TEXT_LIMIT],)
+        snapshot = self._snapshot_search_unit(unit, width)
+        if snapshot is None:
+            plain = Text.from_ansi(self._search_rendered(unit, width)).plain
+        else:
+            plain = await asyncio.to_thread(
+                self._render_search_snapshot,
+                snapshot.renderable,
+                snapshot.width,
+                snapshot.rich_theme,
+            )
+            if self._unit_revision(unit) == snapshot.revision:
+                self._cache_search_text(unit.key, width, snapshot.revision, plain)
+        return (plain[:_FINDER_PREVIEW_TEXT_LIMIT],)
+
+    def finder_publish_candidate_batch(
+        self,
+        request: FinderCandidateRequest,
+        candidates: tuple[Candidate, ...],
+        *,
+        complete: bool,
+    ) -> bool:
+        if self._finder is None or self._finder_generation != request.generation:
+            return False
+        self._finder.extend_candidates(candidates, complete=complete)
+        return True
 
     def finder_publish_candidates(
         self,
@@ -131,12 +187,17 @@ class TranscriptFinderMixin:
             return None
         return self._finder.set_query(query)
 
-    def finder_rank(self) -> RankingResult | None:
+    def finder_needs_ranking(self) -> bool:
+        return self._finder is not None and self._finder.needs_ranking
+
+    def finder_rank(
+        self, *, candidate_limit: int | None = None
+    ) -> RankingResult | None:
         """Compute the current query result; callers run this off the UI thread."""
 
         if self._finder is None:
             return None
-        return self._finder.rank()
+        return self._finder.rank(candidate_limit=candidate_limit)
 
     def finder_publish(self, result: RankingResult) -> bool:
         """Publish a current result and reject stale query generations."""

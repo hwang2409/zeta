@@ -7,6 +7,8 @@ from typing import Any
 
 from prompt_toolkit.buffer import Buffer
 
+_RANK_BATCH_SIZE = 16
+
 
 class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
@@ -39,13 +41,26 @@ class FinderRuntimeMixin:
 
         task = asyncio.current_task()
         try:
-            candidates = await finder.build_finder_candidates(request)
-            if finder is self._finder_target() and finder.finder_publish_candidates(
-                request, candidates
-            ):
+            progressive = getattr(finder, "build_finder_candidate_batches", None)
+            if progressive is None:
+                candidates = await finder.build_finder_candidates(request)
+                if finder is self._finder_target() and finder.finder_publish_candidates(
+                    request, candidates
+                ):
+                    self._invalidate_prompt()
+                    state = finder.finder_state()
+                    if state is not None and not state.complete:
+                        self._start_finder_ranking()
+                return
+            async for candidates, complete in progressive(request):
+                if finder is not self._finder_target():
+                    return
+                if not finder.finder_publish_candidate_batch(
+                    request, candidates, complete=complete
+                ):
+                    return
                 self._invalidate_prompt()
-                state = finder.finder_state()
-                if state is not None and not state.complete:
+                if finder.finder_needs_ranking():
                     self._start_finder_ranking()
         finally:
             if self._finder_prepare_task is task:
@@ -71,15 +86,23 @@ class FinderRuntimeMixin:
         finder = self._finder_target()
         try:
             while finder is self._finder_target() and finder.finder_active:
-                result = await asyncio.to_thread(finder.finder_rank)
+                result = await asyncio.to_thread(
+                    finder.finder_rank, candidate_limit=_RANK_BATCH_SIZE
+                )
                 if result is None:
                     return
                 if finder.finder_publish(result):
                     self._invalidate_prompt()
-                    return
+                    if not finder.finder_needs_ranking():
+                        return
         finally:
             if self._finder_rank_task is task:
                 self._finder_rank_task = None
+                finder = self._finder_target()
+                if finder.finder_active and getattr(
+                    finder, "finder_needs_ranking", lambda: False
+                )():
+                    self._start_finder_ranking()
 
     def _cancel_finder_workers(self) -> None:
         for task in (self._finder_prepare_task, self._finder_rank_task):
