@@ -96,6 +96,7 @@ class AsyncDurableWritesMixin:
         kwargs: dict[str, Any],
     ) -> Any:
         """Run a write against isolated state; the resident store stays loop-owned."""
+        writer: ConversationStore | None = None
         try:
             writer = self._durable_writer
             if writer is None:
@@ -115,6 +116,14 @@ class AsyncDurableWritesMixin:
                 writer_baseline,
                 writer._full_reload_count != full_reload_count,
             )
+        except BaseException:
+            if writer is not None:
+                writer.close()
+                with self._durable_write_condition:
+                    if self._durable_writer is writer:
+                        self._durable_writer = None
+                        self._durable_writer_snapshot = None
+            raise
         finally:
             with self._durable_write_condition:
                 self._durable_writes_in_flight -= 1

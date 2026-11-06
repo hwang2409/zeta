@@ -1710,24 +1710,67 @@ async def test_off_loop_refresh_cancellation_is_prompt(
 
 
 @pytest.mark.asyncio
-async def test_all_async_writes_reuse_one_persistent_writer(tmp_path: Path) -> None:
+async def test_async_writes_reuse_one_detached_store_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path, session_id="persistent-writer")
+    open_count = 0
+    original_init = ConversationStore.__init__
 
-    await store._to_thread_durable(store.append_pending_prompt, "follow up")
-    writer = store._durable_writer
-    assert writer is not None
-    reload_count = writer._full_reload_count
-    await store._to_thread_durable(
-        store.append_agent_notification,
-        "root:1",
-        child_session_path="/child",
-        description="child",
-        status="completed",
-        text="done",
+    def count_open(instance: ConversationStore, *args: object, **kwargs: object) -> None:
+        nonlocal open_count
+        if kwargs.get("_must_exist"):
+            open_count += 1
+        original_init(instance, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "__init__", count_open)
+
+    await asyncio.gather(
+        store._to_thread_durable(store.append_pending_prompt, "follow up"),
+        store._to_thread_durable(
+            store.append_agent_notification,
+            "root:1",
+            child_session_path="/child",
+            description="child",
+            status="completed",
+            text="done",
+        ),
     )
 
-    assert store._durable_writer is writer
-    assert writer._full_reload_count == reload_count
+    assert open_count == 1
+
+
+@pytest.mark.asyncio
+async def test_async_write_failure_discards_writer_before_next_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="failed-writer")
+    open_count = 0
+    original_open = store._new_persistent_durable_writer
+
+    def count_open() -> ConversationStore:
+        nonlocal open_count
+        open_count += 1
+        return original_open()
+
+    monkeypatch.setattr(store, "_new_persistent_durable_writer", count_open)
+    real_fsync = os.fsync
+    failed = True
+
+    def fail_once(fd: int) -> None:
+        nonlocal failed
+        if failed:
+            failed = False
+            raise OSError("injected fsync failure")
+        real_fsync(fd)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=fail_once):
+        with pytest.raises(OSError, match="injected fsync failure"):
+            await store._to_thread_durable(store.append_pending_prompt, "failed")
+        await store._to_thread_durable(store.append_pending_prompt, "succeeds")
+
+    assert open_count == 2
+    assert [entry.data["text"] for entry in store._entries] == ["failed", "succeeds"]
 
 
 @pytest.mark.asyncio
@@ -1745,7 +1788,6 @@ async def test_mixed_async_writes_keep_fifo_order(tmp_path: Path) -> None:
     )
 
     assert [entry.seq for entry in store._entries] == [1, 2, 3]
-    assert store._durable_writer is not None
 
 
 @pytest.mark.asyncio
@@ -1788,7 +1830,6 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert store._durable_writer is not None
     assert store._entries
 
 
@@ -1796,11 +1837,9 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
 async def test_close_drains_and_releases_persistent_writer(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="close-writer")
     await store._to_thread_durable(store.append_pending_prompt, "durable")
-    assert store._durable_writer is not None
 
     store.close()
 
-    assert store._durable_writer is None
     assert store._closed
 
 
