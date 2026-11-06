@@ -11695,13 +11695,13 @@ async def test_draft_write_runs_off_loop_and_flushes(
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     loop_thread = threading.get_ident()
     write_threads: list[int] = []
-    original = persistence_module.write_session_json
+    original = persistence_module.write_json_file
 
     def record_thread(*args, **kwargs) -> None:
         write_threads.append(threading.get_ident())
         original(*args, **kwargs)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", record_thread)
+    monkeypatch.setattr(persistence_module, "write_json_file", record_thread)
     persistence.schedule("draft")
     await asyncio.sleep(0.01)
 
@@ -11723,7 +11723,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
     started = threading.Event()
     release = threading.Event()
     used_fds: list[int] = []
-    original = persistence_module.write_session_json
+    original = persistence_module.write_session_file
 
     def blocked_write(directory_fd: int, *args, **kwargs) -> None:
         used_fds.append(directory_fd)
@@ -11732,7 +11732,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
         original(directory_fd, *args, **kwargs)
 
     monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.05)
-    monkeypatch.setattr(persistence_module, "write_session_json", blocked_write)
+    monkeypatch.setattr(persistence_module, "write_session_file", blocked_write)
     borrowed_fd = store.directory_fd
     app._draft.schedule("safe draft")
     while not started.is_set():
@@ -11945,7 +11945,7 @@ async def test_draft_write_failure_is_reported_once_without_raising(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    monkeypatch.setattr(persistence_module, "write_json_file", fail)
     persistence.schedule("first")
     await persistence.flush_pending()
     persistence.schedule("second")

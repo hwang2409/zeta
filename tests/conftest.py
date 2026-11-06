@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import uuid
 from collections import Counter
 from collections.abc import Generator
@@ -39,10 +40,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         path = item.path.resolve()
         # These modules patch process-wide clock/config during fixture teardown.
-        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
-            "test_test_environment.py",
-            "test_tui.py",
-        }:
+        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name == "test_tui.py":
+            item.fixturenames.append("bootstrap_tui_storage_format")
+        elif path.is_relative_to(_TEST_SITE_PACKAGES) and path.name != "test_test_environment.py":
             item.fixturenames.append("close_direct_test_runtime_owners")
 
 
@@ -607,18 +607,68 @@ def pytest_testnodedown(node, error) -> None:
 
 
 @pytest.fixture
-async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
-    """Close stores and registries constructed directly by repository tests."""
+async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
-    from zeta.storage_format import advance
+    from zeta.storage_format import advance, open_writer
+
+    leases = {}
+    store_init = ConversationStore.__init__
+    manager_init = SessionManager.__init__
+
+    def ensure(home: Path) -> None:
+        home.mkdir(parents=True, exist_ok=True)
+        if not (home / "storage-format.json").exists():
+            advance(home, expected_epoch=0)
+        canonical = home.resolve()
+        if canonical in leases:
+            return
+        result = []
+        thread = threading.Thread(target=lambda: result.append(open_writer(home)))
+        thread.start()
+        thread.join()
+        leases[canonical] = result[0]
+
+    @wraps(store_init)
+    def tracked_store_init(store, *args, **kwargs):
+        root = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
+        home = root
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        ensure(home.parent if home.name == "sessions" else root.parent)
+        store_init(store, *args, **kwargs)
+
+    @wraps(manager_init)
+    def tracked_manager_init(manager, *args, **kwargs):
+        home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
+        ensure(home)
+        manager_init(manager, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    yield
+    for lease in leases.values():
+        lease.close()
+
+
+@pytest.fixture
+async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
+    """Close stores and registries constructed directly by repository tests."""
+    from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
+    from zeta.core.session import SessionManager
+    from zeta.core.store import ConversationStore
+    from zeta.storage_format import StorageFormatError, advance, open_writer
     from zeta.tools import ToolRegistry
+    from zeta.tools._shared.process import BackgroundTaskRegistry
 
     stores: list[ConversationStore] = []
     registries: list[ToolRegistry] = []
+    test_home_leases = {}
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
+    background_init = BackgroundTaskRegistry.__init__
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
@@ -626,6 +676,23 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         home.mkdir(parents=True, exist_ok=True)
         if not (home / "storage-format.json").exists():
             advance(home, expected_epoch=0)
+        canonical = home.resolve()
+        if canonical not in test_home_leases:
+            result = []
+            error = []
+
+            def open_test_writer() -> None:
+                try:
+                    result.append(open_writer(home))
+                except StorageFormatError as exc:
+                    error.append(exc)
+
+            thread = threading.Thread(target=open_test_writer)
+            thread.start()
+            thread.join()
+            if error:
+                raise error[0]
+            test_home_leases[canonical] = result[0]
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
@@ -645,6 +712,28 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         ensure_format(home)
         manager_init(manager, *args, **kwargs)
 
+    @wraps(workspace_init)
+    def tracked_workspace_init(workspace, *args, **kwargs):
+        session_dir = Path(args[0])
+        home = session_dir.parent
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        ensure_format(home.parent if home.name == "sessions" else session_dir.parent)
+        workspace_init(workspace, *args, **kwargs)
+
+    @wraps(background_init)
+    def tracked_background_init(background, *args, **kwargs):
+        session_dir = kwargs.get("session_dir")
+        if session_dir is not None and kwargs.get("storage_lease") is None:
+            session_path = Path(session_dir)
+            home = session_path.parent
+            while home.name != "sessions" and home != home.parent:
+                home = home.parent
+            home = home.parent if home.name == "sessions" else session_path.parent
+            ensure_format(home)
+            kwargs["storage_lease"] = test_home_leases[home.resolve()]
+        background_init(background, *args, **kwargs)
+
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
@@ -654,7 +743,9 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
     for registry in reversed(registries):
         if not registry._closed:
@@ -662,6 +753,8 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     for store in reversed(stores):
         if not store._closed:
             store_close(store)
+    for lease in test_home_leases.values():
+        lease.close()
 
 
 @pytest.fixture

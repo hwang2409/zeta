@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json
@@ -18,7 +19,7 @@ _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
-class StorageFormatError(RuntimeError):
+class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
 
 
@@ -112,6 +113,14 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
                 )
             registered.references += 1
             return WriterLease(canonical, registered)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise StorageFormatError(
+                "stored-format lock acquisition must run off the event loop"
+            )
         fd = _open_lock(canonical)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
@@ -287,6 +296,50 @@ class WriterLease:
             except (OSError, ValueError) as exc:
                 raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
         output = apply_mutations(raw, mutations)
+        encoded = (json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n").encode()
+        publish(directory_fd, name, encoded)
+        return output
+
+    def publish_records(
+        self,
+        directory_fd: int,
+        name: str,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        identity: str,
+        publish: PublishBytes,
+    ) -> list[dict[str, Any]]:
+        """Patch an object-record collection by identity and delete absent records."""
+
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        except FileNotFoundError:
+            raw: object = []
+        else:
+            try:
+                with os.fdopen(fd, "rb") as stream:
+                    raw = json.load(stream)
+            except (OSError, ValueError) as exc:
+                raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+        if type(raw) is not list or any(type(item) is not dict for item in raw):
+            raise StorageFormatError(f"stored JSON record collection is invalid: {name}")
+        existing = {
+            item.get(identity): copy.deepcopy(item)
+            for item in raw
+            if type(item.get(identity)) is str
+        }
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in records:
+            record_id = record.get(identity)
+            if type(record_id) is not str or not record_id or record_id in seen:
+                raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+            seen.add(record_id)
+            current = existing.get(record_id, {})
+            _merge_mapping(current, record)
+            output.append(current)
         encoded = (json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n").encode()
         publish(directory_fd, name, encoded)
         return output

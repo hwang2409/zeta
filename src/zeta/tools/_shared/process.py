@@ -24,8 +24,9 @@ from ...core.session_files import (
     open_session_file,
     read_session_file,
     session_root,
-    write_session_json,
+    write_session_file,
 )
+from ...storage_format import WriterLease
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
@@ -168,6 +169,7 @@ class BackgroundTaskRegistry:
         notice_sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None = None,
         notification_sink: Callable[[TaskExitInput], Awaitable[object]] | None = None,
         command_niceness: int = 10,
+        storage_lease: WriterLease | None = None,
     ) -> None:
         if type(output_limit) is not int or output_limit < 1:
             raise ValueError("output_limit must be a positive integer")
@@ -190,6 +192,7 @@ class BackgroundTaskRegistry:
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
+        self._storage_lease = storage_lease.retain() if storage_lease is not None else None
         self._archive: _BackgroundOutputArchive | None = None
         self._archived_lengths: dict[str, int] = {}
         self._archive_workers: set[asyncio.Task[None]] = set()
@@ -742,6 +745,9 @@ class BackgroundTaskRegistry:
         finally:
             await finish(self._wait_for_archive_workers())
             self._close_storage()
+            if self._storage_lease is not None:
+                self._storage_lease.close()
+                self._storage_lease = None
             if self._temporary_log_root is not None:
                 shutil.rmtree(self._temporary_log_root, ignore_errors=True)
                 self._temporary_log_root = None
@@ -1138,7 +1144,15 @@ class BackgroundTaskRegistry:
             }
             for record in self._records.values()
         ]
-        write_session_json(self._directory_fd, "background_tasks.json", rows)
+        if self._storage_lease is None:
+            return
+        self._storage_lease.publish_records(
+            self._directory_fd,
+            "background_tasks.json",
+            rows,
+            identity="task_id",
+            publish=write_session_file,
+        )
 
 
 def _command_headline(command: str, limit: int = 80) -> str:

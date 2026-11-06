@@ -17,7 +17,13 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
-from ...core.session_files import read_session_file, session_root, write_session_json
+from ...core.session_files import (
+    read_session_file,
+    session_root,
+    write_session_file,
+    write_json_file,
+)
+from ...storage_format import WriterLease, mapping_mutations
 
 DRAFT_WRITE_DELAY = 0.2
 PERSISTENCE_FLUSH_TIMEOUT = 2.0
@@ -159,10 +165,18 @@ class _OrderedFileWriter:
 class DraftPersistence:
     """Persist the current composer text after a short idle delay."""
 
-    def __init__(self, path: str | Path, *, delay: float = DRAFT_WRITE_DELAY, directory_fd: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        delay: float = DRAFT_WRITE_DELAY,
+        directory_fd: int | None = None,
+        storage_lease: WriterLease | None = None,
+    ) -> None:
         self.path = Path(path)
         self.directory_fd = directory_fd
         self.delay = delay
+        self._storage_lease = storage_lease
         self._pending_text: str | None = None
         self._pending_revision: int | None = None
         self._revision = 0
@@ -300,11 +314,20 @@ class DraftPersistence:
             self._unlink(directory_fd)
             return
         with self._directory(create=True, directory_fd=directory_fd) as active_fd:
-            write_session_json(active_fd, self.path.name, {
+            value = {
                 "text": text,
                 "attachment_tokens": dict(attachment_tokens),
                 "next_image_token": next_image_token,
-            })
+            }
+            if self._storage_lease is None:
+                write_json_file(active_fd, self.path.name, value)
+            else:
+                self._storage_lease.publish_json(
+                    active_fd,
+                    self.path.name,
+                    mapping_mutations(value),
+                    write_session_file,
+                )
 
     async def flush_pending(self) -> None:
         self.flush()

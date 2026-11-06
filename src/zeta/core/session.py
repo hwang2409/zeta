@@ -41,7 +41,6 @@ from .session_files import (
     session_root,
     child_directory,
     write_session_file,
-    write_session_json,
 )
 from ..project_registry import ProjectRegistryError
 from ..runtime.project_registry_state import (
@@ -648,8 +647,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         _,
                         directory_fd,
                     ):
-                        write_session_json(
-                            directory_fd, "project_link_pending.json", link
+                        self._storage_lease.publish_json(
+                            directory_fd,
+                            "project_link_pending.json",
+                            mapping_mutations(link),
+                            write_session_file,
                         )
                 except (SessionError, OSError) as exc:
                     logger.warning("could not persist project linkage intent: %s", exc)
@@ -670,7 +672,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self._copy_metadata(metadata, current)
         try:
             persist_pending_root_link(
-                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id,
+                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id, self._storage_lease,
             )
         except (SessionError, OSError) as exc:
             logger.warning("could not persist project linkage intent: %s", exc)

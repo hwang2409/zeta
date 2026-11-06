@@ -171,6 +171,7 @@ class CheckpointTranscriptMixin:
                 self.loop.store.session_dir,
                 self.loop.store.session_id,
                 cap=self._workspace_snapshot_cap,
+                storage_lease=self.loop.store._storage_lease,
             )
         return self._workspace_snapshot_store
 
