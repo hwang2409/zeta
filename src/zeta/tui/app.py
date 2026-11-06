@@ -1172,6 +1172,8 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
+                # Any exit before startup drained its queue keeps accepted input as the draft.
+                self._restore_startup_submissions()
                 await cancel_activation(activation_task)
                 await self._prepare_ui_session_change()
                 if prompt_task is not None:

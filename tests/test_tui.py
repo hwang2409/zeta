@@ -52,6 +52,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.credentials import (
     anthropic_credentials,
@@ -7783,6 +7784,55 @@ async def test_startup_failure_restores_accepted_input_to_draft(
     )
     await app.close()
     assert DraftPersistence(app._draft.path).load() == "do not lose me"
+
+
+@pytest.mark.asyncio
+async def test_exit_during_activation_keeps_accepted_input_in_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        await asyncio.Event().wait()
+
+    async def type_then_exit(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        await activation_started.wait()
+        assert app._submit_input("do not lose me")
+        app.request_exit()
+        return None
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_exit)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        await asyncio.wait_for(app.run(session), timeout=10)
+    await app.close()
+
+    assert DraftPersistence(app._draft.path).load() == "do not lose me", (
+        "input accepted during activation was lost when the user exited"
+    )
 
 
 @pytest.mark.asyncio
