@@ -6687,7 +6687,7 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
                     }
                 ],
                 "last_attempt_at": "2026-10-22T12:00:00Z",
-                "last_error": None,
+                "last_error": "internal refresh error; retry or restart zeta",
             }
         ).encode(),
     )
@@ -6726,6 +6726,7 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         assert row["account"] == "codex:work"
         assert row["current"] is True
         assert row["default"] is True
+        assert row["usage"]["error"] == "internal refresh error; retry or restart zeta"
         assert row["usage"]["snapshot"]["windows"] == [
             {
                 "kind": "primary",

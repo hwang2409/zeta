@@ -13129,7 +13129,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         assert "5h 42%" in plain
         assert f"resets {local_reset}" in plain
         assert "stale" in plain
-        assert "refresh failed: rate limited" in plain
+        assert "refresh failed: rate limited; retry later" in plain
     finally:
         opened.store.close()
 

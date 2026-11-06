@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,16 +14,19 @@ import httpx
 import pytest
 
 from tests.support.credentials import named_account_credentials
-from zeta.accounts import AccountId, AccountStore
+from zeta.accounts import AccountCredentialLockTimeoutError, AccountId, AccountStore
 from zeta.accounts.usage import (
     AccountUsage,
     UsageSnapshot,
     UsageWindow,
+    format_usage_lines,
     normalize_usage,
     read_usage,
     usage_freshness,
+    usage_json,
 )
 from zeta.oauth import OAuthTokens
+from zeta.providers.anthropic_errors import AnthropicAuthError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "usage"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
@@ -108,9 +112,9 @@ def test_rejects_out_of_range_nonfinite_and_unknown_values() -> None:
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        (httpx.Response(401), "authentication failed"),
-        (httpx.Response(429), "rate limited"),
-        (httpx.Response(200, json={"changed": True}), "invalid usage response"),
+        (httpx.Response(401), "authentication failed; log in again"),
+        (httpx.Response(429), "rate limited; retry later"),
+        (httpx.Response(200, json={"changed": True}), "invalid usage response; retry later"),
     ],
 )
 def test_failed_refresh_keeps_previous_snapshot_and_reports_safe_error(
@@ -137,10 +141,72 @@ def test_failed_refresh_keeps_previous_snapshot_and_reports_safe_error(
     result = asyncio.run(usage.refresh_stale())[account]
 
     assert result.error == expected
+    assert format_usage_lines(result)[-1] == f"refresh failed: {expected}"
+    assert usage_json(result)["error"] == expected
     assert result.snapshot is not None
     assert result.snapshot.captured_at == NOW
     assert expected in store.list_display()[0].usage.error
     assert asyncio.run(usage.refresh_stale()) == {}
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (AnthropicAuthError("expired"), "authentication failed; log in again"),
+        (httpx.ConnectError("offline"), "network error; check your connection and retry"),
+        (RuntimeError("internal canary"), "internal refresh error; retry or restart zeta"),
+    ],
+)
+def test_refresh_exception_labels_are_safe_and_actionable_on_tui_and_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, expected: str
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    usage = AccountUsage(store, clock=lambda: NOW)
+
+    async def fail_request(*args: object) -> httpx.Response:
+        raise failure
+
+    monkeypatch.setattr(usage, "_request", fail_request)
+    state = asyncio.run(usage.refresh_stale())[account]
+
+    assert state.error == expected
+    assert format_usage_lines(state)[-1] == f"refresh failed: {expected}"
+    assert usage_json(state)["error"] == expected
+
+
+def test_successful_refresh_clears_previous_failure_label(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    replies = iter(
+        (
+            httpx.Response(429),
+            httpx.Response(200, json=_fixture("anthropic_oauth_usage.json")),
+        )
+    )
+
+    failed = asyncio.run(
+        AccountUsage(
+            store,
+            clock=lambda: NOW,
+            transport=httpx.MockTransport(lambda request: next(replies)),
+        ).refresh_stale()
+    )[account]
+    succeeded = asyncio.run(
+        AccountUsage(
+            store,
+            clock=lambda: NOW + timedelta(minutes=2),
+            transport=httpx.MockTransport(lambda request: next(replies)),
+        ).refresh_stale()
+    )[account]
+
+    assert failed.error == "rate limited; retry later"
+    assert succeeded.error is None
+    assert read_usage(store, account, now=NOW + timedelta(minutes=2)).error is None
 
 
 def test_refresh_is_sequential_one_request_per_account_and_respects_cooldown(
@@ -205,9 +271,57 @@ def test_refresh_has_total_deadline_and_releases_locks(
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.2
-    assert result.error == "usage request failed"
+    assert result.error == "network error; check your connection and retry"
     with store.lifecycle_guard(account):
         pass
+
+
+def test_lock_failure_keeps_account_and_reports_when_to_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+
+    @contextmanager
+    def locked(*args: object, **kwargs: object):
+        raise AccountCredentialLockTimeoutError(account)
+        yield
+
+    monkeypatch.setattr(store, "lifecycle_guard", locked)
+    state = asyncio.run(AccountUsage(store, clock=lambda: NOW).refresh_stale())[account]
+
+    assert store.list() == [account]
+    assert state.error == "account busy; retry after the other account operation finishes"
+
+
+def test_canceled_refresh_keeps_account_and_records_retry_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(tmp_path)
+    account = AccountId("anthropic", "work")
+    _seed(store, account)
+    started = asyncio.Event()
+
+    async def block_request(*args: object) -> httpx.Response:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    usage = AccountUsage(store, clock=lambda: NOW)
+    monkeypatch.setattr(usage, "_request", block_request)
+
+    async def cancel_refresh() -> None:
+        task = asyncio.create_task(usage.refresh_stale())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_refresh())
+
+    assert store.list() == [account]
+    assert read_usage(store, account, now=NOW).error == "refresh canceled; retry"
 
 
 def _write_in_flight(store: AccountStore, account: AccountId, started: datetime) -> None:
@@ -248,7 +362,7 @@ def test_abandoned_in_flight_attempt_shows_safe_failure(
     _write_in_flight(store, account, NOW - timedelta(seconds=2))
 
     state = read_usage(store, account, now=NOW)
-    assert state.error == "usage request failed"
+    assert state.error == "network error; check your connection and retry"
 
 
 def test_active_in_flight_attempt_is_not_failed(

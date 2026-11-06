@@ -174,11 +174,22 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
         if outcome is not None and outcome not in {"in_flight", "succeeded", "failed"}:
             raise ValueError
         error = value.get("last_error")
-        if error is not None and error not in {
-            "authentication failed",
-            "rate limited",
-            "invalid usage response",
-            "usage request failed",
+        legacy_errors = {
+            "authentication failed": "authentication failed; log in again",
+            "rate limited": "rate limited; retry later",
+            "invalid usage response": "invalid usage response; retry later",
+            "usage request failed": "network error; check your connection and retry",
+        }
+        if error in legacy_errors:
+            error = legacy_errors[error]
+        elif error is not None and error not in {
+            "authentication failed; log in again",
+            "rate limited; retry later",
+            "invalid usage response; retry later",
+            "network error; check your connection and retry",
+            "provider error; retry later",
+            "refresh canceled; retry",
+            "internal refresh error; retry or restart zeta",
         }:
             raise ValueError
         if (
@@ -188,7 +199,7 @@ def read_usage(store: AccountStore, account: AccountId, *, now: datetime | None 
                 seconds=REQUEST_TIMEOUT_SECONDS + IN_FLIGHT_GRACE_SECONDS
             )
         ):
-            error = "usage request failed"
+            error = "network error; check your connection and retry"
         return UsageState(snapshot, usage_freshness(snapshot, now), error, attempt)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return UsageState(None, "usage unknown", "invalid usage response")
@@ -225,6 +236,8 @@ class AccountUsage:
         self._transport = transport
 
     async def refresh_stale(self) -> dict[AccountId, UsageState]:
+        from .store import AccountCredentialLockTimeoutError
+
         results: dict[AccountId, UsageState] = {}
         timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
         async with httpx.AsyncClient(
@@ -237,7 +250,15 @@ class AccountUsage:
                 state = read_usage(self.store, account, now=now)
                 if state.freshness == "now":
                     continue
-                result = await self._refresh_one(account, state, now, client)
+                try:
+                    result = await self._refresh_one(account, state, now, client)
+                except AccountCredentialLockTimeoutError:
+                    result = UsageState(
+                        state.snapshot,
+                        state.freshness,
+                        "account busy; retry after the other account operation finishes",
+                        now,
+                    )
                 if result is not None:
                     results[account] = result
         return results
@@ -263,21 +284,38 @@ class AccountUsage:
                     self._request(account, home_fd, client), REQUEST_TIMEOUT_SECONDS
                 )
                 if response.status_code in {401, 403}:
-                    error = "authentication failed"
+                    error = "authentication failed; log in again"
                 elif response.status_code == 429:
-                    error = "rate limited"
+                    error = "rate limited; retry later"
                 elif response.status_code != 200:
-                    error = "usage request failed"
+                    error = "provider error; retry later"
                 else:
                     snapshot = normalize_usage(account.provider, response.json(), now)
                     self._write(account, snapshot, now, None, "succeeded", finished=now)
                     return UsageState(snapshot, "now", None, now)
+            except asyncio.CancelledError:
+                self._write(
+                    account,
+                    state.snapshot,
+                    now,
+                    "refresh canceled; retry",
+                    "failed",
+                    finished=now,
+                )
+                raise
             except (httpx.HTTPError, TimeoutError):
-                error = "usage request failed"
-            except RuntimeError:
-                error = "authentication failed"
+                error = "network error; check your connection and retry"
+            except RuntimeError as exc:
+                from ..codex import CodexAuthError
+                from ..providers.anthropic_errors import AnthropicAuthError
+
+                error = (
+                    "authentication failed; log in again"
+                    if isinstance(exc, (CodexAuthError, AnthropicAuthError))
+                    else "internal refresh error; retry or restart zeta"
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
-                error = "invalid usage response"
+                error = "invalid usage response; retry later"
             self._write(account, state.snapshot, now, error, "failed", finished=now)
             return UsageState(state.snapshot, usage_freshness(state.snapshot, now), error, now)
 
