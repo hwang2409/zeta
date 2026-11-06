@@ -472,7 +472,11 @@ class BackgroundTaskRegistry:
                 record.running = False
                 record.process = None
             else:
-                await asyncio.gather(record.monitor, return_exceptions=True)
+                monitor_result = await asyncio.gather(
+                    record.monitor, return_exceptions=True
+                )
+                if isinstance(monitor_result[0], BaseException):
+                    raise monitor_result[0]
             self._records.pop(task_id, None)
             raise
         return task_id, process.pid
