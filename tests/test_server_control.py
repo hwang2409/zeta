@@ -91,6 +91,7 @@ class _ControllerConnection:
     def __init__(self) -> None:
         self.codec = FrameCodec()
         self.frames: list[bytes] = []
+        self._write_lock = asyncio.Lock()
         self.server = type(
             "Server",
             (),
@@ -102,8 +103,9 @@ class _ControllerConnection:
         )()
 
     async def _write_physical(self, frame: bytes) -> bool:
-        self.frames.append(frame)
-        return True
+        async with self._write_lock:
+            self.frames.append(frame)
+            return True
 
     async def close(self) -> None:
         pass
@@ -177,6 +179,43 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
         "a",
         "b",
         "c",
+    ]
+    registry.release(connection)
+
+
+@pytest.mark.asyncio
+async def test_controller_concurrent_outputs_keep_admission_order() -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop())
+    connection = _ControllerConnection()
+    registry.register(connection)
+    registry.negotiate_role(connection, "controller", "1.2", frozenset())
+    registry.controller_ready(connection)
+    await registry.flush_controller(connection)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    async def gated_write(frame: bytes) -> bool:
+        async with connection._write_lock:
+            if not first_started.is_set():
+                first_started.set()
+                await release_first.wait()
+            connection.frames.append(frame)
+            return True
+
+    connection._write_physical = gated_write  # type: ignore[method-assign]
+    first = asyncio.create_task(
+        registry.publish_controller("assistant_delta", "session", delta="first")
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        registry.publish_controller("assistant_delta", "session", delta="second")
+    )
+    await asyncio.sleep(0)
+    assert connection.frames == []
+    release_first.set()
+    assert await asyncio.gather(first, second) == [True, True]
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+        "first",
+        "second",
     ]
     registry.release(connection)
 
