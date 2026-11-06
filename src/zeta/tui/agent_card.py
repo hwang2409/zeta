@@ -43,6 +43,11 @@ from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
     AgentTranscriptSnapshot,
+    agent_child_paths,
+    agent_path_signature,
+    agent_tree_signature,
+    candidate_paths,
+    registered_child_markers,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -800,7 +805,7 @@ class AgentNavigation:
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
         self._todo_control = AgentTodoControl(cwd=self.store.cwd)
-        self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+        self._metadata_cache: dict[Path, tuple[tuple[int, ...], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
@@ -923,37 +928,16 @@ class AgentNavigation:
         else:
             self._transcript_layout.children[0] = replacement
 
-    @staticmethod
-    def _path_signature(path: Path) -> tuple[int, int] | None:
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
-
-    def _agents_directory_signature(self) -> tuple[object, ...]:
-        agents = self.current_path / "agents"
-        signature = self._path_signature(agents)
-        try:
-            entry_count = sum(1 for _ in os.scandir(agents))
-        except OSError:
-            entry_count = 0
-        return signature, entry_count
+    _path_signature = staticmethod(agent_path_signature)
 
     def _agent_tree_signature(self) -> tuple[object, ...]:
-        """Detect tree changes while statting lifecycle only for live children."""
-
-        running = tuple(
-            (entry.path, self._path_signature(entry.path / "agent_lifecycle.json"))
-            for entry in self.entries
+        running = (
+            entry.path for entry in self.entries
             if entry.state not in _TERMINAL_AGENT_STATES
             and (entry.path != self.root_path or self.child_view_active)
         )
-        return (
-            self.current_path,
-            self.selected_index,
-            self._agents_directory_signature(),
-            running,
+        return agent_tree_signature(
+            self.current_path, self.selected_index, running, self._path_signature
         )
 
     def _schedule_refresh(self, delay: float) -> None:
@@ -1015,13 +999,16 @@ class AgentNavigation:
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
-        fallback: dict[Path, dict[str, Any]] = {}
-        if self.current_path == self.root_path:
-            for marker in self.store.agent_children().values():
-                child_path = marker.get("child_session_path")
-                if isinstance(child_path, str):
-                    fallback[Path(child_path)] = marker
-        children = self._children(self.current_path, fallback)
+        fallback = registered_child_markers(self.current_path)
+        known = {
+            entry.path
+            for entry in self.entries
+            if entry.path.parent == self.current_path / "agents"
+        }
+        candidates = candidate_paths(
+            signature, self._refresh_signature, fallback, known, force
+        )
+        children = self._children(self.current_path, fallback, candidates=candidates)
         at_root = self.current_path == self.root_path
         main_entry = (
             [self._main_entry()] if self._fork_main_path is not None and at_root else []
@@ -1057,17 +1044,13 @@ class AgentNavigation:
             max=MAX_AGENT_LIST_ROWS,
         )
 
-    def _children(self, path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
-        agents = path / "agents"
-        try:
-            candidates = sorted(
-                (child for child in agents.iterdir() if child.is_dir() and not child.is_symlink()),
-                key=lambda child: (not child.name.isdigit(), child.name),
-            )
-        except OSError:
-            return []
+    def _children(
+        self, path: Path, fallback: dict[Path, dict[str, Any]], *,
+        candidates: set[Path] | None = None,
+    ) -> list[AgentEntry]:
+        children = agent_child_paths(path, candidates)
         entries: list[AgentEntry] = []
-        for child in candidates:
+        for child in children:
             metadata = self._cached_agent_metadata(child, fallback.get(child))
             entries.append(
                 AgentEntry(
@@ -1077,7 +1060,7 @@ class AgentNavigation:
                     str(metadata.get("state") or "running"),
                 )
             )
-        candidate_set = set(candidates)
+        candidate_set = set(children)
         self._metadata_cache = {
             child: cached
             for child, cached in self._metadata_cache.items()
@@ -1093,13 +1076,13 @@ class AgentNavigation:
         lifecycle_path = path / "agent_lifecycle.json"
         try:
             stat = lifecycle_path.stat()
-            key = (1, stat.st_mtime_ns, stat.st_size)
+            key = (1, stat.st_mtime_ns, stat.st_size, stat.st_ino)
         except OSError:
             try:
                 stat = (path / "session_state.json").stat()
-                key = (0, stat.st_mtime_ns, stat.st_size)
+                key = (0, stat.st_mtime_ns, stat.st_size, stat.st_ino)
             except OSError:
-                key = (0, 0, 0)
+                key = (0, 0, 0, 0)
         cached = self._metadata_cache.get(path)
         if cached is not None and cached[0] == key:
             return cached[1]
