@@ -611,7 +611,7 @@ def pytest_testnodedown(node, error) -> None:
 
 
 @pytest.fixture
-async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
+def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
     from zeta.storage_format import advance, open_writer
@@ -658,7 +658,10 @@ async def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     yield
     for store in reversed(stores):
         if not store._closed:
-            store.close()
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
     for manager in reversed(managers):
         manager._release_storage_lease()
     for lease in leases.values():
@@ -766,12 +769,21 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     yield
     for registry in reversed(registries):
         if not registry._closed:
-            await registry_close(registry)
+            try:
+                await registry_close(registry)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
     for store in reversed(stores):
         if not store._closed:
-            store_close(store)
+            try:
+                store_close(store)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
     for workspace in reversed(workspaces):
-        workspace.close()
+        try:
+            workspace.close()
+        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+            pass
     for manager in reversed(managers):
         manager._release_storage_lease()
     for lease in test_home_leases.values():
