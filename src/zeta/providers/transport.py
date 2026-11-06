@@ -22,7 +22,9 @@ from .retry_policy import (
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
-DEFAULT_STREAM_STALL_SECONDS = 90.0
+DEFAULT_STREAM_STALL_SECONDS = 90.0  # Transport idle, including missing keepalives.
+# Long hidden reasoning is normal; diagnostics will let us safely tighten this later.
+MODEL_PROGRESS_STALL_SECONDS = 15 * 60.0
 DEFAULT_STREAM_STALL_RETRIES = 2
 _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 
@@ -184,7 +186,7 @@ class StreamFinished:
 class StreamProgress:
     """Track decoded model progress without counting transport keepalives."""
 
-    __slots__ = ("version",)
+    __slots__ = ("last_at", "max_gap_s", "version")
 
     _NON_PROGRESS_EVENTS: ClassVar[frozenset[str]] = frozenset(
         {"keepalive", "ping", "response.in_progress", "response.metadata"}
@@ -192,11 +194,52 @@ class StreamProgress:
 
     def __init__(self) -> None:
         self.version = 0
+        self.last_at = time.monotonic()
+        self.max_gap_s = 0.0
 
     def observe(self, record: tuple[str, dict[str, Any]]) -> None:
         event, payload = record
         if payload.get("type", event) not in self._NON_PROGRESS_EVENTS:
+            now = time.monotonic()
+            self.max_gap_s = max(self.max_gap_s, now - self.last_at)
+            self.last_at = now
             self.version += 1
+
+    def maximum_gap_s(self) -> float:
+        return max(self.max_gap_s, time.monotonic() - self.last_at)
+
+
+class _StreamDeadlines:
+    """Keep transport activity and decoded model progress independent."""
+
+    __slots__ = (
+        "progress",
+        "progress_at",
+        "progress_version",
+        "transport_at",
+        "transport_seconds",
+    )
+
+    def __init__(self, transport_seconds: float, progress: StreamProgress | None) -> None:
+        now = time.monotonic()
+        self.transport_seconds = transport_seconds
+        self.transport_at = now + transport_seconds
+        self.progress_at = now + MODEL_PROGRESS_STALL_SECONDS
+        self.progress = progress
+        self.progress_version = progress.version if progress is not None else 0
+
+    def next(self) -> tuple[float, float, bool]:
+        now = time.monotonic()
+        if self.progress is not None and self.progress.version != self.progress_version:
+            self.progress_version = self.progress.version
+            self.progress_at = now + MODEL_PROGRESS_STALL_SECONDS
+        model_stall = self.progress is not None and self.progress_at < self.transport_at
+        deadline = self.progress_at if model_stall else self.transport_at
+        limit = MODEL_PROGRESS_STALL_SECONDS if model_stall else self.transport_seconds
+        return deadline - now, limit, model_stall
+
+    def transport_activity(self) -> None:
+        self.transport_at = time.monotonic() + self.transport_seconds
 
 
 async def wait_for_response_headers[E: RuntimeError](
@@ -238,11 +281,19 @@ def sse_lines[E: RuntimeError](
         error.stall_seconds = elapsed
         return error
 
+    def on_model_stall(elapsed: float) -> E:
+        error = error_class(
+            f"{provider} model progress stalled for {elapsed:.0f}s", is_stall=True
+        )
+        error.stall_seconds = elapsed
+        return error
+
     is_finished = (lambda: finished.value) if finished is not None else None
     return stall_watchdog(
         response.aiter_lines(),
         seconds=seconds,
         on_stall=on_stall,
+        on_model_stall=on_model_stall,
         is_finished=is_finished,
         progress=progress,
     )
@@ -380,43 +431,30 @@ async def stall_watchdog[T](
     *,
     seconds: float,
     on_stall: Callable[[float], BaseException],
+    on_model_stall: Callable[[float], BaseException] | None = None,
     is_finished: Callable[[], bool] | None = None,
     progress: StreamProgress | None = None,
 ) -> AsyncIterator[T]:
-    """Raise when ``source`` stops making progress for ``seconds``.
+    """Raise on transport silence or, when tracked, missing model progress."""
 
-    Without an explicit progress tracker, every source item is progress.
-    ``is_finished`` makes post-completion silence a clean EOF.
-    """
-
-    if seconds <= 0:
-        async for item in source:
-            yield item
-        return
     iterator = source.__aiter__()
-    deadline = time.monotonic() + seconds
-    progress_version = progress.version if progress is not None else 0
+    deadlines = _StreamDeadlines(seconds, progress)
+    finished = is_finished or (lambda: False)
     try:
         while True:
-            if progress is not None and progress.version != progress_version:
-                progress_version = progress.version
-                deadline = time.monotonic() + seconds
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if is_finished is not None and is_finished():
-                    return
-                raise on_stall(seconds)
+            remaining, limit, model_stall = deadlines.next()
             try:
-                item = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+                timeout = None if seconds <= 0 else max(0, remaining)
+                item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
             except StopAsyncIteration:
                 return
             except TimeoutError as exc:
-                if is_finished is not None and is_finished():
+                if finished():
                     return
-                raise on_stall(seconds) from exc
+                factory = on_model_stall if model_stall else None
+                raise (factory or on_stall)(limit) from exc
+            deadlines.transport_activity()
             yield item
-            if progress is None:
-                deadline = time.monotonic() + seconds
     finally:
         close = getattr(iterator, "aclose", None)
         if close is not None:

@@ -2475,6 +2475,7 @@ async def test_early_stream_end_is_typed(tmp_path: Path) -> None:
     assert record["bytes_received"] > 0
     assert record["sse_events_received"] == 1
     assert record["idle_gap_seconds"] >= 0
+    assert record["max_progress_gap_s"] >= 0
     assert record["open_blocks"] == 0
     assert record["closed_blocks"] == 0
     assert record["stop_reason"] is None

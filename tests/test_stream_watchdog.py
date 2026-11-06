@@ -437,85 +437,63 @@ async def test_anthropic_backend_stall_budget_exhausts(
     await client.aclose()
 
 
-async def test_anthropic_keepalives_do_not_reset_progress_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_keepalives_reset_transport_but_not_progress_deadline(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [0.0]
     monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    progress = transport_module.StreamProgress()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            stream=_ClockedByteStream(
-                clock,
-                [
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                ],
-            ),
-            request=request,
-        )
+    async def source():
+        for _ in range(20):
+            clock[0] += 60.0
+            yield "keepalive"
 
-    client = _mock_client(handler)
-    backend = AnthropicBackend(
-        client=client,
-        token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=10.0,
-        stall_retries=0,
+    watched = stall_watchdog(
+        source(),
+        seconds=90.0,
+        on_stall=lambda elapsed: _StubError(f"transport stalled after {elapsed}"),
+        on_model_stall=lambda elapsed: _StubError(
+            f"model progress stalled after {elapsed}", is_stall=True
+        ),
+        progress=progress,
     )
-    with pytest.raises(AnthropicStreamError) as excinfo:
-        [event async for event in backend.complete([], [])]
+    seen = []
+    with pytest.raises(_StubError, match="model progress stalled after 900.0"):
+        async for item in watched:
+            seen.append(item)
+            progress.observe(("ping", {"type": "ping"}))
 
-    assert excinfo.value.is_stall is True
-    await client.aclose()
+    assert len(seen) == 15
+    assert clock == [900.0]
 
 
 async def test_decoded_progress_resets_progress_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [0.0]
     monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    progress = transport_module.StreamProgress()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            stream=_ClockedByteStream(
-                clock,
-                [
-                    (
-                        8.0,
-                        (
-                            b'event: message_start\ndata: {"type":"message_start",'
-                            b'"message":{"id":"msg-1","model":"claude-test",'
-                            b'"role":"assistant","usage":{"input_tokens":1}}}\n\n'
-                        ),
-                    ),
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                    (4.0, b'event: ping\ndata: {"type":"ping"}\n\n'),
-                ],
-            ),
-            request=request,
-        )
+    async def source():
+        for index in range(20):
+            clock[0] += 60.0
+            yield index
 
-    client = _mock_client(handler)
-    backend = AnthropicBackend(
-        client=client,
-        token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=10.0,
-        stall_retries=0,
+    watched = stall_watchdog(
+        source(),
+        seconds=90.0,
+        on_stall=lambda elapsed: _StubError(f"stalled after {elapsed}", is_stall=True),
+        progress=progress,
     )
-    with pytest.raises(AnthropicStreamError) as excinfo:
-        [event async for event in backend.complete([], [])]
+    seen = []
+    async for item in watched:
+        seen.append(item)
+        event_type = "message_start" if item == 9 else "ping"
+        progress.observe((event_type, {"type": event_type}))
 
-    assert excinfo.value.is_stall is True
-    assert clock == [20.0]
-    await client.aclose()
+    assert seen == list(range(20))
+    assert clock == [1200.0]
 
 
 async def _no_op_sleep(_delay: float) -> None:
@@ -692,9 +670,8 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
             stream=_ClockedByteStream(
                 clock,
                 [
-                    (4.0, b'event: keepalive\ndata: {"type":"keepalive"}\n\n'),
-                    (4.0, b'event: keepalive\ndata: {"type":"keepalive"}\n\n'),
-                    (4.0, b'event: keepalive\ndata: {"type":"keepalive"}\n\n'),
+                    (60.0, b'event: keepalive\ndata: {"type":"keepalive"}\n\n')
+                    for _ in range(15)
                 ],
             ),
             request=request,
@@ -705,10 +682,10 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
         client=client,
         token_store=_codex_store(tmp_path / "codex.json"),
         base_url="https://test.invalid/codex/responses",
-        stall_seconds=10.0,
+        stall_seconds=90.0,
         stall_retries=0,
     )
-    with pytest.raises(CodexStreamError) as excinfo:
+    with pytest.raises(CodexStreamError, match="model progress stalled for 900s") as excinfo:
         [event async for event in backend.complete([], [])]
 
     assert excinfo.value.is_stall is True

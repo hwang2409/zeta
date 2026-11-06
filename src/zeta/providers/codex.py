@@ -377,6 +377,7 @@ async def _decode_response(
         if record is None:
             continue
         progress.observe(record)
+        response_data["max_progress_gap_s"] = progress.maximum_gap_s()
         event, payload = record
         response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
@@ -395,6 +396,8 @@ async def _decode_response(
             yield translated
     record = decoder.finish()
     if record is not None:
+        progress.observe(record)
+        response_data["max_progress_gap_s"] = progress.maximum_gap_s()
         response_data["event_count"] = response_data.get("event_count", 0) + 1
         translated, response_state = _translate_event(
             record[0],
@@ -474,6 +477,7 @@ def _translate_event(
             "last_event_type": event_type,
             "event_count": 1,
             "stream_age_seconds": _stream_age(response_data),
+            "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
         }
         raise failure
     if event_type == "response.created":
@@ -935,6 +939,7 @@ def _decode_terminal_response(
             "last_event_type": event_type,
             "event_count": response_data.get("event_count", 1),
             "stream_age_seconds": _stream_age(response_data),
+            "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
         }
         raise failure
     if response is not None and not isinstance(response, Mapping):
