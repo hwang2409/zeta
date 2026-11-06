@@ -456,28 +456,22 @@ async def test_stdio_cleanup_cancellation_releases_transient_quota(
         await allow_reap.wait()
 
     monkeypatch.setattr(stdio_module, "_kill_and_reap", blocked_cleanup)
-    invalidation = client._start_invalidation(
-        stdio_module.MCPTransportError("test cleanup"), report_failure=False
-    )
-    assert invalidation.task is not None
+    close_task = asyncio.create_task(client.close())
     await kill_entered.wait()
     if stage == "reap":
         allow_kill.set()
         await reap_entered.wait()
+    invalidation = getattr(client, "_invalidation", None)
+    cleanup_task = invalidation.task if invalidation is not None else None
 
-    async def join_cleanup() -> None:
-        assert invalidation.task is not None
-        await asyncio.shield(invalidation.task)
-
-    joiner = asyncio.create_task(join_cleanup())
-    joiner.cancel()
+    close_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await joiner
+        await close_task
     allow_kill.set()
     allow_reap.set()
-    await invalidation.task
+    if cleanup_task is not None:
+        await cleanup_task
     assert spill._transient_bytes == 0
-    await client.close()
     spill.close()
 
 
