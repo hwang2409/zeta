@@ -622,6 +622,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                                 src_dir_fd=source_fd,
                                 dst_dir_fd=destination_fd,
                             )
+                        os.fsync(destination_fd)
+                    os.fsync(root_fd)
             if project_id is not None:
                 link = {
                     "project_id": project_id,

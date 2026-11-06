@@ -719,6 +719,7 @@ class ProjectInbox:
             atomic_publish_file(
                 claimed_fd, name, self._encode(record), sync_directory=True
             )
+            os.fsync(new_fd)
             return self._read_record(claimed_fd, name, bodies_fd)
 
     def done(
@@ -775,6 +776,7 @@ class ProjectInbox:
                 except OSError as exc:
                     raise InboxError("could not complete message") from exc
                 os.fsync(done_fd)
+                os.fsync(claimed_fd)
                 self._prune_done(done_fd, bodies_fd)
             completed = self._read_record(done_fd, name, bodies_fd)
         if reply is not None:

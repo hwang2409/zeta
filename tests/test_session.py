@@ -1479,6 +1479,27 @@ async def test_metadata_lock_rejects_event_loop_thread(tmp_path: Path) -> None:
         opened.store.close()
 
 
+def test_create_syncs_session_directory_and_sessions_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    directory_syncs: list[int] = []
+    original_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_syncs.append(fd)
+        original_fsync(fd)
+
+    monkeypatch.setattr("zeta.core.session_files.os.fsync", record_fsync)
+    SessionManager(tmp_path / "zeta-home").create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
+
+    assert len(directory_syncs) >= 2
+
+
 def test_recency_refresh_skips_busy_lock_and_later_succeeds(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
