@@ -20,11 +20,7 @@ from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.layout import (
-    COMMAND_MENU_ROWS,
-    COMPOSER_CONTENT_PADDING,
-    COMPOSER_PAD_Y,
-)
+from zeta.tui.layout import COMPOSER_CONTENT_PADDING, COMPOSER_PAD_Y
 from zeta.tui.word_wrap import WordWrapWindow
 
 
@@ -81,39 +77,32 @@ def _layout_metrics(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("terminal_height", "todo_count", "candidate_count"),
-    [(24, 0, 1), (24, 2, 2), (24, 8, 20), (10, 8, 20)],
-)
-async def test_completion_menu_stays_above_bottom_chrome_with_todos(
+@pytest.mark.parametrize("input_text", ["@./", "/"])
+@pytest.mark.parametrize("bottom_rows", ["none", "todo", "queued"])
+async def test_completion_menu_touches_composer_with_other_bottom_rows_visible(
     tmp_path: Path,
-    terminal_height: int,
-    todo_count: int,
-    candidate_count: int,
+    monkeypatch: pytest.MonkeyPatch,
+    input_text: str,
+    bottom_rows: str,
 ) -> None:
     completion_dir = tmp_path / "completion-candidates"
     completion_dir.mkdir()
-    for index in range(candidate_count):
-        candidate = completion_dir / f"candidate-{index}"
-        if index % 2:
-            candidate.mkdir()
-        else:
-            candidate.touch()
+    for index in range(4):
+        (completion_dir / f"candidate-{index}").touch()
 
     app, session = _app(tmp_path, cwd=completion_dir)
     session.app.output = SimpleNamespace(
-        get_size=lambda: Size(rows=terminal_height, columns=80),
+        get_size=lambda: Size(rows=24, columns=80),
     )
-    app.loop.store.set_todo_items(
-        [
-            {
-                "content": f"milestone {index} with deliberately long detail",
-                "status": "in_progress" if index == 0 else "pending",
-            }
-            for index in range(todo_count)
-        ]
-    )
-    input_text = "@./"
+    if bottom_rows == "todo":
+        app.loop.store.set_todo_items(
+            [{"content": "visible milestone", "status": "in_progress"}]
+        )
+    elif bottom_rows == "queued":
+        monkeypatch.setattr(
+            TUIApp, "queued_messages", property(lambda _self: ("queued follow-up",))
+        )
+
     session.default_buffer.set_document(Document(input_text))
     with set_app(session.app):
         session.app.layout.focus(session.default_buffer)
@@ -123,45 +112,22 @@ async def test_completion_menu_stays_above_bottom_chrome_with_todos(
             insert_common_part=False,
             complete_event=CompleteEvent(completion_requested=True),
         )
-    screen = render_full_screen(session, 80, terminal_height)
+    screen = render_full_screen(session, 80, 24)
     with set_app(session.app):
         screen.draw_all_floats()
 
     completion_rows = [
         row
-        for row in range(terminal_height)
+        for row in range(24)
         if any(
             "completion-menu.completion" in screen.data_buffer[row][column].style
             for column in range(80)
         )
     ]
-    composer_rows = _composer_rows(screen, 80)
-    footer_rows = [
-        row
-        for row in range(terminal_height)
-        if any(
-            "status-bar" in screen.data_buffer[row][column].style
-            for column in range(80)
-        )
-    ]
+    composer_top = min(_composer_rows(screen, 80))
 
-    chrome_rows = set(composer_rows) | set(footer_rows)
-    todo_rows = [
-        row
-        for row in range(terminal_height)
-        if "milestone"
-        in "".join(screen.data_buffer[row][column].char for column in range(80))
-    ]
-    assert not set(completion_rows) & set(composer_rows)
-    assert not set(completion_rows) & set(footer_rows)
-    if todo_count:
-        assert todo_rows
-        assert not set(completion_rows) & set(todo_rows)
-    protected_rows = chrome_rows | set(todo_rows)
-    available_rows = min(protected_rows)
-    expected_menu_rows = min(candidate_count, COMMAND_MENU_ROWS, available_rows)
-    assert len(completion_rows) == expected_menu_rows
     assert completion_rows
+    assert completion_rows[-1] + 1 == composer_top
     assert session.default_buffer.text == input_text
 
 
