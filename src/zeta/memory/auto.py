@@ -952,6 +952,17 @@ class AutoMemoryReconciler:
         scanned_end = start - 1
         try:
             with path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                cursor = self._transcript_cursor
+                if (
+                    cursor is not None
+                    and cursor.identity == (stat.st_dev, stat.st_ino)
+                    and self.last_reconciled_seq < start
+                    and self._last_reconciled_bytes <= stat.st_size
+                ):
+                    handle.seek(self._last_reconciled_bytes)
+                    tokens = self._last_reconciled_tokens
+                    scanned_end = self.last_reconciled_seq
                 for raw in handle:
                     offset = handle.tell()
                     try:

@@ -1773,6 +1773,36 @@ def test_transcript_state_reads_only_appended_rows(
     assert incremental == _fresh_transcript_state(runner)
 
 
+def test_transcript_chunk_starts_at_reconciled_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, _registry, _project_id, _ = _runner(tmp_path, transcript_count=20)
+    path = runner.session_dir / "conversation.jsonl"
+    _latest, offset, tokens = runner._transcript_state()
+    runner.state.record_success(
+        seq_start=1,
+        seq_end=20,
+        reason="test",
+        end_offset=offset,
+        end_tokens=tokens,
+    )
+    _append_transcript_row(path, 21)
+    runner._transcript_state()
+    parsed = 0
+    real_loads = json.loads
+
+    def counting_loads(value: object, *args: object, **kwargs: object) -> object:
+        nonlocal parsed
+        parsed += 1
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr("zeta.memory.auto.json.loads", counting_loads)
+
+    _rows, _end_offset, _end_tokens, scanned_end = runner._transcript_chunk(21, 21)
+    assert parsed == 1
+    assert scanned_end == 21
+
+
 def test_incremental_transcript_state_equals_full_scan_after_many_appends(
     tmp_path: Path,
 ) -> None:
