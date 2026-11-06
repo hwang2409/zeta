@@ -670,7 +670,10 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     yield
     for registry in reversed(registries):
         if not registry._closed:
-            asyncio.run(registry.close())
+            try:
+                asyncio.run(registry.close())
+            except (AttributeError, RuntimeError):
+                pass
     for store in reversed(stores):
         if not store._closed:
             store.close()
