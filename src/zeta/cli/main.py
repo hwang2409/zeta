@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
@@ -750,6 +751,117 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
+@dataclass(frozen=True, slots=True)
+class _UnsavedDraft:
+    session_id: str
+    text: str
+    attachment_names: tuple[str, ...]
+
+
+def _unsaved_draft(app: object) -> _UnsavedDraft | None:
+    text = app._draft.pending_text
+    if text is None:
+        return None
+    return _UnsavedDraft(
+        session_id=app.loop.store.session_id,
+        text=text,
+        attachment_names=tuple(path.name for path in app._pending_attachments),
+    )
+
+
+def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> None:
+    print("unsaved composer draft:", file=sys.stderr)
+    if draft.session_id != current_session_id:
+        print(f"session: {draft.session_id}", file=sys.stderr)
+    if draft.text:
+        print(draft.text, file=sys.stderr)
+    if draft.attachment_names:
+        print("attachments:", file=sys.stderr)
+        for name in draft.attachment_names:
+            print(f"- {name}", file=sys.stderr)
+
+
+def _retain_active_draft(
+    app: object | None, retained_drafts: list[_UnsavedDraft],
+) -> None:
+    if app is not None and (draft := _unsaved_draft(app)) is not None:
+        retained_drafts.append(draft)
+
+
+def _create_tui_app(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> object | None:
+    try:
+        if args.continue_session or args.resume is not None:
+            print("Loading session…", flush=True)
+            return asyncio.run(asyncio.to_thread(create_app, args))
+        return create_app(args)
+    except SessionError as exc:
+        parser.error(str(exc))
+    except ValueError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return None
+
+
+def _run_tui_lifecycle(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> tuple[int, str | None]:
+    retained_drafts: list[_UnsavedDraft] = []
+    current_session_id = ""
+    restart_session_id: str | None = None
+    exit_status = 0
+    app: object | None = None
+    try:
+        while True:
+            app = _create_tui_app(args, parser)
+            if app is None:
+                exit_status = 1
+                break
+            current_session_id = app.loop.store.session_id
+            run_app = app
+            restart_requested = False
+            restart_cancels_work = False
+            new_session_requested = False
+            try:
+                with patch_stdout(raw=True):
+                    restart_requested, restart_cancels_work = asyncio.run(
+                        _run_tui(run_app, args)
+                    )
+                new_session_requested = run_app.new_session_requested
+                if new_session_requested:
+                    _retain_active_draft(app, retained_drafts)
+                    app = None
+                    args.continue_session = False
+                    args.resume = None
+            except TerminalRenderError as exc:
+                print(f"zeta: {exc}", file=sys.stderr)
+                _print_exit_hint(app)
+                exit_status = 1
+                break
+            finally:
+                _cleanup_ephemeral(run_app)
+            if new_session_requested:
+                continue
+            if restart_requested:
+                if restart_cancels_work:
+                    print(
+                        "restart · running children or background tasks will be cancelled",
+                        file=sys.stderr,
+                    )
+                restart_session_id = current_session_id
+                break
+            _print_exit_hint(app)
+            break
+    finally:
+        _retain_active_draft(app, retained_drafts)
+        for retained_draft in retained_drafts:
+            _print_unsaved_draft(
+                retained_draft,
+                current_session_id=current_session_id,
+            )
+    return exit_status, restart_session_id
+
+
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
     """Replace the original session selector while preserving all other flags."""
 
@@ -954,44 +1066,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    while True:
-        try:
-            if args.continue_session or args.resume is not None:
-                print("Loading session…", flush=True)
-                app = asyncio.run(asyncio.to_thread(create_app, args))
-            else:
-                app = create_app(args)
-        except SessionError as exc:
-            parser.error(str(exc))
-        except ValueError as exc:
-            print(f"zeta: {exc}", file=sys.stderr)
-            return 1
-        restart_requested = False
-        restart_cancels_work = False
-        try:
-            with patch_stdout(raw=True):
-                restart_requested, restart_cancels_work = asyncio.run(
-                    _run_tui(app, args)
-                )
-            if app.new_session_requested:
-                args.continue_session = False
-                args.resume = None
-                continue
-        except TerminalRenderError as exc:
-            print(f"zeta: {exc}", file=sys.stderr)
-            _print_exit_hint(app)
-            return 1
-        finally:
-            _cleanup_ephemeral(app)
-        if restart_requested:
-            if restart_cancels_work:
-                print(
-                    "restart · running children or background tasks will be cancelled",
-                    file=sys.stderr,
-                )
-            return _exec_restart(entrypoint, original_argv, app.loop.store.session_id)
-        _print_exit_hint(app)
-        return 0
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    if restart_session_id is not None:
+        return _exec_restart(entrypoint, original_argv, restart_session_id)
+    return exit_status
 
 
 __all__ = ["build_parser", "main"]
