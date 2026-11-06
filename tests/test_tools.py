@@ -1159,7 +1159,7 @@ async def test_file_tools_leave_target_descriptor_owned_by_open_target(
         ):
             result = await registry.execute(call)
             assert not result["isError"], result
-        assert observed == ["wb", "rb", "r+b"]
+        assert observed == ["wb", "rb", "rb", "wb", "rb"]
         assert (tmp_path / "note.txt").read_text() == "after"
     finally:
         await registry.close()

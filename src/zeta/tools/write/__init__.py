@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from typing import NotRequired, TypedDict
 
 from ...core.approval import ApprovedPathAbsent, ApprovedPathExecution
 from ...protocol.types import StructuredToolResult
+from .._atomic_replace import atomic_replace
 from .._shared.sandbox import _path_from_fd as _sandbox_path_from_fd
 from .._shared.sandbox import open_target
 from ..registry import (
@@ -40,12 +42,17 @@ def _path_from_fd(file_descriptor: int) -> str:
 def _write_target(
     registry: ToolRegistry,
     raw_path: str,
-    content: bytes,
+    content: str,
     *,
     create_parents: bool,
     was_created: bool,
     execution_context: ToolExecutionContext,
-) -> str:
+) -> tuple[str, bytes, str]:
+    try:
+        encoded_content = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("content must be valid UTF-8") from exc
+
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if was_created:
         flags |= os.O_CREAT | os.O_EXCL
@@ -58,14 +65,8 @@ def _write_target(
         execution_context=execution_context,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
-        if not was_created:
-            os.ftruncate(file_descriptor, 0)
-        try:
-            with os.fdopen(file_descriptor, "wb", closefd=False) as handle:
-                handle.write(content)
-        except OSError as exc:
-            raise ValueError(f"could not write file: {path}: {exc}") from exc
-    return path
+        atomic_replace(file_descriptor, path, encoded_content)
+    return path, encoded_content, hashlib.sha256(encoded_content).hexdigest()
 
 
 async def _write(
@@ -75,38 +76,36 @@ async def _write(
     *,
     execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
-    try:
-        encoded_content = arguments["content"].encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError("content must be valid UTF-8") from exc
-
     approved = execution_context.approved_execution
     if isinstance(approved, ApprovedPathExecution):
         was_created = isinstance(approved.target_state, ApprovedPathAbsent)
-        path = _write_target(
+        path, encoded_content, digest = await asyncio.to_thread(
+            _write_target,
             registry,
             arguments["path"],
-            encoded_content,
+            arguments["content"],
             create_parents=arguments.get("create_parents", False),
             was_created=was_created,
             execution_context=execution_context,
         )
     else:
         try:
-            path = _write_target(
+            path, encoded_content, digest = await asyncio.to_thread(
+                _write_target,
                 registry,
                 arguments["path"],
-                encoded_content,
+                arguments["content"],
                 create_parents=arguments.get("create_parents", False),
                 was_created=True,
                 execution_context=execution_context,
             )
             was_created = True
         except FileExistsError:
-            path = _write_target(
+            path, encoded_content, digest = await asyncio.to_thread(
+                _write_target,
                 registry,
                 arguments["path"],
-                encoded_content,
+                arguments["content"],
                 create_parents=arguments.get("create_parents", False),
                 was_created=False,
                 execution_context=execution_context,
@@ -116,7 +115,7 @@ async def _write(
     structured_content: WriteStructuredContent = {
         "path": path,
         "bytes_written": len(encoded_content),
-        "sha256": hashlib.sha256(encoded_content).hexdigest(),
+        "sha256": digest,
         "was_created": was_created,
         "was_overwritten": not was_created,
     }
