@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import threading
@@ -37,6 +38,42 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
+
+
+def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
+    try:
+        state = json.loads((path / "session_state.json").read_bytes())
+    except (OSError, ValueError):
+        state = {}
+    if type(state) is not dict:
+        return {}
+    children = state.get("agent_children")
+    if not isinstance(children, dict):
+        return {}
+    return {
+        Path(child_path): marker
+        for marker in children.values()
+        if isinstance(marker, dict)
+        and isinstance(child_path := marker.get("child_session_path"), str)
+    }
+
+
+def candidate_paths(
+    signature: tuple[object, ...],
+    previous_signature: tuple[object, ...] | None,
+    fallback: dict[Path, dict[str, Any]],
+    known: set[Path],
+    force: bool,
+) -> set[Path] | None:
+    scan_all = force or previous_signature is None
+    if not scan_all:
+        previous_registration = previous_signature[2]
+        current_registration = signature[2]
+        scan_all = (
+            current_registration[0] == previous_registration[0]
+            and current_registration[1] != previous_registration[1]
+        )
+    return None if scan_all else known | set(fallback)
 
 
 def agent_path_signature(path: Path) -> tuple[int, int, int] | None:

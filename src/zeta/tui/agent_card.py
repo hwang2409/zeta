@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 from collections import deque
@@ -47,6 +46,8 @@ from .cards.agent_sync import (
     agent_child_paths,
     agent_path_signature,
     agent_tree_signature,
+    candidate_paths,
+    registered_child_markers,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -142,24 +143,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (ConversationIntegrityError, OSError):
         return {}
     return value if type(value) is dict else {}
-
-
-def _registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
-    try:
-        state = json.loads((path / "session_state.json").read_bytes())
-    except (OSError, ValueError):
-        state = {}
-    if type(state) is not dict:
-        state = {}
-    children = state.get("agent_children")
-    if not isinstance(children, dict):
-        return {}
-    return {
-        Path(child_path): marker
-        for marker in children.values()
-        if isinstance(marker, dict)
-        and isinstance(child_path := marker.get("child_session_path"), str)
-    }
 
 
 def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -990,23 +973,6 @@ class AgentNavigation:
         )
         self._schedule_refresh(delay)
 
-    def _candidate_paths(
-        self,
-        signature: tuple[object, ...],
-        fallback: dict[Path, dict[str, Any]],
-        known: set[Path],
-        force: bool,
-    ) -> set[Path] | None:
-        scan_all = force or self._refresh_signature is None
-        if not scan_all:
-            previous_registration = self._refresh_signature[2]
-            current_registration = signature[2]
-            scan_all = (
-                current_registration[0] == previous_registration[0]
-                and current_registration[1] != previous_registration[1]
-            )
-        return None if scan_all else known | set(fallback)
-
     def refresh(self, *, force: bool = False) -> bool:
         """Refresh at most once per second unless fresh state is required."""
 
@@ -1033,13 +999,15 @@ class AgentNavigation:
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
-        fallback = _registered_child_markers(self.current_path)
+        fallback = registered_child_markers(self.current_path)
         known = {
             entry.path
             for entry in self.entries
             if entry.path.parent == self.current_path / "agents"
         }
-        candidates = self._candidate_paths(signature, fallback, known, force)
+        candidates = candidate_paths(
+            signature, self._refresh_signature, fallback, known, force
+        )
         children = self._children(self.current_path, fallback, candidates=candidates)
         at_root = self.current_path == self.root_path
         main_entry = (
