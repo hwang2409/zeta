@@ -794,6 +794,35 @@ async def test_failed_store_close_is_retained_for_retry(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unobserved_failed_store_close_is_not_retried(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    original_close = store.close
+    attempts = 0
+
+    def flaky_close() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("close failed")
+        original_close()
+
+    store.close = flaky_close  # type: ignore[method-assign]
+    owner.track_store(store)
+    owner.mark_store_finished(store)
+    owner.release_unused_stores()
+    (task,) = tuple(owner._store_close_tasks)
+    await asyncio.wait({task})
+
+    # a later child completion releases stores before anyone observed the failure
+    owner.release_unused_stores()
+    assert attempts == 1
+    with pytest.raises(OSError, match="close failed"):
+        await owner.wait_for_store_closes()
+    assert store in owner._stores
+
+
+@pytest.mark.asyncio
 async def test_wait_for_store_closes_does_not_spin_before_done_callback(
     tmp_path: Path,
 ) -> None:

@@ -98,6 +98,7 @@ class BackgroundAgentOwner:
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
+        self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -273,10 +274,11 @@ class BackgroundAgentOwner:
                 None,
             )
             if existing is not None:
-                if not existing.done():
+                # Retry only a failure that wait_for_store_closes already raised;
+                # an unobserved failure must still reach its waiter.
+                if existing not in self._observed_close_failures:
                     continue
-                # wait_for_store_closes observed this failed task. A later
-                # release call is the explicit retry of the failed close.
+                self._observed_close_failures.discard(existing)
                 self._store_close_tasks.discard(existing)
                 self._store_close_stores.pop(existing, None)
             close_task = asyncio.create_task(
@@ -378,7 +380,15 @@ class BackgroundAgentOwner:
 
         while self._store_close_tasks:
             close_tasks = tuple(self._store_close_tasks)
-            await asyncio.gather(*close_tasks, return_exceptions=False)
+            try:
+                await asyncio.gather(*close_tasks, return_exceptions=False)
+            except Exception:
+                self._observed_close_failures.update(
+                    task
+                    for task in close_tasks
+                    if task.done() and not task.cancelled() and task.exception() is not None
+                )
+                raise
             for task in close_tasks:
                 store = self._store_close_stores.pop(task, None)
                 self._store_close_tasks.discard(task)
