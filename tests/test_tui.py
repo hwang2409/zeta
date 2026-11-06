@@ -11732,8 +11732,7 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
 
     monkeypatch.setattr(persistence_module, "write_session_json", write)
     persistence.schedule("new draft")
-    with pytest.raises(OSError, match="disk full"):
-        await persistence.flush_pending()
+    await persistence.flush_pending()
     assert persistence.load() == "old draft"
     assert persistence._pending_text == "new draft"
 
@@ -11985,6 +11984,7 @@ async def test_draft_write_failure_is_reported_once_without_raising(
     await persistence.flush_pending()
 
     assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
+    assert persistence._pending_text == "second"
 
 
 

@@ -38,6 +38,10 @@ class _OrderedFileWriter:
     def __init__(self, label: str, failure_sink: Callable[[str], None] | None = None) -> None:
         self._label = label
         self._failure_sink = failure_sink
+        try:
+            self._notice_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._notice_loop = None
         self._queue: queue.Queue[_FileAction] = queue.Queue()
         self._lock = threading.Lock()
         self._completed = threading.Condition(self._lock)
@@ -46,7 +50,6 @@ class _OrderedFileWriter:
         self._applied = 0
         self._accepting = True
         self._waiters: list[tuple[int, asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
-        self._outcomes: dict[int, BaseException | None] = {}
         self._reported_failure = False
 
     def submit(
@@ -106,41 +109,30 @@ class _OrderedFileWriter:
         except Exception as exc:  # noqa: BLE001 - completion must not stop the writer
             failure = exc
             self._report_failure(exc)
-        self._mark_applied(item.watermark, failure)
+        self._mark_applied(item.watermark)
 
-    def _mark_applied(self, watermark: int, failure: BaseException | None) -> None:
+    def _mark_applied(self, watermark: int) -> None:
         with self._completed:
-            self._outcomes[watermark] = failure
             self._applied = max(self._applied, watermark)
             ready = [waiter for waiter in self._waiters if waiter[0] <= self._applied]
             self._waiters = [waiter for waiter in self._waiters if waiter[0] > self._applied]
             self._completed.notify_all()
-        for target, loop, future in ready:
+        for _, loop, future in ready:
             try:
-                loop.call_soon_threadsafe(
-                    self._finish_waiter, future, self._outcomes.get(target),
-                )
+                loop.call_soon_threadsafe(self._finish_waiter, future)
             except RuntimeError:
                 pass
 
     @staticmethod
-    def _finish_waiter(
-        future: asyncio.Future[None], failure: BaseException | None,
-    ) -> None:
+    def _finish_waiter(future: asyncio.Future[None]) -> None:
         if not future.done():
-            if failure is None:
-                future.set_result(None)
-            else:
-                future.set_exception(failure)
+            future.set_result(None)
 
     async def flush(self, *, timeout: float) -> None:
         loop = asyncio.get_running_loop()
         with self._lock:
             watermark = self._submitted
             if self._applied >= watermark:
-                failure = self._outcomes.get(watermark)
-                if failure is not None:
-                    raise failure
                 return
             future = loop.create_future()
             self._waiters.append((watermark, loop, future))
@@ -170,10 +162,17 @@ class _OrderedFileWriter:
             self._reported_failure = True
         _LOGGER.warning("failed to persist %s: %s", self._label, exc)
         if self._failure_sink is not None:
-            self._failure_sink(
+            notice = (
                 "composer draft was not saved; your text remains unsaved. "
                 "copy it before exiting."
             )
+            if self._notice_loop is None:
+                self._failure_sink(notice)
+            else:
+                try:
+                    self._notice_loop.call_soon_threadsafe(self._failure_sink, notice)
+                except RuntimeError:
+                    pass
 
 
 class DraftPersistence:
