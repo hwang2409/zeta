@@ -533,14 +533,14 @@ class ServerRuntime:
         if state is not None:
             close_task = asyncio.create_task(self._close_state(state))
             try:
-                try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    await close_task
-                    raise
-            finally:
-                if close_task.done() and self._state is state:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                await close_task
+                if self._state is state:
                     self._state = None
+                raise
+            if self._state is state:
+                self._state = None
         if self._setup_reapers:
             pending = asyncio.gather(*self._setup_reapers)
             try:
@@ -566,7 +566,8 @@ class ServerRuntime:
                 await state.loop.ensure_mcp_servers()
                 state.loop.require_allowed_tools()
         except BaseException:
-            self._state = None
+            if self._state is state:
+                self._state = None
             await self._close_state(state)
             raise
 

@@ -7,13 +7,147 @@ import os
 import shlex
 import signal
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from zeta.tools._shared import background_spawn
 from zeta.tools._shared import process as process_module
-from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+from zeta.tools._shared.process import (
+    BackgroundTaskNotice,
+    BackgroundTaskRegistry,
+    _group_exists,
+)
+
+
+@pytest.mark.asyncio
+async def test_start_notice_follows_off_loop_durable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    registry = BackgroundTaskRegistry(
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    observations: list[bool] = []
+    writer_threads: list[int] = []
+    original_persist = registry._persist
+
+    def gated_persist(rows) -> None:
+        writer_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(10)
+
+    def observe_before_commit() -> None:
+        assert entered.wait(10)
+        observations.append(notices == [])
+        release.set()
+
+    monkeypatch.setattr(registry, "_persist", gated_persist)
+    observer = threading.Thread(target=observe_before_commit)
+    observer.start()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    observer.join()
+
+    assert observations == [True]
+    assert writer_threads != [threading.get_ident()]
+    assert [notice.phase for notice in notices] == ["started"]
+    monkeypatch.setattr(registry, "_persist", original_persist)
+    await registry.kill(task_id)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_start_persistence_failure_reaps_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    registry = BackgroundTaskRegistry(
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+    )
+    spawned_pid: int | None = None
+    original_spawn = process_module.spawn_background
+
+    async def capture_spawn(*args, **kwargs):
+        nonlocal spawned_pid
+        process = await original_spawn(*args, **kwargs)
+        spawned_pid = process.pid
+        return process
+
+    monkeypatch.setattr(process_module, "spawn_background", capture_spawn)
+    original_persist = registry._persist
+    monkeypatch.setattr(
+        registry, "_persist", lambda rows: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        await registry.start("sleep 30", tmp_path)
+
+    assert spawned_pid is not None
+    assert not _group_exists(spawned_pid)
+    assert registry.running_count == 0
+    assert registry.records == ()
+    assert notices == []
+    monkeypatch.setattr(registry, "_persist", original_persist)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_notice_follows_durable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    registry = BackgroundTaskRegistry(
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+    )
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    notices.clear()
+    original_persist = registry._persist
+    monkeypatch.setattr(
+        registry, "_persist", lambda rows: (_ for _ in ()).throw(OSError("disk full"))
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        await registry.kill(task_id)
+
+    assert not registry.snapshot()[0].running
+    assert notices == []
+    monkeypatch.setattr(registry, "_persist", original_persist)
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_registry_close_can_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = BackgroundTaskRegistry()
+    directory_fd = registry._directory_fd
+    assert directory_fd is not None
+    original_persist = registry._persist
+    attempts = 0
+
+    def flaky_persist(rows) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("close failed")
+        original_persist(rows)
+
+    monkeypatch.setattr(registry, "_persist", flaky_persist)
+
+    with pytest.raises(OSError, match="close failed"):
+        await registry.close()
+    assert registry._closing
+    assert not registry._closed
+    os.fstat(directory_fd)
+
+    assert await registry.close() == ()
+    assert attempts == 2
+    with pytest.raises(OSError):
+        os.fstat(directory_fd)
 
 
 @pytest.mark.parametrize("interruption", [None, "spawn", "cleanup", "cleanup_failure"])
