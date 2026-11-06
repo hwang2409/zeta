@@ -617,8 +617,6 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
     from zeta.storage_format import advance, open_writer
 
     leases = {}
-    stores = []
-    managers = []
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
 
@@ -644,26 +642,16 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        stores.append(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
         home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
         ensure(home)
         manager_init(manager, *args, **kwargs)
-        managers.append(manager)
 
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     yield
-    for store in reversed(stores):
-        if not store._closed:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for manager in reversed(managers):
-        manager._release_storage_lease()
     for lease in leases.values():
         lease.close()
 
