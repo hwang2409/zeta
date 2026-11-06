@@ -41,6 +41,10 @@ async def owned_tool_registries(monkeypatch: pytest.MonkeyPatch):
         await registry.close()
 
 
+async def _tick_heartbeat(progressed: threading.Event) -> None:
+    progressed.set()
+
+
 def _release_gate_after_loop_progress(
     loop: asyncio.AbstractEventLoop,
     entered: threading.Event,
@@ -50,7 +54,7 @@ def _release_gate_after_loop_progress(
     *required: threading.Event,
 ) -> None:
     assert entered.wait(timeout=5)
-    loop.call_soon_threadsafe(progressed.set)
+    asyncio.run_coroutine_threadsafe(_tick_heartbeat(progressed), loop)
     all_progressed = progressed.wait(timeout=5)
     for event in required:
         all_progressed = event.wait(timeout=5) and all_progressed
