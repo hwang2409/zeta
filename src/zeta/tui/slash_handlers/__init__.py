@@ -286,7 +286,7 @@ class SlashHandlerMixin:
 
         async def refresh() -> None:
             try:
-                await asyncio.to_thread(
+                refreshed = await asyncio.to_thread(
                     lambda: asyncio.run(
                         AccountUsage(self.loop.account_context.store).refresh_stale()
                     )
@@ -306,6 +306,7 @@ class SlashHandlerMixin:
                 self.loop.account_context.store.list_display
             )
             current.usages = {item.account: item.usage for item in displays}
+            current.usages.update(refreshed)
             self._repaint_accounts_picker()
 
         asyncio.create_task(refresh())
