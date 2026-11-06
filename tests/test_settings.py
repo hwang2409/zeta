@@ -50,6 +50,35 @@ def test_missing_files_are_silent(tmp_path: Path) -> None:
     assert loaded.notices == ()
 
 
+def test_project_settings_can_only_lower_limits(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(
+        home,
+        """
+        [mcp]
+        call_deadline_seconds = 600
+        max_wire_bytes = 134217728
+        spill_after_bytes = 524288
+        """,
+    )
+    _write(
+        project,
+        """
+        [mcp]
+        call_deadline_seconds = 900
+        max_wire_bytes = 268435456
+        spill_after_bytes = 1048576
+        """,
+    )
+
+    settings = load_settings(home=home, project_dir=project).settings
+
+    assert getattr(settings, "mcp_call_deadline_seconds", None) == 600
+    assert getattr(settings, "mcp_max_wire_bytes", None) == 134217728
+    assert getattr(settings, "mcp_spill_after_bytes", None) == 524288
+
+
 def test_global_and_project_merge_with_project_wins(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"

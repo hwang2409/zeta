@@ -29,7 +29,7 @@ from .resources import (
 )
 
 MCP_USAGE = (
-    "mcp usage: /mcp | /mcp reconnect <server> | /mcp add <name> --stdio <cmd...> "
+    "mcp usage: /mcp [status] | /mcp reconnect <server> | /mcp add <name> --stdio <cmd...> "
     "| /mcp add <name> --http <url> [--oauth] "
     "| /mcp remove <name> | /mcp auth <server> "
     "| /mcp resources <server> [<uri>]"

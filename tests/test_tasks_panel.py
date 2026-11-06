@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit.document import Document
+from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.text import Text
 
@@ -18,6 +19,7 @@ from zeta.skills import SkillCatalog
 from zeta.tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
 from zeta.tui import theme
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.shared import wrap_by_cells
 from zeta.tui.cards.tasks_panel import (
     MAX_OUTPUT_LINES,
     BackgroundTasksPanel,
@@ -70,6 +72,104 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
 
 
 # -- pure view model --------------------------------------------------------
+
+
+def _base_decisions_wrap(text: str, width: int) -> list[str]:
+    """Reference oracle copied from decisions.py at base 6a4b690d."""
+
+    width = max(1, width)
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [""]:
+        current = ""
+        for word in paragraph.split() or [""]:
+            piece = word if not current else f"{current} {word}"
+            if sum(max(0, get_cwidth(ch)) for ch in piece) <= width:
+                current = piece
+            else:
+                if current:
+                    lines.append(current)
+                while sum(max(0, get_cwidth(ch)) for ch in word) > width:
+                    split = 0
+                    cells = 0
+                    for index, character in enumerate(word):
+                        step = max(0, get_cwidth(character))
+                        if cells + step > width:
+                            break
+                        cells += step
+                        split = index + 1
+                    if split == 0:
+                        split = 1
+                    lines.append(word[:split])
+                    word = word[split:]
+                current = word
+        lines.append(current)
+    return lines or [""]
+
+
+def _base_tasks_split_cells(text: str, width: int) -> tuple[str, str]:
+    cells = 0
+    for index, ch in enumerate(text):
+        step = max(0, get_cwidth(ch))
+        if cells + step > width:
+            return text[:index], text[index:]
+        cells += step
+    return text, ""
+
+
+def _base_tasks_wrap(text: str, width: int) -> list[str]:
+    """Reference oracle copied from tasks_panel.py at base 6a4b690d."""
+
+    width = max(1, width)
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        current = ""
+        cells = 0
+        for word in paragraph.split(" "):
+            piece = word if not current else " " + word
+            piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            if current and cells + piece_cells > width:
+                lines.append(current)
+                current, cells = "", 0
+                piece = word
+                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            while piece_cells > width:
+                head, piece = _base_tasks_split_cells(piece, width)
+                lines.append((current + head) if current else head)
+                current, cells = "", 0
+                piece_cells = sum(max(0, get_cwidth(ch)) for ch in piece)
+            current += piece
+            cells += piece_cells
+        lines.append(current)
+    return lines or [""]
+
+
+_WRAP_CASES = [
+    pytest.param("a  b", 4, id="repeated-spaces"),
+    pytest.param("a ", 4, id="trailing-space"),
+    pytest.param("a\n", 4, id="one-trailing-newline"),
+    pytest.param("a\n\n", 4, id="two-trailing-newlines"),
+    pytest.param("", 1, id="empty"),
+    pytest.param("abc", 1, id="width-one"),
+    pytest.param("abc", 2, id="width-two"),
+    pytest.param("ab", 2, id="exact-width"),
+    pytest.param("你a好", 3, id="mixed-cjk-ascii"),
+    pytest.param("你", 1, id="cjk-wider-than-width"),
+    pytest.param("abcdefgh", 3, id="long-ascii-token"),
+]
+
+
+@pytest.mark.parametrize(("text", "width"), _WRAP_CASES)
+def test_wrap_by_cells_matches_base_decisions(text: str, width: int) -> None:
+    assert wrap_by_cells(text, width) == _base_decisions_wrap(text, width)
+
+
+@pytest.mark.parametrize(("text", "_width"), _WRAP_CASES)
+def test_normalized_tasks_wrap_matches_base(text: str, _width: int) -> None:
+    normalized = " ".join(text.split())
+    detail_width = 66
+    assert wrap_by_cells(normalized, detail_width) == _base_tasks_wrap(
+        normalized, detail_width
+    )
 
 
 def test_format_runtime_is_compact() -> None:
