@@ -80,7 +80,11 @@ from .layout import (
     full_screen_content,
     status_toolbar,
 )
-from .loop_errors import run_prompt_toolkit
+from .loop_errors import (
+    cancel_activation,
+    run_prompt_toolkit,
+    start_prompt_during_activation,
+)
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
@@ -235,6 +239,7 @@ class TUIApp(
         self._init_fork_runtime()
         self._resumed_session = resumed
         self._startup_replay_active = False
+        self._startup_submissions: list[tuple[str, bool]] = []
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -661,6 +666,9 @@ class TUIApp(
             self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
+        if self._startup_replay_active and self._input_loop_active:
+            self._startup_submissions.append((value, internal))
+            return True
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
@@ -1098,27 +1106,6 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
-    async def _prepare_prompt(self, *, resume_ui: bool) -> bool:
-        if resume_ui:
-            replay_completed = True
-        else:
-            try:
-                replay_completed = await self._rebuild_transcript_async()
-            except BaseException:
-                self._finish_startup_replay(completed=False)
-                raise
-            self._finish_startup_replay(completed=replay_completed is not False)
-        if replay_completed is False or self._exit_requested:
-            return False
-        await self.loop.ensure_mcp_servers()
-        if not self._startup_presented:
-            self._present_startup_output()
-            self._startup_presented = True
-        self._present_pending_approvals()
-        self.start_decisions_poll()
-        self._invalidate_prompt()
-        return True
-
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1142,15 +1129,16 @@ class TUIApp(
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
-            await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)
-            prompt_task: asyncio.Task[object] | None = None
-            if isinstance(session, FullScreenPromptSession):
-                self._install_full_screen_layout(session)
-                prompt_task = asyncio.create_task(run_prompt_toolkit(session, self))
+            activation_task, prompt_task, exited = (
+                await start_prompt_during_activation(self, session, run_prompt_toolkit)
+            )
             try:
+                if exited:
+                    return self._run_result
+                await activation_task
                 startup_task = asyncio.create_task(self._prepare_prompt(resume_ui=resume_ui))
                 try:
                     if prompt_task is not None:
@@ -1184,6 +1172,10 @@ class TUIApp(
                 return self._run_result
             finally:
                 self._input_loop_active = False
+                # Any exit before startup drained its queue keeps accepted input as
+                # the draft; this runs before cleanup detaches the session.
+                self._restore_startup_submissions()
+                await cancel_activation(activation_task)
                 await self._prepare_ui_session_change()
                 if prompt_task is not None:
                     if not prompt_task.done():
@@ -1210,6 +1202,9 @@ class TUIApp(
                         self._active_session = None
                         self._terminal_restored = True
         finally:
+            # Covers failures before the inner cleanup (a prompt crash during
+            # activation); a no-op once the inner cleanup restored the queue.
+            self._restore_startup_submissions()
             if watchdog is not None:
                 await watchdog.close()
             if not self._suspending_for_fork:

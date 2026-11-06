@@ -553,7 +553,15 @@ class AnthropicBackend(CompletionBackend):
             entered = True
             try:
                 if response.status_code >= 400:
-                    raise await build_response_error(response, _http_error)
+                    raise await build_response_error(
+                        response,
+                        _http_error,
+                        stall_seconds=self.stall_seconds,
+                        on_stall=lambda elapsed: AnthropicStreamError(
+                            f"Anthropic error body stalled for {elapsed:.0f}s",
+                            is_stall=True,
+                        ),
+                    )
                 async for event in _decode_response(
                     response,
                     diagnostics_path=self.diagnostics_path,

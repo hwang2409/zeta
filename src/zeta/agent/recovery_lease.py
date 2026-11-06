@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -119,9 +120,17 @@ async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
         raise
 
 
+def _has_recovery_work(loop: AgentLoopForRecovery) -> bool:
+    return bool(loop.store.agent_children()) or any(
+        entry.data.get("kind") == "child_question"
+        for entry in loop.store.agent_notifications()
+    )
+
+
 async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
     if not loop._children_recovered:
-        await recover_agent_children_off_loop(loop)
+        if _has_recovery_work(loop):
+            await recover_agent_children_off_loop(loop)
         loop._children_recovered = True
     if loop._pending_child_recovery:
         await publish_recovered_children(loop)
@@ -133,28 +142,41 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     root = loop.store
     notification = loop._background_owner.notification_store
 
+    stop_recovery = threading.Event()
+
     def recover() -> tuple[NotificationInput, ...]:
-        from .background import recover_agent_children
+        from .background import _recover_agent_children
 
         with ConversationStore(
             root.root_dir, session_id=root.session_id, cwd=root.cwd
         ) as worker_root:
             if notification is root:
-                return recover_agent_children(
-                    _DetachedRecoveryLoop(loop, worker_root, worker_root)
+                return _recover_agent_children(
+                    _DetachedRecoveryLoop(loop, worker_root, worker_root),
+                    should_stop=stop_recovery.is_set,
                 )
             with ConversationStore(
                 notification.root_dir,
                 session_id=notification.session_id,
                 cwd=notification.cwd,
             ) as worker_notification:
-                return recover_agent_children(
-                    _DetachedRecoveryLoop(loop, worker_root, worker_notification)
+                return _recover_agent_children(
+                    _DetachedRecoveryLoop(loop, worker_root, worker_notification),
+                    should_stop=stop_recovery.is_set,
                 )
 
-    deliveries = await root._to_thread_store(recover)
-    for item in deliveries:
-        await loop._background_owner.conversation_channel.produce_to(None, item)
-    await root._refresh_off_loop()
-    if notification is not root:
-        await notification._refresh_off_loop()
+    async def complete_recovery() -> None:
+        deliveries = await root._to_thread_store(recover)
+        for item in deliveries:
+            await loop._background_owner.conversation_channel.produce_to(None, item)
+        await root._refresh_off_loop()
+        if notification is not root:
+            await notification._refresh_off_loop()
+
+    recovery = asyncio.create_task(complete_recovery())
+    try:
+        await asyncio.shield(recovery)
+    except asyncio.CancelledError:
+        stop_recovery.set()
+        await recovery
+        raise

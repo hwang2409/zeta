@@ -137,7 +137,7 @@ class DeliveryRequests:
         if control.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         ergonomics.require_mutable(runtime, control.has_pending_approvals())
-        message = ergonomics.image_message(runtime, params)
+        message = await asyncio.to_thread(ergonomics.image_message, runtime, params)
         text = params.get("text", "")
         assert isinstance(text, str)
         attachments = ergonomics.attachment_summary(message)
