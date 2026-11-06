@@ -750,6 +750,12 @@ def _print_exit_hint(app: object) -> None:
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
 
 
+def _print_unsaved_draft(app: object) -> None:
+    if app._draft.pending_text:
+        print("unsaved composer draft:", file=sys.stderr)
+        print(app._draft.pending_text, file=sys.stderr)
+
+
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
     """Replace the original session selector while preserving all other flags."""
 
@@ -990,6 +996,7 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             return _exec_restart(entrypoint, original_argv, app.loop.store.session_id)
+        _print_unsaved_draft(app)
         _print_exit_hint(app)
         return 0
 

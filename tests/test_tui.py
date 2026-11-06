@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -52,6 +52,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 import zeta.accounts.session as account_session_module
+import zeta.cli.main as cli_main_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.credentials import (
@@ -11860,8 +11861,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
     while not started.is_set():
         await asyncio.sleep(0.001)
 
-    with pytest.raises(TimeoutError):
-        await app.close()
+    await app.close()
     reused_fds: list[int] = []
     try:
         for _ in range(64):
@@ -11883,7 +11883,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
 
 
 @pytest.mark.asyncio
-async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
+async def test_dup_failure_is_reported_not_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
@@ -11905,7 +11905,10 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
     try:
         persistence.schedule("first")
         await asyncio.sleep(0)
-        await persistence.flush_pending()
+        with pytest.raises(OSError, match="Too many open files"):
+            await persistence.flush_pending()
+        assert DraftPersistence(tmp_path / "draft").load() == ""
+        assert persistence.pending_text == "first"
         fail_dup = False
         await persistence.flush_pending()
     finally:
@@ -11917,6 +11920,90 @@ async def test_draft_flush_dup_emfile_warns_once_without_loop_exception(
         "failed to persist composer draft: [Errno 24] Too many open files"
     ) == 1
     assert DraftPersistence(tmp_path / "draft").load() == "first"
+
+
+def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        ),
+        provider="codex",
+        model="offline",
+    )
+    errors: list[BaseException] = []
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(_app: object, _args: object) -> tuple[bool, bool]:
+        app._draft.schedule("copy this unsaved draft")
+        try:
+            await app.close()
+        except BaseException as exc:  # noqa: BLE001 - behavior probe
+            errors.append(exc)
+        return False, False
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    stderr = capsys.readouterr().err
+    assert errors == [], "normal exit leaked the draft persistence error"
+    assert "unsaved composer draft:" in stderr
+    assert "copy this unsaved draft" in stderr
+
+
+def test_new_session_continues_after_failed_draft_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apps = [
+        TUIApp(
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / name),
+                skill_catalog=SkillCatalog.empty(),
+                skip_mcp_mount=True,
+            ),
+            provider="codex",
+            model="offline",
+        )
+        for name in ("old", "new")
+    ]
+    created = iter(apps)
+    runs = 0
+    errors: list[BaseException] = []
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "disk full")
+
+    async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
+        nonlocal runs
+        runs += 1
+        if app is apps[0]:
+            app._new_session_requested = True
+            app._draft.schedule("old session draft")
+        try:
+            await app.close()
+        except BaseException as exc:  # noqa: BLE001 - behavior probe
+            errors.append(exc)
+        return False, False
+
+    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    monkeypatch.setattr(cli_main_module, "create_app", lambda _args: next(created))
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+
+    assert cli_main_module.main([]) == 0
+    assert errors == [], "new-session transition leaked the draft persistence error"
+    assert runs == 2
+    assert apps[0]._draft.pending_text == "old session draft"
 
 
 @pytest.mark.asyncio
@@ -12096,8 +12183,7 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
 
     monkeypatch.setattr(persistence_module, "write_session_json", fail)
     app._draft.schedule("must not disappear")
-    with pytest.raises(OSError, match="disk unavailable"):
-        await app.close()
+    await app.close()
     await asyncio.sleep(0)
 
     rendered = Text.from_ansi("".join(app._transcript_lines)).plain
