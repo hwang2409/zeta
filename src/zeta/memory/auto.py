@@ -15,6 +15,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..context_eviction import estimated_text_tokens
+from ..core.checkpoints import (
+    CONVERSATION_ENTRY_TYPES,
+    ConversationIntegrityError,
+    load_session_json,
+)
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -62,13 +67,19 @@ _MAX_FAILURE_LOG_BYTES = 64 * 1024
 
 
 def _failure_summary(error: Exception) -> str:
-    if isinstance(error, (ReconciliationError, UnsupportedMemoryFormatError)):
+    if isinstance(
+        error, (ReconciliationError, UnsupportedMemoryFormatError, _TranscriptScanError)
+    ):
         return str(error)
     return type(error).__name__
 
 
 class _ConcurrentMemoryUpdate(Exception):
     """Signal that a pending range must remain queued for a later retry."""
+
+
+class _TranscriptScanError(ValueError):
+    """A completed transcript row is not safe evidence for memory."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +201,8 @@ class AutoMemoryReconciler:
         self._resume_catch_up = False
         self._retry_attempts_in_cycle: dict[str, int] = {}
         self._transcript_cursor: _TranscriptCursor | None = None
+        self._transcript_scan_error: str | None = None
+        self._reported_transcript_scan_error: str | None = None
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -341,6 +354,28 @@ class AutoMemoryReconciler:
             )
         self._pending.sort(key=lambda item: item.start)
 
+    async def _scan_state(self) -> tuple[int, int, int]:
+        result = await asyncio.to_thread(self._transcript_state)
+        if (
+            self._transcript_scan_error is not None
+            and self._transcript_scan_error != self._reported_transcript_scan_error
+        ):
+            self._reported_transcript_scan_error = self._transcript_scan_error
+            failure = await asyncio.to_thread(
+                self.state.record_failure,
+                seq_start=self.last_reconciled_seq + 1,
+                seq_end=self.last_reconciled_seq + 1,
+                validation_summary=self._transcript_scan_error,
+                reason="transcript-scan",
+                usage={},
+                retry_backoff_seconds=self.config.retry_backoff_seconds,
+                now=self._retry_clock(),
+                occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            await asyncio.to_thread(self._append_failure_log, failure)
+            self._publish_failure_notice()
+        return result
+
     async def _worker(self) -> None:
         while True:
             if self._closing:
@@ -362,16 +397,14 @@ class AutoMemoryReconciler:
                 self._early_window_started_at = None
             if self._resume_catch_up:
                 self._resume_catch_up = False
-                latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                latest_seq, _, _ = await self._scan_state()
                 if latest_seq > self.last_reconciled_seq:
                     self._add_pending(
                         self.last_reconciled_seq + 1, latest_seq, "resume"
                     )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
-                latest_seq, _transcript_bytes, transcript_tokens = await asyncio.to_thread(
-                    self._transcript_state
-                )
+                latest_seq, _transcript_bytes, transcript_tokens = await self._scan_state()
                 self._seen_activity_generation = generation
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
@@ -480,7 +513,7 @@ class AutoMemoryReconciler:
             except TimeoutError:
                 now = self._clock()
                 if self._idle_deadline is not None and now >= self._idle_deadline:
-                    latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                    latest_seq, _, _ = await self._scan_state()
                     if latest_seq > self.last_reconciled_seq:
                         self._add_pending(
                             self.last_reconciled_seq + 1, latest_seq, "idle"
@@ -498,6 +531,9 @@ class AutoMemoryReconciler:
             rows, end_offset, end_tokens, scanned_end = await asyncio.to_thread(
                 self._transcript_chunk, cursor, item.end
             )
+            if self._transcript_scan_error is not None:
+                self._reported_transcript_scan_error = self._transcript_scan_error
+                raise _TranscriptScanError(self._transcript_scan_error)
             if not rows:
                 if scanned_end < cursor:
                     break
@@ -921,6 +957,23 @@ class AutoMemoryReconciler:
         current = cls._transcript_evidence(handle, identity, stat.st_size, evidence.offset)
         return current.identity == evidence.identity and current.prefix_tail == evidence.prefix_tail
 
+    @staticmethod
+    def _parse_transcript_row(raw: bytes) -> dict[str, object]:
+        try:
+            value = load_session_json(raw)
+        except ConversationIntegrityError as exc:
+            raise _TranscriptScanError("malformed conversation row") from exc
+        if not isinstance(value, dict):
+            raise _TranscriptScanError("conversation row is not an object")
+        entry_type = value.get("type")
+        if entry_type == "header":
+            header = value.get("data")
+            if not isinstance(header, dict) or header.get("schema") != "zeta.conversation.v1":
+                raise _TranscriptScanError("unsupported conversation header")
+        elif entry_type not in CONVERSATION_ENTRY_TYPES:
+            raise _TranscriptScanError("unsupported conversation entry type")
+        return value
+
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
         try:
@@ -941,14 +994,16 @@ class AutoMemoryReconciler:
                     tokens = 0
                     offset = 0
                     handle.seek(0)
+                self._transcript_scan_error = None
                 for raw in handle:
                     if not raw.endswith(b"\n"):
                         break
-                    offset = handle.tell()
                     try:
-                        value = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+                        value = self._parse_transcript_row(raw)
+                    except _TranscriptScanError as exc:
+                        self._transcript_scan_error = str(exc)
+                        break
+                    offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
                     if type(seq) is int:
                         latest = max(latest, seq)
@@ -995,11 +1050,14 @@ class AutoMemoryReconciler:
                 else:
                     handle.seek(0)
                 for raw in handle:
-                    offset = handle.tell()
+                    if not raw.endswith(b"\n"):
+                        break
                     try:
-                        value = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+                        value = self._parse_transcript_row(raw)
+                    except _TranscriptScanError:
+                        self._transcript_scan_error = "malformed conversation row"
+                        break
+                    offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
                     if type(seq) is not int:
                         continue
