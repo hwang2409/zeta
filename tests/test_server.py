@@ -1575,6 +1575,22 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
+        durable_at_turn_aborted = False
+        original_notify = server.control._notify
+
+        async def record_turn_aborted(event, session_id=None, **fields):
+            nonlocal durable_at_turn_aborted
+            if event == "turn_aborted":
+                durable_at_turn_aborted = any(
+                    entry.type == "message"
+                    and (message := Message.from_dict(entry.data["message"])).tool_result
+                    is not None
+                    and message.tool_result.tool_call_id == call.id
+                    for entry in server.runtime.opened.store.replay()
+                )
+            return await original_notify(event, session_id, **fields)
+
+        server.control._notify = record_turn_aborted
         frames = await _request(reader, writer, 4, "abort")
         frames += await _request(reader, writer, 5, "status")
         frames += await _frames_until_event(reader, "turn_aborted")
@@ -1582,6 +1598,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
         assert names.count("approval_end") == 1
         assert names.count("turn_aborted") == 1
         assert names.index("approval_end") < names.index("turn_aborted")
+        assert durable_at_turn_aborted
         ends = _named_events(frames, "approval_end")
         assert ends[0]["request_id"] == approval["request_id"]
     finally:

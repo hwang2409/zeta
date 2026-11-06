@@ -377,7 +377,6 @@ def history_projection(
             "client_delivery",
             "approval_resolution",
             "approval_history",
-            "turn_end",
         }:
             entries[-1].append(entry)
 
@@ -460,12 +459,6 @@ def _history_entry_rows(
             }
         )
         return [{"id": entry.id, "role": "system", "event": "approval_end", **payload}]
-    if entry_type == "turn_end":
-        data = entry.data if isinstance(entry.data, dict) else {}
-        row = {"id": entry.id, "role": "system", "event": "turn_end", "data": {}}
-        if "reason" in data:
-            row["data"] = {"reason": data["reason"]}
-        return [row]
     if entry_type == "notification":
         data = entry.data
         kind = data.get("kind", "agent_completion")
