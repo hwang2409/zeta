@@ -97,6 +97,7 @@ class BackgroundAgentOwner:
         self._stores: list[ConversationStore] = []
         self._pending_stores: set[ConversationStore] = set()
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
+        self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -257,22 +258,33 @@ class BackgroundAgentOwner:
         that descendant's own completion.
         """
 
-        retained: list[ConversationStore] = []
         referenced = set(self._parent_stores.values())
         for stores in self._active_stores.values():
             referenced.update(stores)
         for store in self._stores:
             if store not in self._pending_stores or store in referenced:
-                retained.append(store)
-            else:
-                close_task = asyncio.create_task(
-                    store._to_thread_store(store.close),
-                    name=f"close child store {store.session_id}",
-                )
-                self._store_close_tasks.add(close_task)
-                close_task.add_done_callback(self._store_close_tasks.discard)
-                self._pending_stores.discard(store)
-        self._stores = retained
+                continue
+            existing = next(
+                (
+                    task
+                    for task, task_store in self._store_close_stores.items()
+                    if task_store is store
+                ),
+                None,
+            )
+            if existing is not None:
+                if not existing.done():
+                    continue
+                # wait_for_store_closes observed this failed task. A later
+                # release call is the explicit retry of the failed close.
+                self._store_close_tasks.discard(existing)
+                self._store_close_stores.pop(existing, None)
+            close_task = asyncio.create_task(
+                store._to_thread_store(store.close),
+                name=f"close child store {store.session_id}",
+            )
+            self._store_close_tasks.add(close_task)
+            self._store_close_stores[close_task] = store
 
     def register(
         self,
@@ -367,7 +379,12 @@ class BackgroundAgentOwner:
         while self._store_close_tasks:
             close_tasks = tuple(self._store_close_tasks)
             await asyncio.gather(*close_tasks, return_exceptions=False)
-            self._store_close_tasks.difference_update(close_tasks)
+            for task in close_tasks:
+                store = self._store_close_stores.pop(task, None)
+                self._store_close_tasks.discard(task)
+                if store is not None:
+                    self._pending_stores.discard(store)
+                    self._stores.remove(store)
 
     async def wait(self) -> None:
         current = asyncio.current_task()
