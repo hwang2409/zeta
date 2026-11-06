@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import logging
 import os
 import shutil
-import signal
 import tempfile
 import time
 import uuid
@@ -19,7 +17,7 @@ from pathlib import Path
 from typing import IO, Any, Literal
 
 from ...core.checkpoints import load_session_json
-from ...core.process_env import subprocess_env
+from ...core.process_env import subprocess_env as tool_subprocess_env
 from ...core.session_files import (
     open_session_file,
     read_session_file,
@@ -31,21 +29,15 @@ from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
     _group_exists,
-    _signal_group,
     _terminate_process,
     _terminate_processes,
     create_subprocess_shell_in_fd,
     spawn_background,
 )
+from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
 
 logger = logging.getLogger(__name__)
-
-
-def tool_subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return the scrubbed parent environment for a tool child."""
-
-    return subprocess_env(overrides)
 
 
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
@@ -120,7 +112,7 @@ class BackgroundTaskInfo:
 
     @property
     def headline(self) -> str:
-        return _command_headline(self.command)
+        return command_headline(self.command)
 
 
 @dataclass(slots=True)
@@ -271,7 +263,7 @@ class BackgroundTaskRegistry:
         recovered = tuple(
             TaskExitInput(
                 task_id=task_id,
-                command=_command_headline(command),
+                command=command_headline(command),
                 exit_code=None,
                 note="exit not observed (zeta restarted)",
             )
@@ -456,7 +448,7 @@ class BackgroundTaskRegistry:
                     rows,
                     publish_start,
                     BackgroundTaskNotice(
-                        f"background task {task_id} started: {_command_headline(command)}",
+                        f"background task {task_id} started: {command_headline(command)}",
                         task_id,
                         "started",
                         owner,
@@ -518,9 +510,9 @@ class BackgroundTaskRegistry:
             available = output[offset:]
         capped = len(available) > self.call_limit
         if capped:
-            available = _utf8_chunk(available, self.call_limit)
+            available = utf8_chunk(available, self.call_limit)
         if max_chars is not None:
-            available = _utf8_char_chunk(available, max_chars)
+            available = utf8_char_chunk(available, max_chars)
         next_cursor = start + len(available)
         remaining_bytes = max(0, record.total_bytes - next_cursor)
         result: dict[str, Any] = {
@@ -909,7 +901,7 @@ class BackgroundTaskRegistry:
                     record.task_id,
                     record.command,
                     record.exit_code,
-                    _output_tail(record.output),
+                    output_tail(record.output),
                     None if record.remove_log_on_archive else record.log_path,
                     record.note,
                     owner=record.owner,
@@ -940,7 +932,7 @@ class BackgroundTaskRegistry:
             )
             notice = BackgroundTaskNotice(
                 f"background task {record.task_id} exited ({candidate.exit_code}): "
-                f"{_command_headline(record.command)}",
+                f"{command_headline(record.command)}",
                 record.task_id,
                 candidate.terminal_phase,
                 record.owner,
@@ -1076,7 +1068,7 @@ class BackgroundTaskRegistry:
                 record.task_id,
                 record.command,
                 record.exit_code,
-                _output_tail(record.output),
+                output_tail(record.output),
                 record.log_path,
                 record.note,
                 owner=record.owner,
@@ -1158,7 +1150,7 @@ class BackgroundTaskRegistry:
         await self._notification_sink(
             TaskExitInput(
                 task_id=task_id,
-                command=_command_headline(command),
+                command=command_headline(command),
                 exit_code=exit_code,
                 output_tail=output_tail,
                 log_path=str(log_path) if log_path is not None else None,
@@ -1257,81 +1249,3 @@ class BackgroundTaskRegistry:
             "background_tasks.json",
             self._persistence_rows() if rows is None else rows,
         )
-
-
-def _command_headline(command: str, limit: int = 80) -> str:
-    headline = " ".join(command.split())
-    if len(headline) <= limit:
-        return headline
-    return headline[: max(0, limit - 3)] + "..."
-
-
-def _output_tail(output: bytearray | None) -> str:
-    if not output:
-        return ""
-    return "\n".join(bytes(output)[-2_048:].decode(errors="replace").splitlines()[-20:])
-
-
-def _utf8_chunk(data: bytes, limit: int) -> bytes:
-    """Cap UTF-8 output without ending inside a character."""
-    candidate = data[:limit]
-    try:
-        candidate.decode()
-    except UnicodeDecodeError as exc:
-        if exc.reason == "unexpected end of data" and exc.end == len(candidate):
-            candidate = candidate[: exc.start]
-    if candidate:
-        return candidate
-    for end in range(1, len(data) + 1):
-        try:
-            data[:end].decode()
-        except UnicodeDecodeError as exc:
-            if exc.reason != "unexpected end of data" or exc.end != end:
-                return data[:end]
-        else:
-            return data[:end]
-    return data
-
-
-def _utf8_char_chunk(data: bytes, limit: int) -> bytes:
-    """Cap decoded UTF-8 characters without advancing past retained bytes."""
-    if limit == 0:
-        return b""
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    character_start = 0
-    characters = 0
-    for index, value in enumerate(data):
-        emitted = decoder.decode(bytes((value,)), final=False)
-        if not emitted:
-            continue
-        if characters + len(emitted) > limit:
-            return data[:character_start]
-        characters += len(emitted)
-        character_start = index + 1
-    emitted = decoder.decode(b"", final=True)
-    if characters + len(emitted) > limit:
-        return data[:character_start]
-    return data
-
-
-async def _kill_and_reap(
-    process: asyncio.subprocess.Process,
-    process_tasks: Sequence[asyncio.Task[object]],
-) -> None:
-    # A descendant that calls setsid creates a new session and can escape this group.
-    _signal_group(process, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.1)
-    except asyncio.TimeoutError:
-        pass
-    except asyncio.CancelledError:
-        current = asyncio.current_task()
-        if current is not None:
-            current.uncancel()
-    _signal_group(process, signal.SIGKILL)
-    if process.returncode is None:
-        await process.wait()
-    for task in process_tasks:
-        if not task.done():
-            task.cancel()
-    await asyncio.gather(*process_tasks, return_exceptions=True)

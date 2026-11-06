@@ -16,7 +16,7 @@ from typing import BinaryIO
 
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
-from ..tools._shared.process import _kill_and_reap
+from ..tools._shared.background_spawn import _kill_and_reap
 from ..tools._spill import SpillStore
 
 MAX_LIST_ITEMS = 10_000
