@@ -56,21 +56,31 @@ async def start_prompt_during_activation(
     """Start TUI input first and report whether it exited during activation."""
 
     prompt_task: asyncio.Task[object] | None = None
-    if isinstance(session, FullScreenPromptSession):
-        app._install_full_screen_layout(session)
-        prompt_task = asyncio.create_task(prompt_runner(session, app))
-        app._input_loop_active = True
-        await asyncio.sleep(0)
-    activation_task = asyncio.create_task(app.loop.activate())
-    if prompt_task is None:
-        return activation_task, None, False
-    done, _ = await asyncio.wait(
-        (prompt_task, activation_task), return_when=asyncio.FIRST_COMPLETED
-    )
-    if prompt_task not in done:
-        return activation_task, prompt_task, False
-    await app._run_full_screen(session, prompt_task)
-    return activation_task, prompt_task, True
+    activation_task: asyncio.Task[None] | None = None
+    try:
+        if isinstance(session, FullScreenPromptSession):
+            app._install_full_screen_layout(session)
+            prompt_task = asyncio.create_task(prompt_runner(session, app))
+            app._input_loop_active = True
+            await asyncio.sleep(0)
+        activation_task = asyncio.create_task(app.loop.activate())
+        if prompt_task is None:
+            return activation_task, None, False
+        done, _ = await asyncio.wait(
+            (prompt_task, activation_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if prompt_task not in done:
+            return activation_task, prompt_task, False
+        await app._run_full_screen(session, prompt_task)
+        return activation_task, prompt_task, True
+    except BaseException:
+        # The caller never received these handles, so this helper must stop them.
+        app._input_loop_active = False
+        started = [task for task in (prompt_task, activation_task) if task is not None]
+        for task in started:
+            task.cancel()
+        await asyncio.gather(*started, return_exceptions=True)
+        raise
 
 
 async def cancel_activation(task: asyncio.Task[None]) -> None:

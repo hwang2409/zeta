@@ -7884,6 +7884,71 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
 
 
 @pytest.mark.asyncio
+async def test_cancel_run_during_activation_stops_prompt_and_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    activation_started = asyncio.Event()
+    prompt_started = asyncio.Event()
+    activation_cancelled = asyncio.Event()
+    prompt_cancelled = asyncio.Event()
+
+    async def blocked_activation() -> None:
+        activation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            activation_cancelled.set()
+            raise
+
+    async def waiting_prompt(session: FullScreenPromptSession, owner: object) -> object:
+        del session, owner
+        prompt_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            prompt_cancelled.set()
+            raise
+        return None
+
+    monkeypatch.setattr(app.loop, "activate", blocked_activation)
+    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", waiting_prompt)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run = asyncio.create_task(app.run(session))
+        await asyncio.wait_for(activation_started.wait(), timeout=5)
+        await asyncio.wait_for(prompt_started.wait(), timeout=5)
+        assert app._submit_input("accepted before cancel")
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    assert prompt_cancelled.is_set(), "prompt task outlived the cancelled run"
+    assert activation_cancelled.is_set(), "activation task outlived the cancelled run"
+    assert app._input_loop_active is False
+    assert DraftPersistence(app._draft.path).load() == "accepted before cancel"
+
+
+@pytest.mark.asyncio
 async def test_ctrl_v_paste_waits_for_startup_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
