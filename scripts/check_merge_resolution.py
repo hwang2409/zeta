@@ -1007,7 +1007,7 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
     line_findings: list[Item] = []
     if error:
         return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
-    old_items, _main_items, branch_items, merge_items = (
+    _old_items, _main_items, branch_items, merge_items = (
         parsed[revision] for revision in revisions
     )
     for path in all_paths:
