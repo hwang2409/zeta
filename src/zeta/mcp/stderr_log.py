@@ -236,17 +236,22 @@ class _FileLock:
 
 
 def _open_regular(directory_fd: int, name: str, flags: int) -> int:
-    try:
-        fd = os.open(
-            name,
-            flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-            0o600,
-            dir_fd=directory_fd,
-        )
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise OSError(errno.EINVAL, "refusing symbolic link", name) from exc
-        raise
+    for attempt in range(2):
+        try:
+            fd = os.open(
+                name,
+                flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            break
+        except FileNotFoundError:
+            if not flags & os.O_CREAT or attempt:
+                raise
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise OSError(errno.EINVAL, "refusing symbolic link", name) from exc
+            raise
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
