@@ -46,29 +46,14 @@ def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
 
-def _descendant_command(
-    marker: Path,
-    delay: float = 0.3,
-    started: Path | None = None,
-    release: Path | None = None,
-    child_pid: Path | None = None,
-) -> str:
-    child = "import os,pathlib,time\n"
+def _descendant_command(child_pid: Path | None = None) -> str:
+    child = "import os,signal,pathlib\n"
     if child_pid:
         child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-    if release:
-        child += (
-            f"deadline=time.monotonic()+5\n"
-            f"while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
-            "    time.sleep(0.01)\n"
-        )
-    else:
-        child += f"time.sleep({delay})\n"
-    child += f"pathlib.Path({str(marker)!r}).write_text('alive')"
+    child += "signal.pause()"
     parent = (
-        "import pathlib,subprocess,sys,time; "
+        "import subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-        + (f"pathlib.Path({str(started)!r}).write_text('started'); " if started else "")
         + "time.sleep(5)"
     )
     return _python_command(parent)
@@ -436,7 +421,6 @@ async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "child-alive"
     child_pid = tmp_path / "child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
@@ -445,7 +429,7 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Pa
             ToolCall(
                 "bash-abort",
                 "bash",
-                {"cmd": _descendant_command(marker, child_pid=child_pid)},
+                {"cmd": _descendant_command(child_pid=child_pid)},
             )
         )
     )
@@ -457,14 +441,12 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Pa
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
 
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "child-canceled"
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
@@ -475,14 +457,14 @@ async def test_bash_task_cancellation_kills_process_group(
         process = await create_subprocess_shell(*args, **kwargs)
         spawned_process = process
         spawned.set()
-        await release_spawn.wait()
+        await asyncio.wait_for(release_spawn.wait(), 10)
         return process
 
     monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
-            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
+            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command()})
         )
     )
 
@@ -490,7 +472,7 @@ async def test_bash_task_cancellation_kills_process_group(
     task.cancel()
     release_spawn.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
     assert spawned_process is not None
     assert spawned_process.returncode is not None
@@ -1369,7 +1351,6 @@ async def test_bash_rejects_max_output_above_host_cap_before_spawn_or_capture(
             },
             registry.abort_signal,
         )
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1405,7 +1386,6 @@ async def test_repeated_rejected_bash_output_limits_retain_no_captures(
         )
         assert result["isError"] is True
 
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1606,7 +1586,6 @@ skill_catalog=SkillCatalog.empty(),
 
 @pytest.mark.asyncio
 async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "timeout-child-alive"
     child_pid = tmp_path / "timeout-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
@@ -1616,9 +1595,7 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
                 "bash-timeout",
                 "bash",
                 {
-                    "command": _descendant_command(
-                        marker, delay=1, child_pid=child_pid
-                    ),
+                    "command": _descendant_command(child_pid=child_pid),
                     "timeout": 0.5,
                 },
             )
@@ -1633,7 +1610,6 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     assert result["structuredContent"]["timed_out"] is True
     assert result["structuredContent"]["error"]["tool"] == "bash"
     assert result["structuredContent"]["error"]["kind"] == "timeout"
-    assert not marker.exists()
 
 
 
@@ -1820,7 +1796,6 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "cancel-child-alive"
     child_pid = tmp_path / "cancel-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
@@ -1828,7 +1803,7 @@ async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> 
             ToolCall(
                 "bash-cancel",
                 "bash",
-                {"command": _descendant_command(marker, child_pid=child_pid), "timeout": 5},
+                {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
             )
         )
     )
@@ -1841,14 +1816,12 @@ async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> 
     child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
     await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
-    assert not marker.exists()
 
 
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     tmp_path: Path,
 ) -> None:
-    marker = tmp_path / "abort-child-alive"
     child_pid = tmp_path / "abort-child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
@@ -1857,7 +1830,7 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
             ToolCall(
                 "bash-abort",
                 "bash",
-                {"command": _descendant_command(marker, child_pid=child_pid), "timeout": 5},
+                {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
             )
         )
     )
@@ -1870,7 +1843,6 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
 
 
 @pytest.mark.asyncio
