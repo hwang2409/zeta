@@ -1017,9 +1017,9 @@ async def finish_background_child(
     finish_gate_state: FinishGateState | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
-
     status = "completed"
     notification_text = ""
+    result: object = None
     explicit_finish_report = (
         await TerminalTransitionFence(child_store).recover()
         if explicit_finish
@@ -1073,6 +1073,8 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
+        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
         if (
             child_loop is not None
             and status != "canceled"
@@ -1109,20 +1111,14 @@ async def finish_background_child(
             "canceled": "canceled",
             "error": "failed",
         }[status]
-        effective_parent_store, effective_parent_id = background_owner.parent_edge(
-            child_instance_id, parent_store, agent_instance_id
-        )
-        terminal_stats = agent_stats(
-            child_store.agent_lifecycle(),
-            status=status,
-            turns_used=child_turns(),
-        )
+        effective_parent_store, effective_parent_id = background_owner.parent_edge(child_instance_id, parent_store, agent_instance_id)
+        terminal_stats = agent_stats({**(child_store.agent_lifecycle() or {}), "turns_used": turns_used}, status=status)
         result_text = notification_text or "background child completed"
         if explicit_finish_report is not None:
             explicit_terminal = _background_terminal(
                 lifecycle=child_store.agent_lifecycle(),
                 report=explicit_finish_report,
-                turns_used=child_turns(),
+                turns_used=turns_used,
                 tool_call_id=tool_call.id,
                 fallback_text=result_text,
                 structured_content=explicit_finish_content,
@@ -1180,12 +1176,13 @@ async def finish_background_child(
             for key in ("head_sha", "verdict"):
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
+
         async def commit_adopt_publish() -> ConversationEntry:
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
                 terminal_state=lifecycle_state,
                 final_result=notification_text,
-                turns_used=child_turns(),
+                turns_used=turns_used,
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
@@ -1194,9 +1191,7 @@ async def finish_background_child(
                 ),
             )
             for transferred_id in transferred:
-                background_owner.adopt(
-                    transferred_id, effective_parent_store, effective_parent_id
-                )
+                background_owner.adopt(transferred_id, effective_parent_store, effective_parent_id)
             await background_owner.conversation_channel.close_questions(
                 child_instance_id,
                 reason="canceled" if status == "canceled" else "finished",

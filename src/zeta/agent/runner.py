@@ -852,17 +852,12 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        if not background:
-            child_store.finish_agent_lifecycle(
-                state,
-                final_result=text,
-                turns_used=child_turns(),
-            )
-        return agent_stats(
-            child_store.agent_lifecycle(),
-            status=state if not background else "running",
-            turns_used=child_turns(),
-        )
+        turns_used = child_turns()
+        if background:
+            child_store.update_agent_lifecycle(turns_used=turns_used)
+        else:
+            child_store.finish_agent_lifecycle(state, final_result=text, turns_used=turns_used)
+        return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
         text: str,
@@ -946,9 +941,7 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
-    loop._background_owner.causal_episodes.associate_new_member(
-        child_instance_id, loop.agent_instance_id
-    )
+    loop._background_owner.causal_episodes.associate_new_member(child_instance_id, loop.agent_instance_id)
     finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
