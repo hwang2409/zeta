@@ -121,12 +121,9 @@ async def test_mount_skips_stdio_server_outside_tool_policy_before_spawn(
     marker = tmp_path / "spawned"
     source = (
         "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text('spawned')\n"
-        + _stdio_source()
+        f"Path({str(marker)!r}).write_text('spawned')\n" + _stdio_source()
     )
-    config = MCPServerConfig(
-        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
-    )
+    config = MCPServerConfig("unrelated", "stdio", sys.executable, ("-u", "-c", source))
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
@@ -157,21 +154,16 @@ async def test_restricted_mount_skips_server_added_after_startup(
     marker = tmp_path / "added-spawned"
     source = (
         "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text('spawned')\n"
-        + _stdio_source()
+        f"Path({str(marker)!r}).write_text('spawned')\n" + _stdio_source()
     )
-    config = MCPServerConfig(
-        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
-    )
+    config = MCPServerConfig("unrelated", "stdio", sys.executable, ("-u", "-c", source))
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
         tool_deny=("unrelated__*",),
     )
-    mount = await mount_mcp_servers(
-        registry, MCPConfig(tmp_path / "mcp.json", {})
-    )
+    mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", {}))
     notices: list[str] = []
     try:
         status = await mount.add_server(
@@ -662,12 +654,16 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
             registry, config, notice_sink=notice_sink, home=home
         )
 
-    monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", observe_mount)
+    monkeypatch.setattr(
+        "zeta.runtime.loop.mcp_session.mount_mcp_servers", observe_mount
+    )
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
     loop = AgentLoop(
         backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
+    events = [
+        event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+    ]
     await loop.close()
 
     assert calls == 1
@@ -675,7 +671,9 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
 
 
 @pytest.mark.asyncio
-async def test_stdio_large_tools_list_line_mounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stdio_large_tools_list_line_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '"name": "echo", "description": "echo text",',
@@ -731,7 +729,7 @@ async def test_mcp_stdio_malformed_oversized_line_does_not_wedge_transport(
         '    elif method == "tools/list":\n'
         '        print(\'{"jsonrpc":"2.0","id":\' + str(request["id"]) + \',"result":"\' + "x" * 4096, flush=True)\n'
         '        print(json.dumps({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}), flush=True)\n'
-        '        continue\n',
+        "        continue\n",
     )
     client = StdioMCPClient(
         MCPServerConfig("malformed", "stdio", sys.executable, ("-u", "-c", source))
@@ -758,7 +756,7 @@ async def test_malformed_frame_with_unknown_id_fails_pending_promptly(
         '    elif method == "tools/list":\n        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}\n',
         '    elif method == "tools/list":\n'
         '        print(\'{"jsonrpc":"2.0","id":999,"result":\', flush=True)\n'
-        '        continue\n',
+        "        continue\n",
     )
     client = StdioMCPClient(
         MCPServerConfig("malformed-id", "stdio", sys.executable, ("-u", "-c", source))
@@ -824,7 +822,9 @@ async def test_stdio_write_after_server_exit_preserves_protocol_error(
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
     client = StdioMCPClient(
-        MCPServerConfig("write-after-exit", "stdio", sys.executable, ("-u", "-c", source))
+        MCPServerConfig(
+            "write-after-exit", "stdio", sys.executable, ("-u", "-c", source)
+        )
     )
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -855,7 +855,9 @@ async def test_stdio_write_failure_does_not_wait_for_live_stdout(
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = "import os, time; os.close(0); os.write(2, b'ready'); time.sleep(30)"
     client = StdioMCPClient(
-        MCPServerConfig("write-live-stdout", "stdio", sys.executable, ("-u", "-c", source))
+        MCPServerConfig(
+            "write-live-stdout", "stdio", sys.executable, ("-u", "-c", source)
+        )
     )
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -2063,7 +2065,7 @@ async def test_mount_reports_states_and_notices(
     assert mount.statuses["timed"].state == "timed-out"
     assert "missing environment variable(s): MCP_MISSING" in mount.render()
     assert "stderr:" in mount.render()
-    assert [line.split(":", 1)[0] for line in mount.render().splitlines()[1:]] == list(
+    assert [line.split(":", 1)[0] for line in mount.render().splitlines()[2:]] == list(
         mount.configs
     )
     assert len(notices) == 5
@@ -3411,7 +3413,9 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
         await release.wait()
         return MCPMount(registry, {}, {})
 
-    monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", delayed_mount)
+    monkeypatch.setattr(
+        "zeta.runtime.loop.mcp_session.mount_mcp_servers", delayed_mount
+    )
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
@@ -3423,7 +3427,10 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
 
     release.set()
     await ensure_task
-    assert await status_task == "mcp: 0 mounted, 0 failed"
+    assert await status_task == (
+        "mcp: 0 mounted, 0 failed\n"
+        "mcp limits: deadline 300s | wire 67108864 bytes | spill 262144 bytes"
+    )
     assert calls == 1
     await loop.close()
 
@@ -4233,11 +4240,15 @@ def test_activation_rejects_foreign_definition_with_same_name(tmp_path: Path) ->
 
     # register_mcp must refuse to overwrite the foreign definition, and the
     # foreign name must never be reported as MCP-owned.
-    assert registry.register_mcp("srv__echo", handler, owner=owner, generation=1) is False
+    assert (
+        registry.register_mcp("srv__echo", handler, owner=owner, generation=1) is False
+    )
     assert registry.is_mcp_owned("srv__echo", owner, 1) is False
 
     # A genuine MCP registration is owned; ownership is keyed by owner+generation.
-    assert registry.register_mcp("srv__real", handler, owner=owner, generation=1) is True
+    assert (
+        registry.register_mcp("srv__real", handler, owner=owner, generation=1) is True
+    )
     assert registry.is_mcp_owned("srv__real", owner, 1) is True
     assert registry.is_mcp_owned("srv__real", owner, 2) is False
     assert registry.is_mcp_owned("srv__real", object(), 1) is False
@@ -4518,25 +4529,40 @@ async def test_pagination_end_to_end_http_aggregates_pages() -> None:
             return httpx.Response(202, request=request)
         method = body["method"]
         if method == "initialize":
-            result: dict = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+            result: dict = {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+            }
         elif method == "tools/list":
             cursor = body.get("params", {}).get("cursor")
             pages = {
                 None: {
                     "tools": [
-                        {"name": "t0", "description": "", "inputSchema": {"type": "object"}}
+                        {
+                            "name": "t0",
+                            "description": "",
+                            "inputSchema": {"type": "object"},
+                        }
                     ],
                     "nextCursor": "c1",
                 },
                 "c1": {
                     "tools": [
-                        {"name": "t1", "description": "", "inputSchema": {"type": "object"}}
+                        {
+                            "name": "t1",
+                            "description": "",
+                            "inputSchema": {"type": "object"},
+                        }
                     ],
                     "nextCursor": "c2",
                 },
                 "c2": {
                     "tools": [
-                        {"name": "t2", "description": "", "inputSchema": {"type": "object"}}
+                        {
+                            "name": "t2",
+                            "description": "",
+                            "inputSchema": {"type": "object"},
+                        }
                     ]
                 },
             }
@@ -4688,9 +4714,7 @@ async def test_server_name_with_double_underscore_activates_exact_tool(
     )
     try:
         assert "team__prod__tool_39" not in registry.registered_names
-        activated, rejected = mount.activate_tools(
-            registry, ["team__prod__tool_39"]
-        )
+        activated, rejected = mount.activate_tools(registry, ["team__prod__tool_39"])
         assert activated == ["team__prod__tool_39"]
         assert rejected == []
         assert "team__prod__tool_39" in registry.registered_names
