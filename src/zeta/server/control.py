@@ -812,6 +812,8 @@ class ServeControl:
         if kind is StreamEventType.TOOL_EXECUTION_END:
             if foreground:
                 state.tool_finished()
+            else:
+                await self._approvals.wait_for_terminal_order(_approval_key(event))
             await self._notify(
                 wire_event,
                 session_id,
