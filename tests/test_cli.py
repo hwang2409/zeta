@@ -5,6 +5,7 @@ import os
 import pty
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,20 @@ from tests.support.processes import read_pty_until, reap_process
 from zeta.cli.main import build_parser, main
 from zeta.core.commands.completion import completion_script
 from zeta.project_registry import ProjectRegistry
+
+
+def test_cli_import_does_not_import_tui_app() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import zeta.cli.main; print('zeta.tui.app' in sys.modules)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "False"
 
 
 def test_removed_fake_provider_has_clear_cli_error(
