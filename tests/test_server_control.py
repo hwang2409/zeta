@@ -586,6 +586,7 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
+    server.connections.activate_controller(replacement)
     frame = replacement.codec.notification(
         EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
     )

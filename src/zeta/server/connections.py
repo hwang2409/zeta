@@ -279,7 +279,7 @@ class ConnectionRegistry:
             self._observers.remove(state)
         output = state.output
         if output is not None:
-            self._release_output(output)
+            self._release_output(output, state.role)
 
     async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
@@ -597,21 +597,27 @@ class ConnectionRegistry:
             item.future.cancel()
         return None, None
 
-    def _release_output(self, output: _OutputState) -> None:
+    def _release_output(self, output: _OutputState, role: str | None) -> None:
         output.released = True
-        if output.current_frame is not None:
-            self._finish_future(output.current_frame.future, False)
-        self._settle_output(output)
+        self._cancel_overflow_deadline(output)
+        if role == "observer":
+            self._clear_output(output)
+            if output.writer_task is not None:
+                output.writer_task.cancel()
+            return
+        if (
+            output.current_frame is None
+            and not output.queue
+            and output.writer_task is not None
+        ):
+            output.writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:
             item = output.queue.popleft()
             self._finish_frame_accounting(output, item)
             self._finish_future(item.future, False)
-        if (
-            output.writer_task is not None
-            and output.writer_task is not asyncio.current_task()
-        ):
+        if output.writer_task is not None:
             output.writer_task.cancel()
         self._cancel_overflow_deadline(output)
         self._finish_future(output.ready, False)
