@@ -1163,25 +1163,3 @@ CREATE TRIGGER units_au AFTER UPDATE ON units BEGIN
     INSERT INTO unit_fts(rowid, text) VALUES (new.id, new.text);
 END;
 """
-
-
-def transcript_index_refresh_failure(
-    projects_root: Path, project_id: str, session_id: str
-) -> str | None:
-    from zeta.transcript_search.refresh import (
-        transcript_index_refresh_failure as lookup,
-    )
-
-    return lookup(projects_root, project_id, session_id)
-
-
-async def refresh_transcript_index(
-    projects_root: Path,
-    project_id: str,
-    session_id: str,
-    session_dir: Path,
-    append_receipts: tuple[PersistedAppend, ...] | None = None,
-) -> None:
-    from zeta.transcript_search.refresh import refresh_transcript_index as refresh
-
-    await refresh(projects_root, project_id, session_id, session_dir, append_receipts)

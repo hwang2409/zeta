@@ -19,7 +19,10 @@ from zeta.transcript_search.index import (
     TranscriptIndex,
     TranscriptIndexUnavailable,
     TranscriptSource,
+)
+from zeta.transcript_search.refresh import (
     refresh_transcript_index,
+    transcript_index_refresh_failure,
 )
 
 PROJECT_A = "p_" + "a" * 32
@@ -867,11 +870,9 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     )
     assert index.search("first indexed question")
     assert index.search("durableretrycanary") == ()
-    failure = getattr(
-        index_module,
-        "transcript_index_refresh_failure",
-        lambda *_args: None,
-    )(projects_root, PROJECT_A, store.session_id)
+    failure = transcript_index_refresh_failure(
+        projects_root, PROJECT_A, store.session_id
+    )
     assert failure == (
         "disk full; pending changes will retry after the next transcript refresh"
     )
@@ -886,9 +887,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     assert refresh_calls == 2
     assert len(index.search("durableretrycanary")) == 1
     assert (
-        index_module.transcript_index_refresh_failure(
-            projects_root, PROJECT_A, store.session_id
-        )
+        transcript_index_refresh_failure(projects_root, PROJECT_A, store.session_id)
         is None
     )
 

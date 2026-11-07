@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 from ...core.store import ConversationEntry
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...protocol.types import ContentBlock, Message
-from ...transcript_search.index import (
-    is_indexable_top_level_project_session,
+from ...transcript_search.index import is_indexable_top_level_project_session
+from ...transcript_search.refresh import (
     refresh_transcript_index,
     transcript_index_refresh_failure,
 )
@@ -44,11 +44,14 @@ class StoreWriteMixin:
                 pass
 
     def _indexable_project_session(self: AgentLoop) -> bool:
-        return self.project_registry is not None and is_indexable_top_level_project_session(
-            agent_depth=self.agent_depth,
-            project_id=self.root_project_id,
-            parent_session_id=self.parent_session_id,
-            session_dir=self.store.session_dir,
+        return (
+            self.project_registry is not None
+            and is_indexable_top_level_project_session(
+                agent_depth=self.agent_depth,
+                project_id=self.root_project_id,
+                parent_session_id=self.parent_session_id,
+                session_dir=self.store.session_dir,
+            )
         )
 
     def _configure_transcript_index(self: AgentLoop) -> None:
@@ -118,9 +121,7 @@ class StoreWriteMixin:
             if on_persisted is not None:
                 on_persisted()
             return entry
-        return await self.store.append_message_async(
-            message, on_persisted=on_persisted
-        )
+        return await self.store.append_message_async(message, on_persisted=on_persisted)
 
     async def _append_turn_message_with_approvals(
         self: AgentLoop,
