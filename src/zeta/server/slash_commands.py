@@ -17,12 +17,13 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
-    SlashCommand,
     SlashCommandRegistry,
     SlashStatus,
+    _format_status,
     create_slash_registry,
 )
 from ..mcp.prompt_commands import SlashPromptError
@@ -48,25 +49,22 @@ from .runtime import ServerRuntime
 
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
 _UNAVAILABLE_REASON = "requires_tui"
-
-# This allowlist is the capability seam shared by slash_list and slash_run.
-# A new shared builtin stays unavailable until serve has an executor for it.
-EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
-    {
-        "accounts",
-        "compact",
-        "help",
-        "inbox",
-        "init",
-        "memory",
-        "mcp",
-        "model",
-        "project",
-        "project-instructions",
-        "status",
-        "vim",
-    }
+_SERVE_MCP_VERBS = (
+    "status",
+    "auth",
+    "logout",
+    "add",
+    "remove",
+    "enable",
+    "disable",
+    "trust",
+    "untrust",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ClientOnlySlashResult:
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,23 +95,33 @@ class _ApprovalProjection(Protocol):
 
 
 class ServerSlashSession:
-    """Session shim over ``ServerRuntime`` for the shared slash dispatcher.
-
-    Only methods backed by ``EXECUTABLE_BUILTINS`` live here. The catalog and
-    dispatcher reject every other shared command before it reaches this shim.
-    """
+    """Session adapter for shared slash commands available over serve."""
 
     def __init__(
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
-        status: SlashStatus | None = None,
+        run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
-        self._status = status
+        self._run_blocking = run_blocking
 
     # --- runnable server-side ---
+
+    def slash_status_command(self, args: str) -> str | Awaitable[str]:
+        del args
+        if self._run_blocking is None:
+            return _format_status(self.slash_status())
+        snapshot = self.status_snapshot()
+
+        async def build() -> str:
+            status = await self._run_blocking(lambda: build_slash_status(snapshot))
+            if not isinstance(status, SlashStatus):
+                raise TypeError("status worker returned an invalid projection")
+            return _format_status(status)
+
+        return build()
 
     def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
@@ -138,11 +146,14 @@ class ServerSlashSession:
             vim_mode=opened.metadata.vim_mode,
             pending_approvals=pending,
             usage_tracker=state.usage_tracker,
+            project_context_health=(
+                loop.project_context_health.summary
+                if loop.project_context_health is not None
+                else None
+            ),
         )
 
     def slash_status(self) -> SlashStatus:
-        if self._status is not None:
-            return self._status
         return build_slash_status(self.status_snapshot())
 
     async def slash_accounts(self, args: str) -> str:
@@ -156,7 +167,12 @@ class ServerSlashSession:
         displays = await asyncio.to_thread(context.store.list_display)
         lines: list[str] = []
         for item in displays:
-            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            availability = (
+                "  unavailable: credentials missing" if not item.available else ""
+            )
+            lines.append(
+                str(item) + (f"  {item.detail}" if item.detail else "") + availability
+            )
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 
@@ -280,10 +296,15 @@ class ServerSlashSession:
             MemoryMutationAuthorization.direct_slash(),
         )
 
-    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
+    async def slash_mcp(
+        self, args: str
+    ) -> str | ModelInputEnvelope | _ClientOnlySlashResult:
+        stripped = args.strip()
+        if stripped and stripped.partition(" ")[0] not in _SERVE_MCP_VERBS:
+            return _ClientOnlySlashResult("mcp")
         if self._runtime.loop is None:
             raise RuntimeError(_UNAVAILABLE_NOTICE)
-        return await self._runtime.loop.slash_mcp(args)
+        return await self._runtime.loop.slash_mcp(stripped)
 
     async def slash_inbox(self, args: str) -> str:
         if args.strip():
@@ -323,13 +344,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         project_dir=project_dir,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
-        extra_commands=(
-            SlashCommand(
-                "accounts",
-                lambda session, args: session.slash_accounts(args),
-                "list or label accounts",
-            ),
-        ),
+        surface=SlashSurface.SERVE,
     )
 
 
@@ -390,35 +405,17 @@ async def run_command(
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if (
-        (name == "vim" and tail.strip().lower() in {"on", "off", "toggle"})
-        or name == "compact"
-        or (name == "model" and tail.strip())
-        or (name == "accounts" and tail.strip())
-        or (
-            name == "mcp"
-            and tail.strip().partition(" ")[0]
-            in {"add", "remove", "enable", "disable", "trust", "untrust"}
-        )
-        or (name == "project" and tail.strip() == "init")
-    ):
-        # Guard mutation-capable dispatch on the same seam session-mutation
-        # RPCs use. Without this, `/compact` or `/model <name>` could edit
-        # the store or settings while background children are still running
-        # or an approval is outstanding. Read-only calls (`/status`,
-        # `/help`, argless `/model`) stay guard-free.
+    if runtime.loop is not None:
+        await runtime.loop.refresh_skills()
+    registry = await asyncio.to_thread(build_registry, runtime)
+    command = registry.command_for(name)
+    if command is not None and not registry.available(command):
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
+    if command is not None and command.serve is not None and command.serve.mutates(tail):
         ergonomics.require_mutable(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
         )
-    if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
-    registry = await asyncio.to_thread(build_registry, runtime)
-    builtin_names = {command.name for command in registry.builtin_commands}
-    if name in builtin_names and name not in EXECUTABLE_BUILTINS:
-        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    if name == "mcp":
-        return await _run_mcp_command(runtime, tail)
     # Prompt macros expand to user input rather than dispatch through a handler.
     # Inline shell spans need the client's approval loop; report those as
     # client-only rather than resolving with unapproved output here.
@@ -430,17 +427,9 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(runtime, approval_control)
-    if name == "status":
-        snapshot = session.status_snapshot()
-        status = await (
-            run_blocking(lambda: build_slash_status(snapshot))
-            if run_blocking is not None
-            else asyncio.to_thread(build_slash_status, snapshot)
-        )
-        if not isinstance(status, SlashStatus):
-            raise RuntimeError("status worker returned an invalid projection")
-        session = ServerSlashSession(runtime, approval_control, status)
+    session = ServerSlashSession(
+        runtime, approval_control, run_blocking=run_blocking
+    )
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
@@ -448,45 +437,20 @@ async def run_command(
         return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
         return _model_input_result(result, register_model_input)
+    if isinstance(result, _ClientOnlySlashResult):
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": result.name}
     if isinstance(result, str):
-        return {"kind": SlashResultKindDescriptor.OUTPUT, "text": result}
+        response: dict[str, object] = {
+            "kind": SlashResultKindDescriptor.OUTPUT,
+            "text": result,
+        }
+        credential_error = getattr(result, "credential_store_error", None)
+        if credential_error is not None:
+            public_error = dict(credential_error)
+            public_error["code"] = SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE
+            response["credential_store_error"] = public_error
+        return response
     raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
-
-
-async def _run_mcp_command(
-    runtime: ServerRuntime, tail: str
-) -> dict[str, object]:
-    stripped = tail.strip()
-    verb = stripped.partition(" ")[0]
-    if verb not in {
-        "status",
-        "auth",
-        "logout",
-        "add",
-        "remove",
-        "enable",
-        "disable",
-        "trust",
-        "untrust",
-    }:
-        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": "mcp"}
-    if runtime.loop is None:
-        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-    result = await runtime.loop.slash_mcp(stripped)
-    response: dict[str, object] = {
-        "kind": (
-            SlashResultKindDescriptor.TEXT
-            if stripped == "status"
-            else SlashResultKindDescriptor.OUTPUT
-        ),
-        "text": result,
-    }
-    credential_error = getattr(result, "credential_store_error", None)
-    if credential_error is not None:
-        public_error = dict(credential_error)
-        public_error["code"] = SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE
-        response["credential_store_error"] = public_error
-    return response
 
 
 def _model_input_result(
@@ -514,9 +478,7 @@ def _entries_from_registry(
 
     entries: list[SlashCommandInfo] = []
     for command in registry.builtin_commands:
-        unavailable = (
-            None if command.name in EXECUTABLE_BUILTINS else _UNAVAILABLE_REASON
-        )
+        unavailable = None if registry.available(command) else _UNAVAILABLE_REASON
         if unavailable is None or include_unavailable:
             entries.append(
                 SlashCommandInfo(
@@ -573,7 +535,6 @@ def _entries_from_registry(
 
 
 __all__ = [
-    "EXECUTABLE_BUILTINS",
     "ServerSlashSession",
     "SlashCommandInfo",
     "build_registry",

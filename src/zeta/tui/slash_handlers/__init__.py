@@ -29,7 +29,7 @@ from ...core.session import (
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import SlashStatus
+from ...core.slash import SlashStatus, _format_status
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -100,11 +100,28 @@ class SlashHandlerMixin:
             return
         await controller.resolve_approval(decision, requested_key, always=always)
 
+    def slash_status_command(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_status_card()
+            return ""
+        return _format_status(self.slash_status())
+
     def slash_status(self) -> SlashStatus:
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
+        viewed_path = self._viewed_session_path()
+        if viewed_path == self.loop.store.session_dir:
+            viewed_health = self.loop.project_context_health
+        else:
+            viewed_loop = self.loop._background_owner.project_context_loops.get(
+                viewed_path.name
+            )
+            viewed_health = (
+                viewed_loop.project_context_health if viewed_loop is not None else None
+            )
         return build_slash_status(
             capture_slash_status(
                 self.loop,
@@ -115,7 +132,10 @@ class SlashHandlerMixin:
                 vim_mode=self.vim_mode,
                 pending_approvals=pending,
                 usage_tracker=self._usage_tracker,
-                transcript_session_id=self._viewed_session_path().name,
+                project_context_health=(
+                    viewed_health.summary if viewed_health is not None else None
+                ),
+                transcript_session_id=viewed_path.name,
             )
         )
 
@@ -160,6 +180,7 @@ class SlashHandlerMixin:
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
+            {item.account for item in displays if not item.available},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
