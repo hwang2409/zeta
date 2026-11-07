@@ -601,9 +601,7 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = next_agent_depth(
-        loop.agent_depth, loop.max_agent_depth, background
-    )
+    child_depth, nesting_error = next_agent_depth(loop.agent_depth, loop.max_agent_depth, background)
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -785,18 +783,16 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
+        child_max_depth = loop.max_agent_depth
+        if preset.max_child_depth is not None:
+            child_max_depth = min(child_max_depth, preset.max_child_depth)
         child_loop, child_policy = await _build_child_loop(
             loop,
             child_backend=child_backend,
             child_store=child_store,
             child_instance_id=child_instance_id,
             child_depth=child_depth,
-            child_max_depth=min(
-                loop.max_agent_depth,
-                preset.max_child_depth
-                if preset.max_child_depth is not None
-                else loop.max_agent_depth,
-            ),
+            child_max_depth=child_max_depth,
             preset=preset,
             model=model,
             cwd_override=cwd_override,

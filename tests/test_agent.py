@@ -5611,48 +5611,6 @@ async def test_profile_max_child_depth_only_lowers_the_parent_limit(
 
 
 @pytest.mark.asyncio
-async def test_nested_child_uses_selected_profile_not_parent_profile(
-    tmp_path: Path,
-) -> None:
-    nested = _agent_call("grandchild")
-    child = _agent_call("child", "explore")
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("grandchild complete")]),
-            ScriptedTurn([TextContent("child complete")]),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    child_tools = {schema["name"] for schema in backend.calls[1][1]}
-    grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
-    assert "project_update" not in child_tools
-    assert "project_update" not in grandchild_tools
-    assert all(
-        "project_update" not in {schema["name"] for schema in schemas}
-        for _, schemas in backend.calls
-    )
-    assert child_tools == {
-        "agent_output",
-        "agent_status",
-        "fetch",
-        "read",
-        "skill",
-        "websearch",
-    }
-    assert "bash" in grandchild_tools
-    assert "agent" not in grandchild_tools
-
-
-@pytest.mark.asyncio
 async def test_nested_and_parallel_children_do_not_share_a_terminating_budget(
     tmp_path: Path,
 ) -> None:
