@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 import pytest
+from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
@@ -34,6 +35,7 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
+from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     event as _buffered_event,
 )
@@ -3725,9 +3727,11 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 async def test_session_swap_rejects_pending_notification_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    transport: str,
 ) -> None:
     parent_call = ToolCall(
         "agent-one",
@@ -3746,10 +3750,22 @@ async def test_session_swap_rejects_pending_notification_handoff(
         provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
+        ws_port=0 if transport == "websocket" else None,
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer = await _ready(server, protocol_version="1.1")
-    assert server._client is not None
+    await server.start()
+    if transport == "unix":
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        client = ServeClient(reader=reader, writer=writer)
+    else:
+        assert server._websocket is not None
+        websocket = await connect(
+            f"ws://127.0.0.1:{server._websocket.port}/",
+            subprotocols=["zeta.v1", f"zeta.bearer.{server._websocket.token}"],
+        )
+        client = ServeClient(websocket=websocket)
+    await client.request("hello", "hello", {"protocol_version": "1.1"})
+    await client.request("new", "new_session", {"provider": "codex"})
     agent_end_published = asyncio.Event()
     release_agent_end = asyncio.Event()
     notification_captured = asyncio.Event()
@@ -3768,28 +3784,27 @@ async def test_session_swap_rejects_pending_notification_handoff(
         await release_notification.wait()
         return await original_notification_turn(*args, **kwargs)
 
+    # test-contract: seam serve has no public agent-end publication gate
     monkeypatch.setattr(server.control, "_notify", notify)
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
-    )
+    )  # test-contract: seam serve has no public notification-turn start gate
     old_session_id = server.runtime.session_id
     try:
-        await _request(reader, writer, 3, "send", {"text": "start"})
-        approval = await _event(reader, "approval_request")
+        await client.request("send", "send", {"text": "start"})
+        approval = await client.event("approval_request")
         assert approval["delegated"] is True
         await asyncio.wait_for(agent_end_published.wait(), timeout=TIMEOUT)
 
-        swap_frames = await _request(
-            reader, writer, 4, "new_session", {"provider": "codex"}
+        rejected = await client.request(
+            "busy-swap", "new_session", {"provider": "codex"}
         )
-        assert swap_frames[-1]["error"]["code"] == -32004
+        assert rejected["error"]["code"] == -32004
 
         release_agent_end.set()
-        await _event(reader, "agent_end")
-        await _request(
-            reader,
-            writer,
-            5,
+        await client.event("agent_end")
+        await client.request(
+            "approve",
             "approve",
             {"request_id": approval["request_id"]},
         )
@@ -3799,16 +3814,144 @@ async def test_session_swap_rejects_pending_notification_handoff(
         release_notification.set()
         await asyncio.wait_for(asyncio.shield(notification_turn), timeout=TIMEOUT)
 
-        swap_frames = await _request(
-            reader, writer, 6, "new_session", {"provider": "codex"}
+        swapped = await client.request(
+            "swap", "new_session", {"provider": "codex"}
         )
+        new_session_id = swapped["result"]["session"]["session_id"]
+        assert new_session_id != old_session_id
+
+        resumed = await client.request(
+            "resume", "resume", {"session_id": old_session_id}
+        )
+        assert resumed["result"]["session"]["session_id"] == old_session_id
+        history = await client.request(
+            "history", "session_history", {"session_id": old_session_id}
+        )
+        assert "result" in history, history
+        assert any(
+            message.get("role") == "assistant"
+            and message.get("content")
+            == [{"type": "text", "text": "parent done"}]
+            for message in history["result"]["messages"]
+        )
+    finally:
+        release_agent_end.set()
+        release_notification.set()
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_session_swap_reserves_child_completion_during_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BackgroundChildAndForegroundToolBackend("unused")
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        cwd=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        cli_yolo=True,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server, protocol_version="1.1")
+    old_session_id = server.runtime.session_id
+    setup_entered = asyncio.Event()
+    release_setup = asyncio.Event()
+    wake_attempted = asyncio.Event()
+    notification_captured = asyncio.Event()
+    release_notification = asyncio.Event()
+    original_run_setup = server.runtime._run_setup
+    original_terminate_approvals = server.control._terminate_pending_approvals
+    original_schedule_wake = server.control._schedule_background_wake
+    original_notification_turn = server.turn_contexts.run_notification_turn
+    setup_calls = 0
+    termination_calls = 0
+    wake_task: asyncio.Task[None] | None = None
+
+    async def gated_run_setup(*args: object, **kwargs: object):
+        nonlocal setup_calls
+        setup_calls += 1
+        if setup_calls == 2:
+            raise RuntimeError("forced setup failure")
+        return await original_run_setup(*args, **kwargs)
+
+    async def gated_terminate_approvals(*args: object, **kwargs: object) -> None:
+        nonlocal termination_calls
+        termination_calls += 1
+        if termination_calls == 1:
+            setup_entered.set()
+            await release_setup.wait()
+        await original_terminate_approvals(*args, **kwargs)
+
+    def observe_schedule_wake(session_id: str) -> None:
+        nonlocal wake_task
+        original_schedule_wake(session_id)
+        if setup_entered.is_set():
+            wake_task = server.control._turn_task
+            wake_attempted.set()
+
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        notification_captured.set()
+        await release_notification.wait()
+        return await original_notification_turn(*args, **kwargs)
+
+    # test-contract: seam serve has no public session-setup gate
+    monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    monkeypatch.setattr(
+        server.control, "_terminate_pending_approvals", gated_terminate_approvals
+    )  # test-contract: seam serve has no public pre-setup gate
+    # test-contract: seam serve has no public background-wake observation
+    monkeypatch.setattr(server.control, "_schedule_background_wake", observe_schedule_wake)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )  # test-contract: seam serve has no public notification-turn start gate
+    try:
+        await _request(reader, writer, 3, "send", {"text": "start child"})
+        await _event(reader, "agent_end")
+        await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
+
+        swap = asyncio.create_task(
+            _request(reader, writer, 4, "new_session", {"provider": "codex"})
+        )
+        await asyncio.wait_for(setup_entered.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        owner = loop._background_owner
+        assert len(owner._watchers) == 1
+        watcher = next(iter(owner._watchers.values()))
+        loop.set_background_wake_callback(None)
+        backend.release_child.set()
+        # test-contract: seam serve has no public child-completion join
+        await asyncio.wait_for(asyncio.shield(watcher), TIMEOUT)
+        server.control._schedule_background_wake(old_session_id)
+        await asyncio.wait_for(wake_attempted.wait(), TIMEOUT)
+        if wake_task is not None:
+            await asyncio.wait_for(notification_captured.wait(), TIMEOUT)
+        release_setup.set()
+        swap_frames = await asyncio.wait_for(swap, TIMEOUT)
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
+        release_notification.set()
+        if wake_task is not None:
+            result = await asyncio.gather(wake_task, return_exceptions=True)
+            assert result == [None], result
+
+        failed = await _request(
+            reader, writer, 5, "new_session", {"provider": "codex"}
+        )
+        assert failed[-1]["error"]["code"] == -32000
+        retry = await _request(
+            reader, writer, 6, "new_session", {"provider": "codex"}
+        )
+        assert "result" in retry[-1], retry[-1]
 
         resumed = await _request(
             reader, writer, 7, "resume", {"session_id": old_session_id}
         )
         assert resumed[-1]["result"]["session"]["session_id"] == old_session_id
+        await _event(reader, "turn_end")
         history = await _request(
             reader,
             writer,
@@ -3816,15 +3959,15 @@ async def test_session_swap_rejects_pending_notification_handoff(
             "session_history",
             {"session_id": old_session_id},
         )
-        assert "result" in history[-1], history[-1]
         assert any(
             message.get("role") == "assistant"
             and message.get("content")
-            == [{"type": "text", "text": "parent done"}]
+            == [{"type": "text", "text": "notification handled"}]
             for message in history[-1]["result"]["messages"]
         )
     finally:
-        release_agent_end.set()
+        backend.release_child.set()
+        release_setup.set()
         release_notification.set()
         await _close(server, writer)
 

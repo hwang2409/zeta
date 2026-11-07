@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest
@@ -90,6 +91,8 @@ class ServeControl:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._session_swap_active = False
+        self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
@@ -161,15 +164,34 @@ class ServeControl:
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
         return (
-            self._turn_task is not None and not self._turn_task.done()
-        ) or (
-            self._turn_handoff_task is not None
-            and not self._turn_handoff_task.done()
-        ) or (loop is not None and loop.notification_turn_state != "idle")
+            self._session_swap_active
+            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_handoff_task is not None
+                and not self._turn_handoff_task.done()
+            )
+            or (loop is not None and loop.notification_turn_state != "idle")
+        )
 
     async def require_idle(self) -> None:
         if self.turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
+
+    @contextmanager
+    def reserve_session_swap(self) -> Iterator[None]:
+        if self.turn_busy():
+            raise ProtocolError(-32004, "a turn is already running")
+        state = self.server.runtime.state
+        session_id = None if state is None else state.session_id
+        self._session_swap_active = True
+        self._session_swap_id = session_id
+        try:
+            yield
+        finally:
+            self._session_swap_active = False
+            self._session_swap_id = None
+            if session_id is not None:
+                self._schedule_background_wake(session_id)
 
     def model_input_registrar(self, features: frozenset[str]):
         return self._model_inputs.registrar(
@@ -476,7 +498,7 @@ class ServeControl:
                 self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
-        if self.closing:
+        if self.closing or self._session_swap_id == session_id:
             return
         loop = self.server.runtime.loop
         state = self.server.runtime.state
