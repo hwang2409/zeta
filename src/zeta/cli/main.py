@@ -1136,6 +1136,8 @@ def _main(argv: list[str] | None = None) -> int:
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
+        except StorageFormatError:
+            raise
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
