@@ -549,7 +549,8 @@ def test_shortcut_card_tracks_first_pending_approval(
         controller.approvals_changed()
         main_handle = controller.pending_approvals[0].handle
         assert [
-            (unit.key, shortcut) for unit, shortcut in fork._approval_units.values()
+            (unit.key, shortcut)
+            for unit, shortcut in fork._approval_units.values()
         ] == [(main_handle, True)]
 
         fork.approvals = [
@@ -558,7 +559,9 @@ def test_shortcut_card_tracks_first_pending_approval(
         controller.approvals_changed()
         first_handle = fork.first_pending_approval_key
         shortcut_handles = [
-            unit.key for unit, shortcut in fork._approval_units.values() if shortcut
+            unit.key
+            for unit, shortcut in fork._approval_units.values()
+            if shortcut
         ]
         assert shortcut_handles == [first_handle], (
             "exactly the approval resolved by y/n must advertise the shortcut"
@@ -569,10 +572,9 @@ def test_shortcut_card_tracks_first_pending_approval(
         )
         assert fork.resolved == ["fork"], "y must resolve the advertised fork approval"
         assert [
-            (unit.key, shortcut) for unit, shortcut in fork._approval_units.values()
-        ] == [(main_handle, True)], (
-            "main must gain y/n after the fork approval resolves"
-        )
+            (unit.key, shortcut)
+            for unit, shortcut in fork._approval_units.values()
+        ] == [(main_handle, True)], "main must gain y/n after the fork approval resolves"
 
     monkeypatch.setattr("zeta.tui.fork_session.render_approval_card", render_card)
     asyncio.run(driver())
@@ -610,7 +612,9 @@ def test_replaced_approval_handle_renders_new_card(
     app._invalidate_prompt = lambda: None
     owner = SimpleNamespace()
     old_request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
-    replacement = ApprovalRequest("same", ToolCall("same", "bash", {"command": "pwd"}))
+    replacement = ApprovalRequest(
+        "same", ToolCall("same", "bash", {"command": "pwd"})
+    )
 
     app.sync_visible_approvals((OwnedApproval(owner, old_request, "approval-1"),))
     app.sync_visible_approvals((OwnedApproval(owner, replacement, "approval-2"),))
@@ -679,7 +683,6 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
-
     async def close_navigation() -> None:
         cleaned.append("navigation close")
 
