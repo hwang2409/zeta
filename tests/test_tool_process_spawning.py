@@ -152,7 +152,12 @@ async def test_tool_spawn_paths_preserve_process_contract(
             raise NotImplementedError(
                 "posix_spawn: setsid unavailable on this platform"
             )
-        pid = real_posix_spawn(path, argv, env, **kwargs)  # type: ignore[arg-type]
+        try:
+            pid = real_posix_spawn(path, argv, env, **kwargs)  # type: ignore[arg-type]
+        except NotImplementedError:
+            assert spawn_path == "native_setsid" and uses_setsid
+            kwargs.pop("setsid")
+            pid = real_posix_spawn(path, argv, env, **kwargs)  # type: ignore[arg-type]
         spawned_pids.append(pid)
         return pid
 
