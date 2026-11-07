@@ -75,6 +75,7 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
@@ -85,6 +86,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
+from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -5129,7 +5131,17 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
-    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    task_notice = (
+        "task task-1 (printf hi) has run 1h; "
+        "kill it with task_kill or leave it running"
+    )
+    store.append_message(
+        harness_notice("task safety", task_notice, event="agent_task_safety")
+    )
+    task_cause = (
+        "explicit-finish task safety limit expired at task age 7200 seconds "
+        "after no owner turn for 3600 seconds"
+    )
     store.append_task_notification(
         task_id="task-1",
         command="printf hi",
@@ -5168,6 +5180,11 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
+        assert any(
+            row.get("content", [{}])[0].get("text")
+            == f"[zeta] task safety: {task_notice}"
+            for row in history
+        )
         assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
@@ -8124,6 +8141,361 @@ async def test_memory_command_parity_tui_and_serve() -> None:
     ]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
+
+
+@pytest.mark.asyncio
+async def test_slash_status_uses_live_hooks_usage_and_cost_over_real_transport(
+    tmp_path: Path,
+) -> None:
+    from zeta.tui.app import _status_card_lines
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "hooks.toml").write_text(
+        '[[hook]]\nevent = "stop"\ncommand = "true"\n', encoding="utf-8"
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("done")],
+                usage={"input_tokens": 100, "output_tokens": 50},
+            )
+        ]
+    )
+    server = ZetaServer(
+        home=home,
+        cwd=_seed_slash_fixtures(tmp_path),
+        port=0,
+        provider="codex",
+        model="gpt-5.6-luna",
+        allow_hooks=True,
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "gpt-5.6-luna",
+        ),
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, "send", "send", {"text": "hello"})
+        await _event(reader, "usage")
+        await _event(reader, "turn_end")
+
+        result = (
+            await _request(
+                reader,
+                writer,
+                "status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "output"
+        serve_text = result["text"]
+        assert "hooks: stop: true" in serve_text
+        assert "cache_hit_trend: 1:0%" in serve_text
+        assert "estimated_cost_usd: $" in serve_text
+        assert "estimated_cost_usd: unavailable" not in serve_text
+
+        tui_lines = _status_card_lines(
+            ServerSlashSession(server.runtime).slash_status()
+        )
+        tui_text = "\n".join(
+            "".join(text for _style, text in line) for line in tui_lines
+        )
+        for line in (
+            "hooks: stop: true",
+            "  cache_hit_trend: 1:0%",
+            next(
+                line
+                for line in serve_text.splitlines()
+                if line.startswith("  estimated_cost_usd: $")
+            ),
+        ):
+            assert line in tui_text
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_status_transcript_work_does_not_block_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", server.port
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    worker_completed = threading.Event()
+    worker_errors: list[BaseException] = []
+    request_task: asyncio.Task[None] | None = None
+
+    def capture_worker_error(args: threading.ExceptHookArgs) -> None:
+        worker_errors.append(args.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", capture_worker_error)
+    assert server.connections is not None
+    loop = server.connections.loop
+    call_soon_threadsafe = loop.call_soon_threadsafe
+
+    def track_read_completion(
+        callback: Callable[..., object], *args: object
+    ) -> asyncio.Handle:
+        try:
+            return call_soon_threadsafe(callback, *args)
+        finally:
+            if callback is ConnectionRegistry._read_done:
+                worker_completed.set()
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", track_read_completion)
+    try:
+        await _request(
+            observer_reader,
+            observer_writer,
+            "observer-hello",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "ping"],
+            },
+        )
+        assert server.runtime.loop is not None
+        store = server.runtime.loop.store
+        sources = store.append_many(
+            (
+                "message",
+                {
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("source")]
+                    ).to_dict()
+                },
+            )
+            for _ in range(1_000)
+        )
+        store.append_compaction_marker(
+            "summary", sources[0].seq, sources[-1].seq
+        )
+        original_counter = server.runtime.loop.context_assembler.token_counter
+
+        def blocked_counter(message: Message) -> int:
+            entered.set()
+            assert release.wait(30), "status transcript worker was not released"
+            return original_counter(message)
+
+        # test-contract: seam hold the real synchronous transcript projection
+        monkeypatch.setattr(
+            server.runtime.loop.context_assembler, "token_counter", blocked_counter
+        )
+        probe_ready = threading.Event()
+        probe_frames: list[dict[str, Any]] = []
+        probe_errors: list[BaseException] = []
+
+        def probe_while_blocked() -> None:
+            try:
+                with socket.create_connection(("127.0.0.1", server.port)) as probe:
+                    probe.settimeout(10)
+                    with probe.makefile("rwb") as stream:
+                        stream.write(
+                            b'{"jsonrpc":"2.0","id":"probe-hello","method":"hello",'
+                            b'"params":{"protocol_version":"1.2","role":"observer",'
+                            b'"features":["serve_observers","ping"]}}\n'
+                        )
+                        stream.flush()
+                        probe_frames.append(json.loads(stream.readline()))
+                        probe_ready.set()
+                        if not entered.wait(10):
+                            raise AssertionError("status transcript worker did not start")
+                        stream.write(
+                            b'{"jsonrpc":"2.0","id":"live","method":"status",'
+                            b'"params":{}}\n'
+                        )
+                        stream.flush()
+                        probe_frames.append(json.loads(stream.readline()))
+            except (OSError, ValueError, AssertionError) as exc:
+                probe_errors.append(exc)
+            finally:
+                probe_ready.set()
+                release.set()
+
+        probe_thread = threading.Thread(target=probe_while_blocked)
+        probe_thread.start()
+        assert await asyncio.to_thread(probe_ready.wait, 10)
+        assert not probe_errors
+
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "blocked-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        await asyncio.to_thread(probe_thread.join, 20)
+        assert not probe_thread.is_alive()
+        assert not probe_errors
+        assert probe_frames[-1]["id"] == "live"
+
+        status = await _read(reader)
+        assert status["id"] == "blocked-status"
+        assert status["result"]["kind"] == "output"
+
+        entered.clear()
+        release.clear()
+        worker_completed.clear()
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cancelled-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, 10)
+        release.set()
+        assert await asyncio.to_thread(worker_completed.wait, 10)
+        assert not worker_errors
+        frames = await _frames_until_eof(reader)
+        assert not any(
+            frame.get("id") == "cancelled-status"
+            or frame.get("params", {}).get("event") is not None
+            for frame in frames
+        )
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
+            -1
+        ]["id"] == "after"
+    finally:
+        release.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+        await _close(server, observer_writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    _reader, writer, sid = await _ready_extensions(server)
+    entered = threading.Event()
+    release = threading.Event()
+    worker_completed = asyncio.Event()
+    worker_errors: list[BaseException] = []
+    shutdown_started = asyncio.Event()
+    closing: asyncio.Task[None] | None = None
+    loop_closed = False
+    status_worker: threading.Thread | None = None
+
+    def capture_worker_error(args: threading.ExceptHookArgs) -> None:
+        worker_errors.append(args.exc_value)
+        call_soon_threadsafe(worker_completed.set)
+
+    monkeypatch.setattr(threading, "excepthook", capture_worker_error)
+    assert server.runtime.loop is not None
+    store = server.runtime.loop.store
+    source = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("source")])
+    )
+    store.append_compaction_marker("summary", source.seq, source.seq)
+    original_counter = server.runtime.loop.context_assembler.token_counter
+
+    def blocked_counter(message: Message) -> int:
+        nonlocal status_worker
+        status_worker = threading.current_thread()
+        entered.set()
+        assert release.wait(30), "status transcript worker was not released"
+        return original_counter(message)
+
+    # test-contract: seam hold the real synchronous transcript projection
+    monkeypatch.setattr(
+        server.runtime.loop.context_assembler, "token_counter", blocked_counter
+    )
+    assert server.connections is not None
+    loop = server.connections.loop
+    call_soon_threadsafe = loop.call_soon_threadsafe
+    is_closed = loop.is_closed
+
+    def close_aware_call_soon_threadsafe(
+        callback: Callable[..., object], *args: object
+    ) -> asyncio.Handle:
+        if loop_closed:
+            raise RuntimeError("Event loop is closed")
+        return call_soon_threadsafe(callback, *args)
+
+    def track_closed_status_worker() -> bool:
+        closed = loop_closed or is_closed()
+        if closed and threading.current_thread() is status_worker:
+            call_soon_threadsafe(worker_completed.set)
+        return closed
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", close_aware_call_soon_threadsafe)
+    monkeypatch.setattr(loop, "is_closed", track_closed_status_worker)
+    close_control = server.control.close
+
+    async def track_shutdown() -> None:
+        shutdown_started.set()
+        await close_control()
+
+    monkeypatch.setattr(server.control, "close", track_shutdown)
+    try:
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "closing-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        writer.close()
+        await writer.wait_closed()
+        closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(shutdown_started.wait(), 10)
+        loop_closed = True
+        release.set()
+        await asyncio.wait_for(worker_completed.wait(), 10)
+        assert not worker_errors
+        loop_closed = False
+        await asyncio.wait_for(closing, 10)
+    finally:
+        loop_closed = False
+        release.set()
+        if closing is not None and not closing.done():
+            closing.cancel()
+            with suppress(asyncio.CancelledError):
+                await closing
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
+        await server.close()
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])
