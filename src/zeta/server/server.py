@@ -24,6 +24,7 @@ from . import (
     slash_commands,
 )
 from . import control as session_grants
+from .approval_lifecycle import ApprovalDecision
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
@@ -36,8 +37,11 @@ from .project_requests import (
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
+    Access,
     ErrorDescriptor,
     FrameCodec,
+    Handler,
+    MethodDescriptor,
     ProtocolError,
     _Frame,
     finish_frame_write,
@@ -68,6 +72,20 @@ LOADED_SESSION_MUTATIONS = frozenset(
     }
 )
 _DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
+
+
+async def _legacy_handler(
+    client: object, request_id: str | int, params: dict[str, Any]
+) -> object:
+    return await client._dispatch_legacy(request_id, client._current_method, params)  # type: ignore[attr-defined]
+
+
+HANDLERS: dict[MethodDescriptor, Handler] = {
+    descriptor: _legacy_handler for descriptor in MethodDescriptor
+}
+if HANDLERS.keys() != set(MethodDescriptor):
+    raise RuntimeError("serve method handlers are not exhaustive")
+_METHODS = {descriptor.wire: descriptor for descriptor in MethodDescriptor}
 
 
 class _UnixSocketListener:
@@ -550,6 +568,32 @@ class _Client:
         handled, result = await self._route_request(request_id, method, params)
         if handled:
             return result
+        descriptor = _METHODS.get(method)
+        if descriptor is None:
+            raise ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
+            )
+        if self.role == "observer" and descriptor.access is not Access.READ:
+            raise ProtocolError(
+                ErrorDescriptor.OBSERVER_READ_ONLY,
+                "method is unavailable to read-only observers",
+                {"method": method},
+            )
+        if descriptor.since == "1.1" and self.protocol_version == "1.0":
+            raise ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires protocol 1.1"
+            )
+        if descriptor.feature is not None and descriptor.feature not in self.features:
+            raise ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                f"{method} requires the negotiated {descriptor.feature} feature",
+            )
+        self._current_method = method
+        return await HANDLERS[descriptor](self, request_id, params)
+
+    async def _dispatch_legacy(
+        self, request_id: str | int, method: str, params: dict[str, Any]
+    ) -> object:
         if method in LOADED_SESSION_MUTATIONS and method not in _DELIVERY_MUTATIONS:
             self.server.control._reject_if_unhealthy()
         if method in login.REQUESTS:
@@ -710,8 +754,13 @@ class _Client:
                     ErrorDescriptor.INVALID_PARAMS,
                     "scope 'always_tool' requires approve",
                 )
+            decision = (
+                ApprovalDecision.APPROVE
+                if method == "approve"
+                else ApprovalDecision.DENY
+            )
             return await self.server.control.resolve_approval(
-                method, _required_string(params, "request_id"), scope
+                decision, _required_string(params, "request_id"), scope
             )
         if method == "abort":
             return await self.server.control.abort(
@@ -770,35 +819,11 @@ class _Client:
             max_role=self.max_role,
         )
         self.handshaken = True
-        requests = [
-            "list_sessions",
-            "new_session",
-            "resume",
-            "send",
-            "steer",
-            "approve",
-            "deny",
-            "abort",
-            "status",
-        ]
+        requests = MethodDescriptor.advertised(
+            self.protocol_version, self.features, role
+        )
         if extended:
-            requests += [
-                method
-                for method in ergonomics.EXTENSION_REQUESTS
-                if method != "content_read" or "content_read" in self.features
-            ]
-            requests += login.REQUESTS
-            if "ping" in self.features:
-                requests.append("ping")
             self.server.turn_contexts.add_request(requests, self.features)
-            if "projects" in self.features:
-                requests += PROJECT_REQUESTS
-            if "abort_scope" in self.features:
-                requests.append("clear_steering")
-            if "delivery_id" in self.features:
-                requests.append("delivery_status")
-            if session_grants.FEATURE in self.features:
-                requests += [session_grants.READ, session_grants.REVOKE]
         requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,

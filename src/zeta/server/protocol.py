@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
@@ -226,6 +226,100 @@ FEATURES = (
     "content_read",
     "session_grants",
 )
+
+
+class Access(StrEnum):
+    READ = "read"
+    CONTROLLER_READ = "controller_read"
+    SESSION_MUTATION = "session_mutation"
+    DELIVERY = "delivery"
+    CONTROLLER_WRITE = "controller_write"
+
+
+class MethodDescriptor(Enum):
+    """The single declaration of a served request's wire capability."""
+
+    LIST_SESSIONS = ("list_sessions", None, None, Access.READ)
+    NEW_SESSION = ("new_session", None, None, Access.CONTROLLER_WRITE)
+    RESUME = ("resume", None, None, Access.CONTROLLER_WRITE)
+    SEND = ("send", None, None, Access.DELIVERY)
+    STEER = ("steer", None, None, Access.DELIVERY)
+    APPROVE = ("approve", None, None, Access.CONTROLLER_WRITE)
+    DENY = ("deny", None, None, Access.CONTROLLER_WRITE)
+    ABORT = ("abort", None, None, Access.SESSION_MUTATION)
+    STATUS = ("status", None, None, Access.READ)
+    RENAME_SESSION = ("rename_session", "1.1", None, Access.CONTROLLER_WRITE)
+    DELETE_SESSION = ("delete_session", "1.1", None, Access.CONTROLLER_WRITE)
+    SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
+    SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
+    CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
+    SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
+    FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
+    MODEL_CATALOG = ("model_catalog", "1.1", None, Access.READ)
+    SESSION_SETTINGS = ("session_settings", "1.1", None, Access.READ)
+    SET_SETTINGS = ("set_settings", "1.1", None, Access.SESSION_MUTATION)
+    SET_COMPACTION = ("set_compaction", "1.1", None, Access.SESSION_MUTATION)
+    SEND_IMAGES = ("send_images", "1.1", None, Access.DELIVERY)
+    SLASH_LIST = ("slash_list", "1.1", None, Access.READ)
+    SLASH_RUN = ("slash_run", "1.1", None, Access.SESSION_MUTATION)
+    ACCOUNT_LIST = ("account_list", "1.1", None, Access.READ)
+    ACCOUNT_LOGOUT = ("account_logout", "1.1", None, Access.CONTROLLER_WRITE)
+    ACCOUNT_REFRESH = ("account_refresh", "1.1", None, Access.CONTROLLER_WRITE)
+    ACCOUNT_SWITCH = ("account_switch", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_START = ("login_start", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_STATUS = ("login_status", "1.1", None, Access.READ)
+    LOGIN_CANCEL = ("login_cancel", "1.1", None, Access.CONTROLLER_WRITE)
+    LOGIN_PROVIDERS = ("login_providers", "1.1", None, Access.READ)
+    PING = ("ping", "1.1", "ping", Access.READ)
+    SET_TURN_CONTEXT = (
+        "set_turn_context",
+        "1.1",
+        "turn_context",
+        Access.SESSION_MUTATION,
+    )
+    LIST_PROJECTS = ("list_projects", "1.1", "projects", Access.READ)
+    PROJECT_SHOW = ("project_show", "1.1", "projects", Access.READ)
+    PROJECT_MEMORY_LOG = ("project_memory_log", "1.1", "projects", Access.READ)
+    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_WRITE)
+    CLEAR_STEERING = ("clear_steering", None, "abort_scope", Access.SESSION_MUTATION)
+    DELIVERY_STATUS = ("delivery_status", None, "delivery_id", Access.READ)
+    SESSION_GRANTS = ("session_grants", "1.1", "session_grants", Access.READ)
+    REVOKE_SESSION_GRANTS = (
+        "revoke_session_grants",
+        "1.1",
+        "session_grants",
+        Access.SESSION_MUTATION,
+    )
+
+    def __init__(
+        self, wire: str, since: str | None, feature: str | None, access: Access
+    ) -> None:
+        if feature is not None and feature not in FEATURES:
+            raise ValueError(f"unknown method feature: {feature}")
+        self.wire, self.since, self.feature, self.access = wire, since, feature, access
+
+    @classmethod
+    def advertised(cls, version: str, features: frozenset[str], role: str) -> list[str]:
+        methods = [
+            item.wire
+            for item in cls
+            if (item.since is None or version != "1.0")
+            and (item.feature is None or item.feature in features)
+        ]
+        if role == "observer":
+            methods = sorted(
+                item.wire
+                for item in cls
+                if item.access is Access.READ
+                and (item.since is None or version != "1.0")
+                and (item.feature is None or item.feature in features)
+            )
+        return methods
+
+
+Handler = Callable[[object, str | int, dict[str, object]], object]
+
+
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128

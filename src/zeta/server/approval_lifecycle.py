@@ -7,6 +7,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Literal
 from uuid import uuid4
@@ -78,9 +79,14 @@ class Start:
     wire_event: EventDescriptor
 
 
+class ApprovalDecision(StrEnum):
+    APPROVE = "approve"
+    DENY = "deny"
+
+
 @dataclass(frozen=True, slots=True)
 class Decide:
-    method: str
+    method: ApprovalDecision
     request_id: str
     scope: str = "once"
 
@@ -677,7 +683,7 @@ class ApprovalLifecycle:
                     ErrorDescriptor.INVALID_PARAMS,
                     f"cannot always allow approval request: {exc}",
                 ) from exc
-        decision = "allow" if method == "approve" else "deny"
+        decision = "allow" if method is ApprovalDecision.APPROVE else "deny"
         record = self._reserve(record, decision)
         if record is None:
             raise ProtocolError(

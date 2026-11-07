@@ -30,6 +30,7 @@ from ..protocol.types import (
 )
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
+    ApprovalDecision,
     ApprovalKey,
     ApprovalLifecycle,
     BeginGrace,
@@ -375,7 +376,7 @@ class ServeControl:
         return self._approvals.cleanup_delegated(child_instance_id)
 
     async def resolve_approval(
-        self, method: str, request_id: str, scope: str = "once"
+        self, method: ApprovalDecision, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
         policy = self.server.runtime.policy
@@ -383,7 +384,7 @@ class ServeControl:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
-            Decide(method, request_id, scope)
+            Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
         added = tuple(sorted(map(str, policy.session_allow - grants_before)))
