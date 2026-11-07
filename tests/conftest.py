@@ -709,7 +709,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.memory.auto import AutoMemoryReconciler
     from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
-    from zeta.storage_format import StorageFormatError, open_writer
+    from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
@@ -744,12 +744,12 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         canonical = home.resolve()
         if canonical not in test_home_leases:
             result = []
-            error = []
+            error: list[BaseException] = []
 
             def open_test_writer() -> None:
                 try:
                     result.append(open_writer(home))
-                except StorageFormatError as exc:
+                except BaseException as exc:  # noqa: BLE001 - preserve thread errors
                     error.append(exc)
 
             thread = threading.Thread(target=open_test_writer)
@@ -789,10 +789,18 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager_init(manager, *args, **kwargs)
         managers.append(manager)
 
+    def on_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
     @wraps(project_registry_init)
     def tracked_project_registry_init(registry, *args, **kwargs):
-        root = Path(args[0] if args else kwargs["root"])
-        ensure_format(root.parent)
+        if on_event_loop():
+            root = Path(args[0] if args else kwargs["root"])
+            ensure_format(root.parent)
         project_registry_init(registry, *args, **kwargs)
 
     @wraps(account_store_init)
