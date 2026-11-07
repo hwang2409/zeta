@@ -126,7 +126,8 @@ async def test_management_close_propagates_outer_cancellation(
     tmp_path: Path,
 ) -> None:
     manager = service(tmp_path)
-    transaction = asyncio.create_task(asyncio.Event().wait())
+    transaction_event = asyncio.Event()
+    transaction = asyncio.create_task(asyncio.wait_for(transaction_event.wait(), 10))
     manager._transaction_task = transaction
     closing = asyncio.create_task(manager.aclose())
     try:
