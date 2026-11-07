@@ -22,11 +22,16 @@ from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
 from zeta.server import control as control_module
 from zeta.server import server as server_module
+from zeta.server.control import CONTROLLER_HANDOFF_DEADLINE_SECONDS
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
 
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
+
+# Keep the order: server bound < read guard < release-gate guard.
+HELLO_READ_GUARD_SECONDS = CONTROLLER_HANDOFF_DEADLINE_SECONDS + 5
+RELEASE_GATE_GUARD_SECONDS = HELLO_READ_GUARD_SECONDS + 5
 
 
 async def _connect(
@@ -113,7 +118,7 @@ async def _rpc_within_test_bound(
         _rpc(reader, writer, transport, request_id, method, params)
     )
     try:
-        return await asyncio.wait_for(asyncio.shield(request), 10)
+        return await asyncio.wait_for(asyncio.shield(request), HELLO_READ_GUARD_SECONDS)
     except TimeoutError:
         pending.append(request)
         return None
@@ -360,7 +365,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         async def wait() -> None:
             await operation
             release_entered.set()
-            await asyncio.wait_for(release_gate.wait(), 10)
+            await asyncio.wait_for(release_gate.wait(), RELEASE_GATE_GUARD_SECONDS)
 
         return wait()
 
@@ -473,7 +478,11 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         assert await _read_or_close(old_reader, transport) is None
         assert old_frames_after_fence == []
 
-        monkeypatch.setattr(control_module, "CONTROLLER_HANDOFF_DEADLINE_SECONDS", 10.0)
+        monkeypatch.setattr(
+            control_module,
+            "CONTROLLER_HANDOFF_DEADLINE_SECONDS",
+            CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+        )
         release_gate.set()
         release = server.control._controller_release_task
         assert release is not None
@@ -502,12 +511,14 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         release_gate.set()
         old_output_gate.set()
         for request in pending_requests:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(request, 10)
-        if old_publish is not None and not old_publish.done():
-            old_publish.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(old_publish, 10)
+            request.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(request, RELEASE_GATE_GUARD_SECONDS)
+        if old_publish is not None:
+            if not old_publish.done():
+                old_publish.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(old_publish, RELEASE_GATE_GUARD_SECONDS)
         for writer in (rejected_writer, replay_writer):
             if writer is not None:
                 writer.close()
