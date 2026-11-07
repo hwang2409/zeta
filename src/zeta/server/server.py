@@ -1045,7 +1045,11 @@ def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
     }
     if owner:
         data["owner"] = owner
-    return ProtocolError(-32004, "session is active in another zeta process", data)
+    return ProtocolError(
+        ErrorDescriptor.OPERATION_BUSY,
+        "session is active in another zeta process",
+        data,
+    )
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
