@@ -14,9 +14,12 @@ from .anthropic import (
 from .anthropic import (
     exchange_authorization_code as exchange_anthropic_authorization_code,
 )
+from .anthropic_errors import AnthropicAuthError, AnthropicHTTPError
 from .auth import OAuthTokens, build_pkce_parameters
 from .codex import (
     DEFAULT_CODEX_REDIRECT_URI,
+    CodexAuthError,
+    CodexHTTPError,
     extract_account_id,
 )
 from .codex import (
@@ -26,6 +29,13 @@ from .codex import (
     exchange_authorization_code as exchange_codex_authorization_code,
 )
 from .factory import credential_store
+
+LOGIN_PROVIDER_ERRORS = (
+    AnthropicAuthError,
+    AnthropicHTTPError,
+    CodexAuthError,
+    CodexHTTPError,
+)
 
 
 def pkce_values() -> tuple[str, str, str]:

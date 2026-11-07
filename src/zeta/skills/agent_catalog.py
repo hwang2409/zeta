@@ -28,21 +28,6 @@ _CLAUDE_TOOL_NAMES = {
     "WebSearch": "websearch",
     "TodoWrite": "todo",
 }
-_ZETA_TOOL_NAMES = frozenset(
-    {
-        "agent",
-        "agent_output",
-        "agent_status",
-        "bash",
-        "edit",
-        "fetch",
-        "read",
-        "skill",
-        "todo",
-        "websearch",
-        "write",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,9 +149,7 @@ def _agents_dir(root: Path) -> Path:
     return root / "agents"
 
 
-def _parse_tools(
-    value: object, path: Path, notices: list[str] | None
-) -> frozenset[str] | None:
+def _parse_tools(value: object, path: Path) -> frozenset[str] | None:
     if value is None:
         return None
     if type(value) is str:
@@ -178,22 +161,7 @@ def _parse_tools(
     if not names or any(not name for name in names):
         raise ValueError(f"agent {path} frontmatter tools must contain names")
 
-    supported: set[str] = set()
-    for name in names:
-        zeta_name = _CLAUDE_TOOL_NAMES.get(name)
-        if zeta_name is None and name in _ZETA_TOOL_NAMES:
-            zeta_name = name
-        if zeta_name is None:
-            notice = warn_discovery(
-                path,
-                f"unknown tool name {name!r}; skipped from allowlist",
-                "agent",
-            )
-            if notices is not None:
-                notices.append(notice)
-            continue
-        supported.add(zeta_name)
-    return frozenset(supported)
+    return frozenset(_CLAUDE_TOOL_NAMES.get(name, name) for name in names)
 
 
 def _build_agent(
@@ -233,7 +201,7 @@ def _build_agent(
     assert isinstance(description, str)
     return AgentPreset(
         name=name,
-        tool_names=_parse_tools(metadata.get("tools"), document.path, notices),
+        tool_names=_parse_tools(metadata.get("tools"), document.path),
         preamble="",
         prompt_suffix=document.body,
         selection_guidance=description,
