@@ -42,6 +42,7 @@ from .background_task_types import (
     BackgroundTaskNoticeSinkValue,
     BackgroundTaskShutdownNotice,
     TaskExitInput,
+    deliver_shutdown_task_exit,
 )
 from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
@@ -56,7 +57,6 @@ BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 OUTPUT_CUTOFF_NOTE = "background output was cut off because a process outside the task still held its output"
-SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -730,23 +730,13 @@ class BackgroundTaskRegistry:
                 await self._commit_notice(shutdown_notice)
             for record in notified_records:
                 record.notify_on_exit = True
-                try:
-                    await finish(
-                        asyncio.wait_for(
-                            self._notify_terminal_exit(
-                                record,
-                                delivery_deadline=(
-                                    time.monotonic()
-                                    + SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS
-                                ),
-                            ),
-                            timeout=SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS,
+                await finish(
+                    deliver_shutdown_task_exit(
+                        lambda deadline, record=record: self._notify_terminal_exit(
+                            record, delivery_deadline=deadline
                         )
                     )
-                except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        "shutdown delivery admission timed out"
-                    ) from exc
+                )
             if self._start_cleanup_error is not None:
                 raise self._start_cleanup_error
             self._closing = False
@@ -1115,12 +1105,7 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    async def _notify_terminal_exit(
-        self,
-        record: _BackgroundRecord,
-        *,
-        delivery_deadline: float | None = None,
-    ) -> None:
+    async def _notify_terminal_exit(self, record: _BackgroundRecord, delivery_deadline: float | None = None) -> None:
         if not record.notify_on_exit:
             return
         await self._notify_exit(

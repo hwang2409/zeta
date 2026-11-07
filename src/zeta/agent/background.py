@@ -29,6 +29,7 @@ from .receipt import (
     agent_stats,
     build_agent_receipt,
     build_explicit_finish_receipt,
+    child_cleanup_details,
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
@@ -1029,8 +1030,7 @@ async def finish_background_child(
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
-    result: dict[str, object] = {}
-    close_cause = "background child completion cleanup"
+    close_cause, _ = child_cleanup_details("background", False)
     try:
         try:
             result = await child_task
@@ -1078,9 +1078,7 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        result_structured = (
-            result.get("structuredContent", {}) if isinstance(result, dict) else {}
-        )
+        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
         turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
         if (
             child_loop is not None
@@ -1092,14 +1090,9 @@ async def finish_background_child(
             )
         ):
             from .finish_gate import await_owned_work
-
             await await_owned_work(child_loop, finish_gate_state)
-        # Admission has ended. Closing now can only kill tasks whose safety
-        # deadline expired; direct children remain live for durable transfer.
-        close_cause = (
-            "background child cancellation cleanup"
-            if status == "canceled"
-            else "background child completion cleanup"
+        close_cause, close_event = child_cleanup_details(
+            "background", status == "canceled"
         )
         killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
@@ -1109,9 +1102,6 @@ async def finish_background_child(
         killed_task_ids_truncated = len(killed_tasks) > len(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
-        close_event = (
-            "child cancellation" if status == "canceled" else "child completion"
-        )
         killed_task_notice = (
             f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
             + ", ".join(
