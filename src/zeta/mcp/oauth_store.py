@@ -276,11 +276,12 @@ class MCPCredentialStore:
     def _load_transaction(
         self, name: str, operation: CredentialOperation
     ) -> CredentialSnapshot:
-        lock_fd = self._lock(name, operation, exclusive=False)
-        try:
-            return self._read_locked(name, operation)
-        finally:
-            self._unlock(lock_fd)
+        with open_writer(self._home_root()):
+            lock_fd = self._lock(name, operation, exclusive=False)
+            try:
+                return self._read_locked(name, operation)
+            finally:
+                self._unlock(lock_fd)
 
     def _read_locked(
         self, name: str, operation: CredentialOperation
