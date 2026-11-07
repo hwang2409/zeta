@@ -15,11 +15,28 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from ..storage_format import reject_unknown_keys
 
 DIGEST_LIMIT = 440
 WORKFLOW_MESSAGE_LIMIT = 4
 RECEIPT_KIND_METADATA = "eviction_receipt"
 RECEIPT_FIELDS_METADATA = "eviction_receipt_fields"
+
+
+def _valid_persisted_reasoning_receipt_metadata(value: Mapping[str, object]) -> bool:
+    try:
+        reject_unknown_keys(value, "eviction_reasoning_receipt_metadata")
+    except ValueError:
+        return False
+    return set(value) == {"context_evicted", "source_seq"}
+
+
+def _valid_persisted_reasoning_receipt_metadata(value: Mapping[str, object]) -> bool:
+    try:
+        reject_unknown_keys(value, "eviction_reasoning_receipt_metadata")
+    except ValueError:
+        return False
+    return set(value) == {"context_evicted", "source_seq"}
 
 
 def _persisted_reasoning_receipt(
@@ -31,7 +48,7 @@ def _persisted_reasoning_receipt(
     if (
         message.role is not MessageRole.ASSISTANT
         or message.tool_result is not None
-        or set(message.metadata) != {"context_evicted", "source_seq"}
+        or not _valid_persisted_reasoning_receipt_metadata(message.metadata)
         or message.metadata.get("context_evicted") is not True
         or type(message.metadata.get("source_seq")) is not int
         or message.metadata.get("source_seq") != seq

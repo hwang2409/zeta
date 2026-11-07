@@ -59,7 +59,10 @@ def validate_terminal_transition_data(data: Mapping[str, Any]) -> None:
     """Validate one durable finish-or-cancel fence winner."""
     action = data.get("action")
     report = data.get("report")
-    reject_unknown_keys(data, "response_action_report" if "report" in data else "response_action")
+    if "report" in data:
+        reject_unknown_keys(data, "response_action_report")
+    else:
+        reject_unknown_keys(data, "response_action")
     if isinstance(report, dict):
         reject_unknown_keys(report, "response_report")
     if action not in {"finish", "cancel"}:

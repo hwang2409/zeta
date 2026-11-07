@@ -43,6 +43,7 @@ from ..storage_format import (
     DeleteValue,
     SetValue,
     open_writer,
+    reject_unknown_keys,
     require_closed_variant,
 )
 from .files import (
@@ -1156,9 +1157,10 @@ def _read_publication_pending(directory_fd: int) -> dict[str, str] | None:
         return None
     try:
         value = json.loads(raw)
+        if isinstance(value, Mapping):
+            reject_unknown_keys(value, "account_publication_marker")
         if (
             not isinstance(value, Mapping)
-            or set(value) != {"provider", "name", "sha256"}
             or require_closed_variant("account.provider", value["provider"])
             != value["provider"]
             or not isinstance(value["name"], str)

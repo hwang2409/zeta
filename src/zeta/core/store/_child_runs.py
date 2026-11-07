@@ -6,6 +6,8 @@ import re
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from ...storage_format import reject_unknown_keys
+
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
@@ -40,14 +42,16 @@ def parse_child_run_id(parent_session_id: str, run_id: str) -> tuple[int, str | 
 
 def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
     """Validate the bounded internal start-row payload."""
+    reject_unknown_keys(data, "child_run")
+    reject_unknown_keys(data, "child_run")
+    reject_unknown_keys(data, "child_run")
     run_id = data.get("run_id")
     parent_run_id = data.get("parent_run_id")
     name = data.get("name")
     task = data.get("task")
     started_at = data.get("started_at")
     if (
-        set(data) - {"run_id", "parent_run_id", "name", "task", "started_at"}
-        or type(run_id) is not str
+        type(run_id) is not str
         or not run_id
         or len(run_id.encode("utf-8")) > _MAX_RUN_ID_BYTES
         or type(parent_run_id) not in {str, type(None)}

@@ -38,6 +38,38 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
 # Persisted mappings that reject unknown keys.  Names are wire-shape names, not
 # Python type names, so a conditional variant can be compared independently.
 ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
+    "hook_config": frozenset({"hook"}),
+    "hook_record": frozenset({"event", "command", "timeout_seconds", "tools", "on_error"}),
+    "notification_marker": frozenset({"notification_id"}),
+    "turn_history": frozenset({"turn_id", "reason"}),
+    "prompt_component": frozenset({"offset", "length", "digest"}),
+    "approval_fact": frozenset({"action"}),
+    "approval_display": frozenset({"effective_cwd", "resolved_path", "utf8_bytes"}),
+    "child_run": frozenset({"run_id", "parent_run_id", "name", "task", "started_at"}),
+    "pending_queue_closed": frozenset(),
+    "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
+    "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),
+    "fact_floor_root": frozenset({"version", "oldest", "newest"}),
+    "fact_floor_aggregate": frozenset({"fact", "first_seq", "last_seq", "value_rank"}),
+    "fact_pr": frozenset({"type", "pr"}),
+    "fact_pr_verdict": frozenset({"type", "pr", "verdict"}),
+    "fact_pr_head": frozenset({"type", "pr", "sha"}),
+    "fact_child_status": frozenset({"type", "handle", "status"}),
+    "fact_child_head": frozenset({"type", "handle", "sha"}),
+    "storage_manifest": frozenset({"writer_epoch"}),
+    "project_session_reference": frozenset({"session_id", "transcript_path", "role", "parent_session_id", "recorded_at"}),
+    "remote_memory_sync_state": frozenset({"schema", "project_id", "files", "conflicts"}),
+    "remote_memory_sync_conflict": frozenset({"digests"}),
+    "entry_sync_state": frozenset({"schema", "project_id", "format", "entries", "schema_digest", "conflicts", "transition"}),
+    "entry_sync_schema_conflict": frozenset({"kind", "digests"}),
+    "entry_sync_entry_conflict": frozenset({"kind", "entry_ids", "digests"}),
+    "entry_sync_transition": frozenset({"id", "previous_state", "resolutions", "candidates"}),
+    "entry_sync_schema_resolution_candidate": frozenset({"kind", "local", "remote", "prepared"}),
+    "entry_sync_entry_resolution_candidate": frozenset({"kind", "entry_ids", "local", "remote", "prepared"}),
+    "account_publication_marker": frozenset({"provider", "name", "sha256"}),
+    "memory_history_provenance": frozenset({"session_id", "seq_start", "seq_end", "fragment_start", "fragment_end", "model", "usage"}),
+    "entry_memory_snapshot_reference": frozenset({"state"}),
+    "eviction_reasoning_receipt_metadata": frozenset({"context_evicted", "source_seq"}),
     'todo_item': frozenset({'content', 'status'}),
     'response_action': frozenset({'action'}),
     'response_action_report': frozenset({'action', 'report'}),
@@ -325,12 +357,9 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         decoder = json.JSONDecoder()
         text = raw.decode()
         value, end = decoder.raw_decode(text)
-        if (
-            text[end:].strip()
-            or type(value) is not dict
-            or set(value) != {"writer_epoch"}
-        ):
+        if text[end:].strip() or type(value) is not dict:
             raise ValueError
+        reject_unknown_keys(value, "storage_manifest")
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError

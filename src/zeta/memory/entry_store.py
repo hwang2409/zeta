@@ -520,21 +520,24 @@ def state_digest(state: MemoryState) -> str:
     return hashlib.sha256(canonical_state_bytes(state)).hexdigest()
 
 
-_FORMAT_SHAPES = {
-    "format-2 memory state": "memory_state_root",
-    "memory schema": "memory_schema",
-    "memory kind": "memory_kind",
-    "memory entry": "memory_entry",
-    "missing memory entry": "memory_missing_entry",
-    "memory entry source": "memory_source",
-    "memory entry migration source": "memory_migration_source",
-    "memory operation receipt": "memory_operation_receipt",
-}
-
-
 def _exact_dict(value: object, fields: set[str], label: str) -> dict[str, Any]:
-    if isinstance(value, dict) and label in _FORMAT_SHAPES:
-        reject_unknown_keys(value, _FORMAT_SHAPES[label])
+    if isinstance(value, dict):
+        if label == "format-2 memory state":
+            reject_unknown_keys(value, "memory_state_root")
+        elif label == "memory schema":
+            reject_unknown_keys(value, "memory_schema")
+        elif label == "memory kind":
+            reject_unknown_keys(value, "memory_kind")
+        elif label == "memory entry":
+            reject_unknown_keys(value, "memory_entry")
+        elif label == "missing memory entry":
+            reject_unknown_keys(value, "memory_missing_entry")
+        elif label == "memory entry source":
+            reject_unknown_keys(value, "memory_source")
+        elif label == "memory entry migration source":
+            reject_unknown_keys(value, "memory_migration_source")
+        elif label == "memory operation receipt":
+            reject_unknown_keys(value, "memory_operation_receipt")
     if not isinstance(value, dict) or set(value) != fields:
         _fail(f"invalid {label}")
     return value
