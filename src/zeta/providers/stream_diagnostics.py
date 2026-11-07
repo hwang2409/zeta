@@ -152,7 +152,7 @@ class StreamDiagnostics:
                 "stage": stage,
                 "resource": stage,
                 "index": index,
-                "exception_type": exception_type,
+                "exception": exception_type,
                 "primary_outcome": primary_outcome,
                 "cancelled": primary_outcome == "cancelled",
             },

@@ -335,7 +335,7 @@ async def test_cleanup_diagnostic_is_secret_safe_and_written_off_loop(
     record = json.loads(raw_record)
     assert "cleanup-secret-canary" not in raw_record
     assert "primary-provider-secret-canary" not in raw_record
-    assert record["exception_type"] == "builtins.RuntimeError"
+    assert record["exception"] == "builtins.RuntimeError"
     assert record["stage"] == "client"
     assert record["index"] == 0
     assert record["primary_outcome"] == "error"
