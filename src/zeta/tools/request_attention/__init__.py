@@ -43,6 +43,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "request_attention",
         _request_attention,
+        binding="shared",
         description=(
             "Use once when a decision only the user can make is pending; then continue "
             "other work. Do not repeat that you are waiting on the user. Write why "
