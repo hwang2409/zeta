@@ -38,6 +38,12 @@ from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, Scripte
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
+    assert_event_order,
+    event_owner,
+    frames_for_call,
+    read_until,
+)
+from tests.support.server_client import (
     event as _buffered_event,
 )
 from tests.support.server_client import (
@@ -10642,12 +10648,44 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         ConversationStore, "append_approval_history_async", fail_terminal_history
     )
     reader, writer = await _ready(server)
+    assert server.connections is not None
+    parent_tool_ended = asyncio.Event()
+    release_parent_turn = asyncio.Event()
+    parent_session_id = server.runtime.session_id
+    publish_controller = server.connections.publish_controller
+
+    async def force_parent_tool_end_first(event, session_id, **fields):
+        if failure == "cancelled" and event == "approval_end":
+            await asyncio.wait_for(parent_tool_ended.wait(), timeout=10)
+        if (
+            failure == "cancelled"
+            and event == "turn_start"
+            and session_id == parent_session_id
+            and parent_tool_ended.is_set()
+        ):
+            await asyncio.wait_for(release_parent_turn.wait(), timeout=10)
+        published = await publish_controller(event, session_id, **fields)
+        tool_call = fields.get("tool_call") or {}
+        if event == "tool_end" and tool_call.get("id") == agent.id:
+            parent_tool_ended.set()
+        return published
+
+    # test-contract: seam no public event exposes controller admission order
+    monkeypatch.setattr(
+        server.connections, "publish_controller", force_parent_tool_end_first
+    )
     frames: list[dict[str, Any]] = []
     try:
         async with asyncio.timeout(10):
             await _request(reader, writer, 3, "send", {"text": "delegate"})
-            while not _named_events(frames, "approval_request"):
-                frames.append(await _read(reader))
+            frames += await read_until(
+                reader,
+                lambda frame: (
+                    frame.get("params", {}).get("event") == "approval_request"
+                    and frame["params"]["tool_call"]["id"] == child_call.id
+                ),
+                what=f"approval_request for {child_call.id}",
+            )
             approval = _named_events(frames, "approval_request")[0]
             assert approval["delegated"] is True
             writer.write(
@@ -10664,7 +10702,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 ).encode()
             )
             await writer.drain()
-            await history_write_started.wait()
+            await asyncio.wait_for(history_write_started.wait(), timeout=10)
             settlement = None
             if failure == "cancelled":
                 record = server.control._approvals.state.records[
@@ -10673,23 +10711,33 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
-            while not _named_events(frames, "approval_end"):
-                frames.append(await _read(reader))
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_start = max(
-                index for index, name in enumerate(names) if name == "turn_start"
+            approval_owner = (
+                "approval_end",
+                approval["session_id"],
+                approval["request_id"],
             )
-            approval_end = names.index("approval_end")
-            assert len(_named_events(frames, "approval_end")) == 1
-            assert child_start < approval_end
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == approval_owner,
+                what=f"approval_end for {approval['request_id']}",
+            )
+            assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 with pytest.raises(asyncio.CancelledError):
-                    await settlement
+                    await asyncio.wait_for(settlement, timeout=10)
             else:
-                while not _named_events(frames, "error"):
-                    frames.append(await _read(reader))
+                frames += await read_until(
+                    reader,
+                    lambda frame: frame.get("params", {}).get("event") == "error",
+                    what="approval persistence error",
+                )
                 error = _named_events(frames, "error")[0]
+                approval_end = next(
+                    index
+                    for index, frame in enumerate(frames)
+                    if event_owner(frame) == approval_owner
+                )
                 names = [frame.get("params", {}).get("event") for frame in frames]
                 assert approval_end < names.index("error")
                 assert error["error"] == {
@@ -10703,16 +10751,25 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 health = server.control._approvals.state.health
                 assert health is not None
                 assert health.code == "approval_persistence_failed"
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_terminals = [
-                index
-                for index, name in enumerate(names)
-                if index > child_start and name in {"tool_end", "turn_end"}
-            ]
-            assert all(approval_end < index for index in child_terminals)
+            child_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                child_call.id,
+            )
+            parent_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                agent.id,
+            )
+            # test-contract: seam exact lifecycle order is the protocol contract
+            assert_event_order(frames, parent_tool_owner, approval_owner)
+            if any(event_owner(frame) == child_tool_owner for frame in frames):
+                assert_event_order(frames, approval_owner, child_tool_owner)
             assert key not in server.control._approvals.state.records
+            release_parent_turn.set()
     finally:
         history_release.set()
+        release_parent_turn.set()
         await asyncio.wait_for(_close(server, writer), timeout=10)
 
 
