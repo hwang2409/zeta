@@ -18,6 +18,7 @@ import pytest
 from rich.console import Console
 
 import zeta.agent.background as agent_background_module
+import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
@@ -10695,13 +10696,13 @@ async def test_agent_cwd_sets_child_bash_session_cwd(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     loop_thread = threading.get_ident()
     discovery_threads: list[int] = []
-    real_discover = agent_runner_module.discover_project
+    real_discover = child_context_module.discover_project
 
     def discover_project(*args: object, **kwargs: object):
         discovery_threads.append(threading.get_ident())
         return real_discover(*args, **kwargs)
 
-    monkeypatch.setattr(agent_runner_module, "discover_project", discover_project)
+    monkeypatch.setattr(child_context_module, "discover_project", discover_project)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
