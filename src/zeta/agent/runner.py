@@ -189,7 +189,11 @@ async def consume_child(
         return child_loop._background_owner.owned_running(instance_id)
 
     def owned_tasks() -> tuple[tuple[str, str], ...]:
-        return FinishGateState.owned_tasks(child_loop)
+        return tuple(
+            (task.task_id, task.headline)
+            for task in child_loop.tool_registry.background_tasks.snapshot()
+            if task.running
+        )
 
     try:
         if notification_turn:
@@ -241,6 +245,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if gate_result.outcome == "task_safety_expired":
+                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
