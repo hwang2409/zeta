@@ -1541,8 +1541,7 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
         store = server.runtime.opened.store
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
-        reopened = SessionManager(tmp_path).open(session_id).store
-        assert "reason" not in reopened.entries[-1].data
+        assert "reason" not in store.entries[-1].data
 
         history = (
             await _request(
@@ -2510,7 +2509,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    child_store = ConversationStore(tmp_path / "delegated-child")
+    child_store = await asyncio.to_thread(ConversationStore, tmp_path / "delegated-child")
     child_task: asyncio.Task[None] | None = None
     try:
         await _request(
@@ -3190,7 +3189,11 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    messages = server.runtime.manager.open(session_id).store.messages()
+    reopened = await asyncio.to_thread(
+        server.runtime.manager.open, session_id, _read_only=True
+    )
+    messages = reopened.store.messages()
+    reopened.store.close()
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -3231,8 +3234,8 @@ def test_delegated_approval_wire_keys_are_unique(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_reused_core_key_gets_fresh_wire_id_after_end(tmp_path: Path) -> None:
-    approvals = _bare_approval_lifecycle(tmp_path)
-    store = ConversationStore(tmp_path / "child")
+    approvals = await asyncio.to_thread(_bare_approval_lifecycle, tmp_path)
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "child")
     tool_call = ToolCall("same", "read", {"path": "x"})
     request = ApprovalRequest("same", tool_call, child_instance_id="child")
     store.append_message_with_approval_requests(
@@ -3414,7 +3417,7 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
-    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
+    policy = ApprovalPolicy(store=await asyncio.to_thread(ConversationStore, tmp_path))
     client = ServeControl(
         SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
@@ -3993,8 +3996,9 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         assert sum(branch["current"] for branch in branches) == 1
         restored = (await rpc("session_history"))["result"]["messages"]
         assert restored == history["messages"]
-        reopened = SessionManager(tmp_path).open(sid)
+        reopened = await asyncio.to_thread(SessionManager(tmp_path).open, sid, _read_only=True)
         assert [m.to_dict() for m in reopened.store.messages()] == [m.to_dict() for m in server.runtime.loop.store.messages()]
+        reopened.store.close()
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
         await _close(server, writer)
@@ -4692,7 +4696,9 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
         history = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]["result"]["messages"]
         assert history[0]["content"][1] == {"type": "attachment", "name": "test.png", "size": len(png)}
         assert "data" not in history[0]["content"][1]
-        assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
+        reopened = await asyncio.to_thread(SessionManager(tmp_path).open, sid, _read_only=True)
+        assert reopened.store.messages()[0] == message
+        reopened.store.close()
     finally:
         await _close(server, writer)
 
@@ -4813,14 +4819,16 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
             assert runtime.loop.backend.model == "gpt-5.6-luna"
             assert runtime.loop.context_assembler.token_budget == old_budget
             assert runtime.policy.default.value == "ask"
-            assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
+            persisted = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+            assert persisted.to_dict() == metadata_before
         else:
             assert response["result"] == {"model": "gpt-5.6-sol", "approval_mode": "deny"}
             expected_budget = 123456 if pinned else 400_000
             assert runtime.loop.context_assembler.token_budget == expected_budget
             assert runtime.metadata.compaction_budget == expected_budget
             assert runtime.metadata.budget_pinned == pinned
-            assert SessionManager(tmp_path).open(sid).metadata.compaction_budget == expected_budget
+            persisted = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+            assert persisted.compaction_budget == expected_budget
             await _request(reader, writer, "resume", "resume", {"session_id": sid})
             assert runtime.loop.context_assembler.token_budget == expected_budget
     finally:
@@ -5036,7 +5044,8 @@ async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, mon
         if failure:
             assert response["error"]["code"] == -32000
             assert runtime.metadata.to_dict() == metadata_before
-            assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
+            persisted = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+            assert persisted.to_dict() == metadata_before
             assert loop.backend is backend
             assert loop.context_assembler.backend is backend
             assert loop.context_assembler.token_budget == budget_before
@@ -5212,6 +5221,7 @@ async def test_session_listing_includes_real_and_removed_provider_sessions(
             manager.create, provider=provider, model=model, cwd=tmp_path
         )
         sessions[provider] = opened.metadata.session_id
+        opened.store.close()
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -5346,9 +5356,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
-        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
+        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -5440,9 +5450,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
-    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
+    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -5526,7 +5536,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         assert f"Model reverted to {start_model} ({start_provider})" in failure["error"]["message"]
         assert detail in failure["error"]["message"]
         await _event(reader, "agent_end")
-        metadata = SessionManager(tmp_path).open(sid).metadata
+        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
         assert (metadata.provider, metadata.model) == (start_provider, start_model)
         assert metadata.model_fallback is None
         assert metadata.compaction_budget == old_budget
@@ -5596,7 +5606,8 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _request(reader, writer, 4, "send", {"text": "confirm selection"})
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
-        assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
+        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+        assert metadata.model_fallback is None
         await server.control._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
                             session_id=sid)
         await _event(reader, "error")
@@ -5749,7 +5760,8 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
                 "session_id": sid, "model": model, "approval_mode": "ask",
             })
         assert server.runtime.metadata.model_fallback is None
-        assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
+        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+        assert metadata.model_fallback is None
         await _request(reader, writer, 4, "send", {"text": "try returned selection"})
         failure = (await _event(reader, "error"))["error"]
         assert failure == {"code": "model_access_error", "message": "Access denied"}
@@ -5856,7 +5868,7 @@ async def test_stream_access_error_restores_model_over_wire(tmp_path, provider, 
         assert failure["code"] == "model_reverted"
         await _event(reader, "agent_end")
         assert server.runtime.model == original
-        metadata = SessionManager(tmp_path).open(sid).metadata
+        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
         assert (metadata.provider, metadata.model) == (provider, original)
         assert metadata.model_fallback is None
         await _request(reader, writer, 5, "send", {"text": "try fallback"})
@@ -6006,10 +6018,13 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         assert row["name"] == ""
         assert row["first_message_preview"] == "original preview"
         # An external open store blocks RPC deletion even with no active server session.
-        with SessionManager(tmp_path).open(sid).store:
+        external = await asyncio.to_thread(SessionManager(tmp_path).open, sid)
+        try:
             error = (await _request(reader, writer, 5, "delete_session", {"session_id": sid}))[-1]["error"]
             assert "in use" in error["message"]
             assert (tmp_path / "sessions" / sid).exists()
+        finally:
+            external.store.close()
         assert (await _request(reader, writer, 5, "delete_session", {"session_id": sid}))[-1]["result"] == {"session_id": sid}
         assert not (tmp_path / "sessions" / sid).exists()
         assert all(row["session_id"] != sid for row in (await _request(reader, writer, 6, "list_sessions"))[-1]["result"]["sessions"])
@@ -6029,7 +6044,8 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
     try:
         sid = server.runtime.session_id
         await asyncio.to_thread(
-            server.runtime.manager.rename, sid, "private display name"
+            server.runtime.manager.rename, sid, "private display name",
+            server.runtime.opened.store.execution_lease,
         )
         for method, params in (("rename_session", {"name": "changed"}), ("delete_session", {})):
             result = (await _request(reader, writer, 3, method, {"session_id": sid, **params}))[-1]
