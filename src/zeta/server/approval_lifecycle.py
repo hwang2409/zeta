@@ -830,11 +830,14 @@ class ApprovalLifecycle:
         if not owns_record:
             return (resolution, None) if return_grant_change else resolution
         grant_change: SessionGrantChange | None = None
-        if grant is not None and resolution["decision"] == "allow":
-            if policy is not None:
-                rule = policy.remember_allow(grant)
-                if grant_before is not None and rule not in grant_before:
-                    grant_change = session_grant_change(policy, "grant", (str(rule),))
+        if (
+            grant is not None
+            and resolution["decision"] == "allow"
+            and policy is not None
+        ):
+            rule = policy.remember_allow(grant)
+            if grant_before is not None and rule not in grant_before:
+                grant_change = session_grant_change(policy, "grant", (str(rule),))
         await self._finish_record(record, resolution)
         return (resolution, grant_change) if return_grant_change else resolution
 
