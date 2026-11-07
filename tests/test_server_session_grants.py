@@ -1067,7 +1067,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         monkeypatch.setattr(server.connections, "release", release)
         writer.close()
         await writer.wait_closed()
-        await released.wait()
+        await asyncio.wait_for(released.wait(), TIMEOUT)
 
         replacement_reader, replacement_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
