@@ -54,7 +54,11 @@ class TranscriptLoadError(ConversationIntegrityError):
             "orphaned_root": "orphaned root",
             "invalid_sequence": "non-monotonic conversation sequence",
             "header_session_mismatch": "conversation header session id mismatch",
-            "invalid_json": "terminated invalid conversation row",
+            "invalid_json": (
+                "terminated invalid conversation row"
+                if kind == "invalid_row"
+                else kind.replace("_", " ")
+            ),
         }.get(reason_code)
         label = detail or kind.replace("_", " ")
         super().__init__(f"transcript {label}{location} (session {session_id})")
