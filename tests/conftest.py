@@ -44,9 +44,11 @@ run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 def pytest_sessionstart(session: pytest.Session) -> None:
     if not _IS_REPOSITORY_TESTS:
         return
+    root = Path(str(session.config.rootpath)).resolve()
+    if root != _REPOSITORY_ROOT:
+        return
     import zeta
 
-    root = Path(str(session.config.rootpath)).resolve()
     imported = Path(zeta.__file__).resolve()
     source = (root / "src").resolve()
     if not imported.is_relative_to(source):
