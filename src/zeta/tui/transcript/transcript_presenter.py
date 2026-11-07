@@ -48,6 +48,7 @@ class TranscriptPresenter:
         self._full_screen_active = full_screen_active
         self._print_callback = print_callback
         self._agent_identities = AgentIdentityIndex(agent_markers)
+        self.transcript.set_agent_identity_index(self._agent_identities)
         self._printed_units = False
         self._active_tool_calls: set[ToolLifecycleKey] = set()
         self._background_tool_ids: set[ToolLifecycleKey] = set()
@@ -434,7 +435,7 @@ class TranscriptPresenter:
                 and lifecycle_key is not None
             ):
                 self._tool_region_units[lifecycle_key] = _ToolUnit(
-                    event.tool_call, rendered, event
+                    event.tool_call, rendered, event, self._agent_identities
                 )
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:

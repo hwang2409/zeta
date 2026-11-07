@@ -42,6 +42,7 @@ from .transcript_search import (
 )
 
 if TYPE_CHECKING:
+    from ..cards.agent_message import AgentIdentityIndex
     from .message_finder import MessageFinder
     from .transcript_finder import _FinderRestore
 
@@ -96,12 +97,13 @@ class _ToolUnit:
         call: ToolCall,
         initial: RenderableType,
         start_event: StreamEvent | None = None,
+        agent_identities: AgentIdentityIndex | None = None,
     ) -> None:
         self.call = call
         self.output: list[str] = []
         self.finished = False
         self.revision = 0
-        self.card = AgentCard(call)
+        self.card = AgentCard(call, agent_identities)
         if start_event is not None:
             self.card.start(start_event)
         self.renderable = initial
@@ -257,6 +259,14 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._finder_generation = 0
         self._finder_preview = True
         self._finder_restore: _FinderRestore | None = None
+        self._agent_identities: AgentIdentityIndex | None = None
+
+    def set_agent_identity_index(self, identities: AgentIdentityIndex) -> None:
+        """Share the presenter's in-memory agent identities with recursive cards."""
+
+        self._agent_identities = identities
+        for unit in self._card_units.values():
+            unit.card.set_agent_identity_index(identities)
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -407,7 +417,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         renderable: RenderableType,
         start_event: StreamEvent | None = None,
     ) -> None:
-        unit = _ToolUnit(call, renderable, start_event)
+        unit = _ToolUnit(call, renderable, start_event, self._agent_identities)
         lifecycle_key = _tool_lifecycle_key(call_id, start_event)
         self._append_unit(unit)
         self._tools[lifecycle_key] = unit

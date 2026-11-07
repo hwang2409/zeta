@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from io import StringIO
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -481,6 +482,191 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
     )
     assert "raw child status serialization" not in controls_output
     assert "{'children'" not in controls_output
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_recursive_agent_card_renders_nested_send_and_question_readably(
+    width: int,
+) -> None:
+    from zeta.tui.cards.agent_sync import (
+        AgentTranscriptSnapshot,
+        AgentTranscriptTreeSnapshot,
+    )
+
+    root = Path("/sessions/root/agents/159")
+    worker_path = root / "agents" / "1"
+    worker_handle = f"{HANDLE}:1"
+    worker_name = "nested verifier"
+    first_line = "First line: inspect the writer ownership handoff."
+    second_line = (
+        "Second line: preserve the full decision rationale and report the exact "
+        "failing assertion."
+    )
+    read = ToolCall("read-file", "read", {"path": "README.md"})
+    spawn = ToolCall(
+        "spawn-worker",
+        "agent",
+        {
+            "prompt": "verify the ownership handoff",
+            "description": worker_name,
+            "agent_type": "worker",
+        },
+    )
+    send = ToolCall(
+        "send-worker",
+        "agent_send",
+        {
+            "child_instance_id": worker_handle,
+            "message": f"{first_line}\n{second_line}",
+        },
+    )
+    snapshot = AgentTranscriptTreeSnapshot(
+        root,
+        (
+            (
+                root,
+                AgentTranscriptSnapshot(
+                    (
+                        "read",
+                        "read-result",
+                        "spawn",
+                        "spawn-result",
+                        "send",
+                        "send-result",
+                    ),
+                    (
+                        (
+                            "read",
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "tool_use", "tool_call": read.to_dict()}
+                                ],
+                            },
+                        ),
+                        (
+                            "read-result",
+                            {
+                                "role": "tool_result",
+                                "content": [{"type": "text", "text": "contents"}],
+                                "tool_result": {
+                                    "tool_call_id": read.id,
+                                    "content": "contents",
+                                },
+                            },
+                        ),
+                        (
+                            "spawn",
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "tool_use", "tool_call": spawn.to_dict()}
+                                ],
+                            },
+                        ),
+                        (
+                            "spawn-result",
+                            {
+                                "role": "tool_result",
+                                "content": [{"type": "text", "text": "started"}],
+                                "tool_result": {
+                                    "tool_call_id": spawn.id,
+                                    "content": "started",
+                                    "structured_content": {
+                                        "child_instance_id": worker_handle,
+                                        "child_session_path": str(worker_path),
+                                        "description": worker_name,
+                                        "agent_type": "worker",
+                                    },
+                                },
+                            },
+                        ),
+                        (
+                            "send",
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "tool_use", "tool_call": send.to_dict()}
+                                ],
+                            },
+                        ),
+                        (
+                            "send-result",
+                            {
+                                "role": "tool_result",
+                                "content": [{"type": "text", "text": "queued"}],
+                                "tool_result": {
+                                    "tool_call_id": send.id,
+                                    "content": "queued a follow-up",
+                                    "structured_content": {
+                                        "child_instance_id": worker_handle
+                                    },
+                                },
+                            },
+                        ),
+                    ),
+                ),
+            ),
+            (
+                worker_path,
+                AgentTranscriptSnapshot((), ()),
+            ),
+        ),
+    )
+    transcript = TranscriptWidget()
+    console = Console(
+        file=StringIO(),
+        width=width,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=theme.RICH_THEME,
+    )
+    presenter = TranscriptPresenter(
+        transcript,
+        console,
+        lambda: True,
+        transcript.append,
+    )
+    lead = ToolCall(
+        "lead",
+        "agent",
+        {"prompt": "run the lane", "description": "storage lead"},
+    )
+    presenter.replay_tool_start(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=lead)
+    )
+    transcript.set_tool_child_session_path(lead.id, str(root))
+    lead_unit = transcript._tools[(None, lead.id)]
+    assert lead_unit.card.apply_transcript_snapshot(snapshot) is True
+    lead_unit.refresh()
+    question = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "child_question",
+            "child_instance_id": worker_handle,
+            "description": "child question",
+            "question_id": "q-nested-1234567890",
+            "question": (
+                "May I change the durable record format, or must I preserve backward "
+                "readability?"
+            ),
+            "options": ["preserve format", "bump format epoch"],
+        },
+    )
+    presenter.print_unit(presenter.render_event(question))
+
+    output = Text.from_ansi(transcript.render(width)).plain
+
+    assert "tool: read path=README.md" in output
+    assert "read: done" in output
+    assert f"send → {worker_name} :159:1 · queued" in output
+    assert first_line in output
+    assert all(word in output for word in second_line.split())
+    assert HANDLE not in output
+    assert f"ask ← {worker_name} :159:1 · pending" in output
+    assert "May I change the durable record format" in output
+    assert "preserve backward" in output
+    assert "readability?" in output
 
 
 def test_unknown_identity_snapshot_is_cached_until_observed() -> None:
