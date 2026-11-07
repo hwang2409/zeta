@@ -85,7 +85,7 @@ from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
-from zeta.skills.agent_catalog import AgentCatalog
+from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -101,6 +101,12 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 async def _collect(events):
     return [event async for event in events]
+
+
+def _rendered_text(rendered: object) -> str:
+    output = StringIO()
+    Console(file=output, width=160, color_system=None).print(rendered)
+    return output.getvalue()
 
 
 def _finish_gate_hang_guard(test: Callable) -> Callable:
@@ -1742,9 +1748,10 @@ async def test_background_completion_wakes_idle_parent(
     assert receipt.data["text"].count("canceled=false") == 1
     rendered = render_event(receipt)
     assert rendered is not None
-    assert rendered.plain.startswith("⏺ background research · completed · ")
-    assert "error=false" not in rendered.plain
-    assert "canceled=false" not in rendered.plain
+    rendered_text = _rendered_text(rendered)
+    assert "background research :1 · completed" in rendered_text
+    assert "error=false" not in rendered_text
+    assert "canceled=false" not in rendered_text
     terminal = next(
         event
         for event in background_events
@@ -2348,8 +2355,9 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     assert terminal.tool_result.is_canceled is True
     rendered = render_event(terminal)
     assert rendered is not None
-    assert rendered.plain.count("error=false") == 1
-    assert rendered.plain.count("canceled=true") == 1
+    assert "canceled" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_canceled() == {
         "tool_call_id": call.id,
@@ -4256,7 +4264,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
         message.tool_result for message in child_messages if message.tool_result
     )
     assert child_result.is_error
-    assert child_result.content == "unknown tool: bash"
+    assert child_result.content == "tool not allowed by session tool policy: bash"
 
 
 @pytest.mark.asyncio
@@ -4323,7 +4331,10 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
         if message.tool_result
     )
     assert child_result.is_error
-    assert child_result.content == "unknown tool: remote:write"
+    assert (
+        child_result.content
+        == "tool not allowed by session tool policy: remote:write"
+    )
 
 
 @pytest.mark.asyncio
@@ -4387,6 +4398,372 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
     assert result.content.startswith("child complete")
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_lifecycle()["turns_used"] == turns + 1
+
+
+@pytest.mark.asyncio
+async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_tools(
+    tmp_path: Path,
+) -> None:
+    requested = frozenset({"read", "ask_parent", "agent_send", "run_background"})
+    home = tmp_path / "home"
+    profile = home / "agents" / "bounded.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: bounded\n"
+        "description: bounded session tools\n"
+        "accepts_follow_ups: true\n"
+        f"tools: [{', '.join(sorted(requested))}]\n"
+        "---\nbounded\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("bounded")
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+
+    async def available(arguments: dict[str, object]) -> str:
+        del arguments
+        return "available"
+
+    for name in ("agent_send", "run_background", "inherited_hidden"):
+        registry.register(name, available)
+    parent_loop = AgentLoop(
+        FakeBackend([]),
+        parent_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1", cwd=tmp_path
+    )
+    child_loop, _ = await agent_runner_module._build_child_loop(
+        parent_loop,
+        child_backend=FakeBackend([]),
+        child_store=child_store,
+        child_instance_id=f"{parent_store.session_id}:1",
+        child_depth=1,
+        preset=preset,
+        model=None,
+        cwd_override=None,
+        follow_up_loop=True,
+        description="bounded",
+        child_account_context=None,
+    )
+    child_loop.tool_registry.register("late_hidden", available)
+
+    assert {schema["name"] for schema in child_loop.tool_registry.schemas} == requested
+    allowed = await child_loop.tool_registry.execute(
+        ToolCall("call-agent-send", "agent_send", {})
+    )
+    assert not allowed["isError"]
+    assert allowed["content"][0]["text"] == "available"
+    for name in ("inherited_hidden", "late_hidden"):
+        result = await child_loop.tool_registry.execute(
+            ToolCall(f"call-{name}", name, {})
+        )
+        assert result["isError"]
+        assert "tool not allowed" in result["content"][0]["text"]
+
+    await child_loop.close()
+    child_store.close()
+    await parent_loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_finish_enabled", [True, False])
+async def test_restricted_profile_keeps_eligible_child_runtime_tools(
+    tmp_path: Path,
+    explicit_finish_enabled: bool,
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "restricted.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: restricted\n"
+        "description: restricted background profile\n"
+        "accepts_follow_ups: true\n"
+        "explicit_finish: true\n"
+        "tools: [read]\n"
+        "---\nrestricted\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("restricted")
+    child_turn = (
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall(
+                    "finish-1",
+                    "finish",
+                    {"status": "done", "summary": "finished"},
+                )
+            ]
+        )
+        if explicit_finish_enabled
+        else ScriptedTurn([TextContent("finished")])
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "restricted-1",
+                        "agent",
+                        {
+                            "prompt": "inspect the task",
+                            "description": "restricted task",
+                            "preset": "restricted",
+                            "background": True,
+                        },
+                    )
+                ]
+            ),
+            child_turn,
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = explicit_finish_enabled
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    for _ in range(100):
+        if len(backend.calls) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("background child did not reach the model")
+
+    child_tools = {schema["name"] for schema in backend.calls[1][1]}
+    assert "ask_parent" in child_tools
+    if explicit_finish_enabled:
+        assert {"finish", "agent_handoff"} <= child_tools
+    else:
+        assert {"finish", "agent_handoff"}.isdisjoint(child_tools)
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    profiles = {
+        "orchestrator": "tools: [agent, read]\n",
+        "lead": "tools: [bash]\n",
+        "policy_denied": "tools: [write]\n",
+    }
+    for name, settings in profiles.items():
+        profile = home / "agents" / f"{name}.md"
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text(
+            "---\n"
+            f"name: {name}\n"
+            f"description: {name} profile\n"
+            f"{settings}"
+            "---\n"
+            f"{name}\n",
+            encoding="utf-8",
+        )
+    catalog = discover_session_agents(home=home)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("root-agent", "orchestrator")]),
+            ScriptedTurn(tool_calls=[_agent_call("nested-agent", "lead")]),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("lead-bash", "bash", {"command": "printf nested-ok"})
+                ]
+            ),
+            ScriptedTurn([TextContent("lead complete")]),
+            ScriptedTurn(tool_calls=[_agent_call("denied-agent", "policy_denied")]),
+            ScriptedTurn([TextContent("orchestrator complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+        tool_allow=("agent", "bash", "read", "write"),
+        tool_deny=("write",),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    orchestrator_tools = {schema["name"] for schema in backend.calls[1][1]}
+    lead_tools = {schema["name"] for schema in backend.calls[2][1]}
+    assert "bash" not in orchestrator_tools
+    assert lead_tools == {"bash"}
+    lead_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    bash_result = next(
+        message.tool_result for message in lead_store.messages() if message.tool_result
+    )
+    assert not bash_result.is_error
+    assert "nested-ok" in bash_result.content
+    orchestrator_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    denied_result = next(
+        message.tool_result
+        for message in orchestrator_store.messages()
+        if message.tool_result and message.tool_result.is_error
+    )
+    assert "profile 'policy_denied' requests unavailable tools: write" in denied_result.content
+
+    orchestrator_store.close()
+    lead_store.close()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_shape_resolves_against_the_live_session_registry(
+    tmp_path: Path,
+) -> None:
+    slack_names = {
+        "slack__slack_read_channel",
+        "slack__slack_read_thread",
+        "slack__slack_search_channels",
+        "slack__slack_search_public_and_private",
+    }
+    requested = {"read", "write", "bash", "ask_parent", *slack_names}
+    home = tmp_path / "home"
+    profile = home / "agents" / "monitor.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: monitor\n"
+        "description: monitor session tools\n"
+        "allow_delegation: false\n"
+        "accepts_follow_ups: true\n"
+        "explicit_finish: true\n"
+        f"tools: [{', '.join(sorted(requested))}]\n"
+        "---\nmonitor\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("monitor")
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+
+    async def slack_tool(arguments: dict[str, object]) -> str:
+        del arguments
+        return "ok"
+
+    for name in slack_names:
+        registry.register(name, slack_tool)
+    parent_loop = AgentLoop(
+        FakeBackend([]),
+        parent_store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1", cwd=tmp_path
+    )
+    child_loop, _ = await agent_runner_module._build_child_loop(
+        parent_loop,
+        child_backend=FakeBackend([]),
+        child_store=child_store,
+        child_instance_id=f"{parent_store.session_id}:1",
+        child_depth=1,
+        preset=preset,
+        model=None,
+        cwd_override=None,
+        follow_up_loop=True,
+        description="monitor",
+        child_account_context=None,
+    )
+
+    assert {schema["name"] for schema in child_loop.tool_registry.schemas} == requested
+
+    await child_loop.close()
+    child_store.close()
+    await parent_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_spawn_reports_every_unresolved_profile_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "external.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: external\n"
+        "description: external tools\n"
+        "tools: [present_external, denied_external]\n"
+        "---\nexternal\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("external")
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+        tool_deny=("denied_external",),
+    )
+    registry.register("present_external", lambda arguments: "present")
+    registry.register("denied_external", lambda arguments: "denied")
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_backend = FakeBackend([ScriptedTurn([TextContent("degraded")])])
+    monkeypatch.setattr(
+        agent_runner_module,
+        "resolve_child_backend",
+        lambda _loop, _model: (child_backend, None),
+    )
+    call = _agent_call(agent_type="external")
+
+    result = await loop._run_agent_tool(
+        call,
+        call.arguments,
+        AbortGenerationRegistry().new_generation(),
+        None,
+    )
+
+    assert result["isError"] is True
+    assert "external" in result["content"][0]["text"]
+    assert "denied_external" in result["content"][0]["text"]
+    assert child_backend.calls == []
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -5077,7 +5454,9 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
+async def test_nested_child_uses_selected_profile_not_parent_profile(
+    tmp_path: Path,
+) -> None:
     nested = _agent_call("grandchild")
     child = _agent_call("child", "explore")
     backend = FakeBackend(
@@ -5113,14 +5492,8 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
         "skill",
         "websearch",
     }
-    assert grandchild_tools == {
-        "agent_status",
-        "agent_output",
-        "fetch",
-        "read",
-        "skill",
-        "websearch",
-    }
+    assert "bash" in grandchild_tools
+    assert "agent" not in grandchild_tools
 
 
 @pytest.mark.asyncio
@@ -5630,8 +6003,9 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
         )
     )
     assert rendered is not None
-    assert rendered.plain.count("error=true") == 1
-    assert rendered.plain.count("canceled=false") == 1
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
 
 
 @pytest.mark.asyncio
@@ -5666,8 +6040,9 @@ async def test_failed_background_receipt_matches_error_flag(
     assert terminal.tool_result.is_canceled is False
     rendered = render_event(terminal)
     assert rendered is not None
-    assert rendered.plain.count("error=true") == 1
-    assert rendered.plain.count("canceled=false") == 1
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     await loop.close()
 
 
@@ -5752,8 +6127,9 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
         )
     )
     assert rendered is not None
-    assert rendered.plain.count("error=false") == 1
-    assert rendered.plain.count("canceled=true") == 1
+    assert "canceled" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     child_state = (
         store.session_dir / "agents" / "1" / "session_state.json"
     ).read_text()
