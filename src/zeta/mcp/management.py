@@ -324,7 +324,7 @@ class MCPManagementService:
                                 raise MCPManagementError(
                                     "mcp busy: configuration is being updated; retry"
                                 ) from None
-                            time.sleep(0.01)
+                            self._closed.wait(0.01)
                 except BaseException:
                     handle.close()
                     raise

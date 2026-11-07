@@ -3,6 +3,7 @@ import asyncio
 import fcntl
 import inspect
 import json
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -86,6 +87,83 @@ async def test_management_service_close_owns_transaction_lifetime(
         assert transaction_calls == calls_after_close
     finally:
         release.set()
+        if transaction is not None and not transaction.done():
+            transaction.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
+
+
+@pytest.mark.asyncio
+async def test_management_close_interrupts_lock_held_by_another_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    config_path = manager.path("user")
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('{"servers": {}}\n')
+    before = config_path.read_bytes()
+    before_mtime = config_path.stat().st_mtime_ns
+    lock_path = config_path.with_name(f".{config_path.name}.lock")
+    holder = await asyncio.wait_for(
+        asyncio.to_thread(
+            subprocess.Popen,
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,sys\n"
+                    "lock=open(sys.argv[1], 'a+')\n"
+                    "fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                    "print('ready', flush=True)\n"
+                    "sys.stdin.read(1)\n"
+                ),
+                str(lock_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        ),
+        10,
+    )
+    blocked = threading.Event()
+    original_flock = fcntl.flock
+
+    def observed_flock(fd, operation):
+        try:
+            return original_flock(fd, operation)
+        except BlockingIOError:
+            blocked.set()
+            raise
+
+    # test-contract: seam observe the real non-blocking flock collision
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
+    transaction = None
+    try:
+        assert holder.stdout is not None
+        assert await asyncio.to_thread(holder.stdout.readline) == "ready\n"
+        transaction = asyncio.create_task(
+            manager.add("late", scope="user", command=sys.executable)
+        )
+        assert await asyncio.to_thread(blocked.wait, 10)
+
+        await asyncio.wait_for(_close_management_service(manager), 10)
+        assert config_path.read_bytes() == before
+        assert config_path.stat().st_mtime_ns == before_mtime
+
+        assert holder.stdin is not None
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        result = await asyncio.gather(transaction, return_exceptions=True)
+        assert type(result[0]).__name__ == "MCPManagementClosedError"
+        assert config_path.read_bytes() == before
+        assert config_path.stat().st_mtime_ns == before_mtime
+    finally:
+        if holder.stdin is not None and not holder.stdin.closed:
+            holder.stdin.close()
+        await asyncio.wait_for(asyncio.to_thread(holder.wait), 10)
+        if holder.stdout is not None:
+            holder.stdout.close()
         if transaction is not None and not transaction.done():
             transaction.cancel()
             await asyncio.wait_for(
