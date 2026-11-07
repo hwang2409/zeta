@@ -103,6 +103,8 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
         assert payload_before == damaged
         manifest = recovery.read_evidence_manifest(directory_fd, result.quarantine_id)
         record = recovery.read_recovery_record(directory_fd, result.quarantine_id)
+        assert record is not None and record.state == "committed"
+        assert record.memory_step == "review_pending"
         status_before = recovery.recovery_status(directory_fd, target)
         evidence_before = (
             root / "damaged" / f"conversation.quarantine.{result.quarantine_id}.json"
@@ -123,8 +125,6 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
     finally:
         repaired.close()
     assert manifest.payload_digest == hashlib.sha256(damaged).hexdigest()
-    assert record is not None and record.state == "committed"
-    assert record.memory_step == "review_pending"
     assert status_before == status_after
     assert status_after.quarantine_count == 1
     assert status_after.quarantine_bytes == len(damaged)
@@ -238,15 +238,21 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
             assert record.state == expected
 
 
+@pytest.mark.parametrize("change", ["digest", "identity"])
 def test_source_identity_change_refuses_before_creating_evidence(
-    tmp_path: Path,
+    tmp_path: Path, change: str
 ) -> None:
     root, damaged, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
     transcript = root / "damaged" / "conversation.jsonl"
-    changed = damaged[:-4] + b"null"
+    changed = damaged[:-4] + b"null" if change == "digest" else damaged
     assert len(changed) == len(damaged)
-    transcript.write_bytes(changed)
+    if change == "digest":
+        transcript.write_bytes(changed)
+    else:
+        replacement = transcript.with_suffix(".replacement")
+        replacement.write_bytes(changed)
+        replacement.replace(transcript)
 
     with session_directory(root, "damaged") as (_, directory_fd):
         with pytest.raises(recovery.TranscriptSourceChanged):
