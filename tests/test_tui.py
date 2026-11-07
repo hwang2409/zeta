@@ -11333,7 +11333,8 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     navigation.selected_index = 1
     navigation.open_selected()
     assert navigation.transcript_control._sync_task is not None
-    await navigation.transcript_control._sync_task
+    # test-contract: seam no public transcript-sync completion event exists
+    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
     source = navigation.transcript_control._source
     assert source is not None
     previous = navigation.transcript_control._snapshot
@@ -11378,7 +11379,9 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
         await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
         # Keep the empty todo cleanup pending until both owners have handed off.
-        blocker = asyncio.create_task(todo_cleanup_release.wait())
+        blocker = asyncio.create_task(
+            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
+        )
         await finish_todo_cleanup(
             (blocker, *tasks), close, deadline=deadline, label=label
         )
