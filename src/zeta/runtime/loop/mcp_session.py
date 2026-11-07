@@ -208,7 +208,7 @@ class MCPSession:
             if verb in {"remove", "enable", "disable"}:
                 if len(parts) != 2:
                     return MCP_USAGE
-                item = service.show(parts[1])
+                item = await service.resolve(parts[1])
                 if verb == "remove":
                     await service.remove(item.name, scope=item.scope)
                 else:
@@ -253,12 +253,12 @@ class MCPSession:
     async def _render_mcp_status(
         self, mount: MCPMount, service: MCPManagementService
     ) -> str:
-        entries = await service.refresh_credentials()
-        statuses = {entry.name: entry.auth for entry in entries}
+        view = await service.refresh_credentials()
+        statuses = {entry.name: entry.auth for entry in view.entries}
         return render_mcp_status(
             mount,
             credential_status=statuses,
-            configured_entries=service.snapshot.entries,
+            configured_entries=view.entries,
         )
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:

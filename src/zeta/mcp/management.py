@@ -88,7 +88,7 @@ class ManagedServer:
 
 
 @dataclass(frozen=True, slots=True)
-class MCPManagerSnapshot:
+class _MCPManagerView:
     entries: tuple[ManagedServer, ...]
     generation: int
 
@@ -119,8 +119,10 @@ class MCPManagementService:
         self.mount = mount
         self._lock_timeout = lock_timeout
         self._transaction_gate = asyncio.Lock()
-        self._snapshot = MCPManagerSnapshot((), 0)
+        self._view = _MCPManagerView((), 0)
         self._published_candidate: _ManagementCandidate | None = None
+        self._durable_candidate: _ManagementCandidate | None = None
+        self._transaction_task: asyncio.Task[_ManagementCandidate] | None = None
         self._runtime: MCPConfig | None = None
         self._home_path: Path | None = None
         self._project_path: Path | None = None
@@ -128,12 +130,6 @@ class MCPManagementService:
         self._credential_store = MCPCredentialStore(home=self.home)
         self._credential_status: dict[str, str] = {}
         self.credential_store_error: PublicCredentialStoreError | None = None
-
-    @property
-    def snapshot(self) -> MCPManagerSnapshot:
-        """Return the current immutable, storage-free display state."""
-
-        return self._snapshot
 
     def path(self, scope: _ConfigScope) -> Path:
         if scope == "project":
@@ -507,34 +503,96 @@ class MCPManagementService:
             updated.append(replace(item, status=runtime_status, tool_count=len(tools)))
         return tuple(updated)
 
-    def _publish(self, candidate: _ManagementCandidate) -> MCPManagerSnapshot:
+    def _publish(self, candidate: _ManagementCandidate) -> _MCPManagerView:
         assert self._transaction_gate.locked(), "publication requires transaction gate"
         self._home_path = candidate.home_path
         self._project_path = candidate.project_path
         self._paths_ready = True
-        snapshot = MCPManagerSnapshot(
-            self._with_runtime(candidate.entries), self._snapshot.generation + 1
+        view = _MCPManagerView(
+            self._with_runtime(candidate.entries), self._view.generation + 1
         )
         self._runtime = candidate.runtime_config
         self._published_candidate = candidate
-        self._snapshot = snapshot
-        return snapshot
+        self._view = view
+        return view
+
+    async def _run_transaction_locked(
+        self,
+        mutation: Callable[[Path, Path | None, Path], None] | None = None,
+    ) -> _ManagementCandidate:
+        assert self._transaction_gate.locked(), "transaction requires transaction gate"
+        task = asyncio.create_task(asyncio.to_thread(self._transaction, mutation))
+        self._transaction_task = task
+        try:
+            candidate = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            if self._transaction_task is task:
+                self._transaction_task = None
+            raise
+        self._durable_candidate = candidate
+        if self._transaction_task is task:
+            self._transaction_task = None
+        return candidate
+
+    async def _repair_lag_locked(self) -> None:
+        assert self._transaction_gate.locked(), "repair requires transaction gate"
+        task = self._transaction_task
+        if task is not None:
+            try:
+                self._durable_candidate = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled() and self._transaction_task is task:
+                    self._transaction_task = None
+                raise
+            except BaseException:
+                if self._transaction_task is task:
+                    self._transaction_task = None
+                raise
+            if self._transaction_task is task:
+                self._transaction_task = None
+        durable = self._durable_candidate
+        if durable is not None and durable != self._published_candidate:
+            await self._reconcile(durable.runtime_config)
+            self._publish(durable)
 
     async def _transact_reconcile_publish(
         self,
         mutation: Callable[[Path, Path | None, Path], None] | None = None,
-    ) -> MCPManagerSnapshot:
+    ) -> _MCPManagerView:
         async with self._transaction_gate:
-            if mutation is not None:
-                durable = await asyncio.to_thread(self._transaction)
-                if durable != self._published_candidate:
-                    await self._reconcile(durable.runtime_config)
-                    self._publish(durable)
-            candidate = await asyncio.to_thread(self._transaction, mutation)
+            await self._repair_lag_locked()
+            candidate = await self._run_transaction_locked(mutation)
             await self._reconcile(candidate.runtime_config)
             return self._publish(candidate)
 
-    async def refresh(self) -> MCPManagerSnapshot:
+    async def view(self) -> _MCPManagerView:
+        """Return repaired resident state without re-reading unchanged files."""
+        async with self._transaction_gate:
+            await self._repair_lag_locked()
+            if self._published_candidate is None:
+                candidate = await self._run_transaction_locked()
+                await self._reconcile(candidate.runtime_config)
+                self._publish(candidate)
+            return self._view
+
+    async def resolve(self, name: str, *, scope: Scope = "effective") -> ManagedServer:
+        """Resolve a server from repaired resident state."""
+        view = await self.view()
+        item = next(
+            (
+                entry
+                for entry in reversed(view.entries)
+                if entry.name == name and (scope == "effective" or entry.scope == scope)
+            ),
+            None,
+        )
+        if item is None:
+            raise MCPManagementError(f"unknown MCP server: {name}")
+        return item
+
+    async def refresh(self) -> _MCPManagerView:
         return await self._transact_reconcile_publish()
 
     def _config_mutation(
@@ -558,7 +616,7 @@ class MCPManagementService:
 
     async def _commit(
         self, mutation: Callable[[Path, Path | None, Path], None]
-    ) -> MCPManagerSnapshot:
+    ) -> _MCPManagerView:
         return await self._transact_reconcile_publish(mutation)
 
     async def add(
@@ -573,7 +631,7 @@ class MCPManagementService:
         headers: dict[str, str] | None = None,
         oauth: bool = False,
         enabled: bool = True,
-    ) -> MCPManagerSnapshot:
+    ) -> _MCPManagerView:
         if not name:
             raise MCPManagementError("server name must not be empty")
         if (command is None) == (url is None):
@@ -605,7 +663,7 @@ class MCPManagementService:
 
         return await self._commit(self._config_mutation(scope, change))
 
-    async def remove(self, name: str, *, scope: _ConfigScope) -> MCPManagerSnapshot:
+    async def remove(self, name: str, *, scope: _ConfigScope) -> _MCPManagerView:
         def change(servers: dict[str, object]) -> None:
             if name not in servers:
                 raise MCPManagementError(f"unknown MCP server: {name}")
@@ -615,7 +673,7 @@ class MCPManagementService:
 
     async def set_enabled(
         self, name: str, *, scope: _ConfigScope, enabled: bool
-    ) -> MCPManagerSnapshot:
+    ) -> _MCPManagerView:
         def change(servers: dict[str, object]) -> None:
             raw = servers.get(name)
             if type(raw) is not dict:
@@ -624,7 +682,7 @@ class MCPManagementService:
 
         return await self._commit(self._config_mutation(scope, change))
 
-    async def set_trusted(self, name: str, *, trusted: bool) -> MCPManagerSnapshot:
+    async def set_trusted(self, name: str, *, trusted: bool) -> _MCPManagerView:
         def mutate(_home: Path, project_path: Path | None, trust_path: Path) -> None:
             if project_path is None:
                 raise MCPManagementError("project scope requires a repository")
@@ -642,23 +700,10 @@ class MCPManagementService:
 
         return await self._commit(mutate)
 
-    def show(self, name: str, *, scope: Scope = "effective") -> ManagedServer:
-        item = next(
-            (
-                entry
-                for entry in reversed(self._snapshot.entries)
-                if entry.name == name and (scope == "effective" or entry.scope == scope)
-            ),
-            None,
-        )
-        if item is None:
-            raise MCPManagementError(f"unknown MCP server: {name}")
-        return item
-
-    async def refresh_credentials(self) -> tuple[ManagedServer, ...]:
-        await self.refresh()
+    async def refresh_credentials(self) -> _MCPManagerView:
+        view = await self.refresh()
         self.credential_store_error = None
-        for item in self._snapshot.entries:
+        for item in view.entries:
             auth = item.config.get("auth")
             if not isinstance(auth, Mapping) or auth.get("type") != "oauth":
                 continue
@@ -668,7 +713,7 @@ class MCPManagementService:
                 self.credential_store_error = public_credential_store_error(exc)
                 raise
             self._credential_status[item.name] = token_state(credential.token)
-        return (await self._transact_reconcile_publish()).entries
+        return await self._transact_reconcile_publish()
 
     async def runtime_config(self) -> MCPConfig:
         if self._runtime is None:
@@ -694,7 +739,7 @@ class MCPManagementService:
                     config, source=desired.sources.get(name, desired.path)
                 )
 
-    async def sync_runtime(self) -> MCPManagerSnapshot:
+    async def sync_runtime(self) -> _MCPManagerView:
         return await self._transact_reconcile_publish()
 
     def _policy_registry(self) -> ToolRegistry | None:
@@ -704,9 +749,7 @@ class MCPManagementService:
         return mcp_connection.mcp_server_allowed(self._policy_registry(), name)
 
     async def test(self, name: str, *, scope: Scope = "effective") -> dict[str, object]:
-        if self._snapshot.generation == 0:
-            await self.refresh()
-        item = self.show(name, scope=scope)
+        item = await self.resolve(name, scope=scope)
         if not self._server_allowed(name):
             return {
                 "name": name,
@@ -749,9 +792,7 @@ class MCPManagementService:
     ) -> None:
         from .oauth import authorize
 
-        if self._snapshot.generation == 0:
-            await self.refresh()
-        item = self.show(name, scope=scope)
+        item = await self.resolve(name, scope=scope)
         if not self._server_allowed(name):
             raise MCPManagementError(f"{name}: skipped by tool policy")
         if item.config.get("transport") != "streamable-http":
@@ -783,9 +824,7 @@ class MCPManagementService:
         await self.refresh()
 
     async def logout(self, name: str, *, scope: Scope = "effective") -> None:
-        if self._snapshot.generation == 0:
-            await self.refresh()
-        self.show(name, scope=scope)
+        await self.resolve(name, scope=scope)
         await self._credential_store.delete(name)
         self._credential_status[name] = "unauthorized"
         self.credential_store_error = None
@@ -795,7 +834,6 @@ class MCPManagementService:
 __all__ = [
     "MCPManagementError",
     "MCPManagementService",
-    "MCPManagerSnapshot",
     "ManagedServer",
     "Scope",
 ]

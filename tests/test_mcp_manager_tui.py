@@ -7,6 +7,7 @@ import threading
 from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import create_app_session, get_app
@@ -23,6 +24,7 @@ from zeta.mcp import management as mcp_management
 from zeta.mcp.management import ManagedServer, MCPManagementService
 from zeta.mcp.oauth_store import MCPOAuthToken
 from zeta.runtime.loop import AgentLoop
+from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.mcp_manager import MCPAddDraft, MCPManager
@@ -62,6 +64,99 @@ async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
     await loop.close()
 
 
+@pytest.mark.parametrize("surface", ("tui", "serve"))
+@pytest.mark.asyncio
+async def test_public_mcp_views_repair_a_committed_cancelled_add(
+    tmp_path, monkeypatch, surface
+):
+    class RecordingMount:
+        pinned = False
+
+        def __init__(self):
+            self.configs = {}
+            self.statuses = {}
+            self._actors = {}
+
+        @property
+        def summary(self):
+            return f"mcp: {len(self.configs)} mounted, 0 failed"
+
+        async def add_server(self, config, **_kwargs):
+            self.configs[config.name] = config
+
+        async def remove_server(self, name):
+            self.configs.pop(name, None)
+
+        def render(self):
+            return "\n".join((self.summary, *self.configs))
+
+        async def close(self):
+            return None
+
+    mount = RecordingMount()
+    manager = service(tmp_path, mount)
+    await manager.refresh()
+    original_transaction = manager._transaction
+    committed = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def committed_transaction(mutation=None):
+        try:
+            candidate = original_transaction(mutation)
+            if mutation is not None:
+                committed.set()
+                assert release.wait(10), "timed out releasing committed add"
+            return candidate
+        finally:
+            if mutation is not None:
+                finished.set()
+
+    # test-contract: durability cancel the public add after its disk commit
+    monkeypatch.setattr(manager, "_transaction", committed_transaction)
+    task = asyncio.create_task(
+        manager.add("durable", scope="user", url="https://example.test")
+    )
+    try:
+        assert await asyncio.to_thread(committed.wait, 10), "add did not commit"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        assert await asyncio.to_thread(finished.wait, 10), "add did not finish"
+
+    if surface == "tui":
+        card = MCPManager(manager)
+        await card.dispatch("down")
+        rendered = "\n".join(
+            "".join(text for _style, text in line) for line in card.render()
+        )
+    else:
+        loop = AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        )
+        loop._mcp_management = manager
+        loop._mcp_mount = mount
+        loop._mcp_mount_attempted = True
+        session = ServerSlashSession(SimpleNamespace(loop=loop))
+        try:
+            rendered = str(await session.slash_mcp("disable durable"))
+        finally:
+            await loop.close()
+
+    assert "unknown MCP server" not in rendered
+    if surface == "tui":
+        assert "durable" in rendered
+    else:
+        assert "durable" not in mount.configs
+
+
 @pytest.mark.asyncio
 async def test_manager_renders_every_status_glyph_and_redacts(tmp_path):
     manager = service(tmp_path)
@@ -73,6 +168,7 @@ async def test_manager_renders_every_status_glyph_and_redacts(tmp_path):
     raw["servers"]["disabled"]["headers"] = {"Authorization": "secret"}
     manager.path("user").write_text(json.dumps(raw))
     view = MCPManager(manager)
+    await view.refresh()
 
     rendered = "\n".join(
         "".join(text for _style, text in line) for line in view.render()
@@ -128,7 +224,7 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
     )
-    assert hasattr(app._mcp_manager.service, "snapshot")
+    assert "snapshot" not in vars(type(app._mcp_manager.service))
 
     class StubDialog:
         def __init__(self, value):
@@ -177,14 +273,14 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         pipe.send_text("draft-from-key-path\t\r")
         async with asyncio.timeout(5):
             while not any(
-                item.name == "draft-from-key-path"
-                for item in app._mcp_manager.service.snapshot.entries
+                item.name == "draft-from-key-path" for item in app._mcp_manager.entries
             ):
                 await asyncio.sleep(0)
         assert (
-            app._mcp_manager.service.show("draft-from-key-path", scope="project").name
-            == "draft-from-key-path"
-        )
+            await app._mcp_manager.service.resolve(
+                "draft-from-key-path", scope="project"
+            )
+        ).name == "draft-from-key-path"
         assert "RuntimeError" not in str(app._mcp_manager.last_result)
 
         async def send_manager_key(key: str, completed) -> None:
@@ -194,28 +290,30 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
                     await asyncio.sleep(0)
 
         def item():
-            return app._mcp_manager.service.show("draft-from-key-path")
+            return next(
+                value
+                for value in app._mcp_manager.entries
+                if value.name == "draft-from-key-path"
+            )
 
         await send_manager_key("T", lambda: item().trusted)
         await send_manager_key("T", lambda: not item().trusted)
         await send_manager_key("e", lambda: not item().enabled)
         await send_manager_key("e", lambda: item().enabled)
-        await send_manager_key(
-            "d", lambda: app._mcp_manager.service.snapshot.entries == ()
-        )
+        await send_manager_key("d", lambda: app._mcp_manager.entries == ())
         assert not prompt.done()
         assert app._mcp_manager_open
         assert session.layout.current_window is app._status_card_window
         pipe.send_bytes(b"\x1b")
         async with asyncio.timeout(5):
             while app._mcp_manager_open:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0)
         assert session.default_buffer.text == "draft text"
         assert session.default_buffer.cursor_position == 5
         pipe.send_text("!")
         async with asyncio.timeout(5):
             while session.default_buffer.text != "draft! text":
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0)
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(prompt, 10)
@@ -324,10 +422,13 @@ async def test_real_prompt_lock_contention_stays_responsive_and_renders_busy(
             assert (
                 "mcp error: mcp busy: configuration is being updated; retry" in rendered
             )
-            assert not app._mcp_manager.service.show("contended", scope="user").enabled
+            assert not (
+                await app._mcp_manager.service.resolve("contended", scope="user")
+            ).enabled
     finally:
         mcp_management.fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
+        monkeypatch.undo()
         if prompt is not None:
             prompt.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -633,9 +734,9 @@ async def test_remove_warns_before_unshadowing_user_definition(tmp_path):
 
     result = await view.dispatch("d")
     assert "unshadow" in str(result)
-    assert manager.show("shared").scope == "project"
+    assert (await manager.resolve("shared")).scope == "project"
     await view.dispatch("d")
-    assert manager.show("shared").scope == "user"
+    assert (await manager.resolve("shared")).scope == "user"
 
 
 @pytest.mark.asyncio
@@ -675,15 +776,15 @@ async def test_manager_dispatches_enable_remove_test_trust_and_navigation(
         index for index, item in enumerate(view.entries) if item.name == "one"
     )
     await view.dispatch("T")
-    assert manager.show("one", scope="project").trusted
+    assert (await manager.resolve("one", scope="project")).trusted
     await view.dispatch("T")
-    assert not manager.show("one", scope="project").trusted
+    assert not (await manager.resolve("one", scope="project")).trusted
     await view.dispatch("T")
-    assert manager.show("one", scope="project").trusted
+    assert (await manager.resolve("one", scope="project")).trusted
     await view.dispatch("t")
     assert called == [("one", "project")]
     await view.dispatch("d")
-    assert [item.name for item in manager.snapshot.entries] == ["two"]
+    assert [item.name for item in (await manager.view()).entries] == ["two"]
     assert storage_threads and all(thread != loop_thread for thread in storage_threads)
 
 

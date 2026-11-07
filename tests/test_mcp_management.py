@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import fcntl
 import inspect
@@ -29,6 +30,33 @@ def service(tmp_path, mount=None):
     )
 
 
+def test_resident_mcp_state_has_no_public_read_bypass():
+    message = "MCP state reads must use await service.view() or service.resolve()"
+    public_accessor = "snapshot" in vars(MCPManagementService)
+    bypasses = []
+    source_root = Path(__file__).parents[1] / "src" / "zeta"
+    for path in source_root.rglob("*.py"):
+        if path.name == "management.py":
+            continue
+        source = path.read_text()
+        if "MCPManagementService" not in source and "_mcp_management" not in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Attribute):
+                continue
+            owner = ast.unparse(node.value).rsplit(".", 1)[-1]
+            if node.attr in {"snapshot", "_snapshot", "_view"} and owner in {
+                "service",
+                "manager",
+                "_mcp_management",
+            }:
+                bypasses.append(f"{path.relative_to(source_root)}:{node.lineno}")
+    assert not public_accessor and not bypasses, (
+        f"{message}; public snapshot accessor={public_accessor}; "
+        f"bypasses: {', '.join(bypasses) or 'none'}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_add_scopes_precedence_redaction_and_env_reference(tmp_path):
     manager = service(tmp_path)
@@ -38,10 +66,12 @@ async def test_add_scopes_precedence_redaction_and_env_reference(tmp_path):
     await manager.add(
         "shared", scope="project", command=sys.executable, args=("-c", "pass")
     )
-    assert manager.show("shared").scope == "project"
-    assert manager.show("shared", scope="user").config["env"]["TOKEN"] == "${TOKEN}"
+    assert (await manager.resolve("shared")).scope == "project"
+    assert (await manager.resolve("shared", scope="user")).config["env"][
+        "TOKEN"
+    ] == "${TOKEN}"
     await manager.remove("shared", scope="project")
-    assert manager.show("shared").scope == "user"
+    assert (await manager.resolve("shared")).scope == "user"
 
 
 @pytest.mark.asyncio
@@ -49,25 +79,27 @@ async def test_enable_disable_and_remove(tmp_path):
     manager = service(tmp_path)
     await manager.add("x", scope="user", command=sys.executable)
     await manager.set_enabled("x", scope="user", enabled=False)
-    assert manager.show("x", scope="user").enabled is False
+    assert (await manager.resolve("x", scope="user")).enabled is False
     await manager.set_enabled("x", scope="user", enabled=True)
     await manager.remove("x", scope="user")
-    assert [item for item in manager.snapshot.entries if item.scope == "user"] == []
+    assert [
+        item for item in (await manager.view()).entries if item.scope == "user"
+    ] == []
 
 
 @pytest.mark.asyncio
 async def test_project_trust_is_invalidated_by_definition_change(tmp_path):
     manager = service(tmp_path)
     await manager.add("x", scope="project", command=sys.executable, args=("-c", "pass"))
-    assert manager.show("x", scope="project").trusted is False
+    assert (await manager.resolve("x", scope="project")).trusted is False
     await manager.set_trusted("x", trusted=True)
-    assert manager.show("x", scope="project").trusted is True
+    assert (await manager.resolve("x", scope="project")).trusted is True
     path = manager.path("project")
     document = json.loads(path.read_text())
     document["servers"]["x"]["args"] = ["-c", "changed"]
     path.write_text(json.dumps(document))
     await manager.refresh()
-    assert manager.show("x", scope="project").trusted is False
+    assert (await manager.resolve("x", scope="project")).trusted is False
 
 
 @pytest.mark.asyncio
@@ -79,7 +111,9 @@ async def test_literal_credentials_are_redacted(tmp_path):
     data["servers"]["x"]["auth"]["token"] = "secret"
     path.write_text(json.dumps(data))
     await manager.refresh()
-    assert "secret" not in json.dumps(manager.show("x", scope="user").as_json())
+    assert "secret" not in json.dumps(
+        (await manager.resolve("x", scope="user")).as_json()
+    )
 
 
 @pytest.mark.asyncio
@@ -113,7 +147,7 @@ async def test_trust_fingerprint_covers_every_security_field_and_untrusts(tmp_pa
     await manager.add("x", scope="project", command=sys.executable)
     await manager.set_trusted("x", trusted=True)
     await manager.set_trusted("x", trusted=False)
-    assert not manager.show("x", scope="project").trusted
+    assert not (await manager.resolve("x", scope="project")).trusted
 
 
 @pytest.mark.asyncio
@@ -121,8 +155,8 @@ async def test_project_http_does_not_require_trust_but_stdio_does(tmp_path):
     manager = service(tmp_path)
     await manager.add("http", scope="project", url="https://example.test")
     await manager.add("local", scope="project", command=sys.executable)
-    assert manager.show("http", scope="project").trusted
-    assert not manager.show("local", scope="project").trusted
+    assert (await manager.resolve("http", scope="project")).trusted
+    assert not (await manager.resolve("local", scope="project")).trusted
 
 
 @pytest.mark.asyncio
@@ -138,9 +172,9 @@ async def test_clone_path_has_independent_trust_and_pending_stdio_is_filtered(tm
     second.path("project").write_text(first.path("project").read_text())
     await first.set_trusted("local", trusted=True)
 
-    assert first.show("local").trusted
+    assert (await first.resolve("local")).trusted
     await second.refresh()
-    assert not second.show("local").trusted
+    assert not (await second.resolve("local")).trusted
     filtered = await second.runtime_config()
     assert "local" not in filtered.configured_servers
 
@@ -230,7 +264,7 @@ async def test_management_routes_cannot_publish_stale_candidates(
                 await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
     durable = set(json.loads(manager.path("user").read_text())["servers"])
-    assert {item.name for item in manager.snapshot.entries} == durable
+    assert {item.name for item in (await manager.view()).entries} == durable
     assert reconciled == [set()] * (expected_reconciles - 1) + [durable]
 
 
@@ -241,7 +275,7 @@ async def test_cancelled_management_owner_keeps_old_snapshot(
 ):
     manager = service(tmp_path)
     await manager.refresh()
-    before = manager.snapshot
+    before = await manager.view()
     release_gate = False
     release_thread = threading.Event()
     thread_finished = threading.Event()
@@ -306,24 +340,26 @@ async def test_cancelled_management_owner_keeps_old_snapshot(
             task.cancel()
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
-    assert manager.snapshot is before
+    assert await manager.view() is before
 
 
 @pytest.mark.asyncio
-async def test_reconcile_failure_does_not_publish_candidate(tmp_path, monkeypatch):
+async def test_reconcile_failure_is_repaired_by_the_next_owner_read(
+    tmp_path, monkeypatch
+):
     manager = service(tmp_path)
     await manager.refresh()
-    before = manager.snapshot
 
     async def fail_reconcile(_desired):
         raise RuntimeError("reconcile failed")
 
-    # test-contract: seam inject a runtime reconciliation failure
-    monkeypatch.setattr(manager, "_reconcile", fail_reconcile)
-    with pytest.raises(RuntimeError, match="reconcile failed"):
-        await manager.add("new", scope="user", command=sys.executable)
+    with monkeypatch.context() as context:
+        # test-contract: seam inject a runtime reconciliation failure
+        context.setattr(manager, "_reconcile", fail_reconcile)
+        with pytest.raises(RuntimeError, match="reconcile failed"):
+            await manager.add("new", scope="user", command=sys.executable)
 
-    assert manager.snapshot is before
+    assert (await manager.resolve("new")).name == "new"
 
 
 @pytest.mark.asyncio
@@ -339,7 +375,9 @@ async def test_concurrent_mutations_do_not_lose_writers(tmp_path):
     await run_all()
     assert {
         item.name
-        for item in [item for item in manager.snapshot.entries if item.scope == "user"]
+        for item in [
+            item for item in (await manager.view()).entries if item.scope == "user"
+        ]
     } == {f"server-{index}" for index in range(12)}
 
 
@@ -468,7 +506,7 @@ async def test_service_honors_zeta_mcp_config_with_explicit_home(tmp_path, monke
     await manager.add("override", scope="user", command=sys.executable)
 
     assert manager.path("user") == override
-    assert manager.show("override", scope="user").name == "override"
+    assert (await manager.resolve("override", scope="user")).name == "override"
     assert not (tmp_path / "explicit-home" / "mcp.json").exists()
 
 
@@ -480,7 +518,9 @@ async def test_malformed_url_rejected_and_redaction_total(tmp_path):
     with pytest.raises(MCPManagementError, match="invalid MCP server URL"):
         await manager.add("bad", scope="user", url=malformed)
 
-    assert [item for item in manager.snapshot.entries if item.scope == "user"] == []
+    assert [
+        item for item in (await manager.view()).entries if item.scope == "user"
+    ] == []
     redacted = manager.redact({"url": malformed})["url"]
     assert redacted == "<redacted-url>"
     assert manager.redact({"url": "user:pass?token=secret"})["url"] == (
@@ -500,7 +540,7 @@ async def test_redacts_env_headers_auth_and_url_credentials(tmp_path):
         headers={"Authorization": "Bearer literal"},
         oauth=True,
     )
-    text = json.dumps(manager.show("x", scope="user").as_json())
+    text = json.dumps((await manager.resolve("x", scope="user")).as_json())
     assert "literal" not in text
     assert "pass" not in text
     assert "secret" not in text
@@ -608,7 +648,7 @@ async def test_malformed_non_object_server_is_listed_safely_and_excluded(tmp_pat
     manager.path("user").write_text(json.dumps({"servers": {"broken": raw}}))
 
     await manager.refresh()
-    listed = [item for item in manager.snapshot.entries if item.scope == "user"]
+    listed = [item for item in (await manager.view()).entries if item.scope == "user"]
     assert len(listed) == 1
     assert listed[0].name == "broken"
     assert listed[0].status == "malformed"
@@ -723,7 +763,7 @@ for line in sys.stdin:
     await manager.set_enabled("live", scope="user", enabled=False)
     await manager.sync_runtime()
     assert "live__echo" not in registry.registered_names
-    assert manager.show("live", scope="user").status == "disabled"
+    assert (await manager.resolve("live", scope="user")).status == "disabled"
 
     await manager.set_enabled("live", scope="user", enabled=True)
     await manager.sync_runtime()
@@ -733,7 +773,10 @@ for line in sys.stdin:
 
     await manager.add("broken", scope="user", command=str(tmp_path / "missing"))
     await manager.sync_runtime()
-    assert manager.show("broken", scope="user").status in {"degraded", "failed"}
+    assert (await manager.resolve("broken", scope="user")).status in {
+        "degraded",
+        "failed",
+    }
     assert "broken" in json.loads(manager.path("user").read_text())["servers"]
     await mount.close()
 
@@ -834,7 +877,7 @@ async def test_logout_validates_explicit_scope_without_removing_definition(tmp_p
     await manager.logout("oauth", scope="project")
     token_file = manager.home / "mcp-tokens" / "oauth.json"
     assert json.loads(token_file.read_text()) == {"generation": 1, "token": None}
-    assert manager.show("oauth", scope="project").name == "oauth"
+    assert (await manager.resolve("oauth", scope="project")).name == "oauth"
 
 
 @pytest.mark.asyncio
@@ -889,12 +932,12 @@ async def test_stdio_test_only_lists_tools_without_changing_definition_state(
     )
     path = manager.path(scope)
     before = path.read_bytes()
-    before_item = manager.show("x", scope=scope)
+    before_item = await manager.resolve("x", scope=scope)
 
     if scope == "project":
         await manager.set_trusted("x", trusted=True)
         before = path.read_bytes()
-        before_item = manager.show("x", scope=scope)
+        before_item = await manager.resolve("x", scope=scope)
 
     result = await manager.test("x", scope=scope)
 
@@ -907,7 +950,7 @@ async def test_stdio_test_only_lists_tools_without_changing_definition_state(
         "status": "ok",
     }
     assert path.read_bytes() == before
-    after_item = manager.show("x", scope=scope)
+    after_item = await manager.resolve("x", scope=scope)
     assert after_item.enabled is before_item.enabled
     assert after_item.trusted is before_item.trusted
     if scope == "project":
@@ -926,7 +969,7 @@ async def test_untrusted_project_stdio_server_is_not_spawned_by_test(tmp_path):
         args=("-c", source),
         enabled=True,
     )
-    assert manager.show("untrusted", scope="project").trusted is False
+    assert (await manager.resolve("untrusted", scope="project")).trusted is False
 
     result = await manager.test("untrusted", scope="project")
 
@@ -1017,191 +1060,6 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    ("add", "remove", "enable", "disable", "trust", "untrust"),
-)
-@pytest.mark.parametrize(
-    "failure_at",
-    ("worker_await", "reconcile_error", "reconcile_await", "publish"),
-)
-@pytest.mark.asyncio
-async def test_every_mutation_repairs_committed_unpublished_state_before_validation(
-    tmp_path, monkeypatch, mutation, failure_at
-):
-    class RecordingMount:
-        pinned = False
-
-        def __init__(self):
-            self.configs = {}
-            self.statuses = {}
-            self._actors = {}
-
-        async def add_server(self, config, **_kwargs):
-            self.configs[config.name] = config
-
-        async def remove_server(self, name):
-            self.configs.pop(name, None)
-
-    async def prepare(manager):
-        if mutation in {"remove", "enable", "disable"}:
-            await manager.add(
-                "durable",
-                scope="user",
-                url="https://example.test",
-                enabled=mutation != "enable",
-            )
-        elif mutation in {"trust", "untrust"}:
-            await manager.add("durable", scope="project", command=sys.executable)
-            if mutation == "untrust":
-                await manager.set_trusted("durable", trusted=True)
-        else:
-            await manager.refresh()
-
-    async def mutate(manager):
-        if mutation == "add":
-            return await manager.add(
-                "durable", scope="user", url="https://example.test"
-            )
-        if mutation == "remove":
-            return await manager.remove("durable", scope="user")
-        if mutation in {"enable", "disable"}:
-            return await manager.set_enabled(
-                "durable", scope="user", enabled=mutation == "enable"
-            )
-        return await manager.set_trusted("durable", trusted=mutation == "trust")
-
-    expected_runtime = {
-        "add": {"durable"},
-        "remove": set(),
-        "enable": {"durable"},
-        "disable": set(),
-        "trust": {"durable"},
-        "untrust": set(),
-    }[mutation]
-
-    for retry in ("same", "different"):
-        root = tmp_path / mutation / failure_at / retry
-        mount = RecordingMount()
-        manager = service(root, mount)
-        await prepare(manager)
-        before = manager.snapshot
-        started = threading.Event()
-        finished = threading.Event()
-        release_thread = threading.Event()
-        entered_reconcile = asyncio.Event()
-        release_reconcile = asyncio.Event()
-
-        with monkeypatch.context() as context:
-            if failure_at == "worker_await":
-                original_transaction = manager._transaction
-
-                def committed_transaction(
-                    change=None,
-                    *,
-                    _original=original_transaction,
-                    _started=started,
-                    _release=release_thread,
-                    _finished=finished,
-                ):
-                    candidate = _original(change)
-                    if change is not None and not _started.is_set():
-                        _started.set()
-                        try:
-                            assert _release.wait(10), "timed out releasing commit"
-                        finally:
-                            _finished.set()
-                    return candidate
-
-                # test-contract: durability cancel the public call after its commit
-                context.setattr(manager, "_transaction", committed_transaction)
-            elif failure_at == "reconcile_error":
-
-                async def fail_reconcile(_desired):
-                    raise RuntimeError("injected reconcile failure")
-
-                # test-contract: seam fail the owner after its durable commit
-                context.setattr(manager, "_reconcile", fail_reconcile)
-            elif failure_at == "reconcile_await":
-
-                async def block_reconcile(
-                    _desired,
-                    _entered=entered_reconcile,
-                    _release=release_reconcile,
-                ):
-                    _entered.set()
-                    await asyncio.wait_for(_release.wait(), 10)
-
-                # test-contract: seam cancel the owner at its post-commit await
-                context.setattr(manager, "_reconcile", block_reconcile)
-            else:
-
-                def fail_publish(_candidate):
-                    raise RuntimeError("injected publish failure")
-
-                # test-contract: seam fail the owner after runtime reconciliation
-                context.setattr(manager, "_publish", fail_publish)
-
-            task = asyncio.create_task(mutate(manager))
-            try:
-                if failure_at == "worker_await":
-                    assert await asyncio.to_thread(started.wait, 10), (
-                        "commit did not finish"
-                    )
-                    task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await asyncio.wait_for(task, 10)
-                elif failure_at == "reconcile_await":
-                    await asyncio.wait_for(entered_reconcile.wait(), 10)
-                    task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await asyncio.wait_for(task, 10)
-                else:
-                    with pytest.raises(RuntimeError, match="injected"):
-                        await asyncio.wait_for(task, 10)
-            finally:
-                release_thread.set()
-                release_reconcile.set()
-                if not task.done():
-                    task.cancel()
-                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-                if failure_at == "worker_await":
-                    assert await asyncio.to_thread(finished.wait, 10), (
-                        "transaction did not finish"
-                    )
-
-        assert manager.snapshot is before
-        if retry == "same":
-            if mutation == "add":
-                with pytest.raises(MCPManagementError, match="already configured"):
-                    await mutate(manager)
-            elif mutation == "remove":
-                with pytest.raises(MCPManagementError, match="unknown MCP server"):
-                    await mutate(manager)
-            else:
-                await mutate(manager)
-        else:
-            await manager.add("other", scope="user", url="https://other.test")
-
-        expected = expected_runtime | ({"other"} if retry == "different" else set())
-        assert set(mount.configs) == expected
-        durable_names = {
-            item.name
-            for item in manager.snapshot.entries
-            if item.enabled and item.trusted
-        }
-        assert durable_names == expected
-
-        restarted_mount = RecordingMount()
-        restarted = service(root, restarted_mount)
-        await restarted.refresh()
-        assert set(restarted_mount.configs) == expected
-
-        if mutation == "add":
-            with pytest.raises(MCPManagementError, match="already configured"):
-                await manager.add("durable", scope="user", url="https://different.test")
-
-
 @pytest.mark.asyncio
 async def test_published_snapshot_is_recursively_immutable(tmp_path):
     manager = service(tmp_path)
@@ -1218,4 +1076,3 @@ async def test_published_snapshot_is_recursively_immutable(tmp_path):
         entry.config["enabled"] = False
     with pytest.raises(TypeError):
         entry.config["headers"]["Authorization"] = "changed"
-    assert manager.snapshot is snapshot

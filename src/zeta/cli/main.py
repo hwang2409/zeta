@@ -986,10 +986,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(item.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
-                asyncio.run(service.refresh_credentials())
+                view = asyncio.run(service.refresh_credentials())
                 values = [
                     item.as_json()
-                    for item in service.snapshot.entries
+                    for item in view.entries
                     if args.scope == "effective" or item.scope == args.scope
                 ]
                 output = (
@@ -1004,7 +1004,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.mcp_action == "show":
                 asyncio.run(service.refresh_credentials())
-                value = service.show(args.name, scope=args.scope).as_json()
+                value = asyncio.run(
+                    service.resolve(args.name, scope=args.scope)
+                ).as_json()
                 output = (
                     json.dumps(value, indent=2, sort_keys=True)
                     if args.json

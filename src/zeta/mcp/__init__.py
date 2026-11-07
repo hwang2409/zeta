@@ -29,7 +29,6 @@ from .management import (
     ManagedServer,
     MCPManagementError,
     MCPManagementService,
-    MCPManagerSnapshot,
 )
 from .mount import MCPMount, MCPServerState, MCPServerStatus, mount_mcp_servers
 from .stdio import StdioMCPClient
@@ -40,7 +39,6 @@ __all__ = [
     "MCPConfigError",
     "MCPManagementError",
     "MCPManagementService",
-    "MCPManagerSnapshot",
     "MCPMount",
     "MCPPrompt",
     "MCPPromptArgument",

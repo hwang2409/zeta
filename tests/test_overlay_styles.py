@@ -82,6 +82,7 @@ def _mcp_lines(tmp_path) -> list[overlay.FragmentLine]:
         service.add("beta", scope="project", url="https://example.test", enabled=False)
     )
     view = MCPManager(service)
+    asyncio.run(view.refresh())
     view.details = True
     view.last_result = "ok"
     return view.render()
