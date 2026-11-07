@@ -400,6 +400,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "bash",
         _bash,
+        binding="shared",
         approval_subject="command",
         description=(
             "Run a shell command. Session cwd persists after cd. "
