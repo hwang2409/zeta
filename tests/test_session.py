@@ -74,7 +74,9 @@ def _private_project(home: Path, root: Path, marker: str) -> tuple[str, Path]:
     return project.project_id, path
 
 
-def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, threading.Thread]:
+def _hold_registry_lock(
+    path: Path,
+) -> tuple[threading.Event, threading.Event, threading.Thread]:
     acquired = threading.Event()
     release = threading.Event()
 
@@ -221,11 +223,15 @@ def test_private_instructions_load_in_real_git_linked_worktree(
     worktree = tmp_path / "linked"
     root.mkdir()
     subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=root, check=True
+    )
     subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
     (root / "tracked").write_text("initial", encoding="utf-8")
     subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True
+    )
     subprocess.run(
         ["git", "worktree", "add", "-b", "feature", str(worktree)],
         cwd=root,
@@ -282,13 +288,30 @@ def test_submodule_does_not_load_containing_project_private_file(
     inner_source.mkdir()
     subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True)
     subprocess.run(["git", "init"], cwd=inner_source, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=inner_source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=inner_source,
+        check=True,
+    )
     subprocess.run(["git", "config", "user.name", "Test"], cwd=inner_source, check=True)
     (inner_source / "tracked").write_text("initial", encoding="utf-8")
     subprocess.run(["git", "add", "tracked"], cwd=inner_source, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=inner_source, check=True, capture_output=True)
     subprocess.run(
-        ["git", "-c", "protocol.file.allow=always", "submodule", "add", str(inner_source), "nested"],
+        ["git", "commit", "-m", "initial"],
+        cwd=inner_source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(inner_source),
+            "nested",
+        ],
         cwd=outer,
         check=True,
         capture_output=True,
@@ -317,11 +340,15 @@ def test_nested_linked_worktree_does_not_load_containing_project_private_file(
     outer.mkdir()
     source.mkdir()
     subprocess.run(["git", "init"], cwd=source, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=source, check=True
+    )
     subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True)
     (source / "tracked").write_text("initial", encoding="utf-8")
     subprocess.run(["git", "add", "tracked"], cwd=source, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=source, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=source, check=True, capture_output=True
+    )
     nested = outer / "nested-worktree"
     subprocess.run(
         ["git", "worktree", "add", "-b", "nested", str(nested)],
@@ -371,7 +398,9 @@ def test_resume_notices_private_file_change_when_session_and_cwd_projects_differ
     resumed = create_app(_args("--resume", session_id))
 
     assert "PRIVATE-AFTER" in _system_prompt(resumed)
-    assert any("project instructions changed" in notice for notice in resumed._startup_notices)
+    assert any(
+        "project instructions changed" in notice for notice in resumed._startup_notices
+    )
 
 
 def test_resume_warns_repo_agents_ignore_when_session_and_cwd_projects_differ(
@@ -415,7 +444,9 @@ def test_resume_with_changed_private_instructions_rebuilds_and_notifies(
 
     assert "PRIVATE-BEFORE" not in _system_prompt(resumed)
     assert "PRIVATE-AFTER" in _system_prompt(resumed)
-    assert any("project instructions changed" in notice for notice in resumed._startup_notices)
+    assert any(
+        "project instructions changed" in notice for notice in resumed._startup_notices
+    )
 
 
 def test_resume_with_unchanged_private_instructions_keeps_prefix_bytes(
@@ -435,7 +466,9 @@ def test_resume_with_unchanged_private_instructions_keeps_prefix_bytes(
     resumed = create_app(_args("--resume", session_id))
 
     assert _system_prompt(resumed) == prefix
-    assert not any("project instructions" in notice for notice in resumed._startup_notices)
+    assert not any(
+        "project instructions" in notice for notice in resumed._startup_notices
+    )
 
 
 def test_resume_with_removed_private_instructions_notifies(
@@ -455,7 +488,9 @@ def test_resume_with_removed_private_instructions_notifies(
     resumed = create_app(_args("--resume", session_id))
 
     assert "REMOVED-PRIVATE" not in _system_prompt(resumed)
-    assert any("project instructions removed" in notice for notice in resumed._startup_notices)
+    assert any(
+        "project instructions removed" in notice for notice in resumed._startup_notices
+    )
 
 
 def test_repo_agents_ignore_warns_with_custom_system_prompt(
@@ -561,7 +596,10 @@ async def test_project_instructions_opens_editor_once_in_tui(
 
     assert calls == 1
     assert invocation.read_text() == str(private)
-    assert result == f"project instructions: {private} (applies to new and resumed sessions)"
+    assert (
+        result
+        == f"project instructions: {private} (applies to new and resumed sessions)"
+    )
     assert await app._slash_commands.dispatch_async(app, "/status")
     app.loop.store.close()
 
@@ -644,7 +682,10 @@ def test_project_instructions_slash_command_creates_file(
 
     result = app._slash_commands.dispatch(app, "/project-instructions")
 
-    assert result == f"project instructions: {home / 'projects' / project_id / 'AGENTS.md'}"
+    assert (
+        result
+        == f"project instructions: {home / 'projects' / project_id / 'AGENTS.md'}"
+    )
     assert private.is_file()
 
 
@@ -718,7 +759,9 @@ def test_init_unchanged_for_registered_non_git_folder(
 
     app = create_app(_args())
 
-    assert app._slash_commands.dispatch(app, "/init") == "init error: not inside a project"
+    assert (
+        app._slash_commands.dispatch(app, "/init") == "init error: not inside a project"
+    )
     app.loop.store.close()
 
 
@@ -749,11 +792,15 @@ def test_project_instructions_editor_command_prefers_visual_and_splits_args(
     monkeypatch.setenv("VISUAL", "")
     monkeypatch.setenv("EDITOR", "code -w")
     assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
-        "code", "-w", str(tmp_path / "AGENTS.md")
+        "code",
+        "-w",
+        str(tmp_path / "AGENTS.md"),
     )
     monkeypatch.setenv("VISUAL", "vim --clean")
     assert project_instructions_editor_command(tmp_path / "AGENTS.md") == (
-        "vim", "--clean", str(tmp_path / "AGENTS.md")
+        "vim",
+        "--clean",
+        str(tmp_path / "AGENTS.md"),
     )
 
 
@@ -850,7 +897,9 @@ def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     context_file.write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
     metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata.pop("system_prompt")
@@ -859,7 +908,9 @@ def test_legacy_empty_prompt_resume_builds_default_from_stored_cwd(
     opened.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "codex"]
+        )
     )
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
@@ -884,7 +935,9 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
     (tmp_path / "AGENTS.md").write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
     session_id = opened.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -944,7 +997,9 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
     (tmp_path / "AGENTS.md").write_text("legacy rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
     session_id = opened.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -999,14 +1054,17 @@ def test_legacy_resume_does_not_marker_scan_skill_index(
     opened.store.close()
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "codex"]
+        )
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
     assert prompt == legacy_prompt
-    assert SessionManager(home).read_metadata(
-        opened.store.session_id
-    ).skill_catalog is not None
+    assert (
+        SessionManager(home).read_metadata(opened.store.session_id).skill_catalog
+        is not None
+    )
 
 
 def test_legacy_resume_preserves_unterminated_skill_index(
@@ -1048,7 +1106,10 @@ def test_catalog_boundaries_require_explicit_catalog() -> None:
         (load_project_context, "catalog"),
         (compose_runtime, "skill_catalog"),
     ):
-        assert inspect.signature(callable_).parameters[parameter].default is inspect.Parameter.empty
+        assert (
+            inspect.signature(callable_).parameters[parameter].default
+            is inspect.Parameter.empty
+        )
 
 
 def test_legacy_empty_prompt_adopts_live_default_recipe(
@@ -1059,7 +1120,9 @@ def test_legacy_empty_prompt_adopts_live_default_recipe(
     context_file.write_text("first rules", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path)
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=tmp_path
+    )
     metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata.pop("system_prompt")
@@ -1068,13 +1131,17 @@ def test_legacy_empty_prompt_adopts_live_default_recipe(
 
     opened.store.close()
     first_resume = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "codex"]
+        )
     )
     first_resume.loop.store.close()
     context_file.write_text("second rules", encoding="utf-8")
 
     resumed = create_app(
-        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "codex"])
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "codex"]
+        )
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
@@ -1126,7 +1193,9 @@ def test_resume_system_prompt_flag_wins_over_snapshot(
     first = create_app(_args())
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
-    original_snapshot = json.loads(metadata_path.read_text(encoding="utf-8"))["system_prompt"]
+    original_snapshot = json.loads(metadata_path.read_text(encoding="utf-8"))[
+        "system_prompt"
+    ]
     assert "original rules" in original_snapshot
     first.loop.store.close()
 
@@ -1148,9 +1217,7 @@ def test_resume_system_prompt_flag_wins_over_snapshot(
     assert prompt == _with_runtime_guidance("operator override")
     assert saved["system_prompt"] == _with_runtime_guidance("operator override")
     assert saved["context_files"] == []
-    assert any(
-        "system prompt overridden" in alert for alert in resumed._startup_alerts
-    )
+    assert any("system prompt overridden" in alert for alert in resumed._startup_alerts)
 
 
 def test_resume_append_flag_composes_over_snapshot_base(
@@ -1184,9 +1251,7 @@ def test_resume_append_flag_composes_over_snapshot_base(
     assert "You are zeta" in prompt
     assert "repo rules" in prompt
     assert prompt.endswith("TAIL EXTENSION")
-    assert any(
-        "system prompt overridden" in alert for alert in resumed._startup_alerts
-    )
+    assert any("system prompt overridden" in alert for alert in resumed._startup_alerts)
 
 
 def test_resume_without_flags_recomposes_default_snapshot(
@@ -1241,8 +1306,9 @@ async def test_resume_rebuilds_current_skill_catalog_for_prompt_and_tool(
     )
     first.loop.store.close()
 
-    resumed = await asyncio.to_thread(create_app,
-        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
+    resumed = await asyncio.to_thread(
+        create_app,
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"]),
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     loaded = await resumed.loop.tool_registry.execute(
@@ -1411,7 +1477,11 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     write_threads: list[int] = []
     original_refresh = SessionManager.refresh_recency
 
-    def record_refresh(self: SessionManager, target_session_id: str, execution_lease: object | None = None) -> bool:
+    def record_refresh(
+        self: SessionManager,
+        target_session_id: str,
+        execution_lease: object | None = None,
+    ) -> bool:
         write_threads.append(threading.get_ident())
         return original_refresh(self, target_session_id, execution_lease)
 
@@ -1684,8 +1754,9 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
     with transcript_path.open("ab") as transcript:
         transcript.write(fixture.read_bytes())
 
-    resumed = await asyncio.to_thread(create_app,
-        build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
+    resumed = await asyncio.to_thread(
+        create_app,
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"]),
     )
     try:
         assert "browser" not in {
@@ -1717,7 +1788,9 @@ async def test_model_swap_persists_and_restores_on_resume(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = await asyncio.to_thread(create_app, _args())
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(first, "/model gpt-5.6-sol")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(first, "/model gpt-5.6-sol")
     assert output.startswith("model: gpt-5.6-sol")
     assert first.model == "gpt-5.6-sol"
     session_id = first.loop.store.session_id
@@ -1726,9 +1799,7 @@ async def test_model_swap_persists_and_restores_on_resume(
 
     resumed = await asyncio.to_thread(
         create_app,
-        build_parser().parse_args(
-            ["--resume", session_id, "--provider", "codex"]
-        ),
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"]),
     )
     assert resumed.model == "gpt-5.6-sol"
 
@@ -1743,9 +1814,9 @@ async def test_vim_mode_defaults_on_and_persists_on_resume(
 
     assert first.vim_mode is True
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(first, "/vim off")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            first, "/vim off"
+        )
         == "vim mode: off"
     )
     assert first.vim_mode is False
@@ -1755,9 +1826,7 @@ async def test_vim_mode_defaults_on_and_persists_on_resume(
 
     resumed = await asyncio.to_thread(
         create_app,
-        build_parser().parse_args(
-            ["--resume", session_id, "--provider", "codex"]
-        ),
+        build_parser().parse_args(["--resume", session_id, "--provider", "codex"]),
     )
     assert resumed.vim_mode is False
 
@@ -1790,17 +1859,25 @@ async def _accept_model_change(model: str) -> SimpleNamespace:
 async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
     )
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model offline")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model offline")
     await wait_until(lambda: app._model_catalog_loaded)
 
-    assert output == "model: offline (model catalog unavailable for claude — using anyway)"
+    assert (
+        output == "model: offline (model catalog unavailable for claude — using anyway)"
+    )
     assert app.model == "offline"
 
 
@@ -1837,20 +1914,27 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
 @pytest.mark.asyncio
 async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
     )
 
-    first = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-opus-4-7")
+    first = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-opus-4-7")
     await wait_until(lambda: app._model_catalog_loaded)
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-opus-4-7")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-opus-4-7")
 
     assert first == (
-        "model: claude-opus-4-7 "
-        "(model catalog unavailable for claude — using anyway)"
+        "model: claude-opus-4-7 (model catalog unavailable for claude — using anyway)"
     )
     assert output == "model: claude-opus-4-7"
 
@@ -1864,20 +1948,27 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=load_catalog,
     )
 
-    first = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-new")
+    first = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-new")
     await wait_until(lambda: app._model_catalog_loaded)
-    second = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-other")
+    second = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-other")
 
     assert first == (
-        "model: claude-new "
-        "(model catalog unavailable for claude — using anyway)"
+        "model: claude-new (model catalog unavailable for claude — using anyway)"
     )
     assert second == (
         "model: claude-other (model not found in claude catalog — using anyway)"
@@ -1896,73 +1987,105 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=load_catalog,
     )
 
-    first = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-opus-4-7")
+    first = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-opus-4-7")
 
     assert first == (
-        "model: claude-opus-4-7 "
-        "(model catalog unavailable for claude — using anyway)"
+        "model: claude-opus-4-7 (model catalog unavailable for claude — using anyway)"
     )
     await wait_until(lambda: app._model_catalog_loaded)
     assert loader_threads
     assert input_thread not in loader_threads
-    assert await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-opus-4-7") == (
-        "model: claude-opus-4-7"
-    )
+    assert await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-opus-4-7") == ("model: claude-opus-4-7")
 
 
 @pytest.mark.asyncio
 async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="gpt-5.4",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider, **kwargs: None,
     )
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model gpt-5.6-sol")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model gpt-5.6-sol")
     await wait_until(lambda: app._model_catalog_loaded)
 
-    assert output == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
+    assert (
+        output
+        == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
+    )
 
 
 @pytest.mark.asyncio
 async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset(),
     )
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model gpt-5.6-sol")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model gpt-5.6-sol")
 
-    assert output == "model unchanged: model 'gpt-5.6-sol' has a wrong-provider prefix for claude"
+    assert (
+        output
+        == "model unchanged: model 'gpt-5.6-sol' has a wrong-provider prefix for claude"
+    )
 
 
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
     try:
-        output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model faster")
+        output = await create_slash_registry(
+            skill_catalog=SkillCatalog.empty()
+        ).dispatch_async(app, "/model faster")
     finally:
         app._active_task.cancel()
         await asyncio.gather(app._active_task, return_exceptions=True)
 
-    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert (
+        output
+        == "model unchanged: cannot change model while a turn or approval is active"
+    )
     assert app.model == "offline"
 
 
@@ -1976,23 +2099,39 @@ async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> N
         [(call.id, call)],
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         approval_policy=policy,
     )
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model faster")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model faster")
 
-    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert (
+        output
+        == "model unchanged: cannot change model while a turn or approval is active"
+    )
     assert app.model == "offline"
 
 
 @pytest.mark.asyncio
-async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
+async def test_compact_command_forces_the_existing_compaction_path(
+    tmp_path: Path,
+) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
     assembler = ContextAssembler(
         store,
@@ -2000,17 +2139,24 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
         token_budget=1000,
         retained_tail=1,
         system_prompt="stable identity",
-        token_counter=lambda message: 1
-        if message.metadata.get("context_evicted")
-        else 10,
+        token_counter=lambda message: (
+            1 if message.metadata.get("context_evicted") else 10
+        ),
     )
     app = TUIApp(
-        AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            context_assembler=assembler,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/compact")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/compact")
 
     assert output is not None
     assert output.startswith("compacted entries ")
@@ -2025,13 +2171,19 @@ def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
     older = manager.create(provider="codex", model="offline", cwd=tmp_path)
     newer = manager.create(provider="codex", model="offline", cwd=tmp_path)
     older.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("older message")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("older message")]),
+            MessageOrigin.USER,
+        )
     )
     newer.store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("\x1b[31mnew\x1b[0m\nmessage with controls")],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("\x1b[31mnew\x1b[0m\nmessage with controls")],
+            ),
+            MessageOrigin.USER,
+        )
     )
     older.metadata.updated_at = "2020-01-01T00:00:00+00:00"
     newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
@@ -2054,10 +2206,13 @@ def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("wide \u009b31m" + "界" * 40 + "\u009b0m tail")],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("wide \u009b31m" + "界" * 40 + "\u009b0m tail")],
+            ),
+            MessageOrigin.USER,
+        )
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -2073,15 +2228,17 @@ def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [
-                TextContent(
-                    "start" + "\u0301" * 100_000 + "\u200d" * 100_000
-                    + "\u202e end"
-                )
-            ],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [
+                    TextContent(
+                        "start" + "\u0301" * 100_000 + "\u200d" * 100_000 + "\u202e end"
+                    )
+                ],
+            ),
+            MessageOrigin.USER,
+        )
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -2095,10 +2252,13 @@ def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> 
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("cafe\u0301 family 👩\u200d💻 \u2066safe\u2069")],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("cafe\u0301 family 👩\u200d💻 \u2066safe\u2069")],
+            ),
+            MessageOrigin.USER,
+        )
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -2160,10 +2320,12 @@ def test_resume_picker_render_shows_preview(
     original = create_app(_args())
     resumed = None
     try:
-        original.loop.store.append_message(with_message_origin(
-            Message(MessageRole.USER, [TextContent("visible picker preview")]),
-            MessageOrigin.USER,
-        ))
+        original.loop.store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("visible picker preview")]),
+                MessageOrigin.USER,
+            )
+        )
         original_store = ConversationStore
 
         def reject_read_only_store(*args, **kwargs):
@@ -2181,6 +2343,7 @@ def test_resume_picker_render_shows_preview(
 
         assert "visible picker preview" in capsys.readouterr().out
     finally:
+
         async def close_apps() -> None:
             for app in (resumed, original):
                 if app is not None:
@@ -2214,10 +2377,16 @@ def test_resume_picker_matches_direct_resume(
     picked = direct = None
     try:
         first.loop.store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent("first session")]), MessageOrigin.USER)
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("first session")]),
+                MessageOrigin.USER,
+            )
         )
         second.loop.store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent("second session")]), MessageOrigin.USER)
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("second session")]),
+                MessageOrigin.USER,
+            )
         )
         manager = SessionManager(home)
         first_opened = manager.open(first.loop.store.session_id)
@@ -2245,6 +2414,7 @@ def test_resume_picker_matches_direct_resume(
 
         assert picked.loop.store.session_id == direct.loop.store.session_id
     finally:
+
         async def close_apps() -> None:
             for app in (direct, picked, second, first):
                 if app is not None:
@@ -2265,10 +2435,13 @@ def test_resume_picker_stays_within_shared_content_width(
     monkeypatch.chdir(tmp_path)
     session = create_app(_args())
     session.loop.store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("a very long session preview " * 12)],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("a very long session preview " * 12)],
+            ),
+            MessageOrigin.USER,
+        )
     )
     session.loop.store.close()
     monkeypatch.setattr(
@@ -2349,9 +2522,7 @@ def test_resume_provider_override_requires_force_and_records_audit(
 
     with pytest.raises(SessionError, match="override rejected"):
         create_app(
-            build_parser().parse_args(
-                ["--resume", session_id, "--provider", "claude"]
-            )
+            build_parser().parse_args(["--resume", session_id, "--provider", "claude"])
         )
 
 
@@ -2368,9 +2539,7 @@ def test_resume_honors_provider_from_settings_file(
     project = tmp_path / "project"
     dot_zeta = project / ".zeta"
     dot_zeta.mkdir(parents=True)
-    (dot_zeta / "settings.toml").write_text(
-        'provider = "claude"\n', encoding="utf-8"
-    )
+    (dot_zeta / "settings.toml").write_text('provider = "claude"\n', encoding="utf-8")
     monkeypatch.chdir(project)
     # No CLI --provider; settings.provider alone must trigger the mismatch banner.
     with pytest.raises(SessionError, match="override rejected"):
@@ -2389,9 +2558,7 @@ def test_resume_honors_provider_from_settings_file(
             ]
         )
     )
-    metadata = json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
     assert metadata["provider"] == "codex"
     assert metadata["model"] == "gpt-5.6-luna"
     assert metadata["override_audit"] == []
@@ -2403,7 +2570,9 @@ async def test_forced_override_commits_after_first_successful_request(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
+    monkeypatch.setattr(
+        "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
+    )
     first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
@@ -2413,7 +2582,8 @@ async def test_forced_override_commits_after_first_successful_request(
         return backend, "claude-sonnet-4-6"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = await asyncio.to_thread(create_app,
+    app = await asyncio.to_thread(
+        create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -2424,17 +2594,16 @@ async def test_forced_override_commits_after_first_successful_request(
                 "claude-sonnet-4-6",
                 "--force-provider",
             ]
-        )
+        ),
     )
-    assert json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )["model"] == "gpt-5.6-luna"
+    assert (
+        json.loads((home / "sessions" / session_id / "meta.json").read_text())["model"]
+        == "gpt-5.6-luna"
+    )
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
 
-    metadata = json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
     assert metadata["provider"] == "claude"
     assert metadata["model"] == "claude-sonnet-4-6"
     assert metadata["override_audit"]
@@ -2456,7 +2625,8 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
         return backend, "definitely-not-a-claude-model"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = await asyncio.to_thread(create_app,
+    app = await asyncio.to_thread(
+        create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -2467,7 +2637,7 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
                 "definitely-not-a-claude-model",
                 "--force-provider",
             ]
-        )
+        ),
     )
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
@@ -2561,10 +2731,11 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
     )
     opened.store.close()
 
-    app = await asyncio.to_thread(create_app,
+    app = await asyncio.to_thread(
+        create_app,
         build_parser().parse_args(
             ["--resume", opened.store.session_id, "--provider", "codex"]
-        )
+        ),
     )
     app.console = Console(file=StringIO(), force_terminal=False)
     app._present_pending_approvals()
@@ -2580,7 +2751,12 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
 ) -> None:
     parent_store = ConversationStore(tmp_path / "sessions", session_id="parent")
     policy = ApprovalPolicy(store=parent_store)
-    loop = AgentLoop(FakeBackend([]), parent_store, approval_policy=policy, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]),
+        parent_store,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
     app = TUIApp(
         loop,
         provider="codex",
@@ -2600,18 +2776,14 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
         policy_a.authorize(
             call_a,
             signal_a,
-            capability=loop.tool_registry.resolve_call(
-                call_a.name, call_a.arguments
-            ),
+            capability=loop.tool_registry.resolve_call(call_a.name, call_a.arguments),
         )
     )
     task_b = asyncio.create_task(
         policy_b.authorize(
             call_b,
             signal_b,
-            capability=loop.tool_registry.resolve_call(
-                call_b.name, call_b.arguments
-            ),
+            capability=loop.tool_registry.resolve_call(call_b.name, call_b.arguments),
         )
     )
 
@@ -2630,9 +2802,7 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
     assert [request.key for request in app.pending_approvals] == [
         ("child-a", "same-request")
     ]
-    await app._handle_prompt_value(
-        "/approve ('child-a', 'same-request')"
-    )
+    await app._handle_prompt_value("/approve ('child-a', 'same-request')")
     assert await task_a == ApprovalDecision.ALLOW
     assert await task_b == ApprovalDecision.DENY
     signal_a.abort()
@@ -2660,7 +2830,7 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
             tools={"echo": echo},
             approval_policy=policy,
             max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -2678,9 +2848,16 @@ skill_catalog=SkillCatalog.empty(),
     assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
     await app._handle_prompt_value(f"/approve {call.id}")
     assert executed == []
-    assert len(
-        [message for message in opened.store.messages() if message.tool_result is not None]
-    ) == 1
+    assert (
+        len(
+            [
+                message
+                for message in opened.store.messages()
+                if message.tool_result is not None
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -2689,7 +2866,9 @@ async def test_cancel_honors_approval_won_by_other_writer(
 ) -> None:
     opened = await asyncio.to_thread(
         SessionManager(tmp_path / "zeta-home").create,
-        provider="codex", model="offline", cwd=tmp_path
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
     )
     policy = ApprovalPolicy(store=opened.store)
     call = ToolCall("approval-concurrent-cancel", "echo", {"value": "approved"})
@@ -2761,7 +2940,7 @@ async def test_resume_pending_tool_executes_and_persists_result(
         opened.store,
         tools={"echo": echo},
         approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-tool", "echo", {"value": "done"})
     opened.store.append_message_with_approval_requests(
@@ -2787,7 +2966,9 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path) -> None:
+async def test_resumed_tool_abort_active_persists_canceled_result(
+    tmp_path: Path,
+) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
@@ -2806,7 +2987,7 @@ async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path
         opened.store,
         tools={"block": block},
         approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-abort", "block", {})
     opened.store.append_message_with_approval_requests(
@@ -2830,7 +3011,9 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Path) -> None:
+async def test_resumed_tool_direct_cancel_persists_canceled_result(
+    tmp_path: Path,
+) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
@@ -2849,7 +3032,7 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Pat
         opened.store,
         tools={"block": block},
         approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-cancel", "block", {})
     opened.store.append_message_with_approval_requests(
@@ -2858,7 +3041,9 @@ skill_catalog=SkillCatalog.empty(),
     )
     policy.approve(call.id)
     events: list[StreamEvent] = []
-    task = asyncio.create_task(loop.resume_pending_tool(call.id, event_sink=events.append))
+    task = asyncio.create_task(
+        loop.resume_pending_tool(call.id, event_sink=events.append)
+    )
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2891,7 +3076,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
         opened.store,
         tools={"never": never_runs},
         approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-immediate-abort", "never", {})
     opened.store.append_message_with_approval_requests(
@@ -3022,7 +3207,7 @@ async def test_resume_pending_tool_rejects_existing_result(tmp_path: Path) -> No
         opened.store,
         tools={"echo": echo},
         approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-existing-result", "echo", {"value": "done"})
     opened.store.append_message_with_approval_requests(
@@ -3063,7 +3248,10 @@ async def test_summary_success_commits_override_before_main_failure(
     )
     for index in range(50):
         opened.store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"message {index}")]),
+                MessageOrigin.USER,
+            )
         )
     session_id = opened.store.session_id
     opened.store.close()
@@ -3075,7 +3263,8 @@ async def test_summary_success_commits_override_before_main_failure(
 
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
-    app = await asyncio.to_thread(create_app,
+    app = await asyncio.to_thread(
+        create_app,
         build_parser().parse_args(
             [
                 "--resume",
@@ -3086,7 +3275,7 @@ async def test_summary_success_commits_override_before_main_failure(
                 "claude-sonnet-4-6",
                 "--force-provider",
             ]
-        )
+        ),
     )
     app._invalidate_prompt = lambda: None
     await app._consume_turn("new message")
@@ -3202,7 +3391,9 @@ def test_session_id_collision_retries(
     from types import SimpleNamespace
 
     calls = iter([collision, collision, unique])
-    monkeypatch.setattr("zeta.core.session.uuid", SimpleNamespace(uuid4=lambda: next(calls)))
+    monkeypatch.setattr(
+        "zeta.core.session.uuid", SimpleNamespace(uuid4=lambda: next(calls))
+    )
     manager.create(provider="codex", model="offline", cwd=tmp_path)
     created = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
@@ -3216,7 +3407,9 @@ def test_session_cwd_is_normalized_for_continue(
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="codex", model="offline", cwd=Path("."))
 
-    assert manager.find_most_recent(cwd=Path.cwd()).session_id == opened.store.session_id
+    assert (
+        manager.find_most_recent(cwd=Path.cwd()).session_id == opened.store.session_id
+    )
 
 
 @pytest.mark.asyncio
@@ -3301,7 +3494,9 @@ def test_new_session_stores_the_model_derived_budget(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
+    monkeypatch.setattr(
+        "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
+    )
     app = create_app(
         build_parser().parse_args(
             ["--provider", "claude", "--model", "claude-sonnet-4-6"]
@@ -3328,7 +3523,9 @@ def test_token_budget_override_pins_and_survives_resume(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
+    monkeypatch.setattr(
+        "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
+    )
     first = create_app(
         build_parser().parse_args(
             [
@@ -3357,15 +3554,20 @@ def test_resume_retunes_an_unpinned_budget_to_the_model(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
+    monkeypatch.setattr(
+        "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
+    )
     session_id = create_app(
         build_parser().parse_args(
             ["--provider", "claude", "--model", "claude-opus-4-5"]
         )
     ).loop.store.session_id
-    assert json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )["compaction_budget"] == 200_000
+    assert (
+        json.loads((home / "sessions" / session_id / "meta.json").read_text())[
+            "compaction_budget"
+        ]
+        == 200_000
+    )
 
     resumed = create_app(
         build_parser().parse_args(
@@ -3379,9 +3581,12 @@ def test_resume_retunes_an_unpinned_budget_to_the_model(
         )
     )
     assert resumed.loop.context_assembler.token_budget == 1_000_000
-    assert json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )["compaction_budget"] == 1_000_000
+    assert (
+        json.loads((home / "sessions" / session_id / "meta.json").read_text())[
+            "compaction_budget"
+        ]
+        == 1_000_000
+    )
 
 
 @pytest.mark.asyncio
@@ -3390,7 +3595,9 @@ async def test_model_command_leaves_a_pinned_budget_alone(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None)
+    monkeypatch.setattr(
+        "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
+    )
     app = await asyncio.to_thread(
         create_app,
         build_parser().parse_args(
@@ -3404,9 +3611,10 @@ async def test_model_command_leaves_a_pinned_budget_alone(
             ]
         ),
     )
-    assert await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/model claude-sonnet-4-6") == (
-        "model: claude-sonnet-4-6 "
-        "(model catalog unavailable for claude — using anyway)"
+    assert await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-sonnet-4-6") == (
+        "model: claude-sonnet-4-6 (model catalog unavailable for claude — using anyway)"
     )
     assert app.loop.context_assembler.token_budget == 9000
 
@@ -3415,18 +3623,34 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
     manager = SessionManager(tmp_path)
     metadata = manager.create(provider="claude", model="claude-sonnet-4-6").metadata
     fallback = (metadata.provider, metadata.model, metadata.compaction_budget)
-    manager.record_session_settings(metadata, model="gpt-5.4-mini", provider="codex",
-                                    approval_mode="ask", budget=200_000, model_fallback=fallback)
+    manager.record_session_settings(
+        metadata,
+        model="gpt-5.4-mini",
+        provider="codex",
+        approval_mode="ask",
+        budget=200_000,
+        model_fallback=fallback,
+    )
     assert manager.open(metadata.session_id).metadata.model_fallback == fallback
     assert "model_fallback" not in metadata.to_dict()
     assert metadata.to_storage_dict()["model_fallback"] == list(fallback)
     stale = manager.open(metadata.session_id).metadata
-    manager.record_session_settings(metadata, model=metadata.model, provider=metadata.provider,
-                                    approval_mode="ask", budget=metadata.compaction_budget)
+    manager.record_session_settings(
+        metadata,
+        model=metadata.model,
+        provider=metadata.provider,
+        approval_mode="ask",
+        budget=metadata.compaction_budget,
+    )
     assert manager.open(metadata.session_id).metadata.model_fallback is None
     with pytest.raises(SessionError, match="changed before commit"):
-        manager.record_session_settings(stale, model=stale.model, provider=stale.provider,
-                                        approval_mode="ask", budget=stale.compaction_budget)
+        manager.record_session_settings(
+            stale,
+            model=stale.model,
+            provider=stale.provider,
+            approval_mode="ask",
+            budget=stale.compaction_budget,
+        )
 
 
 def test_copy_metadata_adopts_every_dataclass_field(tmp_path: Path) -> None:
@@ -3481,11 +3705,21 @@ def test_prompt_component_digest_must_match_owned_span(tmp_path: Path) -> None:
         SessionMetadata.from_dict(metadata.to_dict(), path=tmp_path / "meta.json")
 
 
-@pytest.mark.parametrize("fallback", ["bad", [], [[], "model", 5], ["fake", "model", 5],
-                                       ["codex", "", 5], ["codex", "model", True],
-                                       ["codex", "model", -1]])
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        "bad",
+        [],
+        [[], "model", 5],
+        ["fake", "model", 5],
+        ["codex", "", 5],
+        ["codex", "model", True],
+        ["codex", "model", -1],
+    ],
+)
 def test_invalid_model_fallback_metadata_fails_closed(tmp_path, fallback):
     from zeta.core.session import SessionMetadata
+
     manager = SessionManager(tmp_path)
     metadata = manager.create(provider="claude", model="claude-sonnet-4-6").metadata
     data = metadata.to_dict()
@@ -3524,7 +3758,9 @@ def test_session_delete_does_not_follow_links(tmp_path, link_location):
         session.symlink_to(outside, target_is_directory=True)
     else:
         session.mkdir()
-        (session / (".lock" if link_location == "lock" else "nested")).symlink_to(sentinel if link_location == "lock" else outside)
+        (session / (".lock" if link_location == "lock" else "nested")).symlink_to(
+            sentinel if link_location == "lock" else outside
+        )
     if link_location == "nested":
         manager.delete("session")
         assert not session.exists()
@@ -3534,7 +3770,9 @@ def test_session_delete_does_not_follow_links(tmp_path, link_location):
     assert sentinel.read_text() == "keep"
 
 
-@pytest.mark.parametrize("corruption", ["missing_metadata", "bad_metadata", "bad_conversation"])
+@pytest.mark.parametrize(
+    "corruption", ["missing_metadata", "bad_metadata", "bad_conversation"]
+)
 def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     manager = SessionManager(tmp_path)
     session = manager.create(provider="codex", model="offline", cwd=tmp_path)
@@ -3543,7 +3781,10 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     if corruption == "missing_metadata":
         (directory / "meta.json").unlink()
     else:
-        (directory / ("meta.json" if corruption == "bad_metadata" else "conversation.jsonl")).write_bytes(b"\xff")
+        (
+            directory
+            / ("meta.json" if corruption == "bad_metadata" else "conversation.jsonl")
+        ).write_bytes(b"\xff")
     session.store.close()
     manager.delete(sid)
     assert not directory.exists()
@@ -3573,7 +3814,10 @@ def test_removed_compaction_flag_reports_migration_message(
         build_parser().parse_args(["--provider", "codex", "--compaction", "summary"])
 
     assert exc_info.value.code == 2
-    assert "summary compaction mode was removed; eviction is always used" in capsys.readouterr().err
+    assert (
+        "summary compaction mode was removed; eviction is always used"
+        in capsys.readouterr().err
+    )
 
 
 def test_double_dash_compaction_positional_is_not_intercepted() -> None:
@@ -3589,7 +3833,9 @@ async def _install_legacy_summary_fixture(
 ) -> tuple[Path, str]:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    first = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    first = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     session_id = first.loop.store.session_id
     session_dir = home / "sessions" / session_id
     await first.close()
@@ -3607,7 +3853,9 @@ async def test_legacy_summary_marker_fixture_loads_and_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
-    resumed = await asyncio.to_thread(create_app, build_parser().parse_args(["--resume", session_id]))
+    resumed = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--resume", session_id])
+    )
     try:
         messages = await resumed.loop.context_assembler.assemble()
         rendered = "\n".join(
@@ -3628,7 +3876,9 @@ async def test_tui_resume_renders_legacy_summary_marker_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, session_id = await _install_legacy_summary_fixture(tmp_path, monkeypatch)
-    resumed = await asyncio.to_thread(create_app, build_parser().parse_args(["--resume", session_id]))
+    resumed = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--resume", session_id])
+    )
     resumed._active_session = resumed._make_session()
     try:
         await resumed._rebuild_transcript_async()

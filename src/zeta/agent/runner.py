@@ -467,7 +467,9 @@ async def _build_child_loop(
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
-            max_agent_depth=budget.depth_limit(loop.max_agent_depth, preset.max_child_depth),
+            max_agent_depth=budget.depth_limit(
+                loop.max_agent_depth, preset.max_child_depth
+            ),
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -599,7 +601,9 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = budget.child_depth(loop.agent_depth, loop.max_agent_depth, background)
+    child_depth, nesting_error = budget.child_depth(
+        loop.agent_depth, loop.max_agent_depth, background
+    )
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -841,7 +845,9 @@ async def run_agent_tool(
         if background:
             child_store.update_agent_lifecycle(turns_used=turns_used)
         else:
-            child_store.finish_agent_lifecycle(state, final_result=text, turns_used=turns_used)
+            child_store.finish_agent_lifecycle(
+                state, final_result=text, turns_used=turns_used
+            )
         return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
@@ -926,7 +932,9 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
-    loop._background_owner.causal_episodes.associate_new_member(child_instance_id, loop.agent_instance_id)
+    loop._background_owner.causal_episodes.associate_new_member(
+        child_instance_id, loop.agent_instance_id
+    )
     finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
@@ -1048,38 +1056,38 @@ async def run_agent_tool(
 
         async def finish_background() -> None:
             await finish_background_child(
-                    child_task=child_task,
-                    child_store=child_store,
-                    parent_store=loop.store,
-                    tool_call=tool_call,
-                    child_instance_id=child_instance_id,
-                    child_path=child_path,
-                    description=description,
-                    child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                        child_result(
-                            text,
-                            error=error,
-                            status=status,
-                            stats=stats,
-                            include_stats=True,
-                            notice=notice,
-                            notice_items=notice_items,
-                            max_bytes=background_receipt_bytes,
-                        )
-                    ),
-                    validate_result=validate_result,
-                    publish_event=loop._publish_background_event,
-                    cleanup=cleanup_background_child,
-                    close_child=close_background_child,
-                    error_message=error_message,
-                    marker_key=child_marker_key,
-                    agent_instance_id=loop.agent_instance_id,
-                    background_owner=loop._background_owner,
-                    max_receipt_bytes=background_receipt_bytes,
-                    explicit_finish=terminal_fence is not None,
-                    child_loop=child_loop,
-                    finish_gate_state=finish_gate_state,
+                child_task=child_task,
+                child_store=child_store,
+                parent_store=loop.store,
+                tool_call=tool_call,
+                child_instance_id=child_instance_id,
+                child_path=child_path,
+                description=description,
+                child_turns=child_turns,
+                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                    child_result(
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
+                    )
+                ),
+                validate_result=validate_result,
+                publish_event=loop._publish_background_event,
+                cleanup=cleanup_background_child,
+                close_child=close_background_child,
+                error_message=error_message,
+                marker_key=child_marker_key,
+                agent_instance_id=loop.agent_instance_id,
+                background_owner=loop._background_owner,
+                max_receipt_bytes=background_receipt_bytes,
+                explicit_finish=terminal_fence is not None,
+                child_loop=child_loop,
+                finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())
@@ -1223,7 +1231,11 @@ def _compose_child_system_prompt(
     composed = compose_system_prompt(system_prompt, preset.preamble)
     body = preset.prompt_suffix
     if explicit_finish:
-        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
+        body = (
+            f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"
+            if body
+            else _EXPLICIT_FINISH_GUIDANCE
+        )
     if not body:
         return composed
     if isinstance(composed, Message):
