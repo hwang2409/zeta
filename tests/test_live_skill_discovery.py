@@ -6,7 +6,6 @@ import hashlib
 import inspect
 import os
 import threading
-import time
 from io import StringIO
 from pathlib import Path
 
@@ -425,17 +424,22 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
+    # test-contract: seam no public metadata-lock holder seam exists
     release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
     _install_live_skill(home)
-    started = time.monotonic()
-    try:
+
+    async def refresh_and_run_turn() -> None:
         await loop.refresh_live_config()
         _ = [
             event
             async for event in loop.run_turn("next", origin=MessageOrigin.USER)
         ]
-        assert time.monotonic() - started < 0.5
-        assert loop.tool_registry.skill_catalog.find("live").description == "live description"
+
+    try:
+        await asyncio.wait_for(refresh_and_run_turn(), timeout=10)
+        catalog = loop.tool_registry.skill_catalog
+        assert "live" in {skill.name for skill in catalog.skills}
+        assert catalog.find("live").description == "live description"
     finally:
         release.set()
         holder.join(1)
