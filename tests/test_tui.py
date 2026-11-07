@@ -11897,12 +11897,31 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
 
 @pytest.mark.asyncio
 async def test_later_successful_snapshot_clears_earlier_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     first_finished = threading.Event()
     writes = 0
     original_write = persistence_module.write_json_file
+    original_mark_persisted = persistence._mark_persisted
+    mark_started = asyncio.Event()
+    release_mark = asyncio.Event()
+    mark_finished = asyncio.Event()
+    mark_task: asyncio.Task[None] | None = None
+
+    async def finish_mark(revision: int) -> None:
+        await asyncio.wait_for(release_mark.wait(), 10)
+        original_mark_persisted(revision)
+        mark_finished.set()
+
+    def gated_mark_persisted(revision: int) -> None:
+        nonlocal mark_task
+        mark_started.set()
+        mark_task = asyncio.create_task(finish_mark(revision))
+
+    # test-contract: seam no public event reports that pending draft state was cleared
+    monkeypatch.setattr(persistence, "_mark_persisted", gated_mark_persisted)
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -11915,18 +11934,28 @@ async def test_later_successful_snapshot_clears_earlier_failure(
             first_finished.set()
 
     monkeypatch.setattr(persistence_module, "write_json_file", write)
-    persistence.schedule("first")
-    assert await asyncio.to_thread(first_finished.wait, 1)
-    persistence.schedule("second")
-    error: OSError | None = None
     try:
-        await persistence.flush_pending()
-    except OSError as exc:
-        error = exc
+        persistence.schedule("first")
+        assert await asyncio.to_thread(first_finished.wait, 10)
+        persistence.schedule("second")
+        error: OSError | None = None
+        try:
+            await persistence.flush_pending()
+        except OSError as exc:
+            error = exc
 
-    assert error is None, "a successful newer snapshot retained the earlier write failure"
-    assert persistence.load() == "second"
-    assert persistence._pending_text is None
+        assert error is None, (
+            "a successful newer snapshot retained the earlier write failure"
+        )
+        await asyncio.wait_for(mark_started.wait(), 10)
+        assert persistence.load() == "second"
+        release_mark.set()
+        await asyncio.wait_for(mark_finished.wait(), 10)
+        assert persistence.pending_text is None
+    finally:
+        release_mark.set()
+        if mark_task is not None:
+            await asyncio.wait_for(mark_task, 10)
 
 
 @pytest.mark.asyncio
