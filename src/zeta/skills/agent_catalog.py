@@ -79,7 +79,6 @@ class AgentCatalog:
                     "allow_delegation": agent.allow_delegation,
                     "accepts_follow_ups": agent.accepts_follow_ups,
                     "explicit_finish": agent.explicit_finish,
-                    "max_child_depth": agent.max_child_depth,
                 }
             )
             snapshots.append(snapshot)
@@ -101,7 +100,6 @@ class AgentCatalog:
             allow_delegation = item.get("allow_delegation", True)
             accepts_follow_ups = item.get("accepts_follow_ups", False)
             explicit_finish = item.get("explicit_finish", False)
-            max_child_depth = item.get("max_child_depth")
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
@@ -122,13 +120,6 @@ class AgentCatalog:
                 or type(allow_delegation) is not bool
                 or type(accepts_follow_ups) is not bool
                 or type(explicit_finish) is not bool
-                or (
-                    max_child_depth is not None
-                    and (
-                        type(max_child_depth) is not int
-                        or not 0 <= max_child_depth <= HARD_MAX_AGENT_DEPTH
-                    )
-                )
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -148,7 +139,6 @@ class AgentCatalog:
                     allow_delegation=allow_delegation,
                     accepts_follow_ups=accepts_follow_ups,
                     explicit_finish=explicit_finish,
-                    max_child_depth=max_child_depth,
                 )
             )
         return cls(tuple(agents))

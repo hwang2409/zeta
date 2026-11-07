@@ -39,7 +39,6 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
-from zeta.agent.budget import child_depth as next_agent_depth
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.finish_gate import (
     FinishGateControl,
@@ -5518,6 +5517,7 @@ async def test_default_depth_allows_three_delegations_and_stops_there(
             ScriptedTurn(tool_calls=[_agent_call("child")]),
             ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
             ScriptedTurn(tool_calls=[_agent_call("great-grandchild")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused-depth-four")]),
             ScriptedTurn([TextContent("depth three complete")]),
             ScriptedTurn([TextContent("depth two complete")]),
             ScriptedTurn([TextContent("depth one complete")]),
@@ -5530,16 +5530,22 @@ async def test_default_depth_allows_three_delegations_and_stops_there(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert getattr(loop, "max_agent_depth", None) == 3
     assert ["agent" in {schema["name"] for schema in schemas} for _, schemas in backend.calls[:4]] == [
         True,
         True,
         True,
         False,
     ]
-    depth, error = next_agent_depth(3, loop.max_agent_depth, False)
-    assert depth == 4
-    assert error == "agent error: maximum agent nesting depth is 3"
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[4][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused-depth-four"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 3"
+    )
 
 
 @pytest.mark.asyncio
@@ -5654,6 +5660,60 @@ async def test_custom_profile_can_grant_itself_delegation(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_explicit_agent_profile_starts_at_its_depth_cap(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "capped-delegator.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: capped-delegator\ndescription: capped delegator\n"
+        "tools: [agent]\nmax_child_depth: 1\n---\ndelegate when available\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("capped child", "capped-delegator")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused grandchild")]),
+            ScriptedTurn([TextContent("capped child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+
+    assert "agent" not in {schema["name"] for schema in backend.calls[1][1]}
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[2][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused grandchild"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 1"
+    )
+    child_result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert not child_result.is_error
+    assert child_result.content.startswith("capped child complete")
+
+
+@pytest.mark.asyncio
 async def test_profile_max_child_depth_only_lowers_the_parent_limit(
     tmp_path: Path,
 ) -> None:
@@ -5669,6 +5729,8 @@ async def test_profile_max_child_depth_only_lowers_the_parent_limit(
         encoding="utf-8",
     )
     catalog = discover_session_agents(home=home)
+    assert catalog.find("lower").max_child_depth == 1
+    assert all("max_child_depth" not in item for item in catalog.to_snapshot())
 
     async def child_agent_schemas(profile_name: str, parent_limit: int) -> set[str]:
         backend = FakeBackend(

@@ -390,7 +390,11 @@ async def _build_child_loop(
             for name in runtime_tool_names
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
-        excluded_names, profile_tool_allow = resolve_child_profile_tools(
+        (
+            excluded_names,
+            profile_tool_allow,
+            schema_hidden_names,
+        ) = resolve_child_profile_tools(
             child_depth=child_depth,
             child_max_depth=child_max_depth,
             preset=preset,
@@ -406,6 +410,7 @@ async def _build_child_loop(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            hide_schema_names=schema_hidden_names,
             profile_tool_allow=profile_tool_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,
