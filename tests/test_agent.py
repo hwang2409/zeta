@@ -95,6 +95,7 @@ from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
+from zeta.tools.ask_parent import register_ask_parent
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.agent_sync import AgentTranscriptSource, _project_typed_prompts
@@ -6406,62 +6407,12 @@ async def test_profile_max_child_depth_only_lowers_the_parent_limit(
     assert "agent" not in await child_agent_schemas("raise", 1)
 
 
-@pytest.mark.parametrize("tool_name", ["ask_parent", "finish", "agent_handoff"])
-@pytest.mark.asyncio
-async def test_loop_bound_handler_is_rebound_or_absent_in_child_registry(
-    tmp_path: Path, tool_name: str
-) -> None:
-    async with AsyncExitStack() as stack:
-        parent_store = ConversationStore(tmp_path / "parent")
-        stack.callback(parent_store.close)
-        child_store = ConversationStore(tmp_path / "child")
-        stack.callback(child_store.close)
-        parent_registry = ToolRegistry(
-            tmp_path,
-            register_builtin=False,
-            session_store=parent_store,
-            skill_catalog=SkillCatalog.empty(),
-        )
-        stack.push_async_callback(parent_registry.close)
-        writes: list[str] = []
-
-        async def parent_handler(
-            _registry: ToolRegistry, _arguments: dict[str, object]
-        ) -> str:
-            writes.append(parent_store.session_id)
-            return "parent"
-
-        parent_registry.register_session_tool(
-            tool_name,
-            parent_handler,
-            loop_bound=True,
-            requires_approval=False,
-        )
-        child_registry = parent_registry.clone_for_session(child_store)
-        stack.push_async_callback(child_registry.close)
-        assert tool_name not in child_registry.definitions_by_name
-
-        async def child_handler(
-            _registry: ToolRegistry, _arguments: dict[str, object]
-        ) -> str:
-            writes.append(child_store.session_id)
-            return "child"
-
-        child_registry.register_session_tool(
-            tool_name,
-            child_handler,
-            loop_bound=True,
-            requires_approval=False,
-        )
-        result = await child_registry.execute(ToolCall("call", tool_name, {}))
-        assert result["content"][0]["text"] == "child"
-        assert writes == [child_store.session_id]
-
-
 class NestedLoopBoundHandlerBackend(CompletionBackend):
     def __init__(self, *, child_a_profile: str) -> None:
         self.child_a_profile = child_a_profile
+        self.lead_schemas: set[str] = set()
         self.child_a_schemas: set[str] = set()
+        self.registry_clones: list[tuple[ToolRegistry, ToolRegistry]] = []
         self.child_a_started = asyncio.Event()
         self.child_a_finished = asyncio.Event()
         self.child_a_id: str | None = None
@@ -6495,6 +6446,7 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
                 )
             ]
         elif prompt == "lead" and "child-a" not in results:
+            self.lead_schemas = {schema["name"] for schema in tool_schemas}
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -6552,7 +6504,15 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
             else:
                 blocks = [TextContent("child a done")]
         elif prompt == "child-b":
-            await self.release_child_b.wait()
+            release_wait = asyncio.create_task(self.release_child_b.wait())
+            try:
+                await asyncio.wait_for(release_wait, 10)
+            except TimeoutError as exc:
+                raise AssertionError("timed out waiting to release nested child b") from exc
+            finally:
+                if not release_wait.done():
+                    release_wait.cancel()
+                await asyncio.gather(release_wait, return_exceptions=True)
             blocks = [TextContent("child b done")]
         else:
             blocks = [TextContent("done")]
@@ -6613,8 +6573,41 @@ async def _run_nested_loop_bound_case(
         agent_catalog=_nested_handler_catalog(),
     )
     loop.explicit_finish = True
+    register_ask_parent(
+        loop.tool_registry,
+        child_instance_id="classification-probe",
+        channel=loop._background_owner.conversation_channel,
+    )
+    loop.tool_registry.unregister("ask_parent")
     stack.push_async_callback(loop.close)
     stack.callback(backend.release_child_b.set)
+
+    async def unclassified_handler(
+        _registry: ToolRegistry, _arguments: dict[str, object]
+    ) -> str:
+        return "unclassified"
+
+    with pytest.raises(TypeError, match="required keyword-only argument: 'binding'"):
+        loop.tool_registry.register_session_tool(
+            "unclassified", unclassified_handler  # type: ignore[call-arg]
+        )
+    assert loop.tool_registry.register_mcp(
+        "test_mcp",
+        lambda _arguments: "mcp",
+        owner=object(),
+        generation=1,
+        requires_approval=False,
+    )
+    original_clone = ToolRegistry.clone_for_session
+
+    def observe_clone(
+        registry: ToolRegistry, *args: object, **kwargs: object
+    ) -> ToolRegistry:
+        clone = original_clone(registry, *args, **kwargs)
+        backend.registry_clones.append((registry, clone))
+        return clone
+
+    monkeypatch.setattr(ToolRegistry, "clone_for_session", observe_clone)
     original_unregister = loop._background_owner.unregister
 
     def observe_unregister(instance_id: str) -> None:
@@ -6640,6 +6633,11 @@ async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
         )
 
         assert {"finish", "agent_handoff"}.isdisjoint(backend.child_a_schemas)
+        assert backend.child_a_schemas == backend.lead_schemas - {
+            "finish",
+            "agent_handoff",
+        }
+        assert {"skill", "test_mcp"} <= backend.child_a_schemas
         await asyncio.wait_for(backend.child_a_finished.wait(), 10)
         lead_id = next(
             instance_id
@@ -6653,6 +6651,31 @@ async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
         )
         assert lead_id in loop._background_owner._cancellers
         assert loop._background_owner._parent_ids[child_b_id] == lead_id
+        assert backend.child_a_path is not None
+        lead_registry, child_a_registry = next(
+            (parent, child)
+            for parent, child in backend.registry_clones
+            if child._session_store is not None
+            and child._session_store.session_dir == backend.child_a_path
+        )
+        assert any(
+            parent is loop.tool_registry and child is lead_registry
+            for parent, child in backend.registry_clones
+        )
+        for registry in {
+            loop.tool_registry,
+            *(child for _parent, child in backend.registry_clones),
+        }:
+            assert all(
+                definition.binding in {"loop", "shared"}
+                for definition in registry.definitions_by_name.values()
+            )
+        parent_ask = lead_registry.definitions_by_name["ask_parent"]
+        child_ask = child_a_registry.definitions_by_name["ask_parent"]
+        assert parent_ask.binding == child_ask.binding == "loop"
+        assert parent_ask.handler is not child_ask.handler
+        assert parent_ask.binding_owner is lead_registry
+        assert child_ask.binding_owner is child_a_registry
         lead_path = Path(store.agent_children()[lead_id]["child_session_path"])
         lead_store = ConversationStore(lead_path.parent, session_id=lead_path.name)
         stack.callback(lead_store.close)

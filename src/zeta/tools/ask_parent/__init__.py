@@ -70,6 +70,7 @@ def register_ask_parent(
     registry.register_session_tool(
         "ask_parent",
         ask_parent,
+        binding="loop",
         description=(
             "Send your parent one non-blocking question. Continue working; "
             "the answer arrives later as an ordinary follow-up message."
@@ -98,5 +99,4 @@ def register_ask_parent(
         },
         requires_approval=False,
         parallel_safe=True,
-        loop_bound=True,
     )

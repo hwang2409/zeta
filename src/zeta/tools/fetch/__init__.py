@@ -871,6 +871,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "fetch",
         _fetch,
+        binding="shared",
         approval_subject="url",
         description=(
             "Fetch a URL and return readable text. Network access requires approval; "

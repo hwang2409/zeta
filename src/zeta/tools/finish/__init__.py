@@ -87,6 +87,7 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     registry.register_session_tool(
         "finish",
         finish,
+        binding="loop",
         description=(
             "Call finish to end this run and report the contract result with status "
             "and summary; include verdict and head_sha when they apply."
@@ -104,7 +105,6 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         },
         requires_approval=False,
         parallel_safe=False,
-        loop_bound=True,
     )
 
 
