@@ -1215,9 +1215,9 @@ async def test_child_spills_share_one_root_byte_cap(
         first.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
         second.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
         try:
-            old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
+            old_path = first.spills.write_bytes("tool", "duplicate", 0, b"a" * 100)
             sibling_path = second.spills.write_bytes(
-                "tool", "second", 0, b"b" * 100
+                "tool", "duplicate", 0, b"a" * 100
             )
             assert not old_path.exists()
 
