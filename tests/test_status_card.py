@@ -378,7 +378,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
             if dismissal_task is not None:
                 dismissal_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await dismissal_task
+                    await asyncio.wait_for(dismissal_task, 10)
             raise
         assert information.id not in {item.record.id for item in app._decisions_panel.items}
         dismissed = attention.get(information.id)
