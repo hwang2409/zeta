@@ -82,6 +82,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop.empty_turn import empty_turn_error
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -3770,6 +3771,12 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         session_id="session",
         background=True,
     )
+    bounded_error = empty_turn_error("n" * 12_000, "i" * 12_000, "error")
+    await client._event(
+        StreamEvent(StreamEventType.ERROR, error=bounded_error),
+        session_id="session",
+        background=True,
+    )
 
     assert notifications == [
         (
@@ -3791,6 +3798,10 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
                 },
                 "data": {},
             },
+        ),
+        (
+            "error",
+            {"error": {"code": "empty_turn", "message": bounded_error.message}, "data": {}},
         ),
     ]
 

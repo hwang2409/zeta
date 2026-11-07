@@ -103,6 +103,7 @@ from ._store_writes import StoreWriteMixin
 from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
+    EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
     empty_turn_recovery_error,
@@ -136,8 +137,7 @@ class _ToollessTransition:
     continue_turn: bool
     consuming_notifications: bool
     nudge_turn_pending: bool
-    empty_nudge_count: int
-    empty_nudge_episode: int
+    recovery_state: EmptyTurnRecoveryState
     error: ErrorInfo | None = None
 class AgentLoop(
     BackendOwnerMixin,
@@ -672,11 +672,7 @@ class AgentLoop(
         *,
         iteration_consuming_notifications: bool,
         notification_turn: bool,
-        empty_nudge_count: int,
-        empty_nudge_episode: int,
-        tool_result_episode: int,
-        last_tool_call: ToolCall | None,
-        last_tool_result: ToolResult | None,
+        recovery_state: EmptyTurnRecoveryState,
     ) -> _ToollessTransition:
         should_nudge = (
             not iteration_consuming_notifications
@@ -684,8 +680,11 @@ class AgentLoop(
                 assistant_message,
                 stop_reason=self._turn_stop_reason,
                 notification_turn=notification_turn,
-                already_nudged=empty_nudge_episode == tool_result_episode,
-                nudge_count=empty_nudge_count,
+                already_nudged=(
+                    recovery_state.nudge_episode
+                    == recovery_state.tool_result_episode
+                ),
+                nudge_count=recovery_state.nudge_count,
             )
         )
         error = empty_turn_recovery_error(
@@ -693,9 +692,7 @@ class AgentLoop(
             notification_turn=notification_turn,
             consuming_notifications=iteration_consuming_notifications,
             should_nudge=should_nudge,
-            tool_result_episode=tool_result_episode,
-            tool_call=last_tool_call,
-            tool_result=last_tool_result,
+            recovery_state=recovery_state,
         )
         if should_nudge:
             await step_delivery.admit_terminal("nudge")
@@ -703,12 +700,14 @@ class AgentLoop(
         elif not step_delivery.has_pending_edge and self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
         consume_pending = step_delivery.has_pending_edge and not notification_turn
+        if should_nudge:
+            recovery_state.nudge_count += 1
+            recovery_state.nudge_episode = recovery_state.tool_result_episode
         return _ToollessTransition(
             continue_turn=consume_pending or should_nudge,
             consuming_notifications=consume_pending,
             nudge_turn_pending=should_nudge,
-            empty_nudge_count=empty_nudge_count + int(should_nudge),
-            empty_nudge_episode=(tool_result_episode if should_nudge else empty_nudge_episode),
+            recovery_state=recovery_state,
             error=error,
         )
     async def _run_turn_impl(
@@ -785,11 +784,7 @@ class AgentLoop(
         retrying_provider = False
         provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
-        empty_nudge_count = 0
-        empty_nudge_episode = -1
-        tool_result_episode = 0
-        last_tool_call: ToolCall | None = None
-        last_tool_result: ToolResult | None = None
+        recovery_state = EmptyTurnRecoveryState()
         nudge_turn_pending = False
         recovering_tool_limit = False
         consuming_notifications = False
@@ -1186,14 +1181,9 @@ class AgentLoop(
                         iteration_consuming_notifications
                     ),
                     notification_turn=notification_turn,
-                    empty_nudge_count=empty_nudge_count,
-                    empty_nudge_episode=empty_nudge_episode,
-                    tool_result_episode=tool_result_episode,
-                    last_tool_call=last_tool_call,
-                    last_tool_result=last_tool_result,
+                    recovery_state=recovery_state,
                 )
-                empty_nudge_count = transition.empty_nudge_count
-                empty_nudge_episode = transition.empty_nudge_episode
+                recovery_state = transition.recovery_state
                 nudge_turn_pending = transition.nudge_turn_pending
                 if transition.error is not None:
                     yield StreamEvent(StreamEventType.ERROR, error=transition.error)
@@ -1222,9 +1212,9 @@ class AgentLoop(
             try:
                 async for event in dispatch:
                     if event.type is StreamEventType.TOOL_EXECUTION_END:
-                        last_tool_call = event.tool_call
-                        last_tool_result = event.tool_result
-                        tool_result_episode += 1
+                        recovery_state.last_tool_call = event.tool_call
+                        recovery_state.last_tool_result = event.tool_result
+                        recovery_state.tool_result_episode += 1
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is durable before dispatch starts. If

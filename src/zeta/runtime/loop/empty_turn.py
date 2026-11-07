@@ -10,6 +10,7 @@ output-token limit mid-thinking we surface that instead of nudging.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import (
@@ -37,6 +38,20 @@ OUTPUT_LIMIT_ERROR_MESSAGE = (
     "and did not produce a reply"
 )
 MAX_EMPTY_TURN_NUDGES = 3
+MAX_EMPTY_TURN_DETAIL_CHARS = 128
+
+
+@dataclass(slots=True)
+class EmptyTurnRecoveryState:
+    nudge_count: int = 0
+    nudge_episode: int = -1
+    tool_result_episode: int = 0
+    last_tool_call: Any = None
+    last_tool_result: Any = None
+
+
+def _bounded_detail(value: str) -> str:
+    return value[:MAX_EMPTY_TURN_DETAIL_CHARS]
 
 
 def has_visible_output(message: Message) -> bool:
@@ -154,7 +169,8 @@ def empty_turn_error(
     return ErrorInfo(
         "empty_turn",
         "child returned an empty final assistant message after tool "
-        f"`{tool_name}` ({tool_call_id}) {tool_state}",
+        f"`{_bounded_detail(tool_name)}` ({_bounded_detail(tool_call_id)}) "
+        f"{tool_state}",
     )
 
 
@@ -169,18 +185,18 @@ def empty_turn_recovery_error(
     notification_turn: bool,
     consuming_notifications: bool,
     should_nudge: bool,
-    tool_result_episode: int,
-    tool_call: Any,
-    tool_result: Any,
+    recovery_state: EmptyTurnRecoveryState,
 ) -> ErrorInfo | None:
     if (
         notification_turn
         or consuming_notifications
         or should_nudge
         or has_visible_output(message)
-        or tool_result_episode == 0
-        or tool_call is None
-        or tool_result is None
+        or recovery_state.tool_result_episode == 0
+        or recovery_state.last_tool_call is None
+        or recovery_state.last_tool_result is None
     ):
         return None
-    return empty_turn_tool_error(tool_call, tool_result)
+    return empty_turn_tool_error(
+        recovery_state.last_tool_call, recovery_state.last_tool_result
+    )

@@ -10773,9 +10773,14 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.register(
         "ping",
-        lambda *_args, **_kwargs: "pong",
+        lambda *_args, **_kwargs: {
+            "content": [{"text": "pong"}],
+            "isError": False,
+            "structuredContent": None,
+        },
         description="ping",
         requires_approval=False,
+        binding="shared",
     )
 
     await _collect(
@@ -10795,7 +10800,8 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     assert result.is_error
     assert "empty final assistant message after tool `ping`" in result.content
     assert "ping-call" in result.content
-    assert any(state in result.content for state in ("ok", "error", "cancelled"))
+    assert " error" in result.content
+    assert len(result.content) <= 400
 
 
 @pytest.mark.asyncio
