@@ -271,7 +271,7 @@ class ConnectionRegistry:
         self._enqueue(
             output,
             _OutputFrame(frame),
-            wake=output.phase == "flushing",
+            wake=True,
         )
         return outcome
 

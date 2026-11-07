@@ -1058,6 +1058,7 @@ class ApprovalLifecycle:
                         **payload,
                     )
                     record = self._change(record, live_end=admission)
+                    self._release_gate(record, resolution=resolution)
             elif isinstance(record.target.key, tuple):
                 self._release_terminal(record)
                 self._release_gate(record, resolution=resolution)
