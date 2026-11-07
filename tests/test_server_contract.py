@@ -11,6 +11,8 @@ import pytest
 
 from tests.support.serve_contract import ServeClient, ServeContract
 
+pytest_plugins = ("tests.support.socket_fixtures",)
+
 
 @pytest.fixture(params=("unix", "websocket"))
 async def serve_contract(
@@ -135,7 +137,7 @@ async def test_failed_start_preserves_error_when_socket_removal_fails(
     real_unlink = Path.unlink
 
     def fail_socket_removal(path: Path, *, missing_ok: bool = False) -> None:
-        if path.name.startswith("zeta-contract-"):
+        if path.name.startswith("zeta-test-"):
             raise OSError("forced socket removal failure")
         real_unlink(path, missing_ok=missing_ok)
 
