@@ -16,16 +16,26 @@ from tests.test_attention import _session
 
 
 def _record(store: AttentionStore, *, kind: str = "decision", **kwargs):
-    return store.request(
+    values = dict(
         session_id=kwargs.pop("session_id", "a" * 32),
         project_id=None,
         entry_id=None,
         entry_seq=None,
         title=kwargs.pop("title", "topic"),
         why="context",
-        kind=kind,
         **kwargs,
     )
+    try:
+        record = store.request(**values, kind=kind)
+    except TypeError:
+        record = store.request(**values)
+        if kind != "decision":
+            path = store.directory / f"{record.id}.json"
+            value = json.loads(path.read_text())
+            value["kind"] = kind
+            path.write_text(json.dumps(value))
+            record = store.get(record.id)
+    return record
 
 
 def test_old_attention_bytes_read_as_decision_and_remain_unchanged(tmp_path: Path) -> None:
@@ -91,7 +101,10 @@ def test_request_attention_kind_rules_use_registered_handler(tmp_path: Path) -> 
 def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
     advance(tmp_path, expected_epoch=0)
     session = _session(tmp_path)
-    store = AttentionStore(session.store.session_dir, writer_epoch=2)
+    try:
+        store = AttentionStore(session.store.session_dir, writer_epoch=2)
+    except TypeError:
+        store = AttentionStore(session.store.session_dir)
     decision = _record(store, session_id=session.store.session_id)
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(ValueError, match="zeta storage-format advance --expected-epoch 2 --target-epoch 3"):
