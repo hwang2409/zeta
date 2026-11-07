@@ -1,12 +1,19 @@
 import asyncio
 import gc
+import json
+import threading
 import weakref
 from collections.abc import AsyncIterator
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from rich.console import Console
 
 import zeta.providers.retry_policy as retry_policy_module
+import zeta.providers.stream_diagnostics as stream_diagnostics_module
 from zeta.protocol.types import (
     ErrorInfo,
     Message,
@@ -22,10 +29,15 @@ from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (
+    HTTPClientLease,
     build_response_error,
+    cleanup_transport,
     close_transport_resources,
     retry_provider_completion,
+    stall_watchdog,
 )
+from zeta.tui import loop_errors as loop_errors_module
+from zeta.tui.loop_errors import run_prompt_toolkit
 
 
 class _PartialErrorBody(httpx.AsyncByteStream):
@@ -100,22 +112,22 @@ async def test_transport_close_survives_overlapping_cancellation() -> None:
         assert task is not None
         close_tasks.append(task)
         started[index].set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
 
     async def cancel_then_close() -> None:
         try:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         except asyncio.CancelledError:
-            await close_transport_resources(block(0), block(1))
+            await asyncio.wait_for(close_transport_resources(block(0), block(1)), 10)
 
     owner = asyncio.create_task(cancel_then_close())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.sleep(0), 10)
     owner.cancel()
     asyncio.get_running_loop().call_soon(owner.cancel)
 
     with pytest.raises(asyncio.CancelledError):
-        await owner
-    await asyncio.sleep(0)
+        await asyncio.wait_for(owner, 10)
+    await asyncio.wait_for(asyncio.sleep(0), 10)
 
     assert all(event.is_set() for event in started)
     assert all(task.done() for task in close_tasks)
@@ -127,6 +139,432 @@ async def test_transport_close_survives_overlapping_cancellation() -> None:
         reference() is None or reference().done()  # type: ignore[union-attr]
         for reference in close_refs
     )
+
+
+@pytest.mark.asyncio
+async def test_detached_close_failure_reaches_loop_diagnostics() -> None:
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    owner_ready = asyncio.Event()
+
+    async def failed_close() -> None:
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+        except asyncio.CancelledError:
+            raise RuntimeError("detached close canary") from None
+
+    async def cancel_then_close() -> None:
+        owner_ready.set()
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+        except asyncio.CancelledError:
+            await asyncio.wait_for(close_transport_resources(failed_close()), 10)
+
+    try:
+        owner = asyncio.create_task(cancel_then_close())
+        await asyncio.wait_for(owner_ready.wait(), 10)
+        owner.cancel()
+        await asyncio.wait_for(owner, 10)
+        callbacks_flushed = loop.create_future()
+        loop.call_soon(callbacks_flushed.set_result, None)
+        await asyncio.wait_for(callbacks_flushed, 10)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert len(contexts) == 1
+    assert contexts[0] == {
+        "exception_type": "builtins.RuntimeError",
+        "stage": "background_close",
+        "index": 0,
+        "primary_outcome": "success",
+    }
+
+
+class _FailingCloseIterator:
+    def __aiter__(self) -> "_FailingCloseIterator":
+        return self
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        raise RuntimeError("iterator close canary")
+
+
+@pytest.mark.asyncio
+async def test_stream_iterator_close_failure_keeps_success_and_reaches_diagnostics() -> None:
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        values = [
+            value
+            async for value in stall_watchdog(
+                _FailingCloseIterator(),
+                seconds=0,
+                on_stall=lambda _elapsed: RuntimeError("unexpected stall"),
+            )
+        ]
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert values == []
+    assert len(contexts) == 1
+    assert contexts[0] == {
+        "exception_type": "builtins.RuntimeError",
+        "stage": "stream_iterator",
+        "index": 0,
+        "primary_outcome": "success",
+    }
+
+
+class _FailingCloseClient:
+    async def aclose(self) -> None:
+        raise RuntimeError("cleanup-secret-canary")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_error", [False, True])
+async def test_refresh_cleanup_failure_keeps_primary_outcome(
+    primary_error: bool,
+) -> None:
+    lease = HTTPClientLease.__new__(HTTPClientLease)
+    lease.client = _FailingCloseClient()
+    lease.owned = True
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def refresh(_client: object) -> str:
+        if primary_error:
+            raise ValueError("primary-provider-secret-canary")
+        return "fresh-token"
+
+    try:
+        if primary_error:
+            with pytest.raises(ValueError, match="primary-provider-secret-canary"):
+                await asyncio.wait_for(lease.refresh(refresh), 10)
+        else:
+            assert await asyncio.wait_for(lease.refresh(refresh), 10) == "fresh-token"
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert contexts == [
+        {
+            "exception_type": "builtins.RuntimeError",
+            "stage": "refresh_client",
+            "index": 0,
+            "primary_outcome": "error" if primary_error else "success",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_failure_preserves_primary_and_is_secret_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = ValueError("primary-provider-secret-canary")
+    diagnostic_canary = "diagnostic-write-secret-canary"
+    diagnostics: list[dict[str, object]] = []
+    printed: list[object] = []
+
+    async def fail_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(diagnostic_canary)
+
+    monkeypatch.setattr(
+        stream_diagnostics_module.StreamDiagnostics,
+        "record_cleanup_failure",
+        fail_diagnostic_write,
+    )
+    # test-contract: seam capture the real TUI handler's diagnostic record
+    monkeypatch.setattr(
+        loop_errors_module,
+        "_schedule_diagnostic",
+        lambda _path, record: diagnostics.append(record),
+    )
+
+    class PromptApplication:
+        async def run_async(self, *, set_exception_handler: bool) -> BaseException | None:
+            assert not set_exception_handler
+            return await asyncio.wait_for(
+                cleanup_transport(
+                    stream_context=None,
+                    entered=False,
+                    client=_FailingCloseClient(),
+                    owns_client=True,
+                    primary_exception=primary,
+                    http_error_type=RuntimeError,
+                    diagnostics_path=tmp_path / "provider.jsonl",
+                    provider="test-provider",
+                ),
+                10,
+            )
+
+    session = SimpleNamespace(app=PromptApplication())
+    app = SimpleNamespace(
+        _print_unit=printed.append,
+        _invalidate_prompt=lambda: None,
+    )
+
+    (result,) = await asyncio.wait_for(
+        asyncio.gather(run_prompt_toolkit(session, app), return_exceptions=True), 10
+    )
+
+    assert result is primary
+    assert diagnostic_canary not in repr(result)
+    rendered_output = StringIO()
+    console = Console(file=rendered_output, color_system=None, width=120)
+    for unit in printed:
+        console.print(unit)
+    rendered = rendered_output.getvalue()
+    logged = repr(diagnostics)
+    assert printed and diagnostics
+    assert diagnostic_canary not in rendered
+    assert diagnostic_canary not in logged
+    assert "primary-provider-secret-canary" not in rendered
+    assert "primary-provider-secret-canary" not in logged
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_generator_exit_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts: list[dict[str, object]] = []
+
+    async def exit_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise GeneratorExit
+
+    monkeypatch.setattr(
+        stream_diagnostics_module.StreamDiagnostics,
+        "record_cleanup_failure",
+        exit_diagnostic_write,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    primary = ValueError("primary-provider-secret-canary")
+    try:
+        with pytest.raises(GeneratorExit) as raised:
+            await asyncio.wait_for(
+                cleanup_transport(
+                    stream_context=None,
+                    entered=False,
+                    client=_FailingCloseClient(),
+                    owns_client=True,
+                    primary_exception=primary,
+                    http_error_type=RuntimeError,
+                    diagnostics_path=tmp_path / "provider.jsonl",
+                    provider="test-provider",
+                ),
+                10,
+            )
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert raised.value.__cause__ is primary
+    assert contexts == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_generator_exit_preserves_primary_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = asyncio.CancelledError()
+
+    async def exit_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise GeneratorExit
+
+    monkeypatch.setattr(
+        stream_diagnostics_module.StreamDiagnostics,
+        "record_cleanup_failure",
+        exit_diagnostic_write,
+    )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await asyncio.wait_for(
+            cleanup_transport(
+                stream_context=None,
+                entered=False,
+                client=_FailingCloseClient(),
+                owns_client=True,
+                primary_exception=primary,
+                http_error_type=RuntimeError,
+                diagnostics_path=tmp_path / "provider.jsonl",
+                provider="test-provider",
+            ),
+            10,
+        )
+
+    assert raised.value is primary
+
+
+@pytest.mark.asyncio
+async def test_unwritable_cleanup_diagnostic_emits_sanitized_fallback(
+    tmp_path: Path,
+) -> None:
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("file blocks directory creation")
+    primary = ValueError("primary-provider-secret-canary")
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        result = await asyncio.wait_for(
+            cleanup_transport(
+                stream_context=None,
+                entered=False,
+                client=_FailingCloseClient(),
+                owns_client=True,
+                primary_exception=primary,
+                http_error_type=RuntimeError,
+                diagnostics_path=blocked_parent / "provider.jsonl",
+                provider="test-provider",
+            ),
+            10,
+        )
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert result is primary
+    assert contexts == [
+        {
+            "exception_type": "builtins.OSError",
+            "stage": "client_diagnostic",
+            "index": 0,
+            "primary_outcome": "error",
+        }
+    ]
+    assert "primary-provider-secret-canary" not in repr(contexts)
+    assert "cleanup-secret-canary" not in repr(contexts)
+
+
+@pytest.mark.asyncio
+async def test_detached_cleanup_diagnostics_are_bounded_when_writes_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_reports = asyncio.Event()
+    started_reports = 0
+    contexts: list[dict[str, object]] = []
+
+    async def stalled_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        nonlocal started_reports
+        started_reports += 1
+        await asyncio.wait_for(release_reports.wait(), 10)
+
+    monkeypatch.setattr(
+        stream_diagnostics_module.StreamDiagnostics,
+        "record_cleanup_failure",
+        stalled_diagnostic_write,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def flush_callbacks() -> None:
+        for _ in range(2):
+            flushed = loop.create_future()
+            loop.call_soon(flushed.set_result, None)
+            await asyncio.wait_for(flushed, 10)
+
+    class CancelledFailingCloseClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def aclose(self) -> None:
+            self.started.set()
+            try:
+                await asyncio.wait_for(asyncio.Event().wait(), 10)
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup-secret-canary") from None
+
+    try:
+        for index in range(17):
+            client = CancelledFailingCloseClient()
+            owner = asyncio.create_task(
+                cleanup_transport(
+                    stream_context=None,
+                    entered=False,
+                    client=client,
+                    owns_client=True,
+                    primary_exception=None,
+                    http_error_type=RuntimeError,
+                    diagnostics_path=tmp_path / f"provider-{index}.jsonl",
+                    provider="test-provider",
+                )
+            )
+            await asyncio.wait_for(client.started.wait(), 10)
+            owner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(owner, 10)
+            await asyncio.wait_for(flush_callbacks(), 10)
+
+        assert started_reports == 16
+        assert len(contexts) == 1
+        assert contexts[0]["exception_type"] == "builtins.RuntimeError"
+        assert contexts[0]["stage"] == "client_diagnostic_dropped"
+        assert contexts[0]["index"] == 1
+        assert "cleanup-secret-canary" not in repr(contexts)
+    finally:
+        release_reports.set()
+        await asyncio.wait_for(flush_callbacks(), 10)
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_is_secret_safe_and_written_off_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop_thread = threading.get_ident()
+    write_thread: list[int] = []
+    write_started = threading.Event()
+    real_write = stream_diagnostics_module.write_stream_diagnostic
+
+    def observed_write(path: Path, record: object, **kwargs: object) -> None:
+        write_thread.append(threading.get_ident())
+        write_started.set()
+        real_write(path, record, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        stream_diagnostics_module, "write_stream_diagnostic", observed_write
+    )
+    diagnostics_path = tmp_path / "provider.jsonl"
+    primary = ValueError("primary-provider-secret-canary")
+
+    outcome = await asyncio.wait_for(
+        cleanup_transport(
+            stream_context=None,
+            entered=False,
+            client=_FailingCloseClient(),
+            owns_client=True,
+            primary_exception=primary,
+            http_error_type=RuntimeError,
+            diagnostics_path=diagnostics_path,
+            provider="test-provider",
+        ),
+        10,
+    )
+
+    assert outcome is primary
+    assert write_started.is_set()
+    assert write_thread and write_thread[0] != loop_thread
+    raw_record = diagnostics_path.read_text()
+    record = json.loads(raw_record)
+    assert "cleanup-secret-canary" not in raw_record
+    assert "primary-provider-secret-canary" not in raw_record
+    assert record["exception"] == "builtins.RuntimeError"
+    assert record["stage"] == "client"
+    assert record["index"] == 0
+    assert record["primary_outcome"] == "error"
 
 
 @pytest.mark.parametrize("status_code", [520, 521, 522, 523, 524, 529])

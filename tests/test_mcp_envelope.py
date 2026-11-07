@@ -721,7 +721,7 @@ async def test_mcp_status_shows_effective_limits_in_real_tui_render(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_mcp_status_serve_uses_unavailable_classification(tmp_path) -> None:
+async def test_mcp_status_serve_executes_available_command(tmp_path) -> None:
     server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
     await server.start()
     assert server.port is not None
@@ -743,7 +743,8 @@ async def test_mcp_status_serve_uses_unavailable_classification(tmp_path) -> Non
             {"session_id": session_id, "text": "/mcp status"},
         )
 
-        assert response["result"] == {"kind": "client_only", "name": "mcp"}
+        assert response["result"]["kind"] == "text"
+        assert "mcp limits: deadline 300s" in response["result"]["text"]
     finally:
         await client.close()
         await server.close()

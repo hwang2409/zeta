@@ -57,6 +57,7 @@ def _loop(
     backend: FakeBackend | None = None,
     *,
     explicit_schemas: bool = False,
+    max_agent_depth: int = 3,
 ) -> tuple[AgentLoop, Path, Path]:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -83,6 +84,7 @@ def _loop(
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=catalog,
         tool_schemas=schemas,
+        max_agent_depth=max_agent_depth,
         **live_scope,
     )
     return loop, home, project
@@ -141,6 +143,42 @@ async def test_live_config_adds_profile_to_next_agent_schema_and_spawn(
         isinstance(block, TextContent) and "committed specialist body" in block.text
         for block in child_prompt.content
     )
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        "blocked-specialist",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "specialist task",
+            "agent_type": "specialist",
+        },
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn([])])
+    loop, home, _project = _loop(tmp_path, backend, max_agent_depth=0)
+    _write_agent(
+        home / "agents" / "specialist.md",
+        "specialist",
+        "focused specialist",
+    )
+
+    _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
+
+    assert "specialist" in loop.tool_registry.agent_catalog.names()
+    assert all(schema["name"] != "agent" for schema in backend.calls[0][1])
+    result = next(
+        message.tool_result
+        for message in loop.store.messages()
+        if message.tool_result
+        and message.tool_result.tool_call_id == "blocked-specialist"
+    )
+    assert result.is_error
+    assert result.content.startswith("agent error: maximum agent nesting depth is 0")
     await loop.close()
 
 
@@ -335,7 +373,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         def paused(base, *, force: bool = False):
             candidate = original(base, force=force)
             entered.set()
-            release.wait()
+            assert release.wait(timeout=10)
             return candidate
 
         watcher.prepare = paused
@@ -347,35 +385,41 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         def paused(*, force: bool = False):
             candidate = original(force=force)
             entered.set()
-            release.wait()
+            assert release.wait(timeout=10)
             return candidate
 
         watcher.scan = paused
     task = asyncio.create_task(_refresh(loop))
-    assert await asyncio.to_thread(entered.wait, 2)
-    before = (
-        loop.tool_registry.agent_catalog,
-        _definition(loop),
-        loop.tool_schemas,
-        loop._runtime_prompt,
-    )
-    loop._set_runtime_prompt(loop._runtime_prompt)
-    release.set()
-    await task
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        before = (
+            loop.tool_registry.agent_catalog,
+            _definition(loop),
+            loop.tool_schemas,
+            loop._runtime_prompt,
+        )
+        loop._set_runtime_prompt(loop._runtime_prompt)
+        release.set()
+        await task
 
-    assert before == (
-        loop.tool_registry.agent_catalog,
-        _definition(loop),
-        loop.tool_schemas,
-        loop._runtime_prompt,
-    )
-    with pytest.raises(ValueError, match="unknown agent preset"):
-        loop.tool_registry.agent_catalog.find("specialist")
-    await _refresh(loop)
-    assert "specialist" in loop.tool_registry.agent_catalog.names(), (
-        "stale discard did not retry the complete live candidate"
-    )
-    await loop.close()
+        assert before == (
+            loop.tool_registry.agent_catalog,
+            _definition(loop),
+            loop.tool_schemas,
+            loop._runtime_prompt,
+        )
+        with pytest.raises(ValueError, match="unknown agent preset"):
+            loop.tool_registry.agent_catalog.find("specialist")
+        await _refresh(loop)
+        assert "specialist" in loop.tool_registry.agent_catalog.names(), (
+            "stale discard did not retry the complete live candidate"
+        )
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await loop.close()
 
 
 @pytest.mark.asyncio

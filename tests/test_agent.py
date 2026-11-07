@@ -55,6 +55,7 @@ from zeta.agent.runner import (
     _compose_child_system_prompt,
 )
 from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.config.settings import SettingsError, load_settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.checkpoints import ConversationEntry
@@ -4868,7 +4869,6 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
@@ -4975,7 +4975,6 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(
     )
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
@@ -6112,29 +6111,165 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("explicit_tool_schemas", [False, True])
 @pytest.mark.asyncio
-async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
-    nested = _agent_call("nested")
+async def test_root_at_depth_cap_hides_agent_schema_and_rejects_forged_call(
+    tmp_path: Path, explicit_tool_schemas: bool
+) -> None:
     backend = FakeBackend(
         [
-            ScriptedTurn(tool_calls=[_agent_call()]),
-            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn(tool_calls=[_agent_call("blocked")]),
+            ScriptedTurn([TextContent("complete")]),
+        ]
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path / "session"),
+        registry=registry,
+        tool_schemas=registry.schemas if explicit_tool_schemas else None,
+        max_agent_depth=0,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert "agent" not in {
+        schema["name"] for schema in backend.calls[0][1]
+    }
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[1][0]
+        if message.tool_result and message.tool_result.tool_call_id == "blocked"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_depth_allows_three_delegations_and_stops_there(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
+            ScriptedTurn(tool_calls=[_agent_call("great-grandchild")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused-depth-four")]),
+            ScriptedTurn([TextContent("depth three complete")]),
+            ScriptedTurn([TextContent("depth two complete")]),
+            ScriptedTurn([TextContent("depth one complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert ["agent" in {schema["name"] for schema in schemas} for _, schemas in backend.calls[:4]] == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[4][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused-depth-four"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_configured_depth_five_allows_five_delegations(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        "[agents]\nmax_depth = 5\n", encoding="utf-8"
+    )
+    try:
+        configured_depth = getattr(
+            load_settings(home=home).settings, "agents_max_depth", None
+        )
+    except SettingsError:
+        configured_depth = None
+    assert configured_depth == 5
+
+    backend = FakeBackend(
+        [
+            *(
+                ScriptedTurn(tool_calls=[_agent_call(f"depth-{depth}")])
+                for depth in range(1, 6)
+            ),
+            ScriptedTurn([TextContent("depth five complete")]),
+            *(
+                ScriptedTurn([TextContent(f"depth {depth} complete")])
+                for depth in range(4, 0, -1)
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session")
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        max_agent_depth=configured_depth,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert [
+        "agent" in {schema["name"] for schema in schemas}
+        for _, schemas in backend.calls[:6]
+    ] == [True, True, True, True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_custom_profile_can_grant_itself_delegation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "delegator.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: delegator\ndescription: delegates work\ntools: [agent]\n---\n"
+        "delegate the task\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child", "delegator")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
             ScriptedTurn([TextContent("grandchild complete")]),
             ScriptedTurn([TextContent("child complete")]),
         ]
     )
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
 
     await _collect(
         AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.content.startswith("child complete")
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -6142,52 +6277,128 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
+    assert not child_result.is_error
     assert child_result.content.startswith("grandchild complete")
-    grandchild_schemas = {schema["name"] for schema in backend.calls[2][1]}
-    assert "agent" not in grandchild_schemas
+
+    explore_backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("explore", "explore")]),
+            ScriptedTurn([TextContent("explore complete")]),
+        ]
+    )
+    explore_store = ConversationStore(tmp_path / "explore-session")
+    await _collect(
+        AgentLoop(
+            explore_backend,
+            explore_store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+    explore_tools = {schema["name"] for schema in explore_backend.calls[1][1]}
+    assert "agent" not in explore_tools
 
 
 @pytest.mark.asyncio
-async def test_nested_child_uses_selected_profile_not_parent_profile(
-    tmp_path: Path,
-) -> None:
-    nested = _agent_call("grandchild")
-    child = _agent_call("child", "explore")
+async def test_explicit_agent_profile_starts_at_its_depth_cap(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "capped-delegator.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: capped-delegator\ndescription: capped delegator\n"
+        "tools: [agent]\nmax_child_depth: 1\n---\ndelegate when available\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
     backend = FakeBackend(
         [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("grandchild complete")]),
-            ScriptedTurn([TextContent("child complete")]),
+            ScriptedTurn(tool_calls=[_agent_call("capped child", "capped-delegator")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused grandchild")]),
+            ScriptedTurn([TextContent("capped child complete")]),
         ]
     )
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
 
     await _collect(
         AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    child_tools = {schema["name"] for schema in backend.calls[1][1]}
-    grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
-    assert "project_update" not in child_tools
-    assert "project_update" not in grandchild_tools
-    assert all(
-        "project_update" not in {schema["name"] for schema in schemas}
-        for _, schemas in backend.calls
+    assert "agent" not in {schema["name"] for schema in backend.calls[1][1]}
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[2][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused grandchild"
     )
-    assert child_tools == {
-        "agent",
-        "agent_output",
-        "agent_status",
-        "fetch",
-        "read",
-        "skill",
-        "websearch",
-    }
-    assert "bash" in grandchild_tools
-    assert "agent" not in grandchild_tools
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 1"
+    )
+    child_result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert not child_result.is_error
+    assert child_result.content.startswith("capped child complete")
+
+
+@pytest.mark.asyncio
+async def test_profile_max_child_depth_only_lowers_the_parent_limit(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    agents = home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "lower.md").write_text(
+        "---\nname: lower\ndescription: lower limit\nmax_child_depth: 1\n---\nlower\n",
+        encoding="utf-8",
+    )
+    (agents / "raise.md").write_text(
+        "---\nname: raise\ndescription: cannot raise\nmax_child_depth: 5\n---\nraise\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    assert catalog.find("lower").max_child_depth == 1
+    assert all("max_child_depth" not in item for item in catalog.to_snapshot())
+
+    async def child_agent_schemas(profile_name: str, parent_limit: int) -> set[str]:
+        backend = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[_agent_call("child", profile_name)]),
+                ScriptedTurn([TextContent("child complete")]),
+            ]
+        )
+        store = ConversationStore(tmp_path / profile_name)
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=catalog,
+        )
+        loop = AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        loop.max_agent_depth = parent_limit
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        return {schema["name"] for schema in backend.calls[1][1]}
+
+    assert "agent" not in await child_agent_schemas("lower", 3)
+    assert "agent" not in await child_agent_schemas("raise", 1)
 
 
 @pytest.mark.asyncio
@@ -13373,6 +13584,271 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
+
+
+@pytest.mark.parametrize(
+    "task_count", [1, 2], ids=["first-task-after-long-idle", "later-task-after-clear"]
+)
+@pytest.mark.asyncio
+async def test_idle_task_safety_window_starts_with_each_running_task_period(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_count: int,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store, finish_gate_task_timeout=5)
+    owner.conversation_channel.register_loop("root:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(store)
+    now = 0.0
+    idle_entries = [asyncio.Event() for _ in range(task_count * 2)]
+    idle_releases = [asyncio.Event() for _ in idle_entries]
+    safety_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+    idle_call = 0
+
+    async def consume(_loop, _prompt, **kwargs):
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(_wake, _timeout):
+        nonlocal idle_call
+        call = idle_call
+        idle_call += 1
+        idle_entries[call].set()
+        await asyncio.wait_for(idle_releases[call].wait(), timeout=10)
+        return True
+
+    async def controlled_task_deadline(task_registry, timeout):
+        evaluated = asyncio.Event()
+        safety_calls.put_nowait((timeout, evaluated))
+        if timeout <= 0:
+            for task in task_registry.snapshot():
+                if task.running:
+                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+            evaluated.set()
+            return tuple(
+                task.task_id for task in task_registry.snapshot() if not task.running
+            )
+        evaluated.set()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+        return ()
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    monkeypatch.setattr(
+        run_consumer_module,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now),
+            create_task=asyncio.create_task,
+            gather=asyncio.gather,
+        ),
+    )
+    monkeypatch.setattr(
+        run_consumer_module, "kill_tasks_after_deadline", controlled_task_deadline
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=store,
+            child_turns=lambda: 1,
+            finish_lifecycle=lambda *_: {},
+            idle_clock=lambda: now,
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(idle_entries[0].wait(), timeout=10)
+        for task_index in range(task_count):
+            now += 10
+            task_id, _pid = await asyncio.wait_for(
+                registry.background_tasks.start(
+                    _python("import time; time.sleep(60)"), tmp_path
+                ),
+                timeout=10,
+            )
+            idle_releases[task_index * 2].set()
+            timeout, evaluated = await asyncio.wait_for(safety_calls.get(), timeout=10)
+            await asyncio.wait_for(evaluated.wait(), timeout=10)
+
+            task = next(
+                item
+                for item in registry.background_tasks.snapshot()
+                if item.task_id == task_id
+            )
+            assert task.running, "a task started after a long idle was killed at once"
+            assert timeout == owner.finish_gate_task_timeout
+
+            await asyncio.wait_for(registry.background_tasks.kill(task_id), timeout=10)
+            if task_index + 1 < task_count:
+                await asyncio.wait_for(
+                    idle_entries[task_index * 2 + 1].wait(), timeout=10
+                )
+                idle_releases[task_index * 2 + 1].set()
+                await asyncio.wait_for(
+                    idle_entries[(task_index + 1) * 2].wait(), timeout=10
+                )
+    finally:
+        run.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run, return_exceptions=True), timeout=10
+        )
+        owner.conversation_channel.unregister_loop("root:1")
+        await asyncio.wait_for(registry.close(), timeout=10)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_task_completion_turn_rearms_full_safety_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store, finish_gate_task_timeout=5)
+    owner.conversation_channel.register_loop("root:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        notification_pending=lambda: bool(
+            loop.step_delivery and loop.step_delivery.has_pending_edge
+        ),
+    )
+    first_idle = asyncio.Event()
+    inspect_running_task = asyncio.Event()
+    second_task_idle = asyncio.Event()
+    deadline_calls: list[tuple[float, asyncio.Event, asyncio.Event]] = []
+    deadline_armed = asyncio.Event()
+    task_b_id: str | None = None
+    idle_call = 0
+
+    async def produce_task_exit(item) -> None:
+        await asyncio.wait_for(
+            AgentLoop._produce_task_exit(loop, item), timeout=10  # type: ignore[arg-type]
+        )
+
+    registry.background_tasks.set_notification_sink(produce_task_exit)
+
+    async def consume(_loop, prompt, *, origin, **kwargs):
+        nonlocal task_b_id
+        await asyncio.wait_for(_ack_fake_delivery(store, kwargs), timeout=10)
+        if not prompt and loop.step_delivery.has_pending_edge:
+            await asyncio.wait_for(
+                loop.step_delivery.prepare_request("terminal_fallback", [], None),
+                timeout=10,
+            )
+            await asyncio.wait_for(loop.step_delivery.acknowledge_active(), timeout=10)
+        if origin is MessageOrigin.NOTIFICATION:
+            task_b_id, _pid = await asyncio.wait_for(
+                registry.background_tasks.start(
+                    _python("import time; time.sleep(60)"), tmp_path
+                ),
+                timeout=10,
+            )
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(wake, _timeout):
+        nonlocal idle_call
+        call = idle_call
+        idle_call += 1
+        if call == 0:
+            first_idle.set()
+            await asyncio.wait_for(inspect_running_task.wait(), timeout=10)
+        else:
+            if call == 2:
+                second_task_idle.set()
+            await asyncio.wait_for(wake(), timeout=10)
+        return True
+
+    async def controlled_task_deadline(task_registry, timeout):
+        expire = asyncio.Event()
+        finished = asyncio.Event()
+        deadline_calls.append((timeout, expire, finished))
+        deadline_armed.set()
+        try:
+            await asyncio.wait_for(expire.wait(), timeout=10)
+            for task in task_registry.snapshot():
+                if task.running:
+                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+            return tuple(
+                task.task_id for task in task_registry.snapshot() if not task.running
+            )
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    monkeypatch.setattr(
+        run_consumer_module, "kill_tasks_after_deadline", controlled_task_deadline
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=store,
+            child_turns=lambda: idle_call,
+            finish_lifecycle=lambda *_: {},
+            idle_clock=lambda: 0.0,
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(first_idle.wait(), timeout=10)
+        task_a_id, _pid = await asyncio.wait_for(
+            registry.background_tasks.start(_python("input()"), tmp_path), timeout=10
+        )
+        inspect_running_task.set()
+        await asyncio.wait_for(deadline_armed.wait(), timeout=10)
+        await asyncio.wait_for(
+            registry.background_tasks.input(task_a_id, "done\\n", eof=True), timeout=10
+        )
+        await asyncio.wait_for(second_task_idle.wait(), timeout=10)
+
+        old_timeout, expire_old_window, old_window_finished = deadline_calls[0]
+        expire_old_window.set()
+        await asyncio.wait_for(old_window_finished.wait(), timeout=10)
+        assert task_b_id is not None
+        task_b = next(
+            task
+            for task in registry.background_tasks.snapshot()
+            if task.task_id == task_b_id
+        )
+        assert task_b.running, "task B was killed at task A's old deadline"
+        assert len(deadline_calls) == 2, "task B did not receive a new safety timer"
+        assert old_timeout == owner.finish_gate_task_timeout
+        assert deadline_calls[1][0] == owner.finish_gate_task_timeout
+    finally:
+        run.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run, return_exceptions=True), timeout=10
+        )
+        owner.conversation_channel.unregister_loop("root:1")
+        await asyncio.wait_for(registry.close(), timeout=10)
+        store.close()
 
 
 async def _idle_nudge_run(
