@@ -118,8 +118,9 @@ def test_predecessor_writer_refuses_advanced_home_without_writes(
         if path.is_file()
     }
 
+    assert verify(tmp_path).writer_epoch == 2
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
-        open_writer(tmp_path, capability=storage_format.WRITER_EPOCH - 1)
+        open_writer(tmp_path, capability=1)
 
     after = {
         path.relative_to(tmp_path): path.read_bytes()
