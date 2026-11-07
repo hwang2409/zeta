@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from ...storage_format import WriterLease, mapping_mutations, open_writer
 from ..process_env import subprocess_env
 from ..session_files import (
     child_directory,
@@ -41,7 +42,6 @@ from ..session_files import (
     session_directory,
     session_root,
     write_session_file,
-    write_session_json,
 )
 from . import ConversationIntegrityError, load_session_json
 
@@ -458,25 +458,37 @@ class WorkspaceSnapshotStore:
         session_id: str,
         *,
         cap: int | None = None,
+        storage_lease: WriterLease | None = None,
     ) -> None:
         self.session_dir = Path(session_dir)
         self.session_id = session_id
         self.state_path = self.session_dir / SNAPSHOT_STATE_FILE
-        resolved_cap = DEFAULT_SNAPSHOT_CAP if cap is None else int(cap)
-        if resolved_cap < 1:
-            raise ValueError("workspace snapshot cap must be >= 1")
-        self._cap = resolved_cap
-        self._snapshots: list[WorkspaceSnapshot] = []
-        self._current_id: str | None = None
-        self._is_corrupt = False
-        with session_root(self.session_dir.parent, create=True) as root_fd, child_directory(root_fd, self.session_dir.name, create=True):
-            pass
-        with ExitStack() as lease:
-            _, self.directory_fd = lease.enter_context(
-                session_directory(self.session_dir.parent, self.session_dir.name)
+        home = self.session_dir.parent
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        home = home.parent if home.name == "sessions" else self.session_dir.parent
+        with ExitStack() as storage_ownership:
+            self._storage_lease = storage_ownership.enter_context(
+                storage_lease.retain() if storage_lease is not None else open_writer(home)
             )
-            self._load()
-            self._release_lease = weakref.finalize(self, lease.pop_all().close)
+            resolved_cap = DEFAULT_SNAPSHOT_CAP if cap is None else int(cap)
+            if resolved_cap < 1:
+                raise ValueError("workspace snapshot cap must be >= 1")
+            self._cap = resolved_cap
+            self._snapshots: list[WorkspaceSnapshot] = []
+            self._current_id: str | None = None
+            self._is_corrupt = False
+            with session_root(self.session_dir.parent, create=True) as root_fd, child_directory(root_fd, self.session_dir.name, create=True):
+                pass
+            with ExitStack() as lease:
+                _, self.directory_fd = lease.enter_context(
+                    session_directory(self.session_dir.parent, self.session_dir.name)
+                )
+                self._load()
+                self._release_lease = weakref.finalize(
+                    self, self._close_leases, lease.pop_all(), self._storage_lease
+                )
+            storage_ownership.pop_all()
 
     def _load(self) -> None:
         try:
@@ -520,7 +532,17 @@ class WorkspaceSnapshotStore:
             "snapshots": [snapshot.to_dict() for snapshot in self._snapshots],
             "current_id": self._current_id,
         }
-        write_session_json(self.directory_fd, SNAPSHOT_STATE_FILE, payload)
+        self._storage_lease.publish_json(
+            self.directory_fd,
+            SNAPSHOT_STATE_FILE,
+            mapping_mutations(payload, broad=("snapshots",)),
+            write_session_file,
+        )
+
+    @staticmethod
+    def _close_leases(directory_lease: ExitStack, storage_lease: WriterLease) -> None:
+        directory_lease.close()
+        storage_lease.close()
 
     def close(self) -> None:
         self._release_lease()
@@ -638,6 +660,7 @@ class WorkspaceSnapshotStore:
             self._current_id = None
         self._is_corrupt = False
         try:
+            os.unlink(SNAPSHOT_STATE_FILE, dir_fd=self.directory_fd)
             self._persist()
         except OSError:
             self._is_corrupt = True

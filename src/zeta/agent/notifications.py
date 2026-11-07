@@ -55,6 +55,7 @@ class AgentNotificationMixin:
             store,
             wake_sink=self._on_step_delivery_edge,
             context_assembler=self.context_assembler,
+            causal_episodes=self._background_owner.causal_episodes,
         )
         flow.initialize_resident_edges()
         self._background_owner.conversation_channel.register_delivery_flow(
@@ -132,6 +133,7 @@ class AgentNotificationMixin:
             self.store,
             wake_sink=self._on_step_delivery_edge,
             context_assembler=self.context_assembler,
+            causal_episodes=self._background_owner.causal_episodes,
         )
         await flow.initialize()
         self._background_owner.conversation_channel.register_delivery_flow(
@@ -153,6 +155,20 @@ class AgentNotificationMixin:
         else:
             self._background_owner.notify_wake()
         self._schedule_transcript_index()
+
+    def run_harness_notice_turn(
+        self,
+        notice: Message,
+    ) -> AsyncIterator[StreamEvent]:
+        """Run one zeta-authored notice without representing it as user input."""
+
+        if notice.role is not MessageRole.SYSTEM:
+            raise ValueError("harness notice must have the system role")
+        return self._run_turn(
+            "",
+            origin=MessageOrigin.HARNESS_NUDGE,
+            system_message=notice,
+        )
 
     def run_turn(
         self,
@@ -185,15 +201,17 @@ class AgentNotificationMixin:
         abort_signal: ToolAbortSignal | None = None,
         notification_turn: bool = False,
         turn_context: str | None = None,
+        system_message: Message | None = None,
         on_turn_context_persisted: Callable[[], None] | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         from ..runtime.loop._completion import close_completion
 
-        system_message = (
-            _turn_context_message(turn_context) if turn_context is not None else None
-        )
+        if turn_context is not None:
+            if system_message is not None:
+                raise ValueError("pass only one system message")
+            system_message = _turn_context_message(turn_context)
         self._notification_turn_scheduled = False
         self._turn_active = True
         stream = self._run_turn_impl(

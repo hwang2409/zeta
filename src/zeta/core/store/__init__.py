@@ -1,6 +1,6 @@
 """Conversation store public API."""
 
-from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend
+from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -45,7 +45,6 @@ from ._store import (
     uuid,
     warnings,
     weakref,
-    write_session_json,
 )
 
 __all__ = [
@@ -76,6 +75,7 @@ __all__ = [
     "TodoItem",
     "ToolCall",
     "ToolUseContent",
+    "TranscriptLoadError",
     "child_directory",
     "contextmanager",
     "copy",
@@ -95,5 +95,4 @@ __all__ = [
     "uuid",
     "warnings",
     "weakref",
-    "write_session_json",
 ]

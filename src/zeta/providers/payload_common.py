@@ -18,7 +18,11 @@ HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER = (
 
 def is_harness_notification(message: Message) -> bool:
     """Return whether a system-role message is conversational harness data."""
-    return message.metadata.get("zeta_event") == "agent_notifications"
+    return message.metadata.get("zeta_event") == "agent_notifications" or (
+        message.role.value == "system"
+        and message.metadata.get(MESSAGE_ORIGIN_METADATA)
+        == MessageOrigin.HARNESS_NUDGE.value
+    )
 
 
 def images_before_prompt(message: Message) -> list[ContentBlock]:

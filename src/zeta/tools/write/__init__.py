@@ -8,8 +8,14 @@ from typing import NotRequired, TypedDict
 
 from ...core.approval import ApprovedPathAbsent, ApprovedPathExecution
 from ...protocol.types import StructuredToolResult
+from .._atomic_replace import (
+    PublicationGuard,
+    atomic_create,
+    atomic_replace,
+    run_file_worker,
+)
 from .._shared.sandbox import _path_from_fd as _sandbox_path_from_fd
-from .._shared.sandbox import open_target
+from .._shared.sandbox import open_parent, open_target
 from ..registry import (
     AbortSignal,
     ToolExecutionContext,
@@ -40,83 +46,89 @@ def _path_from_fd(file_descriptor: int) -> str:
 def _write_target(
     registry: ToolRegistry,
     raw_path: str,
-    content: bytes,
+    content: str,
     *,
     create_parents: bool,
     was_created: bool,
+    abort_signal: AbortSignal,
     execution_context: ToolExecutionContext,
-) -> str:
-    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    publication: PublicationGuard,
+) -> tuple[str, bytes, str]:
+    try:
+        encoded_content = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("content must be valid UTF-8") from exc
+
     if was_created:
-        flags |= os.O_CREAT | os.O_EXCL
-    with open_target(
-        registry,
-        raw_path,
-        flags=flags,
-        mode=0o666,
-        create_parents=create_parents,
-        execution_context=execution_context,
-    ) as (file_descriptor, _resolved_path):
-        path = _path_from_fd(file_descriptor)
-        if not was_created:
-            os.ftruncate(file_descriptor, 0)
-        try:
-            with os.fdopen(file_descriptor, "wb", closefd=False) as handle:
-                handle.write(content)
-        except OSError as exc:
-            raise ValueError(f"could not write file: {path}: {exc}") from exc
-    return path
+        with open_parent(
+            registry,
+            raw_path,
+            create_parents=create_parents,
+            execution_context=execution_context,
+        ) as (parent_fd, name, resolved_path):
+            path = str(resolved_path)
+            atomic_create(
+                parent_fd,
+                name,
+                path,
+                encoded_content,
+                abort_signal,
+                publication,
+            )
+    else:
+        with open_target(
+            registry,
+            raw_path,
+            flags=os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            execution_context=execution_context,
+        ) as (file_descriptor, _resolved_path):
+            path = _path_from_fd(file_descriptor)
+            atomic_replace(
+                file_descriptor,
+                path,
+                encoded_content,
+                abort_signal,
+                publication,
+            )
+    return path, encoded_content, hashlib.sha256(encoded_content).hexdigest()
 
 
 async def _write(
     registry: ToolRegistry,
     arguments: WriteArguments,
-    _abort_signal: AbortSignal,
+    abort_signal: AbortSignal,
     *,
     execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
-    try:
-        encoded_content = arguments["content"].encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError("content must be valid UTF-8") from exc
+    async def write_target(was_created: bool) -> tuple[str, bytes, str]:
+        return await run_file_worker(
+            _write_target,
+            registry,
+            arguments["path"],
+            arguments["content"],
+            create_parents=arguments.get("create_parents", False),
+            was_created=was_created,
+            abort_signal=abort_signal,
+            execution_context=execution_context,
+            signal=abort_signal,
+        )
 
     approved = execution_context.approved_execution
     if isinstance(approved, ApprovedPathExecution):
         was_created = isinstance(approved.target_state, ApprovedPathAbsent)
-        path = _write_target(
-            registry,
-            arguments["path"],
-            encoded_content,
-            create_parents=arguments.get("create_parents", False),
-            was_created=was_created,
-            execution_context=execution_context,
-        )
+        path, encoded_content, digest = await write_target(was_created)
     else:
         try:
-            path = _write_target(
-                registry,
-                arguments["path"],
-                encoded_content,
-                create_parents=arguments.get("create_parents", False),
-                was_created=True,
-                execution_context=execution_context,
-            )
+            path, encoded_content, digest = await write_target(True)
             was_created = True
         except FileExistsError:
-            path = _write_target(
-                registry,
-                arguments["path"],
-                encoded_content,
-                create_parents=arguments.get("create_parents", False),
-                was_created=False,
-                execution_context=execution_context,
-            )
+            path, encoded_content, digest = await write_target(False)
             was_created = False
 
     structured_content: WriteStructuredContent = {
         "path": path,
         "bytes_written": len(encoded_content),
-        "sha256": hashlib.sha256(encoded_content).hexdigest(),
+        "sha256": digest,
         "was_created": was_created,
         "was_overwritten": not was_created,
     }
