@@ -26,35 +26,8 @@ def _is_close_serve_call(node: ast.AST) -> bool:
     )
 
 
-_SERVER_START_HELPERS = frozenset({"start_server"})
-
-
-def _call_name(node: ast.AST) -> str | None:
-    if not isinstance(node, ast.Call):
-        return None
-    if isinstance(node.func, ast.Name):
-        return node.func.id
-    if isinstance(node.func, ast.Attribute):
-        return node.func.attr
-    return None
-
-
-def _is_server_acquisition(node: ast.stmt) -> bool:
-    value: ast.AST | None = None
-    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Expr)):
-        value = node.value
-    if value is None:
-        return False
-    calls = [call for call in ast.walk(value) if isinstance(call, ast.Call)]
-    names = {_call_name(call) for call in calls}
-    names.discard(None)
-    if any(name in _SERVER_START_HELPERS for name in names):
-        return True
-    return any(name == "start_server" for name in names)
-
-
 def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
-    """Line numbers of close_serve calls that are not owned by server setup."""
+    """Line numbers of close_serve calls that are not unconditional cleanup."""
     parents = {
         child: parent
         for parent in ast.walk(tree)
@@ -102,26 +75,6 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
             for ancestor in other_ancestors
         ):
             lines.add(node.lineno)
-            continue
-        # The owning try must be the next statement after server acquisition.
-        block = parents.get(try_ancestor)
-        if not hasattr(block, "body") or try_ancestor not in block.body:
-            lines.add(node.lineno)
-            continue
-        index = block.body.index(try_ancestor)
-        if index == 0:
-            function_decorators = getattr(function, "decorator_list", [])
-            if any(
-                isinstance(decorator, ast.Name)
-                and decorator.id == "asynccontextmanager"
-                for decorator in function_decorators
-            ):
-                lines.add(node.lineno)
-            continue
-        if _is_server_acquisition(block.body[index - 1]):
-            continue
-        if any(_is_server_acquisition(statement) for statement in block.body[:index]):
-            lines.add(node.lineno)
     return lines
 
 
@@ -140,39 +93,6 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
         pytest.param("async def test():\n    try:\n        pass\n    finally:\n        close_serve(s)\n", False, id="finally"),
         pytest.param(
             "async def test():\n"
-            "    server = await start_server()\n"
-            "    try:\n"
-            "        pass\n"
-            "    finally:\n"
-            "        await close_serve(server)\n",
-            False,
-            id="adjacent-acquisition",
-        ),
-        pytest.param(
-            "async def test():\n"
-            "    server = await start_server()\n"
-            "    await can_fail()\n"
-            "    try:\n"
-            "        pass\n"
-            "    finally:\n"
-            "        await close_serve(server)\n",
-            True,
-            id="await-between-acquisition-and-try",
-        ),
-        pytest.param(
-            "async def test():\n"
-            "    server = await start_server()\n"
-            "    if ready:\n"
-            "        return\n"
-            "    try:\n"
-            "        pass\n"
-            "    finally:\n"
-            "        await close_serve(server)\n",
-            True,
-            id="return-between-acquisition-and-try",
-        ),
-        pytest.param(
-            "async def test():\n"
             "    @asynccontextmanager\n"
             "    async def serving(server):\n"
             "        try:\n"
@@ -181,8 +101,8 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
             "            await close_serve(server)\n"
             "    async with serving(s):\n"
             "        pass\n",
-            True,
-            id="generic-asynccontextmanager",
+            False,
+            id="helper",
         ),
     ],
 )

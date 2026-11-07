@@ -710,10 +710,8 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
     tmp_path: Path,
 ) -> None:
     server = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path))
-    writers = []
+    reader, writer = await _connect(server)
     try:
-        reader, writer = await _connect(server)
-        writers.append(writer)
         await _request(
             reader,
             writer,
@@ -752,7 +750,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
         }
         assert not server.runtime.loop.has_pending_steering
     finally:
-        await close_serve(server, *writers)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
