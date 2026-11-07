@@ -1175,6 +1175,7 @@ class BackgroundTaskRegistry:
             "background_tasks.json",
             rows,
             identity="task_id",
+            delete_ids=(),
             publish=write_session_file,
         )
 

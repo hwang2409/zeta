@@ -322,12 +322,13 @@ class WriterLease:
         self,
         directory_fd: int,
         name: str,
-        records: Iterable[Mapping[str, Any]],
+        upserts: Iterable[Mapping[str, Any]],
         *,
         identity: str,
+        delete_ids: Iterable[str],
         publish: PublishBytes,
     ) -> list[dict[str, Any]]:
-        """Patch an object-record collection by identity and delete absent records."""
+        """Patch and explicitly delete object records by identity."""
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
@@ -343,21 +344,42 @@ class WriterLease:
                 raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
         if type(raw) is not list or any(type(item) is not dict for item in raw):
             raise StorageFormatError(f"stored JSON record collection is invalid: {name}")
-        existing = {
-            item.get(identity): copy.deepcopy(item)
-            for item in raw
-            if type(item.get(identity)) is str
-        }
-        output: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for record in records:
+
+        output = copy.deepcopy(raw)
+        positions: dict[str, int] = {}
+        for index, record in enumerate(output):
             record_id = record.get(identity)
-            if type(record_id) is not str or not record_id or record_id in seen:
+            if type(record_id) is not str or not record_id or record_id in positions:
+                raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+            positions[record_id] = index
+
+        requested_deletes = tuple(delete_ids)
+        if any(
+            type(record_id) is not str or not record_id
+            for record_id in requested_deletes
+        ):
+            raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+        deleted = set(requested_deletes)
+        output = [record for record in output if record[identity] not in deleted]
+        positions = {record[identity]: index for index, record in enumerate(output)}
+        seen: set[str] = set()
+        for record in upserts:
+            record_id = record.get(identity)
+            if (
+                type(record_id) is not str
+                or not record_id
+                or record_id in seen
+                or record_id in deleted
+            ):
                 raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
             seen.add(record_id)
-            current = existing.get(record_id, {})
-            _merge_mapping(current, record)
-            output.append(current)
+            if record_id in positions:
+                _merge_mapping(output[positions[record_id]], record)
+            else:
+                positions[record_id] = len(output)
+                current: dict[str, Any] = {}
+                _merge_mapping(current, record)
+                output.append(current)
         encoded = (json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n").encode()
         publish(directory_fd, name, encoded)
         return output

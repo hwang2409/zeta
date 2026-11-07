@@ -151,10 +151,10 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"session id must be one safe path component: {self.session_id!r}"
             )
-        self._storage_lease = (
-            _storage_lease.retain() if _storage_lease is not None else open_writer(home)
-        )
-        try:
+        with ExitStack() as storage_ownership:
+            self._storage_lease = storage_ownership.enter_context(
+                _storage_lease.retain() if _storage_lease is not None else open_writer(home)
+            )
             self.on_persisted_activity: Callable[[int], None] | None = None
             self._initialize_entries_installed()
             self.session_dir = self.root_dir / self.session_id
@@ -231,9 +231,7 @@ class ConversationStore(
                     lease.pop_all(),
                     self._storage_lease,
                 )
-        except BaseException:
-            self._storage_lease.close()
-            raise
+            storage_ownership.pop_all()
 
     def bind_owner_thread(self) -> None:
         """Bind resident state publication and mutation to the event-loop thread."""

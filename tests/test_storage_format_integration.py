@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 from pathlib import Path
@@ -14,6 +13,7 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.runtime.loop.persistence import DraftPersistence
+from zeta.storage_format import StorageFormatError
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
 
@@ -122,7 +122,11 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
                     "pid": 1,
                     "running": False,
                     "future": {"nested": True},
-                }
+                },
+                {
+                    "task_id": "future-task",
+                    "future_shape": {"version": 2},
+                },
             ]
         )
     )
@@ -132,7 +136,15 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
         storage_lease=store._storage_lease,
     )
     background._persist()
-    assert json.loads(background_path.read_text())[0]["future"] == {"nested": True}
+    background_rows = {
+        row["task_id"]: row for row in json.loads(background_path.read_text())
+    }
+    assert background_rows["task-1"]["future"] == {"nested": True}
+    assert "future-task" in background_rows
+    assert background_rows["future-task"] == {
+        "task_id": "future-task",
+        "future_shape": {"version": 2},
+    }
     await background.close()
 
     from zeta.core.session_links import persist_pending_root_link
@@ -173,40 +185,47 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
     store.close()
 
 
-def test_session_publishers_have_no_ungated_session_json_path() -> None:
-    source_root = Path(__file__).parents[1] / "src" / "zeta"
-    publisher_paths = {
-        "core/agent_state.py",
-        "core/checkpoints/workspace.py",
-        "core/session.py",
-        "core/session_links.py",
-        "core/store/_store.py",
-        "runtime/loop/persistence.py",
-        "tools/_shared/process.py",
+@pytest.mark.parametrize(
+    ("family", "filename"),
+    (
+        ("metadata", "meta.json"),
+        ("session-state", "session_state.json"),
+        ("agent-lifecycle", "agent_lifecycle.json"),
+        ("workspace", "workspace_snapshots.json"),
+        ("background-tasks", "background_tasks.json"),
+        ("project-link", "project_link_pending.json"),
+        ("draft", "draft"),
+    ),
+)
+def test_session_publication_families_leave_too_new_home_unchanged(
+    tmp_path: Path, family: str, filename: str
+) -> None:
+    manifest = tmp_path / "storage-format.json"
+    manifest.write_text('{"writer_epoch":999}\n')
+    session_dir = tmp_path / "sessions" / "session-1"
+    session_dir.mkdir(parents=True)
+    target = session_dir / filename
+    target.write_bytes(b"unchanged future bytes\n")
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and path.name != ".storage-format.lock"
     }
-    observed = {
-        str(path.relative_to(source_root))
-        for path in source_root.rglob("*.py")
-        if any(
-            isinstance(node, ast.Attribute)
-            and node.attr in {"publish_json", "publish_records"}
-            for node in ast.walk(ast.parse(path.read_text()))
-        )
-    }
-    assert observed == publisher_paths
-    sources = {
-        relative: (source_root / relative).read_text() for relative in publisher_paths
-    }
-    assert all(
-        "write_json_file(" not in source
-        for relative, source in sources.items()
-        if relative != "runtime/loop/persistence.py"
-    )
-    assert sources["core/session.py"].count("write_session_file(") == 1
-    assert sources["core/checkpoints/workspace.py"].count("write_session_file(") == 1
 
-    with pytest.raises(ValueError, match="stored-format lease"):
-        DraftPersistence(Path("draft"), directory_fd=1)
+    with pytest.raises(StorageFormatError, match="newer than writer capability"):
+        if family == "workspace":
+            WorkspaceSnapshotStore(session_dir, "session-1")
+        elif family in {"session-state", "agent-lifecycle"}:
+            ConversationStore(tmp_path / "sessions", session_id="session-1")
+        else:
+            SessionManager(tmp_path)
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file() and path.name != ".storage-format.lock"
+    }
+    assert after == before
 
 
 def test_too_new_refusal_is_visible_in_tui_and_server(

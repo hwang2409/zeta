@@ -467,26 +467,28 @@ class WorkspaceSnapshotStore:
         while home.name != "sessions" and home != home.parent:
             home = home.parent
         home = home.parent if home.name == "sessions" else self.session_dir.parent
-        self._storage_lease = (
-            storage_lease.retain() if storage_lease is not None else open_writer(home)
-        )
-        resolved_cap = DEFAULT_SNAPSHOT_CAP if cap is None else int(cap)
-        if resolved_cap < 1:
-            raise ValueError("workspace snapshot cap must be >= 1")
-        self._cap = resolved_cap
-        self._snapshots: list[WorkspaceSnapshot] = []
-        self._current_id: str | None = None
-        self._is_corrupt = False
-        with session_root(self.session_dir.parent, create=True) as root_fd, child_directory(root_fd, self.session_dir.name, create=True):
-            pass
-        with ExitStack() as lease:
-            _, self.directory_fd = lease.enter_context(
-                session_directory(self.session_dir.parent, self.session_dir.name)
+        with ExitStack() as storage_ownership:
+            self._storage_lease = storage_ownership.enter_context(
+                storage_lease.retain() if storage_lease is not None else open_writer(home)
             )
-            self._load()
-            self._release_lease = weakref.finalize(
-                self, self._close_leases, lease.pop_all(), self._storage_lease
-            )
+            resolved_cap = DEFAULT_SNAPSHOT_CAP if cap is None else int(cap)
+            if resolved_cap < 1:
+                raise ValueError("workspace snapshot cap must be >= 1")
+            self._cap = resolved_cap
+            self._snapshots: list[WorkspaceSnapshot] = []
+            self._current_id: str | None = None
+            self._is_corrupt = False
+            with session_root(self.session_dir.parent, create=True) as root_fd, child_directory(root_fd, self.session_dir.name, create=True):
+                pass
+            with ExitStack() as lease:
+                _, self.directory_fd = lease.enter_context(
+                    session_directory(self.session_dir.parent, self.session_dir.name)
+                )
+                self._load()
+                self._release_lease = weakref.finalize(
+                    self, self._close_leases, lease.pop_all(), self._storage_lease
+                )
+            storage_ownership.pop_all()
 
     def _load(self) -> None:
         try:

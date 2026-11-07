@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from zeta.core.checkpoints import ConversationIntegrityError
+from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.store import ConversationStore
 from zeta.storage_format import (
     DeleteValue,
@@ -53,6 +54,19 @@ def _closed_owner_allows_exclusive_lock(home: str, owner: str, result) -> None:
                 storage_lease=root_lease,
             )
             asyncio.run(registry.close())
+    elif owner == "workspace":
+        with ConversationStore(
+            path / "sessions", session_id="owner", _storage_lease=root_lease
+        ) as store:
+            try:
+                WorkspaceSnapshotStore(
+                    store.session_dir,
+                    store.session_id,
+                    cap=0,
+                    storage_lease=root_lease,
+                )
+            except ValueError:
+                pass
     else:
         try:
             ConversationStore(
@@ -125,6 +139,10 @@ def test_background_registry_releases_its_only_writer_lease(tmp_path: Path) -> N
 
 def test_failed_store_construction_releases_writer_lease(tmp_path: Path) -> None:
     _assert_closed_owner_allows_exclusive_lock(tmp_path, "failed-store")
+
+
+def test_failed_workspace_construction_releases_writer_lease(tmp_path: Path) -> None:
+    _assert_closed_owner_allows_exclusive_lock(tmp_path, "workspace")
 
 
 def test_mutations_preserve_unknown_nested_keys_and_declare_deletes() -> None:
