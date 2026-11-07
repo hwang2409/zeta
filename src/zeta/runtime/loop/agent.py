@@ -63,7 +63,6 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    OwnedCompletionBackend,
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
@@ -85,12 +84,7 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ..backend_state import (
-    PreparedBackendState,
-    apply_backend_state,
-    effective_backend_budget,
-    prepare_backend_state,
-)
+from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
@@ -207,8 +201,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
-        self._backend_owners: list[OwnedCompletionBackend] = []
-        self.register_backend_owner(backend)
+        self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -381,17 +374,6 @@ class AgentLoop(
             for message in messages
         ]
 
-    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
-        return prepare_backend_state(self, backend)
-
-    def current_backend_state(self) -> PreparedBackendState:
-        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
-
-    def apply_backend_state(
-        self, state: PreparedBackendState
-    ) -> OwnedCompletionBackend | None:
-        return apply_backend_state(self, state)
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         token_budget = effective_backend_budget(self.backend, token_budget)
@@ -562,13 +544,7 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
-            owners = tuple(self._backend_owners)
-            for owner in owners:
-                owner.retire()
-            await asyncio.gather(
-                *(self.close_backend(owner, stage="runtime_close") for owner in owners),
-                return_exceptions=True,
-            )
+            await self.close_backend_owners(stage="runtime_close")
             killed = await self._close_delivery_resources()
         return killed
 
