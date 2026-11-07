@@ -14,14 +14,11 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict
-from urllib.parse import quote
 
 from ..core.session import env_home
 from .client import MCPError
+from .filename import encode_mcp_filename
 
-_SAFE_FILENAME_CHARS = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
-)
 _MAX_CREDENTIAL_RECORD_BYTES = 64 * 1024
 _LOCK_TIMEOUT_SECONDS = 1.0
 REFRESH_LEEWAY_SECONDS = 30.0
@@ -160,17 +157,13 @@ def public_credential_store_error(
     }
 
 
-def _credential_filename(name: str) -> str:
-    return quote(name, safe=_SAFE_FILENAME_CHARS)
-
-
 def token_store_dir(home: str | Path | None = None) -> Path:
     root = Path(home).expanduser() if home is not None else env_home()
     return root / "mcp-tokens"
 
 
 def token_store_path(name: str, home: str | Path | None = None) -> Path:
-    return token_store_dir(home) / f"{_credential_filename(name)}.json"
+    return token_store_dir(home) / f"{encode_mcp_filename(name)}.json"
 
 
 class MCPCredentialStore:

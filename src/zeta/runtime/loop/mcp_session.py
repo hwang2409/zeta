@@ -1,7 +1,6 @@
 """MCP session lifecycle operations for AgentLoop."""
 
 import asyncio
-import os
 import shlex
 from collections.abc import Callable
 from pathlib import Path
@@ -12,18 +11,13 @@ from ...mcp import (
     MCPManagementError,
     MCPManagementService,
     MCPMount,
-    home_config_path,
-    load_mcp_config_overlay,
     mount_mcp_servers,
-    project_config_path,
     tool_prefix,
 )
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
-    add_and_mount,
     parse_add_command,
-    remove_and_unshadow,
     render_mcp_status,
     run_mcp_resource_attach,
     run_mcp_resources_list,
@@ -68,19 +62,16 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            service = await asyncio.to_thread(
-                MCPManagementService,
-                home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value,
-            )
-            config = service.runtime_config()
+            service = self._mcp_management
+            config = await service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry,
                 config,
                 notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
             )
-        except MCPConfigError as exc:
+            service.mount = self._mcp_mount
+        except (MCPConfigError, MCPManagementError) as exc:
             self._mcp_config_error = str(exc)
             self._mcp_mount = MCPMount(
                 self.tool_registry, {}, {}, home=self._mcp_home_hint
@@ -109,7 +100,12 @@ class MCPSession:
 
         self._mcp_home_hint = None if home is None else str(home)
         self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser().resolve()
+            None if project_dir is None else Path(project_dir).expanduser()
+        )
+        self._mcp_management = MCPManagementService(
+            home=self._mcp_home_hint,
+            project_dir=self._mcp_project_dir_value,
+            mount=self._mcp_mount,
         )
 
     def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
@@ -185,12 +181,8 @@ class MCPSession:
             return f"mcp error: {self._mcp_config_error}"
         if mount is None:
             return "mcp: no configured servers"
-        service = await asyncio.to_thread(
-            MCPManagementService,
-            home=self._mcp_home_hint,
-            project_dir=self._mcp_project_dir_value,
-            mount=mount,
-        )
+        service = self._mcp_management
+        service.mount = mount
         if not parts:
             return await self._render_mcp_status(mount, service)
         verb = parts[0]
@@ -204,27 +196,32 @@ class MCPSession:
                 await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
                 return await self._render_mcp_status(mount, service)
             if verb == "add":
-                await add_and_mount(
-                    mount,
-                    parse_add_command(parts[1:]),
-                    target=self._mcp_add_target(),
-                    notice_sink=self._mcp_notice_sink,
+                parsed = parse_add_command(parts[1:])
+                scope = "project" if self._mcp_project_dir_value is not None else "user"
+                await service.add(
+                    parsed.name,
+                    scope=scope,
+                    command=parsed.command,
+                    args=parsed.args,
+                    url=parsed.url,
+                    oauth=parsed.auth_type == "oauth",
                 )
                 return await self._render_mcp_status(mount, service)
-            if verb == "remove":
+            if verb in {"remove", "enable", "disable"}:
                 if len(parts) != 2:
                     return MCP_USAGE
-                await remove_and_unshadow(
-                    mount,
-                    parts[1],
-                    home_path=self._mcp_home_path(),
-                    load_home=lambda: (
-                        load_mcp_config_overlay(
-                            home=self._mcp_home_hint, project_dir=None
-                        ).configured_servers
-                    ),
-                    notice_sink=self._mcp_notice_sink,
-                )
+                item = service.show(parts[1])
+                if verb == "remove":
+                    await service.remove(item.name, scope=item.scope)
+                else:
+                    await service.set_enabled(
+                        item.name, scope=item.scope, enabled=verb == "enable"
+                    )
+                return await self._render_mcp_status(mount, service)
+            if verb in {"trust", "untrust"}:
+                if len(parts) != 2:
+                    return MCP_USAGE
+                await service.set_trusted(parts[1], trusted=verb == "trust")
                 return await self._render_mcp_status(mount, service)
             if verb == "auth":
                 if len(parts) != 2:
@@ -260,7 +257,11 @@ class MCPSession:
     ) -> str:
         entries = await service.refresh_credentials()
         statuses = {entry.name: entry.auth for entry in entries}
-        return render_mcp_status(mount, credential_status=statuses)
+        return render_mcp_status(
+            mount,
+            credential_status=statuses,
+            configured_entries=service.snapshot.entries,
+        )
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
@@ -268,15 +269,3 @@ class MCPSession:
         if self._mcp_mount is None:
             raise RuntimeError("MCP mount is unavailable")
         return await self._mcp_mount.get_prompt(name, arguments)
-
-    def _mcp_add_target(self) -> Path:
-        project_dir = self._mcp_project_dir_value
-        if project_dir is not None:
-            return project_config_path(project_dir)
-        return home_config_path(self._mcp_home_hint)
-
-    def _mcp_home_path(self) -> Path:
-        override = os.environ.get("ZETA_MCP_CONFIG")
-        if override:
-            return Path(override).expanduser().resolve()
-        return home_config_path(self._mcp_home_hint).resolve()

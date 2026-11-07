@@ -23,10 +23,14 @@ from .config import (
     resolve_server_config,
     server_to_json,
     tool_prefix,
-    write_mcp_config,
 )
 from .http import StreamableHTTPMCPClient
-from .management import ManagedServer, MCPManagementError, MCPManagementService
+from .management import (
+    ManagedServer,
+    MCPManagementError,
+    MCPManagementService,
+    MCPManagerSnapshot,
+)
 from .mount import MCPMount, MCPServerState, MCPServerStatus, mount_mcp_servers
 from .stdio import StdioMCPClient
 
@@ -36,6 +40,7 @@ __all__ = [
     "MCPConfigError",
     "MCPManagementError",
     "MCPManagementService",
+    "MCPManagerSnapshot",
     "MCPMount",
     "MCPPrompt",
     "MCPPromptArgument",
@@ -60,5 +65,4 @@ __all__ = [
     "resolve_server_config",
     "server_to_json",
     "tool_prefix",
-    "write_mcp_config",
 ]

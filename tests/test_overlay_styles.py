@@ -10,6 +10,8 @@ leaks the Rich ``on`` spelling, and a selected row really does set ``bg:``.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from prompt_toolkit.styles import Style
 
@@ -63,16 +65,22 @@ def _tasks_list_lines() -> list[overlay.FragmentLine]:
 
 def _tasks_detail_lines() -> list[overlay.FragmentLine]:
     panel = BackgroundTasksPanel()
-    panel.set_tasks([_task("task-aa", running=False, exit_code=1, ended_at=3.0)], now=9.0)
+    panel.set_tasks(
+        [_task("task-aa", running=False, exit_code=1, ended_at=3.0)], now=9.0
+    )
     panel.open_details()
     panel.feed_output("line one\nline two\n", total_lines=2)
     return panel.render_lines()
 
 
 def _mcp_lines(tmp_path) -> list[overlay.FragmentLine]:
-    service = MCPManagementService(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    service.add("alpha", scope="user", command="python")
-    service.add("beta", scope="project", url="https://example.test", enabled=False)
+    service = MCPManagementService(
+        home=tmp_path / "home", project_dir=tmp_path / "repo"
+    )
+    asyncio.run(service.add("alpha", scope="user", command="python"))
+    asyncio.run(
+        service.add("beta", scope="project", url="https://example.test", enabled=False)
+    )
     view = MCPManager(service)
     view.details = True
     view.last_result = "ok"
@@ -117,7 +125,9 @@ def _assert_parses(lines: list[overlay.FragmentLine]) -> set[str]:
     return backgrounds
 
 
-@pytest.mark.parametrize("palette", list(theme.BUILT_IN_PALETTES.values()), ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "palette", list(theme.BUILT_IN_PALETTES.values()), ids=lambda p: p.name
+)
 def test_every_popup_style_parses_in_every_palette(palette, tmp_path) -> None:
     theme.set_active_palette(palette)
     for name, lines in _all_popup_lines(tmp_path).items():

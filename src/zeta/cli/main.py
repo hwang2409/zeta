@@ -964,21 +964,32 @@ def main(argv: list[str] | None = None) -> int:
                 if server_command[:1] == ["--"]:
                     server_command.pop(0)
                 command = server_command[0] if server_command else None
-                result = service.add(
-                    args.name,
-                    scope=args.scope,
-                    command=command,
-                    args=tuple(server_command[1:]),
-                    url=args.url,
-                    oauth=args.oauth,
-                    env=dict(item.split("=", 1) for item in args.env),
-                    headers=dict(item.split("=", 1) for item in args.header),
+                result = asyncio.run(
+                    service.add(
+                        args.name,
+                        scope=args.scope,
+                        command=command,
+                        args=tuple(server_command[1:]),
+                        url=args.url,
+                        oauth=args.oauth,
+                        env=dict(item.split("=", 1) for item in args.env),
+                        headers=dict(item.split("=", 1) for item in args.header),
+                    )
                 )
-                print(json.dumps(result.as_json(), sort_keys=True))
+                item = next(
+                    value
+                    for value in result.entries
+                    if value.name == args.name and value.scope == args.scope
+                )
+                print(json.dumps(item.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
                 asyncio.run(service.refresh_credentials())
-                values = [item.as_json() for item in service.list(scope=args.scope)]
+                values = [
+                    item.as_json()
+                    for item in service.snapshot.entries
+                    if args.scope == "effective" or item.scope == args.scope
+                ]
                 output = (
                     json.dumps(values, sort_keys=True)
                     if args.json
@@ -1000,20 +1011,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action in {"enable", "disable"}:
-                service.set_enabled(
-                    args.name,
-                    scope=args.scope,
-                    enabled=args.mcp_action == "enable",
+                asyncio.run(
+                    service.set_enabled(
+                        args.name,
+                        scope=args.scope,
+                        enabled=args.mcp_action == "enable",
+                    )
                 )
                 return 0
             if args.mcp_action == "remove":
-                service.remove(args.name, scope=args.scope)
+                asyncio.run(service.remove(args.name, scope=args.scope))
                 return 0
             if args.mcp_action == "trust":
-                service.trust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=True))
                 return 0
             if args.mcp_action == "untrust":
-                service.untrust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=False))
                 return 0
             if args.mcp_action == "logout":
                 asyncio.run(service.logout(args.name, scope=args.scope))

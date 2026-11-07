@@ -8809,20 +8809,33 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     reader, writer, sid = await _ready_extensions(server)
     try:
         project_config = project / ".zeta" / "mcp.json"
-        add_response = (
-            await _request(
-                reader,
-                writer,
-                "mcp-add-client-only",
-                "slash_run",
-                {
-                    "session_id": sid,
-                    "text": "/mcp add surprise --http https://mcp.test",
-                },
-            )
-        )[-1]["result"]
-        assert add_response == {"kind": "client_only", "name": "mcp"}
-        assert not project_config.exists()
+
+        async def run_mcp(request_id: str, command: str) -> dict[str, object]:
+            return (
+                await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/mcp {command}"},
+                )
+            )[-1]["result"]
+
+        commands = (
+            "add surprise --stdio missing-command",
+            "disable surprise",
+            "trust surprise",
+            "untrust surprise",
+            "enable surprise",
+        )
+        for index, command in enumerate(commands):
+            result = await run_mcp(f"mcp-mutation-{index}", command)
+            assert result["kind"] == "output"
+        assert project_config.exists()
+        assert "surprise" in json.loads(project_config.read_text())["servers"]
+        removed = await run_mcp("mcp-mutation-remove", "remove surprise")
+        assert removed["kind"] == "output"
+        assert "surprise" not in json.loads(project_config.read_text())["servers"]
 
         response = (
             await _request(
