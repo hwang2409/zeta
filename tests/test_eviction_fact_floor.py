@@ -303,6 +303,75 @@ def test_ten_replacements_equal_one_shot_and_stay_bounded() -> None:
     assert len(repeated["newest"]) <= 16
 
 
+def test_eviction_marker_restores_pinned_user_at_its_source_sequence() -> None:
+    pinned = with_message_origin(
+        Message(MessageRole.USER, [TextContent("request")]), MessageOrigin.USER
+    )
+    marker = ConversationEntry(
+        seq=10,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 3,
+            "pinned_message": Message(
+                pinned.role,
+                list(pinned.content),
+                metadata={**pinned.metadata, "source_seq": 2},
+            ).to_dict(),
+            "view": [
+                {"seq": 1, "message": _assistant("before").to_dict()},
+                {"seq": 3, "message": _assistant("after").to_dict()},
+            ],
+        },
+    )
+
+    items = ContextAssembler._marker_items(marker, {1, 2, 3, 10})
+
+    assert [item.message.content[0].text for item in items] == [
+        "before",
+        "request",
+        "after",
+    ]
+    assert sum(item.message.role is MessageRole.USER for item in items) == 1
+
+
+def test_legacy_eviction_marker_places_pinned_user_before_later_updates() -> None:
+    pinned = with_message_origin(
+        Message(MessageRole.USER, [TextContent("request")]), MessageOrigin.USER
+    )
+    marker = ConversationEntry(
+        seq=10,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 1,
+            "source_seq_end": 4,
+            "pinned_message": pinned.to_dict(),
+            "view": [
+                {"seq": 1, "message": pinned.to_dict()},
+                {"seq": 3, "message": _assistant("later update").to_dict()},
+                {"seq": 4, "message": _assistant("more").to_dict()},
+            ],
+        },
+    )
+
+    items = ContextAssembler._marker_items(marker, {1, 3, 4, 10})
+
+    assert [item.message.content[0].text for item in items] == [
+        "request",
+        "later update",
+        "more",
+    ]
+    assert sum(item.message.role is MessageRole.USER for item in items) == 1
+
+
 def test_old_marker_without_floor_projects_without_rewrite() -> None:
     message = _assistant("receipt")
     marker = ConversationEntry(
