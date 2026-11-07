@@ -532,11 +532,11 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
     )
     tui_result = SlashHandlerMixin.slash_memory(tui, "undo")
     if inspect.isawaitable(tui_result):
-        tui_result = await tui_result
+        tui_result = await asyncio.wait_for(tui_result, 10)
     assert tui_result == "ok"
     serve_result = ServerSlashSession(runtime).slash_memory("undo")
     if inspect.isawaitable(serve_result):
-        serve_result = await serve_result
+        serve_result = await asyncio.wait_for(serve_result, 10)
     assert serve_result == "ok"
 
     project_calls: list[int] = []
@@ -626,7 +626,7 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
         ({"id": "1" * 32, "status": "done", "reply_id": "2" * 32},),
     )
     if inspect.isawaitable(mark_result):
-        await mark_result
+        await asyncio.wait_for(mark_result, 10)
 
     assert len(calls) == 3
     assert all(thread_id != loop_thread for thread_id in calls)
