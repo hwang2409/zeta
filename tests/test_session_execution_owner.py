@@ -366,9 +366,11 @@ def test_read_only_store_is_lease_free(tmp_path: Path) -> None:
         assert observer._runtime_lease is None
         with pytest.raises(Exception, match="read-only"):
             observer.append_pending_prompt("no")
-        with pytest.raises(Exception) as excinfo:
-            manager.open(session_id)
-        assert type(excinfo.value).__name__ == "SessionOwnedError"
+        shared = manager.open(session_id)
+        try:
+            assert _epoch(shared.store) == _epoch(owner)
+        finally:
+            shared.store.close()
 
 
 def test_closed_capability_is_stale(tmp_path: Path) -> None:
@@ -433,54 +435,57 @@ def test_detached_writer_retains_the_resident_epoch(tmp_path: Path) -> None:
             detached.close()
 
 
-def test_tui_real_render_refuses_owned_session(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from zeta.cli.main import _create_tui_app, build_parser
-
+def test_tui_real_render_refuses_owned_session(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.chdir(tmp_path)
     session_id = _created_session(home, tmp_path)
-    parser = build_parser()
-    args = parser.parse_args(["--provider", "codex", "--resume", session_id])
-
-    with SessionManager(home).open(session_id).store:
-        try:
-            app = _create_tui_app(args, parser)
-        except SystemExit as exc:
-            assert exc.code == 2
-        else:
-            app.loop.store.close()
-            pytest.fail("the TUI rendered a second writable session")
-
-    rendered = capsys.readouterr()
-    assert "active in another zeta process" in rendered.err
-
-
-def test_headless_refuses_owned_session(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from zeta.cli.main import build_parser
-    from zeta.runtime.headless import run_headless
-
-    home = tmp_path / "home"
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    monkeypatch.chdir(tmp_path)
-    session_id = _created_session(home, tmp_path)
-    args = build_parser().parse_args(
-        ["--provider", "codex", "--resume", session_id, "-p", "blocked"]
+    script = (
+        "from zeta.cli.main import _create_tui_app, build_parser; "
+        "parser = build_parser(); "
+        f"args = parser.parse_args(['--provider', 'codex', '--resume', '{session_id}']); "
+        "_create_tui_app(args, parser)"
     )
+    env = os.environ | {"ZETA_HOME": str(home)}
 
     with SessionManager(home).open(session_id).store:
-        code = run_headless(args, args.prompt)
+        rendered = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_TIMEOUT_SECONDS,
+            check=False,
+        )
 
-    assert code == 1
-    assert "active in another zeta process" in capsys.readouterr().err
+    assert rendered.returncode == 2
+    assert "active in another zeta process" in rendered.stderr
+
+
+def test_headless_refuses_owned_session(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    script = (
+        "from zeta.cli.main import build_parser; "
+        "from zeta.runtime.headless import run_headless; "
+        "parser = build_parser(); "
+        f"args = parser.parse_args(['--provider', 'codex', '--resume', '{session_id}', '-p', 'blocked']); "
+        "raise SystemExit(run_headless(args, args.prompt))"
+    )
+    env = os.environ | {"ZETA_HOME": str(home)}
+
+    with SessionManager(home).open(session_id).store:
+        rendered = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_WAIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+
+    assert rendered.returncode == 1
+    assert "active in another zeta process" in rendered.stderr
 
 
 def test_production_spawn_does_not_inherit_execution_owner(tmp_path: Path) -> None:

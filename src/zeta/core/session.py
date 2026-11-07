@@ -254,6 +254,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             )
             metadata._execution_lease = store.execution_lease
             try:
+                store.activate_runtime_lease()
                 if project_id is not None:
                     link = {
                         "project_id": project_id,
@@ -746,8 +747,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         execution_lease: SessionExecutionLease | None,
     ):
         if execution_lease is not None:
-            execution_lease.assert_owned()
-            yield execution_lease
+            with execution_lease.serialize_mutation():
+                yield execution_lease
             return
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             lease = SessionExecutionLease.retain_resident(directory_fd)
@@ -758,7 +759,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     owner=OwnerHint(self._owner_surface),
                 )
             try:
-                yield lease
+                with lease.serialize_mutation():
+                    yield lease
             finally:
                 lease.close()
 

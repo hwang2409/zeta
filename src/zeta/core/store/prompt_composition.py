@@ -145,9 +145,17 @@ class PromptCompositionMixin:
         if store.session_id != metadata.session_id:
             raise SessionError("prompt execution lease does not match session metadata")
         store.assert_execution_owner()
-        with self._metadata_lock(metadata.session_id) as directory_fd:
+        with (
+            store.execution_lease.serialize_mutation(),
+            self._metadata_lock(metadata.session_id) as directory_fd,
+        ):
             current = self._read(metadata.session_id, directory_fd=directory_fd)
-            composition = compose(current)
+            with store.prompt_resume_lease() as should_compose:
+                if not should_compose:
+                    composition = _composition_from_metadata(current)
+                    self._copy_metadata(metadata, current)
+                    return composition
+                composition = compose(current)
             if _persisted_fields(composition) != _persisted_fields(
                 _composition_from_metadata(current)
             ):

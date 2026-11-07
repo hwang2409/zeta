@@ -62,8 +62,11 @@ class _OwnedLease:
     fd: int
     identity: tuple[int, int]
     epoch: str
+    pid: int
     refs: int
     state: Literal["owned", "recovery", "releasing"]
+    mutation_lock: threading.RLock = field(default_factory=threading.RLock)
+    active_runtimes: int = 0
 
 
 _REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
@@ -114,6 +117,7 @@ class SessionExecutionLease:
         self._owned = owned
         self.epoch = epoch
         self._closed = False
+        self._runtime_active = False
 
     @classmethod
     def acquire(
@@ -131,8 +135,15 @@ class SessionExecutionLease:
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:
             local = _REGISTRY.get(identity)
+            if local is not None and local.pid != os.getpid():
+                os.close(local.fd)
+                del _REGISTRY[identity]
+                local = None
             if local is not None:
-                raise SessionOwnedError(session_id)
+                if local.state not in {"owned", "recovery"}:
+                    raise SessionOwnedError(session_id)
+                local.refs += 1
+                return cls(local, local.epoch)
             fd = open_session_file(
                 directory_fd,
                 RUNTIME_LEASE_NAME,
@@ -163,6 +174,7 @@ class SessionExecutionLease:
                 fd=fd,
                 identity=identity,
                 epoch=epoch,
+                pid=os.getpid(),
                 refs=1,
                 state="recovery" if recovery else "owned",
             )
@@ -177,7 +189,11 @@ class SessionExecutionLease:
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:
             owned = _REGISTRY.get(identity)
-            if owned is None or owned.state not in {"owned", "recovery"}:
+            if (
+                owned is None
+                or owned.pid != os.getpid()
+                or owned.state not in {"owned", "recovery"}
+            ):
                 return None
             owned.refs += 1
             return cls(owned, owned.epoch)
@@ -204,6 +220,12 @@ class SessionExecutionLease:
         finally:
             lease.close()
 
+    def __deepcopy__(self, memo: dict[int, object]) -> SessionExecutionLease:
+        """Metadata snapshots carry this process capability by reference."""
+
+        memo[id(self)] = self
+        return self
+
     def retain(self) -> SessionExecutionLease:
         """Return another capability retaining this exact kernel lock and epoch."""
 
@@ -226,6 +248,35 @@ class SessionExecutionLease:
             ):
                 raise StaleSessionOwnerError("session execution capability is stale")
 
+    @contextmanager
+    def serialize_mutation(self) -> Iterator[None]:
+        """Serialize mutations made through capabilities retained by this process."""
+
+        self.assert_owned()
+        with self._owned.mutation_lock:
+            self.assert_owned()
+            yield
+
+    def activate_runtime(self) -> None:
+        """Mark this retained capability as one active runtime."""
+
+        with self._owned.mutation_lock:
+            self.assert_owned()
+            if not self._runtime_active:
+                self._owned.active_runtimes += 1
+                self._runtime_active = True
+
+    @contextmanager
+    def resume_runtime(self) -> Iterator[bool]:
+        """Compose only for the first runtime, then publish this one as active."""
+
+        with self.serialize_mutation():
+            should_compose = self._owned.active_runtimes == 0
+            try:
+                yield should_compose
+            finally:
+                self.activate_runtime()
+
     def close(self) -> None:
         """Release this capability and close the lock after its last retained owner."""
 
@@ -234,6 +285,9 @@ class SessionExecutionLease:
                 return
             self._closed = True
             owned = self._owned
+            if self._runtime_active:
+                owned.active_runtimes -= 1
+                self._runtime_active = False
             owned.refs -= 1
             if owned.refs:
                 return
@@ -274,6 +328,14 @@ class StoreRuntimeLeaseMixin:
 
     def assert_execution_owner(self) -> None:
         self.execution_lease.assert_owned()
+
+    def activate_runtime_lease(self) -> None:
+        self.execution_lease.activate_runtime()
+
+    @contextmanager
+    def prompt_resume_lease(self) -> Iterator[bool]:
+        with self.execution_lease.resume_runtime() as should_compose:
+            yield should_compose
 
     @contextmanager
     def orphan_recovery_lease(self) -> Iterator[bool]:
