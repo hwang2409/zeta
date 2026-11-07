@@ -37,7 +37,12 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_files import child_directory, read_session_file, session_root
+from ...core.session_files import (
+    child_directory,
+    open_session_file,
+    read_session_file,
+    session_root,
+)
 from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
 from ...protocol.types import (
@@ -77,6 +82,8 @@ _STATUS_ROW_STRING_FIELDS = (
     "cwd",
 )
 _MISSING = object()
+_AGENT_OUTPUT_CACHE_MAX_ENTRIES = 4
+_AGENT_OUTPUT_CACHE_MAX_CHARS = 32 * 1024 * 1024
 
 
 def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
@@ -300,15 +307,18 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
 def _read_agent_transcript(
     child_path: Path,
     cached: tuple[tuple[int, int, int], str] | None,
-) -> tuple[tuple[int, int, int], str]:
+) -> tuple[tuple[int, int, int], str, bool]:
     try:
         with session_root(child_path) as directory_fd:
-            transcript = child_path / "conversation.jsonl"
-            identity = os.stat(transcript, follow_symlinks=False)
-            key = (identity.st_ino, identity.st_size, identity.st_mtime_ns)
-            if cached is not None and cached[0] == key:
-                return cached
-            raw = read_session_file(directory_fd, "conversation.jsonl")
+            fd = open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY)
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                key = (before.st_ino, before.st_size, before.st_mtime_ns)
+                if cached is not None and cached[0] == key:
+                    return (*cached, True)
+                raw = handle.read()
+                after = os.fstat(handle.fileno())
+            after_key = (after.st_ino, after.st_size, after.st_mtime_ns)
         rows = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
@@ -353,8 +363,7 @@ def _read_agent_transcript(
             if entry.type == "message"
         ]
         output = _serialize_agent_transcript(messages)
-        identity = os.stat(transcript, follow_symlinks=False)
-        return (identity.st_ino, identity.st_size, identity.st_mtime_ns), output
+        return after_key, output, after_key == key
     except (OSError, ValueError, ConversationIntegrityError) as exc:
         raise ValueError("could not read child transcript") from exc
 
@@ -367,8 +376,8 @@ def _read_agent_output(
     limit: int | None,
     max_bytes: int,
     cached: tuple[tuple[int, int, int], str] | None = None,
-) -> tuple[tuple[int, int, int], str, dict[str, object]]:
-    identity, output = _read_agent_transcript(child_path, cached)
+) -> tuple[tuple[int, int, int], str, bool, dict[str, object]]:
+    identity, output, cacheable = _read_agent_transcript(child_path, cached)
     result = _agent_output_page(
         output,
         handle=requested_handle,
@@ -378,7 +387,7 @@ def _read_agent_output(
     )
     if result is None:
         raise ValueError("transcript page exceeds response limit")
-    return identity, output, result
+    return identity, output, cacheable, result
 
 
 def _unknown_agent_status(
@@ -878,7 +887,7 @@ async def _agent_output(
         if child_path is None:
             raise ValueError("unknown child handle")
         cached = registry._agent_output_cache.get(child_path)
-        identity, output, result = await asyncio.to_thread(
+        identity, output, cacheable, result = await asyncio.to_thread(
             _read_agent_output,
             child_path,
             requested_handle=handle,
@@ -887,10 +896,19 @@ async def _agent_output(
             max_bytes=max_bytes,
             cached=cached,
         )
-        registry._agent_output_cache[child_path] = (identity, output)
-        registry._agent_output_cache.move_to_end(child_path)
-        while len(registry._agent_output_cache) > 4:
-            registry._agent_output_cache.popitem(last=False)
+        if cacheable and len(output) <= _AGENT_OUTPUT_CACHE_MAX_CHARS:
+            previous = registry._agent_output_cache.pop(child_path, None)
+            if previous is not None:
+                registry._agent_output_cache_chars -= len(previous[1])
+            registry._agent_output_cache[child_path] = (identity, output)
+            registry._agent_output_cache_chars += len(output)
+            registry._agent_output_cache.move_to_end(child_path)
+            while (
+                len(registry._agent_output_cache) > _AGENT_OUTPUT_CACHE_MAX_ENTRIES
+                or registry._agent_output_cache_chars > _AGENT_OUTPUT_CACHE_MAX_CHARS
+            ):
+                _, evicted = registry._agent_output_cache.popitem(last=False)
+                registry._agent_output_cache_chars -= len(evicted[1])
         return _bounded_agent_result(result, max_bytes)
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)

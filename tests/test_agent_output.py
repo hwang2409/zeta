@@ -413,17 +413,17 @@ async def test_agent_output_read_does_not_block_event_loop(
         parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
-    raw = (child.session_dir / "conversation.jsonl").read_bytes()
     started = threading.Event()
+    ticked_after_start = threading.Event()
     release = threading.Event()
+    original_load = agent_tools.load_session_json
 
-    def blocked_read(*args: object, **kwargs: object) -> bytes:
-        del args, kwargs
+    def blocked_load(row: bytes) -> object:
         started.set()
-        assert release.wait(10)
-        return raw
+        release.wait(10)
+        return original_load(row)
 
-    monkeypatch.setattr(agent_tools, "read_session_file", blocked_read)
+    monkeypatch.setattr(agent_tools, "load_session_json", blocked_load)
     # test-contract: seam the thread-only file-read boundary
     monkeypatch.setattr(
         agent_tools,
@@ -434,22 +434,21 @@ async def test_agent_output_read_does_not_block_event_loop(
         max_output_chars=10_000,
         session_store=parent,
         _agent_output_cache=OrderedDict(),
+        _agent_output_cache_chars=0,
     )
     ticks = 0
-    tick_condition = threading.Condition()
 
     async def heartbeat() -> None:
         nonlocal ticks
         while not release.is_set():
-            with tick_condition:
-                ticks += 1
-                tick_condition.notify_all()
+            ticks += 1
+            if started.is_set():
+                ticked_after_start.set()
             await asyncio.sleep(0)
 
     def release_after_heartbeat() -> None:
         assert started.wait(10)
-        with tick_condition:
-            tick_condition.wait_for(lambda: ticks > 0, timeout=10)
+        ticked_after_start.wait(10)
         release.set()
 
     release_thread = threading.Thread(target=release_after_heartbeat)
@@ -465,7 +464,7 @@ async def test_agent_output_read_does_not_block_event_loop(
     try:
         assert await asyncio.to_thread(started.wait, 10)
         await asyncio.sleep(0)
-        assert ticks > 0
+        assert ticked_after_start.is_set()
         release.set()
         result = await asyncio.wait_for(output_task, 10)
         assert result["content"][0]["text"] == "assistant: answer\n"
@@ -484,7 +483,8 @@ async def test_agent_output_read_does_not_block_event_loop(
 async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    child = ConversationStore(tmp_path / "agents", session_id="1")
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
     # test-contract: seam the receipt lookup to isolate transcript caching
     monkeypatch.setattr(
@@ -503,8 +503,9 @@ async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_appe
     monkeypatch.setattr(agent_tools, "load_session_json", counting_load)
     registry = SimpleNamespace(
         max_output_chars=10_000,
-        session_store=object(),
+        session_store=parent,
         _agent_output_cache=OrderedDict(),
+        _agent_output_cache_chars=0,
     )
     first = await agent_tools._agent_output(
         registry, {"handle": "parent:1", "limit": 1}, object()
@@ -523,6 +524,64 @@ async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_appe
     )
     assert "assistant: new tail" in refreshed["content"][0]["text"]
     assert parsed > before
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_agent_output_does_not_cache_append_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("old")]))
+    monkeypatch.setattr(
+        agent_tools,
+        "_active_agent_receipts",
+        lambda store: {"parent:1": child.session_dir},
+    )
+    original_fdopen = agent_tools.os.fdopen
+    injected = False
+
+    class ReadAndAppend:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def read(self):
+            nonlocal injected
+            raw = self.handle.read()
+            if not injected:
+                injected = True
+                child.append_message(Message(MessageRole.ASSISTANT, [TextContent("new")]))
+            return raw
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    monkeypatch.setattr(
+        agent_tools.os,
+        "fdopen",
+        lambda fd, mode: ReadAndAppend(original_fdopen(fd, mode)),
+    )
+    registry = SimpleNamespace(
+        max_output_chars=10_000,
+        session_store=parent,
+        _agent_output_cache=OrderedDict(),
+        _agent_output_cache_chars=0,
+    )
+    first = await agent_tools._agent_output(registry, {"handle": "parent:1"}, object())
+    assert first["content"][0]["text"] == "assistant: old\n"
+    assert not registry._agent_output_cache
+    second = await agent_tools._agent_output(registry, {"handle": "parent:1"}, object())
+    assert second["content"][0]["text"] == "assistant: old\nassistant: new\n"
 
 
 @pytest.mark.asyncio
