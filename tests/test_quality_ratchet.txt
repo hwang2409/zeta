@@ -1,5 +1,10 @@
+tests/support/processes.py::reap_process
 tests/support/server_backend.py::complete
 tests/test_account_home.py::test_refresh_writes_token_and_lock_to_account_home
+tests/test_accounts.py::_hold_lifecycle_lock
+tests/test_accounts.py::_hold_registry_lock
+tests/test_accounts.py::_login_lock_worker
+tests/test_accounts.py::_migration_worker
 tests/test_accounts.py::blocked_refresh
 tests/test_accounts.py::race
 tests/test_accounts.py::test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_block_loop
@@ -228,6 +233,7 @@ tests/test_bash_cwd.py::test_delegated_shell_approval_uses_persisted_bash_cwd
 tests/test_bash_cwd.py::test_run_background_relative_cwd_uses_persisted_bash_cwd
 tests/test_codex.py::__aexit__
 tests/test_codex.py::__aiter__
+tests/test_codex.py::_refresh_process
 tests/test_codex.py::aiter_lines
 tests/test_codex.py::test_cancellation_wins_over_failing_cleanup
 tests/test_codex.py::test_codex_refresh_keeps_existing_token_when_response_does_not_rotate
@@ -342,6 +348,8 @@ tests/test_mcp_envelope.py::test_http_deadline_retains_cancellation_resistant_ca
 tests/test_mcp_envelope.py::test_large_http_parse_stays_off_loop
 tests/test_mcp_envelope.py::test_spill_reservation_does_not_wait_for_spill_write
 tests/test_mcp_envelope.py::test_spill_reservation_rejects_before_cap_and_releases
+tests/test_mcp_http_resume.py::do_GET
+tests/test_mcp_http_resume.py::resumable_notification_server
 tests/test_mcp_management.py::run_all
 tests/test_mcp_management.py::slow_mount
 tests/test_mcp_management.py::test_activate_starts_slow_mcp_mount_without_blocking_first_render
@@ -399,6 +407,7 @@ tests/test_resume_recovery_bootstrap.py::test_resume_recovery_cancel_during_noti
 tests/test_resume_recovery_bootstrap.py::test_resume_recovery_cancel_during_setup_is_safe
 tests/test_resume_recovery_bootstrap.py::test_warm_writer_startup_and_close_are_cancellation_safe
 tests/test_scripted_fake.py::delay_decision_response_until_tool_end
+tests/test_server.py::_hold_registry_lock_after_start
 tests/test_server.py::blocked_catalog
 tests/test_server.py::complete
 tests/test_server.py::delay_delegated_approval_end
@@ -567,6 +576,8 @@ tests/test_tools.py::test_read_abort_returns_canceled_result_during_scan
 tests/test_tools.py::test_registry_abort_cancels_loop_batch_and_next_tool
 tests/test_tools.py::test_write_create_parents_symlink_race_stays_in_sandbox
 tests/test_tools.py::test_write_overwrite_symlink_race_stays_in_sandbox
+tests/test_transcript_index.py::_append_index_process
+tests/test_transcript_index.py::_construct_index_process
 tests/test_transcript_index.py::test_refreshes_coalesce_per_project
 tests/test_transport.py::__aiter__
 tests/test_transport.py::blocking_sleep

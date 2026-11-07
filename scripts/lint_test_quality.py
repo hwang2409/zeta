@@ -415,14 +415,6 @@ def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     return False
 
 
-def _inside_test_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
-    return any(
-        isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
-        and ancestor.name.startswith("test_")
-        for ancestor in _enclosing_nodes(node, parents)
-    )
-
-
 def _enclosing_function_touches_added_line(
     node: ast.AST, added: set[int], parents: dict[ast.AST, ast.AST]
 ) -> bool:
@@ -440,10 +432,44 @@ def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> b
         and not node.keywords
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in {"join", "wait"}
-        and not isinstance(parents.get(node), ast.Await)
+        and not any(
+            isinstance(ancestor, ast.Await)
+            for ancestor in _enclosing_nodes(node, parents)
+        )
         and not _inside_deadline_argument(node, parents)
-        and _inside_test_function(node, parents)
     )
+
+
+def _unwrap_transparent(node: ast.AST) -> ast.AST:
+    """Strip asyncio.shield/ensure_future/create_task, zero-arg lambdas, and functools.partial."""
+    while True:
+        if isinstance(node, ast.Lambda) and not (
+            node.args.posonlyargs
+            or node.args.args
+            or node.args.vararg
+            or node.args.kwonlyargs
+            or node.args.kwarg
+        ):
+            node = node.body
+            continue
+        if (
+            isinstance(node, ast.Call)
+            and node.args
+            and _name(node.func)
+            in {
+                "asyncio.shield",
+                "shield",
+                "asyncio.ensure_future",
+                "ensure_future",
+                "asyncio.create_task",
+                "create_task",
+                "functools.partial",
+                "partial",
+            }
+        ):
+            node = node.args[0]
+            continue
+        return node
 
 
 def _is_blocking_to_thread(node: ast.AST) -> bool:
@@ -452,9 +478,13 @@ def _is_blocking_to_thread(node: ast.AST) -> bool:
         "to_thread",
     }:
         return False
-    if not node.args or not isinstance(node.args[0], ast.Attribute):
+    if not node.args:
         return False
-    target = node.args[0]
+    target = _unwrap_transparent(node.args[0])
+    if isinstance(target, ast.Call):
+        target = target.func
+    if not isinstance(target, ast.Attribute):
+        return False
     if target.attr in {"recv", "recv_into", "read", "readline", "accept"}:
         return True
     return target.attr == "get" and "queue" in _name(target.value).lower()
@@ -496,7 +526,7 @@ def _deadline_findings(
         )
     if not isinstance(node, ast.Await):
         return []
-    value = node.value
+    value = _unwrap_transparent(node.value)
     violates = (
         isinstance(value, (ast.Name, ast.Attribute))
         or _is_blocking_to_thread(value)
@@ -527,6 +557,34 @@ def _deadline_findings(
     ]
 
 
+def _scan_added_nodes(
+    path: Path,
+    nodes: list[ast.AST],
+    lines: list[str],
+    literal_names: set[str],
+    serialized_names: set[str],
+) -> list[Finding]:
+    findings: list[Finding] = []
+    for node in nodes:
+        findings.extend(_timing_findings(path, node, lines))
+        findings.extend(_digest_findings(path, node, literal_names, serialized_names))
+        findings.extend(_contract_findings(path, node, lines))
+    return findings
+
+
+def _scan_deadline_nodes(
+    path: Path,
+    nodes: list[ast.AST],
+    lines: list[str],
+    parents: dict[ast.AST, ast.AST],
+) -> list[Finding]:
+    return [
+        finding
+        for node in nodes
+        for finding in _deadline_findings(path, node, lines, parents)
+    ]
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -549,21 +607,18 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         for parent in ast.walk(tree)
         for child in ast.iter_child_nodes(parent)
     }
-    findings: list[Finding] = []
-    for node in ast.walk(tree):
-        if not hasattr(node, "lineno"):
-            continue
-        touches_added = _touches_added_line(node, added)
-        if touches_added:
-            findings.extend(_timing_findings(path, node, lines))
-            findings.extend(
-                _digest_findings(path, node, literal_names, serialized_names)
-            )
-            findings.extend(_contract_findings(path, node, lines))
-        if touches_added or _enclosing_function_touches_added_line(
-            node, added, parents
-        ):
-            findings.extend(_deadline_findings(path, node, lines, parents))
+    nodes = [node for node in ast.walk(tree) if hasattr(node, "lineno")]
+    added_nodes = [node for node in nodes if _touches_added_line(node, added)]
+    deadline_nodes = [
+        node
+        for node in nodes
+        if node in added_nodes
+        or _enclosing_function_touches_added_line(node, added, parents)
+    ]
+    findings = _scan_added_nodes(
+        path, added_nodes, lines, literal_names, serialized_names
+    )
+    findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 

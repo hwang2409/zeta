@@ -216,6 +216,17 @@ def test_support_gather_requires_reasoned_marker(
     ]
 
 
+@pytest.mark.parametrize("path", ["tests/test_example.py", "tests/support/helper.py"])
+def test_await_deadline_rule_rejects_sync_wait_in_shared_helper(
+    tmp_path: Path, path: str
+) -> None:
+    source = "def helper():\n    ready.wait()\n"
+
+    findings = _lint(tmp_path, source, path=path)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
 @pytest.mark.parametrize("target", ["thread", "process"])
 def test_await_deadline_rule_rejects_unbounded_thread_join(
     tmp_path: Path, target: str
@@ -271,6 +282,14 @@ def test_await_deadline_rule_accepts_bounded_sync_event_wait(
     assert _lint(tmp_path, source) == []
 
 
+def test_await_deadline_rule_rejects_shielded_task_wait(tmp_path: Path) -> None:
+    source = "async def test_worker():\n    await asyncio.shield(task)\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
 def test_await_deadline_rule_catches_pr_774_blocking_pipe_receive(
     tmp_path: Path,
 ) -> None:
@@ -295,6 +314,20 @@ def test_await_deadline_rule_catches_pr_774_blocking_pipe_receive(
     ],
 )
 def test_await_deadline_rule_rejects_blocking_to_thread(
+    tmp_path: Path, target: str
+) -> None:
+    source = f"async def test_worker():\n    await asyncio.to_thread({target})\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["lambda: pipe.recv()", "functools.partial(stream.read)"],
+)
+def test_await_deadline_rule_rejects_wrapped_blocking_to_thread(
     tmp_path: Path, target: str
 ) -> None:
     source = f"async def test_worker():\n    await asyncio.to_thread({target})\n"
