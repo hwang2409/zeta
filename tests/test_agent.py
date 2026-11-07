@@ -13121,6 +13121,324 @@ async def _idle_nudge_run(
     return run, prompts, notices, owner, registry, store
 
 
+class _ConsumeTaskSafetyWait:
+    def __init__(self) -> None:
+        self.timeouts: asyncio.Queue[float | None] = asyncio.Queue()
+        self.releases: asyncio.Queue[bool] = asyncio.Queue()
+
+    async def __call__(self, _wake, timeout: float | None) -> bool:
+        await self.timeouts.put(timeout)
+        return await self.releases.get()
+
+
+async def _start_consume_task_safety_harness(
+    stack: contextlib.AsyncExitStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    store = ConversationStore(tmp_path / "session")
+    stack.callback(store.close)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store, finish_gate_task_timeout=10)
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    stack.push_async_callback(_close_test_agent_loop, loop)
+    loop.agent_instance_id = "root:1"
+    loop.explicit_finish = True
+    loop._terminal_transition_fence = TerminalTransitionFence(store)
+    owner.conversation_channel.register_loop("root:1")
+    stack.callback(owner.conversation_channel.unregister_loop, "root:1")
+    await owner.conversation_channel.unregister_delivery_flow(None)
+    loop.step_delivery = None
+
+    now = [100.0]
+    safety_wait = _ConsumeTaskSafetyWait()
+    warnings: asyncio.Queue[str] = asyncio.Queue()
+    warning_turn_gates: asyncio.Queue[asyncio.Event] = asyncio.Queue()
+    idle_entries: asyncio.Queue[None] = asyncio.Queue()
+    old_kill_started = asyncio.Event()
+    old_kill_release = asyncio.Event()
+    old_kill_done = asyncio.Event()
+    old_path = hasattr(run_consumer_module, "kill_tasks_after_deadline")
+    calls = 0
+
+    if old_path:
+        async def old_kill_all(registry, _timeout):
+            old_kill_started.set()
+            await asyncio.wait_for(old_kill_release.wait(), 10)
+            killed = []
+            try:
+                for task in registry.snapshot():
+                    if task.running:
+                        await registry.kill(
+                            task.task_id, cause="old child-wide safety deadline"
+                        )
+                        killed.append(task.task_id)
+                return tuple(killed)
+            finally:
+                old_kill_done.set()
+
+        monkeypatch.setattr(
+            run_consumer_module, "kill_tasks_after_deadline", old_kill_all
+        )
+
+    async def fake_consume(_loop, _prompt, **kwargs):
+        nonlocal calls
+        calls += 1
+        await _ack_fake_delivery(store, kwargs)
+        flow = await loop._ensure_step_delivery()
+        if flow.has_pending_edge:
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+            safety_messages = [
+                message
+                for message in prepared.messages
+                if message.role is MessageRole.SYSTEM
+                and message.metadata.get("zeta_event") == "agent_task_safety"
+            ]
+            await flow.acknowledge_active()
+            for message in safety_messages:
+                await warnings.put(message.content[0].text)
+                gate = await warning_turn_gates.get()
+                await asyncio.wait_for(gate.wait(), 10)
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def idle_wait(wake, _timeout):
+        await idle_entries.put(None)
+        await asyncio.wait_for(wake(), 10)
+        return True
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
+
+    async def start_task(task_id: str, started_at: float) -> str:
+        result = await asyncio.wait_for(
+            loop.tool_registry.execute(
+                ToolCall(
+                    task_id,
+                    "run_background",
+                    {"command": _python("import time; time.sleep(30)")},
+                )
+            ),
+            10,
+        )
+        started_id = result["structuredContent"]["task_id"]
+        registry = loop.tool_registry.background_tasks
+        registry._record(started_id).started_at = started_at
+        registry._persist()
+        return started_id
+
+    async def start_run() -> asyncio.Task[dict[str, object]]:
+        run = asyncio.create_task(
+            agent_runner_module.consume_run(
+                loop,
+                "work",
+                child_store=store,
+                child_turns=lambda: calls,
+                finish_lifecycle=lambda *_: {},
+                idle_clock=lambda: now[0],
+                idle_wait=idle_wait,
+                task_safety_clock=lambda: now[0],
+                task_safety_wait=safety_wait,
+                task_safety_cohort_seconds=0,
+            )
+        )
+        stack.push_async_callback(_cancel_and_drain_test_task, run)
+        await asyncio.wait_for(idle_entries.get(), 10)
+        if old_path:
+            await asyncio.wait_for(old_kill_started.wait(), 10)
+        return run
+
+    return SimpleNamespace(
+        store=store,
+        loop=loop,
+        now=now,
+        safety_wait=safety_wait,
+        warnings=warnings,
+        warning_turn_gates=warning_turn_gates,
+        idle_entries=idle_entries,
+        old_path=old_path,
+        old_kill_started=old_kill_started,
+        old_kill_release=old_kill_release,
+        old_kill_done=old_kill_done,
+        start_task=start_task,
+        start_run=start_run,
+    )
+
+
+def _running_task_ids(loop: AgentLoop) -> set[str]:
+    return {
+        task.task_id
+        for task in loop.tool_registry.background_tasks.snapshot()
+        if task.running
+    }
+
+
+def _task_exit_receipts(store: ConversationStore) -> dict[str, object]:
+    return {
+        entry.data["task_id"]: entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    }
+
+
+@pytest.mark.asyncio
+async def test_consume_run_keeps_late_task_on_its_own_safety_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        harness = await _start_consume_task_safety_harness(
+            stack, tmp_path, monkeypatch
+        )
+        task_a = await harness.start_task("start-a", 100.0)
+        await harness.start_run()
+
+        if not harness.old_path:
+            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 10
+            gate_a = asyncio.Event()
+            await harness.warning_turn_gates.put(gate_a)
+            harness.now[0] = 110.0
+            await harness.safety_wait.releases.put(False)
+            warning_a = await asyncio.wait_for(harness.warnings.get(), 10)
+            assert f"task {task_a} (" in warning_a
+
+            gate_a.set()
+            await asyncio.wait_for(harness.idle_entries.get(), 10)
+            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+            await harness.safety_wait.releases.put(True)
+            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 10
+
+        harness.now[0] = 115.0
+        task_b = await harness.start_task("start-b", 115.0)
+
+        if harness.old_path:
+            harness.now[0] = 120.0
+            harness.old_kill_release.set()
+            await asyncio.wait_for(harness.old_kill_done.wait(), 10)
+        else:
+            await harness.safety_wait.releases.put(True)
+            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 5
+            harness.now[0] = 120.0
+            await harness.safety_wait.releases.put(False)
+            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 5
+
+        receipts = _task_exit_receipts(harness.store)
+        assert task_a not in _running_task_ids(harness.loop)
+        if not harness.old_path:
+            assert receipts[task_a].data["note"] == (
+                "explicit-finish task safety limit expired at task age 20 seconds "
+                "after no owner turn for 10 seconds"
+            )
+        assert task_b in _running_task_ids(harness.loop)
+        assert task_b not in receipts
+        assert harness.warnings.empty()
+
+        gate_b = asyncio.Event()
+        await harness.warning_turn_gates.put(gate_b)
+        harness.now[0] = 125.0
+        await harness.safety_wait.releases.put(False)
+        warning_b = await asyncio.wait_for(harness.warnings.get(), 10)
+        assert f"task {task_b} (" in warning_b
+        assert f"task {task_a} (" not in warning_b
+
+        gate_b.set()
+        await asyncio.wait_for(harness.idle_entries.get(), 10)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+        await harness.safety_wait.releases.put(True)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 10
+        harness.now[0] = 135.0
+        await harness.safety_wait.releases.put(False)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+
+        receipts = _task_exit_receipts(harness.store)
+        assert task_b not in _running_task_ids(harness.loop)
+        assert receipts[task_b].data["note"] == (
+            "explicit-finish task safety limit expired at task age 20 seconds "
+            "after no owner turn for 10 seconds"
+        )
+
+
+@pytest.mark.asyncio
+async def test_consume_run_owner_turn_resets_only_warned_task_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """b was not warned when the owner turn reset a's warned window."""
+    async with contextlib.AsyncExitStack() as stack:
+        harness = await _start_consume_task_safety_harness(
+            stack, tmp_path, monkeypatch
+        )
+        task_a = await harness.start_task("start-a", 100.0)
+        task_b = await harness.start_task("start-b", 105.0)
+        await harness.start_run()
+        assert not harness.old_path
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 10
+
+        gate_a = asyncio.Event()
+        await harness.warning_turn_gates.put(gate_a)
+        harness.now[0] = 110.0
+        await harness.safety_wait.releases.put(False)
+        warning_a = await asyncio.wait_for(harness.warnings.get(), 10)
+        assert f"task {task_a} (" in warning_a
+        assert f"task {task_b} (" not in warning_a
+
+        harness.now[0] = 112.0
+        gate_a.set()
+        await asyncio.wait_for(harness.idle_entries.get(), 10)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 5
+        await harness.safety_wait.releases.put(True)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 3
+
+        gate_b = asyncio.Event()
+        await harness.warning_turn_gates.put(gate_b)
+        harness.now[0] = 115.0
+        await harness.safety_wait.releases.put(False)
+        warning_b = await asyncio.wait_for(harness.warnings.get(), 10)
+        assert f"task {task_b} (" in warning_b
+        assert f"task {task_a} (" not in warning_b
+        gate_b.set()
+        await asyncio.wait_for(harness.idle_entries.get(), 10)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 7
+        await harness.safety_wait.releases.put(True)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 7
+
+        harness.now[0] = 120.0
+        assert task_a in _running_task_ids(harness.loop)
+        assert task_b in _running_task_ids(harness.loop)
+
+        harness.now[0] = 122.0
+        await harness.safety_wait.releases.put(False)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 3
+        harness.now[0] = 125.0
+        await harness.safety_wait.releases.put(False)
+        assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+
+        receipts = _task_exit_receipts(harness.store)
+        assert task_a not in _running_task_ids(harness.loop)
+        assert task_b not in _running_task_ids(harness.loop)
+        assert receipts[task_a].data["note"] == (
+            "explicit-finish task safety limit expired at task age 22 seconds "
+            "after no owner turn for 10 seconds"
+        )
+        assert receipts[task_b].data["note"] == (
+            "explicit-finish task safety limit expired at task age 20 seconds "
+            "after no owner turn for 10 seconds"
+        )
+
+
 @pytest.mark.asyncio
 async def test_late_task_gets_its_own_safety_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
