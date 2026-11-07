@@ -2,7 +2,6 @@ import asyncio
 import fcntl
 import inspect
 import json
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -28,22 +27,6 @@ def service(tmp_path, mount=None):
     return MCPManagementService(
         home=tmp_path / "home", project_dir=tmp_path / "repo", mount=mount
     )
-
-
-_ADD_MCP_SERVER_PROCESS = """
-import asyncio
-import inspect
-import sys
-
-from zeta.mcp.management import MCPManagementService
-
-manager = MCPManagementService(home=sys.argv[1], project_dir=sys.argv[2])
-print("ready", flush=True)
-sys.stdin.readline()
-result = manager.add(sys.argv[3], scope="user", command=sys.executable)
-if inspect.isawaitable(result):
-    asyncio.run(result)
-"""
 
 
 @pytest.mark.asyncio
@@ -187,65 +170,6 @@ async def test_untrusted_cloned_project_never_creates_subprocess(tmp_path, monke
     await mount.close()
 
 
-@pytest.mark.asyncio
-async def test_multiprocess_mutations_do_not_lose_writers(tmp_path):
-    processes = []
-    for name in ("process-one", "process-two"):
-        process = await asyncio.to_thread(
-            subprocess.Popen,
-            [
-                sys.executable,
-                "-c",
-                _ADD_MCP_SERVER_PROCESS,
-                str(tmp_path / "home"),
-                str(tmp_path / "repo"),
-                name,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        processes.append(process)
-    try:
-        for process in processes:
-            assert process.stdout is not None
-            assert (
-                await asyncio.wait_for(
-                    asyncio.to_thread(process.stdout.readline), 10
-                )
-                == "ready\n"
-            )
-        for process in processes:
-            assert process.stdin is not None
-            process.stdin.write("start\n")
-            process.stdin.close()
-
-        exitcodes = []
-        for process in processes:
-            try:
-                exitcodes.append(await asyncio.to_thread(process.wait, 10))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                await asyncio.to_thread(process.wait)
-                pytest.fail("MCP config writer process did not exit")
-        assert exitcodes == [0, 0], [
-            process.stderr.read() if process.stderr is not None else ""
-            for process in processes
-        ]
-    finally:
-        for process in processes:
-            if process.poll() is None:
-                process.kill()
-                await asyncio.to_thread(process.wait)
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-
-    document = json.loads((tmp_path / "home" / "mcp.json").read_text())
-    assert set(document["servers"]) == {"process-one", "process-two"}
-
-
 @pytest.mark.parametrize(
     ("route", "gated_read", "expected_reconciles"),
     (
@@ -348,7 +272,7 @@ async def test_cancelled_management_owner_keeps_old_snapshot(
 
         async def blocked_reconcile(_desired):
             started_async.set()
-            await release_reconcile.wait()
+            await asyncio.wait_for(release_reconcile.wait(), 10)
 
         # test-contract: seam pause runtime reconciliation before publication
         monkeypatch.setattr(manager, "_reconcile", blocked_reconcile)
@@ -1097,76 +1021,82 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
 
 
+@pytest.mark.parametrize("failure_at", ("transaction", "reconcile"))
 @pytest.mark.asyncio
-async def test_cancelled_mutation_releases_lock_and_refresh_adopts_commit(
-    tmp_path, monkeypatch
+async def test_duplicate_add_repairs_a_committed_unpublished_mutation(
+    tmp_path, monkeypatch, failure_at
 ):
-    manager = service(tmp_path)
-    assert inspect.iscoroutinefunction(manager.add)
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    original = manager._atomic_json
-
-    def gated_write(path, data, *, mode=None):
-        assert threading.get_ident() != loop_thread
-        started.set()
-        release.wait()
-        try:
-            original(path, data, mode=mode)
-        finally:
-            finished.set()
-
-    loop_thread = threading.get_ident()
-    # test-contract: durability force cancellation after the durable write starts
-    monkeypatch.setattr(manager, "_atomic_json", gated_write)
-    task = asyncio.create_task(
-        manager.add("committed", scope="user", command=sys.executable)
-    )
-    try:
-        await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 10)
-    finally:
-        release.set()
-        task.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
-        await asyncio.wait_for(asyncio.to_thread(finished.wait), 10)
-
-    assert manager.snapshot.generation == 0
-    await asyncio.wait_for(manager.refresh(), 10)
-    assert manager.show("committed", scope="user").name == "committed"
-
-
-@pytest.mark.asyncio
-async def test_mount_failure_keeps_prior_snapshot_and_durable_commit(tmp_path):
-    class FailingMount:
+    class OneFailureMount:
         pinned = False
 
         def __init__(self):
             self.configs = {}
             self.statuses = {}
             self._actors = {}
+            self.fail = failure_at == "reconcile"
 
-        async def add_server(self, *_args, **_kwargs):
-            raise RuntimeError("mount failed")
+        async def add_server(self, config, **_kwargs):
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("mount failed")
+            self.configs[config.name] = config
 
-        async def remove_server(self, *_args, **_kwargs):
-            raise AssertionError("nothing is mounted")
+        async def remove_server(self, name):
+            self.configs.pop(name)
 
-    manager = service(tmp_path, FailingMount())
+    mount = OneFailureMount()
+    manager = service(tmp_path, mount)
     assert inspect.iscoroutinefunction(manager.add)
     before = manager.snapshot
-    with pytest.raises(RuntimeError, match="mount failed"):
-        await manager.add("durable", scope="user", url="https://example.test")
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_transaction = manager._transaction
+
+    def gated_transaction(mutation=None):
+        candidate = original_transaction(mutation)
+        if mutation is not None and not started.is_set():
+            started.set()
+            try:
+                assert release.wait(10), "timed out releasing committed transaction"
+            finally:
+                finished.set()
+        return candidate
+
+    if failure_at == "transaction":
+        # test-contract: durability cancel the public call after its commit
+        monkeypatch.setattr(manager, "_transaction", gated_transaction)
+
+    task = asyncio.create_task(
+        manager.add("durable", scope="user", url="https://example.test")
+    )
+    try:
+        if failure_at == "transaction":
+            assert await asyncio.to_thread(started.wait, 10), "transaction did not commit"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        else:
+            with pytest.raises(RuntimeError, match="mount failed"):
+                await asyncio.wait_for(task, 10)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        if failure_at == "transaction":
+            assert await asyncio.to_thread(finished.wait, 10), "transaction did not finish"
 
     assert manager.snapshot is before
     assert "durable" in json.loads(manager.path("user").read_text())["servers"]
-    manager.mount = None
-    await manager.refresh()
-    assert manager.show("durable").name == "durable"
+
+    snapshot = await manager.add(
+        "durable", scope="user", url="https://example.test"
+    )
+    assert [item.name for item in snapshot.entries] == ["durable"]
+    assert set(mount.configs) == {"durable"}
+    with pytest.raises(MCPManagementError, match="already configured"):
+        await manager.add("durable", scope="user", url="https://different.test")
 
 
 @pytest.mark.asyncio

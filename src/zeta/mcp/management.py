@@ -592,6 +592,8 @@ class MCPManagementService:
 
         def change(servers: dict[str, object]) -> None:
             if name in servers:
+                if servers[name] == raw:
+                    return
                 raise MCPManagementError(f"MCP server already configured: {name}")
             servers[name] = raw
 
