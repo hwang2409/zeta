@@ -77,7 +77,9 @@ def tool_content(event: StreamEvent) -> str:
         if result.content:
             return result.content
         if result.structured_content:
-            return json.dumps(result.structured_content, sort_keys=True, separators=(",", ":"))
+            return json.dumps(
+                result.structured_content, sort_keys=True, separators=(",", ":")
+            )
         return ""
     tool_name = event.tool_call.name if event.tool_call is not None else "tool"
     return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
@@ -116,8 +118,16 @@ def strip_terminal_controls(value: str) -> str:
 
 
 def safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
+    clean = strip_terminal_controls(value)
+    if clean == value:
+        return Text(
+            clean,
+            style=style,
+            overflow="fold" if wrap else "ellipsis",
+            no_wrap=not wrap,
+        )
     return Text.from_ansi(
-        strip_terminal_controls(value),
+        clean,
         style=style,
         overflow="fold" if wrap else "ellipsis",
         no_wrap=not wrap,
@@ -132,7 +142,9 @@ def tool_header(call: ToolCall) -> RenderableType:
             padding=(0, 1),
             expand=False,
         )
-    return Text.assemble((call.name, theme.COMMAND), (f" {arguments(call.arguments)}", theme.DIM))
+    return Text.assemble(
+        (call.name, theme.COMMAND), (f" {arguments(call.arguments)}", theme.DIM)
+    )
 
 
 def render_tool_output(
@@ -143,7 +155,11 @@ def render_tool_output(
 ) -> Text:
     scan = scan_tool_output(content) if scan is None else scan
     visible = list(scan.lines[:MAX_TOOL_LINES])
-    omitted = max(0, scan.total_lines - MAX_TOOL_LINES) if scan.total_lines is not None else None
+    omitted = (
+        max(0, scan.total_lines - MAX_TOOL_LINES)
+        if scan.total_lines is not None
+        else None
+    )
     if extra_lines:
         visible.extend(extra_lines)
     rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
@@ -211,12 +227,16 @@ def tool_body(
         char_sizes = [
             block["full_size_chars"]
             for block in result.content_blocks
-            if block.get("type") == "text" and block.get("truncated") and "full_size_chars" in block
+            if block.get("type") == "text"
+            and block.get("truncated")
+            and "full_size_chars" in block
         ]
         byte_sizes = [
             block["full_size"]
             for block in result.content_blocks
-            if block.get("type") == "text" and block.get("truncated") and "full_size_chars" not in block
+            if block.get("type") == "text"
+            and block.get("truncated")
+            and "full_size_chars" not in block
         ]
         if char_sizes:
             extra_lines.append(f"[truncated; full_size_chars={max(char_sizes)} chars]")

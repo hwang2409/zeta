@@ -2,7 +2,7 @@ import random
 import re
 import sys
 
-from zeta.tui.cards.base import UNSAFE_CONTROL_RE, strip_terminal_controls
+from zeta.tui.cards.base import UNSAFE_CONTROL_RE, safe_text, strip_terminal_controls
 
 # Reference: the implementation before the clean-text fast path, kept verbatim.
 _OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)")
@@ -87,6 +87,30 @@ def test_mixed_controls_and_escape_sequences_match_reference() -> None:
     for _ in range(20_000):
         value = "".join(rng.choice(pieces) for _ in range(rng.randrange(0, 12)))
         assert strip_terminal_controls(value) == _reference(value), repr(value)
+
+
+def test_safe_text_clean_card_lines_skip_ansi_parser(monkeypatch) -> None:
+    calls = 0
+    original = safe_text.__globals__["Text"].from_ansi
+
+    def count_parser(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(safe_text.__globals__["Text"], "from_ansi", count_parser)
+    clean = "stdout:\nplain output\nexit_code: 0"
+    rendered = safe_text(clean, style="body")
+
+    assert rendered.plain == clean
+    assert calls == 0
+
+
+def test_safe_text_preserves_ansi_card_output() -> None:
+    rendered = safe_text("\x1b[31mfailed\x1b[0m", style="body")
+
+    assert rendered.plain == strip_terminal_controls("\x1b[31mfailed\x1b[0m")
+    assert rendered.style == "body"
 
 
 def test_clean_text_skips_the_character_loop() -> None:
