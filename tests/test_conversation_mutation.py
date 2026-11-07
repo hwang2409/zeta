@@ -523,3 +523,258 @@ def test_append_validation_matches_replay_validation(tmp_path: Path) -> None:
         assert store.path.read_bytes() == before
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_commit_async_cancel_before_lock_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store.bind_owner_thread()
+    await store._async_write_lock.acquire()
+    before = store.path.read_bytes()
+    task = asyncio.create_task(
+        store.commit_async(
+            AppendConversationRows((_warning("not locked"),)),
+            store.conversation_generation,
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        task.cancel()
+        store._async_write_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert store.path.read_bytes() == before
+        assert store.entries == []
+    finally:
+        if store._async_write_lock.locked():
+            store._async_write_lock.release()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(store.close)
+
+
+@pytest.mark.asyncio
+async def test_commit_async_close_race_keeps_durable_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store.bind_owner_thread()
+    committed = threading.Event()
+    release = threading.Event()
+    original = store._run_committed_mutation
+
+    def pause_after_commit(
+        command: object, generation: int, cancelled: threading.Event
+    ) -> object:
+        result = original(command, generation, cancelled)
+        committed.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
+    task = asyncio.create_task(
+        store.commit_async(
+            AppendConversationRows((_warning("close race"),)),
+            store.conversation_generation,
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(committed.wait, 10), 11)
+        await asyncio.to_thread(store.close)
+        release.set()
+        await asyncio.wait_for(task, 10)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    reopened = await asyncio.to_thread(
+        ConversationStore, tmp_path, session_id=store.session_id
+    )
+    try:
+        assert [entry.data["message"] for entry in reopened.entries] == ["close race"]
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_legacy_delta_patch_contains_only_declared_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store.bind_owner_thread()
+    observed: list[object] = []
+    original = store._run_committed_mutation
+
+    def capture(command: object, generation: int, cancelled: threading.Event) -> object:
+        result = original(command, generation, cancelled)
+        observed.append(result[0])
+        return result
+
+    monkeypatch.setattr(store, "_run_committed_mutation", capture)
+    try:
+        await store._commit_method_async(store.append_pending_prompt, "declared")
+        patch = observed[0]._resident_patch
+        assert set(patch.values) <= set(patch.expected)
+        assert "cwd" not in patch.values
+    finally:
+        await asyncio.to_thread(store.close)
+
+
+@pytest.mark.asyncio
+async def test_transient_address_retries_conflict_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    created = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (created.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    await asyncio.to_thread(created.close)
+    calls = 0
+    original = ConversationStore.commit
+    loop_thread = threading.get_ident()
+
+    def conflict_once(
+        self: ConversationStore, command: object, generation: int
+    ) -> object:
+        nonlocal calls
+        assert threading.get_ident() != loop_thread
+        calls += 1
+        if calls == 1:
+            raise ConversationGenerationConflict(generation, generation + 1)
+        return original(self, command, generation)
+
+    monkeypatch.setattr(ConversationStore, "commit", conflict_once)
+    delta = await commit_conversation_async(
+        ConversationAddress("project", "root", "root"),
+        AppendConversationRows((_warning("retried"),)),
+    )
+    assert calls == 2
+    assert delta.committed_entries[0].data["message"] == "retried"
+
+
+@pytest.mark.asyncio
+async def test_address_concurrent_resident_commits_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    store = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (store.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    store.bind_owner_thread()
+    started = threading.Event()
+    release = threading.Event()
+    original = store._run_committed_mutation
+    first = True
+
+    def hold_first(
+        command: object, generation: int, cancelled: threading.Event
+    ) -> object:
+        nonlocal first
+        result = original(command, generation, cancelled)
+        if first:
+            first = False
+            started.set()
+            assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(store, "_run_committed_mutation", hold_first)
+    address = ConversationAddress("project", "root", "root")
+    tasks = [
+        asyncio.create_task(
+            commit_conversation_async(
+                address, AppendConversationRows((_warning(f"resident-{i}"),))
+            )
+        )
+        for i in range(8)
+    ]
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 10), 11)
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), 20)
+        assert len(results) == 8
+        messages = [entry.data["message"] for entry in store.entries]
+        assert sorted(messages) == [f"resident-{i}" for i in range(8)]
+        generation = store.conversation_generation
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.to_thread(store.close)
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert reopened.conversation_generation == generation
+        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+            f"resident-{i}" for i in range(8)
+        ]
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_address_transient_waiter_retries_after_owner_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    created = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (created.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    await asyncio.to_thread(created.close)
+    entered = threading.Event()
+    release = threading.Event()
+    original = ConversationStore.commit
+    calls = 0
+
+    def hold_owner(self: ConversationStore, command: object, generation: int) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10)
+        return original(self, command, generation)
+
+    monkeypatch.setattr(ConversationStore, "commit", hold_owner)
+    address = ConversationAddress("project", "root", "root")
+    owner = asyncio.create_task(
+        commit_conversation_async(address, AppendConversationRows((_warning("owner"),)))
+    )
+    waiter = asyncio.create_task(
+        commit_conversation_async(
+            address, AppendConversationRows((_warning("waiter"),))
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(owner, waiter), 20)
+    finally:
+        release.set()
+        for task in (owner, waiter):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(owner, waiter, return_exceptions=True)
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+            "owner",
+            "waiter",
+        ]
+    finally:
+        await asyncio.to_thread(reopened.close)

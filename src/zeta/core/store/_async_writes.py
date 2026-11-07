@@ -240,6 +240,14 @@ class AsyncDurableWritesMixin:
             raise asyncio.CancelledError
         return delta
 
+    async def _commit_address_async(
+        self: ConversationStore, command: ConversationMutation[Any]
+    ) -> CommittedDelta[Any]:
+        async with self._async_write_lock:
+            return await self._commit_async_unlocked(
+                command, self.conversation_generation
+            )
+
     async def _commit_method_async(
         self: ConversationStore,
         method: Callable[..., Any],

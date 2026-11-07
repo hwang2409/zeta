@@ -139,7 +139,13 @@ _TARGETS_LOCK = threading.RLock()
 _TARGETS: weakref.WeakValueDictionary[str, ConversationStore] = (
     weakref.WeakValueDictionary()
 )
-_TARGET_RESERVATIONS: set[str] = set()
+@dataclass
+class _TransientReservation:
+    token: object
+    waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]]
+
+
+_TARGET_RESERVATIONS: dict[str, _TransientReservation] = {}
 
 
 def _target_key(path: Path) -> str:
@@ -193,21 +199,46 @@ def _authenticate_address(address: ConversationAddress) -> tuple[Path, Path, str
     return path, root_dir, session_id
 
 
-def _reserve_target(path: Path) -> ConversationStore | None:
+def _resident_target(path: Path) -> ConversationStore | None:
     key = _target_key(path)
     with _TARGETS_LOCK:
-        if key in _TARGET_RESERVATIONS:
-            raise ConversationIntegrityError(
-                "conversation target already has a commit slot"
-            )
-        _TARGET_RESERVATIONS.add(key)
         resident = _TARGETS.get(key)
         return resident if resident is not None and not resident._closed else None
 
 
-def _release_target(path: Path) -> None:
+async def _acquire_transient_target(path: Path) -> object:
+    key = _target_key(path)
+    while True:
+        with _TARGETS_LOCK:
+            resident = _TARGETS.get(key)
+            if resident is not None and not resident._closed:
+                return resident
+            reservation = _TARGET_RESERVATIONS.get(key)
+            if reservation is None:
+                token = object()
+                _TARGET_RESERVATIONS[key] = _TransientReservation(token, [])
+                return token
+            loop = asyncio.get_running_loop()
+            waiter: asyncio.Future[None] = loop.create_future()
+            reservation.waiters.append((loop, waiter))
+        await asyncio.shield(waiter)
+
+
+def _release_transient_target(path: Path, token: object) -> None:
+    key = _target_key(path)
     with _TARGETS_LOCK:
-        _TARGET_RESERVATIONS.discard(_target_key(path))
+        reservation = _TARGET_RESERVATIONS.get(key)
+        if reservation is None or reservation.token is not token:
+            return
+        del _TARGET_RESERVATIONS[key]
+        waiters = reservation.waiters
+    for loop, waiter in waiters:
+        loop.call_soon_threadsafe(_wake_waiter, waiter)
+
+
+def _wake_waiter(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
 
 
 def _cursor(store: ConversationStore) -> CommittedLogCursor:
@@ -433,19 +464,11 @@ async def commit_conversation_async[ResultT](
     path, root_dir, session_id = await loop.run_in_executor(
         None, _authenticate_address, address
     )
-    resident = _reserve_target(path)
+    target = await _acquire_transient_target(path)
+    if hasattr(target, "_commit_address_async"):
+        return await target._commit_address_async(command)
+    token = target
     try:
-        if resident is not None:
-            last_conflict: ConversationGenerationConflict | None = None
-            for _attempt in range(4):
-                expected = resident.conversation_generation
-                try:
-                    return await resident.commit_async(command, expected)
-                except ConversationGenerationConflict as exc:
-                    last_conflict = exc
-            assert last_conflict is not None
-            raise last_conflict
-
         def commit_transient() -> CommittedDelta[ResultT]:
             from ..store._store import ConversationStore
 
@@ -484,7 +507,7 @@ async def commit_conversation_async[ResultT](
             raise asyncio.CancelledError
         return result
     finally:
-        _release_target(path)
+        _release_transient_target(path, token)
 
 
 async def resident_await_started[ResultT](
