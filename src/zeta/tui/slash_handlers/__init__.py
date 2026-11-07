@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -23,7 +22,7 @@ from ...accounts import (
 from ...accounts.login import login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
-from ...core.project_context import discover_project_root
+from ...core.project_context import initialize_project_for_directory
 from ...core.session import (
     SessionError,
     env_home,
@@ -767,13 +766,11 @@ class SlashHandlerMixin:
             return "project registry unavailable"
         project = None
         if args.strip() == "init":
-            root = (
-                discover_project_root(self.loop.store.cwd)
-                or Path(self.loop.store.cwd).resolve()
-            )
             try:
                 project = await asyncio.to_thread(
-                    registry.find_or_create_for_directory, root
+                    initialize_project_for_directory,
+                    registry,
+                    self.loop.store.cwd,
                 )
                 await persist_metadata_change(
                     self.loop.manager,

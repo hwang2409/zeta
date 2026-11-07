@@ -6504,6 +6504,57 @@ async def test_slash_status_maps_compaction_with_or_without_fact_floor(
         await _close(server, writer)
 
 
+async def test_serve_project_init_runs_discovery_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=workspace,
+        port=0,
+        provider="codex",
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    discovery_threads.clear()
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "project-init",
+                "slash_run",
+                {"session_id": sid, "text": "/project init"},
+            )
+        )[-1]
+
+        project_id = server.runtime.metadata.project_id
+        assert project_id is not None
+        assert response["result"] == {
+            "kind": "output",
+            "text": (
+                f"project: workspace ({project_id})\n"
+                f"root: {workspace.resolve()}\n"
+                "memory: brief, decisions, state, backlog, changelog"
+            ),
+        }
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
+    finally:
+        await _close(server, writer)
+
+
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
@@ -7001,6 +7052,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # `/project init` mutates the session association — must reject.
+        assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only — must still hand off to the
         # client's picker (never the mutation guard).
         assert (await run(6, "/model"))["result"] == {

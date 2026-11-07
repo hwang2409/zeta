@@ -326,6 +326,15 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     return discovery.primary_root if discovery.eligible else None
 
 
+def initialize_project_for_directory(
+    registry: ProjectRegistry, cwd: str | Path
+) -> Project:
+    """Discover a project root and create or find its registry entry."""
+
+    root = discover_project_root(cwd) or Path(cwd).resolve()
+    return registry.find_or_create_for_directory(root)
+
+
 def discover_or_find_project(
     registry: ProjectRegistry, cwd: str | Path, user_home: Path
 ) -> Project | None:
@@ -1050,6 +1059,7 @@ __all__ = [
     "discover_project",
     "discover_project_root",
     "discover_repo_root",
+    "initialize_project_for_directory",
     "load_project_context",
     "resolve_project_context",
     "resolve_prompt_argument",

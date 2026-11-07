@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -634,8 +635,18 @@ def test_first_auto_created_session_refreshes_project_memory_on_resume(
 async def test_project_init_rebinds_runtime_child_and_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.core import project_context
     from zeta.tui.app import create_app
 
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
     plain = tmp_path / "plain"
     plain.mkdir()
     home = tmp_path / "zeta-home"
@@ -647,7 +658,11 @@ async def test_project_init_rebinds_runtime_child_and_approval(
     app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
     try:
         assert app.loop.root_project_id is None
-        assert "project: plain" in await app.slash_project("init")
+        discovery_threads.clear()
+        output = await app._slash_commands.dispatch_async(app, "/project init")
+        assert "project: plain" in output
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
         project_id = app.loop.session_metadata.project_id
         assert project_id is not None
         assert app.loop.root_project_id == project_id

@@ -18,7 +18,10 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
-from ..core.project_context import discover_project_root, discover_repo_root
+from ..core.project_context import (
+    discover_repo_root,
+    initialize_project_for_directory,
+)
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -290,13 +293,11 @@ class ServerSlashSession:
             return "project registry unavailable"
         project = None
         if args.strip() == "init":
-            root = (
-                discover_project_root(opened.store.cwd)
-                or Path(opened.store.cwd).resolve()
-            )
             try:
                 project = await asyncio.to_thread(
-                    registry.find_or_create_for_directory, root
+                    initialize_project_for_directory,
+                    registry,
+                    opened.store.cwd,
                 )
                 await persist_metadata_change(
                     runtime.manager,

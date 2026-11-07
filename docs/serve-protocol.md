@@ -1268,13 +1268,15 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
 The scope floor served over `slash_run` is `/status`, `/compact`,
-`/model`, `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
-`kind: prompt`) plus skills. `/model` splits by argument shape: argless
-`/model` returns `client_only` so the frontend client can open Settings for the
-picker surface, while `/model <name>` dispatches server-side through the
-shared settings-apply path. Exec macros and every command in the
-`client_only` set report themselves as client-only rather than
-half-executing here.
+`/model`, `/project`, `/init`, `/help`, and user prompt macros
+(`.zeta/commands/*.md` with `kind: prompt`) plus skills. `/model` splits by
+argument shape: argless `/model` returns `client_only` so the frontend client
+can open Settings for the picker surface, while `/model <name>` dispatches
+server-side through the shared settings-apply path. `/project` shows the
+current association, and `/project init` discovers the working directory and
+associates the session. The mutating form is rejected while a turn, child, or
+approval is active. Exec macros and every command in the `client_only` set
+report themselves as client-only rather than half-executing here.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on
