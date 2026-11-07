@@ -5,9 +5,7 @@ from typing import Any
 import pytest
 
 from tests.support.stores import open_test_store
-
 from zeta.core.approval import ApprovalPolicy
-from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry

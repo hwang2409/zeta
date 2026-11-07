@@ -26,7 +26,6 @@ from rich.panel import Panel
 from rich.text import Text
 
 from tests.support.stores import open_test_store
-
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

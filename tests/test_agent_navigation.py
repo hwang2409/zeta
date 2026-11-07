@@ -21,7 +21,6 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.stores import open_test_store
-
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.loop import AgentLoop

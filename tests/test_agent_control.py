@@ -7,10 +7,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.stores import open_test_store
-
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.presets import AGENT_PRESETS
-from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry

@@ -8,7 +8,6 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.stores import open_test_store
-
 from zeta.agent import runner as agent_runner
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.session import SessionManager

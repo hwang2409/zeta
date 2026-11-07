@@ -7,7 +7,6 @@ import pytest
 from rich.console import Console
 
 from tests.support.stores import open_test_store
-
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import (
     ApprovalAbortPolicy,

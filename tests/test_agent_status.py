@@ -13,7 +13,6 @@ import pytest
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.stores import open_test_store
-
 from zeta.agent.receipt import encode_json
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry

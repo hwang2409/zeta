@@ -9,7 +9,6 @@ import pytest
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.stores import open_test_store
-
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
