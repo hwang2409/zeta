@@ -84,13 +84,42 @@ def _collection_elements(value: ast.expr) -> list[ast.expr]:
     return []
 
 
-def parse_items(path: str, text: str) -> list[Item]:
+def parse_items(
+    path: str, text: str, collection_lookup: dict[str, list[ast.expr]] | None = None
+) -> list[Item]:
     tree = ast.parse(text, filename=path)
     result: list[Item] = []
+    collection_lookup = collection_lookup or {}
+
+    def add_memberships(node: ast.AST, qualname: str) -> None:
+        for comparison in ast.walk(node):
+            if not (
+                isinstance(comparison, ast.Compare)
+                and len(comparison.ops) == 1
+                and isinstance(comparison.ops[0], (ast.In, ast.NotIn))
+            ):
+                continue
+            right = comparison.comparators[0]
+            elements = _collection_elements(right)
+            if not elements:
+                elements = collection_lookup.get(ast.unparse(right), [])
+            left = ast.unparse(comparison.left)
+            for element in elements:
+                result.append(
+                    Item(
+                        path,
+                        "membership element",
+                        f"{qualname}|{left}",
+                        element.lineno,
+                        ast.unparse(element),
+                    )
+                )
 
     def visit_body(body: list[ast.stmt], scope: str = "") -> None:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    add_memberships(node, node.name)
                 result.append(
                     Item(
                         path,
@@ -310,12 +339,66 @@ def parse_revisions(
 ]:
     parsed = {revision: {} for revision in revisions}
     for revision in revisions:
+        collection_lookup: dict[str, list[ast.expr]] = {}
+        module_collections: dict[str, list[ast.expr]] = {}
+        trees: dict[str, ast.Module] = {}
         for path in sorted(paths):
             text = sources[(revision, path)]
             if text is None:
                 continue
             try:
-                found = parse_items(path, text)
+                tree = ast.parse(text, filename=path)
+            except SyntaxError as error:
+                return parsed, (revision, path, error)
+            trees[path] = tree
+            module = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+            for node in tree.body:
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                elements = _collection_elements(value)
+                if not elements:
+                    continue
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        collection_lookup[target.id] = elements
+                        full = f"{module}.{target.id}"
+                        module_collections[full] = elements
+                        collection_lookup[
+                            f"{module.rsplit('.', 1)[-1]}.{target.id}"
+                        ] = elements
+        for path, tree in trees.items():
+            for node in tree.body:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        name = alias.asname or alias.name.rsplit(".", 1)[-1]
+                        prefix = alias.name + "."
+                        for full, elements in module_collections.items():
+                            if full.startswith(prefix):
+                                collection_lookup[f"{name}.{full[len(prefix) :]}"] = (
+                                    elements
+                                )
+                elif isinstance(node, ast.ImportFrom):
+                    module_name = node.module or path.removeprefix("src/").rsplit(
+                        "/", 1
+                    )[0].replace("/", ".")
+                    for alias in node.names:
+                        if alias.name == "*":
+                            continue
+                        full = f"{module_name}.{alias.name}"
+                        if full in module_collections:
+                            collection_lookup[alias.asname or alias.name] = (
+                                module_collections[full]
+                            )
+        for path in sorted(paths):
+            text = sources[(revision, path)]
+            if text is None:
+                continue
+            try:
+                found = parse_items(path, text, collection_lookup)
             except SyntaxError as error:
                 return parsed, (revision, path, error)
             parsed[revision].update({item_key(item): item for item in found})
@@ -368,7 +451,7 @@ def main() -> int:
     findings: list[Item] = []
     for key, item in main_items.items():
         path, _kind, _name, _value = key
-        if item.kind == "collection element":
+        if item.kind in {"collection element", "membership element"}:
             continue
         candidate = key not in old_items or path in changed
         if candidate and key not in merge_items:
@@ -386,7 +469,10 @@ def main() -> int:
                 Item(item.path, item.kind, item.name, item.line, item.value)
             )
     for key, item in {**main_items, **branch_items}.items():
-        if item.kind != "collection element" or key in merge_items:
+        if (
+            item.kind not in {"collection element", "membership element"}
+            or key in merge_items
+        ):
             continue
         main_item = main_items.get(key)
         branch_item = branch_items.get(key)
@@ -407,7 +493,7 @@ def main() -> int:
             where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merge absent"
             if finding.kind == "constant" and merged is not None:
                 where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merged value {merged.value!r}"
-            if finding.kind == "collection element":
+            if finding.kind in {"collection element", "membership element"}:
                 parents_with_element = []
                 if main_item := main_items.get(key):
                     parents_with_element.append(f"main parent line {main_item.line}")

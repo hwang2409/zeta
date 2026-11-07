@@ -28,21 +28,27 @@ def commit(r: Path, message: str) -> None:
     subprocess.run(["git", "commit", "-qm", message], cwd=r, check=True)
 
 
-def test_dropped_collection_element_flagged(tmp_path: Path):
+def test_dropped_membership_element_flagged(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
-    (r / "src/render.py").write_text(
-        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED"}\n'
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
     )
     commit(r, "base")
     subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
-    (r / "src/render.py").write_text(
-        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED", "BRANCH"}\n'
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        '    return event.type in ("CONFIG_CHANGED", "CHILD_MESSAGE_DELIVERED")\n'
     )
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/render.py").write_text(
-        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"CONFIG_CHANGED", "MAIN"}\n'
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED", "MAIN"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
     )
     commit(r, "main")
     subprocess.run(
@@ -51,14 +57,16 @@ def test_dropped_collection_element_flagged(tmp_path: Path):
     subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
-    (r / "src/render.py").write_text(
-        'BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = {"MAIN", "BRANCH"}\n'
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
     )
     commit(r, "bad merge")
     result = run(r)
     assert result.returncode == 1
     assert "CONFIG_CHANGED" in result.stdout
-    assert "main parent line 1" in result.stdout
+    assert "check|event.type" in result.stdout
 
 
 def test_dropped_main_function_flagged(tmp_path: Path):
