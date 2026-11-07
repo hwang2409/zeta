@@ -92,12 +92,14 @@ from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
+from zeta.runtime.tool_setup import select_tool_registry
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tools.ask_parent import register_ask_parent
+from zeta.tools.registry import _register_discovered_tools
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.agent_sync import AgentTranscriptSource, _project_typed_prompts
@@ -5145,7 +5147,7 @@ async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_
         return "available"
 
     for name in ("agent_send", "run_background", "inherited_hidden"):
-        registry.register(name, available)
+        registry.register(name, available, binding="shared")
     parent_loop = AgentLoop(
         FakeBackend([]),
         parent_store,
@@ -5390,7 +5392,7 @@ async def test_monitor_shape_resolves_against_the_live_session_registry(
         return "ok"
 
     for name in slack_names:
-        registry.register(name, slack_tool)
+        registry.register(name, slack_tool, binding="shared")
     parent_loop = AgentLoop(
         FakeBackend([]),
         parent_store,
@@ -6105,7 +6107,7 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
     registry = ToolRegistry(store.cwd, skill_catalog=SkillCatalog.empty())
-    registry.register("wait", wait_forever)
+    registry.register("wait", wait_forever, binding="shared")
     loop = AgentLoop(
         backend,
         store,
@@ -6418,6 +6420,37 @@ async def test_profile_max_child_depth_only_lowers_the_parent_limit(
     assert "agent" not in await child_agent_schemas("raise", 1)
 
 
+@pytest.mark.asyncio
+async def test_session_handler_binding_is_required(tmp_path: Path) -> None:
+    async with AsyncExitStack() as stack:
+        store = ConversationStore(tmp_path)
+        loop = AgentLoop(
+            FakeBackend([]),
+            store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        stack.push_async_callback(loop.close)
+        register_ask_parent(
+            loop.tool_registry,
+            child_instance_id="classification-probe",
+            channel=loop._background_owner.conversation_channel,
+        )
+        assert loop.tool_registry.definitions_by_name["ask_parent"].binding == "loop"
+
+        async def unclassified_handler(
+            _registry: ToolRegistry, _arguments: dict[str, object]
+        ) -> str:
+            return "unclassified"
+
+        with pytest.raises(
+            TypeError, match="required keyword-only argument: 'binding'"
+        ):
+            loop.tool_registry.register_session_tool(
+                "unclassified", unclassified_handler  # type: ignore[call-arg]
+            )
+
+
 class NestedLoopBoundHandlerBackend(CompletionBackend):
     def __init__(self, *, child_a_profile: str) -> None:
         self.child_a_profile = child_a_profile
@@ -6576,32 +6609,38 @@ async def _run_nested_loop_bound_case(
 ) -> tuple[AgentLoop, ConversationStore, NestedLoopBoundHandlerBackend]:
     backend = NestedLoopBoundHandlerBackend(child_a_profile=child_a_profile)
     store = ConversationStore(tmp_path, cwd=tmp_path)
+    skill_catalog = SkillCatalog.empty()
+    agent_catalog = _nested_handler_catalog()
+
+    async def runtime_schema_tool(_arguments: dict[str, object]) -> str:
+        return "runtime schema"
+
+    registry = select_tool_registry(
+        store,
+        tools={"runtime_schema": runtime_schema_tool},
+        registry=None,
+        skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
+        tool_schemas=[
+            {
+                "name": "runtime_schema",
+                "description": "runtime schema test tool",
+                "parameters": {"type": "object", "additionalProperties": False},
+            }
+        ],
+    )
+    _register_discovered_tools(registry)
     loop = AgentLoop(
         backend,
         store,
+        registry=registry,
         max_turns=1,
-        skill_catalog=SkillCatalog.empty(),
-        agent_catalog=_nested_handler_catalog(),
+        skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
     )
     loop.explicit_finish = True
-    register_ask_parent(
-        loop.tool_registry,
-        child_instance_id="classification-probe",
-        channel=loop._background_owner.conversation_channel,
-    )
-    loop.tool_registry.unregister("ask_parent")
     stack.push_async_callback(loop.close)
     stack.callback(backend.release_child_b.set)
-
-    async def unclassified_handler(
-        _registry: ToolRegistry, _arguments: dict[str, object]
-    ) -> str:
-        return "unclassified"
-
-    with pytest.raises(TypeError, match="required keyword-only argument: 'binding'"):
-        loop.tool_registry.register_session_tool(
-            "unclassified", unclassified_handler  # type: ignore[call-arg]
-        )
     assert loop.tool_registry.register_mcp(
         "test_mcp",
         lambda _arguments: "mcp",
@@ -6648,7 +6687,7 @@ async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
             "finish",
             "agent_handoff",
         }
-        assert {"skill", "test_mcp"} <= backend.child_a_schemas
+        assert {"runtime_schema", "skill", "test_mcp"} <= backend.child_a_schemas
         await asyncio.wait_for(backend.child_a_finished.wait(), 10)
         lead_id = next(
             instance_id
