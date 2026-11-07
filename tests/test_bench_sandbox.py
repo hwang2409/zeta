@@ -1,7 +1,9 @@
 """The benchmark sandbox keeps the serve probe off the real provider.
 
-The probe runs in a child process because the sandbox installs a permanent
-audit hook and replaces os.environ; neither may leak into the pytest process.
+The serve probe runs as bench.py itself in a child process: the harness's own
+home copy, provider pinning, and serve probe, on two fixture source sessions.
+The sandbox installs a permanent audit hook and replaces os.environ; neither
+may leak into the pytest process.
 """
 
 from __future__ import annotations
@@ -34,17 +36,23 @@ def _load_sandbox():
 
 
 # Installed as sitecustomize in the bench.py process, so it applies to the
-# unmodified harness. The recorder logs any connect or name lookup to a
-# non-local host and ends the process at once, so nothing reaches the network.
-# Once the harness adds its own audit hook (the sandbox network guard), the
-# recorder moves behind it and sees only what the guard let through. The
-# keychain read returns fake Claude tokens, so the fallback stays reachable
-# without touching the real keychain.
+# unmodified harness. It records the provider traffic of the run: each TCP
+# connect to a loopback host (the local stub), each read of the Claude keychain
+# fallback (stubbed: fake tokens, the real keychain is never read), and each
+# connect or name lookup to a non-local host (refused: the process ends at
+# once, so nothing reaches the network). Once the harness adds its own audit
+# hook (the sandbox network guard), the recorder moves behind it and sees only
+# what the guard let through.
 SITECUSTOMIZE = r"""
 import os, sys, time
 
 _LOCAL = {"127.0.0.1", "localhost", "::1"}
 _moved = []
+
+
+def _note(line):
+    with open(os.environ["BENCH_TEST_RECORD"], "a") as handle:
+        handle.write(line + "\n")
 
 
 def _record(event, args):
@@ -53,9 +61,10 @@ def _record(event, args):
         host = args[0].decode() if isinstance(args[0], bytes) else args[0]
     elif event == "socket.connect" and isinstance(args[1], tuple):
         host = args[1][0]
-    if host and host not in _LOCAL:
-        with open(os.environ["BENCH_TEST_RECORD"], "a") as handle:
-            handle.write(f"{event} {host}\n")
+    if host in _LOCAL and event == "socket.connect":
+        _note("loopback connect")
+    elif host and host not in _LOCAL:
+        _note(f"{event} {host}")
         os._exit(97)
 
 
@@ -80,9 +89,13 @@ _add(_early)
 from zeta.oauth import OAuthTokens
 from zeta.providers import anthropic
 
-anthropic._keychain_claude_tokens = lambda: OAuthTokens(
-    "fake-access", "fake-refresh", time.time() + 3600
-)
+
+def _fake_keychain():
+    _note("keychain read")
+    return OAuthTokens("fake-access", "fake-refresh", time.time() + 3600)
+
+
+anthropic._keychain_claude_tokens = _fake_keychain
 """
 
 # bench.py's default sources, resolved under the throwaway HOME.
@@ -162,26 +175,37 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         ZETA_BENCH_TREE=src,  # already on the tree, so bench.py keeps PYTHONPATH
         BENCH_TEST_RECORD=str(record),
     )
-    run = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "scripts/bench/bench.py"),
-            "--tree",
-            str(ROOT),
-            *("--session", "phoebe", "--session", "orchestrator"),
-            *("--probe", "serve"),
-        ],
-        env=env,
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    try:
+        run = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/bench/bench.py"),
+                "--tree",
+                str(ROOT),
+                *("--session", "phoebe", "--session", "orchestrator"),
+                *("--probe", "serve"),
+            ],
+            env=env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        returncode, stderr = run.returncode, run.stderr
+    except subprocess.TimeoutExpired as exc:
+        # The run is killed; the traffic it recorded is still checked first.
+        run, returncode, stderr = None, "timed out", exc.stderr
 
-    # No connect or lookup to a non-local host got past the harness.
-    assert (record.read_text() if record.exists() else "") == ""
-    assert run.returncode == 0, run.stderr
+    # Provider traffic went to the local stub only: no keychain read and no
+    # connect or lookup to a non-local host got past the harness.
+    lines = record.read_text().splitlines() if record.exists() else []
+    assert {
+        "outside": [line for line in lines if line != "loopback connect"],
+        "reached_loopback": "loopback connect" in lines,
+    } == {"outside": [], "reached_loopback": True}
+    assert returncode == 0, stderr
+    assert run is not None
     decoder, text, results = json.JSONDecoder(), run.stdout, {}
     while text := text.lstrip():
         value, end = decoder.raw_decode(text)
