@@ -132,6 +132,7 @@ class _MethodMutation[ResultT]:
     persisted_callback: Callable[[], None] | None = None
     accept_external_generation: bool = False
     baseline_count: int | None = None
+    baseline_last_id: str | None = None
     baseline_digest: bytes | None = None
     baseline_patch: Mapping[str, object] | None = None
 
@@ -418,7 +419,6 @@ def _execute_method[ResultT](
         else command.baseline_patch
     )
     baseline_patch = _snapshot_patch(store, command.patch_fields)
-    writer_generation = store.conversation_generation
     result = (
         command.method(store, *command.args, **dict(command.kwargs))
         if command.method_accepts_store
@@ -431,8 +431,16 @@ def _execute_method[ResultT](
         if command.accept_external_generation
         else store._owned_installed_delta(tuple(store._entries[baseline_count:]))
     )
-    replace_entries = entries == "reset" or (
-        command.accept_external_generation and writer_generation != expected_generation
+    baseline_index = (command.baseline_count or 0) - 1
+    writer_baseline_id = (
+        store._entries[baseline_index].id
+        if 0 <= baseline_index < len(store._entries)
+        else None
+    )
+    replace_entries = (
+        entries == "reset"
+        or store._entry_prefix_digest != command.baseline_digest
+        or writer_baseline_id != command.baseline_last_id
     )
     if replace_entries:
         entries = tuple(store._entries)

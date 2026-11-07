@@ -154,8 +154,6 @@ class AsyncDurableWritesMixin:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
             self._before_committed_mutation()
-            if cancelled_before_write.is_set():
-                raise asyncio.CancelledError
             cancelled_before_write.write_started.set()
             delta = execute_mutation(writer, command, expected_generation)
             return delta, writer.take_persisted_appends()
@@ -299,6 +297,7 @@ class AsyncDurableWritesMixin:
                 persisted_callback=_on_persisted,
                 accept_external_generation=_accept_external_generation,
                 baseline_count=len(self._entries),
+                baseline_last_id=self._entries[-1].id if self._entries else None,
                 baseline_digest=self._entry_prefix_digest,
                 baseline_patch={
                     field: copy.deepcopy(getattr(self, field))
@@ -315,6 +314,9 @@ class AsyncDurableWritesMixin:
                     command = replace(
                         command,
                         baseline_count=len(self._entries),
+                        baseline_last_id=self._entries[-1].id
+                        if self._entries
+                        else None,
                         baseline_digest=self._entry_prefix_digest,
                         baseline_patch={
                             field: copy.deepcopy(getattr(self, field))
