@@ -17,7 +17,11 @@ from zeta.core.store import ConversationStore
 from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
-from zeta.mcp.management import MCPManagementError, MCPManagementService
+from zeta.mcp.management import (
+    MCPManagementClosedError,
+    MCPManagementError,
+    MCPManagementService,
+)
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
@@ -122,21 +126,34 @@ async def test_management_close_ignores_cancelled_transaction_from_closed_loop(
 
 
 @pytest.mark.asyncio
-async def test_management_close_propagates_outer_cancellation(
+async def test_management_close_propagates_outer_cancellation_after_join(
     tmp_path: Path,
 ) -> None:
     manager = service(tmp_path)
-    transaction_event = asyncio.Event()
-    transaction = asyncio.create_task(asyncio.wait_for(transaction_event.wait(), 10))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def transaction_that_fails_after_close() -> None:
+        started.set()
+        await asyncio.to_thread(manager._closed.wait)
+        await asyncio.wait_for(release.wait(), 10)
+        raise MCPManagementClosedError("MCP management service is closed")
+
+    transaction = asyncio.create_task(transaction_that_fails_after_close())
     manager._transaction_task = transaction
     closing = asyncio.create_task(manager.aclose())
     try:
-        assert await asyncio.to_thread(manager._closed.wait, timeout=10)
+        await asyncio.wait_for(started.wait(), 10)
+        assert await asyncio.to_thread(manager._closed.wait, 10)
         closing.cancel()
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(closing, 10)
+        assert transaction.done()
+        assert isinstance(transaction.exception(), MCPManagementClosedError)
     finally:
-        transaction.cancel()
+        if not transaction.done():
+            transaction.cancel()
         await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
 
 

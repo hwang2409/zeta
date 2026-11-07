@@ -581,14 +581,24 @@ class MCPManagementService:
             except BaseException:  # noqa: BLE001,S110 - consume the owned outcome
                 pass
             return
+        cancelled = False
+        current = asyncio.current_task()
+        baseline = current.cancelling() if current is not None else 0
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except MCPManagementClosedError:
+                pass
+        while current is not None and current.cancelling() > baseline:
+            current.uncancel()
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if not task.cancelled() or (current is not None and current.cancelling()):
-                raise
+            task.result()
         except MCPManagementClosedError:
             pass
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _repair_lag_locked(self) -> None:
         assert self._transaction_gate.locked(), "repair requires transaction gate"
