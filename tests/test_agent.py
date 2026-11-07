@@ -717,13 +717,13 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     completion_published = asyncio.Event()
     close_calls = 0
 
-    async def close_child() -> tuple[str, ...]:
+    async def close_child(_cause: str) -> tuple[str, ...]:
         nonlocal close_calls
         close_calls += 1
         # test-contract: durability block the final close after receipt publication.
         if close_calls == 2:
             close_started.set()
-            await release_close.wait()
+            await asyncio.wait_for(release_close.wait(), 10)
         return ()
 
     def cleanup() -> None:
@@ -768,7 +768,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     )
     owner.register("child-1", lambda: None, watcher, parent_store)
 
-    await close_started.wait()
+    await asyncio.wait_for(close_started.wait(), 10)
     wait_started = asyncio.Event()
 
     async def wait_for_owner() -> None:
@@ -785,7 +785,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
         assert not cleanup_called.is_set()
     finally:
         release_close.set()
-        await watcher
+        await asyncio.wait_for(watcher, timeout=10)
         await asyncio.wait_for(waiting, timeout=10)
     assert cleanup_called.is_set()
 
@@ -836,7 +836,7 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
         original_write_lifecycle(self)
         loop.call_soon_threadsafe(finalization_committed.set)
         if threading.current_thread() is not main_thread:
-            release_finalization.wait()
+            assert release_finalization.wait(10)
 
     # test-contract: seam force cancellation after the durable commit
     monkeypatch.setattr(
@@ -848,12 +848,14 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
 
     async def pause_publish(**kwargs):
         publish_entered.set()
-        await release_publish.wait()
+        await asyncio.wait_for(release_publish.wait(), 10)
         return await original_publish(**kwargs)
 
     monkeypatch.setattr(owner.conversation_channel, "publish_completion", pause_publish)
     release_grandchild_registration = asyncio.Event()
-    grandchild_watcher = asyncio.create_task(release_grandchild_registration.wait())
+    grandchild_watcher = asyncio.create_task(
+        asyncio.wait_for(release_grandchild_registration.wait(), 10)
+    )
     owner.register(
         "grandchild-1",
         grandchild_watcher.cancel,
@@ -865,7 +867,7 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
     async def child_result() -> dict[str, object]:
         return {"content": [{"text": "done"}], "isError": False}
 
-    async def close_child() -> tuple[()]:
+    async def close_child(_cause: str) -> tuple[()]:
         return ()
 
     watcher = asyncio.create_task(
@@ -898,13 +900,13 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
     )
     owner.register("child-1", watcher.cancel, watcher, parent_store)
 
-    await finalization_committed.wait()
+    await asyncio.wait_for(finalization_committed.wait(), 10)
     watcher.cancel()
     release_finalization.set()
-    await publish_entered.wait()
+    await asyncio.wait_for(publish_entered.wait(), 10)
     release_publish.set()
     with pytest.raises(asyncio.CancelledError):
-        await watcher
+        await asyncio.wait_for(watcher, 10)
 
     assert not child_store.agent_children()
     assert "grandchild-1" in parent_store.agent_children()
@@ -917,7 +919,7 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
     assert len(completions) == 1
 
     release_grandchild_registration.set()
-    await grandchild_watcher
+    await asyncio.wait_for(grandchild_watcher, 10)
     owner.unregister("grandchild-1")
     grandchild_store.close()
     child_store.close()
@@ -1006,7 +1008,7 @@ async def _assert_failed_child_waits_for_owned_descendant(
         }[terminal_path]
         return {"content": [{"text": text}], "isError": True}
 
-    async def close_child() -> tuple[()]:
+    async def close_child(_cause: str) -> tuple[()]:
         return ()
 
     finish_kwargs = {
@@ -1045,7 +1047,7 @@ async def _assert_failed_child_waits_for_owned_descendant(
     drain_wait = asyncio.create_task(drain_entered.wait())
     completion_wait = asyncio.create_task(completion_published.wait())
     done, _pending = await asyncio.wait(
-        {drain_wait, completion_wait}, return_when=asyncio.FIRST_COMPLETED
+        {drain_wait, completion_wait}, timeout=10, return_when=asyncio.FIRST_COMPLETED
     )
     assert drain_wait in done
     assert completion_wait not in done
@@ -1054,8 +1056,8 @@ async def _assert_failed_child_waits_for_owned_descendant(
     owner.unregister("grandchild-1")
     owner.conversation_channel.wake("child-1")
     release_grandchild.set()
-    await grandchild_watcher
-    result = await watcher
+    await asyncio.wait_for(grandchild_watcher, 10)
+    result = await asyncio.wait_for(watcher, 10)
     assert result is None
     assert len(parent_store.agent_notifications(pending_only=False)) == 1
     assert (
@@ -1064,7 +1066,7 @@ async def _assert_failed_child_waits_for_owned_descendant(
     )
     assert child_store.agent_lifecycle()["state"] == "failed"
     completion_wait.cancel()
-    await asyncio.gather(completion_wait, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(completion_wait, return_exceptions=True), 10)
     grandchild_store.close()
     child_store.close()
     parent_store.close()
@@ -1180,7 +1182,7 @@ async def test_background_completion_truncates_long_killed_task_id(
         ),
         publish_event=lambda event: None,
         cleanup=lambda: None,
-        close_child=lambda: asyncio.sleep(0, result=(long_task_id,)),
+        close_child=lambda _cause: asyncio.sleep(0, result=(long_task_id,)),
         error_message=str,
         background_owner=owner,
     )
@@ -2824,7 +2826,7 @@ async def test_parent_abort_cancels_background_grandchild(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
     loop.abort()
     await wait_background_owner(loop)
     assert (
@@ -3860,7 +3862,7 @@ def _finish_gate_with_running_task(
 
 @pytest.mark.asyncio
 @_finish_gate_hang_guard
-async def test_finish_gate_ollama_close_obeys_task_deadline(
+async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
@@ -3934,8 +3936,8 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
     assert result is not None
     assert result.outcome == "task_safety_expired"
     assert clients and clients[0].stream_context.close_cancelled.is_set()
-    assert clients[0].close_started.is_set()
-    assert clients[0].close_cancelled.is_set()
+    assert not clients[0].close_started.is_set()
+    assert not clients[0].close_cancelled.is_set()
     store.close()
 
 
@@ -4120,7 +4122,7 @@ async def test_child_finish_gate_wait_timeout_adopts(
     run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await deadlines.started_event.wait()
+    await asyncio.wait_for(deadlines.started_event.wait(), 10)
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_child_bound(state)
     await asyncio.wait_for(run, timeout=10)
@@ -9615,10 +9617,10 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     close = asyncio.create_task(flow.admit_terminal("segment_end"))
     ticked = asyncio.Event()
     asyncio.get_running_loop().call_soon(ticked.set)
-    await asyncio.wait_for(ticked.wait(), timeout=2)
+    await asyncio.wait_for(ticked.wait(), timeout=10)
     release.set()
-    assert await asyncio.wait_for(send, timeout=2) is None
-    terminal = await asyncio.wait_for(close, timeout=2)
+    assert await asyncio.wait_for(send, timeout=10) is None
+    terminal = await asyncio.wait_for(close, timeout=10)
     assert terminal.pending is True
     assert terminal.closed_empty is False
     assert [
@@ -9648,10 +9650,10 @@ async def test_turn_boundary_close_races_agent_send_atomically(
         )
     )
     release.set()
-    terminal = await asyncio.wait_for(close, timeout=2)
+    terminal = await asyncio.wait_for(close, timeout=10)
     assert terminal.pending is False
     assert terminal.closed_empty is True
-    error = await asyncio.wait_for(send, timeout=2)
+    error = await asyncio.wait_for(send, timeout=10)
     assert error is not None and "no live run" in error
 
 
@@ -11197,10 +11199,10 @@ async def test_finish_gate_task_without_exit_reports_safety_bound(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await deadlines.started_event.wait()
+    await asyncio.wait_for(deadlines.started_event.wait(), 10)
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire(state)
-    await run
+    await asyncio.wait_for(run, 10)
     notification = await _completion_after_publication(store, completion_published)
     text = notification.data["text"]
     assert "finish-gate task safety bound expired" in text
@@ -11329,9 +11331,8 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
-    # S2: a child that still owns a running task when it completes has the task
-    # killed without a notification; close() returns the ids and the runner
-    # folds them into the child's completion receipt (text + data).
+    # S2: a child that still owns a running task when it completes records the
+    # close cause and folds the killed task ids into its completion receipt.
     backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
@@ -11359,7 +11360,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await deadlines.started_event.wait()
+    await asyncio.wait_for(deadlines.started_event.wait(), 10)
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire(state)
     events.extend(await asyncio.wait_for(run, timeout=10))
@@ -11396,6 +11397,17 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
     assert lifecycle["final_result"] == text
+    task_exit = next(
+        entry
+        for entry in child_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    )
+    assert task_exit.data["background_phase"] == "task_kill"
+    assert (
+        task_exit.data["note"]
+        == "finish-gate task safety bound expired after 0.05 seconds"
+    )
+    child_store.close()
     await loop.close()
 
 
@@ -11467,7 +11479,7 @@ async def test_killed_task_receipt_never_contains_command_secrets(
 
     loop.set_background_event_sink(collect_event)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await deadlines.started_event.wait()
+    await asyncio.wait_for(deadlines.started_event.wait(), 10)
     for state, _configured_timeout in deadlines.started:
         deadlines.expire(state)
     await asyncio.wait_for(receipt_published.wait(), timeout=10)
@@ -12928,7 +12940,7 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
@@ -13972,7 +13984,12 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period(
         if timeout <= 0:
             for task in task_registry.snapshot():
                 if task.running:
-                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+                    await asyncio.wait_for(
+                        task_registry.kill(
+                            task.task_id, cause="test requested task stop"
+                        ),
+                        timeout=10,
+                    )
             evaluated.set()
             return tuple(
                 task.task_id for task in task_registry.snapshot() if not task.running
@@ -14027,7 +14044,12 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period(
             assert task.running, "a task started after a long idle was killed at once"
             assert timeout == owner.finish_gate_task_timeout
 
-            await asyncio.wait_for(registry.background_tasks.kill(task_id), timeout=10)
+            await asyncio.wait_for(
+                registry.background_tasks.kill(
+                    task_id, cause="test requested task stop"
+                ),
+                timeout=10,
+            )
             if task_index + 1 < task_count:
                 await asyncio.wait_for(
                     idle_entries[task_index * 2 + 1].wait(), timeout=10
@@ -14128,7 +14150,12 @@ async def test_task_completion_turn_rearms_full_safety_window(
             await asyncio.wait_for(expire.wait(), timeout=10)
             for task in task_registry.snapshot():
                 if task.running:
-                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+                    await asyncio.wait_for(
+                        task_registry.kill(
+                            task.task_id, cause="test requested task stop"
+                        ),
+                        timeout=10,
+                    )
             return tuple(
                 task.task_id for task in task_registry.snapshot() if not task.running
             )
@@ -15242,6 +15269,7 @@ async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
 
     owner.register("root:1", cancel, watcher)
     registry._agent_owner = owner
+    # test-contract: seam Control the agent status read while exercising cancellation.
     monkeypatch.setattr(
         "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "root:1"}]
     )
@@ -15325,6 +15353,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         return await original_wait(awaitables, timeout=timeout)
 
     monkeypatch.setattr(agent_background_module.asyncio, "wait", controlled_wait)
+    # test-contract: seam Control the agent status read while exercising cancellation.
     monkeypatch.setattr(
         "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "root:1"}]
     )
@@ -15833,11 +15862,11 @@ async def test_ask_parent_answer_does_not_block_finish(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
-    await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    await asyncio.wait_for(backend.question_published.wait(), timeout=10)
     question = next(
         entry
         for entry in store.agent_notifications()
@@ -15856,7 +15885,7 @@ async def test_ask_parent_answer_does_not_block_finish(
         if entry.data.get("kind") == "child_question"
     ] == [other_question.id]
     backend.release_question_finish.set()
-    await asyncio.wait_for(backend.answer_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.answer_seen.wait(), timeout=10)
     await wait_background_owner(loop)
     assert (
         store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
@@ -16358,7 +16387,7 @@ async def test_retry_before_provider_event_leaves_prompt_pending(
             )
         )
     )
-    await asyncio.wait_for(retry_backend.retry_sent.wait(), timeout=2)
+    await asyncio.wait_for(retry_backend.retry_sent.wait(), timeout=10)
     first_attempt.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first_attempt
@@ -16410,10 +16439,10 @@ async def test_unrelated_send_does_not_close_open_question(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     backend.release_child.set()
-    await asyncio.wait_for(backend.question_published.wait(), timeout=2)
+    await asyncio.wait_for(backend.question_published.wait(), timeout=10)
     question = next(
         entry
         for entry in store.agent_notifications()

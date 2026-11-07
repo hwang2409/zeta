@@ -29,6 +29,7 @@ from .receipt import (
     agent_stats,
     build_agent_receipt,
     build_explicit_finish_receipt,
+    child_cleanup_details,
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
@@ -1010,7 +1011,7 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], Awaitable[None] | None],
-    close_child: Callable[[], Awaitable[tuple[str, ...]]],
+    close_child: Callable[[str], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     background_owner: BackgroundAgentOwner,
     marker_key: str | None = None,
@@ -1030,6 +1031,7 @@ async def finish_background_child(
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
+    close_cause, _ = child_cleanup_details("background", False)
     try:
         try:
             result = await child_task
@@ -1089,11 +1091,11 @@ async def finish_background_child(
             )
         ):
             from .finish_gate import await_owned_work
-
             await await_owned_work(child_loop, finish_gate_state)
-        # Admission has ended. Closing now can only kill tasks whose safety
-        # deadline expired; direct children remain live for durable transfer.
-        killed_tasks = list(await close_child() or ())
+        close_cause, close_event = child_cleanup_details(
+            "background", status == "canceled"
+        )
+        killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
@@ -1102,7 +1104,7 @@ async def finish_background_child(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
         killed_task_notice = (
-            "\nbackground tasks killed on child completion: "
+            f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
             + ", ".join(
                 f"{task_id} (background command; archive: {child_path}/background-output.archive)"
                 for task_id in killed_tasks
@@ -1244,7 +1246,7 @@ async def finish_background_child(
             raise asyncio.CancelledError
     finally:
         try:
-            await close_child()
+            await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.
             await asyncio.sleep(0)

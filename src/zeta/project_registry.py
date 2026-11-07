@@ -49,6 +49,12 @@ from .project_schema import (
     validate_project_root,
     validate_project_text,
 )
+from .storage_format import (
+    WriterLease,
+    mapping_mutations,
+    open_writer,
+    require_closed_variant,
+)
 
 MAX_NAME_LENGTH = project_schema.MAX_NAME_LENGTH
 MAX_PROJECTS = project_schema.MAX_PROJECTS
@@ -57,7 +63,6 @@ MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
 _PROJECT_ID = project_schema.PROJECT_ID_PATTERN
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
-_SESSION_ROLES = {"session", "orchestrator", "worker"}
 _READ_RETRIES = 10
 _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
 _PROJECT_REGISTRY_LOCK_POLL_SECONDS = 0.05
@@ -326,7 +331,16 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
     def _locked(self, *, write: bool) -> Iterator[int]:
         if not write:
             raise AssertionError("read operations must use _read")
+        lease = open_writer(self.root.parent)
         self._ensure_root()
+        try:
+            with self._locked_home() as root_fd:
+                yield root_fd
+        finally:
+            lease.close()
+
+    @contextmanager
+    def _locked_home(self) -> Iterator[int]:
         for attempt in range(_READ_RETRIES):
             root_fd, _ = self._open_root()
             try:
@@ -422,13 +436,23 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         return value
 
     @staticmethod
-    def _publish(directory_fd: int, name: str, value: dict[str, object]) -> None:
-        data = (
-            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
-        if len(data) > MAX_RECORD_SIZE:
+    def _publish(
+        lease: WriterLease,
+        directory_fd: int,
+        name: str,
+        value: dict[str, object],
+    ) -> None:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        if len(encoded) + 1 > MAX_RECORD_SIZE:
             raise ProjectRegistryError(f"project record {name} is too large")
-        atomic_publish_file(directory_fd, name, data, sync_directory=True)
+        lease.publish_json(
+            directory_fd,
+            name,
+            mapping_mutations(value),
+            lambda fd, filename, data: atomic_publish_file(
+                fd, filename, data, sync_directory=True
+            ),
+        )
 
     @staticmethod
     def _publish_directory(root_fd: int, staging: str, final: str) -> None:
@@ -461,7 +485,11 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
     @staticmethod
     def _decode(value: dict[str, object], expected_id: str | None = None) -> Project:
         try:
+            require_closed_variant(
+                "project.schema_version", value.get("schema_version")
+            )
             fields = validate_project_record(value, expected_id)
+            require_closed_variant("project.repo_agents", fields[-1])
         except ValueError as exc:
             raise ProjectRegistryError(str(exc)) from exc
         return Project(*fields)
@@ -520,7 +548,10 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                     dir_fd=root_fd,
                 )
                 try:
-                    self._publish(directory_fd, "project.json", self._encode(project))
+                    with open_writer(self.root.parent) as lease:
+                        self._publish(
+                            lease, directory_fd, "project.json", self._encode(project)
+                        )
                     os.mkdir("memory", 0o700, dir_fd=directory_fd)
                     memory_fd = os.open(
                         "memory",
@@ -788,8 +819,10 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         if len(path.encode("utf-8")) > MAX_SESSION_REFERENCE_SIZE:
             raise ProjectRegistryError("project session reference is too large")
         role = _validate_text(value["role"], "role", 64)
-        if role not in _SESSION_ROLES:
-            raise ProjectRegistryError("invalid project session role")
+        try:
+            require_closed_variant("project.session_role", role)
+        except ValueError as exc:
+            raise ProjectRegistryError("invalid project session role") from exc
         parent = value["parent_session_id"]
         if parent is not None:
             _validate_text(parent, "parent_session_id", 128, allow_surrogates=True)
@@ -934,8 +967,10 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         _validate_text(session_id, "session_id", 128)
         _validate_text(transcript_path, "transcript_path", MAX_SCOPE_LENGTH)
         _validate_text(role, "role", 64)
-        if role not in _SESSION_ROLES:
-            raise ProjectRegistryError("invalid project session role")
+        try:
+            require_closed_variant("project.session_role", role)
+        except ValueError as exc:
+            raise ProjectRegistryError("invalid project session role") from exc
         _validate_text(session_id, "session_id", 128)
         if parent_session_id is not None:
             _validate_text(parent_session_id, "parent_session_id", 128)
@@ -961,7 +996,12 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                     raise ProjectRegistryError(
                         "project session reference limit exceeded"
                     )
-                self._append_reference_blob(directory_fd, payload)
+                with open_writer(self.root.parent) as lease:
+                    lease.publish_append(
+                        "project.session_role",
+                        (role,),
+                        lambda: self._append_reference_blob(directory_fd, payload),
+                    )
             finally:
                 os.close(directory_fd)
 
@@ -979,7 +1019,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         _validate_id(project_id, _PROJECT_ID, "project_id")
         if not records:
             return
-        payloads: list[tuple[str, bytes]] = []
+        payloads: list[tuple[str, object, bytes]] = []
         batch_ids: set[str] = set()
         for record in records:
             session_id = record["session_id"]
@@ -989,8 +1029,10 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             _validate_text(session_id, "session_id", 128)
             _validate_text(transcript_path, "transcript_path", MAX_SCOPE_LENGTH)
             _validate_text(role, "role", 64)
-            if role not in _SESSION_ROLES:
-                raise ProjectRegistryError("invalid project session role")
+            try:
+                require_closed_variant("project.session_role", role)
+            except ValueError as exc:
+                raise ProjectRegistryError("invalid project session role") from exc
             if parent_session_id is not None:
                 _validate_text(parent_session_id, "parent_session_id", 128)
             if session_id in batch_ids:
@@ -1008,7 +1050,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             )
             if len(payload) > MAX_SESSION_REFERENCE_SIZE:
                 raise ProjectRegistryError("project session reference is too large")
-            payloads.append((session_id, payload))
+            payloads.append((session_id, role, payload))
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -1016,21 +1058,25 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                     directory_fd, repair_torn_final=True
                 )
                 existing_ids = {item["session_id"] for item in existing}
-                blob = b"".join(
-                    payload
-                    for session_id, payload in payloads
+                missing = [
+                    (role, payload)
+                    for session_id, role, payload in payloads
                     if session_id not in existing_ids
-                )
-                if not blob:
+                ]
+                if not missing:
                     return
-                added = sum(
-                    1 for session_id, _ in payloads if session_id not in existing_ids
-                )
+                blob = b"".join(payload for _role, payload in missing)
+                added = len(missing)
                 if len(existing) + added > MAX_SESSION_REFERENCES:
                     raise ProjectRegistryError(
                         "project session reference limit exceeded"
                     )
-                self._append_reference_blob(directory_fd, blob)
+                with open_writer(self.root.parent) as lease:
+                    lease.publish_append(
+                        "project.session_role",
+                        (role for role, _payload in missing),
+                        lambda: self._append_reference_blob(directory_fd, blob),
+                    )
             finally:
                 os.close(directory_fd)
 

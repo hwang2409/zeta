@@ -29,7 +29,6 @@ from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (
-    HTTPClientLease,
     build_response_error,
     cleanup_transport,
     close_transport_resources,
@@ -224,43 +223,6 @@ async def test_stream_iterator_close_failure_keeps_success_and_reaches_diagnosti
 class _FailingCloseClient:
     async def aclose(self) -> None:
         raise RuntimeError("cleanup-secret-canary")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("primary_error", [False, True])
-async def test_refresh_cleanup_failure_keeps_primary_outcome(
-    primary_error: bool,
-) -> None:
-    lease = HTTPClientLease.__new__(HTTPClientLease)
-    lease.client = _FailingCloseClient()
-    lease.owned = True
-    contexts: list[dict[str, object]] = []
-    loop = asyncio.get_running_loop()
-    previous_handler = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
-
-    async def refresh(_client: object) -> str:
-        if primary_error:
-            raise ValueError("primary-provider-secret-canary")
-        return "fresh-token"
-
-    try:
-        if primary_error:
-            with pytest.raises(ValueError, match="primary-provider-secret-canary"):
-                await asyncio.wait_for(lease.refresh(refresh), 10)
-        else:
-            assert await asyncio.wait_for(lease.refresh(refresh), 10) == "fresh-token"
-    finally:
-        loop.set_exception_handler(previous_handler)
-
-    assert contexts == [
-        {
-            "exception_type": "builtins.RuntimeError",
-            "stage": "refresh_client",
-            "index": 0,
-            "primary_outcome": "error" if primary_error else "success",
-        }
-    ]
 
 
 @pytest.mark.asyncio

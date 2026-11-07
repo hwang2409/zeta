@@ -27,6 +27,7 @@ from zeta.project_registry import (
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools import ToolRegistry
 
 
@@ -213,8 +214,11 @@ def test_project_record_publish_rejects_oversized_data_without_replacing(
     monkeypatch.setattr(registry_module, "MAX_RECORD_SIZE", len(original) - 1)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(ProjectRegistryError, match="too large"):
-            registry._publish(directory_fd, "project.json", registry._encode(project))
+        with (
+            pytest.raises(ProjectRegistryError, match="too large"),
+            open_writer(tmp_path) as lease,
+        ):
+            registry._publish(lease, directory_fd, "project.json", registry._encode(project))
     finally:
         os.close(directory_fd)
 
@@ -229,7 +233,8 @@ def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) 
     value["scope"] = "legacy" + chr(0xD800)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        registry._publish(directory_fd, "project.json", value)
+        with open_writer(tmp_path) as lease:
+            registry._publish(lease, directory_fd, "project.json", value)
     finally:
         os.close(directory_fd)
 
@@ -527,8 +532,11 @@ async def test_child_lineage_two_roots_each_with_child_and_grandchild(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
@@ -558,8 +566,11 @@ async def test_child_lineage_reconciled_after_registry_failure(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
@@ -2030,8 +2041,12 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     root_repository.mkdir()
     child_repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    root_project = registry.create_project("root", "root scope", root_repository)
-    child_project = registry.create_project("child", "child scope", child_repository)
+    root_project = await asyncio.to_thread(
+        registry.create_project, "root", "root scope", root_repository
+    )
+    child_project = await asyncio.to_thread(
+        registry.create_project, "child", "child scope", child_repository
+    )
 
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
