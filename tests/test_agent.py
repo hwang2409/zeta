@@ -10932,37 +10932,38 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
             self.loop: AgentLoop | None = None
 
         async def complete(self, messages, tool_schemas):
-            if len(self.calls) == 7:
-                assert self.loop is not None
-                flow = await self.loop._ensure_step_delivery()
-                await flow.produce(
-                    pending_delivery_module.NotificationInput(
-                        "task_exit",
-                        {
-                            "origin": "notification",
-                            "kind": "task_exited",
-                            "task_id": "task",
-                            "headline": "work",
-                            "exit_code": 0,
-                            "output_tail": "",
-                            "background_owner": "run_background",
-                            "background_phase": "natural_exit",
-                        },
-                        dedupe_key="task",
-                    )
-                )
             async for event in super().complete(messages, tool_schemas):
+                if len(self.calls) == 8 and event.type is StreamEventType.MESSAGE_END:
+                    assert self.loop is not None
+                    flow = await self.loop._ensure_step_delivery()
+                    await flow.produce(
+                        pending_delivery_module.NotificationInput(
+                            "task_exit",
+                            {
+                                "origin": "notification",
+                                "kind": "task_exited",
+                                "task_id": "task",
+                                "headline": "work",
+                                "exit_code": 0,
+                                "output_tail": "",
+                                "background_owner": "run_background",
+                                "background_phase": "natural_exit",
+                            },
+                            dedupe_key="task",
+                        )
+                    )
                 yield event
 
     backend = Backend(
         [
-            ScriptedTurn(tool_calls=[_agent_call("child-call")]),
-            ScriptedTurn(tool_calls=[ToolCall("ping-2", "ping", {})]),
-            ScriptedTurn([ThinkingContent("empty-3", "sig-3")]),
-            ScriptedTurn(tool_calls=[ToolCall("ping-4", "ping", {})]),
-            ScriptedTurn([ThinkingContent("empty-5", "sig-5")]),
-            ScriptedTurn(tool_calls=[ToolCall("ping-6", "ping", {})]),
-            ScriptedTurn([ThinkingContent("empty-7", "sig-7")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-1", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-2", "sig-2")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-3", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-4", "sig-4")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-5", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-6", "sig-6")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-7", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-8", "sig-8")]),
             ScriptedTurn([TextContent("notification consumed")]),
         ]
     )
@@ -10978,21 +10979,29 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
         backend,
         store,
         registry=registry,
-        max_turns=1,
+        max_turns=None,
+        agent_depth=1,
+        agent_instance_id="child",
         skill_catalog=SkillCatalog.empty(),
     )
     backend.loop = loop
     events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    assert len(backend.calls) == 9
-    assert any(
-        message.metadata.get("zeta_event") == "agent_notifications"
-        for message in backend.calls[-1][0]
-    )
     assert not any(
         event.type is StreamEventType.ERROR
         and event.error is not None
         and event.error.code == "empty_turn"
         for event in events
+    )
+    assert not any(
+        message.tool_result is not None
+        and message.tool_result.is_error
+        and "empty final assistant message" in message.tool_result.content
+        for message in store.messages()
+    )
+    assert len(backend.calls) == 9
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in backend.calls[-1][0]
     )
     assert any(
         message.metadata.get("zeta_event") == "agent_notifications"
