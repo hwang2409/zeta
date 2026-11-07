@@ -412,7 +412,7 @@ def select_base(event_name: str, base_ref: str = "") -> str:
         return subprocess.check_output(
             ["git", "merge-base", "HEAD", "FETCH_HEAD"], text=True
         ).strip()
-    if event_name == "push":
+    if event_name in {"push", "workflow_dispatch"}:
         return subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip()
     raise ValueError(f"unsupported github event: {event_name}")
 
@@ -425,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) != 1:
         print(
             "usage: lint_test_quality.py <unified-diff-path|-> | "
-            "--base <pull_request|push> [base-ref]",
+            "--base <pull_request|push|workflow_dispatch> [base-ref]",
             file=sys.stderr,
         )
         return 2

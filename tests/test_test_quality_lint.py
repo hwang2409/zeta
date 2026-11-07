@@ -353,6 +353,17 @@ def test_select_base_uses_first_parent_for_push(monkeypatch) -> None:
     assert commands == [(["git", "rev-parse", "HEAD^"], True)]
 
 
+def test_select_base_uses_first_parent_for_workflow_dispatch(monkeypatch) -> None:
+    commands = []
+    monkeypatch.setattr(
+        "scripts.lint_test_quality.subprocess.check_output",
+        lambda command, text: commands.append((command, text)) or "parent\n",
+    )
+
+    assert quality.select_base("workflow_dispatch") == "parent"
+    assert commands == [(["git", "rev-parse", "HEAD^"], True)]
+
+
 def test_ci_runs_quality_lint_for_pull_requests_and_main_pushes() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text()
     step = workflow.split("- name: Reject new low-signal test patterns", 1)[1]
