@@ -3994,6 +3994,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
     pending = await asyncio.wait_for(
         policy.wait_for_delegated_requests(2), timeout=10
     )
+    # test-contract: durability both delegated approvals are published before resolution.
     assert len(pending) == 2
     assert {request.child_instance_id for request in pending} == {
         f"{store.session_id}:1",
@@ -4552,12 +4553,9 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
     loop.explicit_finish = explicit_finish_enabled
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if len(backend.calls) >= 2:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("background child did not reach the model")
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
+    notification = store.agent_notifications(pending_only=False)[-1]
+    assert notification.data["status"] == "completed"
 
     child_tools = {schema["name"] for schema in backend.calls[1][1]}
     assert "ask_parent" in child_tools
@@ -4565,7 +4563,6 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
         assert {"finish", "agent_handoff"} <= child_tools
     else:
         assert {"finish", "agent_handoff"}.isdisjoint(child_tools)
-    await _wait_for_notification(store, "completed")
     await loop.close()
 
 
@@ -5834,6 +5831,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     pending = await asyncio.wait_for(policy.wait_for_delegated_requests(), timeout=10)
+    # test-contract: durability the grandchild approval is published before resolution.
     assert len(pending) == 1
     request = pending[0]
     assert request.child_instance_id == f"{store.session_id}:1:1"
