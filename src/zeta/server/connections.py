@@ -735,6 +735,68 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
+
+def _active_status_parts(
+    client: Any, loop: Any, fallback_config: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    runtime = client.server.runtime
+    transcript_index_failure = (
+        loop.transcript_index_failure(runtime.session_id)
+        if client.protocol_version != "1.0" and loop is not None
+        else None
+    )
+    status = {
+        "session": client._session_snapshot(),
+        "state": (
+            "idle"
+            if client.server.control.unhealthy() or runtime.state is None
+            else runtime.state.status
+        ),
+        "explicit_finish": (
+            loop.explicit_finish
+            if loop is not None
+            else fallback_config.agents_explicit_finish
+        ),
+    }
+    suffix = {
+        "pending_approvals": [],
+        "usage": dict(runtime.usage),
+        **(
+            {"transcript_index_failure": transcript_index_failure}
+            if transcript_index_failure is not None
+            else {}
+        ),
+        "store": runtime.opened.store,
+    }
+    return status, suffix
+
+
+def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, object]:
+    runtime = client.server.runtime
+    loop = runtime.loop
+    if loop is None and fallback_config is None:
+        raise RuntimeError("status fallback config was not resolved")
+    if runtime.opened is None:
+        status = {"session": None, "state": "idle", "explicit_finish": False}
+        suffix = {
+            "pending_approvals": [],
+            "usage": {},
+            "compaction_markers": 0,
+        }
+        session_id = None
+    else:
+        status, suffix = _active_status_parts(client, loop, fallback_config)
+        session_id = runtime.session_id
+    if client.protocol_version != "1.0":
+        status["max_agent_depth"] = (
+            loop.max_agent_depth
+            if loop is not None
+            else fallback_config.agents_max_depth
+        )
+    status.update(suffix)
+    return session_id, status
+
+
 def capture_read(
     client: Any,
     method: str,
@@ -757,58 +819,7 @@ def capture_read(
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
-        loop = runtime.loop
-        if loop is None and fallback_config is None:
-            raise RuntimeError("status fallback config was not resolved")
-        if runtime.opened is None:
-            status = {
-                "session": None,
-                "state": "idle",
-                "explicit_finish": False,
-            }
-            suffix = {
-                "pending_approvals": [],
-                "usage": {},
-                "compaction_markers": 0,
-            }
-            session_id = None
-        else:
-            transcript_index_failure = (
-                loop.transcript_index_failure(runtime.session_id)
-                if client.protocol_version != "1.0" and loop is not None
-                else None
-            )
-            status = {
-                "session": client._session_snapshot(),
-                "state": (
-                    "idle"
-                    if client.server.control.unhealthy() or runtime.state is None
-                    else runtime.state.status
-                ),
-                "explicit_finish": (
-                    loop.explicit_finish
-                    if loop is not None
-                    else fallback_config.agents_explicit_finish
-                ),
-            }
-            suffix = {
-                "pending_approvals": [], "usage": dict(runtime.usage),
-                **(
-                    {"transcript_index_failure": transcript_index_failure}
-                    if transcript_index_failure is not None
-                    else {}
-                ),
-                "store": runtime.opened.store,
-            }
-            session_id = runtime.session_id
-        if client.protocol_version != "1.0":
-            status["max_agent_depth"] = (
-                loop.max_agent_depth
-                if loop is not None
-                else fallback_config.agents_max_depth
-            )
-        status.update(suffix)
-        return session_id, status
+        return _capture_status(client, fallback_config)
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)
     if method == "session_settings":
