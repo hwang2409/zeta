@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.stores import open_test_store
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.presets import AGENT_PRESETS
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
@@ -18,7 +18,7 @@ from zeta.tools.registry import ToolRegistry
 async def test_owner_cancel_is_scoped_and_idempotent(
     tmp_path: Path,
 ) -> None:
-    owner = BackgroundAgentOwner(await open_test_store(tmp_path))
+    owner = BackgroundAgentOwner(ConversationStore(tmp_path))
     canceled: list[str] = []
     finished = asyncio.Event()
 
@@ -37,7 +37,7 @@ async def test_owner_cancel_is_scoped_and_idempotent(
 
 @pytest.mark.asyncio
 async def test_owner_cancel_only_cancels_selected_subtree(tmp_path: Path) -> None:
-    owner = BackgroundAgentOwner(await open_test_store(tmp_path))
+    owner = BackgroundAgentOwner(ConversationStore(tmp_path))
     canceled: list[str] = []
     tasks: dict[str, asyncio.Task[None]] = {}
     for handle in ("root", "sibling", "grandchild"):
@@ -45,9 +45,7 @@ async def test_owner_cancel_only_cancels_selected_subtree(tmp_path: Path) -> Non
     owner.register("root", lambda: canceled.append("root"), tasks["root"])
     owner.register("sibling", lambda: canceled.append("sibling"), tasks["sibling"])
     owner.register(
-        "grandchild",
-        lambda: canceled.append("grandchild"),
-        tasks["grandchild"],
+        "grandchild", lambda: canceled.append("grandchild"), tasks["grandchild"],
         parent_instance_id="root",
     )
 
@@ -63,46 +61,30 @@ async def test_owner_cancel_only_cancels_selected_subtree(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_owner_cancel_follows_reparented_deep_descendants(tmp_path: Path) -> None:
-    owner = BackgroundAgentOwner(await open_test_store(tmp_path))
+    owner = BackgroundAgentOwner(ConversationStore(tmp_path))
     canceled: list[str] = []
-    tasks = {
-        # test-contract: latency long sleeps keep tasks pending for cancellation
-        name: asyncio.create_task(asyncio.sleep(10))
-        for name in (
-            "survivor",
-            "ancestor",
-            "grandchild",
-            "great-grandchild",
-            "sibling",
-        )
-    }
+    tasks = {name: asyncio.create_task(asyncio.sleep(10)) for name in (
+        "survivor", "ancestor", "grandchild", "great-grandchild", "sibling"
+    )}
     owner.register("survivor", lambda: canceled.append("survivor"), tasks["survivor"])
     owner.register(
-        "ancestor",
-        lambda: canceled.append("ancestor"),
-        tasks["ancestor"],
+        "ancestor", lambda: canceled.append("ancestor"), tasks["ancestor"],
         parent_instance_id="survivor",
     )
     owner.register(
-        "grandchild",
-        lambda: canceled.append("grandchild"),
-        tasks["grandchild"],
+        "grandchild", lambda: canceled.append("grandchild"), tasks["grandchild"],
         parent_instance_id="ancestor",
     )
     owner.register(
-        "great-grandchild",
-        lambda: canceled.append("great-grandchild"),
-        tasks["great-grandchild"],
-        parent_instance_id="grandchild",
+        "great-grandchild", lambda: canceled.append("great-grandchild"),
+        tasks["great-grandchild"], parent_instance_id="grandchild",
     )
     owner.register("sibling", lambda: canceled.append("sibling"), tasks["sibling"])
 
     # Each completing ancestor adopts its live child through its current edge.
-    owner.adopt("grandchild", await open_test_store(tmp_path / "survivor"), "survivor")
+    owner.adopt("grandchild", ConversationStore(tmp_path / "survivor"), "survivor")
     owner.unregister("ancestor")
-    owner.adopt(
-        "great-grandchild", await open_test_store(tmp_path / "survivor"), "survivor"
-    )
+    owner.adopt("great-grandchild", ConversationStore(tmp_path / "survivor"), "survivor")
     owner.unregister("grandchild")
 
     assert owner.cancel("survivor") is True
@@ -117,7 +99,7 @@ async def test_owner_cancel_follows_reparented_deep_descendants(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_owner_registration_does_not_wake_frontend(tmp_path: Path) -> None:
-    owner = BackgroundAgentOwner(await open_test_store(tmp_path))
+    owner = BackgroundAgentOwner(ConversationStore(tmp_path))
     wakes: list[str] = []
     owner.set_wake_callback(lambda: wakes.append("wake"))
     task = asyncio.create_task(asyncio.sleep(10))
@@ -132,14 +114,11 @@ async def test_owner_registration_does_not_wake_frontend(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_agent_control_tools_execute_through_registry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = await open_test_store(tmp_path / "session")
+    store = ConversationStore(tmp_path / "session")
     registry = ToolRegistry(
-        tmp_path,
-        session_store=store,
-        skill_catalog=SkillCatalog.empty(),
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty(),
         register_builtin=True,
     )
     owner = BackgroundAgentOwner(store)
@@ -150,9 +129,7 @@ async def test_agent_control_tools_execute_through_registry(
         "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "child"}]
     )
     try:
-        canceled = await registry.execute(
-            ToolCall("cancel", "agent_cancel", {"handle": "child"})
-        )
+        canceled = await registry.execute(ToolCall("cancel", "agent_cancel", {"handle": "child"}))
         assert canceled["structuredContent"]["status"] == "cancellation_confirmed"
         owner.unregister("child")
     finally:
@@ -165,7 +142,7 @@ async def test_agent_control_tools_execute_through_registry(
 async def test_agent_cancel_reads_status_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = await open_test_store(tmp_path / "session")
+    store = ConversationStore(tmp_path / "session")
     registry = ToolRegistry(
         tmp_path,
         session_store=store,

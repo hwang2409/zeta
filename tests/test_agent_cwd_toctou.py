@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.stores import open_test_store
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -21,8 +21,8 @@ async def test_delegated_write_uses_approved_canonical_target_after_alias_swap(
     outside.mkdir()
     alias = tmp_path / "alias"
     alias.symlink_to(approved_dir, target_is_directory=True)
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=parent_cwd)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=parent_cwd)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=parent_cwd)
     parent_policy = ApprovalPolicy(
         store=parent_store,
         always_allow={"write(src/**)"},
@@ -74,8 +74,8 @@ async def test_delegated_bash_uses_approved_canonical_cwd_after_alias_swap(
     outside.mkdir()
     alias = tmp_path / "cwd-alias"
     alias.symlink_to(parent_cwd, target_is_directory=True)
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=parent_cwd)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=parent_cwd)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=parent_cwd)
     child_store.set_bash_cwd(str(alias))
     parent_policy = ApprovalPolicy(
         store=parent_store,

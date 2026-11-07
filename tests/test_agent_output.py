@@ -8,7 +8,6 @@ import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.stores import open_test_store
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
@@ -84,9 +83,7 @@ def test_receipt_compaction_preserves_killed_task_provenance() -> None:
         (["x" * 64] + [f"task-{index}" for index in range(63)], 65),
     ],
 )
-def test_killed_task_metadata_is_bounded_and_counted(
-    ids: list[str], count: int
-) -> None:
+def test_killed_task_metadata_is_bounded_and_counted(ids: list[str], count: int) -> None:
     result = build_agent_receipt(
         "completed",
         "answer",
@@ -126,7 +123,7 @@ async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None
     )
     loop = AgentLoop(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
-        await open_test_store(tmp_path),
+        ConversationStore(tmp_path),
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
@@ -162,7 +159,7 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         "agent",
         {"prompt": "inspect", "description": "late setup"},
     )
-    store = await open_test_store(tmp_path)
+    store = ConversationStore(tmp_path)
     loop = AgentLoop(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
         store,
@@ -216,7 +213,7 @@ async def test_post_clone_setup_failure_releases_registry_directory(
     )
     loop = AgentLoop(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
-        await open_test_store(tmp_path),
+        ConversationStore(tmp_path),
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
@@ -253,7 +250,7 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
         "agent",
         {"prompt": "inspect", "description": "research"},
     )
-    store = await open_test_store(tmp_path)
+    store = ConversationStore(tmp_path)
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[call]),
@@ -328,9 +325,7 @@ def test_active_agent_receipt_discovery_does_not_scan_branch(
     assert receipts == {"parent:1": store.session_dir / "agents" / "1"}
     assert parsed == 0
 
-    session_id = store.session_id
-    store.close()
-    reopened = ConversationStore(tmp_path, session_id=session_id)
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
     parsed = 0
     assert _active_agent_receipts(reopened) == receipts
     assert parsed == 0
@@ -338,7 +333,7 @@ def test_active_agent_receipt_discovery_does_not_scan_branch(
 
 @pytest.mark.asyncio
 async def test_agent_output_rejects_handle_not_on_active_branch(tmp_path: Path) -> None:
-    store = await open_test_store(tmp_path)
+    store = ConversationStore(tmp_path)
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
@@ -355,16 +350,12 @@ async def test_agent_output_rejects_handle_not_on_active_branch(tmp_path: Path) 
 async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
     tmp_path: Path,
 ) -> None:
-    store = await open_test_store(tmp_path, session_id="parent")
-    other = await open_test_store(tmp_path, session_id="other")
-    victim = await open_test_store(other.session_dir / "agents", session_id="1")
+    store = ConversationStore(tmp_path, session_id="parent")
+    other = ConversationStore(tmp_path, session_id="other")
+    victim = ConversationStore(other.session_dir / "agents", session_id="1")
     victim.append_message(Message(MessageRole.ASSISTANT, [TextContent("secret")]))
     real_call = ToolCall("real-agent", "agent", {})
-    store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(real_call)]))
     store.append_message(
         Message(
@@ -413,13 +404,9 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
 
 @pytest.mark.asyncio
 async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> None:
-    store = await open_test_store(tmp_path)
-    child = await open_test_store(store.session_dir / "agents", session_id="1")
-    store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    store = ConversationStore(tmp_path)
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -461,8 +448,8 @@ async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> 
 async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     tmp_path: Path,
 ) -> None:
-    parent = await open_test_store(tmp_path / "parent")
-    child = await open_test_store(parent.session_dir / "agents", session_id="1")
+    parent = ConversationStore(tmp_path / "parent")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
     handle = "parent:1"
     child.start_agent_lifecycle(
         handle=handle,
@@ -478,11 +465,7 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
         turns_used=2,
         finished_at="2026-09-04T10:00:01+00:00",
     )
-    parent.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    parent.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     parent.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -538,7 +521,7 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         "agent",
         {"prompt": "inspect", "description": "stats", "background": True},
     )
-    store = await open_test_store(tmp_path)
+    store = ConversationStore(tmp_path)
     loop = AgentLoop(
         FakeBackend(
             [
@@ -612,7 +595,7 @@ async def _terminal_agent_event(
     remove_live_agent_lifecycle(child.agent_lifecycle_path)
     registry = ToolRegistry(
         tmp_path,
-        session_store=await open_test_store(tmp_path / "parent"),
+        session_store=ConversationStore(tmp_path / "parent"),
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
     )
@@ -650,7 +633,7 @@ async def _terminal_agent_event(
 async def test_concurrent_status_calls_cannot_regress_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    child = await open_test_store(tmp_path / "agents", session_id="1")
+    child = ConversationStore(tmp_path / "agents", session_id="1")
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-01-01T00:00:00+00:00",
@@ -721,7 +704,7 @@ async def test_concurrent_status_calls_cannot_regress_projection(
 async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    child = await open_test_store(tmp_path / "agents", session_id="1")
+    child = ConversationStore(tmp_path / "agents", session_id="1")
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-01-01T00:00:00+00:00",
@@ -730,16 +713,12 @@ async def test_terminal_result_construction_never_reads_lifecycle_on_event_loop(
         description="child",
     )
     child.finish_agent_lifecycle(
-        "completed",
-        final_result="done",
-        turns_used=1,
-        finished_at="2026-01-01T00:00:01+00:00",
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
     )
     loop_thread = threading.get_ident()
     read_threads: list[int] = []
     core_load = agent_progress.load_session_json
     tool_load = agent_tools.load_session_json
-
     def tracked_core_load(*args: object, **kwargs: object) -> object:
         read_threads.append(threading.get_ident())
         return core_load(*args, **kwargs)
@@ -785,7 +764,7 @@ async def test_full_child_runs_never_read_lifecycle_on_event_loop(
             turns.append(ScriptedTurn([TextContent("done")]))
         elif case == "cancel":
             turns.append(ScriptedTurn([TextContent("late")], delay=10))
-        store = await open_test_store(tmp_path / case)
+        store = ConversationStore(tmp_path / case)
         loop = AgentLoop(
             FakeBackend(turns),
             store,
@@ -793,7 +772,6 @@ async def test_full_child_runs_never_read_lifecycle_on_event_loop(
             skill_catalog=SkillCatalog.empty(),
         )
         if case == "setup-failure":
-
             def fail_clone(*args: object, **kwargs: object) -> None:
                 del args, kwargs
                 raise RuntimeError("registry clone exploded")
@@ -821,7 +799,7 @@ async def test_full_child_runs_never_read_lifecycle_on_event_loop(
 async def test_tui_receipt_render_never_reads_lifecycle_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    child = await open_test_store(tmp_path / "agents", session_id="1")
+    child = ConversationStore(tmp_path / "agents", session_id="1")
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-01-01T00:00:00+00:00",
@@ -830,10 +808,7 @@ async def test_tui_receipt_render_never_reads_lifecycle_on_event_loop(
         description="child",
     )
     child.finish_agent_lifecycle(
-        "completed",
-        final_result="done",
-        turns_used=1,
-        finished_at="2026-01-01T00:00:01+00:00",
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
     )
     loop, event = await _terminal_agent_event(tmp_path, child)
     monkeypatch.setattr(
@@ -850,7 +825,7 @@ async def test_tui_receipt_render_never_reads_lifecycle_on_event_loop(
 async def test_durable_terminal_receipt_survives_repeated_renders(
     tmp_path: Path,
 ) -> None:
-    child = await open_test_store(tmp_path / "agents", session_id="1")
+    child = ConversationStore(tmp_path / "agents", session_id="1")
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-01-01T00:00:00+00:00",
@@ -860,10 +835,7 @@ async def test_durable_terminal_receipt_survives_repeated_renders(
     )
     child.update_agent_lifecycle(tool_calls=3)
     child.finish_agent_lifecycle(
-        "completed",
-        final_result="done",
-        turns_used=1,
-        finished_at="2026-01-01T00:00:01+00:00",
+        "completed", final_result="done", turns_used=1, finished_at="2026-01-01T00:00:01+00:00"
     )
     loop, event = await _terminal_agent_event(tmp_path, child)
     assert event.tool_call is not None
@@ -879,18 +851,10 @@ async def test_durable_terminal_receipt_survives_repeated_renders(
 
 @pytest.mark.asyncio
 async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) -> None:
-    store = await open_test_store(tmp_path)
-    child = await open_test_store(store.session_dir / "agents", session_id="1")
-    child.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("x" * 10_000)]), MessageOrigin.USER
-        )
-    )
-    store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    store = ConversationStore(tmp_path)
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("x" * 10_000)]), MessageOrigin.USER))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -925,19 +889,11 @@ async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) ->
 async def test_agent_output_pages_unicode_with_persistence_size(
     tmp_path: Path,
 ) -> None:
-    store = await open_test_store(tmp_path, session_id="parent")
-    child = await open_test_store(store.session_dir / "agents", session_id="1")
-    child.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("😀" * 1_800)]), MessageOrigin.USER
-        )
-    )
+    store = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("😀" * 1_800)]), MessageOrigin.USER))
     call = ToolCall("emoji-agent", "agent", {})
-    store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -984,9 +940,9 @@ async def test_agent_output_pages_unicode_with_persistence_size(
 async def test_agent_output_reads_adopted_background_descendant_notification(
     tmp_path: Path,
 ) -> None:
-    root = await open_test_store(tmp_path, session_id="parent")
-    child = await open_test_store(root.session_dir / "agents", session_id="1")
-    grandchild = await open_test_store(child.session_dir / "agents", session_id="1")
+    root = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     grandchild.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("grandchild output")])
     )
@@ -1016,9 +972,7 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
         child_instance_id="parent:1:2",
     )
     adopt_agent_children(child, root)
-    reopened_root = await open_test_store(
-        tmp_path, session_id="parent", _read_only=True
-    )
+    reopened_root = ConversationStore(tmp_path, session_id="parent")
     assert reopened_root.agent_children()["parent:1:1"]["turns_used"] == 4
     reopened_root.close()
     root.append_agent_notification(
@@ -1048,14 +1002,10 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
 async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = await open_test_store(tmp_path)
-    child = await open_test_store(store.session_dir / "agents", session_id="1")
+    store = ConversationStore(tmp_path)
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved")]))
-    store.append_message(
-        with_message_origin(
-            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
-        )
-    )
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -1141,9 +1091,7 @@ def test_terminal_receipt_round_trips_after_store_reopen(tmp_path: Path) -> None
             tool_result=receipt_tool_result("receipt-call", result),
         )
     )
-    session_id = store.session_id
-    store.close()
-    reopened = ConversationStore(tmp_path, session_id=session_id)
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     saved = reopened.messages()[0].tool_result
     assert saved is not None
@@ -1186,7 +1134,7 @@ async def test_agent_output_error_total_cap_handles_multibyte_handle(
 ) -> None:
     loop = AgentLoop(
         FakeBackend([]),
-        await open_test_store(tmp_path),
+        ConversationStore(tmp_path),
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )

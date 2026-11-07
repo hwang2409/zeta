@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from tests.support.stores import open_test_store
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import (
     ApprovalAbortPolicy,
@@ -203,14 +202,14 @@ async def test_nested_child_abort_reaches_serve_with_innermost_identity(
     tmp_path: Path,
     depth: int,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     control = _RecordingServeApprovalControl()
     parent_policy.bind_serve_control(control)
     policy: ApprovalPolicy | ChildApprovalPolicy = parent_policy
     child_stores: list[ConversationStore] = []
     for level in range(1, depth + 1):
-        child_store = await open_test_store(
+        child_store = ConversationStore(
             tmp_path / f"child-{level}-sessions", cwd=tmp_path
         )
         child_stores.append(child_store)
@@ -223,17 +222,16 @@ async def test_nested_child_abort_reaches_serve_with_innermost_identity(
         )
 
     assert isinstance(policy, ChildApprovalPolicy)
-    assert (
-        await policy._resolve_abort_or_winner(
+    assert await policy._resolve_abort_or_winner(
         "nested-request",
         execution_token=None,
         capability=object(),  # type: ignore[arg-type]
-        )
-        is None
-    )
+    ) is None
     await policy.cleanup()
 
-    assert control.aborts == [("nested-request", f"child-{depth}", "child_cleanup")]
+    assert control.aborts == [
+        ("nested-request", f"child-{depth}", "child_cleanup")
+    ]
     assert control.cleanups == [f"child-{depth}"]
     for store in reversed(child_stores):
         store.close()
@@ -244,8 +242,8 @@ async def test_nested_child_abort_reaches_serve_with_innermost_identity(
 async def test_pre_aborted_child_task_output_fails_closed(
     tmp_path: Path,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         parent_policy,
@@ -312,7 +310,7 @@ async def test_parent_and_child_approval_decision_paths(
     policy_kind: str,
     outcome: str,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     decision_store = parent_store
     policy: ApprovalPolicy | ChildApprovalPolicy = parent_policy
@@ -321,7 +319,7 @@ async def test_parent_and_child_approval_decision_paths(
         "approval_store": parent_store,
     }
     if policy_kind == "child":
-        child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+        child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
         policy = ChildApprovalPolicy(
             parent_policy,
             child_store,
@@ -364,9 +362,7 @@ async def test_parent_and_child_approval_decision_paths(
                 return False
             return original_resolve(request_id, decision, **kwargs)
 
-        monkeypatch.setattr(
-            decision_store, "resolve_approval", allow_when_abort_resolves
-        )
+        monkeypatch.setattr(decision_store, "resolve_approval", allow_when_abort_resolves)
         registry.abort()
     else:
         approval_started = asyncio.Event()
@@ -409,8 +405,8 @@ async def test_bound_edit_abort_arbitration_preserves_winner(
     monkeypatch: pytest.MonkeyPatch,
     abort_winner: str,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     child_policy = ChildApprovalPolicy(
         ApprovalPolicy(store=parent_store),
         child_store,
@@ -464,16 +460,7 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
-    parent = ApprovalPolicy(store=parent_store)
-    child = ChildApprovalPolicy(
-        parent,
-        child_store,
-        "child",
-        "display-binding",
-        child_cwd=tmp_path,
-    )
+    parent, child = _child_policy_for_display(tmp_path, {"write": "path"})
     monkeypatch.setattr(
         parent,
         "capture_child_binding",
@@ -505,8 +492,8 @@ async def test_write_uses_binding_captured_before_persisted_request(
     alias = tmp_path / "alias"
     alias.symlink_to(safe, target_is_directory=True)
 
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         parent_policy,
@@ -592,8 +579,8 @@ async def _assert_shell_uses_displayed_cwd(
     alias = tmp_path / "cwd-alias"
     alias.symlink_to(safe, target_is_directory=True)
 
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         parent_policy,
@@ -657,8 +644,8 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
 ) -> None:
     approved_cwd = tmp_path / "approved"
     approved_cwd.mkdir()
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     first_policy = ChildApprovalPolicy(
         parent_policy,
@@ -702,7 +689,8 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
     assert parent_policy.pending_requests() == []
     assert result["isError"] is True
     assert result["content"][0]["text"] == (
-        "tool execution denied: approval binding unavailable; submit a new tool request"
+        "tool execution denied: approval binding unavailable; "
+        "submit a new tool request"
     )
     assert not (approved_cwd / "marker.txt").exists()
 
@@ -712,8 +700,8 @@ async def test_canceled_execution_discards_its_approval_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(
         store=parent_store,
         always_allow={"bash(echo *)"},
@@ -784,8 +772,8 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         parent_policy, child_store, "child", "race", child_cwd=tmp_path
@@ -799,7 +787,9 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
     )
     original_resolve = child_store.resolve_approval
 
-    def allow_before_abort(request_id: str, decision: str, **kwargs: object) -> bool:
+    def allow_before_abort(
+        request_id: str, decision: str, **kwargs: object
+    ) -> bool:
         if decision == "abort":
             original_resolve(request_id, "allow")
         return original_resolve(request_id, decision)
@@ -819,8 +809,8 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
 async def test_replayed_allow_without_binding_fails_closed_for_cwd(
     tmp_path: Path,
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     call = ToolCall("replay", "bash", {"command": "pwd"})
     child_store.append_message_with_approval_requests(
@@ -842,13 +832,11 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
         "resolved_path": None,
     }
     assert child_store.resolve_approval(call.id, "allow")
-    child_session_id = child_store.session_id
-    child_store.close()
 
     # The durable display is audit-only: a restarted policy has no in-memory
     # binding and must not turn the persisted cwd into execution authority.
-    restarted_store = await open_test_store(
-        tmp_path / "child-sessions", session_id=child_session_id, cwd=tmp_path
+    restarted_store = ConversationStore(
+        tmp_path / "child-sessions", session_id=child_store.session_id, cwd=tmp_path
     )
     restarted_policy = ChildApprovalPolicy(
         parent_policy, restarted_store, "child", "restart", child_cwd=tmp_path
@@ -872,8 +860,8 @@ async def _execute_after_manual_approval(
     child_cwd: Path | None = None,
 ):
     child_cwd = child_cwd or tmp_path
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=child_cwd)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=child_cwd)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=child_cwd)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=child_cwd)
     parent_policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         parent_policy, child_store, "child", call.id, child_cwd=child_cwd
@@ -938,8 +926,8 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
     (evil / "value").write_text("SECRET", encoding="utf-8")
     alias = tmp_path / "alias"
     alias.symlink_to(safe, target_is_directory=True)
-    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=work)
-    child_store = await open_test_store(tmp_path / "child-sessions", cwd=work)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=work)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=work)
     parent_policy = ApprovalPolicy(
         store=parent_store, always_allow={f"read({tmp_path}/**)"}
     )
@@ -1096,13 +1084,7 @@ async def test_all_path_binding_tools_consume_execution_binding(tmp_path: Path) 
     ("tool_name", "action", "subject", "binding", "arguments"),
     [
         ("task", "start", "command", "cwd", {"action": "start", "command": "pwd"}),
-        (
-            "artifact",
-            "update",
-            "path",
-            "path",
-            {"action": "update", "path": "result.txt"},
-        ),
+        ("artifact", "update", "path", "path", {"action": "update", "path": "result.txt"}),
     ],
 )
 async def test_replayed_action_scoped_allow_requires_original_binding(
@@ -1113,8 +1095,8 @@ async def test_replayed_action_scoped_allow_requires_original_binding(
     binding: str,
     arguments: dict[str, str],
 ) -> None:
-    parent_store = await open_test_store(tmp_path / "parent", cwd=tmp_path)
-    child_store = await open_test_store(tmp_path / "child", cwd=tmp_path)
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
     parent = ApprovalPolicy(store=parent_store)
     registry = ToolRegistry(
         tmp_path,
@@ -1151,9 +1133,7 @@ async def test_replayed_action_scoped_allow_requires_original_binding(
         [(call.id, call)],
     )
     assert child_store.resolve_approval(call.id, "allow")
-    restarted = ChildApprovalPolicy(
-        parent, child_store, "child", "replayed", child_cwd=tmp_path
-    )
+    restarted = ChildApprovalPolicy(parent, child_store, "child", "replayed", child_cwd=tmp_path)
 
     decision = await restarted.authorize(
         call,
