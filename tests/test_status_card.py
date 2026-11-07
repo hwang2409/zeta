@@ -11,9 +11,9 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.overlay import OverlayControl

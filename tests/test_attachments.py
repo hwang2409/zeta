@@ -16,7 +16,6 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ImageContent,
@@ -28,6 +27,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import _attachments, composer, paste_runtime
 from zeta.tui.app import TUIApp

@@ -80,7 +80,6 @@ from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
@@ -94,6 +93,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
@@ -9027,7 +9027,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from tempfile import TemporaryDirectory
 
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
+        from zeta.runtime.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
