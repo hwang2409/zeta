@@ -1,12 +1,13 @@
 import asyncio
 import json
-import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+import zeta.mcp.http as mcp_http_module
 from zeta.core.abort import AbortSignal
 from zeta.mcp import (
     MCPConfig,
@@ -592,48 +593,61 @@ async def test_mcp_http_notification_listener_immediate_eof_backs_off(
     assert delays == [0.1, 0.2]
 
 
-class _DelayedEOFStream(httpx.AsyncByteStream):
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        await asyncio.sleep(0.02)
-        if False:
-            yield b""
-
-
 @pytest.mark.asyncio
 async def test_mcp_http_notification_listener_healthy_idle_resets_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    requested_at: list[float] = []
+    now = 0.0
+    request_count = 0
+    delays: list[float] = []
+
+    class ClockedEOFStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            nonlocal now
+            now += 0.02
+            if False:
+                yield b""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requested_at.append(time.monotonic())
-        if len(requested_at) <= 2:
+        nonlocal request_count
+        request_count += 1
+        if request_count <= 2:
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
                 content=b"",
                 request=request,
             )
-        if len(requested_at) == 3:
+        if request_count == 3:
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                stream=_DelayedEOFStream(),
+                stream=ClockedEOFStream(),
                 request=request,
             )
         return httpx.Response(405, request=request)
 
-    monkeypatch.setattr(
-        "zeta.mcp.http.NOTIFICATION_STREAM_HEALTHY_SECONDS", 0.01, raising=False
+    async def sleep(delay: float) -> None:
+        nonlocal now
+        delays.append(delay)
+        now += delay
+
+    fake_loop = SimpleNamespace(time=lambda: now)
+    fake_asyncio = SimpleNamespace(
+        **{
+            **vars(asyncio),
+            "get_running_loop": lambda: fake_loop,
+            "sleep": sleep,
+        }
     )
+    monkeypatch.setattr(mcp_http_module, "asyncio", fake_asyncio)
+    monkeypatch.setattr(mcp_http_module, "NOTIFICATION_STREAM_HEALTHY_SECONDS", 0.01)
+
     await _run_notification_listener(
         MCPServerConfig("http", "streamable-http", url="https://mcp.test"), handler
     )
 
-    reconnect_delay = requested_at[3] - requested_at[2] - 0.02
-    assert reconnect_delay == pytest.approx(
-        NOTIFICATION_RECONNECT_INITIAL_SECONDS, abs=0.08
-    )
+    assert delays == [0.1, 0.2, NOTIFICATION_RECONNECT_INITIAL_SECONDS]
 
 
 @pytest.mark.asyncio

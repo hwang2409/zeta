@@ -589,7 +589,6 @@ async def test_switch_cancel_during_apply_handoff_releases_lock_and_fails_closed
 def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     faulthandler.dump_traceback_later(SATURATED_RACE_TIMEOUT_SECONDS, exit=True)
     results.send(("ready", time.monotonic()))
-    race_started = time.monotonic()
 
     async def run() -> None:
         home = Path(home_value)
@@ -657,9 +656,9 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.send(("result", repr(exc), time.monotonic() - race_started))
+        results.send(("result", repr(exc)))
     else:
-        results.send(("result", None, time.monotonic() - race_started))
+        results.send(("result", None))
     finally:
         faulthandler.cancel_dump_traceback_later()
         results.close()
@@ -692,10 +691,9 @@ def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) ->
             )
         assert process.exitcode == 0
         assert results.poll(1)
-        event, error, race_seconds = results.recv()
+        event, error = results.recv()
         assert event == "result"
         assert error is None, error
-        assert race_seconds < SATURATED_RACE_TIMEOUT_SECONDS
     finally:
         if process.is_alive():
             process.terminate()

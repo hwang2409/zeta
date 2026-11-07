@@ -14359,35 +14359,34 @@ async def test_ask_parent_answer_does_not_block_finish(
     await loop.close()
 
 
+# test-contract: seam observe private append-lock ownership because no public seam exists.
 async def _assert_fence_operation_does_not_block_loop(
     store: ConversationStore,
     operation,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> object:
-    locked = threading.Event()
+    owner_thread = threading.get_ident()
+    lock_threads: list[int] = []
+    append_lock = ConversationStore._append_lock
 
-    def hold_lock() -> None:
-        with store._append_lock():
-            locked.set()
-            threading.Event().wait(0.25)
+    def observed_append_lock(
+        candidate: ConversationStore, *args: object, **kwargs: object
+    ):
+        lock_threads.append(threading.get_ident())
+        return append_lock(candidate, *args, **kwargs)
 
-    holder = asyncio.create_task(asyncio.to_thread(hold_lock))
-    assert await asyncio.to_thread(locked.wait, 2)
-    loop = asyncio.get_running_loop()
-    ticked = loop.create_future()
-    started = loop.time()
-    task = asyncio.create_task(operation())
-    loop.call_soon(ticked.set_result, None)
-    await ticked
-    delay = loop.time() - started
-    result = await task
-    await holder
-    assert delay < 0.05
+    with monkeypatch.context() as patch:
+        patch.setattr(ConversationStore, "_append_lock", observed_append_lock)
+        result = await operation()
+
+    assert lock_threads
+    assert owner_thread not in lock_threads
     return result
 
 
 @pytest.mark.asyncio
 async def test_explicit_finish_accept_does_not_block_event_loop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path, session_id="finish-off-loop")
     fence = TerminalTransitionFence(store)
@@ -14395,6 +14394,7 @@ async def test_explicit_finish_accept_does_not_block_event_loop(
     result = await _assert_fence_operation_does_not_block_loop(
         store,
         lambda: fence.accept_finish({"status": "done", "summary": "done"}),
+        monkeypatch,
     )
 
     assert result is None
@@ -14402,12 +14402,14 @@ async def test_explicit_finish_accept_does_not_block_event_loop(
 
 @pytest.mark.asyncio
 async def test_cancel_and_idle_nudge_do_not_block_event_loop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cancel_store = ConversationStore(tmp_path, session_id="cancel-off-loop")
     assert (
         await _assert_fence_operation_does_not_block_loop(
-            cancel_store, TerminalTransitionFence(cancel_store).cancel
+            cancel_store,
+            TerminalTransitionFence(cancel_store).cancel,
+            monkeypatch,
         )
         is True
     )
@@ -14415,7 +14417,9 @@ async def test_cancel_and_idle_nudge_do_not_block_event_loop(
     nudge_store = ConversationStore(tmp_path, session_id="nudge-off-loop")
     assert (
         await _assert_fence_operation_does_not_block_loop(
-            nudge_store, TerminalTransitionFence(nudge_store).reserve_idle_nudge
+            nudge_store,
+            TerminalTransitionFence(nudge_store).reserve_idle_nudge,
+            monkeypatch,
         )
         is True
     )
