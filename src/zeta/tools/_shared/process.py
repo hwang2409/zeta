@@ -1,5 +1,4 @@
 """Process-group cleanup shared by shell tools."""
-
 from __future__ import annotations
 
 import asyncio
@@ -49,6 +48,7 @@ from .process_output import (
     utf8_char_chunk,
     utf8_chunk,
 )
+from .task_changes import TaskChangeSignal
 from .tool_spawn import create_tool_subprocess_shell
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,6 @@ class _BackgroundRecord:
 
 class BackgroundTaskRegistry:
     """Own detached process groups and their bounded session output."""
-
     def __init__(
         self,
         *,
@@ -147,8 +146,7 @@ class BackgroundTaskRegistry:
             str, tuple[_BackgroundRecord, BackgroundTaskNotice]
         ] = {}
         self._task_start_generation = 0
-        self._task_change_generation = 0
-        self._task_changed = asyncio.Event()
+        self.task_changes = TaskChangeSignal()
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
         self._shutdown_cause: str | None = None
@@ -173,28 +171,7 @@ class BackgroundTaskRegistry:
 
     @property
     def task_start_generation(self) -> int:
-        """Return the monotonic count of tasks that reached running state."""
-
         return self._task_start_generation
-
-    @property
-    def task_change_generation(self) -> int:
-        """Return the monotonic count of committed task start and exit changes."""
-
-        return self._task_change_generation
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    async def wait_for_task_change(self, generation: int) -> None:
-        """Wait until a task starts or reaches terminal state after generation."""
-
-        while self._task_change_generation == generation:
-            self._task_changed.clear()
-            if self._task_change_generation != generation:
-                return
-            await self._task_changed.wait()
 
     def close_failure_generation(self) -> int:
         return self._close_failure_generation
@@ -204,8 +181,6 @@ class BackgroundTaskRegistry:
         return tuple(self._records.values())
 
     def snapshot(self) -> tuple[BackgroundTaskInfo, ...]:
-        """Return an immutable, read-only view of every task in this session."""
-
         return tuple(
             BackgroundTaskInfo(
                 task_id=record.task_id,
@@ -230,8 +205,7 @@ class BackgroundTaskRegistry:
         self._notice_sink = sink
 
     def set_notification_sink(
-        self,
-        sink: Callable[[TaskExitInput], Awaitable[object]] | None,
+        self, sink: Callable[[TaskExitInput], Awaitable[object]] | None
     ) -> tuple[TaskExitInput, ...]:
         self._notification_sink = sink
         if sink is None:
@@ -456,8 +430,7 @@ class BackgroundTaskRegistry:
                 self._records[record.task_id] = record
                 record.monitor = asyncio.create_task(self._monitor(record, log_handle))
                 self._task_start_generation += 1
-                self._task_change_generation += 1
-                self._task_changed.set()
+                self.task_changes.advance()
 
             await self._commit_transition(
                 rows,
@@ -759,8 +732,7 @@ class BackgroundTaskRegistry:
                 raise self._start_cleanup_error
             self._closing = False
             self._closed = True
-            self._task_change_generation += 1
-            self._task_changed.set()
+            self.task_changes.close()
             self._shutdown_killed = tuple(killed)
             shutdown_result = tuple(killed)
         finally:
@@ -951,7 +923,10 @@ class BackgroundTaskRegistry:
                 self._pending_terminals[record.task_id] = candidate, notice
                 raise
             self._pending_terminals.pop(record.task_id, None)
-        await self._notify_terminal_exit(candidate)
+        try:
+            await self._notify_terminal_exit(candidate)
+        finally:
+            self.task_changes.wake()
         return True
 
     def _publish_terminal(
@@ -962,8 +937,7 @@ class BackgroundTaskRegistry:
         record.ended_at = candidate.ended_at
         record.process = candidate.process
         record.terminal_phase = candidate.terminal_phase
-        self._task_change_generation += 1
-        self._task_changed.set()
+        self.task_changes.advance(wake=False)
 
     async def _retry_pending_terminals(self) -> None:
         pending = tuple(self._pending_terminals.items())
@@ -983,8 +957,12 @@ class BackgroundTaskRegistry:
                 self._pending_terminals.pop(task_id, None)
 
         await self._commit_transition(rows, publish, None)
-        for _, (candidate, _) in pending:
-            await self._notify_terminal_exit(candidate)
+        try:
+            for _, (candidate, _) in pending:
+                await self._notify_terminal_exit(candidate)
+        finally:
+            if pending:
+                self.task_changes.wake()
 
     async def _read_output(
         self,

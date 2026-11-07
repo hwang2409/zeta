@@ -42,9 +42,7 @@ class IdleNudgeLifecycle:
         self,
         *,
         clock: Callable[[], float],
-        wait: Callable[
-            [Callable[[], Awaitable[None]], float | None], Awaitable[bool]
-        ]
+        wait: Callable[[Callable[[], Awaitable[None]], float | None], Awaitable[bool]]
         | None = None,
         nudge_seconds: float | None = None,
         nudge_limit: int = 3,
@@ -57,9 +55,7 @@ class IdleNudgeLifecycle:
         self._nudge_count = 0
         self._immediate_reminded = False
 
-    async def reserve_immediate_reminder(
-        self, fence: TerminalTransitionFence
-    ) -> bool:
+    async def reserve_immediate_reminder(self, fence: TerminalTransitionFence) -> bool:
         """Reserve one immediate reminder, sharing the nudge limit and fence."""
         if self._immediate_reminded or self._nudge_count >= self._nudge_limit:
             return False
@@ -120,7 +116,9 @@ def format_idle_resource_usage(usage: dict[str, object]) -> str:
 
     count = usage["idle_child_count"]
     floor = usage["idle_child_fd_floor"]
-    warning = "; warning: more than 16 idle children" if usage["idle_child_warning"] else ""
+    warning = (
+        "; warning: more than 16 idle children" if usage["idle_child_warning"] else ""
+    )
     return f"idle children: {count}; known fd floor: {floor}{warning}"
 
 
@@ -190,9 +188,7 @@ class TaskSafetyLifecycle:
         limit: float,
         *,
         clock: Callable[[], float] = time.monotonic,
-        wait: Callable[
-            [Callable[[], Awaitable[None]], float | None], Awaitable[bool]
-        ]
+        wait: Callable[[Callable[[], Awaitable[None]], float | None], Awaitable[bool]]
         | None = None,
         cohort_seconds: float = TASK_SAFETY_COHORT_SECONDS,
     ) -> None:
@@ -229,9 +225,7 @@ class TaskSafetyLifecycle:
             window = self._windows.get(task_id)
             if window is None:
                 started = task.started_at if task.started_at is not None else now
-                self._windows[task_id] = _TaskSafetyWindow(
-                    task, started + self._limit
-                )
+                self._windows[task_id] = _TaskSafetyWindow(task, started + self._limit)
             else:
                 window.task = task
 
@@ -239,7 +233,7 @@ class TaskSafetyLifecycle:
         self, registry: BackgroundTaskRegistry, generation: int
     ) -> None:
         owner_change = asyncio.create_task(self._changed.wait())
-        task_change = asyncio.create_task(registry.wait_for_task_change(generation))
+        task_change = asyncio.create_task(registry.task_changes.wait(generation))
         try:
             await asyncio.wait(
                 (owner_change, task_change),
@@ -303,8 +297,8 @@ class TaskSafetyLifecycle:
         registry: BackgroundTaskRegistry,
         publish_notice: Callable[[str], Awaitable[str]],
     ) -> None:
-        while not registry.closed:
-            generation = registry.task_change_generation
+        while not registry.task_changes.closed:
+            generation = registry.task_changes.generation
             now = self._clock()
             self._reconcile_running(
                 {task.task_id: task for task in registry.snapshot() if task.running},

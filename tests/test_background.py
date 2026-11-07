@@ -54,6 +54,7 @@ from zeta.tools._shared.process import (
     _group_exists,
     _OrderedLogWriter,
 )
+from zeta.tools._shared.task_changes import TaskChangeSignal
 from zeta.tui.render import format_status
 
 
@@ -89,15 +90,19 @@ async def test_termination_does_not_signal_reused_descendant_pid(monkeypatch) ->
 
     monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", snapshot)
     monkeypatch.setattr(spawn_module, "_signal_group", lambda process, number: None)
-    monkeypatch.setattr(spawn_module, "_signal_pids", lambda pids, number: signals.extend(
-        (pid, number) for pid in pids
-    ))
+    monkeypatch.setattr(
+        spawn_module,
+        "_signal_pids",
+        lambda pids, number: signals.extend((pid, number) for pid in pids),
+    )
 
     await _terminate_process(Process(), 0.001)
     assert signals == [(42, signal.SIGTERM)]
 
 
-def _task_notification(item: TaskExitInput) -> pending_delivery_module.NotificationInput:
+def _task_notification(
+    item: TaskExitInput,
+) -> pending_delivery_module.NotificationInput:
     data: dict[str, object] = {
         "task_id": item.task_id,
         "headline": item.command,
@@ -173,9 +178,13 @@ async def test_shutdown_snapshot_does_not_block_live_loop(
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notice_is_structured_for_field_accessing_sinks(tmp_path: Path) -> None:
+async def test_shutdown_notice_is_structured_for_field_accessing_sinks(
+    tmp_path: Path,
+) -> None:
     notices = []
-    registry = BackgroundTaskRegistry(notice_sink=lambda notice: notices.append(notice.message))
+    registry = BackgroundTaskRegistry(
+        notice_sink=lambda notice: notices.append(notice.message)
+    )
     task_id, _ = await registry.start("sleep 30", tmp_path)
     await registry.close()
     assert any("killed on session exit" in message for message in notices)
@@ -377,7 +386,9 @@ async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
         wakes += 1
 
     registry = _notification_registry(store, wake_sink=lambda _source: wake())
-    task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
+    task_id, _ = await registry.start(
+        _python("import time; time.sleep(30)"), Path.cwd()
+    )
     killed = await registry.close()
     assert task_id in killed
     assert store.agent_notifications() == []
@@ -399,7 +410,11 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
             directory_fd=session_store.directory_fd,
         )
         seed._records["task-seed"] = _BackgroundRecord(
-            task_id="task-seed", command="sleep 99", pid=4242, process=None, running=True
+            task_id="task-seed",
+            command="sleep 99",
+            pid=4242,
+            process=None,
+            running=True,
         )
         seed._persist()
         seed.release_directory()
@@ -414,7 +429,9 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     # First resume: recovery must fire through the normal AgentLoop construction.
     store1 = ConversationStore(tmp_path, session_id="restart")
     seed_running_row(store1)
-    loop1 = AgentLoop(FakeBackend([]), store1, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop1 = AgentLoop(
+        FakeBackend([]), store1, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
     await loop1.activate()
     recovered = task_exits(store1)
     assert len(recovered) == 1
@@ -428,7 +445,9 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
     # the observed-notification check must keep it at exactly one.
     store2 = ConversationStore(tmp_path, session_id="restart")
     seed_running_row(store2)
-    loop2 = AgentLoop(FakeBackend([]), store2, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop2 = AgentLoop(
+        FakeBackend([]), store2, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
     await loop2.activate()
     assert len(task_exits(store2)) == 1
     await loop2.close()
@@ -436,7 +455,9 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_failed_run_background_start_uses_tool_error_as_canonical_result(tmp_path: Path) -> None:
+async def test_failed_run_background_start_uses_tool_error_as_canonical_result(
+    tmp_path: Path,
+) -> None:
     # A failed run_background start is rendered by its error tool card; do not
     # persist a second task_exited receipt.
     store = ConversationStore(tmp_path / "session")
@@ -455,7 +476,11 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
     notices = []
     registry.background_tasks.set_notice_sink(notices.append)
     result = await registry.execute(
-        ToolCall("macro-fail", "bash", {"command": "echo hi", "cwd": str(tmp_path / "does-not-exist")}),
+        ToolCall(
+            "macro-fail",
+            "bash",
+            {"command": "echo hi", "cwd": str(tmp_path / "does-not-exist")},
+        ),
         _background=True,
     )
     assert result["isError"] is True
@@ -483,9 +508,7 @@ async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
         _python("import time; time.sleep(30)"), Path.cwd()
     )
 
-    await registry.execute(
-        ToolCall("kill", "task_kill", {"task_id": task_id})
-    )
+    await registry.execute(ToolCall("kill", "task_kill", {"task_id": task_id}))
 
     task_exits = [
         entry
@@ -503,7 +526,10 @@ async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="task-fork")
     store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("before notification")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("before notification")]),
+            MessageOrigin.USER,
+        )
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
     store.append_checkpoint("before-task")
@@ -718,6 +744,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
     assert "b2517c6f0fbb448e86dbb8b34fe0fbc0" in plain
     assert "question withdrawn: child finished" not in plain
 
+
 def test_child_question_notification_strips_terminal_controls() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
     from zeta.tui.render import render_agent_notification
@@ -834,7 +861,8 @@ async def test_agent_store_closes_after_each_foreground_completion(
     owner = loop._background_owner
     track_store = owner.track_store
     owner.track_store = lambda child_store: (
-        child_stores.append(child_store), track_store(child_store)
+        child_stores.append(child_store),
+        track_store(child_store),
     )
 
     try:
@@ -947,7 +975,9 @@ async def test_wait_for_store_closes_does_not_spin_before_done_callback(
 
 
 @pytest.mark.asyncio
-async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path) -> None:
+async def test_background_agent_store_closes_before_root_shutdown(
+    tmp_path: Path,
+) -> None:
     call = ToolCall(
         "background",
         "agent",
@@ -963,7 +993,8 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
     owner = loop._background_owner
     track_store = owner.track_store
     owner.track_store = lambda child_store: (
-        child_stores.append(child_store), track_store(child_store)
+        child_stores.append(child_store),
+        track_store(child_store),
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(owner.wait(), timeout=10)
@@ -1099,7 +1130,9 @@ async def test_background_stdin_is_owned_pipe_when_parent_stdin_is_a_tty(
 async def test_background_stdin_round_trip_and_eof(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry()
     task_id, _ = await tasks.start(
-        _python("import sys; data=sys.stdin.buffer.read(); print(data.decode(), end='')"),
+        _python(
+            "import sys; data=sys.stdin.buffer.read(); print(data.decode(), end='')"
+        ),
         tmp_path,
     )
     first = await tasks.input(task_id, "hello ")
@@ -1109,16 +1142,25 @@ async def test_background_stdin_round_trip_and_eof(tmp_path: Path) -> None:
     assert tasks.records[0].stdin is None
     assert stdin_writer.is_closing()
     assert first == {
-        "task_id": task_id, "bytes_written": 6, "eof": False,
-        "status": "committed", "retry": False,
+        "task_id": task_id,
+        "bytes_written": 6,
+        "eof": False,
+        "status": "committed",
+        "retry": False,
     }
     assert second == {
-        "task_id": task_id, "bytes_written": 5, "eof": True,
-        "status": "committed", "retry": False,
+        "task_id": task_id,
+        "bytes_written": 5,
+        "eof": True,
+        "status": "committed",
+        "retry": False,
     }
     assert await tasks.input(task_id, eof=True) == {
-        "task_id": task_id, "bytes_written": 0, "eof": True,
-        "status": "committed", "retry": False,
+        "task_id": task_id,
+        "bytes_written": 0,
+        "eof": True,
+        "status": "committed",
+        "retry": False,
     }
     await _wait_for_exit(tasks, task_id)
     assert (await tasks.output(task_id))["output"] == "hello world"
@@ -1126,7 +1168,9 @@ async def test_background_stdin_round_trip_and_eof(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_background_stdin_cancellation_returns_committed_bytes(tmp_path: Path) -> None:
+async def test_background_stdin_cancellation_returns_committed_bytes(
+    tmp_path: Path,
+) -> None:
     tasks = BackgroundTaskRegistry(stdin_drain_timeout=1)
     task_id, _ = await tasks.start(
         _python(
@@ -1161,12 +1205,12 @@ async def test_background_stdin_cancellation_returns_committed_bytes(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_background_stdin_timeout_aborts_fd_and_forbids_retry(tmp_path: Path) -> None:
+async def test_background_stdin_timeout_aborts_fd_and_forbids_retry(
+    tmp_path: Path,
+) -> None:
     tasks = BackgroundTaskRegistry(stdin_drain_timeout=0.01, term_grace=0.1)
     task_id, _ = await tasks.start(
-        _python(
-            "import sys; data=sys.stdin.buffer.read(); print(len(data), end='')"
-        ),
+        _python("import sys; data=sys.stdin.buffer.read(); print(len(data), end='')"),
         tmp_path,
     )
     writer = tasks.records[0].stdin
@@ -1188,7 +1232,9 @@ async def test_background_stdin_timeout_aborts_fd_and_forbids_retry(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_background_stdin_serializes_writes_and_bounds_input(tmp_path: Path) -> None:
+async def test_background_stdin_serializes_writes_and_bounds_input(
+    tmp_path: Path,
+) -> None:
     tasks = BackgroundTaskRegistry()
     task_id, _ = await tasks.start(
         _python("import sys; sys.stdout.write(sys.stdin.read()); sys.stdout.flush()"),
@@ -1233,7 +1279,9 @@ async def test_background_stdin_unknown_finished_and_kill_races(tmp_path: Path) 
     shutting_down = BackgroundTaskRegistry()
     shutdown_id, _ = await shutting_down.start("sleep 30", tmp_path)
     shutdown_writes = [shutting_down.input(shutdown_id, "x" * 100) for _ in range(10)]
-    await asyncio.gather(shutting_down.close(), *shutdown_writes, return_exceptions=True)
+    await asyncio.gather(
+        shutting_down.close(), *shutdown_writes, return_exceptions=True
+    )
     assert shutting_down.records[-1].stdin is None
 
 
@@ -1242,9 +1290,10 @@ async def test_task_output_reads_immediately_and_rejects_wait_argument(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    assert "wait_seconds" not in registry.definitions_by_name["task_output"].parameters[
-        "properties"
-    ]
+    assert (
+        "wait_seconds"
+        not in registry.definitions_by_name["task_output"].parameters["properties"]
+    )
     started = await registry.execute(
         ToolCall(
             "start",
@@ -1572,7 +1621,9 @@ async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
             directory_fd=store.directory_fd,
             output_limit=4,
         )
-        assert (await resumed.output(task_id, since=0))["output"] == "cancellation-output"
+        assert (await resumed.output(task_id, since=0))[
+            "output"
+        ] == "cancellation-output"
         await resumed.close()
 
 
@@ -1622,7 +1673,9 @@ async def test_wait_publishes_terminal_state_only_after_archive_commit(
             await wait_started.wait()
 
             persisted = json.loads(
-                (store.session_dir / "background_tasks.json").read_text(encoding="utf-8")
+                (store.session_dir / "background_tasks.json").read_text(
+                    encoding="utf-8"
+                )
             )
             assert not waiting.done()
             assert tasks.snapshot()[0].running is True
@@ -1638,7 +1691,9 @@ async def test_wait_publishes_terminal_state_only_after_archive_commit(
             result = await asyncio.wait_for(waiting, timeout=10)
 
             persisted = json.loads(
-                (store.session_dir / "background_tasks.json").read_text(encoding="utf-8")
+                (store.session_dir / "background_tasks.json").read_text(
+                    encoding="utf-8"
+                )
             )
             assert result == {"task_id": task_id, "running": False, "exit_code": 0}
             assert tasks.snapshot()[0].running is False
@@ -1729,15 +1784,15 @@ async def test_crash_between_data_and_manifest_recovers(
 
         assert after_manifest["output"] == "after-manifest"
         assert archive == b"committedinterruptedafter-manifest"
-        assert not (
-            store.session_dir / f"background-{after_manifest_id}.log"
-        ).exists()
+        assert not (store.session_dir / f"background-{after_manifest_id}.log").exists()
         await recovered_again.close()
 
 
 @pytest.mark.asyncio
 async def test_active_task_log_recovered_after_crash(tmp_path: Path) -> None:
-    with ConversationStore(tmp_path / "sessions", session_id="active-log-crash") as store:
+    with ConversationStore(
+        tmp_path / "sessions", session_id="active-log-crash"
+    ) as store:
         task_id = "task-crashed-active"
         payload = b"output-written-before-crash"
         (store.session_dir / f"background-{task_id}.log").write_bytes(payload)
@@ -1824,7 +1879,9 @@ async def test_task_output_reads_archive_not_replaceable_path(tmp_path: Path) ->
 async def test_output_beyond_ring_recoverable_active_and_finished(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with ConversationStore(tmp_path / "sessions", session_id="concurrent-output") as store:
+    with ConversationStore(
+        tmp_path / "sessions", session_id="concurrent-output"
+    ) as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
@@ -1894,7 +1951,7 @@ async def test_output_beyond_ring_recoverable_active_and_finished(
 
 
 def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
-    script = r'''
+    script = r"""
 import asyncio, json, os, resource, sys
 from pathlib import Path
 from zeta.core.store import ConversationStore
@@ -1934,7 +1991,7 @@ try:
     asyncio.run(main(root, lease))
 finally:
     lease.close()
-'''
+"""
     completed = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],
         text=True,
@@ -1950,7 +2007,9 @@ finally:
 async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=tmp_path))
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="fake", cwd=tmp_path)
+    )
     store = opened.store
     tasks = BackgroundTaskRegistry(
         session_dir=store.session_dir,
@@ -2002,7 +2061,9 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
         def write(self, data: bytes) -> int:
             write_entered.set()
             try:
-                assert release_write.wait(timeout=10), "event loop could not release log write"
+                assert release_write.wait(timeout=10), (
+                    "event loop could not release log write"
+                )
                 return self._handle.write(data)
             finally:
                 write_finished.set()
@@ -2054,7 +2115,9 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, max_output_chars=10_000, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=10_000, skill_catalog=SkillCatalog.empty()
+    )
     started = await registry.execute(
         ToolCall(
             "start",
@@ -2162,10 +2225,14 @@ async def test_background_task_stays_running_for_detached_group_member(
 
 
 @pytest.mark.asyncio
-async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Path) -> None:
+async def test_background_kill_escalates_for_term_ignoring_process(
+    tmp_path: Path,
+) -> None:
     tasks = BackgroundTaskRegistry(term_grace=0.03)
     task_id, _ = await tasks.start(
-        _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+        _python(
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        ),
         tmp_path,
     )
     result = await tasks.kill(task_id)
@@ -2365,7 +2432,9 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
         await tasks.start(
-            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            _python(
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            ),
             tmp_path,
         )
         for _ in range(3)
@@ -2413,7 +2482,9 @@ async def test_close_terminates_many_tasks_in_one_grace_period(
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
         await tasks.start(
-            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            _python(
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            ),
             tmp_path,
         )
         for _ in range(20)
@@ -2423,7 +2494,9 @@ async def test_close_terminates_many_tasks_in_one_grace_period(
 
     # test-contract: complexity shutdown cost is one batch, not one grace per task
     assert termination_batches == [len(task_ids)]
-    assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
+    assert all(
+        not _group_exists(tasks.records[index].pid) for index in range(len(task_ids))
+    )
 
 
 @pytest.mark.asyncio
@@ -2437,7 +2510,7 @@ async def test_background_approval_is_enforced(tmp_path: Path) -> None:
             always_deny={"run_background"},
             default=ApprovalDecision.ALLOW,
         ),
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     result = await denied.execute(
         ToolCall("deny", "run_background", {"command": "sleep 30"})
@@ -2447,7 +2520,9 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
+async def test_more_than_eight_background_tasks_run_concurrently(
+    tmp_path: Path,
+) -> None:
     tasks = BackgroundTaskRegistry()
     gate = tmp_path / "release"
     try:
@@ -2467,7 +2542,9 @@ async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    first = ToolRegistry(store.cwd, session_store=store, skill_catalog=SkillCatalog.empty())
+    first = ToolRegistry(
+        store.cwd, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
     started = await first.execute(
         ToolCall("start", "run_background", {"command": "sleep 30"})
     )
@@ -2477,7 +2554,11 @@ async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
     resumed_store = ConversationStore(
         tmp_path / "sessions", session_id=store.session_id
     )
-    resumed = ToolRegistry(resumed_store.cwd, session_store=resumed_store, skill_catalog=SkillCatalog.empty())
+    resumed = ToolRegistry(
+        resumed_store.cwd,
+        session_store=resumed_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
     output = await resumed.execute(
         ToolCall("output", "task_output", {"task_id": task_id})
     )
@@ -2519,12 +2600,14 @@ async def test_task_input_approval_is_scoped_to_each_data_chunk(tmp_path: Path) 
     definition = registry.definitions_by_name["task_input"]
     assert definition.requires_approval is True
     assert definition.approval_subject == "data"
-    assert policy.decide(
-        registry.resolve_call("task_input", {"data": "safe input"})
-    ) is ApprovalDecision.ALLOW
-    assert policy.decide(
-        registry.resolve_call("task_input", {"data": "unsafe input"})
-    ) is ApprovalDecision.DENY
+    assert (
+        policy.decide(registry.resolve_call("task_input", {"data": "safe input"}))
+        is ApprovalDecision.ALLOW
+    )
+    assert (
+        policy.decide(registry.resolve_call("task_input", {"data": "unsafe input"}))
+        is ApprovalDecision.DENY
+    )
     denied = await registry.execute(
         ToolCall("deny-input", "task_input", {"task_id": "unknown", "data": "unsafe"})
     )
@@ -2554,7 +2637,9 @@ async def test_registry_setup_ignores_corrupt_background_state(
     store = ConversationStore(tmp_path / "sessions")
     path = store.session_dir / "background_tasks.json"
     path.write_bytes(payload)
-    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
     assert registry.background_tasks.running_count == 0
     assert path.read_bytes() == payload
     await registry.close()
@@ -2564,7 +2649,7 @@ class _ControlledTaskSafetyRegistry:
     def __init__(self) -> None:
         self.tasks: list[SimpleNamespace] = []
         self.kills: list[tuple[str, str]] = []
-        self.task_change_generation = 0
+        self.task_changes = TaskChangeSignal()
         self.closed = False
 
     def snapshot(self) -> tuple[SimpleNamespace, ...]:
@@ -2573,10 +2658,6 @@ class _ControlledTaskSafetyRegistry:
     async def kill(self, task_id: str, *, cause: str) -> None:
         self.kills.append((task_id, cause))
         next(task for task in self.tasks if task.task_id == task_id).running = False
-
-    async def wait_for_task_change(self, generation: int) -> None:
-        assert generation == self.task_change_generation
-        await asyncio.Future()
 
 
 class _ControlledTaskSafetyWait:
@@ -2609,7 +2690,9 @@ async def test_task_start_and_exit_wake_task_safety_supervisor(tmp_path: Path) -
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     lifecycle = TaskSafetyLifecycle(3600, wait=observe_registry_wake)
     notices = _TaskSafetyNotices()
-    supervisor = asyncio.create_task(lifecycle.run(registry.background_tasks, notices.publish))
+    supervisor = asyncio.create_task(
+        lifecycle.run(registry.background_tasks, notices.publish)
+    )
     task_id: str | None = None
     try:
         assert await timeouts.get() is None
@@ -2642,16 +2725,21 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period() ->
     wait = _ControlledTaskSafetyWait()
     registry = _ControlledTaskSafetyRegistry()
     notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    lifecycle = TaskSafetyLifecycle(
+        3600, clock=lambda: now[0], wait=wait, cohort_seconds=0
+    )
     supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
     try:
         assert await wait.timeouts.get() is None
         registry.tasks.append(
             SimpleNamespace(
-                task_id="late-task", headline="watch ci", running=True, started_at=now[0]
+                task_id="late-task",
+                headline="watch ci",
+                running=True,
+                started_at=now[0],
             )
         )
-        registry.task_change_generation += 1
+        registry.task_changes.advance()
         await wait.releases.put(True)
         assert await wait.timeouts.get() == 3600
         assert registry.kills == []
@@ -2666,7 +2754,7 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period() ->
 
         # Once all tasks end, a later task owns a new full window from its start.
         registry.tasks[0].running = False
-        registry.task_change_generation += 1
+        registry.task_changes.advance()
         lifecycle.delivery_completed(set())
         await wait.releases.put(True)
         assert await wait.timeouts.get() is None
@@ -2676,7 +2764,7 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period() ->
                 task_id="later-task", headline="next", running=True, started_at=now[0]
             )
         )
-        registry.task_change_generation += 1
+        registry.task_changes.advance()
         await wait.releases.put(True)
         assert await wait.timeouts.get() == 3600
     finally:
@@ -2693,10 +2781,18 @@ async def test_task_safety_coalesces_deadlines_within_one_second() -> None:
     registry = _ControlledTaskSafetyRegistry()
     registry.tasks.extend(
         [
-            SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
-            SimpleNamespace(task_id="task-2", headline="second", running=True, started_at=0.5),
-            SimpleNamespace(task_id="task-3", headline="boundary", running=True, started_at=1.0),
-            SimpleNamespace(task_id="task-4", headline="next cohort", running=True, started_at=1.001),
+            SimpleNamespace(
+                task_id="task-1", headline="first", running=True, started_at=0.0
+            ),
+            SimpleNamespace(
+                task_id="task-2", headline="second", running=True, started_at=0.5
+            ),
+            SimpleNamespace(
+                task_id="task-3", headline="boundary", running=True, started_at=1.0
+            ),
+            SimpleNamespace(
+                task_id="task-4", headline="next cohort", running=True, started_at=1.001
+            ),
         ]
     )
     notices = _TaskSafetyNotices()
@@ -2723,16 +2819,20 @@ async def test_task_safety_rereads_terminal_state_at_deadline() -> None:
 
     now = [0.0]
     wait = _ControlledTaskSafetyWait()
-    task = SimpleNamespace(task_id="task-1", headline="done", running=True, started_at=0.0)
+    task = SimpleNamespace(
+        task_id="task-1", headline="done", running=True, started_at=0.0
+    )
     registry = _ControlledTaskSafetyRegistry()
     registry.tasks.append(task)
     notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    lifecycle = TaskSafetyLifecycle(
+        3600, clock=lambda: now[0], wait=wait, cohort_seconds=0
+    )
     supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
     try:
         assert await wait.timeouts.get() == 3600
         task.running = False
-        registry.task_change_generation += 1
+        registry.task_changes.advance()
         now[0] = 3600
         await wait.releases.put(False)
         assert await wait.timeouts.get() is None
@@ -2751,10 +2851,14 @@ async def test_task_completion_turn_rearms_full_safety_window() -> None:
     wait = _ControlledTaskSafetyWait()
     registry = _ControlledTaskSafetyRegistry()
     registry.tasks.append(
-        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+        SimpleNamespace(
+            task_id="task-1", headline="watch ci", running=True, started_at=0.0
+        )
     )
     notices = _TaskSafetyNotices()
-    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    lifecycle = TaskSafetyLifecycle(
+        3600, clock=lambda: now[0], wait=wait, cohort_seconds=0
+    )
     supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
     try:
         assert await wait.timeouts.get() == 3600

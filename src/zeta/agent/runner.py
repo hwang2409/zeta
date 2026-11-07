@@ -186,11 +186,7 @@ async def consume_child(
         return child_loop._background_owner.owned_running(instance_id)
 
     def owned_tasks() -> tuple[tuple[str, str], ...]:
-        return tuple(
-            (task.task_id, task.headline)
-            for task in child_loop.tool_registry.background_tasks.snapshot()
-            if task.running
-        )
+        return FinishGateState.owned_tasks(child_loop)
 
     try:
         if notification_turn:

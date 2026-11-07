@@ -1029,7 +1029,6 @@ async def finish_background_child(
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
-    close_cause = "background child completion cleanup"
     try:
         try:
             result = await child_task
@@ -1093,11 +1092,7 @@ async def finish_background_child(
             await await_owned_work(child_loop, finish_gate_state)
         # Admission has ended. Closing now can only kill tasks whose safety
         # deadline expired; direct children remain live for durable transfer.
-        close_cause = (
-            "background child cancellation cleanup"
-            if status == "canceled"
-            else "background child completion cleanup"
-        )
+        close_cause = f"background child {'cancellation' if status == 'canceled' else 'completion'} cleanup"
         killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
@@ -1106,11 +1101,8 @@ async def finish_background_child(
         killed_task_ids_truncated = len(killed_tasks) > len(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
-        close_event = (
-            "child cancellation" if status == "canceled" else "child completion"
-        )
         killed_task_notice = (
-            f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
+            f"\nbackground tasks killed on child {'cancellation' if status == 'canceled' else 'completion'}; cause: {close_cause}: "
             + ", ".join(
                 f"{task_id} (background command; archive: {child_path}/background-output.archive)"
                 for task_id in killed_tasks
@@ -1252,6 +1244,7 @@ async def finish_background_child(
             raise asyncio.CancelledError
     finally:
         try:
+            close_cause = f"background child {'cancellation' if status == 'canceled' else 'completion'} cleanup"
             await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.
