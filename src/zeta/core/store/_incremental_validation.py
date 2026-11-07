@@ -39,6 +39,7 @@ class IncrementalValidationMixin:
         self._active_pending_prompt_messages: dict[str, Message] = {}
         self._active_notification_delivery_message: Message | None = None
         self._active_last_message: Message | None = None
+        self._active_last_turn_end: ConversationEntry | None = None
 
     def _rebuild_incremental_validation_state(self) -> None:
         """Build O(1) integrity indexes after a complete validation pass."""
@@ -91,6 +92,7 @@ class IncrementalValidationMixin:
             self._active_notification_delivery_message
         )
         staged._active_last_message = self._active_last_message
+        staged._active_last_turn_end = self._active_last_turn_end
         staged._task_notification_ids = set(self._task_notification_ids)
         staged._sent_message_receipts = list(self._sent_message_receipts)
         for index, entry in enumerate(entries):
@@ -124,6 +126,7 @@ class IncrementalValidationMixin:
             staged._active_notification_delivery_message
         )
         self._active_last_message = staged._active_last_message
+        self._active_last_turn_end = staged._active_last_turn_end
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
@@ -254,7 +257,9 @@ class IncrementalValidationMixin:
         self._active_pending_prompt_entries[entry.id] = entry
 
     def _record_active_entry(self, entry: ConversationEntry) -> None:
-        if entry.type == "message":
+        if entry.type == "turn_end":
+            self._active_last_turn_end = entry
+        elif entry.type == "message":
             self._record_message_entry(entry)
         elif entry.type == "approval_request":
             raise ConversationIntegrityError(

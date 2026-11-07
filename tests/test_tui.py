@@ -12510,28 +12510,66 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
 
 @pytest.mark.asyncio
 async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[tuple[str, int]] = []
+    notice_delivered = asyncio.Event()
+
+    def notice_sink(message: str) -> None:
+        notices.append((message, threading.get_ident()))
+        notice_delivered.set()
+
     persistence = DraftPersistence(
         tmp_path / "draft",
         delay=0,
-        notice_sink=lambda message: notices.append((message, threading.get_ident())),
+        notice_sink=notice_sink,
     )
+    loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
+    call_soon_threadsafe = loop.call_soon_threadsafe
+    late_notice: tuple[Callable[..., object], tuple[object, ...]] | None = None
+
+    def capture_late_notice(
+        callback: Callable[..., object],
+        *args: object,
+        context: object = None,
+    ) -> object:
+        nonlocal late_notice
+        if callback is notice_sink:
+            late_notice = (callback, args)
+            return None
+        return call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", capture_late_notice)
 
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
     _patch_draft_publish(monkeypatch, fail)
-    persistence.schedule("first")
-    with pytest.raises(OSError, match="disk unavailable"):
-        await persistence.flush_pending()
+    notice_handle: asyncio.Handle | None = None
+    try:
+        persistence.schedule("first")
+        with pytest.raises(OSError, match="disk unavailable"):
+            await persistence.flush_pending()
 
-    assert notices == [(
-        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
-        loop_thread,
-    )]
+        assert late_notice is not None
+        callback, args = late_notice
+        notice_handle = loop.call_soon(callback, *args)
+        await asyncio.wait_for(notice_delivered.wait(), 10)
+    finally:
+        if notice_handle is not None and not notice_delivered.is_set():
+            notice_handle.cancel()
+        if late_notice is not None and not notice_delivered.is_set():
+            callback, args = late_notice
+            callback(*args)
+
+    assert notices == [
+        (
+            "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+            loop_thread,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -12951,15 +12989,24 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
 
 
 
-def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("do the thing")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("do the thing")]),
+            MessageOrigin.USER,
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
-    store.append_message(build_nudge_message())
+    nudge = build_nudge_message()
+    assert nudge.role is MessageRole.SYSTEM
+    assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
+    store.append_message(nudge)
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -12971,11 +13018,15 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
         console=Console(file=output, force_terminal=False),
     )
 
-    app._rebuild_transcript()
+    try:
+        app._rebuild_transcript()
 
-    rendered = Text.from_ansi(output.getvalue()).plain
-    assert "here is the answer" in rendered
-    assert "ended your turn" not in rendered
+        rendered = Text.from_ansi(output.getvalue()).plain
+        assert "here is the answer" in rendered
+        assert "[zeta] empty-turn recovery:" in rendered
+        assert rendered.count("do the thing") == 1
+    finally:
+        await app.loop.close()
 
 
 @pytest.mark.asyncio

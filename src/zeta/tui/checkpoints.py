@@ -40,6 +40,7 @@ from ..protocol.types import (
     ToolUseContent,
     assistant_text,
     is_passive_harness_message,
+    is_visible_harness_notice,
 )
 from .cards.base import strip_terminal_controls
 from .render import (
@@ -83,6 +84,14 @@ def _age(created_at: str) -> str:
     if seconds < 86_400:
         return f"{seconds // 3_600}h ago"
     return f"{seconds // 86_400}d ago"
+
+
+def _visible_harness_notice_text(message: Message) -> str | None:
+    if not is_visible_harness_notice(message):
+        return None
+    return "\n".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
 
 
 def _parse_force(args: str) -> tuple[str, bool]:
@@ -703,6 +712,9 @@ class CheckpointTranscriptMixin:
             if message is None:
                 raise RuntimeError("TUI message projection is missing its message")
             if is_passive_harness_message(message):
+                notice_text = _visible_harness_notice_text(message)
+                if notice_text is not None:
+                    self._print_system(notice_text)
                 yield
                 continue
             if message.role is MessageRole.USER:

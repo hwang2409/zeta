@@ -24,7 +24,11 @@ from rich.text import Text
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import read_pid_file, wait_for_path_command
+from tests.support.processes import (
+    read_pid_file,
+    wait_for_path_command,
+    wait_pid_exited,
+)
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
@@ -2213,14 +2217,7 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         release_second_snapshot.set()
         with pytest.raises(asyncio.CancelledError):
             await killing
-        state = await asyncio.to_thread(
-            subprocess.run,
-            ["ps", "-o", "stat=", "-p", str(child_pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert state.returncode != 0 or state.stdout.lstrip().startswith("Z")
+        await wait_pid_exited(child_pid)
     finally:
         release_second_snapshot.set()
         if killing is not None:
