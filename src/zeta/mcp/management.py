@@ -273,7 +273,7 @@ class MCPManagementService:
         )
         project_path = (
             project_config_path(project_dir).resolve()
-            if project_dir is not None and project_dir.is_dir()
+            if project_dir is not None
             else None
         )
         trust_path = home_path.parent / "mcp-trust.json"
