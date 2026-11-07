@@ -56,6 +56,7 @@ BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 OUTPUT_CUTOFF_NOTE = "background output was cut off because a process outside the task still held its output"
+SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -648,12 +649,12 @@ class BackgroundTaskRegistry:
             ]
             records = [record for record, _ in entries]
             killed = [record.task_id for record in records]
-            # Whole-session and child-completion shutdown kills silently; callers
-            # surface the ids (child receipt) instead. Prepare every record before
-            # signaling so that monitors cannot emit notifications during shutdown.
+            notified_records = [record for record in records if record.notify_on_exit]
+            # Prepare every record before signaling so monitors cannot publish a
+            # terminal event until every shutdown kill has a durable cause.
             for record in records:
                 record.notify_on_exit = False
-                record.terminal_phase = "session_shutdown"
+                record.terminal_phase = "task_kill"
                 record.note = self._shutdown_cause or "background task registry closed"
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
@@ -726,6 +727,25 @@ class BackgroundTaskRegistry:
             )
             async with self._transition_lock:
                 await self._commit_notice(shutdown_notice)
+            for record in notified_records:
+                record.notify_on_exit = True
+                try:
+                    await finish(
+                        asyncio.wait_for(
+                            self._notify_terminal_exit(
+                                record,
+                                delivery_deadline=(
+                                    time.monotonic()
+                                    + SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS
+                                ),
+                            ),
+                            timeout=SHUTDOWN_TASK_EXIT_DELIVERY_TIMEOUT_SECONDS,
+                        )
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "shutdown delivery admission timed out"
+                    ) from exc
             if self._start_cleanup_error is not None:
                 raise self._start_cleanup_error
             self._closing = False
@@ -1094,7 +1114,12 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    async def _notify_terminal_exit(self, record: _BackgroundRecord) -> None:
+    async def _notify_terminal_exit(
+        self,
+        record: _BackgroundRecord,
+        *,
+        delivery_deadline: float | None = None,
+    ) -> None:
         if not record.notify_on_exit:
             return
         await self._notify_exit(
@@ -1106,6 +1131,7 @@ class BackgroundTaskRegistry:
             record.note,
             owner=record.owner,
             phase=record.terminal_phase or "natural_exit",
+            delivery_deadline=delivery_deadline,
         )
 
     async def _notify_exit(
@@ -1119,6 +1145,7 @@ class BackgroundTaskRegistry:
         *,
         owner: str = "run_background",
         phase: str = "natural_exit",
+        delivery_deadline: float | None = None,
     ) -> None:
         if self._notification_sink is None:
             return
@@ -1132,6 +1159,7 @@ class BackgroundTaskRegistry:
                 note=note,
                 owner=owner,
                 phase=phase,
+                delivery_deadline=delivery_deadline,
             )
         )
 

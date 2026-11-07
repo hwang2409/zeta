@@ -7,6 +7,14 @@ from typing import Literal
 
 from .process_output import command_headline
 
+TUI_PRESENTED_TASK_KILL_CAUSES = frozenset(
+    {
+        "task_kill tool requested by the agent",
+        "TUI tasks panel requested by the user",
+        "background macro canceled by the user",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class BackgroundTaskNotice:
@@ -42,6 +50,7 @@ class TaskExitInput:
     note: str | None = None
     owner: str = "run_background"
     phase: str = "natural_exit"
+    delivery_deadline: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

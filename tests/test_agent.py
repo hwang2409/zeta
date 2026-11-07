@@ -10314,9 +10314,8 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
-    # S2: a child that still owns a running task when it completes has the task
-    # killed without a notification; close() returns the ids and the runner
-    # folds them into the child's completion receipt (text + data).
+    # S2: a child that still owns a running task when it completes records the
+    # close cause and folds the killed task ids into its completion receipt.
     backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(
@@ -10381,6 +10380,14 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
     assert lifecycle["final_result"] == text
+    task_exit = next(
+        entry
+        for entry in child_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    )
+    assert task_exit.data["background_phase"] == "task_kill"
+    assert task_exit.data["note"] == "finish-gate task safety bound expired after 0.05 seconds"
+    child_store.close()
     await loop.close()
 
 

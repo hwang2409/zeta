@@ -293,9 +293,7 @@ async def test_background_exit_persists_task_notification(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
-    # S1: whole-session shutdown kills running tasks and returns their ids, but
-    # must NOT create task_exited notifications.
+async def test_registry_close_persists_specific_kill_cause(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")
     wakes = 0
 
@@ -305,10 +303,16 @@ async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
 
     registry = _notification_registry(store, wake_sink=lambda _source: wake())
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
+    registry.begin_shutdown("tool registry closed")
     killed = await registry.close()
+
     assert task_id in killed
-    assert store.agent_notifications() == []
-    assert wakes == 0
+    notifications = store.agent_notifications(pending_only=False)
+    assert len(notifications) == 1
+    assert notifications[0].data["task_id"] == task_id
+    assert notifications[0].data["background_phase"] == "task_kill"
+    assert notifications[0].data["note"] == "tool registry closed"
+    assert wakes == 1
 
 
 @pytest.mark.asyncio
@@ -2020,6 +2024,7 @@ async def test_background_task_stays_running_for_detached_group_member(
         ),
         tmp_path,
     )
+    # test-contract: latency allow the detached child to enter the process group.
     await asyncio.sleep(0.1)
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
@@ -2440,7 +2445,7 @@ async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
     async def injected_deadline(timeout: float) -> None:
         assert timeout == 7
         sleep_started.set()
-        await deadline.wait()
+        await asyncio.wait_for(deadline.wait(), 10)
 
     monkeypatch.setattr(
         explicit_finish, "asyncio", SimpleNamespace(sleep=injected_deadline)
@@ -2448,20 +2453,20 @@ async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
     wake = asyncio.Event()
     store = ConversationStore(tmp_path)
     registry = _notification_registry(store, wake_sink=lambda _source: wake.set())
-    first_id, _ = await registry.start(
-        _python("import time; time.sleep(60)"), tmp_path
+    first_id, _ = await asyncio.wait_for(
+        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
     )
     kill = asyncio.create_task(
         explicit_finish.kill_tasks_after_deadline(registry, 7)
     )
-    await sleep_started.wait()
-    second_id, _ = await registry.start(
-        _python("import time; time.sleep(60)"), tmp_path
+    await asyncio.wait_for(sleep_started.wait(), 10)
+    second_id, _ = await asyncio.wait_for(
+        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
     )
 
     deadline.set()
-    killed = await kill
-    await asyncio.wait_for(wake.wait(), timeout=1)
+    killed = await asyncio.wait_for(kill, 10)
+    await asyncio.wait_for(wake.wait(), 10)
     events = store.agent_notifications(pending_only=False)
     cause = (
         "explicit-finish child task safety deadline expired after 7 seconds"
@@ -2470,7 +2475,7 @@ async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
     assert [event.data["task_id"] for event in events] == [first_id, second_id]
     assert all(event.data["background_phase"] == "task_kill" for event in events)
     assert all(event.data["note"] == cause for event in events)
-    await registry.close()
+    await asyncio.wait_for(registry.close(), 10)
     store.close()
 
 

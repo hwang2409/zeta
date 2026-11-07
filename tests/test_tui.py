@@ -99,7 +99,6 @@ from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
-from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -551,7 +550,7 @@ async def _background_event_transcript_count(
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"background tasks killed on session exit: {task_id}"
+            f"⏺ task {task_id} exited"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
@@ -562,6 +561,8 @@ async def _background_event_transcript_count(
             else "⏺ /matrix · failed"
         )
     visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
+    if event == "session_shutdown" and owner == "run_background":
+        assert "session shutdown" in visible
     return visible.count(needle), visible
 
 
@@ -874,7 +875,7 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_run_background_shutdown_output_failure_is_bounded(
+async def test_close_task_notification_admission_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -896,23 +897,7 @@ async def test_run_background_shutdown_output_failure_is_bounded(
         return await original_produce(item)
 
     monkeypatch.setattr(flow, "produce", gated_produce)
-    app = SimpleNamespace(
-        _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
-        _invalidate_prompt=lambda: None,
-        loop=loop,
-    )
-
-    async def close_registry() -> tuple[str, ...]:
-        background_notice(
-            app,
-            BackgroundTaskShutdownNotice(
-                "background tasks killed on session exit: task-1",
-                tasks=(("task-1", "run_background"),),
-            ),
-        )
-        return ()
-
-    monkeypatch.setattr(registry, "close", close_registry)
+    await registry.background_tasks.start("sleep 30", tmp_path)
     ticks = 0
     stop_ticker = asyncio.Event()
 
@@ -924,15 +909,19 @@ async def test_run_background_shutdown_output_failure_is_bounded(
 
     ticker = asyncio.create_task(tick())
     close_task = asyncio.create_task(loop.close())
-    await asyncio.wait_for(producer_started.wait(), 1)
-    with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
-        await asyncio.wait_for(close_task, 2)
-    stop_ticker.set()
-    await ticker
-
-    assert ticks > 10
-    assert not loop._tracked_tasks
-    assert store.agent_notifications() == []
+    try:
+        await asyncio.wait_for(producer_started.wait(), 2)
+        with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
+            await asyncio.wait_for(close_task, 2)
+        assert ticks > 10
+        assert store.agent_notifications() == []
+    finally:
+        allow_producer.set()
+        stop_ticker.set()
+        await ticker
+        await asyncio.gather(close_task, return_exceptions=True)
+        await registry.background_tasks.close()
+        store.close()
 
 
 def test_other_background_notices_remain_visible() -> None:

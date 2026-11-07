@@ -562,7 +562,12 @@ class AgentLoop(
             data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
-            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+            NotificationInput(
+                "task_exit",
+                data,
+                dedupe_key=item.task_id,
+                deadline=item.delivery_deadline,
+            )
         )
 
     async def activate(self) -> None:

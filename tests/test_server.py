@@ -4681,8 +4681,15 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 
 @pytest.mark.asyncio
-async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
-    # Protocol 1.2 gives known notification kinds explicit events.
+@pytest.mark.parametrize(
+    "task_cause",
+    ["foreground child completion cleanup", "tool registry closed"],
+    ids=["child-cleanup", "registry-close"],
+)
+async def test_close_kill_cause_reaches_live_serve_event(
+    tmp_path: Path, task_cause: str
+) -> None:
+    # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
@@ -4690,37 +4697,53 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer, _session_id = await _ready_extensions(server)
+    reader, writer, session_id = await _ready_extensions(server)
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.05)
     reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-    hello_frames = await _request(
-        reader, writer, 4, "hello", {"protocol_version": "1.2"}
-    )
-    store = server.runtime.opened.store
-    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
-    store.append_agent_notification(
-        "child-1",
-        child_session_path="/tmp/child-1",
-        description="child",
-        status="completed",
-        text="child done",
-    )
-    registry = server.runtime.loop.tool_registry.background_tasks
-    task_id, _pid = await registry.start("sleep 30", tmp_path)
-    kill_options = (
-        {"cause": task_cause}
-        if "cause" in inspect.signature(registry.kill).parameters
-        else {}
-    )
-    await registry.kill(task_id, **kill_options)
-    task_frames = await _frames_until_event(reader, "turn_end")
     try:
-        frames = hello_frames
+        hello_frames = await _request(
+            reader, writer, 4, "hello", {"protocol_version": "1.2"}
+        )
+        store = server.runtime.opened.store
+        store.append_agent_notification(
+            "child-1",
+            child_session_path="/tmp/child-1",
+            description="child",
+            status="completed",
+            text="child done",
+        )
+        registry = server.runtime.loop.tool_registry.background_tasks
+        task_id, _pid = await registry.start("sleep 30", tmp_path)
+        registry.begin_shutdown(task_cause)
+        await registry.close()
+
+        history_frames = await _request(
+            reader,
+            writer,
+            6,
+            "session_history",
+            {"session_id": session_id},
+        )
+        history = history_frames[-1]["result"]["messages"]
+        task_rows = [
+            row
+            for row in history
+            if row.get("notification", {}).get("kind") == "task_exited"
+        ]
+        assert len(task_rows) == 1
+        assert task_cause in task_rows[0]["content"][0]["text"]
+
+        task_frames = history_frames
+        if not any(
+            frame.get("params", {}).get("event") == "turn_end"
+            for frame in task_frames
+        ):
+            task_frames += await _frames_until_event(reader, "turn_end")
         events = [
             frame["params"]
-            for frame in task_frames + frames
+            for frame in task_frames + hello_frames
             if frame.get("params", {}).get("event")
             in {"task_exit_notification", "sub_agent_receipt"}
         ]

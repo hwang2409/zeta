@@ -24,6 +24,7 @@ from ..protocol.types import (
     ToolCall,
     ToolUseContent,
 )
+from ..tools._shared.background_task_types import TUI_PRESENTED_TASK_KILL_CAUSES
 from . import theme
 from .cards.agent import AgentCard
 from .cards.agent_message import (
@@ -574,13 +575,10 @@ def render_agent_notification(
     """Render durable notifications unless a tool card or prior TUI owns them."""
     if event.data.get("tui_presented") is True:
         return None
-    if event.data.get("background_phase") == "task_kill" and event.data.get(
-        "note"
-    ) in {
-        "task_kill tool requested by the agent",
-        "TUI tasks panel requested by the user",
-        "background macro canceled by the user",
-    }:
+    if (
+        event.data.get("background_phase") == "task_kill"
+        and event.data.get("note") in TUI_PRESENTED_TASK_KILL_CAUSES
+    ):
         return None
     kind = event.data.get("kind", "agent_completion")
     if kind == "project_inbox":
