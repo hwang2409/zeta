@@ -287,14 +287,14 @@ def _compare_artifacts(session: str, base: dict[str, Any], head: dict[str, Any])
     if len(base_record["records"]) != len(head_record["records"]):
         return "scalar trace invocation count differs"
     for index, (left, right) in enumerate(zip(base_record["records"], head_record["records"]), 1):
+        for metric in right["trace"]["floor_metrics"]:
+            if any(metric[key] > base_record["limits"][key] for key in metric):
+                return f"retained-floor bound check failed: {metric} limits={base_record['limits']}"
         for name in left["digests"]:
             if left["digests"][name] != right["digests"][name]:
                 a = json.loads((base["artifacts"] / str(index) / name).read_text())
                 b = json.loads((head["artifacts"] / str(index) / name).read_text())
                 return f"invocation {index}: {name} at {_pointer_diff(a, b)}"
-        for metric in right["trace"]["floor_metrics"]:
-            if any(metric[key] > base_record["limits"][key] for key in metric):
-                return f"retained-floor bound check failed: {metric} limits={base_record['limits']}"
     return None
 
 
