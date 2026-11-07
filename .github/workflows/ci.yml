@@ -10,8 +10,8 @@ on:
     branches: [main]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Superseded pull-request runs are disposable; main runs are the record.
+  # Every main commit needs a result; superseded pull-request runs do not.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -36,12 +36,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # uv defaults to ~/Library/Caches/uv on macOS; pin one location on
-          # both platforms so the cache step below keys the same way.
-          echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+
+      # uv defaults to ~/Library/Caches/uv on macOS; pin one location on both
+      # platforms so the cache step below keys the same way.
+      - name: Set uv cache location
+        run: echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
 
       - name: Cache uv downloads
         uses: actions/cache@v4
@@ -65,9 +68,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
 
       # ruff is pinned through uv.lock (it is in the dev dependency group) and
       # the violations that predate this job are grandfathered per file and
@@ -85,8 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
       - name: Run Gamma browser-client protocol tests
         run: uv run --frozen pytest -q tests/test_server_gamma.py
