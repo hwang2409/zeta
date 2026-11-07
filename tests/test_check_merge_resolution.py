@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -868,6 +869,33 @@ def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
     if case == "lost line":
         assert "pr-line" in result.stdout
 
+
+
+def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "merge")
+    result = run(r)
+    line = next(line for line in result.stdout.splitlines() if "pr-line" in line)
+    name = line.split("pr-line ", 1)[1].split(":", 1)[0]
+    owner, digest = name.rsplit("@", 1)
+    group = hashlib.sha256(f"{name}=added = 2".encode()).hexdigest()[:12]
+    body = tmp_path / "body"
+    body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{group} -> intentional\n")
+    assert run(r, "--pr-body-file", str(body)).returncode == 0
+    body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{digest} -> stale\n")
+    assert run(r, "--pr-body-file", str(body)).returncode == 1
 
 
 @pytest.mark.parametrize(
