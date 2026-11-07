@@ -15,6 +15,7 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
+from .approval_admission import admit_end_then_terminal, reset_cancelled_settlement
 from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
@@ -90,13 +91,11 @@ class ExternalEnd:
     data: Mapping[str, object]
     suppress_write_errors: bool = False
 
-
 @dataclass(frozen=True, slots=True)
 class Cancel:
     request_id: str
     child_instance_id: str | None = None
     reason: str = "turn_canceled"
-
 
 @dataclass(frozen=True, slots=True)
 class CleanupChild:
@@ -788,7 +787,18 @@ class ApprovalLifecycle:
             except OSError:
                 return None
 
-        resolution = await persist()
+        try:
+            resolution = await persist()
+        except asyncio.CancelledError:
+            current = self._state.records.get(target.key)
+            if (
+                current is not None
+                and current.token == token
+                and generation == self._state.generation
+            ):
+                reset_cancelled_settlement(current, self._release_gate, self._put,
+                                            max((item.token for item in self._state.records.values()), default=0))
+            raise
         current = self._state.records.get(target.key)
         owns_record = (
             current is not None
@@ -924,34 +934,6 @@ class ApprovalLifecycle:
             return exc
         return None
 
-    def _admit_end_then_terminal(
-        self,
-        key: ApprovalKey,
-        end: tuple[str, dict[str, object]] | None,
-        terminal: tuple[str, dict[str, object]] | None,
-    ) -> tuple[Admission | None, Admission | None]:
-        """Admit the end and matching terminal without an await between them."""
-        del key
-        end_result = (
-            self._admit(
-                EventDescriptor.APPROVAL_END,
-                self._session_id(),
-                **end[1],
-            )
-            if end is not None
-            else None
-        )
-        terminal_result = (
-            self._admit(
-                EventDescriptor.TOOL_END,
-                self._session_id(),
-                **terminal[1],
-            )
-            if terminal is not None
-            else None
-        )
-        return end_result, terminal_result
-
     def _release_terminal(self, record: ApprovalRecord) -> Admission | None:
         terminal = record.terminal
         if terminal is None or record.terminal_result is not None:
@@ -1030,8 +1012,9 @@ class ApprovalLifecycle:
             if payload is not None and record.published:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal
-                    end_result, terminal_result = self._admit_end_then_terminal(
-                        record.target.key,
+                    end_result, terminal_result = admit_end_then_terminal(
+                        self._admit,
+                        self._session_id(),
                         ("approval_end", payload),
                         ("tool_end", terminal[2]) if terminal is not None else None,
                     )

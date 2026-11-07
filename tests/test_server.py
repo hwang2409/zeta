@@ -3796,6 +3796,7 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
         notifications.append((event, fields))
         return original_admit(event, session_id, **fields)
 
+    # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(client, "_admit_controller", admit)
     call = ToolCall("missing", "write", {"path": "provider/path"})
     await client._event(

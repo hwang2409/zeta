@@ -349,6 +349,7 @@ async def test_same_tick_approval_reservation_winner(
         events.append(event)
         return original_admit(event, *args, **kwargs)
 
+    # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
@@ -567,6 +568,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         notifications.append(event)
         return original_admit(event, *args, **kwargs)
 
+    # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     try:
         policy = server.runtime.policy
@@ -1167,6 +1169,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             events.append((event, code))
             return original_admit(event, *args, **kwargs)
 
+        # test-contract: seam observe approval admission through the single publication route
         monkeypatch.setattr(server.control, "_admit_controller", record_admit)
         assert server.runtime.loop is not None
         monkeypatch.setattr(
@@ -1219,6 +1222,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
         events.append(event)
         return original_admit(event, *args, **kwargs)
 
+    # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     assert server.runtime.loop is not None
     monkeypatch.setattr(server.runtime.loop, "abort", lambda **kwargs: None)
@@ -1939,6 +1943,7 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         events.append((event, request_id if isinstance(request_id, str) else None))
         return original_admit(event, session_id, **fields)
 
+    # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
