@@ -167,10 +167,11 @@ class DecisionsPanel:
         available = CONTENT_WIDTH - len(label) - 4
         if _cells(title) > available:
             title = _truncate_text(title, available)
+        label_style = theme.ACCENT if item.record.kind == "decision" else theme.DIM
         return overlay.row(
             [
                 (theme.BODY, title),
-                (theme.DIM, f"  {label}"),
+                (label_style, f"  {label}"),
             ],
             selected=selected,
         )

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from dataclasses import fields
 from io import StringIO
@@ -24,6 +25,7 @@ from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.overlay import OverlayControl
+from zeta.tui.slash_handlers import decisions_panel as decisions_panel_module
 
 
 def _lines(texts: list[str]) -> list[list[tuple[str, str]]]:
@@ -166,7 +168,9 @@ async def test_status_card_renders_compaction_with_or_without_fact_floor(
 
 
 @pytest.mark.asyncio
-async def test_decisions_popup_renders_kinds_and_dismisses_information(tmp_path) -> None:
+async def test_decisions_popup_renders_kinds_and_dismisses_information(
+    tmp_path, monkeypatch
+) -> None:
     store = ConversationStore(tmp_path / "sessions")
     attention = AttentionStore(store.session_dir)
     decision = attention.request(
@@ -225,18 +229,38 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(tmp_path)
         text = "\n".join(rows)
         assert "decision" in text and "answer" in text
         assert text.index("decision") < text.index("answer")
-        decision_row = next(row for row in rows if "decision" in row)
-        answer_row = next(row for row in rows if "answer" in row)
-        assert {
-            screen.data_buffer[rows.index(decision_row)][x].style for x in range(100)
-        } != {
-            screen.data_buffer[rows.index(answer_row)][x].style for x in range(100)
-        }
+        decision_badge = next(
+            style
+            for style, text in app._decisions_panel._list_row(
+                app._decisions_panel.items[0]
+            )
+            if text.startswith("  decision ·")
+        )
+        answer_badge = next(
+            style
+            for style, text in app._decisions_panel._list_row(
+                app._decisions_panel.items[1]
+            )
+            if text.startswith("  answer ·")
+        )
+        def foreground(style: str) -> str:
+            return style.split(" on ", 1)[0].split(" bg:", 1)[0]
+
+        assert foreground(decision_badge) != foreground(answer_badge)
         assert "d dismiss" in text
         assert app._decisions_panel.selected.record.kind == "answer"
 
         app._stop_decisions_refresh()
         tick_done = asyncio.Event()
+        dismissal_task: asyncio.Task[None] | None = None
+        original_create_task = asyncio.create_task
+
+        def capture_task(coro):
+            nonlocal dismissal_task
+            dismissal_task = original_create_task(coro)
+            return dismissal_task
+
+        monkeypatch.setattr(decisions_panel_module.asyncio, "create_task", capture_task)
         original_tick = app._decisions_tick
 
         async def wait_for_dismissal() -> None:
@@ -247,7 +271,14 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(tmp_path)
         with set_app(session.app):
             session.app.key_processor.feed(KeyPress("d"))
             session.app.key_processor.process_keys()
-        await tick_done.wait()
+        try:
+            await asyncio.wait_for(tick_done.wait(), timeout=10)
+        except TimeoutError:
+            if dismissal_task is not None:
+                dismissal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dismissal_task
+            raise
         assert information.id not in {item.record.id for item in app._decisions_panel.items}
         dismissed = attention.get(information.id)
         assert dismissed.status == "resolved"
