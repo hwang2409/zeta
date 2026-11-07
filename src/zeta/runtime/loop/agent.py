@@ -115,10 +115,10 @@ from .empty_turn import (
     read_turn_metadata,
     should_nudge_empty_turn,
 )
+from .live_config import LiveConfigMixin
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -152,7 +152,7 @@ class AgentLoop(
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
-    SkillRefreshMixin,
+    LiveConfigMixin,
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
@@ -191,9 +191,9 @@ class AgentLoop(
         child_lineage_publisher: ChildLineagePublisher | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
-        skill_home: Path | None = None,
-        skill_project_dir: Path | None = None,
-        freeze_skill_catalog: bool = False,
+        live_config_home: Path | None = None,
+        live_config_project_dir: Path | None = None,
+        freeze_live_config: bool = False,
     ) -> None:
         if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
             raise ValueError(
@@ -299,7 +299,7 @@ class AgentLoop(
             self.tool_registry.set_approval_policy(approval_policy)
         if self.tool_registry.approval_policy is not None:
             self.tool_registry.bind_approval_store(store)
-        self.tool_schemas = list(
+        self.tool_schemas = tuple(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
@@ -315,11 +315,12 @@ class AgentLoop(
             usage_sink=usage_sink,
         )
         self._initialize_step_delivery(store)
-        self._configure_skill_refresh(
-            catalog=self.tool_registry.skill_catalog,
-            home=skill_home,
-            project_dir=skill_project_dir,
-            frozen=freeze_skill_catalog,
+        self._configure_live_config(
+            skill_catalog=self.tool_registry.skill_catalog,
+            agent_catalog=self.tool_registry.agent_catalog,
+            home=live_config_home,
+            project_dir=live_config_project_dir,
+            frozen=freeze_live_config,
             runtime_prompt=runtime_prompt,
         )
         self.on_completion_success = on_completion_success
@@ -738,7 +739,7 @@ class AgentLoop(
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
-        await self.refresh_skills()
+        await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._check_project_inbox()
@@ -757,7 +758,7 @@ class AgentLoop(
             raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
-        await self._flush_skill_refresh_notices()
+        await self._flush_live_config_notices()
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()

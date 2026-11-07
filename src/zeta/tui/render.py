@@ -541,12 +541,14 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
 # by design. Keep this exhaustive when adding a StreamEventType member.
 BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
 })
 STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
     StreamEventType.ACCOUNT_LIMIT,
     StreamEventType.ACCOUNT_STATE_UNKNOWN,
@@ -682,6 +684,16 @@ def render_event(
         return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         return render_agent_notification(event, identity_index)
+    if event.type is StreamEventType.CONFIG_CHANGED:
+        message = event.data.get("message")
+        if not isinstance(message, str) or not message:
+            return Text("live config changed", style=theme.NOTICE)
+        return Text(
+            message,
+            style=theme.NOTICE,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
         preview = event.data.get("preview", "")
         if not isinstance(preview, str):

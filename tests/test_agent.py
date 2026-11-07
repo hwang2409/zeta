@@ -11660,7 +11660,7 @@ async def test_agent_cwd_sets_child_bash_session_cwd(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert discovery_threads and discovery_threads != [loop_thread]
+    assert discovery_threads and loop_thread not in discovery_threads
     assert (worktree / "bash_marker").exists()
     assert not (parent_dir / "bash_marker").exists()
     await loop.close()
@@ -12573,11 +12573,15 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         project_registry=registry,
     )
 
-    prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)
+    prompt, project_dir = _child_base_system_prompt(
+        loop, str(child_cwd), child_tools
+    )
+    assert isinstance(prompt, str)
 
     assert "PROJECT A MEMORY" in prompt
     assert "PROJECT B MEMORY" not in prompt
     assert "CHILD CWD INSTRUCTIONS" in prompt
+    assert project_dir == child_cwd
     assert child_tools.project_id == project_a.project_id
     assert child_tools.project_id != project_b.project_id
     await child_tools.close()

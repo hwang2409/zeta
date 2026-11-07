@@ -449,6 +449,9 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_prompt, child_project_dir = await asyncio.to_thread(
+            _child_base_system_prompt, loop, cwd_override, child_registry)
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -458,9 +461,7 @@ async def _build_child_loop(
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                await asyncio.to_thread(
-                    _child_base_system_prompt, loop, cwd_override, child_registry
-                ),
+                child_prompt,
                 preset,
                 explicit_finish=explicit_finish,
             ),
@@ -475,7 +476,10 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            live_config_home=child_home,
+            live_config_project_dir=child_project_dir,
         )
+        await child_loop.refresh_live_config(publish=False)
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
         child_loop.account_context = child_registry.account_context
@@ -1168,24 +1172,20 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
-
-
 def _child_base_system_prompt(
     loop: AgentLoop,
     cwd_override: str | None,
     child_registry: ToolRegistry | None = None,
-) -> str | Message:
-    """Compose project context from an explicit cwd that differs from the parent."""
-
+) -> tuple[str | Message, Path]:
     if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
-        return loop.context_assembler.system_prompt
+        scope = getattr(loop, "_live_config_scope", None)
+        project_dir = getattr(scope, "project_dir", Path(loop.store.cwd))
+        return loop.context_assembler.system_prompt, project_dir
     if child_registry is not None:
         child_registry.verify_cwd_identity()
-    home_hint = loop.active_home
-    zeta_home = Path(home_hint) if home_hint else env_home()
+    zeta_home = Path(loop.active_home) if loop.active_home else env_home()
     discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    registry = loop.project_registry
-    session_project = None
+    registry, session_project = loop.project_registry, None
     if loop.root_project_id is not None and registry is not None:
         try:
             session_project = registry.show_project(loop.root_project_id)
@@ -1203,7 +1203,7 @@ def _child_base_system_prompt(
         cwd_project=cwd_project,
         inbox_enabled=False,
     )
-    return context.system_prompt
+    return context.system_prompt, discovery.primary_root or discovery.cwd
 
 
 _EXPLICIT_FINISH_GUIDANCE = (
