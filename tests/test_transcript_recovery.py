@@ -59,6 +59,32 @@ def _strict_reopen(root: Path, session_id: str) -> None:
     reopened.close()
 
 
+def test_semantic_diagnosis_retains_only_rows_before_first_bad_link(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="links")
+    store.append_message(_message("retained"))
+    store.append_message(_message("discarded"))
+    store.close()
+    transcript = root / "links" / "conversation.jsonl"
+    rows = transcript.read_text(encoding="utf-8").splitlines()
+    damaged = json.loads(rows[2])
+    damaged["parent_id"] = "missing"
+    rows[2] = json.dumps(damaged, separators=(",", ":"), sort_keys=True)
+    transcript.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    with pytest.raises(TranscriptLoadError) as raised:
+        refused = ConversationStore(root, session_id="links", _read_only=True)
+        refused.close()
+    facts = getattr(raised.value, "_source_facts", None)
+    assert facts is not None
+    assert raised.value.kind == "broken_links"
+    assert facts.first_bad_row == 3
+    assert facts.prefix.last_sequence == 1
+    assert facts.prefix.last_entry_id == json.loads(rows[1])["id"]
+
+
 def test_transaction_preserves_complete_evidence_and_strictly_reopens(
     tmp_path: Path,
 ) -> None:

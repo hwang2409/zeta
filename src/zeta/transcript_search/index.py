@@ -404,6 +404,7 @@ class TranscriptSource:
     expected_project_id: str | None = None
     append_receipts: tuple[PersistedAppend, ...] | None = None
     recovery_generation: int = 0
+
     @property
     def conversation_path(self) -> Path:
         return self.session_dir / "conversation.jsonl"
@@ -435,17 +436,15 @@ class IndexStatus:
     detail: str | None = None
 
 
-type _RecoveryState = Literal["stale", "rebuilding", "ready", "failed"]
 @dataclass(slots=True)
 class _RefreshState:
     pending: dict[str, TranscriptSource] = field(default_factory=dict)
     waiters: list[asyncio.Future[None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
     failure: str | None = None
-    recovery: dict[str, tuple[int, _RecoveryState]] = field(default_factory=dict)
-_REFRESH_STATES: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[Path, str], _RefreshState]
-] = weakref.WeakKeyDictionary()
+    recovery: dict[str, tuple[int, Literal["stale", "rebuilding", "ready", "failed"]]] = field(default_factory=dict)
+
+_REFRESH_STATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[Path, str], _RefreshState]] = weakref.WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)

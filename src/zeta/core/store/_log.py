@@ -336,7 +336,14 @@ class _FullLoadValidator:
 
     def validated_prefix(self, end_offset: int) -> ValidatedPrefix:
         """Return the exact prefix already accepted by this one-pass validator."""
-        last = self.state._entries[-1] if self.state._entries else None
+        last = next(
+            (
+                entry
+                for entry in reversed(self.state._entries)
+                if self.rows_by_id[entry.id].byte_offset < end_offset
+            ),
+            None,
+        )
         return ValidatedPrefix(
             end_offset=end_offset,
             last_sequence=last.seq if last is not None else 0,
