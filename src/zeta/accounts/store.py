@@ -45,6 +45,15 @@ from ..storage_format import (
     open_writer,
     require_closed_variant,
 )
+from .availability import (
+    AccountDisplay,
+)
+from .availability import (
+    catalog_display as _catalog_display,
+)
+from .availability import (
+    list_display as _list_display,
+)
 from .files import (
     exists as _exists,
 )
@@ -143,18 +152,6 @@ class AccountId:
 
     def __str__(self) -> str:
         return f"{self.provider}:{self.name}"
-
-
-@dataclass(frozen=True, slots=True)
-class AccountDisplay:
-    account: AccountId
-    label: str
-    detail: str | None = None
-    usage: Any = None
-    available: bool = True
-
-    def __str__(self) -> str:
-        return f"{self.account.provider}:{self.label}"
 
 
 class AccountStore:
@@ -273,40 +270,19 @@ class AccountStore:
     def list_catalog(self) -> list[AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
-        return [
-            AccountDisplay(
-                AccountId(*key.split(":", 1)),
-                value["labels"].get(key, key.split(":", 1)[1]),
-            )
-            for key in value["accounts"]
-        ]
+        return _catalog_display(value)
 
     def list_display(self) -> list[AccountDisplay]:
-        result = []
-        catalog = self.list_catalog()
-        with self._home() as home_fd:
-            for item in catalog:
-                tokens = _read_account_tokens(home_fd, item.account)
-                details = (
-                    tuple(filter(None, (tokens.email, tokens.workspace)))
-                    if tokens
-                    else ()
-                )
-                from .usage import read_usage
-                result.append(
-                    AccountDisplay(
-                        item.account,
-                        item.label,
-                        " · ".join(details) or None,
-                        read_usage(self, item.account),
-                        tokens is not None,
-                    )
-                )
-        return result
+        return _list_display(self)
 
     def require_available(self, account: AccountId) -> None:
-        if not any(item.account == account and item.available for item in self.list_display()):
-            raise AccountError(f"account {account} is unavailable: credentials missing; run 'zeta accounts login {account.provider} {account.name} --replace'")
+        if not any(
+            item.account == account and item.available for item in self.list_display()
+        ):
+            raise AccountError(
+                f"account {account} is unavailable: credentials missing; "
+                f"run 'zeta accounts login {account.provider} {account.name} --replace'"
+            )
 
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:

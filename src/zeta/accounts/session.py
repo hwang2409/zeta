@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING, Any
 from ..core.session import account_home
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from ..protocol.types import is_owned_completion_backend
+from .availability import AccountDisplay
 from .exhaustion import classify_subscription_limit, recovery_alternatives
-from .store import AccountDisplay, AccountError, AccountId, AccountStore
+from .store import AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
 
 if TYPE_CHECKING:
@@ -36,9 +37,10 @@ def account_provider(provider: str) -> str | None:
 
 
 def api_key_mode(provider: str) -> bool:
-    return provider in {"claude", "anthropic"} and os.environ.get(
-        "ZETA_ALLOW_API_KEY"
-    ) == "1"
+    return (
+        provider in {"claude", "anthropic"}
+        and os.environ.get("ZETA_ALLOW_API_KEY") == "1"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +79,12 @@ class SessionAccountContext:
     _switch_sequences: dict[str, int] = field(default_factory=dict)
     _account_state_unknown: bool = False
     _unavailable_accounts: tuple[str, ...] = ()
-    _unknown_state: _UnknownAccountState | None = field(default=None, init=False, repr=False)
-    _switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _unknown_state: _UnknownAccountState | None = field(
+        default=None, init=False, repr=False
+    )
+    _switch_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False
+    )
 
     @classmethod
     def load(
@@ -185,7 +191,9 @@ class SessionAccountContext:
             with self.store.pin_guard({canonical: selected}):
                 self._pins[canonical] = selected
                 assert self.manager is not None
-                self.manager.record_account_selection(self.metadata, selected, boundary=0)
+                self.manager.record_account_selection(
+                    self.metadata, selected, boundary=0
+                )
         return selected
 
     def require_active_available(self, provider: str) -> None:
@@ -361,9 +369,7 @@ class SessionAccountContext:
             discard_backend=discard,
         )
 
-    def _mark_unknown(
-        self, build_backend: Callable[[SessionMetadata], Any]
-    ) -> None:
+    def _mark_unknown(self, build_backend: Callable[[SessionMetadata], Any]) -> None:
         self._account_state_unknown = True
         self._unknown_state = _UnknownAccountState(build_backend)
 
@@ -626,7 +632,9 @@ class SessionAccountContext:
 
         await self._run_locked_apply(loop, build_backend, recover)
 
-    async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
+    async def subscription_limit_event(
+        self, failure: object
+    ) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)
 
     def _subscription_limit_event(self, failure: object) -> dict[str, object] | None:

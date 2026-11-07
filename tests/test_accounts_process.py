@@ -13,6 +13,8 @@ from tests.support.account_homes import build_account_home
 from tests.support.server_client import request
 from zeta.accounts import AccountId
 
+_PROCESS_TIMEOUT = 30
+
 
 def _entrypoint() -> Path:
     path = Path(sys.executable).with_name("zeta")
@@ -30,6 +32,42 @@ def _environment(home: Path) -> dict[str, str]:
         if name.startswith("ZETA_TEST_"):
             environment.pop(name)
     return environment
+
+
+async def _wait_until_ready(
+    process: asyncio.subprocess.Process, output: bytearray
+) -> None:
+    assert process.stderr is not None
+    while True:
+        line = await process.stderr.readline()
+        output.extend(line)
+        assert line, output.decode(errors="replace")
+        if b"ready" in line:
+            return
+
+
+async def _stop_process(
+    process: asyncio.subprocess.Process, output: bytearray, step: str
+) -> None:
+    if process.returncode is None:
+        process.send_signal(signal.SIGTERM)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), _PROCESS_TIMEOUT)
+    except TimeoutError as exc:
+        process.kill()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), _PROCESS_TIMEOUT
+            )
+        except TimeoutError as kill_exc:
+            raise AssertionError(
+                f"timed out waiting for {step} after killing the process"
+            ) from kill_exc
+        raise AssertionError(
+            f"timed out waiting for {step}: "
+            f"{(output + stdout + stderr).decode(errors='replace')}"
+        ) from exc
+    assert process.returncode == 0, (output + stdout + stderr).decode(errors="replace")
 
 
 @pytest.mark.parametrize(
@@ -54,6 +92,7 @@ def test_console_surfaces_refuse_only_the_active_missing_account(
         capture_output=True,
         text=True,
         check=False,
+        timeout=_PROCESS_TIMEOUT,
     )
 
     assert result.returncode == 2
@@ -84,6 +123,7 @@ def test_console_lists_non_active_missing_accounts(
         capture_output=True,
         text=True,
         check=False,
+        timeout=_PROCESS_TIMEOUT,
     )
     assert listed.returncode == 0, listed.stderr
     assert "anthropic:current" in listed.stdout
@@ -114,16 +154,16 @@ async def test_console_serve_refuses_a_session_with_missing_active_account(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    assert process.stderr is not None
     output = bytearray()
     writer: asyncio.StreamWriter | None = None
     try:
-        while True:
-            line = await process.stderr.readline()
-            output.extend(line)
-            assert line, output.decode(errors="replace")
-            if b"ready" in line:
-                break
+        try:
+            await asyncio.wait_for(_wait_until_ready(process, output), _PROCESS_TIMEOUT)
+        except TimeoutError as exc:
+            raise AssertionError(
+                "timed out waiting for serve readiness: "
+                f"{output.decode(errors='replace')}"
+            ) from exc
         reader, writer = await asyncio.open_unix_connection(socket_path)
         await request(reader, writer, "hello", "hello", {"protocol_version": "1.1"})
         response = (
@@ -140,16 +180,13 @@ async def test_console_serve_refuses_a_session_with_missing_active_account(
             "run 'zeta accounts login codex work --replace'"
         )
     finally:
-        if writer is not None:
-            writer.close()
-            await writer.wait_closed()
-        if process.returncode is None:
-            process.send_signal(signal.SIGTERM)
-        stdout, stderr = await process.communicate()
-        assert process.returncode == 0, (output + stdout + stderr).decode(
-            errors="replace"
-        )
-        Path(f"{socket_path}.lock").unlink(missing_ok=True)
+        try:
+            if writer is not None:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), _PROCESS_TIMEOUT)
+        finally:
+            await _stop_process(process, output, "serve shutdown")
+            Path(f"{socket_path}.lock").unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
@@ -181,21 +218,16 @@ async def test_console_serve_starts_when_only_non_active_accounts_are_missing(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    assert process.stderr is not None
     output = bytearray()
     try:
-        while True:
-            line = await process.stderr.readline()
-            output.extend(line)
-            assert line, output.decode(errors="replace")
-            if b"ready" in line:
-                break
+        try:
+            await asyncio.wait_for(_wait_until_ready(process, output), _PROCESS_TIMEOUT)
+        except TimeoutError as exc:
+            raise AssertionError(
+                "timed out waiting for serve readiness: "
+                f"{output.decode(errors='replace')}"
+            ) from exc
         assert process.returncode is None
     finally:
-        if process.returncode is None:
-            process.send_signal(signal.SIGTERM)
-        stdout, stderr = await process.communicate()
-        assert process.returncode == 0, (output + stdout + stderr).decode(
-            errors="replace"
-        )
+        await _stop_process(process, output, "serve shutdown")
         Path(f"{socket_path}.lock").unlink(missing_ok=True)

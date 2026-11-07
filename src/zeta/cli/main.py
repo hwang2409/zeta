@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -925,6 +926,26 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
+def _run_account_frontend(run: Callable[[], int]) -> int:
+    try:
+        return run()
+    except AccountError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_tui_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    entrypoint: str,
+    original_argv: list[str],
+) -> int:
+    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    if restart_session_id is not None:
+        return _exec_restart(entrypoint, original_argv, restart_session_id)
+    return exit_status
+
+
 async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     """Run the main TUI, keeping it live while discussion forks are shown.
 
@@ -1095,10 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
-            asyncio.run(run_server(server))
-        except AccountError as exc:
-            print(f"zeta: {exc}", file=sys.stderr)
-            return 2
+            return _run_account_frontend(lambda: asyncio.run(run_server(server)) or 0)
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
@@ -1123,21 +1141,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt is not None:
         from ..runtime.headless import run_headless
 
-        try:
-            return run_headless(args, args.prompt)
-        except AccountError as exc:
-            print(f"zeta: {exc}", file=sys.stderr)
-            return 2
+        return _run_account_frontend(lambda: run_headless(args, args.prompt))
     if args.format != "text":
         parser.error("--format requires --print")
-    try:
-        exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
-    except AccountError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
-        return 2
-    if restart_session_id is not None:
-        return _exec_restart(entrypoint, original_argv, restart_session_id)
-    return exit_status
+    return _run_account_frontend(
+        lambda: _run_tui_command(args, parser, entrypoint, original_argv)
+    )
 
 
 __all__ = ["build_parser", "main"]
