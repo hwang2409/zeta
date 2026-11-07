@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 
 from zeta.protocol.types import (
@@ -28,6 +28,9 @@ class ScriptedTurn:
     delay: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
     stop_reason: str | None = None
+
+
+ACTOR_WAIT_TIMEOUT = 30
 
 
 class FakeBackend(CompletionBackend):
@@ -114,6 +117,77 @@ class FakeBackend(CompletionBackend):
             self.completion_close_count += 1
             if self.close_error is not None:
                 raise self.close_error
+
+
+def _public_input_prompt(messages: Sequence[Message], prompts: Collection[str]) -> str:
+    public_inputs = [
+        block.text
+        for message in messages
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    prompt = next((text for text in public_inputs if text in prompts), None)
+    if prompt is None:
+        raise AssertionError(f"no scripted backend for actor prompt {public_inputs!r}")
+    return prompt
+
+
+class PerActorFakeBackend:
+    def __init__(
+        self,
+        parent_turns: list[ScriptedTurn],
+        child_turns: dict[str, list[ScriptedTurn]],
+        *,
+        parent_prompt: str,
+        gated_child_call: int = 1,
+    ) -> None:
+        self.parent_prompt = parent_prompt
+        self.parent = FakeBackend(parent_turns)
+        self.children = {
+            prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
+        }
+        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
+        self.child_calls = dict.fromkeys(self.children, 0)
+        self.release_children = asyncio.Event()
+        self.gated_child_call = gated_child_call
+
+    async def complete(self, messages, tool_schemas):
+        actor_prompt = _public_input_prompt(
+            messages, {self.parent_prompt, *self.children}
+        )
+        child_prompt = actor_prompt if actor_prompt in self.children else None
+        backend = (
+            self.children[child_prompt] if child_prompt is not None else self.parent
+        )
+        if child_prompt is not None:
+            self.child_calls[child_prompt] += 1
+        if (
+            child_prompt is not None
+            and self.child_calls[child_prompt] == self.gated_child_call
+        ):
+            self.child_started[child_prompt].set()
+            try:
+                await asyncio.wait_for(self.release_children.wait(), ACTOR_WAIT_TIMEOUT)
+            except TimeoutError as error:
+                raise AssertionError("children were not released") from error
+        stream = backend.complete(messages, tool_schemas)
+        if child_prompt is None and self.parent.calls:
+            try:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(started.wait() for started in self.child_started.values())
+                        ),
+                        ACTOR_WAIT_TIMEOUT,
+                    )
+                except TimeoutError as error:
+                    raise AssertionError("child did not start") from error
+                yield await anext(stream)
+            finally:
+                self.release_children.set()
+        async for event in stream:
+            yield event
 
 
 def _script_actor_prompt(messages: Sequence[Message], child_prompts: set[str]) -> str:

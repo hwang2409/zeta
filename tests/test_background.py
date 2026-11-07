@@ -23,7 +23,7 @@ from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import (
     read_pid_file,
     wait_for_path_command,
@@ -949,8 +949,11 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         "agent",
         {"prompt": "child", "description": "background", "background": True},
     )
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[call])],
+        {"child": [ScriptedTurn([TextContent("done")])]},
+        parent_prompt="start",
+        gated_child_call=0,
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
