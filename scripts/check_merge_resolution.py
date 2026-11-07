@@ -168,7 +168,9 @@ def parse_items(
                 line,
                 rendered,
                 fingerprint=(
-                    ast.dump(value, include_attributes=False) if value is not None else ""
+                    ast.dump(value, include_attributes=False)
+                    if value is not None
+                    else ""
                 ),
             )
         )
