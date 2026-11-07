@@ -13361,7 +13361,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     assert task is not None
     await task
 
-    assert off_loop_calls == ["list"]
+    assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
     assert loop.account_context.snapshot()["codex"] == second
     assert AccountStore(home).default("codex") == first
