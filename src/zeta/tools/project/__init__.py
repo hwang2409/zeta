@@ -9,11 +9,11 @@ from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
 
-def _error(message: str) -> StructuredToolResult:
+def _error(message: str, *, kind: str = "project_memory") -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
-        "structuredContent": {"error": {"kind": "project_memory", "message": message}},
+        "structuredContent": {"error": {"kind": kind, "message": message}},
     }
 
 
@@ -31,6 +31,12 @@ async def _inspect_project(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
+        state = getattr(registry, "project_registry_state", None)
+        if state is not None and state.unavailable is not None:
+            return _error(
+                "project registry is temporarily unavailable; try again later",
+                kind="project_registry_unavailable",
+            )
         projects = registry.project_registry
         if projects is None:
             raise ProjectRegistryError("project registry capability is unavailable")
@@ -49,7 +55,8 @@ async def _inspect_project(
             memory = projects._entry_memory_view(project.project_id, byte_cap=64 * 1024)
         else:
             memory = {
-                name: content for name, content in projects.load_memory(project.project_id)
+                name: content
+                for name, content in projects.load_memory(project.project_id)
             }
         return _success_result(
             text_block(f"read bounded memory for project {project.name}"),

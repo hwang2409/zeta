@@ -47,6 +47,10 @@ from time import monotonic as _monotonic
 
 from ..memory.entry_store import utc_now
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
+from ..project_context.projection import (
+    ProjectContextHealth,
+    ProjectContextProjection,
+)
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
@@ -90,6 +94,7 @@ class ProjectContext:
     has_override: bool = False
     prompt_recipe: str | None = None
     prompt_components: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    health: ProjectContextHealth | None = None
 
 
 def _git_env() -> dict[str, str]:
@@ -193,12 +198,17 @@ def discover_project(
             directory, repo_root, common_dir, None, home, root, False
         )
     first = next(
-        (line for line in worktrees.stdout.splitlines() if line.startswith("worktree ")),
+        (
+            line
+            for line in worktrees.stdout.splitlines()
+            if line.startswith("worktree ")
+        ),
         None,
     )
     if first is None:
         logging.getLogger(__name__).warning(
-            "git project discovery failed for %s: worktree list had no primary", directory
+            "git project discovery failed for %s: worktree list had no primary",
+            directory,
         )
         return ProjectDiscovery(
             directory, repo_root, common_dir, None, home, root, False
@@ -227,7 +237,11 @@ def _checkout_common_dir(path: Path) -> Path | None:
     if not line.startswith("gitdir: "):
         return None
     target = Path(line.removeprefix("gitdir: "))
-    target = (marker.parent / target).resolve() if not target.is_absolute() else target.resolve()
+    target = (
+        (marker.parent / target).resolve()
+        if not target.is_absolute()
+        else target.resolve()
+    )
     if target.parent.name == "worktrees":
         return target.parent.parent
     return target
@@ -260,7 +274,8 @@ def _project_at_root(
             candidate
             for candidate in registry.list_projects()
             if _valid_registry_candidate(candidate, discovery) is not None
-            and Path(candidate.canonical_integration_root).expanduser().resolve() == root
+            and Path(candidate.canonical_integration_root).expanduser().resolve()
+            == root
         ),
         None,
     )
@@ -281,9 +296,7 @@ def _find_or_create_valid_project(
     ]
     for name in names:
         try:
-            return registry.create_project(
-                name, "git", root, memory_profile="zeta"
-            )
+            return registry.create_project(name, "git", root, memory_profile="zeta")
         except ProjectRegistryError:
             project = _project_at_root(registry, root, discovery)
             if project is not None:
@@ -564,27 +577,54 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
     return files
 
 
-def resolve_project_context(
-    discovery: ProjectDiscovery, registry: ProjectRegistry
+def resolve_project_context_from_projects(
+    discovery: ProjectDiscovery, projects: tuple[Project, ...]
 ) -> Project | None:
-    """Resolve cwd-owned private instructions without running Git or creating a project."""
+    """Resolve cwd-owned private instructions from one registry snapshot."""
 
-    if not discovery.eligible or not registry.root.exists():
+    if not discovery.eligible:
         return None
-    if discovery.primary_root is None:
-        return _project_at_root(registry, discovery.cwd, discovery)
-    project = _project_at_root(registry, discovery.primary_root, discovery)
-    if project is not None or discovery.common_dir is None:
-        return project
+    roots = (
+        (discovery.cwd,)
+        if discovery.primary_root is None
+        else (discovery.primary_root,)
+    )
+    for root in roots:
+        project = next(
+            (
+                candidate
+                for candidate in projects
+                if candidate.canonical_integration_root is not None
+                and Path(candidate.canonical_integration_root) == root
+                and _valid_registry_candidate(candidate, discovery) is not None
+            ),
+            None,
+        )
+        if project is not None:
+            return project
+    if discovery.common_dir is None:
+        return None
     return next(
         (
             candidate
-            for candidate in registry.list_projects()
+            for candidate in projects
             if _valid_registry_candidate(candidate, discovery) is not None
             and _checkout_common_dir(Path(candidate.canonical_integration_root))
             == discovery.common_dir
         ),
         None,
+    )
+
+
+def resolve_project_context(
+    discovery: ProjectDiscovery, registry: ProjectRegistry
+) -> Project | None:
+    """Resolve cwd-owned private instructions without running Git or creating a project."""
+
+    if not registry.root.exists():
+        return None
+    return resolve_project_context_from_projects(
+        discovery, tuple(registry.list_projects())
     )
 
 
@@ -604,9 +644,10 @@ def project_instructions_path(
             "here and restart zeta, or start zeta inside a registered project."
         )
     state = registry_state or available_project_registry(zeta_home / "projects")
+    if state.unavailable is not None:
+        return "project instructions unavailable: project registry is temporarily unavailable; try again later"
     if state.registry is None:
-        assert state.unavailable is not None
-        return f"project instructions unavailable: {state.unavailable.reason}"
+        return "project instructions unavailable: project registry capability is unavailable"
     try:
         registry = state.registry
         discovery = discover_project(project_root, user_home=zeta_home.parent)
@@ -705,7 +746,9 @@ def _instruction_files(
                 seen.add(resolved)
                 files.append(resolved)
     if private_project is not None:
-        private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
+        private_agents = (
+            home / "projects" / private_project.project_id / AGENTS_FILENAME
+        )
         if _present(private_agents):
             files.append(private_agents.resolve())
     return files
@@ -723,6 +766,8 @@ def load_project_context(
     session_project: Project | None = None,
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
+    registry: ProjectRegistry | None = None,
+    project_projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -810,7 +855,7 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
-            registry = project_registry(home / "projects")
+            registry = registry or project_registry(home / "projects")
             project = session_project
             if project is not None:
                 manual_memory_sections: list[str] = []
@@ -830,65 +875,82 @@ def load_project_context(
                         "omitted the memory block"
                     )
                 else:
-                    try:
-                        context_entries = registry.load_memory_for_context(
-                            project.project_id
-                        )
-                    except UnsupportedMemoryFormatError:
-                        # Format 2 remains reachable only through the private
-                        # fixture store until the activation PR. Its projection
-                        # is nevertheless complete and directly testable here.
-                        snapshot = registry._entry_memory_state_for_context(
-                            project.project_id
-                        )
-                        projection = render_entry_memory(
-                            snapshot.state,
+                    entry_snapshot = (
+                        project_projection.entry_memory
+                        if project_projection is not None
+                        else None
+                    )
+                    if entry_snapshot is not None:
+                        entry_projection = render_entry_memory(
+                            entry_snapshot.state,
                             now=utc_now(),
                             byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                         )
-                        if len(projection.block.encode("utf-8")) <= budget_for_memory:
-                            memory_block = projection.block
+                        if (
+                            len(entry_projection.block.encode("utf-8"))
+                            <= budget_for_memory
+                        ):
+                            memory_block = entry_projection.block
                         else:
                             notices.append(
                                 f"context · project memory exceeded {byte_cap} byte cap; "
                                 "omitted the memory block"
                             )
                     else:
-                        for entry in context_entries:
-                            path = (
-                                registry.root
-                                / project.project_id
-                                / "memory"
-                                / entry.name
-                            )
-                            section = _format_section(path, entry.content)
-                            candidate_manual = list(manual_memory_sections)
-                            candidate_automatic = list(automatic_memory_sections)
-                            target = (
-                                candidate_automatic
-                                if entry.automatic
-                                else candidate_manual
-                            )
-                            target.append(section)
-                            candidate = _render_memory_block(
-                                project.project_id,
-                                candidate_manual,
-                                candidate_automatic,
-                            )
-                            if len(candidate.encode("utf-8")) <= budget_for_memory:
-                                manual_memory_sections = candidate_manual
-                                automatic_memory_sections = candidate_automatic
-                                loaded.append(path)
-                            else:
-                                notices.append(
-                                    "context · project memory exceeded "
-                                    f"{byte_cap} byte cap; skipped {entry.name}"
+                        try:
+                            context_entries = (
+                                project_projection.memory
+                                if project_projection is not None
+                                else registry.load_memory_for_context(
+                                    project.project_id
                                 )
-                        memory_block = _render_memory_block(
-                            project.project_id,
-                            manual_memory_sections,
-                            automatic_memory_sections,
-                        )
+                            )
+                        except UnsupportedMemoryFormatError:
+                            snapshot = registry._entry_memory_state_for_context(
+                                project.project_id
+                            )
+                            entry_projection = render_entry_memory(
+                                snapshot.state,
+                                now=utc_now(),
+                                byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
+                            )
+                            memory_block = entry_projection.block
+                        else:
+                            for entry in context_entries:
+                                path = (
+                                    registry.root
+                                    / project.project_id
+                                    / "memory"
+                                    / entry.name
+                                )
+                                section = _format_section(path, entry.content)
+                                candidate_manual = list(manual_memory_sections)
+                                candidate_automatic = list(automatic_memory_sections)
+                                target = (
+                                    candidate_automatic
+                                    if entry.automatic
+                                    else candidate_manual
+                                )
+                                target.append(section)
+                                candidate = _render_memory_block(
+                                    project.project_id,
+                                    candidate_manual,
+                                    candidate_automatic,
+                                )
+                                if len(candidate.encode("utf-8")) <= budget_for_memory:
+                                    manual_memory_sections = candidate_manual
+                                    automatic_memory_sections = candidate_automatic
+                                    loaded.append(path)
+                                else:
+                                    notices.append(
+                                        "context · project memory exceeded "
+                                        f"{byte_cap} byte cap; skipped {entry.name}"
+                                    )
+                            memory_block = _render_memory_block(
+                                project.project_id,
+                                manual_memory_sections,
+                                automatic_memory_sections,
+                            )
                     if memory_block is not None:
                         memory_index = len(sections)
                         memory_project_id = project.project_id
@@ -943,7 +1005,11 @@ def load_project_context(
             "length": skill_index.length,
             "digest": skill_index.digest,
         }
-    if memory_offset is not None and memory_length is not None and memory_digest is not None:
+    if (
+        memory_offset is not None
+        and memory_length is not None
+        and memory_digest is not None
+    ):
         components["project_memory"] = {
             "offset": memory_offset,
             "length": memory_length,
@@ -960,6 +1026,7 @@ def load_project_context(
         has_override=has_override,
         prompt_recipe="custom" if has_override else "default",
         prompt_components=components,
+        health=(project_projection.health if project_projection is not None else None),
     )
 
 

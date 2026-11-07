@@ -31,7 +31,9 @@ def _context_projects(registry: ProjectRegistry, project_id: str) -> dict[str, o
     return {"session_project": project, "cwd_project": project}
 
 
-def _source(seq: int, *, observed_at: str = "2026-10-08T12:00:00Z") -> tuple[MemorySource, ...]:
+def _source(
+    seq: int, *, observed_at: str = "2026-10-08T12:00:00Z"
+) -> tuple[MemorySource, ...]:
     return (
         MemorySource(
             session_id="session-1",
@@ -71,7 +73,9 @@ def _entry_project(tmp_path: Path) -> tuple[Path, Path, ProjectRegistry, str]:
     return home, workspace, registry, project.project_id
 
 
-def _add(registry: ProjectRegistry, project_id: str, operations: tuple[AddOperation, ...]):
+def _add(
+    registry: ProjectRegistry, project_id: str, operations: tuple[AddOperation, ...]
+):
     snapshot = registry._entry_memory_state(project_id)
     return registry._compare_and_swap_entries(
         project_id,
@@ -88,10 +92,16 @@ def test_prompt_orders_active_entries_by_schema_priority(tmp_path: Path) -> None
         registry,
         project_id,
         (
-            AddOperation("state", "newer state", _source(1, observed_at="2026-10-08T13:00:00Z")),
+            AddOperation(
+                "state", "newer state", _source(1, observed_at="2026-10-08T13:00:00Z")
+            ),
             AddOperation("decisions", "older decision", _source(2)),
             AddOperation("reference", "hidden reference", _source(3)),
-            AddOperation("decisions", "newer decision", _source(4, observed_at="2026-10-08T14:00:00Z")),
+            AddOperation(
+                "decisions",
+                "newer decision",
+                _source(4, observed_at="2026-10-08T14:00:00Z"),
+            ),
         ),
     )
     decision_ids = [
@@ -113,8 +123,12 @@ def test_prompt_orders_active_entries_by_schema_priority(tmp_path: Path) -> None
         now="2026-10-08T15:00:00Z",
     )
 
-    assert projection.block.index("newer decision") < projection.block.index("older decision")
-    assert projection.block.index("older decision") < projection.block.index("newer state")
+    assert projection.block.index("newer decision") < projection.block.index(
+        "older decision"
+    )
+    assert projection.block.index("older decision") < projection.block.index(
+        "newer state"
+    )
     assert "hidden reference" not in projection.block
     assert all(entry_id in projection.block for entry_id in decision_ids)
     assert "<zeta-automatic-notes>" in projection.block
@@ -177,7 +191,9 @@ def test_prompt_cap_prioritizes_always_kinds_for_168_entries(tmp_path: Path) -> 
     assert "read-only `project` tool" in projection.block
 
 
-def test_prompt_cap_keeps_complete_entries_and_reports_omissions(tmp_path: Path) -> None:
+def test_prompt_cap_keeps_complete_entries_and_reports_omissions(
+    tmp_path: Path,
+) -> None:
     _home, _workspace, registry, project_id = _entry_project(tmp_path)
     operations = tuple(
         AddOperation("state", f"entry-{index}-" + "x" * 4000, _source(index + 1))
@@ -274,13 +290,16 @@ def test_active_run_prompt_is_byte_stable_after_memory_commit(tmp_path: Path) ->
 
     assert context.system_prompt == active_prompt
     assert changed_text not in active_prompt
-    assert changed_text in load_project_context(
-        cwd=workspace,
-        repo_root=workspace,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        **_context_projects(registry, project_id),
-    ).system_prompt
+    assert (
+        changed_text
+        in load_project_context(
+            cwd=workspace,
+            repo_root=workspace,
+            zeta_home=home,
+            catalog=SkillCatalog.empty(),
+            **_context_projects(registry, project_id),
+        ).system_prompt
+    )
 
 
 def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
@@ -300,18 +319,30 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
         store=SimpleNamespace(cwd=str(workspace)),
     )
 
-    assert _child_base_system_prompt(loop, str(workspace)) is parent_prompt
+    assert (
+        _child_base_system_prompt(loop, str(workspace)).system_prompt is parent_prompt
+    )
     equivalent_cwd = str(workspace / ".." / workspace.name)
-    assert _child_base_system_prompt(loop, equivalent_cwd) is parent_prompt
+    assert (
+        _child_base_system_prompt(loop, equivalent_cwd).system_prompt is parent_prompt
+    )
     symlink_cwd = tmp_path / "workspace-link"
     symlink_cwd.symlink_to(workspace, target_is_directory=True)
-    assert _child_base_system_prompt(loop, str(symlink_cwd)) is parent_prompt
+    assert (
+        _child_base_system_prompt(loop, str(symlink_cwd)).system_prompt is parent_prompt
+    )
     assert "new memory" not in parent_prompt
 
 
-def test_fresh_cwd_child_loads_current_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fresh_cwd_child_loads_current_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home, workspace, registry, project_id = _entry_project(tmp_path)
-    _add(registry, project_id, (AddOperation("state", "current child memory", _source(1)),))
+    _add(
+        registry,
+        project_id,
+        (AddOperation("state", "current child memory", _source(1)),),
+    )
     parent_cwd = tmp_path / "parent"
     parent_cwd.mkdir()
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -324,13 +355,15 @@ def test_fresh_cwd_child_loads_current_memory(tmp_path: Path, monkeypatch: pytes
         project_registry=registry,
     )
 
-    child_prompt = _child_base_system_prompt(loop, str(workspace))
+    child_prompt = _child_base_system_prompt(loop, str(workspace)).system_prompt
     assert isinstance(child_prompt, str)
     assert "current child memory" in child_prompt
 
 
 @pytest.mark.asyncio
-async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Path) -> None:
+async def test_serve_resume_rebuilds_identity_and_memory_components(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "serve-workspace"
     workspace.mkdir()
@@ -339,7 +372,9 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Pa
     registry = ProjectRegistry(home / "projects")
     project = registry.create_project("serve", "test", workspace)
     registry.initialize_memory(project.project_id)
-    registry.update_memory(project.project_id, {"state.md": "# State\n\nmemory before\n"})
+    registry.update_memory(
+        project.project_id, {"state.md": "# State\n\nmemory before\n"}
+    )
 
     first_runtime = ServerRuntime(home, cwd=workspace, provider="codex")
     metadata = await first_runtime.create_session()
@@ -348,17 +383,29 @@ async def test_serve_resume_rebuilds_identity_and_memory_components(tmp_path: Pa
     assert metadata.prompt_components
 
     (home / "AGENTS.md").write_text("identity after", encoding="utf-8")
-    registry.update_memory(project.project_id, {"state.md": "# State\n\nmemory after\n"})
-    assert (await first_runtime.resume_session(metadata.session_id)).session_id == metadata.session_id
-    assert first_runtime.loop.context_assembler.system_prompt.content[0].text == first_prompt
+    registry.update_memory(
+        project.project_id, {"state.md": "# State\n\nmemory after\n"}
+    )
+    assert (
+        await first_runtime.resume_session(metadata.session_id)
+    ).session_id == metadata.session_id
+    assert (
+        first_runtime.loop.context_assembler.system_prompt.content[0].text
+        == first_prompt
+    )
     await first_runtime.close()
 
     resumed_runtime = ServerRuntime(home, cwd=tmp_path, provider="codex")
     resumed_metadata = await resumed_runtime.resume_session(metadata.session_id)
-    resumed_prompt = resumed_runtime.loop.context_assembler.system_prompt.content[0].text
+    resumed_prompt = resumed_runtime.loop.context_assembler.system_prompt.content[
+        0
+    ].text
     assert resumed_metadata.prompt_recipe == "default"
     default_component = resumed_metadata.prompt_components["default_context"]
-    assert default_component["digest"] == hashlib.sha256(resumed_prompt.encode()).hexdigest()
+    assert (
+        default_component["digest"]
+        == hashlib.sha256(resumed_prompt.encode()).hexdigest()
+    )
     assert default_component["length"] == len(resumed_prompt)
     await resumed_runtime.close()
 
@@ -386,20 +433,22 @@ async def test_serve_unknown_recipe_preserves_custom_bytes_and_refreshes_owned_m
     assert context.memory_digest is not None
     custom_prefix = "CUSTOM-LEGACY-PROMPT\n"
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(lambda: manager.create(
-        provider="codex",
-        model="offline",
-        cwd=workspace,
-        system_prompt=custom_prefix + context.system_prompt,
-        context_files=context.files,
-        skill_catalog=SkillCatalog.empty(),
-        agent_catalog=AgentCatalog.empty(),
-        project_id=project_id,
-        auto_project=False,
-        project_memory_offset=context.memory_offset + len(custom_prefix),
-        project_memory_length=context.memory_length,
-        project_memory_digest=context.memory_digest,
-    ))
+    opened = await asyncio.to_thread(
+        lambda: manager.create(
+            provider="codex",
+            model="offline",
+            cwd=workspace,
+            system_prompt=custom_prefix + context.system_prompt,
+            context_files=context.files,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=AgentCatalog.empty(),
+            project_id=project_id,
+            auto_project=False,
+            project_memory_offset=context.memory_offset + len(custom_prefix),
+            project_memory_length=context.memory_length,
+            project_memory_digest=context.memory_digest,
+        )
+    )
     session_id = opened.metadata.session_id
     opened.store.close()
     _add(registry, project_id, (AddOperation("state", "memory after", _source(2)),))
@@ -430,5 +479,9 @@ def test_format_two_projection_is_fixture_only(tmp_path: Path) -> None:
     production = registry.create_project("production", "test", tmp_path / "production")
     registry.initialize_memory(production.project_id)
     assert registry.memory_state(production.project_id).contents.keys() == {
-        "brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"
+        "brief.md",
+        "state.md",
+        "backlog.md",
+        "changelog.md",
+        "decisions.md",
     }

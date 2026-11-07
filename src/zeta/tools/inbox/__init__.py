@@ -126,18 +126,20 @@ def _result(
     )
 
 
-def _error(message: str) -> StructuredToolResult:
+def _error(message: str, *, kind: str = "project_inbox") -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
-        "structuredContent": {"error": {"kind": "project_inbox", "message": message}},
+        "structuredContent": {"error": {"kind": kind, "message": message}},
     }
 
 
 def _validate_action(arguments: dict[str, Any]) -> str:
     action = arguments.get("action")
     if not isinstance(action, str) or action not in _ACTIONS:
-        raise InboxError("action must be one of: send, list, sent, claim, done, projects")
+        raise InboxError(
+            "action must be one of: send, list, sent, claim, done, projects"
+        )
     metadata = _ACTIONS[action]
     unexpected = sorted(set(arguments) - metadata.allowed_fields)
     if unexpected:
@@ -159,7 +161,9 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
         raise InboxError("inbox is unavailable before the session is active")
     tracker = registry.sent_message_tracker
     if tracker is None:
-        tracker = SentMessageTracker(projects.root.parent / "sessions", store.session_id)
+        tracker = SentMessageTracker(
+            projects.root.parent / "sessions", store.session_id
+        )
         registry.sent_message_tracker = tracker
     return (
         ProjectInbox(
@@ -176,6 +180,12 @@ async def _inbox(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
+        state = getattr(registry, "project_registry_state", None)
+        if state is not None and state.unavailable is not None:
+            return _error(
+                "project registry is temporarily unavailable; try again later",
+                kind="project_registry_unavailable",
+            )
         action = _validate_action(arguments)
         inbox, project_id, session_id = _bound(registry)
         if action == "projects":
@@ -245,7 +255,9 @@ def register_send_only(registry: ToolRegistry) -> None:
     _register(registry, {"send": _ACTIONS["send"]})
 
 
-def _approval_subject(registry: ToolRegistry, arguments: Mapping[str, object]) -> str | None:
+def _approval_subject(
+    registry: ToolRegistry, arguments: Mapping[str, object]
+) -> str | None:
     project = arguments.get("project")
     if not isinstance(project, str) or registry.project_registry is None:
         return None
@@ -281,5 +293,7 @@ def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
             "additionalProperties": False,
         },
         requires_approval=True,
-        approval_subject_resolver=lambda arguments: _approval_subject(registry, arguments),
+        approval_subject_resolver=lambda arguments: _approval_subject(
+            registry, arguments
+        ),
     )

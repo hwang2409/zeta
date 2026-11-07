@@ -14,17 +14,13 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import (
-    discover_project,
-    load_project_context,
-    resolve_project_context,
-)
-from ..core.session import env_home
+from ..core.project_context import ProjectContext
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
+from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
@@ -40,6 +36,7 @@ from ..protocol.types import (
 )
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
+from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -47,6 +44,11 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
 from .background import CancellationRequest, finish_background_child
+from .child_context import (
+    _child_base_system_prompt,
+    _compose_child_project_context,
+    _load_child_project_context,
+)
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
@@ -55,7 +57,6 @@ from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
     AgentPreset,
-    compose_system_prompt,
     resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
@@ -449,6 +450,14 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        child_context = await asyncio.to_thread(
+            _child_base_system_prompt, loop, cwd_override, child_registry
+        )
+        child_context = _compose_child_project_context(
+            child_context,
+            preset,
+            explicit_finish=explicit_finish,
+        )
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -457,17 +466,15 @@ async def _build_child_loop(
             max_turns=None,
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
-            system_prompt=_compose_child_system_prompt(
-                await asyncio.to_thread(
-                    _child_base_system_prompt, loop, cwd_override, child_registry
-                ),
-                preset,
-                explicit_finish=explicit_finish,
+            runtime_prompt=RuntimePrompt(
+                child_context.system_prompt, child_context.prompt_components
             ),
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
-            max_agent_depth=budget.depth_limit(loop.max_agent_depth, preset.max_child_depth),
+            max_agent_depth=budget.depth_limit(
+                loop.max_agent_depth, preset.max_child_depth
+            ),
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -475,6 +482,32 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+        )
+
+        def prepare_child_project_context(
+            projection: ProjectContextProjection,
+        ) -> ProjectContext:
+            context = _load_child_project_context(
+                loop,
+                cwd_override,
+                child_registry,
+                projection=projection,
+            )
+            return _compose_child_project_context(
+                context,
+                preset,
+                explicit_finish=explicit_finish,
+            )
+
+        inherited_prompt = cwd_override is None or same_physical_path(
+            cwd_override, loop.store.cwd
+        )
+        child_loop._configure_project_context_recovery(
+            registry=loop.project_registry,
+            project_id=loop.root_project_id,
+            health=child_context.health,
+            prepare=prepare_child_project_context,
+            replace_component=("project_memory" if inherited_prompt else None),
         )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
@@ -599,7 +632,9 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = budget.child_depth(loop.agent_depth, loop.max_agent_depth, background)
+    child_depth, nesting_error = budget.child_depth(
+        loop.agent_depth, loop.max_agent_depth, background
+    )
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -778,6 +813,9 @@ async def run_agent_tool(
             description=description,
             child_account_context=child_account_pins,
         )
+        loop._background_owner.project_context_loops[child_store.session_id] = (
+            child_loop
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
@@ -844,7 +882,9 @@ async def run_agent_tool(
         if background:
             child_store.update_agent_lifecycle(turns_used=turns_used)
         else:
-            child_store.finish_agent_lifecycle(state, final_result=text, turns_used=turns_used)
+            child_store.finish_agent_lifecycle(
+                state, final_result=text, turns_used=turns_used
+            )
         return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
@@ -929,7 +969,9 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
-    loop._background_owner.causal_episodes.associate_new_member(child_instance_id, loop.agent_instance_id)
+    loop._background_owner.causal_episodes.associate_new_member(
+        child_instance_id, loop.agent_instance_id
+    )
     finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
@@ -1040,6 +1082,9 @@ async def run_agent_tool(
             loop._background_owner.conversation_channel.unregister_loop(
                 child_instance_id
             )
+            loop._background_owner.project_context_loops.pop(
+                child_store.session_id, None
+            )
             loop._background_owner.unregister(child_instance_id)
             if child_policy is not None:
                 await child_policy.cleanup()
@@ -1051,38 +1096,38 @@ async def run_agent_tool(
 
         async def finish_background() -> None:
             await finish_background_child(
-                    child_task=child_task,
-                    child_store=child_store,
-                    parent_store=loop.store,
-                    tool_call=tool_call,
-                    child_instance_id=child_instance_id,
-                    child_path=child_path,
-                    description=description,
-                    child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                        child_result(
-                            text,
-                            error=error,
-                            status=status,
-                            stats=stats,
-                            include_stats=True,
-                            notice=notice,
-                            notice_items=notice_items,
-                            max_bytes=background_receipt_bytes,
-                        )
-                    ),
-                    validate_result=validate_result,
-                    publish_event=loop._publish_background_event,
-                    cleanup=cleanup_background_child,
-                    close_child=close_background_child,
-                    error_message=error_message,
-                    marker_key=child_marker_key,
-                    agent_instance_id=loop.agent_instance_id,
-                    background_owner=loop._background_owner,
-                    max_receipt_bytes=background_receipt_bytes,
-                    explicit_finish=terminal_fence is not None,
-                    child_loop=child_loop,
-                    finish_gate_state=finish_gate_state,
+                child_task=child_task,
+                child_store=child_store,
+                parent_store=loop.store,
+                tool_call=tool_call,
+                child_instance_id=child_instance_id,
+                child_path=child_path,
+                description=description,
+                child_turns=child_turns,
+                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                    child_result(
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
+                    )
+                ),
+                validate_result=validate_result,
+                publish_event=loop._publish_background_event,
+                cleanup=cleanup_background_child,
+                close_child=close_background_child,
+                error_message=error_message,
+                marker_key=child_marker_key,
+                agent_instance_id=loop.agent_instance_id,
+                background_owner=loop._background_owner,
+                max_receipt_bytes=background_receipt_bytes,
+                explicit_finish=terminal_fence is not None,
+                child_loop=child_loop,
+                finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())
@@ -1161,6 +1206,7 @@ async def run_agent_tool(
         raise
     finally:
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
+        loop._background_owner.project_context_loops.pop(child_store.session_id, None)
         loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
             await child_policy.cleanup()
@@ -1168,71 +1214,3 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
-
-
-def _child_base_system_prompt(
-    loop: AgentLoop,
-    cwd_override: str | None,
-    child_registry: ToolRegistry | None = None,
-) -> str | Message:
-    """Compose project context from an explicit cwd that differs from the parent."""
-
-    if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
-        return loop.context_assembler.system_prompt
-    if child_registry is not None:
-        child_registry.verify_cwd_identity()
-    home_hint = loop.active_home
-    zeta_home = Path(home_hint) if home_hint else env_home()
-    discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    registry = loop.project_registry
-    session_project = None
-    if loop.root_project_id is not None and registry is not None:
-        try:
-            session_project = registry.show_project(loop.root_project_id)
-        except ProjectRegistryError:
-            pass
-    cwd_project = (
-        resolve_project_context(discovery, registry) if registry is not None else None
-    )
-    context = load_project_context(
-        cwd=cwd_override,
-        repo_root=discovery.primary_root or discovery.cwd,
-        zeta_home=zeta_home,
-        catalog=loop.tool_registry.skill_catalog,
-        session_project=session_project,
-        cwd_project=cwd_project,
-        inbox_enabled=False,
-    )
-    return context.system_prompt
-
-
-_EXPLICIT_FINISH_GUIDANCE = (
-    "With explicit finish enabled, this run ends only when you call the `finish` "
-    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
-    "apply). Ending a turn without calling `finish` leaves you idle for "
-    "follow-ups; call it when the contract's exit criteria are met or when you "
-    "are blocked."
-)
-
-
-def _compose_child_system_prompt(
-    system_prompt: str | Message,
-    preset: AgentPreset,
-    *,
-    explicit_finish: bool = False,
-) -> str | Message:
-    """Apply the preset preamble and custom body to the child prompt."""
-
-    composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = preset.prompt_suffix
-    if explicit_finish:
-        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
-    if not body:
-        return composed
-    if isinstance(composed, Message):
-        return Message(
-            MessageRole.SYSTEM,
-            [*composed.content, TextContent(body)],
-            metadata=dict(composed.metadata),
-        )
-    return composed + "\n\n" + body
