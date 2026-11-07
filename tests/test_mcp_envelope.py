@@ -491,25 +491,25 @@ async def test_mcp_status_shows_effective_limits_tui(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_status_shows_effective_limits_serve(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    mount = _status_mount(tmp_path / "tools")
-    output = render_mcp_status(mount, home=None)
-
+async def test_mcp_status_serve_uses_unavailable_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Loop:
         async def refresh_skills(self) -> None:
             return None
 
         async def slash_mcp(self, args: str) -> str:
-            assert args == "status"
-            return output
+            raise AssertionError(f"unavailable command dispatched: {args}")
 
     runtime = SimpleNamespace(loop=Loop())
-    monkeypatch.setattr("zeta.server.slash_commands.build_registry", lambda _runtime: SimpleNamespace(notices=()))
-    response = await run_command(runtime, "/mcp status")
+    registry = SimpleNamespace(
+        builtin_commands=[SimpleNamespace(name="mcp")], notices=()
+    )
+    monkeypatch.setattr(
+        "zeta.server.slash_commands.build_registry", lambda _runtime: registry
+    )
 
-    try:
-        assert response == {"kind": "text", "text": output}
-        assert "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes" in response["text"]
-    finally:
-        await mount.close()
-        await mount.registry.close()
+    assert await run_command(runtime, "/mcp status") == {
+        "kind": "client_only",
+        "name": "mcp",
+    }
