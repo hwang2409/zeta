@@ -372,7 +372,6 @@ class AgentLoop(
             self.step_delivery.capacity_changed()
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
-
     def abort(
         self,
         *,
