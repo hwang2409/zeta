@@ -21,6 +21,7 @@ from .._shared.process import (
     spawn_background,
     tool_subprocess_env,
 )
+from .._shared.shell_cwd import bind_shell_cwd
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -183,8 +184,8 @@ async def _bash(
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
-        start_cwd, cwd_fd = registry.open_shell_cwd(
-            arguments.get("cwd"), approved_cwd
+        start_cwd, cwd_fd = bind_shell_cwd(
+            registry, arguments.get("cwd"), approved_cwd
         )
         task_id, pid = await registry.background_tasks.start(
             shell_command,
@@ -207,7 +208,7 @@ async def _bash(
             },
         )
 
-    start_cwd, cwd_fd = registry.open_shell_cwd(arguments.get("cwd"), approved_cwd)
+    start_cwd, cwd_fd = bind_shell_cwd(registry, arguments.get("cwd"), approved_cwd)
     try:
         read_fd, write_fd = os.pipe()
     except BaseException:

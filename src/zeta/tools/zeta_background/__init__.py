@@ -6,6 +6,7 @@ from typing import Any, TypedDict
 
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
+from .._shared.shell_cwd import bind_shell_cwd
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
@@ -34,8 +35,8 @@ async def _run_background(
         if isinstance(approved_execution, ApprovedCwdExecution)
         else None
     )
-    start_cwd, cwd_fd = registry.open_shell_cwd(
-        arguments.get("cwd"), approved_cwd
+    start_cwd, cwd_fd = bind_shell_cwd(
+        registry, arguments.get("cwd"), approved_cwd
     )
     environment = dict(execution_context.host_environment) if execution_context else {}
     environment["PWD"] = start_cwd
