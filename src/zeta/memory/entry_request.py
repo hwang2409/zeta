@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from .entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry, MemoryState, state_digest
+from .entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry, MemoryState
 from .reconciler import (
     ReconciliationError,
     RequestTooLargeError,
@@ -108,7 +108,7 @@ class _CachedEntry:
     words: frozenset[str]
 
 
-_ENTRY_CACHE: tuple[str, dict[str, _CachedEntry]] | None = None
+_ENTRY_CACHE: tuple[tuple[str, int], dict[str, _CachedEntry]] | None = None
 
 
 def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
@@ -192,7 +192,7 @@ def _entry_relevance_terms(entry: MemoryEntry) -> tuple[frozenset[str], frozense
 
 def _cached_entries(state: MemoryState) -> dict[str, _CachedEntry]:
     global _ENTRY_CACHE
-    key = state_digest(state)
+    key = (state.project_id, state.generation)
     if _ENTRY_CACHE is not None and _ENTRY_CACHE[0] == key:
         return _ENTRY_CACHE[1]
     cached: dict[str, _CachedEntry] = {}
