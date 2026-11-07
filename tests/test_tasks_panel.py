@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.submissions import await_submission_pipeline
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -542,6 +543,7 @@ async def test_slash_tasks_opens_the_panel(tmp_path: Path) -> None:
     session.default_buffer.set_document(Document("/tasks", 6))
 
     assert app._submit_input("/tasks") is True
+    await await_submission_pipeline(app)
     try:
         assert app.tasks_panel_active
         assert session.default_buffer.text == ""
