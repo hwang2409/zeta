@@ -89,7 +89,6 @@ async def consume_child(
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
-
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
@@ -306,7 +305,6 @@ async def consume_run(
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume one child run through its follow-up and idle lifecycle."""
-
     return await consume_follow_up_run(
         consume_child,
         child_loop,
