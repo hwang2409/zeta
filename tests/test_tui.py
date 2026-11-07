@@ -6669,7 +6669,8 @@ async def test_status_card_wraps_long_path_at_separator(
         path_lines = [
             line.strip(" │")
             for line in rendered_lines
-            if any(part in line for part in ("Users", "projects", "zeta", "worktrees", "long-token"))
+            if "INSERT" not in line
+            and any(part in line for part in ("Users", "wrap-word-boundary", "long-token"))
         ]
 
         assert path_lines
