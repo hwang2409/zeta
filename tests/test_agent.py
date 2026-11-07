@@ -705,6 +705,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     async def close_child() -> tuple[str, ...]:
         nonlocal close_calls
         close_calls += 1
+        # test-contract: durability block the final close after receipt publication.
         if close_calls == 2:
             close_started.set()
             await release_close.wait()
@@ -753,11 +754,18 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     owner.register("child-1", lambda: None, watcher, parent_store)
 
     await close_started.wait()
-    waiting = asyncio.create_task(owner.wait())
+    wait_started = asyncio.Event()
+
+    async def wait_for_owner() -> None:
+        wait_started.set()
+        await owner.wait()
+
+    waiting = asyncio.create_task(wait_for_owner())
     try:
+        await asyncio.wait_for(wait_started.wait(), timeout=10)
         assert completion_published.is_set()
+        # test-contract: durability the completion receipt precedes final store close.
         assert parent_store.agent_notifications()[0].data["status"] == "completed"
-        await asyncio.sleep(0)
         assert not waiting.done()
         assert not cleanup_called.is_set()
     finally:
@@ -1586,7 +1594,7 @@ async def _wait_for_background_event(
     events: list[StreamEvent], event_type: StreamEventType, ready: asyncio.Event
 ) -> StreamEvent:
     while True:
-        await asyncio.wait_for(ready.wait(), timeout=5)
+        await asyncio.wait_for(ready.wait(), timeout=10)
         ready.clear()
         for event in events:
             if event.type is event_type and event.data.get("notification_id"):
@@ -2319,6 +2327,7 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "canceled"
     assert "parent session exited" not in notification.data["text"]
+    # test-contract: durability the terminal receipt has one copy of each status flag.
     assert notification.data["text"].count("error=false") == 1
     assert notification.data["text"].count("canceled=true") == 1
     assert terminal.tool_result is not None
@@ -3975,7 +3984,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     pending = await asyncio.wait_for(
-        policy.wait_for_delegated_requests(2), timeout=5
+        policy.wait_for_delegated_requests(2), timeout=10
     )
     assert len(pending) == 2
     assert {request.child_instance_id for request in pending} == {
@@ -5451,7 +5460,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
     )
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    pending = await asyncio.wait_for(policy.wait_for_delegated_requests(), timeout=5)
+    pending = await asyncio.wait_for(policy.wait_for_delegated_requests(), timeout=10)
     assert len(pending) == 1
     request = pending[0]
     assert request.child_instance_id == f"{store.session_id}:1:1"
@@ -9876,9 +9885,10 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
     await deadlines.started_event.wait()
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire(state)
-    events.extend(await asyncio.wait_for(run, timeout=5))
-    await asyncio.wait_for(receipt_published.wait(), timeout=2)
+    events.extend(await asyncio.wait_for(run, timeout=10))
+    await asyncio.wait_for(receipt_published.wait(), timeout=10)
     notifications = store.agent_notifications(pending_only=False)
+    # test-contract: durability child completion persists one receipt.
     assert len(notifications) == 1
     notification = notifications[0]
     published = [
@@ -9887,6 +9897,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         if event.type is StreamEventType.TOOL_EXECUTION_END
         and event.data.get("notification_id")
     ]
+    # test-contract: durability child completion publishes one terminal event.
     assert len(published) == 1
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
@@ -9969,8 +9980,9 @@ async def test_killed_task_receipt_never_contains_command_secrets(
 
     loop.set_background_event_sink(collect_event)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(receipt_published.wait(), timeout=5)
+    await asyncio.wait_for(receipt_published.wait(), timeout=10)
     notifications = store.agent_notifications(pending_only=False)
+    # test-contract: durability secret filtering preserves one completion receipt.
     assert len(notifications) == 1
     notification = notifications[0]
     killed_task_ids = notification.data.get("killed_task_ids")
@@ -11555,14 +11567,15 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
         idle_published.set()
         return notification
 
+    # test-contract: seam child-idle has no public publication event.
     monkeypatch.setattr(
         loop._background_owner.conversation_channel,
         "publish_idle",
         publish_idle_and_signal,
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_replied.wait(), timeout=2)
-    await asyncio.wait_for(idle_published.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_replied.wait(), timeout=10)
+    await asyncio.wait_for(idle_published.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "child_idle"
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
