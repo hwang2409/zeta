@@ -174,7 +174,7 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
         )
         assert catalog[-1]["result"]["sessions"]
         release.set()
-        assert (await history)[-1]["result"]["messages"] == []
+        assert (await asyncio.wait_for(history, 10))[-1]["result"]["messages"] == []
     finally:
         release.set()
         observer_writer.close()
@@ -433,14 +433,14 @@ async def test_controller_history_does_not_block_other_clients(
             TIMEOUT,
         )
         await asyncio.wait_for(ping, TIMEOUT)
-        await asyncio.to_thread(watchdog.join)
+        await asyncio.to_thread(watchdog.join, 10)
         assert history[-1]["result"]["messages"] == []
         assert answered_before_release == [True]
     finally:
         release.set()
-        watchdog.join()
+        watchdog.join(timeout=10)
         ping.cancel()
-        await asyncio.gather(ping, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(ping, return_exceptions=True), 10)
         observer_writer.close()
         await observer_writer.wait_closed()
         await close_serve(server, controller_writer)
@@ -833,7 +833,7 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
         gate = asyncio.Event()
 
         async def blocked_write(payload: bytes) -> bool:
-            await gate.wait()
+            await asyncio.wait_for(gate.wait(), 10)
             return True
 
         observer._write_physical = blocked_write
@@ -842,7 +842,7 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
             for _ in range(257)
         ]
         asyncio.get_running_loop().call_later(0.1, gate.set)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
         await asyncio.wait_for(reader.read(), TIMEOUT)
         assert reader.at_eof() or writer.is_closing()
     finally:
@@ -900,7 +900,7 @@ async def test_session_tree_uses_one_store_snapshot(
     finally:
         release.set()
     try:
-        response = (await request)[-1]
+        response = (await asyncio.wait_for(request, 10))[-1]
         assert response["result"] == {
             "branches": [
                 {"id": first.id, "label": "before", "depth": 0, "current": True}

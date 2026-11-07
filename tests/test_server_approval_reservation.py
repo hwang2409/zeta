@@ -312,7 +312,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
                 await server.control.resolve_approval("approve", wire_id)
             assert loser.value.code == -32006
             gate.release.set()
-            await cleanup
+            await asyncio.wait_for(cleanup, 10)
             expected = "abort"
         else:
             approve = asyncio.create_task(
@@ -321,7 +321,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             await _wait_thread_gate(gate)
             assert policy.cleanup_delegated("child") is None
             gate.release.set()
-            result = await approve
+            result = await asyncio.wait_for(approve, 10)
             assert result["decision"] == "approve"
             expected = "allow"
         await server.control.wait_for_approval_settlement()
@@ -363,7 +363,7 @@ async def test_same_tick_approval_reservation_winner(
                 await server.control.resolve_approval("approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
-            await abort
+            await asyncio.wait_for(abort, 10)
         else:
             approve = asyncio.create_task(
                 server.control.resolve_approval("approve", call.id)
@@ -372,8 +372,8 @@ async def test_same_tick_approval_reservation_winner(
             abort = asyncio.create_task(server.control._terminate_pending_approvals())
             assert not abort.done()
             gate.release.set()
-            result = await approve
-            await abort
+            result = await asyncio.wait_for(approve, 10)
+            await asyncio.wait_for(abort, 10)
             assert result["decision"] == "approve"
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
@@ -419,7 +419,7 @@ async def test_always_tool_grant_waits_for_durable_approval(
         assert server.runtime.policy is not None
         assert server.runtime.policy.session_allow == frozenset()
         gate.release.set()
-        frames = await approval
+        frames = await asyncio.wait_for(approval, 10)
         assert frames[-1]["error"]["code"] == -32000
         assert server.runtime.policy.session_allow == frozenset()
     finally:
@@ -468,7 +468,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
+        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
         await server.control.wait_for_approval_settlement()
 
         history = [
@@ -1074,7 +1074,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
 
     async def gated_close(*args: object, **kwargs: object) -> tuple[str, ...]:
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         result = await original_close(*args, **kwargs)
         completed.set()
         return result
@@ -1091,7 +1091,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         assert server.runtime.state is old_state
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await resume
+            await asyncio.wait_for(resume, 10)
         assert completed.is_set()
         assert server.runtime.state is None
         assert old_store._closed
@@ -1342,7 +1342,7 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
         asyncio.get_running_loop().call_soon(responsive.set)
         await asyncio.wait_for(responsive.wait(), TIMEOUT)
         gate.release.set()
-        await released
+        await asyncio.wait_for(released, 10)
         assert gate.thread_ids != [threading.get_ident()]
         resolution = server.runtime.opened.store.approval_resolution_data(call.id)
         actual = (json.dumps(resolution, separators=(",", ":")) + "\n").encode()
@@ -1371,7 +1371,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         cleanup = policy.cleanup_delegated("child")
         assert policy._delegated == {}
         if cleanup is not None:
-            await cleanup
+            await asyncio.wait_for(cleanup, 10)
 
         await close_serve(server, writer)
         late = ConversationStore(tmp_path / "late-child")
@@ -1553,7 +1553,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         if competing_event != "none":
             original_resolve(call.id, "abort", reason=reasons[competing_event])
         release.set()
-        frames = await rpc
+        frames = await asyncio.wait_for(rpc, 10)
         await server.control.wait_for_approval_settlement()
 
         resolution = store.approval_resolution_data(call.id)
@@ -1739,7 +1739,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
+        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
 
         assert child.approval_resolution_data(call.id) == {
             "request_id": call.id,
@@ -1900,7 +1900,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace = server.control._grace_task
         assert grace is not None
         grace.cancel()
-        await asyncio.gather(grace, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(grace, return_exceptions=True), 10)
         server.approval_reconnect_grace = 0
         monkeypatch.setattr(server.runtime.opened.store, gate.method, gate.call)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
@@ -2014,7 +2014,7 @@ async def test_approval_reconnect_status_during_reserved_write(
             await server.control.resolve_approval("deny", call.id)
         assert competing.value.code == -32006
         gate.release.set()
-        await decision
+        await asyncio.wait_for(decision, 10)
     finally:
         gate.release.set()
         await close_serve(server, writer)
