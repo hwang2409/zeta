@@ -43,6 +43,48 @@ class _Writer:
             raise RuntimeError("writer close failed")
 
 
+class _CancellationServer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = False
+        self.task: asyncio.Task[None] | None = None
+        self.owner_task: asyncio.Task[None] | None = None
+        self.cancel_owner = False
+
+    async def close(self) -> None:
+        self.task = asyncio.current_task()
+        self.started.set()
+        if self.cancel_owner and self.owner_task is not None:
+            self.owner_task.cancel()
+        await asyncio.wait_for(self.release.wait(), 10)
+        self.closed = True
+
+
+class _CancellationWriter:
+    def __init__(self, server: _CancellationServer, *, wait: bool) -> None:
+        self.server = server
+        self.wait = wait
+        self.waiting = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        self.waiting.set()
+        if self.wait:
+            try:
+                await asyncio.wait_for(self.finished.wait(), 10)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        else:
+            self.finished.set()
+
+
 @pytest.mark.asyncio
 async def test_close_serve_starts_server_shutdown_before_peer_wait() -> None:
     server = _Server()
@@ -91,3 +133,36 @@ async def test_close_serve_cleanup_outcomes(
         assert str(outcome) == "server close failed"
     else:
         assert outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["first-yield", "writer-wait", "server-wait"])
+async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
+    server = _CancellationServer()
+    writer = _CancellationWriter(server, wait=phase == "writer-wait")
+    close_task = asyncio.create_task(close_serve(server, writer))
+    server.owner_task = close_task
+    server.cancel_owner = phase == "first-yield"
+    try:
+        if phase == "first-yield":
+            await asyncio.wait_for(server.started.wait(), 10)
+        elif phase == "writer-wait":
+            await asyncio.wait_for(writer.waiting.wait(), 10)
+            close_task.cancel()
+            await asyncio.wait_for(writer.cancelled.wait(), 10)
+            close_task.cancel()
+        else:
+            await asyncio.wait_for(writer.finished.wait(), 10)
+            close_task.cancel()
+        assert not close_task.done(), "cleanup must drain the server before returning"
+        server.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, 10)
+        assert server.closed
+        assert close_task.done()
+        assert server.task is not None and server.task.done()
+    finally:
+        server.release.set()
+        if not close_task.done():
+            close_task.cancel()
+        await asyncio.gather(close_task, return_exceptions=True)

@@ -714,9 +714,12 @@ async def _controller_event_stream(
         assert session_id.encode() in b"".join(frames)
         return b"".join(frames)
     finally:
-        if observer_socket is not None:
-            observer_socket[1].close()
-            await close_serve(server, writer, observer_socket[1])
+        observer_writer = observer_socket[1] if observer_socket is not None else None
+        await close_serve(
+            server,
+            writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
