@@ -843,12 +843,14 @@ async def test_store(tmp_path, owner):
     "drain",
     [
         "await task",
-        "await asyncio.gather(task)",
         "await asyncio.wait_for(task, 10)",
+        "await asyncio.wait_for(task, timeout=TIMEOUT)",
     ],
 )
 def test_tq006_accepts_immediately_drained_task(tmp_path: Path, drain: str) -> None:
-    source = f"""async def test_task():
+    source = f"""TIMEOUT = 10
+
+async def test_task():
     task = asyncio.create_task(run())
     {drain}
 """
@@ -856,6 +858,42 @@ def test_tq006_accepts_immediately_drained_task(tmp_path: Path, drain: str) -> N
     assert [
         finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
     ] == []
+
+
+@pytest.mark.parametrize(
+    "drain",
+    [
+        "await asyncio.wait_for(task, timeout=raising_timeout())",
+        "await asyncio.gather(raises_synchronously(), task)",
+    ],
+)
+def test_tq006_rejects_immediate_drain_that_can_raise_before_awaiting_task(
+    tmp_path: Path, drain: str
+) -> None:
+    source = f"""async def test_task():
+    task = asyncio.create_task(run())
+    {drain}
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 2)]
+
+
+def test_tq006_rejects_wait_for_with_local_timeout_name(tmp_path: Path) -> None:
+    source = """async def test_task():
+    TIMEOUT = 10
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(task, timeout=TIMEOUT)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 3)]
 
 
 def test_tq006_accepts_immediate_transfer_to_resource_owner(tmp_path: Path) -> None:
@@ -884,22 +922,51 @@ def test_tq006_accepts_task_transferred_to_owned_app_owner(tmp_path: Path) -> No
     ] == []
 
 
-def test_tq006_accepts_prebound_app_and_its_nested_resources(tmp_path: Path) -> None:
-    source = """async def test_app(tmp_path):
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def test_app(tmp_path):
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store)
     app = TUIApp(loop)
     async with owned_app(app):
         await run(app)
-"""
-
+""",
+        """async def test_app(tmp_path):
+    loop = AgentLoop(backend, ConversationStore(tmp_path))
+    async with owned_app(TUIApp(loop)):
+        await run(loop)
+""",
+    ],
+)
+def test_tq006_accepts_explicit_tui_composition_edges(
+    tmp_path: Path, source: str
+) -> None:
     assert [
         finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
     ] == []
 
 
-def test_tq006_accepts_cleaning_context_manager_helper(tmp_path: Path) -> None:
-    source = """@contextmanager
+def test_tq006_rejects_resource_created_inside_owned_task(tmp_path: Path) -> None:
+    source = """async def test_task(tmp_path):
+    async with owned_resources() as owner:
+        task = owner.task(
+            asyncio.create_task(use(ConversationStore(tmp_path)))
+        )
+        await task
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 4)]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """@contextmanager
 def _store(tmp_path):
     store = ConversationStore(tmp_path)
     try:
@@ -910,11 +977,44 @@ def _store(tmp_path):
 def test_store(tmp_path):
     with _store(tmp_path) as store:
         assert store.messages() == []
-"""
+""",
+        """@asynccontextmanager
+async def _store(tmp_path):
+    store = ConversationStore(tmp_path)
+    try:
+        yield store
+    finally:
+        store.close()
 
+async def test_store(tmp_path):
+    async with _store(tmp_path) as store:
+        await run(store)
+""",
+    ],
+)
+def test_tq006_accepts_cleaning_context_manager_helper(
+    tmp_path: Path, source: str
+) -> None:
     assert [
         finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
     ] == []
+
+
+def test_tq006_rejects_context_manager_helper_without_finally(tmp_path: Path) -> None:
+    source = """@contextmanager
+def unsafe_store(tmp_path):
+    yield ConversationStore(tmp_path)
+
+def test_store(tmp_path):
+    with unsafe_store(tmp_path) as store:
+        assert store.messages() == []
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 3), ("TQ006", 6)]
 
 
 def test_tq006_accepts_task_transferred_to_cancellation_owner(tmp_path: Path) -> None:

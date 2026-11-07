@@ -36,6 +36,10 @@ AWAIT_DEADLINE_CODE = "TQ004"
 RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
 CLEANUP_RATCHET_PATH = Path("tests/test_cleanup_owner_ratchet.txt")
 CLEANUP_CODE = "TQ006"
+OWNED_COMPOSITION_EDGES = {
+    ("TUIApp", 0): "async resource",
+    ("AgentLoop", 1): "store",
+}
 CLEANUP_OWNERS = {
     "app": "`async with owned_app(TUIApp(...)):`",
     "store": (
@@ -643,14 +647,17 @@ def _owned_by_function(
     return _enclosing_function(node, parents) is function
 
 
+def _assignment_targets(node: ast.AST) -> list[ast.AST] | None:
+    if isinstance(node, ast.Assign):
+        return node.targets
+    if isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+        return [node.target]
+    return None
+
+
 def _bound_name(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str | None:
     for ancestor in _enclosing_nodes(node, parents):
-        if isinstance(ancestor, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            targets = (
-                ancestor.targets
-                if isinstance(ancestor, ast.Assign)
-                else [ancestor.target]
-            )
+        if (targets := _assignment_targets(ancestor)) is not None:
             names = [target.id for target in targets if isinstance(target, ast.Name)]
             return names[0] if len(names) == 1 else None
         if isinstance(ancestor, ast.stmt):
@@ -991,15 +998,55 @@ def _cleaned_in_finally(
     return _following_try_cleans(resource, open_statement, statements, index)
 
 
-def _await_drains(value: ast.AST, name: str) -> bool:
+def _module_constants(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> set[str]:
+    module = next(
+        (
+            parent
+            for parent in _enclosing_nodes(node, parents)
+            if isinstance(parent, ast.Module)
+        ),
+        None,
+    )
+    if module is None:
+        return set()
+    return {
+        target.id
+        for statement in module.body
+        if (targets := _assignment_targets(statement)) is not None
+        for target in targets
+        if isinstance(target, ast.Name) and target.id.isupper()
+    }
+
+
+def _literal_timeout(
+    node: ast.AST, call: ast.Call, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ) or (isinstance(node, ast.Name) and node.id in _module_constants(call, parents))
+
+
+def _await_drains(value: ast.AST, name: str, parents: dict[ast.AST, ast.AST]) -> bool:
     value = _unwrap_transparent(value)
     if isinstance(value, ast.Name):
         return value.id == name
-    if not isinstance(value, ast.Call):
+    if not isinstance(value, ast.Call) or _name(value.func) != "asyncio.wait_for":
         return False
-    terminal = _name(value.func).rsplit(".", 1)[-1]
-    return terminal in {"gather", "wait_for"} and any(
-        _contains_name(argument, name) for argument in value.args
+    if not (
+        len(value.args) >= 1
+        and isinstance(value.args[0], ast.Name)
+        and value.args[0].id == name
+    ):
+        return False
+    if len(value.args) == 2 and not value.keywords:
+        return _literal_timeout(value.args[1], value, parents)
+    return (
+        len(value.args) == 1
+        and len(value.keywords) == 1
+        and value.keywords[0].arg == "timeout"
+        and _literal_timeout(value.keywords[0].value, value, parents)
     )
 
 
@@ -1026,7 +1073,7 @@ def _immediately_drained(
     return (
         isinstance(following, ast.Expr)
         and isinstance(following.value, ast.Await)
-        and (_await_drains(following.value.value, resource.name))
+        and (_await_drains(following.value.value, resource.name, parents))
     )
 
 
@@ -1082,10 +1129,90 @@ def _transferred_to_context_owner(
     )
 
 
+def _context_helper(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    module = next(
+        (
+            parent
+            for parent in _enclosing_nodes(resource.node, parents)
+            if isinstance(parent, ast.Module)
+        ),
+        None,
+    )
+    called = _name(resource.node.func).rsplit(".", 1)[-1]
+    if module is None:
+        return None
+    return next(
+        (
+            node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == called
+            and any(
+                _name(decorator).rsplit(".", 1)[-1]
+                in {"contextmanager", "asynccontextmanager"}
+                for decorator in node.decorator_list
+            )
+        ),
+        None,
+    )
+
+
+def _yielded_name(statement: ast.stmt) -> str | None:
+    if not isinstance(statement, ast.Expr) or not isinstance(
+        statement.value, ast.Yield
+    ):
+        return None
+    value = statement.value.value
+    return value.id if isinstance(value, ast.Name) else None
+
+
+def _exact_context_cleanup(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    helper = _context_helper(resource, parents)
+    if helper is None or len(helper.body) != 2:
+        return False
+    open_statement, cleanup_try = helper.body
+    targets = _assignment_targets(open_statement)
+    value = getattr(open_statement, "value", None)
+    if (
+        targets is None
+        or len(targets) != 1
+        or not isinstance(targets[0], ast.Name)
+        or not isinstance(value, ast.Call)
+        or _cleanup_kind(value) != resource.kind
+        or not isinstance(cleanup_try, ast.Try)
+        or cleanup_try.handlers
+        or cleanup_try.orelse
+        or len(cleanup_try.body) != 1
+        or len(cleanup_try.finalbody) != 1
+    ):
+        return False
+    name = targets[0].id
+    if _yielded_name(cleanup_try.body[0]) != name:
+        return False
+    cleanup = cleanup_try.finalbody[0]
+    if not isinstance(cleanup, ast.Expr):
+        return False
+    expression = (
+        cleanup.value.value if isinstance(cleanup.value, ast.Await) else cleanup.value
+    )
+    return (
+        isinstance(expression, ast.Call)
+        and _name(expression.func) == f"{name}.close"
+        and not expression.args
+        and not expression.keywords
+    )
+
+
 def _used_as_context_manager(
     resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
 ) -> bool:
-    if _cleanup_kind(resource.node) is not None:
+    if _cleanup_kind(resource.node) is not None or not _exact_context_cleanup(
+        resource, parents
+    ):
         return False
     for node in _enclosing_nodes(resource.node, parents):
         if isinstance(node, (ast.With, ast.AsyncWith)):
@@ -1150,7 +1277,27 @@ def _returned_by_helper(
     resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
 ) -> bool:
     returned = _returned_at(resource, parents)
-    return returned is not None and _transfer_is_immediate(resource, returned, parents)
+    return isinstance(returned, ast.Return) and _transfer_is_immediate(
+        resource, returned, parents
+    )
+
+
+def _composition_parent(
+    resource: ResourceOpen, resources: list[ResourceOpen]
+) -> ResourceOpen | None:
+    for parent in resources:
+        for index, argument in enumerate(parent.node.args):
+            edge = OWNED_COMPOSITION_EDGES.get(
+                (_name(parent.node.func).rsplit(".", 1)[-1], index)
+            )
+            if edge == resource.kind and (
+                _direct_value(argument, resource.node)
+                or (
+                    resource.name is not None and _direct_value(argument, resource.name)
+                )
+            ):
+                return parent
+    return None
 
 
 def _resource_is_safe(
@@ -1173,20 +1320,9 @@ def _resource_is_safe(
         or _transferred_to_cancellation_owner(resource, parents)
     ):
         return True
-    return any(
-        (
-            resource.node in ast.walk(parent.node)
-            or (
-                resource.name is not None
-                and parent.node.lineno >= resource.node.lineno
-                and _contains_name(parent.node, resource.name)
-            )
-        )
-        and _resource_is_safe(
-            parent, resources, owner_names, parents, checked | {resource}
-        )
-        for parent in resources
-        if parent is not resource
+    parent = _composition_parent(resource, resources)
+    return parent is not None and _resource_is_safe(
+        parent, resources, owner_names, parents, checked | {resource}
     )
 
 
@@ -1431,6 +1567,32 @@ def _read_ratchet(root: Path, path: Path = RATCHET_PATH) -> set[str]:
     }
 
 
+def _cleanup_ratchet_findings(
+    cleanup_findings: list[Finding],
+    cleanup_trees: dict[Path, ast.AST],
+    cleanup_ratchet: set[str],
+) -> list[Finding]:
+    current = {
+        cleanup_ratchet_key(finding, cleanup_trees) for finding in cleanup_findings
+    }
+    findings = [
+        finding
+        for finding in cleanup_findings
+        if cleanup_ratchet_key(finding, cleanup_trees) not in cleanup_ratchet
+    ]
+    findings.extend(
+        Finding(
+            CLEANUP_RATCHET_PATH,
+            line,
+            1,
+            CLEANUP_CODE,
+            f"{key} no longer exists; remove it from {CLEANUP_RATCHET_PATH}",
+        )
+        for line, key in enumerate(sorted(cleanup_ratchet - current), start=1)
+    )
+    return findings
+
+
 def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
     root = Path.cwd() if root is None else root
     deadline_findings, deadline_trees = _scan_deadline_findings(root)
@@ -1448,9 +1610,6 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
         )
     deadline_ratchet = _read_ratchet(root)
     cleanup_ratchet = _read_ratchet(root, CLEANUP_RATCHET_PATH)
-    current_cleanup = {
-        cleanup_ratchet_key(finding, cleanup_trees) for finding in cleanup_findings
-    }
     findings = [
         finding
         for finding in deadline_findings
@@ -1458,19 +1617,7 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
         not in deadline_ratchet
     ]
     findings.extend(
-        finding
-        for finding in cleanup_findings
-        if cleanup_ratchet_key(finding, cleanup_trees) not in cleanup_ratchet
-    )
-    findings.extend(
-        Finding(
-            CLEANUP_RATCHET_PATH,
-            line,
-            1,
-            CLEANUP_CODE,
-            f"{key} no longer exists; remove it from {CLEANUP_RATCHET_PATH}",
-        )
-        for line, key in enumerate(sorted(cleanup_ratchet - current_cleanup), start=1)
+        _cleanup_ratchet_findings(cleanup_findings, cleanup_trees, cleanup_ratchet)
     )
     return sorted(
         findings,
