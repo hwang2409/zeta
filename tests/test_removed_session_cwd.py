@@ -27,6 +27,99 @@ async def _collect(loop: AgentLoop) -> list[object]:
     return await asyncio.wait_for(collect(), 10)
 
 
+def _fd_count() -> int:
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        if Path(directory).is_dir():
+            return len(list(Path(directory).iterdir()))
+    pytest.skip("file descriptor directory is unavailable")
+
+
+async def _execute_shell_route(
+    registry: ToolRegistry, route: str, command: str
+) -> dict[str, object]:
+    result = await _execute(
+        registry,
+        ToolCall(route, route, {"command": command}),
+    )
+    if route == "run_background" and result["isError"] is False:
+        await asyncio.wait_for(
+            registry.background_tasks.wait(result["structuredContent"]["task_id"]),
+            10,
+        )
+    return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["bash", "run_background"])
+async def test_shell_replacement_between_verification_and_spawn_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:
+    session_cwd = tmp_path / "worktree"
+    target = tmp_path / "replacement-target"
+    marker = target / "marker"
+    session_cwd.mkdir()
+    target.mkdir()
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+    verify = registry.verify_cwd_identity
+    interleaved = False
+
+    def replace_after_verification(*, allow_removed: bool = False) -> None:
+        nonlocal interleaved
+        verify(allow_removed=allow_removed)
+        shutil.rmtree(session_cwd)
+        session_cwd.symlink_to(target, target_is_directory=True)
+        interleaved = True
+
+    monkeypatch.setattr(registry, "verify_cwd_identity", replace_after_verification)
+    baseline = _fd_count()
+    try:
+        result = await _execute_shell_route(registry, route, "touch marker")
+
+        assert interleaved is True
+        assert result["isError"] is True
+        assert marker.exists() is False
+        assert _fd_count() == baseline
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["bash", "run_background"])
+async def test_shell_removal_between_verification_and_spawn_uses_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:
+    session_cwd = tmp_path / "worktree"
+    marker = tmp_path / "marker"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+    verify = registry.verify_cwd_identity
+    interleaved = False
+
+    def remove_after_verification(*, allow_removed: bool = False) -> None:
+        nonlocal interleaved
+        verify(allow_removed=allow_removed)
+        shutil.rmtree(session_cwd)
+        interleaved = True
+
+    monkeypatch.setattr(registry, "verify_cwd_identity", remove_after_verification)
+    try:
+        result = await _execute_shell_route(registry, route, "touch marker")
+
+        assert interleaved is True
+        assert result["isError"] is False
+        assert marker.exists() is True
+        assert registry.bash_cwd == str(tmp_path)
+        assert registry.take_cwd_recovery_notices() == (
+            (str(session_cwd), str(tmp_path)),
+        )
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
+
+
 @pytest.mark.asyncio
 async def test_bash_explicit_cwd_survives_removed_session_cwd(tmp_path: Path) -> None:
     session_cwd = tmp_path / "worktree"
