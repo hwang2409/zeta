@@ -7,6 +7,7 @@ import stat
 import sys
 import threading
 import uuid
+import weakref
 from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -707,7 +708,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     loops: list[AgentLoop] = []
-    stores: list[ConversationStore] = []
+    stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
@@ -763,7 +764,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        stores.append(store)
+        stores.add(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
@@ -823,7 +824,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
                 await registry_close(registry)
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for store in reversed(stores):
+    for store in reversed(tuple(stores)):
         if not store._closed:
             try:
                 store_close(store)
