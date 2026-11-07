@@ -7,7 +7,6 @@ import errno
 import fcntl
 import json
 import os
-import re
 import stat
 import tempfile
 import time
@@ -15,11 +14,14 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict
+from urllib.parse import quote
 
 from ..core.session import env_home
 from .client import MCPError
 
-_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+_SAFE_FILENAME_CHARS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+)
 _MAX_CREDENTIAL_RECORD_BYTES = 64 * 1024
 _LOCK_TIMEOUT_SECONDS = 1.0
 REFRESH_LEEWAY_SECONDS = 30.0
@@ -158,8 +160,8 @@ def public_credential_store_error(
     }
 
 
-def _safe_slug(name: str) -> str:
-    return _SAFE_NAME.sub("_", name) or "server"
+def _credential_filename(name: str) -> str:
+    return quote(name, safe=_SAFE_FILENAME_CHARS)
 
 
 def token_store_dir(home: str | Path | None = None) -> Path:
@@ -168,7 +170,7 @@ def token_store_dir(home: str | Path | None = None) -> Path:
 
 
 def token_store_path(name: str, home: str | Path | None = None) -> Path:
-    return token_store_dir(home) / f"{_safe_slug(name)}.json"
+    return token_store_dir(home) / f"{_credential_filename(name)}.json"
 
 
 class MCPCredentialStore:
@@ -218,12 +220,9 @@ class MCPCredentialStore:
             operation,
         )
 
-    def _lock(
-        self, name: str, operation: CredentialOperation, *, exclusive: bool
-    ) -> int:
-        directory = token_store_dir(self._home)
+    def _open_lock(self, name: str, operation: CredentialOperation) -> int:
         try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            token_store_dir(self._home).mkdir(parents=True, exist_ok=True, mode=0o700)
             lock_path = token_store_path(name, self._home).with_suffix(".lock")
             flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
             flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -238,6 +237,7 @@ class MCPCredentialStore:
                 raise self._error(
                     name, operation, CredentialStoreErrorReason.UNSAFE_FILE
                 )
+            return fd
         except MCPCredentialStoreError:
             raise
         except OSError as exc:
@@ -247,6 +247,11 @@ class MCPCredentialStore:
                 else CredentialStoreErrorReason.IO
             )
             raise self._error(name, operation, reason) from exc
+
+    def _lock(
+        self, name: str, operation: CredentialOperation, *, exclusive: bool
+    ) -> int:
+        fd = self._open_lock(name, operation)
         deadline = time.monotonic() + self._lock_timeout
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         while True:

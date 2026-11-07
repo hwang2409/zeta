@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import multiprocessing
 import os
 import socket
 import stat
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -24,6 +25,7 @@ from zeta.mcp import (
     MCPServerConfig,
     StreamableHTTPMCPClient,
     load_mcp_config,
+    oauth_store,
 )
 from zeta.mcp.client import MCPHTTPError, MCPResource, MCPResourceContent
 from zeta.mcp.commands import parse_add_command
@@ -42,8 +44,10 @@ from zeta.mcp.oauth import (
     refresh_access_token,
 )
 from zeta.mcp.oauth_store import (
+    CredentialSnapshot,
     MCPCredentialStore,
     MCPOAuthToken,
+    SaveIfCurrentResult,
     redact_token,
     token_is_expired,
     token_state,
@@ -2404,3 +2408,506 @@ async def test_refresh_commit_failure_never_sends_candidate(
     assert candidate_requests == []
     await client.close()
     await transport.aclose()
+
+
+class _CredentialRaceStore(MCPCredentialStore):
+    """Gate one worker transaction while public MCP operations keep running."""
+
+    def __init__(
+        self,
+        *,
+        home: Path,
+        loop_thread_id: int,
+        gate: str,
+        load_number: int = 0,
+    ) -> None:
+        super().__init__(home=home)
+        self.loop_thread_id = loop_thread_id
+        self.gate = gate
+        self.load_number = load_number
+        self.loads = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _block(self) -> None:
+        assert threading.get_ident() != self.loop_thread_id
+        self.entered.set()
+        assert self.release.wait(timeout=5), "credential race gate timed out"
+
+    def _load_transaction(self, name: str, operation: str) -> CredentialSnapshot:
+        self.loads += 1
+        selected = self.loads == self.load_number
+        if self.gate == "before_load" and selected:
+            self._block()
+        snapshot = super()._load_transaction(name, operation)  # type: ignore[arg-type]
+        if self.gate == "after_load" and selected:
+            self._block()
+        return snapshot
+
+    def _save_if_current_transaction(
+        self,
+        name: str,
+        expected_generation: int,
+        replacement: MCPOAuthToken,
+    ) -> SaveIfCurrentResult:
+        result = super()._save_if_current_transaction(
+            name, expected_generation, replacement
+        )
+        if self.gate == "after_save_if_current":
+            self._block()
+        return result
+
+    def _save_login_transaction(
+        self, name: str, token: MCPOAuthToken
+    ) -> CredentialSnapshot:
+        snapshot = super()._save_login_transaction(name, token)
+        if self.gate == "after_save_login":
+            self._block()
+        return snapshot
+
+    def _delete_transaction(self, name: str) -> CredentialSnapshot:
+        snapshot = super()._delete_transaction(name)
+        if self.gate == "after_delete":
+            self._block()
+        return snapshot
+
+
+async def _wait_for_thread_gate(store: _CredentialRaceStore) -> None:
+    entered = await asyncio.wait_for(
+        asyncio.to_thread(store.entered.wait, 5), timeout=6
+    )
+    assert entered, "credential race gate was not reached"
+
+
+def _oauth_manager(home: Path, project: Path) -> MCPManagementService:
+    project.mkdir(exist_ok=True)
+    manager = MCPManagementService(home=home, project_dir=project)
+    manager.add("live", scope="user", url="https://mcp.test/rpc", oauth=True)
+    return manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["committed", "stale"])
+@pytest.mark.parametrize("window", ["before_result_publication", "before_retry_read"])
+async def test_logout_wins_every_refresh_result_to_retry_window(
+    tmp_path: Path,
+    disposition: str,
+    window: str,
+) -> None:
+    home = tmp_path / "home"
+    original = _write_token("live", home, access_token="stale-token")
+    manager = _oauth_manager(home, tmp_path / "project")
+    race = _CredentialRaceProcess(
+        home,
+        gate=(
+            "after_save_if_current"
+            if window == "before_result_publication"
+            else "before_load"
+        ),
+        load_number=3,
+    )
+    try:
+        await race.request(401, "expired")
+        token_request = await race.receive()
+        assert token_request[:2] == ("request", "/token")
+        if disposition == "stale":
+            winner = replace(original, access_token="winner-token")
+            await MCPCredentialStore(home=home).save_login("live", winner)
+        race.connection.send(
+            (200, {"access_token": "candidate-token", "token_type": "Bearer"})
+        )
+        await race.gate()
+        await manager.logout("live", scope="user")
+        race.release()
+        result = await race.result()
+
+        assert result["isError"] is True
+        assert race.headers == ["Bearer stale-token"]
+        authority = await MCPCredentialStore(home=home).load("live")
+        assert authority.token is None
+    finally:
+        await race.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("window", "replace_during_failure"),
+    [
+        ("before_failed_reload", False),
+        ("after_failed_reload", True),
+    ],
+)
+async def test_logout_wins_failed_refresh_reload_windows(
+    tmp_path: Path,
+    window: str,
+    replace_during_failure: bool,
+) -> None:
+    home = tmp_path / "home"
+    original = _write_token("live", home, access_token="stale-token")
+    manager = _oauth_manager(home, tmp_path / "project")
+    race = _CredentialRaceProcess(
+        home,
+        gate="before_load" if window == "before_failed_reload" else "after_load",
+        load_number=3,
+    )
+    try:
+        await race.request(401, "expired")
+        token_request = await race.receive()
+        assert token_request[:2] == ("request", "/token")
+        if replace_during_failure:
+            changed = replace(original, access_token="changed-token")
+            await MCPCredentialStore(home=home).save_login("live", changed)
+        race.connection.send((400, {"error": "invalid_grant"}))
+        await race.gate()
+        await manager.logout("live", scope="user")
+        race.release()
+        result = await race.result()
+
+        assert result["isError"] is True
+        assert race.headers == ["Bearer stale-token"]
+        authority = await MCPCredentialStore(home=home).load("live")
+        assert authority.token is None
+    finally:
+        await race.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_adopts_changed_durable_token(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    original = _write_token("live", home, access_token="stale-token")
+    race = _CredentialRaceProcess(home, gate="none")
+    try:
+        await race.request(401, "expired")
+        token_request = await race.receive()
+        assert token_request[:2] == ("request", "/token")
+        changed = replace(original, access_token="changed-token")
+        await MCPCredentialStore(home=home).save_login("live", changed)
+        race.connection.send((400, {"error": "invalid_grant"}))
+        retry = await race.receive()
+        assert retry[:3] == ("request", "/rpc", "Bearer changed-token")
+        body = json.loads(retry[3])
+        race.connection.send(
+            (
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"content": [{"type": "text", "text": "changed"}]},
+                },
+            )
+        )
+        result = await race.result()
+
+        assert result["content"][0]["text"] == "changed"
+        assert race.headers == ["Bearer stale-token"]
+    finally:
+        await race.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_commit", ["logout", "login"])
+async def test_public_login_and_logout_follow_both_exclusive_lock_orders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    last_commit: str,
+) -> None:
+    home = tmp_path / "home"
+    original = _write_token("live", home, access_token="old-token")
+    manager = _oauth_manager(home, tmp_path / "project")
+    candidate = replace(original, access_token="new-login-token")
+
+    async def fake_authorize(**_kwargs: object) -> MCPOAuthToken:
+        return candidate
+
+    monkeypatch.setattr("zeta.mcp.oauth.authorize", fake_authorize)
+    gate = "after_save_login" if last_commit == "logout" else "after_delete"
+    store = _CredentialRaceStore(
+        home=home,
+        loop_thread_id=threading.get_ident(),
+        gate=gate,
+    )
+    manager._credential_store = store
+
+    first = (
+        asyncio.create_task(manager.login("live", scope="user", no_browser=True))
+        if last_commit == "logout"
+        else asyncio.create_task(manager.logout("live", scope="user"))
+    )
+    await _wait_for_thread_gate(store)
+    second = (
+        asyncio.create_task(manager.logout("live", scope="user"))
+        if last_commit == "logout"
+        else asyncio.create_task(manager.login("live", scope="user", no_browser=True))
+    )
+    await asyncio.wait_for(second, timeout=5)
+    store.release.set()
+    await asyncio.wait_for(first, timeout=5)
+
+    authority = await MCPCredentialStore(home=home).load("live")
+    if last_commit == "logout":
+        assert authority.token is None
+    else:
+        assert authority.token is not None
+        assert authority.token.access_token == "new-login-token"
+
+
+@pytest.mark.asyncio
+async def test_colliding_server_names_keep_separate_credentials_and_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    manager = MCPManagementService(home=home, project_dir=tmp_path / "project")
+    (tmp_path / "project").mkdir()
+    names = ("team/server", "team_server")
+    for name in names:
+        manager.add(
+            name,
+            scope="user",
+            url=f"https://{name.replace('/', '-')}.test/rpc",
+            oauth=True,
+        )
+
+    async def fake_authorize(*, server_name: str, server_url: str, **kwargs: object):
+        token = MCPOAuthToken(
+            access_token=f"token-for-{server_name}",
+            refresh_token="refresh-token",
+            expires_at=None,
+            token_type="Bearer",
+            scope=None,
+            authorization_server="https://auth.test",
+            token_endpoint="https://auth.test/token",
+            authorization_endpoint="https://auth.test/authorize",
+            client_id="client",
+            client_secret=None,
+            redirect_uri="http://127.0.0.1/callback",
+            resource=server_url,
+        )
+        legacy_save = getattr(oauth_store, "save_token", None)
+        if legacy_save is not None:
+            legacy_save(server_name, token, home=kwargs.get("home"))
+        return token
+
+    monkeypatch.setattr("zeta.mcp.oauth.authorize", fake_authorize)
+    for name in names:
+        await manager.login(name, scope="user", no_browser=True)
+
+    seen: dict[str, list[str | None]] = {name: [] for name in names}
+
+    def client_for(name: str) -> tuple[StreamableHTTPMCPClient, httpx.AsyncClient]:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen[name].append(request.headers.get("authorization"))
+            body = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"content": [{"type": "text", "text": name}]},
+                },
+                request=request,
+            )
+
+        transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return (
+            StreamableHTTPMCPClient(
+                MCPServerConfig(
+                    name,
+                    "streamable-http",
+                    url=f"https://{name.replace('/', '-')}.test/rpc",
+                    auth_type="oauth",
+                ),
+                client=transport,
+                home=str(home),
+            ),
+            transport,
+        )
+
+    pairs = {name: client_for(name) for name in names}
+    try:
+        for name, (client, _transport) in pairs.items():
+            result = await client.call_tool("echo", {}, AbortSignal())
+            assert result["content"][0]["text"] == name
+            assert seen[name] == [f"Bearer token-for-{name}"]
+
+        logout = manager.logout("team/server", scope="user")
+        if inspect.isawaitable(logout):
+            await logout
+        removed = await pairs["team/server"][0].call_tool("echo", {}, AbortSignal())
+        retained = await pairs["team_server"][0].call_tool("echo", {}, AbortSignal())
+        assert removed["isError"] is True
+        assert retained["content"][0]["text"] == "team_server"
+        assert seen["team/server"] == ["Bearer token-for-team/server"]
+        assert seen["team_server"] == [
+            "Bearer token-for-team_server",
+            "Bearer token-for-team_server",
+        ]
+    finally:
+        for client, transport in pairs.values():
+            await client.close()
+            await transport.aclose()
+
+
+class _ProcessCredentialRaceStore(MCPCredentialStore):
+    def __init__(
+        self,
+        *,
+        home: Path,
+        loop_thread_id: int,
+        gate: str,
+        load_number: int,
+        connection: Any,
+    ) -> None:
+        super().__init__(home=home)
+        self.loop_thread_id = loop_thread_id
+        self.gate = gate
+        self.load_number = load_number
+        self.connection = connection
+        self.loads = 0
+
+    def _block(self) -> None:
+        assert threading.get_ident() != self.loop_thread_id
+        self.connection.send(("gate", self.gate))
+        assert self.connection.recv() == "release"
+
+    def _load_transaction(self, name: str, operation: str) -> CredentialSnapshot:
+        self.loads += 1
+        selected = self.loads == self.load_number
+        if self.gate == "before_load" and selected:
+            self._block()
+        snapshot = super()._load_transaction(name, operation)  # type: ignore[arg-type]
+        if self.gate == "after_load" and selected:
+            self._block()
+        return snapshot
+
+    def _save_if_current_transaction(
+        self,
+        name: str,
+        expected_generation: int,
+        replacement: MCPOAuthToken,
+    ) -> SaveIfCurrentResult:
+        result = super()._save_if_current_transaction(
+            name, expected_generation, replacement
+        )
+        if self.gate == "after_save_if_current":
+            self._block()
+        return result
+
+
+async def _credential_race_child(
+    home_text: str,
+    gate: str,
+    load_number: int,
+    connection: Any,
+) -> None:
+    home = Path(home_text)
+    store = _ProcessCredentialRaceStore(
+        home=home,
+        loop_thread_id=threading.get_ident(),
+        gate=gate,
+        load_number=load_number,
+        connection=connection,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        connection.send(
+            (
+                "request",
+                request.url.path,
+                request.headers.get("authorization"),
+                bytes(request.content),
+            )
+        )
+        status, payload = await asyncio.to_thread(connection.recv)
+        if isinstance(payload, dict):
+            return httpx.Response(status, json=payload, request=request)
+        return httpx.Response(status, text=payload, request=request)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test/rpc", auth_type="oauth"
+        ),
+        client=transport,
+        home=home_text,
+    )
+    client._credential_store = store
+    try:
+        result = await client.call_tool("echo", {}, AbortSignal())
+        connection.send(("result", result))
+    finally:
+        await client.close()
+        await transport.aclose()
+        connection.close()
+
+
+def _credential_race_process_entry(
+    home_text: str,
+    gate: str,
+    load_number: int,
+    connection: Any,
+) -> None:
+    asyncio.run(_credential_race_child(home_text, gate, load_number, connection))
+
+
+class _CredentialRaceProcess:
+    def __init__(self, home: Path, *, gate: str, load_number: int = 0) -> None:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe()
+        self.connection = parent
+        self.process = context.Process(
+            target=_credential_race_process_entry,
+            args=(str(home), gate, load_number, child),
+        )
+        self.process.start()
+        child.close()
+        self.headers: list[str | None] = []
+
+    async def receive(self) -> tuple[Any, ...]:
+        message = await asyncio.wait_for(
+            asyncio.to_thread(self.connection.recv), timeout=10
+        )
+        assert isinstance(message, tuple)
+        return message
+
+    async def request(self, status: int, payload: object) -> tuple[Any, ...]:
+        message = await self.receive()
+        assert message[0] == "request"
+        self.headers.append(message[2])
+        self.connection.send((status, payload))
+        return message
+
+    async def gate(self) -> None:
+        message = await self.receive()
+        assert message[0] == "gate"
+
+    def release(self) -> None:
+        self.connection.send("release")
+
+    async def result(self) -> dict[str, object]:
+        while True:
+            message = await self.receive()
+            if message[0] == "result":
+                return message[1]
+            assert message[0] == "request"
+            self.headers.append(message[2])
+            body = json.loads(message[3])
+            self.connection.send(
+                (
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {"content": [{"type": "text", "text": "unexpected"}]},
+                    },
+                )
+            )
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self.process.join, 10)
+        if self.process.is_alive():
+            self.process.kill()
+            await asyncio.to_thread(self.process.join, 5)
+            raise AssertionError("credential race child did not exit")
+        assert self.process.exitcode == 0
+        self.process.close()
+        self.connection.close()

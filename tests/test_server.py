@@ -55,7 +55,7 @@ from zeta.core.store import (
     ConversationStore,
 )
 from zeta.core.store._validation import NOTIFICATION_KINDS
-from zeta.mcp.oauth_store import token_store_path
+from zeta.mcp.oauth_store import MCPOAuthToken, token_store_path
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
@@ -8414,8 +8414,24 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_slash_run_mcp_status_maps_malformed_credential_error(
+@pytest.mark.parametrize(
+    ("record", "reason", "description"),
+    [
+        pytest.param("{broken", "malformed", "malformed", id="malformed"),
+        pytest.param(
+            json.dumps({"access_token": "x" * (70 * 1024)}),
+            "oversized",
+            "too large",
+            id="oversized",
+        ),
+    ],
+)
+async def test_slash_run_mcp_credential_evidence_recovery(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record: str,
+    reason: str,
+    description: str,
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -8437,7 +8453,25 @@ async def test_slash_run_mcp_status_maps_malformed_credential_error(
     )
     credential_file = token_store_path("live", home)
     credential_file.parent.mkdir()
-    credential_file.write_text("{broken")
+    credential_file.write_text(record)
+
+    async def fake_authorize(**_kwargs: object) -> MCPOAuthToken:
+        return MCPOAuthToken(
+            access_token="recovered-token",
+            refresh_token="refresh-token",
+            expires_at=None,
+            token_type="Bearer",
+            scope=None,
+            authorization_server="https://auth.test",
+            token_endpoint="https://auth.test/token",
+            authorization_endpoint="https://auth.test/authorize",
+            client_id="client",
+            client_secret=None,
+            redirect_uri="http://127.0.0.1/callback",
+            resource="https://mcp.test",
+        )
+
+    monkeypatch.setattr("zeta.mcp.oauth.authorize", fake_authorize)
     server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -8451,7 +8485,8 @@ async def test_slash_run_mcp_status_maps_malformed_credential_error(
             )
         )[-1]["result"]
         expected_text = (
-            f"MCP credential file is malformed for 'live': {credential_file.absolute()}. "
+            f"MCP credential file is {description} for 'live': "
+            f"{credential_file.absolute()}. "
             "Move this file aside, then run '/mcp auth live'."
         )
         assert response == {
@@ -8459,7 +8494,7 @@ async def test_slash_run_mcp_status_maps_malformed_credential_error(
             "text": expected_text,
             "credential_store_error": {
                 "code": "mcp_credential_store",
-                "reason": "malformed",
+                "reason": reason,
                 "server": "live",
                 "credential_file": str(credential_file.absolute()),
                 "operation": "load",
@@ -8467,6 +8502,52 @@ async def test_slash_run_mcp_status_maps_malformed_credential_error(
                 "text": expected_text,
             },
         }
-        assert credential_file.read_text() == "{broken"
+        assert credential_file.read_text() == record
+
+        for command, operation in (
+            ("/mcp auth live", "load"),
+            ("/mcp logout live", "delete"),
+        ):
+            error_response = (
+                await _request(
+                    reader,
+                    writer,
+                    f"mcp-{operation}-error",
+                    "slash_run",
+                    {"session_id": sid, "text": command},
+                )
+            )[-1]["result"]
+            assert error_response == {
+                "kind": "output",
+                "text": expected_text,
+                "credential_store_error": {
+                    "code": "mcp_credential_store",
+                    "reason": reason,
+                    "server": "live",
+                    "credential_file": str(credential_file.absolute()),
+                    "operation": operation,
+                    "recovery": "move_aside_then_auth",
+                    "text": expected_text,
+                },
+            }
+            assert credential_file.read_text() == record
+
+        moved_evidence = credential_file.with_suffix(".evidence")
+        credential_file.rename(moved_evidence)
+        recovered = (
+            await _request(
+                reader,
+                writer,
+                "mcp-auth-recovered",
+                "slash_run",
+                {"session_id": sid, "text": "/mcp auth live"},
+            )
+        )[-1]["result"]
+        assert recovered["kind"] == "output"
+        assert "credential_store_error" not in recovered
+        assert json.loads(credential_file.read_text())["token"]["access_token"] == (
+            "recovered-token"
+        )
+        assert moved_evidence.read_text() == record
     finally:
         await _close(server, writer)

@@ -16,6 +16,7 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.mcp.management import ManagedServer, MCPManagementService
+from zeta.mcp.oauth_store import MCPOAuthToken
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -470,7 +471,21 @@ async def test_manager_dispatches_enable_remove_test_trust_and_navigation(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_path):
+@pytest.mark.parametrize(
+    ("record", "reason", "description"),
+    [
+        pytest.param("{broken", "malformed", "malformed", id="malformed"),
+        pytest.param(
+            json.dumps({"access_token": "x" * (70 * 1024)}),
+            "oversized",
+            "too large",
+            id="oversized",
+        ),
+    ],
+)
+async def test_real_prompt_mcp_credential_evidence_recovery(
+    tmp_path, monkeypatch, record, reason, description
+):
     home = tmp_path / "home"
     project = tmp_path / "repo"
     project.mkdir()
@@ -484,7 +499,7 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
     )
     credential_file = home / "mcp-tokens" / "live.json"
     credential_file.parent.mkdir()
-    credential_file.write_text("{broken")
+    credential_file.write_text(record)
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path / "sessions"),
@@ -499,7 +514,7 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
         zeta_home=home,
     )
     expected_text = (
-        f"MCP credential file is malformed for 'live': {credential_file.absolute()}. "
+        f"MCP credential file is {description} for 'live': {credential_file.absolute()}. "
         "Move this file aside, then run '/mcp auth live'."
     )
     refreshed = asyncio.Event()
@@ -509,10 +524,28 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
         original_refresh()
         refreshed.set()
 
+    async def fake_authorize(**_kwargs):
+        return MCPOAuthToken(
+            access_token="recovered-token",
+            refresh_token="refresh-token",
+            expires_at=None,
+            token_type="Bearer",
+            scope=None,
+            authorization_server="https://auth.test",
+            token_endpoint="https://auth.test/token",
+            authorization_endpoint="https://auth.test/authorize",
+            client_id="client",
+            client_secret=None,
+            redirect_uri="http://127.0.0.1/callback",
+            resource="https://mcp.test",
+        )
+
+    monkeypatch.setattr("zeta.mcp.oauth.authorize", fake_authorize)
     app._refresh_mcp_manager = record_refresh
 
-    with create_pipe_input() as pipe, create_app_session(
-        input=pipe, output=DummyOutput()
+    with (
+        create_pipe_input() as pipe,
+        create_app_session(input=pipe, output=DummyOutput()),
     ):
         session = app._make_session()
         app._active_session = session
@@ -523,22 +556,37 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
                 await asyncio.sleep(0)
         pipe.send_text("/mcp\r")
         await asyncio.wait_for(refreshed.wait(), timeout=5)
-        error = getattr(app._mcp_manager, "credential_store_error", None)
-        assert error == {
-            "code": "mcp_credential_store",
-            "reason": "malformed",
-            "server": "live",
-            "credential_file": str(credential_file.absolute()),
-            "operation": "load",
-            "recovery": "move_aside_then_auth",
-            "text": expected_text,
-        }
-        rendered = "\n".join(
-            "".join(text for _style, text in line)
-            for line in app._status_card._lines
-        )
-        assert expected_text in rendered
-        assert credential_file.read_text() == "{broken"
+        for key, operation in (("l", "load"), ("o", "delete")):
+            refreshed.clear()
+            pipe.send_text(key)
+            await asyncio.wait_for(refreshed.wait(), timeout=5)
+            error = getattr(app._mcp_manager, "credential_store_error", None)
+            assert error == {
+                "code": "mcp_credential_store",
+                "reason": reason,
+                "server": "live",
+                "credential_file": str(credential_file.absolute()),
+                "operation": operation,
+                "recovery": "move_aside_then_auth",
+                "text": expected_text,
+            }
+            rendered = "\n".join(
+                "".join(text for _style, text in line)
+                for line in app._status_card._lines
+            )
+            assert expected_text in rendered
+            assert credential_file.read_text() == record
+
+        moved_evidence = credential_file.with_suffix(".evidence")
+        credential_file.rename(moved_evidence)
+        refreshed.clear()
+        pipe.send_text("l")
+        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        saved = json.loads(credential_file.read_text())
+        assert saved["token"]["access_token"] == "recovered-token"
+        assert moved_evidence.read_text() == record
+        assert app._mcp_manager.last_result == "authorized live."
+        assert app._mcp_manager.credential_store_error is None
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
             await prompt

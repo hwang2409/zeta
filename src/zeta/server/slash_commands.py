@@ -63,7 +63,6 @@ CLIENT_ONLY_BUILTINS: frozenset[str] = frozenset(
         "theme",
         "runs",
         "send",
-        "mcp",
     }
 )
 
@@ -348,8 +347,9 @@ class ServerSlashSession:
         return self._client_only("send")
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
-        del args
-        return self._client_only("mcp")
+        if self._runtime.loop is None:
+            raise RuntimeError(_UNAVAILABLE_NOTICE)
+        return await self._runtime.loop.slash_mcp(args)
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         del name, arguments
