@@ -468,9 +468,7 @@ async def _wait_for_finish(
                 tasks_running=bool(tasks),
             )
         else:
-            result = await state.wait_transition(
-                child_loop, tasks_running=bool(tasks)
-            )
+            result = await state.wait_transition(child_loop, tasks_running=bool(tasks))
         if result is not None:
             return result
     return FinishGateResult("completed")
