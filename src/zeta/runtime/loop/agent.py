@@ -515,9 +515,7 @@ class AgentLoop(
         return killed
 
     async def close(
-        self,
-        *,
-        cancel_background: bool = True,
+        self, *, cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
@@ -534,9 +532,7 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown(
-                    background_task_cause
-                )
+                self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):

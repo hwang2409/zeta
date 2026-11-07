@@ -2653,9 +2653,12 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period() ->
         now[0] += 3600
         await wait.releases.put(False)
         assert await wait.timeouts.get() is None
-        assert notices == [
-            "task late-task (watch ci) has run 1h; kill it with task_kill or leave it running"
-        ]
+        assert len(notices) == 1
+        assert notices[0].startswith(
+            "task late-task (watch ci) has run 1h; "
+            "kill it with task_kill or leave it running\n[task-safety-cohort: "
+        )
+        assert notices[0].endswith("]")
         assert registry.kills == []
 
         # Once all tasks end, a later task owns a new full window from its start.
@@ -3008,7 +3011,7 @@ async def test_task_safety_cancellation_finishes_warning_commit() -> None:
 
     async def publish(text: str) -> str:
         publishing.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         notices.append(text)
         return "warning-1"
 
