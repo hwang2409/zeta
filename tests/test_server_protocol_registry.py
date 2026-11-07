@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.slash import create_slash_registry
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -13,6 +14,7 @@ from zeta.server.protocol import (
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
 )
+from zeta.skills import SkillCatalog
 
 ROOT = Path(__file__).parents[1]
 PROTOCOL_DOC = ROOT / "docs" / "serve-protocol.md"
@@ -53,12 +55,20 @@ def _documented_events(document: str) -> set[str]:
 
 
 def _documented_slash_result_kinds(document: str) -> set[str]:
-    section = _section(document, "Returns a `kind` discriminator:", "The built-ins")
+    section = _section(
+        document,
+        "Returns a `kind` discriminator:",
+        "The shared slash registry",
+    )
     return set(re.findall(r"^  - `([a-z_]+)`:", section, re.MULTILINE))
 
 
 def _documented_slash_error_codes(document: str) -> set[str]:
-    section = _section(document, "Structured slash error codes are:", "The built-ins")
+    section = _section(
+        document,
+        "Structured slash error codes are:",
+        "The shared slash registry",
+    )
     return set(re.findall(r"^\| `([a-z_]+)` \|", section, re.MULTILINE))
 
 
@@ -393,6 +403,60 @@ def _raw_frame_bypasses() -> list[str]:
     return violations
 
 
+class _SlashRegistryBypassVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.violations: list[str] = []
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Name)
+                and "EXECUTABLE" in target.id
+                and isinstance(node.value, (ast.Set, ast.Call))
+            ):
+                self.violations.append(
+                    f"line {node.lineno}: slash availability belongs in ServeSlash"
+                )
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        if (
+            isinstance(node.left, ast.Name)
+            and node.left.id == "name"
+            and any(
+                isinstance(comparator, ast.Constant)
+                and isinstance(comparator.value, str)
+                for comparator in node.comparators
+            )
+        ):
+            self.violations.append(
+                f"line {node.lineno}: slash dispatch belongs in SlashCommand"
+            )
+        self.generic_visit(node)
+
+
+def _slash_registry_bypasses(source: str) -> list[str]:
+    visitor = _SlashRegistryBypassVisitor()
+    visitor.visit(ast.parse(source))
+    return visitor.violations
+
+
+def test_no_serve_slash_allowlist_or_named_dispatch_bypasses_registry() -> None:
+    source = (ROOT / "src/zeta/server/slash_commands.py").read_text()
+    assert not (violations := _slash_registry_bypasses(source)), "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        'EXECUTABLE_BUILTINS = frozenset({"status", "mcp"})',
+        'def run(name):\n    if name == "mcp":\n        return "special"',
+    ),
+)
+def test_slash_registry_gate_rejects_committed_bypass_mutations(source: str) -> None:
+    assert _slash_registry_bypasses(source)
+
+
 def test_no_code_bypasses_the_typed_frame_codec() -> None:
     assert not (violations := _raw_frame_bypasses()), (
         "error and notification wire frames have one typed chokepoint in "
@@ -522,6 +586,30 @@ STRUCTURED_ERROR_FIXTURES = (
 )
 
 
+def test_documented_slash_table_matches_shared_registry() -> None:
+    document = PROTOCOL_DOC.read_text()
+    table = document.split(
+        "The shared slash registry has this order and surface availability:", 1
+    )[1].split("\n\n", 2)[1]
+    documented = []
+    for line in table.splitlines()[2:]:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        documented.append(
+            (
+                cells[0].strip("`"),
+                cells[1] == "yes",
+                cells[2].replace("`", ""),
+            )
+        )
+
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+    actual = [
+        (command.name, command.serve is not None, command.description)
+        for command in registry.builtin_commands
+    ]
+    assert documented == actual
+
+
 def test_structured_error_frames_match_pinned_bytes() -> None:
     codec = FrameCodec()
     assert {descriptor for descriptor, _, _, _ in STRUCTURED_ERROR_FIXTURES} == {
@@ -561,7 +649,7 @@ def test_registered_protocol_values_match_pinned_bytes() -> None:
         codec.response(
             7,
             {
-                "kind": SlashResultKindDescriptor.TEXT,
+                "kind": SlashResultKindDescriptor.OUTPUT,
                 "text": "credential error",
                 "credential_store_error": {
                     "code": SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE,
@@ -574,5 +662,5 @@ def test_registered_protocol_values_match_pinned_bytes() -> None:
                 },
             },
         )
-        == b'{"jsonrpc":"2.0","id":7,"result":{"kind":"text","text":"credential error","credential_store_error":{"code":"mcp_credential_store","reason":"invalid_json","server":"live","credential_file":"/home/.zeta/mcp-oauth.json","operation":"load","recovery":"move_aside_then_auth","text":"credential error"}}}\n'
+        == b'{"jsonrpc":"2.0","id":7,"result":{"kind":"output","text":"credential error","credential_store_error":{"code":"mcp_credential_store","reason":"invalid_json","server":"live","credential_file":"/home/.zeta/mcp-oauth.json","operation":"load","recovery":"move_aside_then_auth","text":"credential error"}}}\n'
     )

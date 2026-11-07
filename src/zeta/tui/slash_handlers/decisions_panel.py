@@ -80,6 +80,11 @@ class DecisionsMixin:
         return self._decisions_panel_open and self._full_screen_active()
 
     async def slash_decisions(self, args: str) -> str:
+        full_screen_active = getattr(self, "_full_screen_active", lambda: False)
+        if not args.strip() and full_screen_active():
+            self._consume_overlay_submission()
+            self.open_decisions_panel()
+            return ""
         from ...attention_decisions import open_decisions
         from ...attention_records import AttentionStore
 
@@ -171,17 +176,13 @@ class DecisionsMixin:
 
     # -- open / close -------------------------------------------------------
 
-    def open_decisions_panel(self, *, restore_composer: bool = True) -> None:
+    def open_decisions_panel(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        if restore_composer:
-            self._decisions_restore_text = buffer.text
-            self._decisions_restore_cursor = buffer.cursor_position
-        else:
-            self._decisions_restore_text = ""
-            self._decisions_restore_cursor = 0
+        self._decisions_restore_text = buffer.text
+        self._decisions_restore_cursor = buffer.cursor_position
         self._decisions_panel_open = True
         self._decisions_panel_control.set_lines(
             self._decisions_panel.render_lines(), overflow_hint=True

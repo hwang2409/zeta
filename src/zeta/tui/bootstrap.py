@@ -8,6 +8,7 @@ import asyncio
 import threading
 from collections.abc import Sequence
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +21,7 @@ from ..core.project_context import (
     PromptArgumentError,
     associate_project_discovery,
     discover_project,
-    resolve_project_context,
+    resolve_project_context_from_projects,
     resolve_prompt_argument,
 )
 from ..core.session import (
@@ -35,7 +36,6 @@ from ..core.session import (
 )
 from ..core.slash import resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
-from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
@@ -349,17 +349,35 @@ def _create_app_with_root(
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
     registry = manager.project_registry
-    if config.auto_project and not ephemeral and not resuming and registry is not None:
+    if (
+        config.auto_project
+        and not ephemeral
+        and not resuming
+        and registry is not None
+        and manager.project_registry_unavailable is None
+    ):
         discovery = associate_project_discovery(discovery, registry)
-    cwd_project = (
-        resolve_project_context(discovery, registry) if registry is not None else None
+    selected_project_id = (
+        metadata.project_id
+        if resuming
+        else discovery.project.project_id
+        if discovery.project is not None
+        else None
     )
-    session_project = discovery.project if registry is not None else None
-    if resuming and metadata.project_id is not None and registry is not None:
-        try:
-            session_project = registry.show_project(metadata.project_id)
-        except ProjectRegistryError:
-            session_project = None
+    projection = (
+        registry.project_context_projection(selected_project_id)
+        if registry is not None
+        else None
+    )
+    cwd_project = (
+        resolve_project_context_from_projects(discovery, projection.projects)
+        if projection is not None
+        else None
+    )
+    session_project = projection.session_project if projection is not None else None
+    if not resuming and session_project is None and cwd_project is not None:
+        session_project = cwd_project
+        discovery = replace(discovery, project=cwd_project)
     override_on_resume = False
     if resuming:
         cli_provider = getattr(args, "provider", None)
@@ -403,6 +421,8 @@ def _create_app_with_root(
             system_append=system_prompt_append,
             context_loader=_app.load_project_context,
             project_features_enabled=registry is not None,
+            registry=registry,
+            project_projection=projection,
         )
         project_context = resumed_prompt.context
         skill_catalog = resumed_prompt.skill_catalog
@@ -424,6 +444,8 @@ def _create_app_with_root(
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
+            registry=registry,
+            project_projection=projection,
         )
     recency: _SessionRecency | None = None
     pending_override = None
