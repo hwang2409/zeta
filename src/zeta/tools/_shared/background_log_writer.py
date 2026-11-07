@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
 import queue
 import threading
 from typing import IO
+
+from ...core.thread_call import run_owned_thread_call
 
 
 class _OrderedLogWriter:
@@ -65,13 +66,8 @@ class _OrderedLogWriter:
         try:
             await _await_worker(completion)
         finally:
-            await asyncio.to_thread(self._thread.join)
+            await run_owned_thread_call(self._thread.join)
 
 
 async def _await_worker(completion: concurrent.futures.Future[None]) -> None:
-    wrapped = asyncio.wrap_future(completion)
-    try:
-        await asyncio.shield(wrapped)
-    except asyncio.CancelledError:
-        await wrapped
-        raise
+    await run_owned_thread_call(completion.result)

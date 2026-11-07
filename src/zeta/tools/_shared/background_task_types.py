@@ -51,16 +51,20 @@ class _BackgroundRecord:
     note: str | None = None
     log_path: str | None = None
     remove_log_on_archive: bool = False
-    log_fd: int | None = None
-    storage_lock: asyncio.Lock | None = None
     notify_on_exit: bool = True
-    receipt_pending: bool = False
     tui_presented: bool = False
     owner: str = "run_background"
     terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (
         None
     )
-    monitor: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTaskKillOutcome:
+    killed_by_this_call: bool
+    cause: str | None
+    exit_code: int | None
+    status: Literal["running", "exited", "killed"]
 
 
 @dataclass(frozen=True, slots=True)

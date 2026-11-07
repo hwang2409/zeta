@@ -324,6 +324,11 @@ class ToolRegistry:
             storage_lease=(
                 session_store._storage_lease if session_store is not None else None
             ),
+            notification_exists=(
+                session_store.has_task_exit_notification
+                if session_store is not None
+                else None
+            ),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -762,6 +767,7 @@ class ToolRegistry:
             directory_fd=store.directory_fd,
             command_niceness=clone.command_niceness,
             storage_lease=store._storage_lease,
+            notification_exists=store.has_task_exit_notification,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -822,6 +828,9 @@ class ToolRegistry:
         self.policy = SandboxPolicy(
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
+        )
+        self.background_tasks.set_notification_exists(
+            store.has_task_exit_notification
         )
         self.background_tasks.bind_session_dir(
             store.session_dir, store.directory_fd, store._storage_lease

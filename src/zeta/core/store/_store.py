@@ -193,8 +193,8 @@ class ConversationStore(
             self._collect_persisted_appends = _collect_persisted_appends
             self._persisted_appends: list[PersistedAppend] = []
             self._persisted_appends_unverified = False
-            # Task-exit task ids for O(1) append_task_notification dedupe (task ids
-            # are unique and exit once, so this mirrors the active-branch scan).
+            # Task-exit task ids from all durable history. Acknowledgement and
+            # compaction do not make a task eligible for a second exit receipt.
             self._task_notification_ids: set[str] = set()
             self._sent_message_receipts: list[tuple[str, str]] = []
             self._todo_items: list[TodoItem] = []
@@ -780,6 +780,25 @@ class ConversationStore(
                 self._task_notification_ids.add(task_id)
         self._publish_entries_installed((entry,))
         return entry
+
+    def task_exit_notification(self, task_id: str) -> ConversationEntry | None:
+        """Return the durable task-exit receipt, including acknowledged history."""
+
+        if task_id not in self._task_notification_ids:
+            return None
+        return next(
+            (
+                self._snapshot_entry(entry)
+                for entry in reversed(self._entries)
+                if entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+                and entry.data.get("task_id") == task_id
+            ),
+            None,
+        )
+
+    def has_task_exit_notification(self, task_id: str) -> bool:
+        return task_id in self._task_notification_ids
 
     def append_message(
         self, message: Message, *, parent_id: str | None = None

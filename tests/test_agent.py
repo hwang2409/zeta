@@ -11584,7 +11584,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         for entry in child_store.agent_notifications(pending_only=False)
         if entry.data.get("kind") == "task_exited"
     )
-    assert task_exit.data["background_phase"] == "task_kill"
+    assert task_exit.data["background_phase"] == "session_shutdown"
     assert task_exit.data["note"] == "finish-gate task safety bound expired after 0.05 seconds"
     child_store.close()
     await loop.close()

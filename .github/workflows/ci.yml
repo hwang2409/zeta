@@ -63,6 +63,9 @@ jobs:
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
 
+      - name: Reject unsafe cancellation ownership
+        run: uv run --frozen python scripts/lint_cancel_ownership.py
+
       - name: Reject new low-signal test patterns
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
