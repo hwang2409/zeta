@@ -887,8 +887,9 @@ def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
         relevance_terms += 1
         return original_relevance_terms(entry)
 
-    # test-contract: seams count projection and relevance cache work through prepare
+    # test-contract: seam projection cache is observed through prepare output
     monkeypatch.setattr(entry_request, "_entry_projection", projection)
+    # test-contract: seam relevance cache is observed through prepare output
     monkeypatch.setattr(
         entry_request, "_entry_relevance_terms", entry_relevance_terms
     )
