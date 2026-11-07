@@ -818,7 +818,8 @@ class ApprovalLifecycle:
                 record = self._health_abort(record, reason or "turn_canceled")
                 self._change(record, settlement=None)
             error = OSError("approval decision could not be persisted")
-            self._release_gate(record, error=error)
+            if not owns_record:
+                self._release_gate(record, error=error)
             raise error
         if not owns_record:
             self._release_gate(record, resolution=resolution)
@@ -1066,6 +1067,7 @@ class ApprovalLifecycle:
                 if current is not None and (
                     not isinstance(record.target.key, tuple)
                     or current.terminal_result is not None
+                    or current.live_end is not None
                     or isinstance(history_outcome, (OSError, asyncio.CancelledError))
                 ):
                     if current.terminal_watchdog is not None:
