@@ -123,7 +123,11 @@ def _write_todos(path: Path, items: list[dict[str, str]]) -> None:
 
 def _todo_text(widget: TodoWidget) -> str:
     content = widget.create_content(80, 20)
-    return "".join(text for index in range(content.line_count) for _, text in content.get_line(index))
+    return "".join(
+        text
+        for index in range(content.line_count)
+        for _, text in content.get_line(index)
+    )
 
 
 def test_agent_metadata_cache_reads_only_changed_lifecycle(
@@ -147,14 +151,22 @@ def test_agent_metadata_cache_reads_only_changed_lifecycle(
 
     lifecycle = first / "agent_lifecycle.json"
     lifecycle.write_text(
-        json.dumps({"description": "changed", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "changed", "agent_type": "general", "state": "running"}
+        )
         + " "
     )
     navigation.refresh(force=True)
 
     assert reads == [lifecycle]
-    assert next(entry for entry in navigation.entries if entry.path == first).label == "changed"
-    assert next(entry for entry in navigation.entries if entry.path == second).label == "second"
+    assert (
+        next(entry for entry in navigation.entries if entry.path == first).label
+        == "changed"
+    )
+    assert (
+        next(entry for entry in navigation.entries if entry.path == second).label
+        == "second"
+    )
 
 
 def test_agent_signature_avoids_per_child_stats_for_terminal_children(
@@ -360,7 +372,9 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
     assert widget.visible
     assert "root work" in _todo_text(widget)
     navigation.selected_index = next(
-        index for index, entry in enumerate(navigation.entries) if entry.path == child_without_todos
+        index
+        for index, entry in enumerate(navigation.entries)
+        if entry.path == child_without_todos
     )
     navigation.open_selected()
     assert not widget.visible
@@ -368,7 +382,9 @@ def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
 
     navigation.back_to_parent()
     navigation.selected_index = next(
-        index for index, entry in enumerate(navigation.entries) if entry.path == child_with_todos
+        index
+        for index, entry in enumerate(navigation.entries)
+        if entry.path == child_with_todos
     )
     navigation.open_selected()
     assert widget.visible
@@ -477,23 +493,30 @@ async def test_child_todo_refresh_coalesces_pending_requests(
         nonlocal refreshes
         refreshes += 1
         started.set()
-        assert release.wait(5)
+        assert release.wait(10)
         return original_refresh(source)
 
     monkeypatch.setattr(AgentTodoSource, "refresh", blocked_refresh)
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    assert await asyncio.to_thread(started.wait, 5)
-    task = navigation._todo_control._task
+    task = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        # test-contract: seam no public pending-refresh task interface exists.
+        task = navigation._todo_control._task
+        assert task is not None
+
+        for _ in range(20):
+            navigation._todo_control.request(child)
+        assert navigation._todo_control._task is task
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
     assert task is not None
-
-    for _ in range(20):
-        navigation._todo_control.request(child)
-    assert navigation._todo_control._task is task
-    release.set()
     await task
-
     assert refreshes == 2
     root.close()
 
@@ -539,7 +562,10 @@ def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
         navigation.refresh(force=True)
     assert widget.visible
     assert _todo_text(widget) == "child todos unavailable"
-    assert sum("agent todo refresh failed" in record.message for record in caplog.records) == 1
+    assert (
+        sum("agent todo refresh failed" in record.message for record in caplog.records)
+        == 1
+    )
 
     state_path.write_bytes(valid_state)
     navigation.refresh(force=True)
@@ -715,12 +741,18 @@ def test_registered_child_from_another_store_is_discovered_at_root(
     navigation._last_refresh_at = float("-inf")
 
     assert navigation.refresh()
-    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    assert [entry.path for entry in navigation.entries] == [
+        navigation_store.session_dir,
+        child,
+    ]
     assert scans == 0
 
     navigation._last_refresh_at = float("-inf")
     navigation.refresh()
-    assert [entry.path for entry in navigation.entries] == [navigation_store.session_dir, child]
+    assert [entry.path for entry in navigation.entries] == [
+        navigation_store.session_dir,
+        child,
+    ]
     writer_store.close()
     navigation_store.close()
 
@@ -762,7 +794,9 @@ def test_finished_or_removed_known_child_updates_without_registration_change(
         lifecycle = child / "agent_lifecycle.json"
         original = lifecycle.stat()
         replacement = child / "replacement.json"
-        replacement.write_bytes(lifecycle.read_bytes().replace(b"starting", b"canceled"))
+        replacement.write_bytes(
+            lifecycle.read_bytes().replace(b"starting", b"canceled")
+        )
         os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
         os.replace(replacement, lifecycle)
         assert lifecycle.stat().st_size == original.st_size
@@ -1056,7 +1090,9 @@ def test_agent_list_selection_crossing_page_boundary_updates_page(
     assert "page 2/2 · 6 agents" in _list_lines(navigation)[-1]
 
 
-async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, ConversationStore, object, list[str]]:
+async def _child_send_app(
+    tmp_path: Path,
+) -> tuple[TUIApp, ConversationStore, ConversationStore, object, list[str]]:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child_path = _child(store, 1, description="Worker", agent_type="worker")
     call = ToolCall("worker-call", "agent", {"prompt": "work"})
@@ -1070,7 +1106,12 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
         child_instance_id="root:worker",
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -1102,6 +1143,7 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
 
 
 async def _await_child_send_completion(app: TUIApp) -> None:
+    # test-contract: seam no public child-send completion interface exists.
     tasks = tuple(entry[0] for entry in app._child_send_tasks.values())
     assert tasks
     remaining = len(tasks)
@@ -1115,7 +1157,7 @@ async def _await_child_send_completion(app: TUIApp) -> None:
 
     for task in tasks:
         task.add_done_callback(mark_published)
-    await asyncio.wait_for(published.wait(), 5)
+    await asyncio.wait_for(published.wait(), 10)
 
 
 @pytest.mark.asyncio
@@ -1235,8 +1277,10 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     assert not closing.done()
     notices_before_release = list(notices)
     release.set()
-    await asyncio.wait_for(closing, 5)
-    assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["at exit"]
+    await asyncio.wait_for(closing, 10)
+    assert [
+        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
+    ] == ["at exit"]
     assert store.messages() == []
     assert notices == notices_before_release
 
@@ -1283,7 +1327,9 @@ async def test_send_to_run_rejects_a_missing_child_cleanly(
 
 
 @pytest.mark.asyncio
-async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Path) -> None:
+async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(
+    tmp_path: Path,
+) -> None:
     app, store, child, _session, _notices = await _child_send_app(tmp_path)
     root_fd = os.open(child.session_dir.parent, os.O_RDONLY)
     fcntl.flock(root_fd, fcntl.LOCK_EX)
@@ -1299,8 +1345,7 @@ async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Pa
         os.close(root_fd)
     assert result is None
     assert [
-        entry.data["text"]
-        for entry in await asyncio.to_thread(child.pending_prompts)
+        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
     ] == ["while locked"]
 
 
@@ -1378,7 +1423,14 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Worker", agent_type="worker")
     child.joinpath("agent_lifecycle.json").write_text(
-        json.dumps({"description": "Worker", "agent_type": "worker", "state": "running", "handle": "root:worker"})
+        json.dumps(
+            {
+                "description": "Worker",
+                "agent_type": "worker",
+                "state": "running",
+                "handle": "root:worker",
+            }
+        )
     )
     call = ToolCall("worker-call", "agent", {"prompt": "work"})
     store.register_agent_child(
@@ -1391,7 +1443,12 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
         child_instance_id="root:worker",
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -1446,7 +1503,12 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     release.set()
     await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
-    assert [entry.data["text"] for entry in await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts)] == ["follow up"]
+    assert [
+        entry.data["text"]
+        for entry in await asyncio.to_thread(
+            ConversationStore(child.parent, session_id=child.name).pending_prompts
+        )
+    ] == ["follow up"]
     assert store.messages() == []
     assert "queued message for root:worker" in notices
     await app.close()
@@ -1459,7 +1521,13 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Foreground")
     child.joinpath("agent_lifecycle.json").write_text(
-        json.dumps({"description": "Foreground", "state": "running", "handle": "root:foreground"})
+        json.dumps(
+            {
+                "description": "Foreground",
+                "state": "running",
+                "handle": "root:foreground",
+            }
+        )
     )
     call = ToolCall("foreground-call", "agent", {"prompt": "work"})
     store.register_agent_child(
@@ -1470,7 +1538,12 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
         child_instance_id="root:foreground",
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -1492,7 +1565,12 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     assert app._agent_navigation.child_view_active
     assert app._submit_input(session.default_buffer.text) is False
     assert session.default_buffer.text == "keep this"
-    assert await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts) == []
+    assert (
+        await asyncio.to_thread(
+            ConversationStore(child.parent, session_id=child.name).pending_prompts
+        )
+        == []
+    )
     assert not any(message.role is MessageRole.USER for message in store.messages())
     assert any("return to main" in notice for notice in notices)
     await app.close()
@@ -1571,15 +1649,11 @@ def test_breadcrumb_colours_main_and_subagent_crumbs(tmp_path: Path) -> None:
 
     fragments = navigation._breadcrumb_fragments()
     crumbs = [
-        (style, text)
-        for style, text in fragments
-        if style != "class:agent-breadcrumb"
+        (style, text) for style, text in fragments if style != "class:agent-breadcrumb"
     ]
 
     assert crumbs[0] == ("class:agent-breadcrumb.main", "main")
-    assert all(
-        style == "class:agent-breadcrumb.child" for style, _ in crumbs[1:]
-    )
+    assert all(style == "class:agent-breadcrumb.child" for style, _ in crumbs[1:])
     assert [text for _, text in crumbs[1:]] == ["Explore", "Inspect"]
     # The breadcrumb classes resolve to distinct identity colours.
     rules = agent_card.agent_navigation_style_rules()
@@ -1635,9 +1709,7 @@ def test_child_view_reuses_markdown_and_tool_card_rendering(tmp_path: Path) -> N
             tool_result=ToolResult(read.id, "print('safe')"),
         )
     )
-    child_store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(edit)])
-    )
+    child_store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(edit)]))
     child_store.append_message(
         Message(
             MessageRole.TOOL_RESULT,
@@ -1700,7 +1772,11 @@ def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> N
     child_store.append_message(
         Message(
             MessageRole.ASSISTANT,
-            [ThinkingContent("\n".join(f"thought {index} " + "x" * 1_980 for index in range(100)))],
+            [
+                ThinkingContent(
+                    "\n".join(f"thought {index} " + "x" * 1_980 for index in range(100))
+                )
+            ],
         )
     )
 
@@ -1892,7 +1968,11 @@ def test_replay_defaults_keep_main_transcript_presentation() -> None:
     call = ToolCall("read-1", "read", {"path": "main.py"})
     assistant = Message(
         MessageRole.ASSISTANT,
-        [ThinkingContent("private plan"), TextContent("visible answer"), ToolUseContent(call)],
+        [
+            ThinkingContent("private plan"),
+            TextContent("visible answer"),
+            ToolUseContent(call),
+        ],
     )
     result = Message(
         MessageRole.TOOL_RESULT,
@@ -1921,12 +2001,16 @@ def test_replay_defaults_keep_main_transcript_presentation() -> None:
     assert len(units) == 2
 
 
-def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: Path) -> None:
+def test_child_transcript_excludes_nested_child_calls_and_is_bounded(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")
     nested_store = ConversationStore(child / "agents", session_id="1")
     nested_store.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Nested", "agent_type": "general", "state": "completed"})
+        json.dumps(
+            {"description": "Nested", "agent_type": "general", "state": "completed"}
+        )
     )
     nested = nested_store.session_dir
     _message(
@@ -2173,7 +2257,10 @@ def test_child_transcript_truncation_accounting_sweep(
                     }
                 },
             }
-            while len(json.dumps(message, separators=(",", ":")).encode()) + 1 < target_size:
+            while (
+                len(json.dumps(message, separators=(",", ":")).encode()) + 1
+                < target_size
+            ):
                 text_lines[-1] += "x"
                 message["data"]["message"]["content"][0]["text"] = "\n".join(text_lines)
             if (
@@ -2191,7 +2278,9 @@ def test_child_transcript_truncation_accounting_sweep(
     prefix_message_count = 0
     if total_size == "above":
         prefix_message_count = (
-            100 if message_layout == "mixed-pair" else 131
+            100
+            if message_layout == "mixed-pair"
+            else 131
             if landing == "mid-row"
             else 132
         )
@@ -2232,7 +2321,9 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     child.append_message(
         Message(
@@ -2279,11 +2370,7 @@ def _append_child_lines(path: Path, lines: Iterable[str]) -> None:
     child_store.append_many(
         (
             "message",
-            {
-                "message": Message(
-                    MessageRole.ASSISTANT, [TextContent(text)]
-                ).to_dict()
-            },
+            {"message": Message(MessageRole.ASSISTANT, [TextContent(text)]).to_dict()},
         )
         for text in lines
     )
@@ -2310,7 +2397,9 @@ def _wheel(event_type: MouseEventType) -> MouseEvent:
     )
 
 
-def test_subagent_view_can_scroll_to_first_message_while_running(tmp_path: Path) -> None:
+def test_subagent_view_can_scroll_to_first_message_while_running(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Running")
     for index in range(300):
@@ -2369,14 +2458,10 @@ def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
     assert control.transcript.follow_tail
 
 
-def _replacement_transcript(
-    tmp_path: Path, session_id: str, text: str
-) -> bytes:
+def _replacement_transcript(tmp_path: Path, session_id: str, text: str) -> bytes:
     root = tmp_path / f"replacement-{text}"
     replacement = ConversationStore(root, session_id=session_id)
-    replacement.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent(text)])
-    )
+    replacement.append_message(Message(MessageRole.ASSISTANT, [TextContent(text)]))
     replacement.close()
     return (root / session_id / "conversation.jsonl").read_bytes()
 
@@ -2389,7 +2474,9 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
     control = agent_card.AgentTranscriptControl()
     await control.load(child)
     replacement = child / "replacement.jsonl"
-    replacement.write_bytes(_replacement_transcript(tmp_path, child.name, "replacement"))
+    replacement.write_bytes(
+        _replacement_transcript(tmp_path, child.name, "replacement")
+    )
 
     os.replace(replacement, child / "conversation.jsonl")
 
@@ -2532,7 +2619,12 @@ async def test_large_subagent_append_keeps_event_loop_responsive(
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )

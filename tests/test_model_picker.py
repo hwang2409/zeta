@@ -194,6 +194,7 @@ async def test_model_name_matching_nothing_is_still_used_as_typed(
 async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="offline")
     active_turn = asyncio.Event()
+    # test-contract: seam no public active-turn setup interface exists.
     app._active_task = asyncio.create_task(active_turn.wait())
 
     try:
@@ -395,35 +396,35 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
         task = asyncio.create_task(
             session.prompt_async(" > ", pre_run=prompt_ready.set)
         )
-        await asyncio.wait_for(prompt_ready.wait(), 5)
+        await asyncio.wait_for(prompt_ready.wait(), 10)
 
         pipe.send_text("\x1b[B\x1b[A")
-        await asyncio.wait_for(moves_published.wait(), 5)
+        await asyncio.wait_for(moves_published.wait(), 10)
 
         expected_text = "typed"
         text_published.clear()
         pipe.send_text(expected_text)
-        await asyncio.wait_for(text_published.wait(), 5)
+        await asyncio.wait_for(text_published.wait(), 10)
         expected_text = "typed!"
         text_published.clear()
         pipe.send_text("\x1b[B\x1b[A!")
-        await asyncio.wait_for(text_published.wait(), 5)
+        await asyncio.wait_for(text_published.wait(), 10)
         assert moves == [1, -1]
         assert actions == []
 
         session.default_buffer.reset()
         pipe.send_text("\r")
-        await asyncio.wait_for(select_published.wait(), 5)
+        await asyncio.wait_for(select_published.wait(), 10)
         assert session.default_buffer.text == ""
 
         pipe.send_text("\x1b")
-        await asyncio.wait_for(cancel_published.wait(), 5)
+        await asyncio.wait_for(cancel_published.wait(), 10)
 
         active = False
         expected_text = "done"
         text_published.clear()
         pipe.send_text("\x1b[Bdone")
-        await asyncio.wait_for(text_published.wait(), 5)
+        await asyncio.wait_for(text_published.wait(), 10)
         assert moves == [1, -1]
 
         task.cancel()

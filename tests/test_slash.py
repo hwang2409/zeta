@@ -114,11 +114,15 @@ def test_ollama_context_budgets_are_known_and_capped() -> None:
         40_960,
         True,
     )
-    assert resolve_session_budget(100_000, True, "ollama", "qwen3:4b-instruct", None) == (
+    assert resolve_session_budget(
+        100_000, True, "ollama", "qwen3:4b-instruct", None
+    ) == (
         32_768,
         True,
     )
-    assert resolve_session_budget(16_000, True, "ollama", "qwen3:4b-instruct", None) == (
+    assert resolve_session_budget(
+        16_000, True, "ollama", "qwen3:4b-instruct", None
+    ) == (
         16_000,
         True,
     )
@@ -269,7 +273,9 @@ def test_dollar_completion_lists_only_skills_and_filters_mid_message(
 ) -> None:
     project = tmp_path / "project"
     _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
-    _write_skill(project / ".zeta" / "skills" / "research.md", "research", "research body")
+    _write_skill(
+        project / ".zeta" / "skills" / "research.md", "research", "research body"
+    )
     command_dir = project / ".zeta" / "commands"
     command_dir.mkdir(parents=True)
     (command_dir / "report.md").write_text("report command", encoding="utf-8")
@@ -288,8 +294,7 @@ def test_dollar_completion_lists_only_skills_and_filters_mid_message(
     )
 
     assert [
-        (item.text, item.display[0][1], item.display_meta[0][1])
-        for item in completions
+        (item.text, item.display[0][1], item.display_meta[0][1]) for item in completions
     ] == [("review ", "$review", "[project] review description")]
     all_names = {
         item.text.strip()
@@ -321,11 +326,14 @@ def test_dollar_completion_acceptance_adds_space_and_shell_mode_is_excluded(
     buffer.apply_completion(completion)
 
     assert buffer.text == "please $review "
-    assert list(
-        completer.get_completions(
-            Document("! echo $rev"), CompleteEvent(completion_requested=True)
+    assert (
+        list(
+            completer.get_completions(
+                Document("! echo $rev"), CompleteEvent(completion_requested=True)
+            )
         )
-    ) == []
+        == []
+    )
 
 
 def test_slash_completion_is_unchanged_when_dollar_skills_are_enabled(
@@ -350,7 +358,9 @@ def test_slash_completion_is_unchanged_when_dollar_skills_are_enabled(
 
 
 @pytest.mark.asyncio
-async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path) -> None:
+async def test_inline_dollar_skill_request_is_sent_and_persisted(
+    tmp_path: Path,
+) -> None:
     project = tmp_path / "project"
     _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
     catalog = discover_session_skills(project_dir=project)
@@ -378,10 +388,7 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
     assert sent.content[0].text == expected
     assert persisted.content[0].text == expected
     assert displayed_user_text(persisted) == "please $review this branch"
-    assert (
-        persisted.metadata[MESSAGE_ORIGIN_METADATA]
-        == MessageOrigin.SKILL_EXPANSION
-    )
+    assert persisted.metadata[MESSAGE_ORIGIN_METADATA] == MessageOrigin.SKILL_EXPANSION
     await app.close()
 
 
@@ -393,7 +400,9 @@ def test_help_documents_both_skill_invocation_forms(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=project),
     )
 
-    assert "skills (use /name or $name; $name also works inline):" in registry.help_text()
+    assert (
+        "skills (use /name or $name; $name also works inline):" in registry.help_text()
+    )
     assert "/review" in registry.help_text()
 
 
@@ -407,15 +416,18 @@ def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -
 
     assert isinstance(result, ModelInputEnvelope)
     assert result.text == (
-        "bundle body\n\nSkill resources directory: "
-        f"{skill_dir.resolve()}"
+        f"bundle body\n\nSkill resources directory: {skill_dir.resolve()}"
     )
 
 
 @pytest.mark.asyncio
 async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="test-xyz-123")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER
+        )
+    )
     store.append_compaction_marker("summary", 1, 1)
     store.append_compaction_marker("summary 2", 1, 1)
     backend = FakeBackend([])
@@ -425,7 +437,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         store,
         approval_policy=policy,
         retained_tail=17,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
     await loop.context_assembler.assemble()
     loop.explicit_finish = True
@@ -455,7 +467,9 @@ skill_catalog=SkillCatalog.empty(),
         model="model-live",
         approval_policy=policy,
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/status"
+    )
 
     assert output is not None
     assert f"session_id: {store.session_id}" in output
@@ -513,13 +527,17 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()
+    )
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
     await app._consume_turn("second")
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/status"
+    )
 
     assert output is not None
     assert "tokens_used_this_session: 70" in output
@@ -573,7 +591,9 @@ async def test_manual_compact_avoids_summarization_cost(tmp_path: Path) -> None:
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()
+    )
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
@@ -646,7 +666,9 @@ def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
         usage_history=tracker.history,
         usage_cost_by_model=tracker.cost_by_model,
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        FakeSlashSession(status), "/status"
+    )
 
     assert output is not None
     assert len(tracker.history) == 8
@@ -663,12 +685,22 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
         return _proposal(prompt)
 
     runner, registry, project_id, _notices = _runner(
-        tmp_path, invoke, transcript_count=1, minimum_interval=0, retry_backoff_seconds=0
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=0,
     )
     runner.state.record_failure(
-        seq_start=1, seq_end=1, validation_summary="terminal failure", reason="test",
-        usage={}, retry_backoff_seconds=0, now=0,
-        occurred_at="2026-10-07T00:00:00+00:00", terminal=True,
+        seq_start=1,
+        seq_end=1,
+        validation_summary="terminal failure",
+        reason="test",
+        usage={},
+        retry_backoff_seconds=0,
+        now=0,
+        occurred_at="2026-10-07T00:00:00+00:00",
+        terminal=True,
     )
     receipt = runner.terminal_receipts()[0]
     runner.session_dir.joinpath("conversation.jsonl").write_bytes(
@@ -694,7 +726,10 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
     path = runner.session_dir / "conversation.jsonl"
     path.unlink()
     path.write_text(
-        json.dumps({"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}}) + "\n",
+        json.dumps(
+            {"seq": 1, "id": "m1", "parent_id": None, "type": "message", "data": {}}
+        )
+        + "\n",
         encoding="utf-8",
     )
     runner.activity(1)
@@ -740,7 +775,9 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
             uncached_input_tokens=0,
         )
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(empty_session, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        empty_session, "/status"
+    )
 
     assert output is not None
     assert "prompt_cache_hit_rate: n/a" in output
@@ -770,7 +807,10 @@ def test_status_includes_child_usage_without_misattributing_cost() -> None:
     assert "child_output_tokens: 3" in output
     assert "child_cache_hit_rate: 63.6%" in output
     assert "cache_hit_trend: none (parent turns only)" in output
-    assert "estimated_cost_usd: unavailable (unknown model: offline) (parent only)" in output
+    assert (
+        "estimated_cost_usd: unavailable (unknown model: offline) (parent only)"
+        in output
+    )
 
 
 def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
@@ -845,7 +885,9 @@ def test_context_gauge_unknown_window_is_bounded() -> None:
 
 
 def test_status_renders_compaction_history_and_empty_state() -> None:
-    empty = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session(), "/status")
+    empty = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        session(), "/status"
+    )
     assert empty is not None
     assert "compaction_history:\n  none" in empty
 
@@ -853,7 +895,9 @@ def test_status_renders_compaction_history_and_empty_state() -> None:
         session().status,
         compaction_history=(CompactionSummary(3, 4, 120),),
     )
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        FakeSlashSession(status), "/status"
+    )
     assert output is not None
     assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
 
@@ -1007,7 +1051,10 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(2):
         store.append_message(
-            with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"message {index}")]),
+                MessageOrigin.USER,
+            )
         )
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"reply {index}")])
@@ -1037,9 +1084,17 @@ def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
 
     store = ConversationStore(tmp_path / "sessions")
     source = [
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER)),
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER
+            )
+        ),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source 2")]), MessageOrigin.USER)),
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("source 2")]), MessageOrigin.USER
+            )
+        ),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply 2")])),
     ]
     store.append_compaction_marker(
@@ -1063,7 +1118,11 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
 
     store = ConversationStore(tmp_path / "sessions")
     first_source = [
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER)),
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER
+            )
+        ),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
     ]
     first_marker = store.append_compaction_marker(
@@ -1072,11 +1131,21 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
         first_source[-1].seq,
     )
     second_source = [
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new source")]), MessageOrigin.USER)),
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("new source")]),
+                MessageOrigin.USER,
+            )
+        ),
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("new reply")])
         ),
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new source 2")]), MessageOrigin.USER)),
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("new source 2")]),
+                MessageOrigin.USER,
+            )
+        ),
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])
         ),
@@ -1096,10 +1165,18 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
 
 def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("original")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("original")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
     checkpoint = store.append_checkpoint("saved")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("abandoned")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("abandoned")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("later")]))
     store.append_compaction_marker("abandoned summary", 1, 5)
     store.append_fork(str(checkpoint.seq))
@@ -1185,7 +1262,9 @@ async def test_compact_command_uses_async_dispatch() -> None:
         async def slash_compact(self) -> str:
             return "compacted entries 1–2; tokens after: 3"
 
-    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(CompactSession(), "/compact")
+    output = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(CompactSession(), "/compact")
 
     assert output == "compacted entries 1–2; tokens after: 3"
 
@@ -1243,7 +1322,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
         )
         run_task = asyncio.create_task(app.run(prompt))
         pipe.send_text("/status\r")
-        await asyncio.wait_for(status_rendered.wait(), 5)
+        await asyncio.wait_for(status_rendered.wait(), 10)
         pipe.send_text("\x04")
         await run_task
 

@@ -503,7 +503,9 @@ def test_accept_resolves_target_after_earlier_unit_is_removed() -> None:
     _open_finder(transcript)
     state = transcript.finder_state()
     assert state is not None
-    selected = next(i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text)
+    selected = next(
+        i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text
+    )
     transcript.finder_move(selected)
     transcript.remove(earlier)
 
@@ -524,7 +526,9 @@ def test_accept_removed_target_jumps_to_nearest_surviving_unit() -> None:
     _open_finder(transcript)
     state = transcript.finder_state()
     assert state is not None
-    selected = next(i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text)
+    selected = next(
+        i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text
+    )
     transcript.finder_move(selected)
     transcript.remove(earlier)
     transcript.remove(target)
@@ -554,9 +558,7 @@ def test_accept_removed_matching_target_keeps_nearest_survivor(
     state = transcript.finder_state()
     assert state is not None
     selected = next(
-        index
-        for index, row in enumerate(state.rows)
-        if row.candidate.key == target.key
+        index for index, row in enumerate(state.rows) if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
     transcript.remove(target)
@@ -591,9 +593,7 @@ def test_accept_highlights_target_and_continues_navigation(
     state = transcript.finder_state()
     assert state is not None
     selected = next(
-        index
-        for index, row in enumerate(state.rows)
-        if row.candidate.key == target.key
+        index for index, row in enumerate(state.rows) if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
 
@@ -635,9 +635,7 @@ async def test_virtual_accept_stays_on_target_while_search_index_builds(
     state = transcript.finder_state()
     assert state is not None
     selected = next(
-        index
-        for index, row in enumerate(state.rows)
-        if row.candidate.key == target.key
+        index for index, row in enumerate(state.rows) if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
     search_published = _track_virtual_search_publication(transcript, monkeypatch)
@@ -671,9 +669,7 @@ async def test_removed_virtual_search_anchor_keeps_navigation_working(
     state = transcript.finder_state()
     assert state is not None
     selected = next(
-        index
-        for index, row in enumerate(state.rows)
-        if row.candidate.key == target.key
+        index for index, row in enumerate(state.rows) if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
     search_published = _track_virtual_search_publication(transcript, monkeypatch)
@@ -710,9 +706,7 @@ def test_removed_eager_search_anchor_keeps_navigation_working(
     state = transcript.finder_state()
     assert state is not None
     selected = next(
-        index
-        for index, row in enumerate(state.rows)
-        if row.candidate.key == target.key
+        index for index, row in enumerate(state.rows) if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
 
