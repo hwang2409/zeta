@@ -461,7 +461,7 @@ async def test_bash_task_cancellation_kills_process_group(
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
-    create_subprocess_shell = bash_module.create_tool_subprocess_shell
+    create_subprocess_shell = bash_module.create_subprocess_shell_in_fd
 
     async def hold_spawn(*args, **kwargs):
         nonlocal spawned_process
@@ -471,7 +471,7 @@ async def test_bash_task_cancellation_kills_process_group(
         await release_spawn.wait()
         return process
 
-    monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
+    monkeypatch.setattr(bash_module, "create_subprocess_shell_in_fd", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
@@ -513,7 +513,7 @@ async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_invalid_start_cwd_falls_back_without_persisting(
+async def test_bash_removed_start_cwd_falls_back_and_persists(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing"
@@ -522,9 +522,9 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
 
     result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
 
-    assert result["isError"] is True
-    assert result["structuredContent"]["cwd_after"] == str(missing)
-    assert registry.bash_cwd == str(missing)
+    assert result["isError"] is False
+    assert result["structuredContent"]["cwd_after"] == str(tmp_path)
+    assert registry.bash_cwd == str(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -1659,7 +1659,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
         f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
         f"pathlib.Path({str(command_finished)!r}).touch()"
     )
-    original_spawn = bash_module.create_tool_subprocess_shell
+    original_spawn = bash_module.create_subprocess_shell_in_fd
 
     async def spawn_after_command_started(*args, **kwargs):
         process = await original_spawn(*args, **kwargs)
@@ -1669,7 +1669,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
         return process
 
     monkeypatch.setattr(
-        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
+        bash_module, "create_subprocess_shell_in_fd", spawn_after_command_started
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
@@ -1701,7 +1701,7 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
         "import subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
     )
-    original_spawn = bash_module.create_tool_subprocess_shell
+    original_spawn = bash_module.create_subprocess_shell_in_fd
 
     async def spawn_after_grandchild_started(*args, **kwargs):
         process = await original_spawn(*args, **kwargs)
@@ -1709,7 +1709,7 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
         return process
 
     monkeypatch.setattr(
-        bash_module, "create_tool_subprocess_shell", spawn_after_grandchild_started
+        bash_module, "create_subprocess_shell_in_fd", spawn_after_grandchild_started
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await asyncio.wait_for(
