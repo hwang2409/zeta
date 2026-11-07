@@ -135,8 +135,8 @@ def test_slash_new_requests_restart_only_when_idle(
 def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
     async def rejected() -> None:
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
         from zeta.core.store import ConversationStore
+        from zeta.runtime.loop import AgentLoop
         from zeta.tui.app import TUIApp
 
         app = TUIApp(
