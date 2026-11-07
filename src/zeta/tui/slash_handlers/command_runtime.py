@@ -315,7 +315,9 @@ class CommandRuntimeMixin:
             instance_id,
             lambda: asyncio.create_task(
                 self.loop.tool_registry.background_tasks.kill(
-                    task_id, cause="background macro canceled by the user"
+                    task_id,
+                    cause="background macro canceled by the user",
+                    tui_presented=True,
                 )
             ),
             watcher,

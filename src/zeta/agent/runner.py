@@ -58,7 +58,7 @@ from .presets import (
     compose_system_prompt,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
+from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 
@@ -1043,7 +1043,7 @@ async def run_agent_tool(
             loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
-            return tuple(await child_loop.close(cancel_background=False, background_task_cause=cause))
+            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
 
         async def finish_background() -> None:
             await finish_background_child(
@@ -1128,14 +1128,12 @@ async def run_agent_tool(
         parent_instance_id=loop.agent_instance_id,
     )
     abort_task = loop._create_task(abort_signal.wait())
-    background_task_cause = "foreground child completion cleanup"
     try:
         done, _ = await asyncio.wait(
             (child_task, abort_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # A completed child wins a same-turn abort race so its descendants can
-        # be adopted by receipt processing rather than canceled as unreachable.
+        # A completed child wins an abort race so descendants can be adopted by receipt processing.
         if child_task in done:
             result = child_task.result()
             if follow_up_loop:
@@ -1154,7 +1152,6 @@ async def run_agent_tool(
             await cancel_child()
             raise asyncio.CancelledError()
     except asyncio.CancelledError:
-        background_task_cause = "foreground child cancellation cleanup"
         await cancel_child()
         raise
     finally:
@@ -1165,8 +1162,7 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(cancel_background=False, background_task_cause=background_task_cause)
-
+        await child_loop.close(cancel_background=False, background_task_cause=child_cleanup_details("foreground", child_task.cancelled())[0])
 
 def _child_base_system_prompt(
     loop: AgentLoop,

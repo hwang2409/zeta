@@ -571,21 +571,14 @@ class AgentLoop(
             self.hooks.session_start()
 
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
-        data: dict[str, object] = {
-            "task_id": item.task_id,
-            "headline": item.command,
-            "exit_code": item.exit_code,
-            "output_tail": item.output_tail,
-            "background_owner": item.owner,
-            "background_phase": item.phase,
-        }
-        if item.log_path is not None:
-            data["log_path"] = item.log_path
-        if item.note is not None:
-            data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
-            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+            NotificationInput(
+                "task_exit",
+                item.notification_data(),
+                dedupe_key=item.task_id,
+                tui_presented=item.tui_presented,
+            )
         )
 
     async def activate(self) -> None:
@@ -597,7 +590,10 @@ class AgentLoop(
         self._activated = True
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
-            await self._produce_task_exit(item)
+            await self.tool_registry.background_tasks._notify_exit(
+                item.task_id, item.command, item.exit_code, item.output_tail, item.log_path, item.note,
+                owner=item.owner, phase=item.phase, tui_presented=item.tui_presented,
+            )
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
