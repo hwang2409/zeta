@@ -73,7 +73,7 @@ class SteerToolBackend(CompletionBackend):
         self.call_started[index].set()
         if index == 0:
             self.turn1_streaming.set()
-            await self.release_turn1.wait()
+            await _await(self.release_turn1)
             blocks = [TextContent("working"), ToolUseContent(self.tool_call)]
         else:
             blocks = [TextContent(f"reply {index}")]
@@ -89,7 +89,7 @@ class SteerToolBackend(CompletionBackend):
 
 async def _drive(coro: asyncio.Task[Any]) -> None:
     try:
-        await coro
+        await asyncio.wait_for(coro, 10)
     except asyncio.CancelledError:
         pass
 
@@ -201,14 +201,14 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
             pass
 
     task = asyncio.create_task(run())
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     loop.steer(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("steer-1")]), MessageOrigin.USER
         )
     )
     backend.release_turn1.set()
-    await task
+    await asyncio.wait_for(task, 10)
 
     roles = [message.role for message in store.messages()]
     texts = [
@@ -891,7 +891,7 @@ async def test_aborted_notification_turn_is_not_retried(
     async with asyncio.timeout(10):
         await captured.get()
     timers[0][1].fire()
-    await backend.started.wait()
+    await _await(backend.started)
     provider_task = app._submissions.provider_task
     assert provider_task is not None
     app._submissions.abort()
@@ -955,7 +955,7 @@ async def test_pipeline_routes_default_submission_as_steer(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     provider_task = app._submissions.provider_task
     assert provider_task is not None
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1012,7 +1012,7 @@ async def test_backslash_prefix_defers_to_after_turn_end(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("\\ follow-up")
     # The blocked first turn proves the follow-up cannot inject before release.
@@ -1068,7 +1068,7 @@ async def test_abort_drops_pending_steering(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("ghost")
     assert app.loop.has_pending_steering
@@ -1136,7 +1136,7 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("late")
     assert app.loop.has_pending_steering
@@ -1177,7 +1177,7 @@ async def test_queued_message_dispatches_after_stale_notification_wake(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("queued")
     assert app.loop.has_pending_steering
@@ -1219,7 +1219,7 @@ async def test_steer_submitted_as_provider_finishes_is_delivered_once(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     backend.release_turn1.set()
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("racing")
@@ -1258,7 +1258,7 @@ async def test_toolless_turn_delivers_two_late_steers_in_order(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("late one")
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1304,12 +1304,12 @@ async def test_undo_during_late_steer_auto_turn_restores_steer(
 
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("late")
     assert app.loop.has_pending_steering
     backend.release_turn1.set()
-    await backend.turn2_streaming.wait()
+    await _await(backend.turn2_streaming)
 
     app.undo_sent_turn()
     await _await_pipeline_consumer(app)
@@ -1353,14 +1353,14 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
             pass
 
     task = asyncio.create_task(run())
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     loop.steer(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER
         )
     )
     backend.release_turn1.set()
-    await task
+    await asyncio.wait_for(task, 10)
 
     # Every message in the first provider call is also in the second, in
     # the same order at the head: the cached prefix (system prompt + tool
@@ -1581,7 +1581,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue(
     turns = _watch_turn_starts(app)
     # test-contract: seam composer submission has no public acknowledgement method
     await app._handle_prompt_value("prompt")
-    await backend.turn1_streaming.wait()
+    await _await(backend.turn1_streaming)
     async with asyncio.timeout(10):
         provider_task = await turns.get()
     assert app.loop.step_delivery is not None
