@@ -204,21 +204,26 @@ def push_session(
         metadata = manager.read_metadata(manager.resolve_id(session_id))
     session_id = metadata.session_id
     source = manager.sessions_dir / session_id
-    with tempfile.TemporaryDirectory(prefix="zeta-session-push-") as temporary:
-        snapshot = Path(temporary) / session_id
+    with tempfile.TemporaryDirectory(
+        dir=source.parent, prefix=f".{session_id}.push-staging-"
+    ) as staging_temporary:
+        staging = Path(staging_temporary) / session_id
         with _snapshot_locks(source):
-            _copy_tree(source, snapshot)
+            _copy_tree(source, staging)
+        with tempfile.TemporaryDirectory(prefix="zeta-session-push-") as temporary:
+            snapshot = Path(temporary) / session_id
+            _copy_tree(staging, snapshot)
             manifest = _make_manifest(snapshot, metadata.cwd)
             _write_json(snapshot / "transfer.json", manifest)
-        if metadata.project_id is not None:
-            sync_project_memory(
-                local_home,
-                transport,
-                project_id=metadata.project_id,
-                direction="push",
-            )
-        published = transport.publish_session(snapshot, force=force)
-        final = _read_manifest(published)
+            if metadata.project_id is not None:
+                sync_project_memory(
+                    local_home,
+                    transport,
+                    project_id=metadata.project_id,
+                    direction="push",
+                )
+            published = transport.publish_session(snapshot, force=force)
+            final = _read_manifest(published)
     return _result(final)
 
 
