@@ -10407,7 +10407,7 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.register(
         "ping",
-        lambda _arguments: "pong",
+        lambda *_args, **_kwargs: "pong",
         description="ping",
         requires_approval=False,
     )
@@ -10452,7 +10452,7 @@ async def test_subagent_empty_after_tools_stops_at_recovery_cap(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.register(
         "ping",
-        lambda _arguments: "pong",
+        lambda *_args, **_kwargs: "pong",
         description="ping",
         requires_approval=False,
     )
@@ -10493,7 +10493,7 @@ async def test_subagent_tool_recovery_works_after_earlier_empty_nudge(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.register(
         "ping",
-        lambda _arguments: "pong",
+        lambda *_args, **_kwargs: "pong",
         description="ping",
         requires_approval=False,
     )

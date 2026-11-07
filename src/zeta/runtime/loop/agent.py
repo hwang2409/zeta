@@ -131,7 +131,6 @@ def _sanitize_account_message(message: Message) -> Message:
         metadata=message.metadata,
     )
 TaskResult = TypeVar("TaskResult")
-
 @dataclass(frozen=True, slots=True)
 class _ToollessTransition:
     continue_turn: bool
@@ -328,7 +327,6 @@ class AgentLoop(
         self._plan_mode_prior_prompt: RuntimePrompt | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -337,7 +335,6 @@ class AgentLoop(
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
-
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -351,7 +348,6 @@ class AgentLoop(
         if not agent_tool_available(self.agent_depth, self.max_agent_depth):
             schemas = [schema for schema in schemas if schema.get("name") != "agent"]
         return canonical_tool_schemas(schemas)
-
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
         account_context = getattr(self, "account_context", None)
         provider = (
@@ -369,7 +365,6 @@ class AgentLoop(
             else _sanitize_account_message(message)
             for message in messages
         ]
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         token_budget = effective_backend_budget(self.backend, token_budget)
