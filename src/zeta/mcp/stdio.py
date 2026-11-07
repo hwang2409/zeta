@@ -14,7 +14,7 @@ from weakref import WeakKeyDictionary
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
 from ..protocol.types import StructuredToolResult
-from ..tools._shared.process import _kill_and_reap
+from ..tools._shared.background_spawn import _kill_and_reap
 from ..tools._spill import SpillStore
 from .client import (
     MCPCanceled,
