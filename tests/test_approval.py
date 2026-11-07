@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -39,6 +39,14 @@ from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+def _approval_started_sink(started: asyncio.Event) -> Callable[[str], None]:
+    def publish(state: str) -> None:
+        if state == "approval_start":
+            started.set()
+
+    return publish
 
 
 def _capability(
@@ -157,8 +165,16 @@ skill_catalog=SkillCatalog.empty(),
         return arguments["value"]
 
     first_registry.register("echo", echo)
-    pending_task = asyncio.create_task(first_registry.execute(call))
-    await asyncio.sleep(0.06)
+    approval_started = asyncio.Event()
+    pending_task = asyncio.create_task(
+        first_registry.execute(
+            call,
+            _lifecycle_sink=_approval_started_sink(approval_started),
+        )
+    )
+    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    assert first_policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert not pending_task.done()
     pending_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending_task
@@ -205,13 +221,17 @@ skill_catalog=SkillCatalog.empty(),
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
-    task = asyncio.create_task(registry.execute(call))
+    approval_started = asyncio.Event()
+    task = asyncio.create_task(
+        registry.execute(
+            call,
+            _lifecycle_sink=_approval_started_sink(approval_started),
+        )
+    )
 
-    for _ in range(20):
-        if policy.pending_requests():
-            break
-        await asyncio.sleep(0.01)
-    assert policy.pending_requests()
+    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert not task.done()
     assert policy.deny(call.id)
 
     result = await task
@@ -248,6 +268,7 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_abort_pending_request_cancels_and_closes_tool_call_history(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("call-1", "step", {})
     backend = FakeBackend(
@@ -257,6 +278,15 @@ async def test_abort_pending_request_cancels_and_closes_tool_call_history(
     policy = ApprovalPolicy(default="ask")
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("step", lambda arguments: "ran")
+    approval_published = asyncio.Event()
+    append_with_approvals = store.append_message_with_approval_requests
+
+    def publish_approval(*args: object, **kwargs: object) -> object:
+        result = append_with_approvals(*args, **kwargs)
+        approval_published.set()
+        return result
+
+    monkeypatch.setattr(store, "append_message_with_approval_requests", publish_approval)
     task = asyncio.create_task(
         collect(
             AgentLoop(
@@ -269,11 +299,9 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
 
-    for _ in range(20):
-        if policy.pending_requests():
-            break
-        await asyncio.sleep(0.01)
-    assert policy.pending_requests()
+    await asyncio.wait_for(approval_published.wait(), timeout=3)
+    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert not task.done()
     registry.abort()
     events = await asyncio.wait_for(task, timeout=1)
 
@@ -535,8 +563,16 @@ skill_catalog=SkillCatalog.empty(),
         return original_resolve(request_id, decision)
 
     store.resolve_approval = approve_when_abort_resolves  # type: ignore[method-assign]
-    task = asyncio.create_task(registry.execute(call))
-    await asyncio.sleep(0.06)
+    approval_started = asyncio.Event()
+    task = asyncio.create_task(
+        registry.execute(
+            call,
+            _lifecycle_sink=_approval_started_sink(approval_started),
+        )
+    )
+    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert not task.done()
     signal.abort()
 
     result = await asyncio.wait_for(task, timeout=1)
@@ -587,8 +623,16 @@ skill_catalog=SkillCatalog.empty(),
         return original_resolve(request_id, decision)
 
     store.resolve_approval = approve_when_abort_resolves  # type: ignore[method-assign]
-    task = asyncio.create_task(registry.execute(call))
-    await asyncio.sleep(0.06)
+    approval_started = asyncio.Event()
+    task = asyncio.create_task(
+        registry.execute(
+            call,
+            _lifecycle_sink=_approval_started_sink(approval_started),
+        )
+    )
+    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert not task.done()
     registry.abort()
     await asyncio.wait_for(started.wait(), timeout=1)
     assert not task.done()
@@ -739,22 +783,22 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
         FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
     )
 
-    task = asyncio.create_task(
-        collect(dispatch_tool_calls(loop, calls, _validated_tool_result))
+    event_stream = dispatch_tool_calls(loop, calls, _validated_tool_result)
+    approval_events = [await anext(event_stream), await anext(event_stream)]
+    assert {event.tool_call.id for event in approval_events if event.tool_call} == {
+        call.id for call in calls
+    }
+    assert all(
+        event.type is StreamEventType.TOOL_APPROVAL_START
+        for event in approval_events
     )
-    for _ in range(100):
-        if {request.request_id for request in policy.pending_requests()} == {
-            call.id for call in calls
-        }:
-            break
-        await asyncio.sleep(0.01)
     assert {request.request_id for request in policy.pending_requests()} == {
         call.id for call in calls
     }
 
     registry.abort()
 
-    events = await asyncio.wait_for(task, timeout=1)
+    events = approval_events + await asyncio.wait_for(collect(event_stream), timeout=1)
     results = [
         event.tool_result
         for event in events
@@ -771,6 +815,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
 @pytest.mark.asyncio
 async def test_pending_request_wins_over_policy_change_after_restart(
     approval_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("call-1", "echo", {})
     first_store = ConversationStore(approval_root, session_id="session")
@@ -790,9 +835,26 @@ skill_catalog=SkillCatalog.empty(),
     )
     executed: list[bool] = []
     registry.register("echo", lambda arguments: executed.append(True) or "ran")
+    approval_claimed = asyncio.Event()
+    authorize = changed_policy.authorize
+
+    async def claim_pending(
+        tool_call: ToolCall,
+        abort_signal: ToolAbortSignal,
+        *,
+        capability: object,
+    ) -> ApprovalDecision | None:
+        approval_claimed.set()
+        return await authorize(
+            tool_call,
+            abort_signal,
+            capability=capability,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(changed_policy, "authorize", claim_pending)
     task = asyncio.create_task(registry.execute(call))
 
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(approval_claimed.wait(), timeout=3)
     assert not task.done()
     assert executed == []
     assert changed_policy.pending_requests()

@@ -342,8 +342,18 @@ async def test_parent_and_child_approval_decision_paths(
         monkeypatch.setattr(decision_store, "resolve_approval", allow_when_abort_resolves)
         registry.abort()
     else:
-        execution = asyncio.create_task(registry.execute(call))
-        await asyncio.sleep(0.06)
+        approval_started = asyncio.Event()
+
+        def publish_approval_state(state: str) -> None:
+            if state == "approval_start":
+                approval_started.set()
+
+        execution = asyncio.create_task(
+            registry.execute(call, _lifecycle_sink=publish_approval_state)
+        )
+        await asyncio.wait_for(approval_started.wait(), timeout=3)
+        assert decision_store.pending_approvals()
+        assert not execution.done()
         registry.abort()
         result = await execution
 
