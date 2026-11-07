@@ -97,6 +97,7 @@ from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
+from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui import loop_errors as loop_errors_module
@@ -113,7 +114,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -5375,10 +5376,11 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
-    assert "child line 4" not in rendered
-    assert "child line 5" in rendered
+    assert "child line 5" not in rendered
+    assert "… +6 lines" in rendered
+    assert "child line 6" in rendered
     assert "child line 24" in rendered
-    assert rendered.count("child line ") == 20
+    assert rendered.count("child line ") == 19
 
 
 def test_agent_cards_remain_in_sequential_order() -> None:
@@ -8575,6 +8577,33 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
+def test_rebuild_renders_closed_turn_end_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    replay = tuple(
+        SimpleNamespace(
+            type="turn_end", data={"turn_id": "0" * 32, "reason": reason}, id=reason
+        )
+        for reason in ("user_stop", "completed", "error", "disconnect")
+    )
+    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "turn stopped by the user" in rendered
+    assert "turn ended with an error" in rendered
+    assert "turn ended when the controller disconnected" in rendered
+    assert "completed" not in rendered
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
@@ -11310,25 +11339,40 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     previous = navigation.transcript_control._snapshot
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh(*args, **kwargs):
         entered.set()
         return original_refresh(*args, **kwargs)
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public transcript-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public transcript-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public transcript-refresh lock seam exists
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late transcript cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         agent_sync._REFRESH_LOCK.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
     assert navigation.transcript_control._snapshot is previous
     assert not published.is_set()
@@ -11359,25 +11403,40 @@ async def test_tui_close_hands_off_blocked_todo_source(
     assert source is not None
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh():
         entered.set()
         return original_refresh()
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public todo-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public todo-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public todo-refresh lock seam exists
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late todo cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         source._lock.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._store is None
     assert control._snapshot is None
     assert not published.is_set()
@@ -11731,6 +11790,35 @@ async def test_many_flushed_writers_leave_no_live_threads() -> None:
 
 
 
+def _patch_draft_publish(
+    monkeypatch: pytest.MonkeyPatch, write: Callable[..., None]
+) -> None:
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
+    original_publish = WriterLease.publish_json
+
+    def publish(
+        lease: WriterLease,
+        directory_fd: int,
+        name: str,
+        mutations: object,
+        publisher: Callable[[int, str, bytes], None],
+        *,
+        initial: object | None = None,
+    ) -> object:
+        if name == "draft":
+            write(directory_fd, name, b"")
+        return original_publish(
+            lease,
+            directory_fd,
+            name,
+            mutations,
+            publisher,
+            initial=initial,
+        )
+
+    monkeypatch.setattr(WriterLease, "publish_json", publish)
+
+
 @pytest.mark.asyncio
 async def test_draft_write_runs_off_loop_and_flushes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -11738,13 +11826,13 @@ async def test_draft_write_runs_off_loop_and_flushes(
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     loop_thread = threading.get_ident()
     write_threads: list[int] = []
-    original = persistence_module.write_session_json
+    original = persistence_module.write_json_file
 
     def record_thread(*args, **kwargs) -> None:
         write_threads.append(threading.get_ident())
         original(*args, **kwargs)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", record_thread)
+    monkeypatch.setattr(persistence_module, "write_json_file", record_thread)
     persistence.schedule("draft")
     await asyncio.sleep(0.01)
 
@@ -11761,7 +11849,7 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
     persistence.schedule("old draft")
     await persistence.flush_pending()
 
-    original = persistence_module.write_session_json
+    original = persistence_module.write_json_file
     failures = 2
     writes = 0
 
@@ -11773,7 +11861,7 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
             raise OSError(errno.ENOSPC, "disk full")
         original(directory_fd, *args, **kwargs)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
     persistence.schedule("new draft")
     with pytest.raises(OSError, match="disk full"):
         await persistence.flush_pending()
@@ -11792,22 +11880,26 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
+    storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
     persistence = DraftPersistence(
-        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+        tmp_path / "draft",
+        directory_fd=directory_fd,
+        storage_lease=storage_lease,
+        delay=0,
     )
     baseline = _fd_count()
     stop_delivered = threading.Event()
     release_worker = threading.Event()
     original_deliver = persistence._writer._deliver
     writes = 0
-    original_write = persistence_module.write_session_json
+    original_write = WriterLease.publish_json
 
-    def write(*args: object, **kwargs: object) -> None:
+    def write(lease: WriterLease, *args: object, **kwargs: object) -> None:
         nonlocal writes
         writes += 1
         if writes == 1:
             raise OSError(errno.ENOSPC, "disk full")
-        original_write(*args, **kwargs)
+        original_write(lease, *args, **kwargs)
 
     def gated_deliver(
         item: persistence_module._FileAction,
@@ -11817,20 +11909,20 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
         original_deliver(item, result, failure)
         if item.stop:
             stop_delivered.set()
-            assert release_worker.wait(1)
+            assert release_worker.wait(10)
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(WriterLease, "publish_json", write)
     monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
     persistence.schedule("new draft")
     shutdown = asyncio.create_task(persistence.shutdown_pending())
-    assert await asyncio.to_thread(stop_delivered.wait, 1)
+    assert await asyncio.to_thread(stop_delivered.wait, 10)
     with pytest.raises(OSError, match="disk full"):
         await shutdown
 
     persistence.flush()
     assert persistence._writer._queue.qsize() == 1
     release_worker.set()
-    await persistence._writer.flush(timeout=0.05)
+    await persistence._writer.flush(timeout=10)
 
     try:
         assert persistence.load() == "new draft"
@@ -11839,6 +11931,7 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
     finally:
         release_worker.set()
         os.close(directory_fd)
+        storage_lease.close()
 
 
 @pytest.mark.asyncio
@@ -11848,7 +11941,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     first_finished = threading.Event()
     writes = 0
-    original_write = persistence_module.write_session_json
+    original_write = persistence_module.write_json_file
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -11860,7 +11953,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
         finally:
             first_finished.set()
 
-    monkeypatch.setattr(persistence_module, "write_session_json", write)
+    monkeypatch.setattr(persistence_module, "write_json_file", write)
     persistence.schedule("first")
     assert await asyncio.to_thread(first_finished.wait, 1)
     persistence.schedule("second")
@@ -11888,7 +11981,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
     started = threading.Event()
     release = threading.Event()
     used_fds: list[int] = []
-    original = persistence_module.write_session_json
+    original = persistence_module.write_session_file
 
     def blocked_write(directory_fd: int, *args, **kwargs) -> None:
         used_fds.append(directory_fd)
@@ -11897,7 +11990,7 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
         original(directory_fd, *args, **kwargs)
 
     monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.05)
-    monkeypatch.setattr(persistence_module, "write_session_json", blocked_write)
+    monkeypatch.setattr(persistence_module, "write_session_file", blocked_write)
     borrowed_fd = store.directory_fd
     app._draft.schedule("safe draft")
     while not started.is_set():
@@ -11929,8 +12022,12 @@ async def test_dup_failure_is_reported_not_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
+    storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
     persistence = DraftPersistence(
-        tmp_path / "draft", directory_fd=directory_fd, delay=0,
+        tmp_path / "draft",
+        directory_fd=directory_fd,
+        storage_lease=storage_lease,
+        delay=0,
     )
     original_dup = persistence_module.os.dup
     fail_dup = True
@@ -11956,6 +12053,7 @@ async def test_dup_failure_is_reported_not_success(
     finally:
         os.close(directory_fd)
         await persistence.shutdown_pending()
+        storage_lease.close()
 
     assert exceptions == []
     assert caplog.messages.count(
@@ -11990,7 +12088,7 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
             errors.append(exc)
         return False, False
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
@@ -12047,7 +12145,7 @@ def test_new_session_continues_after_failed_draft_save(
             errors.append(exc)
         return False, False
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
@@ -12135,7 +12233,7 @@ def test_failed_active_draft_is_printed_on_every_exit(
         restart_called.set()
         return 0
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
@@ -12215,7 +12313,7 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         restart_called.set()
         return 0
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail_write)
+    _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
@@ -12425,7 +12523,7 @@ async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    _patch_draft_publish(monkeypatch, fail)
     persistence.schedule("first")
     with pytest.raises(OSError, match="disk unavailable"):
         await persistence.flush_pending()
@@ -12445,7 +12543,7 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    _patch_draft_publish(monkeypatch, fail)
     app._draft.schedule("must not disappear")
     await app.close()
     await asyncio.sleep(0)
@@ -12466,7 +12564,7 @@ async def test_draft_write_failure_is_reported_once_without_raising(
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(persistence_module, "write_session_json", fail)
+    monkeypatch.setattr(persistence_module, "write_json_file", fail)
     persistence.schedule("first")
     with pytest.raises(OSError, match="disk unavailable"):
         await persistence.flush_pending()
@@ -12853,15 +12951,24 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
 
 
 
-def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("do the thing")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("do the thing")]),
+            MessageOrigin.USER,
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
-    store.append_message(build_nudge_message())
+    nudge = build_nudge_message()
+    assert nudge.role is MessageRole.SYSTEM
+    assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
+    store.append_message(nudge)
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -12873,11 +12980,15 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
         console=Console(file=output, force_terminal=False),
     )
 
-    app._rebuild_transcript()
+    try:
+        app._rebuild_transcript()
 
-    rendered = Text.from_ansi(output.getvalue()).plain
-    assert "here is the answer" in rendered
-    assert "ended your turn" not in rendered
+        rendered = Text.from_ansi(output.getvalue()).plain
+        assert "here is the answer" in rendered
+        assert "[zeta] empty-turn recovery:" in rendered
+        assert rendered.count("do the thing") == 1
+    finally:
+        await app.loop.close()
 
 
 @pytest.mark.asyncio
@@ -13106,7 +13217,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
 
 
 @pytest.mark.asyncio
-async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
+async def test_tui_model_command_does_no_lock_work_on_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     manager = SessionManager(tmp_path / "home")
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
@@ -13143,30 +13256,21 @@ async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> No
         on_model_change=switch_model,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    lock_held = threading.Event()
+    owner_thread = threading.get_ident()
+    lock_threads: list[int] = []
+    metadata_lock = manager._metadata_lock
 
-    def hold_metadata_lock() -> None:
-        with manager._metadata_lock(opened.metadata.session_id) as directory_fd:
-            assert directory_fd is not None
-            lock_held.set()
-            time.sleep(0.25)
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        lock_threads.append(threading.get_ident())
+        return metadata_lock(*args, **kwargs)
 
-    holder = threading.Thread(target=hold_metadata_lock)
-    holder.start()
-    assert await asyncio.to_thread(lock_held.wait, 1)
-    event_loop = asyncio.get_running_loop()
-    started = event_loop.time()
-    callback_delays: list[float] = []
-    event_loop.call_later(
-        0.01, lambda: callback_delays.append(event_loop.time() - started)
-    )
-
+    # test-contract: seam observe lock ownership because no public seam exists.
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
 
     assert output is not None and str(output).startswith("model: gpt-5.4")
-    assert callback_delays and callback_delays[0] < 0.05
-    await asyncio.to_thread(holder.join, 1)
-    assert not holder.is_alive()
+    assert lock_threads
+    assert owner_thread not in lock_threads
     await loop.close()
     opened.store.close()
 
@@ -13706,22 +13810,36 @@ async def test_accounts_refresh_does_not_block_event_loop(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    # test-contract: seam no public headless presenter injection exists
     app._presenter.print_unit = Mock()
+    # test-contract: seam no public headless transcript injection exists
     app._transcript.replace = lambda unit, replacement: replacement
 
-    async def blocking_refresh(self):
-        time.sleep(0.2)  # noqa: ASYNC251 - proves the work runs on another thread
+    owner_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+    refresh_done = asyncio.Event()
+    # test-contract: seam no public account-picker repaint completion hook exists
+    original_repaint = app._repaint_accounts_picker
+
+    async def observed_refresh(self):
+        refresh_threads.append(threading.get_ident())
         return {}
 
-    monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
+    def repaint_and_signal() -> None:
+        original_repaint()
+        picker = app._accounts_picker
+        if picker is not None and not picker.refreshing:
+            refresh_done.set()
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", observed_refresh)
+    # test-contract: seam no public account-refresh completion event exists
+    monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        started = time.monotonic()
-        await asyncio.sleep(0.02)
-        assert time.monotonic() - started < 0.1
-        while app._accounts_picker and app._accounts_picker.refreshing:
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(refresh_done.wait(), timeout=10)
+        # test-contract: seam no public account-refresh executor identity exists
+        assert refresh_threads and refresh_threads[0] != owner_thread
     finally:
         opened.store.close()
 

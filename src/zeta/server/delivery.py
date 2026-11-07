@@ -159,9 +159,7 @@ class DeliveryRequests:
         assert isinstance(text, str)
         if delivery_id is None:
             try:
-                await control.user_message(
-                    text, "send", features, prepared.attachments
-                )
+                await control.user_message(text, "send", features, prepared.attachments)
             except asyncio.CancelledError:
                 await asyncio.to_thread(
                     ergonomics.cleanup_image_delivery, runtime, prepared
@@ -170,9 +168,7 @@ class DeliveryRequests:
             control.start_turn(text, message)
             return {"accepted": True, "session_id": runtime.session_id}
 
-        tagged = tag_client_delivery(
-            message, delivery_id, prepared.payload_digest
-        )
+        tagged = tag_client_delivery(message, delivery_id, prepared.payload_digest)
         outcome: dict[str, object] = {
             "accepted": True,
             "session_id": runtime.session_id,
@@ -240,6 +236,7 @@ class DeliveryRequests:
                 "steer",
                 "queued",
                 outcome,
+                accepted_message=message,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -259,6 +256,7 @@ class DeliveryRequests:
         self,
         session_id: str,
         state: SessionState,
+        turn_id: str,
         outcome: TurnOutcome,
         *,
         schedule_wake: bool,
@@ -270,6 +268,7 @@ class DeliveryRequests:
             self._finalize_turn(
                 session_id,
                 state,
+                turn_id,
                 outcome,
                 schedule_wake=schedule_wake,
                 owner_task=owner_task,
@@ -286,6 +285,7 @@ class DeliveryRequests:
         self,
         session_id: str,
         state: SessionState,
+        turn_id: str,
         outcome: TurnOutcome,
         *,
         schedule_wake: bool,
@@ -302,18 +302,27 @@ class DeliveryRequests:
             dropped = await state.opened.store.drop_client_steering_async(reason)
             connections = control.server.connections
             if connections is not None:
-                for entry in dropped:
-                    row = event_contract.delivery_status_row(entry)
+                for entry, accepted_message in dropped:
+                    row = event_contract.delivery_status_row(entry, accepted_message)
                     await connections.publish_controller(
                         "delivery_status",
                         session_id,
                         required_feature="session_history_fidelity",
                         **{key: value for key, value in row.items() if key != "event"},
                     )
+        turn_reason = {
+            TurnOutcome.COMPLETED: "completed",
+            TurnOutcome.FOREGROUND_CANCELED: "user_stop",
+            TurnOutcome.SESSION_CANCELED: "user_stop",
+            TurnOutcome.FAILED: "error",
+            TurnOutcome.DISCONNECTED: "disconnect",
+        }[outcome]
+        await state.opened.store.append_turn_end_async(turn_id, turn_reason)
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()
         if control._turn_task is owner_task:
+            control._turn_handoff_task = owner_task
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (
@@ -368,10 +377,7 @@ class DeliveryRequests:
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
-            if (
-                payload_digest is not None
-                and delivery.payload_digest != payload_digest
-            ):
+            if payload_digest is not None and delivery.payload_digest != payload_digest:
                 raise ProtocolError(
                     -32010,
                     "delivery id already used for a different payload",
@@ -450,9 +456,7 @@ async def _deliver_after_commit(
         raise error
 
 
-def _require_feature(
-    features: frozenset[str], feature: str, param: str
-) -> None:
+def _require_feature(features: frozenset[str], feature: str, param: str) -> None:
     if feature not in features:
         raise ProtocolError(-32602, f"{param} requires negotiated feature '{feature}'")
 
@@ -481,22 +485,31 @@ class ResolvedModelInput:
     origin: MessageOrigin
     message: Message | None
 
+
 class PendingModelInputs:
     """Issue and consume single-use IDs for server-generated envelopes."""
+
     def __init__(self, *, limit: int = 32) -> None:
         self._limit = limit
         self._inputs: dict[str, tuple[str, ModelInputEnvelope]] = {}
+
     def register(self, session_id: str, envelope: ModelInputEnvelope) -> str:
         while len(self._inputs) >= self._limit:
             del self._inputs[next(iter(self._inputs))]
         input_id = secrets.token_urlsafe(24)
         self._inputs[input_id] = (session_id, envelope)
         return input_id
-    def registrar(self, session_id: str, *, enabled: bool) -> Callable[[ModelInputEnvelope], str] | None:
+
+    def registrar(
+        self, session_id: str, *, enabled: bool
+    ) -> Callable[[ModelInputEnvelope], str] | None:
         if not enabled:
             return None
         return lambda envelope: self.register(session_id, envelope)
-    def resolve(self, session_id: str, params: Mapping[str, object], *, enabled: bool) -> ResolvedModelInput:
+
+    def resolve(
+        self, session_id: str, params: Mapping[str, object], *, enabled: bool
+    ) -> ResolvedModelInput:
         has_text, has_input_id = "text" in params, "input_id" in params
         if has_text == has_input_id:
             raise ValueError("send requires exactly one of text or input_id")
@@ -514,5 +527,14 @@ class PendingModelInputs:
         if pending is None or pending[0] != session_id:
             raise ValueError("input_id is invalid or expired")
         envelope = pending[1]
-        message = Message(MessageRole.USER, [TextContent(envelope.text)], metadata={MESSAGE_ORIGIN_METADATA: envelope.origin.value, "zeta.user_display_text": envelope.display_text})
-        return ResolvedModelInput(envelope.text, envelope.display_text, envelope.origin, message)
+        message = Message(
+            MessageRole.USER,
+            [TextContent(envelope.text)],
+            metadata={
+                MESSAGE_ORIGIN_METADATA: envelope.origin.value,
+                "zeta.user_display_text": envelope.display_text,
+            },
+        )
+        return ResolvedModelInput(
+            envelope.text, envelope.display_text, envelope.origin, message
+        )

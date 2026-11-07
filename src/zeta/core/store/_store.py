@@ -30,7 +30,8 @@ from ...protocol.types import (
     ToolUseContent,
     require_new_message_origin,
 )
-from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
+from ...storage_format import WriterLease, open_writer
+from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
@@ -44,7 +45,6 @@ from ..session_files import (
     read_session_file,
     session_directory,
     session_root,
-    write_session_json,
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import (
@@ -70,8 +70,10 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
+from ._turn_history import TurnHistoryMixin, validate_turn_end_data
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -110,8 +112,10 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
+    TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
+    SessionStatePersistenceMixin,
 ):
     def __init__(
         self,
@@ -125,12 +129,15 @@ class ConversationStore(
         _must_exist: bool = False,
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
+        _storage_lease: WriterLease | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
+        home = self.root_dir
+        while home.name != "sessions" and home != home.parent:
+            home = home.parent
+        home = home.parent if home.name == "sessions" else self.root_dir.parent
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
-        self.on_persisted_activity: Callable[[int], None] | None = None
-        self._initialize_entries_installed()
         session_path = Path(self.session_id)
         if (
             not self.session_id
@@ -142,79 +149,87 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"session id must be one safe path component: {self.session_id!r}"
             )
-        self.session_dir = self.root_dir / self.session_id
-        self._read_only = _read_only
-        self._must_exist = _must_exist
-        self._runtime_lease: SessionRuntimeLease | None = None
-        self._closed = False
-        self._closing = False
-        self._owner_thread_id: int | None = None
-        self._transcript_generation = 0
-        self._initialize_async_writes()
-        if not _read_only and not _must_exist:
-            with session_root(self.root_dir, create=True) as root_fd:
-                # Serialize first publication of the permanent append lock. On
-                # Darwin, racing O_CREAT | O_NOFOLLOW opens can transiently
-                # report ENOENT even though neither constructor removes it.
-                fcntl.flock(root_fd, fcntl.LOCK_EX)
-                try:
-                    with child_directory(
-                        root_fd, self.session_id, create=True
-                    ) as directory_fd:
-                        os.close(
-                            open_session_file(
-                                directory_fd, ".lock", os.O_RDWR | os.O_CREAT
+        with ExitStack() as storage_ownership:
+            self._storage_lease = storage_ownership.enter_context(
+                _storage_lease.retain() if _storage_lease is not None else open_writer(home)
+            )
+            self.on_persisted_activity: Callable[[int], None] | None = None
+            self._initialize_entries_installed()
+            self.session_dir = self.root_dir / self.session_id
+            self._read_only = _read_only
+            self._must_exist = _must_exist
+            self._runtime_lease: SessionRuntimeLease | None = None
+            self._closed = False
+            self._closing = False
+            self._owner_thread_id: int | None = None
+            self._transcript_generation = 0
+            self._initialize_async_writes()
+            if not _read_only and not _must_exist:
+                with session_root(self.root_dir, create=True) as root_fd:
+                    # Serialize first publication of the permanent append lock. On
+                    # Darwin, racing O_CREAT | O_NOFOLLOW opens can transiently
+                    # report ENOENT even though neither constructor removes it.
+                    fcntl.flock(root_fd, fcntl.LOCK_EX)
+                    try:
+                        with child_directory(
+                            root_fd, self.session_id, create=True
+                        ) as directory_fd:
+                            os.close(
+                                open_session_file(
+                                    directory_fd, ".lock", os.O_RDWR | os.O_CREAT
+                                )
                             )
-                        )
-                finally:
-                    fcntl.flock(root_fd, fcntl.LOCK_UN)
-        self.path = self.session_dir / "conversation.jsonl"
-        self.state_path = self.session_dir / "session_state.json"
-        self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
-        self.lock_path = self.session_dir / ".lock"
-        self.cwd = str(cwd or Path.cwd())
-        self.bash_cwd = str(bash_cwd or self.cwd)
-        self._entries: list[ConversationEntry] = []
-        self._entry_prefix_digest = b""
-        self._initialize_client_delivery_lifecycle()
-        self._collect_persisted_appends = _collect_persisted_appends
-        self._persisted_appends: list[PersistedAppend] = []
-        self._persisted_appends_unverified = False
-        # Task-exit task ids for O(1) append_task_notification dedupe (task ids
-        # are unique and exit once, so this mirrors the active-branch scan).
-        self._task_notification_ids: set[str] = set()
-        self._sent_message_receipts: list[tuple[str, str]] = []
-        self._todo_items: list[TodoItem] = []
-        self._todo_dismissed = False
-        self._agent_counter = 0
-        self._agent_children: dict[str, dict[str, Any]] = {}
-        self._agent_parent: dict[str, Any] | None = None
-        self._agent_canceled: dict[str, Any] | None = None
-        self._agent_lifecycle: dict[str, Any] | None = None
-        self._write_deadline: float | None = None
-        self.pending_prompt_queue = PendingPromptQueue(self)
-        with ExitStack() as lease:
-            _, self.directory_fd = lease.enter_context(
-                session_directory(self.root_dir, self.session_id)
-            )
-            if _read_only:
-                self._load()
-                self._load_session_state()
-            else:
-                if _validated_log_state is not None:
-                    self._install_log_state(_validated_log_state)
-                    self._strict_snapshot_sync = True
-                with self._append_lock(deadline=_lock_deadline):
+                    finally:
+                        fcntl.flock(root_fd, fcntl.LOCK_UN)
+            self.path = self.session_dir / "conversation.jsonl"
+            self.state_path = self.session_dir / "session_state.json"
+            self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
+            self.lock_path = self.session_dir / ".lock"
+            self.cwd = str(cwd or Path.cwd())
+            self.bash_cwd = str(bash_cwd or self.cwd)
+            self._entries: list[ConversationEntry] = []
+            self._entry_prefix_digest = b""
+            self._initialize_client_delivery_lifecycle()
+            self._collect_persisted_appends = _collect_persisted_appends
+            self._persisted_appends: list[PersistedAppend] = []
+            self._persisted_appends_unverified = False
+            # Task-exit task ids for O(1) append_task_notification dedupe (task ids
+            # are unique and exit once, so this mirrors the active-branch scan).
+            self._task_notification_ids: set[str] = set()
+            self._sent_message_receipts: list[tuple[str, str]] = []
+            self._todo_items: list[TodoItem] = []
+            self._todo_dismissed = False
+            self._agent_counter = 0
+            self._agent_children: dict[str, dict[str, Any]] = {}
+            self._agent_parent: dict[str, Any] | None = None
+            self._agent_canceled: dict[str, Any] | None = None
+            self._agent_lifecycle: dict[str, Any] | None = None
+            self._write_deadline: float | None = None
+            self.pending_prompt_queue = PendingPromptQueue(self)
+            with ExitStack() as lease:
+                _, self.directory_fd = lease.enter_context(
+                    session_directory(self.root_dir, self.session_id)
+                )
+                if _read_only:
+                    self._load()
                     self._load_session_state()
-                self._strict_snapshot_sync = False
-            if not _read_only:
-                self._runtime_lease = SessionRuntimeLease(self.directory_fd)
-            self._release_lease = weakref.finalize(
-                self,
-                close_store_leases,
-                self._runtime_lease,
-                lease.pop_all(),
-            )
+                else:
+                    if _validated_log_state is not None:
+                        self._install_log_state(_validated_log_state)
+                        self._strict_snapshot_sync = True
+                    with self._append_lock(deadline=_lock_deadline):
+                        self._load_session_state()
+                    self._strict_snapshot_sync = False
+                if not _read_only:
+                    self._runtime_lease = SessionRuntimeLease(self.directory_fd)
+                self._release_lease = weakref.finalize(
+                    self,
+                    close_store_leases,
+                    self._runtime_lease,
+                    lease.pop_all(),
+                    self._storage_lease,
+                )
+            storage_ownership.pop_all()
 
     def bind_owner_thread(self) -> None:
         """Bind resident state publication and mutation to the event-loop thread."""
@@ -227,7 +242,6 @@ class ConversationStore(
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
-
         resolved = str(cwd)
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
@@ -269,18 +283,15 @@ class ConversationStore(
 
     def todo_items(self) -> list[TodoItem]:
         """Return a detached snapshot of the current session todo list."""
-
         return [dict(item) for item in self._todo_items]
 
     @property
     def todo_dismissed(self) -> bool:
         """Return whether the terminal todo receipt was dismissed."""
-
         return self._todo_dismissed
 
     def dismiss_todo(self) -> None:
         """Persist dismissal of the terminal todo receipt."""
-
         with self._append_lock():
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
@@ -350,24 +361,6 @@ class ConversationStore(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
                 )
             self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
-
-    def _write_session_state(
-        self, bash_cwd: str, todo_items: Iterable[TodoItem]
-    ) -> None:
-        state: dict[str, Any] = {"bash_cwd": bash_cwd}
-        normalized_items = [dict(item) for item in todo_items]
-        if normalized_items:
-            state["todo_items"] = normalized_items
-        if self._todo_dismissed:
-            state["todo_dismissed"] = True
-        _apply_agent_state(
-            state,
-            agent_counter=self._agent_counter,
-            agent_children=self._agent_children,
-            agent_parent=self._agent_parent,
-            agent_canceled=self._agent_canceled,
-        )
-        write_session_json(self.directory_fd, "session_state.json", state)
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
@@ -559,6 +552,8 @@ class ConversationStore(
                 _validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "approval_history":
                 validate_approval_history_data(entry.data)
+            elif entry.type == "turn_end":
+                validate_turn_end_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:

@@ -18,17 +18,21 @@ import logging
 import os
 import re
 import stat
+import threading
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..storage_format import WriterLease, mapping_mutations
 from .session_files import (
     SessionError,
     child_directory,
     open_session_file,
     session_directory,
-    write_session_json,
+    write_session_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +123,7 @@ def persist_pending_root_link(
     project_id: str,
     role: str,
     parent_session_id: str | None,
+    lease: WriterLease,
 ) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
@@ -129,11 +134,20 @@ def persist_pending_root_link(
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
     with session_directory(sessions_dir, session_id) as (_, directory_fd):
-        write_session_json(directory_fd, "project_link_pending.json", link)
+        lease.publish_json(
+            directory_fd,
+            "project_link_pending.json",
+            mapping_mutations(link),
+            write_session_file,
+        )
         os.fsync(directory_fd)
 
 
-def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[str, object]) -> None:
+def persist_pending_child_link(
+    root_session_dir: os.PathLike[str],
+    link: dict[str, object],
+    lease: WriterLease,
+) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 
     Written and directory-fsynced BEFORE the registry append (in place of any
@@ -151,32 +165,76 @@ def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[st
         # Ensuring the index directory added its entry to the root session dir;
         # fsync root_fd so that directory entry is durable before the registry
         # append.  Otherwise a crash after this returns but before the append
-        # could lose the whole index -- write_session_json below fsyncs the
+        # could lose the whole index -- the JSON publisher below fsyncs the
         # intent file and the index dir, but never the parent that names it.
         os.fsync(root_fd)
-        write_session_json(pending_fd, name, link)
+        lease.publish_json(
+            pending_fd, name, mapping_mutations(link), write_session_file
+        )
         # Durably land the new directory entry before the registry append;
-        # write_session_json fsyncs the file and its rename, not the dir.
+        # the JSON publisher fsyncs the file and its rename, not the dir.
         os.fsync(pending_fd)
 
 
-def remove_pending_child_link(root_session_dir: os.PathLike[str], session_id: str) -> None:
-    """Drop a published intent from the ROOT's index, directory-fsynced.
+_ReconcileOutcome = Literal["drained", "more", "failed"]
 
-    Called only after the registry append is durable.  A missing entry (already
-    reconciled, or never written) is harmless and swallowed.
-    """
-    root = Path(root_session_dir)
-    name = _encode_link_name(session_id)
-    try:
-        with (
-            session_directory(root.parent, root.name) as (_, root_fd),
-            child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME) as pending_fd,
-        ):
-            os.unlink(name, dir_fd=pending_fd)
-            os.fsync(pending_fd)
-    except (FileNotFoundError, NotADirectoryError, SessionError, OSError):
-        pass
+
+class ChildLineagePublisher:
+    """Durably admit and single-flight live child-lineage publication."""
+
+    def __init__(
+        self,
+        project_registry: ProjectRegistry,
+        root_session_dir: os.PathLike[str] | str,
+        storage_lease: WriterLease,
+    ) -> None:
+        self._project_registry = project_registry
+        self._root_session_dir = Path(root_session_dir)
+        self._storage_lease = storage_lease
+        self._mutex = threading.Lock()
+        self._generation = 0
+        self._owner_active = False
+
+    def publish(self, link: Mapping[str, object]) -> None:
+        value = dict(link)
+        persist_pending_child_link(
+            self._root_session_dir, value, self._storage_lease
+        )
+        with self._mutex:
+            self._generation += 1
+            if self._owner_active:
+                return
+            self._owner_active = True
+            observed_generation = self._generation
+
+        def ready_collection_started() -> None:
+            nonlocal observed_generation
+            with self._mutex:
+                observed_generation = self._generation
+
+        try:
+            while True:
+                outcome = _reconcile_child_links_pass(
+                    self._project_registry,
+                    self._root_session_dir.parent,
+                    self._root_session_dir.name,
+                    ready_collection_started=ready_collection_started,
+                )
+                if outcome == "failed":
+                    raise ProjectRegistryError("child project lineage remains pending")
+                with self._mutex:
+                    current_generation = self._generation
+                    if (
+                        outcome == "drained"
+                        and current_generation == observed_generation
+                    ):
+                        self._owner_active = False
+                        return
+                    observed_generation = current_generation
+        except BaseException:
+            with self._mutex:
+                self._owner_active = False
+            raise
 
 
 def reconcile_child_links(
@@ -193,6 +251,18 @@ def reconcile_child_links(
     crash, a failed append, or a bounded pass is recovered on the next open
     without ever double-recording a link.
     """
+    outcome = _reconcile_child_links_pass(project_registry, sessions_dir, session_id)
+    if outcome == "failed":
+        logger.warning("child project linkage reconciliation failed for %s", session_id)
+
+
+def _reconcile_child_links_pass(
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    *,
+    ready_collection_started: Callable[[], None] | None = None,
+) -> _ReconcileOutcome:
     try:
         with session_directory(sessions_dir, session_id) as (_, session_fd):
             try:
@@ -201,42 +271,47 @@ def reconcile_child_links(
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=session_fd,
                 )
-            except (FileNotFoundError, NotADirectoryError, OSError):
-                return
+            except (FileNotFoundError, NotADirectoryError):
+                return "drained"
+            except OSError:
+                return "failed"
             try:
-                intents = _collect_pending_intents(pending_fd, session_fd)
-                if intents:
-                    _publish_pending_intents(project_registry, pending_fd, intents)
+                if ready_collection_started is not None:
+                    ready_collection_started()
+                intents, more, failed = _collect_pending_intents(pending_fd, session_fd)
+                if failed:
+                    return "failed"
+                if intents and not _publish_pending_intents(
+                    project_registry, pending_fd, intents
+                ):
+                    return "failed"
+                return "more" if more else "drained"
             finally:
                 os.close(pending_fd)
-    except (SessionError, OSError) as exc:
-        logger.warning(
-            "child project linkage reconciliation failed for %s: %s",
-            session_id,
-            exc,
-        )
+    except (SessionError, OSError):
+        return "failed"
 
 
 def _collect_pending_intents(
     pending_fd: int, session_fd: int
-) -> list[tuple[str, dict[str, object]]]:
+) -> tuple[list[tuple[str, dict[str, object]]], bool, bool]:
     """Scan one bounded pass, quarantining only permanently invalid entries.
 
     A failed metadata lookup or read is transient: stop immediately and leave the
     entry in place so the next open can retry it.  Only structural and content
     invalidity is quarantined.
     """
-    names, temps, stopped = _scan_pending_entries(pending_fd)
+    names, temps, stopped, more = _scan_pending_entries(pending_fd)
     if stopped:
-        return []
+        return [], more, True
     for name in temps:
         if not _remove_stale_temp(pending_fd, name):
-            return []
+            return [], more, True
     try:
         quarantine_fd = _open_quarantine(session_fd)
     except OSError as exc:
         logger.warning("cannot open pending-link quarantine: %s", exc)
-        return []
+        return [], more, True
     try:
         intents: list[tuple[str, dict[str, object]]] = []
         for name in names:
@@ -245,30 +320,34 @@ def _collect_pending_intents(
                 intents.append((name, link))
             elif status == "invalid":
                 if not _quarantine_entry(pending_fd, quarantine_fd, name):
-                    return []
+                    return [], more, True
                 logger.warning("quarantined unpublishable child-link entry %r", name)
             elif status == "stop":
-                return []
-        return intents
+                return [], more, True
+        return intents, more, False
     finally:
         os.close(quarantine_fd)
 
 
-def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str], bool]:
+def _scan_pending_entries(
+    pending_fd: int,
+) -> tuple[list[str], list[str], bool, bool]:
     """Read up to the per-pass budget, recognizing only writer temp names."""
     names: list[str] = []
     temps: list[str] = []
     seen = 0
     stopped = False
+    more = False
     # os.scandir iterates lazily; the pass stops at the bound instead of
     # materializing an unbounded listing.
     with os.scandir(pending_fd) as entries:
         for entry in entries:
             if seen >= _CHILD_LINK_MAX_ENTRIES_PER_PASS:
+                more = True
                 logger.warning(
                     "child project linkage reconciliation reached the %d-entry "
                     "pass limit; the remaining pending links will be reconciled "
-                    "on a later open",
+                    "in a later pass",
                     _CHILD_LINK_MAX_ENTRIES_PER_PASS,
                 )
                 break
@@ -279,7 +358,7 @@ def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str], bool]:
                 temps.append(entry.name)
             else:
                 names.append(entry.name)
-    return names, temps, stopped
+    return names, temps, stopped, more
 
 
 def _remove_stale_temp(pending_fd: int, name: str) -> bool:
@@ -354,11 +433,20 @@ def _classify_pending_entry(
     return "publish", value
 
 
+def _record_child_lineage_batch(
+    project_registry: ProjectRegistry,
+    project_id: str,
+    records: list[Mapping[str, object]],
+) -> None:
+    """Acquire today's registry lock through one seam for p06 conversion."""
+    project_registry.record_sessions(project_id, records)
+
+
 def _publish_pending_intents(
     project_registry: ProjectRegistry,
     pending_fd: int,
     intents: list[tuple[str, dict[str, object]]],
-) -> None:
+) -> bool:
     # Group by project so the registry's JSONL file is read exactly once per
     # project, then published in a single deduped batch.
     by_project: dict[str, list[tuple[str, dict[str, object]]]] = {}
@@ -375,17 +463,18 @@ def _publish_pending_intents(
             for _name, link in group
         ]
         try:
-            project_registry.record_sessions(project_id, records)
+            _record_child_lineage_batch(project_registry, project_id, records)
         except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
             # Stop the pass; a failed append leaves the intents in place and the
             # next open retries them (the registry dedupes on session id).
             logger.warning("child project linkage remains pending: %s", exc)
-            return
-        # The batch landed (or every id was already present); the index entries
-        # are now redundant.  A failed unlink is harmless -- the registry dedupes
-        # on the next pass -- so it is swallowed.
+            return False
+        # The batch landed (or every id was already present). A failed cleanup
+        # defers the exact intent to durable recovery rather than declaring drained.
         for name, _link in group:
-            _remove_entry(pending_fd, name)
+            if not _remove_entry(pending_fd, name):
+                return False
+    return True
 
 
 def _open_quarantine(session_fd: int) -> int:
@@ -443,7 +532,6 @@ __all__ = [
     "_PROJECT_ROLES",
     "persist_pending_child_link",
     "reconcile_child_links",
-    "remove_pending_child_link",
     "valid_child_pending_link",
     "valid_pending_link",
 ]

@@ -186,4 +186,5 @@ async def test_installed_serve_process_survives_reconnect_and_restart(
                 process.kill()
                 await process.communicate()
         socket_path.unlink(missing_ok=True)
+        Path(f"{socket_path}.lock").unlink(missing_ok=True)
         shutil.rmtree(home, ignore_errors=True)
