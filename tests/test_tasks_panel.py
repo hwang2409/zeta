@@ -330,12 +330,16 @@ def test_output_tail_is_bounded_to_recent_lines() -> None:
 # -- registry seam ----------------------------------------------------------
 
 
-def test_snapshot_reports_status_and_line_count() -> None:
+@pytest.mark.asyncio
+async def test_snapshot_reports_status_and_line_count() -> None:
     registry = BackgroundTaskRegistry()
-    # A record recovered from a previous session has no start time.
-    info = _info("task-x")
-    assert info.started_at == 0.0
-    assert registry.snapshot() == ()
+    try:
+        # A record recovered from a previous session has no start time.
+        info = _info("task-x")
+        assert info.started_at == 0.0
+        assert registry.snapshot() == ()
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -343,17 +347,18 @@ async def test_output_tail_reads_only_new_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("cat", tmp_path)
-    output_ready = asyncio.Event()
-    original_append = registry._append
-
-    def signal_output(record: Any, chunk: bytes) -> None:
-        original_append(record, chunk)
-        output_ready.set()
-
-    # test-contract: seam BackgroundTaskRegistry has no public output-ready event
-    monkeypatch.setattr(registry, "_append", signal_output)
+    task_id = None
     try:
+        task_id, _ = await registry.start("cat", tmp_path)
+        output_ready = asyncio.Event()
+        original_append = registry._append
+
+        def signal_output(record: Any, chunk: bytes) -> None:
+            original_append(record, chunk)
+            output_ready.set()
+
+        # test-contract: seam BackgroundTaskRegistry has no public output-ready event
+        monkeypatch.setattr(registry, "_append", signal_output)
         await registry.input(task_id, "x" * 5000 + "\n")
         await asyncio.wait_for(output_ready.wait(), timeout=10)
         # Drain the backlog fully, tracking the cursor as the panel does.
@@ -371,7 +376,8 @@ async def test_output_tail_reads_only_new_bytes(
         tail = await registry.output(task_id, since=cursor)
         assert tail["output"] == "DELTA\n"
     finally:
-        await registry.kill(task_id)
+        if task_id is not None:
+            await registry.kill(task_id)
         await registry.close()
 
 
