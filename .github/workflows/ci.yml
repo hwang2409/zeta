@@ -22,23 +22,22 @@ permissions:
   pull-requests: read
 
 jobs:
-  ubuntu:
-    name: ubuntu
-    uses: ./.github/workflows/pytest.yml
-    with:
-      os: ubuntu-latest
-
-  macos:
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos') }}
-    name: macos
-    uses: ./.github/workflows/pytest.yml
-    with:
-      os: macos-latest
+  test:
+    name: pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     # Main keeps one running macOS job and only the newest pending commit.
-    # Other events use a unique group and cannot replace a main job.
+    # Other matrix jobs use a unique group and cannot replace it.
     concurrency:
-      group: ${{ github.event_name == 'push' && 'ci-macos-main' || format('ci-macos-{0}', github.run_id) }}
+      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}', github.workflow, github.sha, matrix.os) }}
       cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/pytest
 
   lint:
     name: ruff

@@ -16,7 +16,9 @@ permissions:
 jobs:
   macos:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
-    name: macos
-    uses: ./.github/workflows/pytest.yml
-    with:
-      os: macos-latest
+    name: pytest (macos label)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/pytest
