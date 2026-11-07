@@ -10,6 +10,7 @@ import secrets
 import stat
 import threading
 from collections.abc import Callable
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,16 @@ class ConcurrentFileChangeError(ValueError):
 
 class FilePublishedWithoutDurabilityError(RuntimeError):
     """Publication completed before cancellation, but its fsync did not."""
+
+
+class FilePublicationOutcomeUnknownError(RuntimeError):
+    """Cancellation overlapped the publication syscall."""
+
+
+class PublicationState(Enum):
+    CANCELED = auto()
+    PUBLISHING = auto()
+    PUBLISHED = auto()
 
 
 class PublicationGuard:
@@ -39,24 +50,18 @@ class PublicationGuard:
             function()
             self._published = True
 
-    def cancel(self) -> bool:
-        """Return whether publication had already completed."""
+    def cancel(self) -> PublicationState:
+        """Inspect or cancel publication without waiting for its syscall."""
 
-        with self._lock:
-            if self._published:
-                return True
-            self._canceled = True
-            return False
-
-
-async def _cancel_publication(publication: PublicationGuard) -> bool:
-    task = asyncio.create_task(asyncio.to_thread(publication.cancel))
-    while not task.done():
+        if not self._lock.acquire(blocking=False):
+            return PublicationState.PUBLISHING
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            pass
-    return task.result()
+            if self._published:
+                return PublicationState.PUBLISHED
+            self._canceled = True
+            return PublicationState.CANCELED
+        finally:
+            self._lock.release()
 
 
 def _retrieve_worker_result(task: asyncio.Task[Any]) -> None:
@@ -80,11 +85,15 @@ async def run_file_worker[Result](
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        published = await _cancel_publication(publication)
+        publication_state = publication.cancel()
         if task.done():
             return task.result()
         task.add_done_callback(_retrieve_worker_result)
-        if published and signal.is_set():
+        if publication_state is PublicationState.PUBLISHING and signal.is_set():
+            raise FilePublicationOutcomeUnknownError(
+                "publication was in progress; file write outcome is unknown"
+            ) from None
+        if publication_state is PublicationState.PUBLISHED and signal.is_set():
             raise FilePublishedWithoutDurabilityError(
                 "file was written; durability was not confirmed before cancellation"
             ) from None

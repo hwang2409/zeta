@@ -11,7 +11,6 @@ from typing import Any, Self
 
 import pytest
 
-import zeta.tools._atomic_replace as atomic_replace_module
 import zeta.tools.edit as edit_module
 from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
@@ -20,48 +19,31 @@ from zeta.tools import ToolRegistry
 ToolInvocation = Callable[[ToolRegistry, str], Awaitable[StructuredToolResult]]
 
 
-def _observe_publication_cancel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> asyncio.Event | None:
-    original = getattr(atomic_replace_module, "_cancel_publication", None)
-    if original is None:
-        return None
-    finished = asyncio.Event()
-
-    async def observed(publication: Any) -> bool:
-        result = await original(publication)
-        finished.set()
-        return result
-
-    # test-contract: seam coordinate after the off-loop cancellation phase
-    monkeypatch.setattr(atomic_replace_module, "_cancel_publication", observed)
-    return finished
-
-
 async def _assert_completes_before_worker_release(
     operation: asyncio.Task[StructuredToolResult],
-    cancel_finished: asyncio.Event | None,
 ) -> StructuredToolResult:
-    completed = asyncio.ensure_future(asyncio.shield(operation))
+    loop = asyncio.get_running_loop()
+    for _ in range(20):
+        if operation.done():
+            return operation.result()
+        turn = loop.create_future()
+        loop.call_soon(turn.set_result, None)
+        await turn
+    assert operation.done(), "abort did not finish while the file worker was blocked"
+    return operation.result()
 
-    if cancel_finished is not None:
-        await cancel_finished.wait()
 
-    async def event_loop_checkpoint() -> None:
-        loop = asyncio.get_running_loop()
-        for _ in range(20):
-            turn = loop.create_future()
-            loop.call_soon(turn.set_result, None)
-            await turn
-
-    checkpoint = asyncio.create_task(event_loop_checkpoint())
+async def _wait_for_event_or_operation(
+    event: threading.Event,
+    operation: asyncio.Task[StructuredToolResult],
+) -> StructuredToolResult | None:
+    event_wait = asyncio.create_task(asyncio.to_thread(event.wait))
     done, _pending = await asyncio.wait(
-        {completed, checkpoint}, return_when=asyncio.FIRST_COMPLETED
+        {event_wait, operation}, return_when=asyncio.FIRST_COMPLETED
     )
-    assert completed in done, "abort did not finish while the file worker was blocked"
-    checkpoint.cancel()
-    await asyncio.gather(checkpoint, return_exceptions=True)
-    return completed.result()
+    if operation in done:
+        return operation.result()
+    return None
 
 
 async def _write(registry: ToolRegistry, path: str) -> StructuredToolResult:
@@ -319,7 +301,6 @@ async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
     main_thread = threading.get_ident()
     original_fdopen = os.fdopen
     original_unlink = os.unlink
-    cancel_finished = _observe_publication_cancel(monkeypatch)
 
     class BlockingWriter:
         def __init__(self, handle: Any) -> None:
@@ -361,9 +342,7 @@ async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
         await asyncio.to_thread(entered.wait)
         registry.abort()
 
-        result = await _assert_completes_before_worker_release(
-            operation, cancel_finished
-        )
+        result = await _assert_completes_before_worker_release(operation)
         assert result["isError"] is True
         assert result["content"][0]["text"] == "tool execution canceled"
 
@@ -372,6 +351,52 @@ async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
         assert target.read_text(encoding="utf-8") == "old content"
         assert list(tmp_path.glob(".*.tmp")) == []
     finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invoke", [_write, _edit])
+async def test_abort_during_publication_reports_unknown_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invoke: ToolInvocation,
+) -> None:
+    target = tmp_path / "target.txt"
+    if invoke is _edit:
+        target.write_text("old content", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    entered = threading.Event()
+    release = threading.Event()
+    original_link = os.link
+    original_replace = os.replace
+
+    def blocking_link(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        release.wait()
+        original_link(*args, **kwargs)
+
+    def blocking_replace(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        release.wait()
+        original_replace(*args, **kwargs)
+
+    monkeypatch.setattr(os, "link", blocking_link)
+    monkeypatch.setattr(os, "replace", blocking_replace)
+    operation = asyncio.create_task(invoke(registry, target.name))
+    try:
+        result = await _wait_for_event_or_operation(entered, operation)
+        if result is None:
+            registry.abort()
+            result = await _assert_completes_before_worker_release(operation)
+
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == (
+            "publication was in progress; file write outcome is unknown"
+        )
+    finally:
+        entered.set()
         release.set()
         await asyncio.gather(operation, return_exceptions=True)
         await registry.close()
@@ -389,33 +414,28 @@ async def test_abort_after_publication_reports_unconfirmed_durability(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     published = threading.Event()
     release = threading.Event()
-    trailing_fsync_finished = threading.Event()
     original_fsync = os.fsync
-    cancel_finished = _observe_publication_cancel(monkeypatch)
 
     def blocking_directory_fsync(file_descriptor: int) -> None:
         if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
             published.set()
             release.wait()
-            trailing_fsync_finished.set()
         original_fsync(file_descriptor)
 
     monkeypatch.setattr(os, "fsync", blocking_directory_fsync)
     operation = asyncio.create_task(invoke(registry, target.name))
     try:
-        await asyncio.to_thread(published.wait)
-        registry.abort()
-
-        result = await _assert_completes_before_worker_release(
-            operation, cancel_finished
-        )
+        result = await _wait_for_event_or_operation(published, operation)
+        if result is None:
+            registry.abort()
+            result = await _assert_completes_before_worker_release(operation)
         assert result["isError"] is True
         assert result["content"][0]["text"] == (
             "file was written; durability was not confirmed before cancellation"
         )
         assert target.read_text(encoding="utf-8") == "new content"
     finally:
+        published.set()
         release.set()
-        await asyncio.to_thread(trailing_fsync_finished.wait)
         await asyncio.gather(operation, return_exceptions=True)
         await registry.close()
