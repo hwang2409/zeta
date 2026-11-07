@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from ..store._child_runs import child_run_segments
 from . import RepairResult, RepairTarget
 
 if TYPE_CHECKING:
+    from ...memory.auto import AutoMemoryReconciler
     from ..session import SessionManager
 
 
@@ -32,6 +34,37 @@ def repair_command_for_child_path(path: Path) -> str:
     if not root or not segments:
         return ""
     return f"/repair-transcript {root} {root}:{':'.join(segments)}"
+
+
+def _resident_memory_commit(
+    reconciler: AutoMemoryReconciler | None,
+    session_id: str,
+    child_run_id: str | None,
+) -> Callable[[str, int, bool], None] | None:
+    if (
+        child_run_id is not None
+        or reconciler is None
+        or reconciler.session_id != session_id
+    ):
+        return None
+    owner_loop = asyncio.get_running_loop()
+
+    def commit(
+        quarantine_id: str,
+        retained_last_sequence: int,
+        memory_review_required: bool,
+    ) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            reconciler.recovery_committed(
+                quarantine_id=quarantine_id,
+                retained_last_sequence=retained_last_sequence,
+                memory_review_required=memory_review_required,
+            ),
+            owner_loop,
+        )
+        future.result()
+
+    return commit
 
 
 def _notification_id(target: RepairTarget, quarantine_id: str) -> str:
@@ -69,10 +102,17 @@ async def repair_transcript_for_runtime(
     child_run_id: str | None,
     *,
     parent_store: ConversationStore | None,
+    memory_reconciler: AutoMemoryReconciler | None = None,
 ) -> RepairResult:
-    """Commit one repair, then publish its child lifecycle notice."""
+    """Commit one repair through its resident owner, then publish success."""
+    resident_memory_commit = _resident_memory_commit(
+        memory_reconciler, session_id, child_run_id
+    )
     result = await asyncio.to_thread(
-        manager.repair_transcript, session_id, child_run_id
+        manager.repair_transcript,
+        session_id,
+        child_run_id,
+        resident_memory_commit=resident_memory_commit,
     )
     if (
         child_run_id is not None

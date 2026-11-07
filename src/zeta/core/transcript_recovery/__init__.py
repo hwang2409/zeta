@@ -7,8 +7,7 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -19,12 +18,7 @@ from ...storage_format import (
     STRICT_PAYLOAD_KEYS,
 )
 from ..checkpoints import ConversationEntry, load_session_json
-from ..session_files import (
-    child_directory,
-    open_session_file,
-    session_directory,
-    write_json_file,
-)
+from ..session_files import open_session_file, write_json_file
 
 _BUFFER_SIZE = 1024 * 1024
 _MAX_RECORD_BYTES = 64 * 1024
@@ -299,28 +293,6 @@ def parse_recovery_record(value: Mapping[str, Any]) -> RecoveryRecord:
         ),
         memory_step=memory_step,
     )
-
-
-@contextmanager
-def repair_target_directory(
-    sessions_root: os.PathLike[str], target: RepairTarget
-) -> Iterator[int]:
-    """Pin exactly one validated root or nested child transcript directory."""
-    with ExitStack() as stack:
-        _, directory_fd = stack.enter_context(
-            session_directory(Path(sessions_root), target.root_session_id)
-        )
-        current_run_id = target.root_session_id
-        for segment in _child_run_segments(target.root_session_id, target.child_run_id):
-            from ..store._child_runs import verify_child_run_directory
-
-            directory_fd = stack.enter_context(child_directory(directory_fd, "agents"))
-            directory_fd = stack.enter_context(
-                child_directory(directory_fd, str(segment))
-            )
-            current_run_id = f"{current_run_id}:{segment}"
-            verify_child_run_directory(directory_fd, current_run_id)
-        yield directory_fd
 
 
 def repair_transcript(

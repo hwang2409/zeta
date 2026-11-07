@@ -73,6 +73,36 @@ async def refresh_transcript_index(
     await waiter
 
 
+async def _refresh_pending(
+    key: tuple[Path, str], state: _RefreshState
+) -> TranscriptIndexError | None:
+    pending = tuple(state.pending.values())
+    state.pending.clear()
+    try:
+        await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
+    except (
+        OSError,
+        sqlite3.Error,
+        TranscriptIndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        logger.warning("could not refresh transcript index: %s", exc)
+        for source in pending:
+            newer = state.pending.get(source.session_id)
+            state.pending[source.session_id] = (
+                _merge_refresh_sources(source, newer)
+                if newer is not None
+                else source
+            )
+        state.failure = (
+            f"{exc}; pending changes will retry after the next transcript refresh"
+        )
+        return TranscriptIndexError(f"could not refresh transcript index: {exc}")
+    state.failure = None
+    return None
+
+
 async def _drain_refreshes(
     key: tuple[Path, str],
     state: _RefreshState,
@@ -81,32 +111,9 @@ async def _drain_refreshes(
     failure: TranscriptIndexError | None = None
     try:
         while state.pending:
-            pending = tuple(state.pending.values())
-            state.pending.clear()
-            try:
-                await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
-            except (
-                OSError,
-                sqlite3.Error,
-                TranscriptIndexError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                logger.warning("could not refresh transcript index: %s", exc)
-                for source in pending:
-                    newer = state.pending.get(source.session_id)
-                    state.pending[source.session_id] = (
-                        _merge_refresh_sources(source, newer)
-                        if newer is not None
-                        else source
-                    )
-                state.failure = f"{exc}; pending changes will retry after the next transcript refresh"
-                failure = TranscriptIndexError(
-                    f"could not refresh transcript index: {exc}"
-                )
+            failure = await _refresh_pending(key, state)
+            if failure is not None:
                 break
-            else:
-                state.failure = None
     finally:
         waiters, state.waiters = state.waiters, []
         state.task = None

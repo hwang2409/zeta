@@ -372,7 +372,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return OpenedSession(metadata, store)
 
     def repair_transcript(
-        self, session_id: str, child_run_id: str | None = None
+        self,
+        session_id: str,
+        child_run_id: str | None = None,
+        *,
+        resident_memory_commit: Callable[[str, int, bool], None] | None = None,
     ) -> RepairResult:
         """Repair one diagnosed root or child transcript."""
         metadata = self.read_metadata(session_id)
@@ -399,7 +403,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     f"session {session_id} transcript does not need repair"
                 )
             if child_run_id is None:
-                return self._complete_root_recovery(metadata, store, result)
+                return self._complete_root_recovery(
+                    metadata,
+                    store,
+                    result,
+                    resident_memory_commit=resident_memory_commit,
+                )
             return result
         finally:
             store.close()
@@ -409,6 +418,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         metadata: SessionMetadata,
         store: ConversationStore,
         result: RepairResult | None = None,
+        *,
+        resident_memory_commit: Callable[[str, int, bool], None] | None = None,
     ) -> RepairResult | None:
         """Close memory state before a repaired root store is published."""
         status = recovery_status(store.directory_fd, RepairTarget(metadata.session_id))
@@ -425,20 +436,18 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 retained_last_sequence=record.cutoff_sequence,
                 diagnosed_at=record.diagnosis_timestamp,
             )
-            from ..memory.reconciliation_state import ReconciliationState
-
-            state = ReconciliationState(
-                store.session_dir / "memory-reconcile.json",
-                project_id=metadata.project_id,
-                session_id=metadata.session_id,
-                diagnostics_path=self.home / "logs" / "memory-reconciliation.jsonl",
-                storage_lease=self._storage_lease,
-            )
-            if state.recovery_quarantine_id != record.quarantine_id:
-                state.reset_for_recovery(
-                    generation=state.generation + 1,
-                    retained_last_sequence=record.cutoff_sequence,
+            if resident_memory_commit is not None:
+                resident_memory_commit(
+                    record.quarantine_id,
+                    record.cutoff_sequence,
+                    bool(overlaps),
+                )
+            else:
+                self._commit_detached_memory_recovery(
+                    metadata,
+                    store,
                     quarantine_id=record.quarantine_id,
+                    retained_last_sequence=record.cutoff_sequence,
                     paused=bool(overlaps),
                 )
         set_memory_review_required(
@@ -457,6 +466,33 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             result,
             memory_review_required=bool(overlaps),
             overlapping_memory_versions=overlaps,
+        )
+
+    def _commit_detached_memory_recovery(
+        self,
+        metadata: SessionMetadata,
+        store: ConversationStore,
+        *,
+        quarantine_id: str,
+        retained_last_sequence: int,
+        paused: bool,
+    ) -> None:
+        from ..memory.reconciliation_state import ReconciliationState
+
+        state = ReconciliationState(
+            store.session_dir / "memory-reconcile.json",
+            project_id=metadata.project_id,
+            session_id=metadata.session_id,
+            diagnostics_path=self.home / "logs" / "memory-reconciliation.jsonl",
+            storage_lease=self._storage_lease,
+        )
+        if state.recovery_quarantine_id == quarantine_id:
+            return
+        state.reset_for_recovery(
+            generation=state.generation + 1,
+            retained_last_sequence=retained_last_sequence,
+            quarantine_id=quarantine_id,
+            paused=paused,
         )
 
     def _reconcile_project_link(self, session_id: str) -> None:

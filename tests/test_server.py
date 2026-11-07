@@ -10045,6 +10045,88 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
 
 
 @pytest.mark.asyncio
+async def test_serve_current_session_repair_updates_live_memory_owner(
+    tmp_path: Path,
+) -> None:
+    from tests.support.owned import await_or_fail
+    from zeta.project_registry import ProjectRegistry
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("recovery", "test", workspace)
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=workspace,
+        port=0,
+        provider="codex",
+        auto_memory=True,
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    assert server.runtime.loop is not None
+    root = server.runtime.opened.store
+    reconciler = server.runtime.loop.memory_reconciler
+    assert reconciler is not None
+    assert reconciler.session_id == session_id
+    root.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=registry.memory_digest(project.project_id),
+        updates={"state.md": "automatic\n"},
+        provenance={
+            "session_id": session_id,
+            "seq_start": 1,
+            "seq_end": 2,
+            "model": "offline",
+        },
+    )
+    transcript = root.path
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+    try:
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": True},
+            )
+        )[-1]["result"]
+        quarantine_id = repaired["quarantine_id"]
+        assert repaired["memory_review_required"] is True
+
+        await await_or_fail(
+            asyncio.to_thread(
+                reconciler.state.record_scanner_failure,
+                seq=2,
+                cause="delayed live publication",
+                occurred_at="2026-01-01T00:00:00Z",
+            ),
+            what="publish delayed live memory failure",
+        )
+        memory_state = json.loads(
+            (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
+        )
+        assert reconciler.state.generation == memory_state["generation"] == 1
+        assert (
+            reconciler.state.recovery_quarantine_id
+            == memory_state["recovery_quarantine_id"]
+            == quarantine_id
+        )
+        assert reconciler.state.recovery_cutoff == memory_state["recovery_cutoff"] == 1
+        assert reconciler.state.paused_for_recovery is True
+        assert memory_state["recovery_paused"] is True
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)

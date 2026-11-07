@@ -186,6 +186,29 @@ class _FormatOnePayloadAdapter:
         )
 
 
+def _overlapping_automatic_versions(
+    records: list[dict[str, object]],
+    *,
+    session_id: str,
+    retained_last_sequence: int,
+    diagnosed_at: str | None,
+) -> tuple[str, ...]:
+    result = []
+    for record in records:
+        provenance = record.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        if provenance.get("session_id") != session_id:
+            continue
+        seq_end = provenance.get("seq_end")
+        if type(seq_end) is not int or seq_end <= retained_last_sequence:
+            continue
+        if diagnosed_at is not None and str(record.get("created_at", "")) > diagnosed_at:
+            continue
+        result.append(str(record["version"]))
+    return tuple(result)
+
+
 class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
 
@@ -1047,23 +1070,12 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         def read(root_fd: int) -> tuple[str, ...]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
-                records = self._records_locked(directory_fd)
-                result = []
-                for record in records:
-                    provenance = record.get("provenance")
-                    if not isinstance(provenance, dict):
-                        continue
-                    if provenance.get("session_id") != session_id:
-                        continue
-                    seq_end = provenance.get("seq_end")
-                    if type(seq_end) is not int or seq_end <= retained_last_sequence:
-                        continue
-                    if diagnosed_at is not None and str(
-                        record.get("created_at", "")
-                    ) > diagnosed_at:
-                        continue
-                    result.append(str(record["version"]))
-                return tuple(result)
+                return _overlapping_automatic_versions(
+                    self._records_locked(directory_fd),
+                    session_id=session_id,
+                    retained_last_sequence=retained_last_sequence,
+                    diagnosed_at=diagnosed_at,
+                )
             finally:
                 os.close(directory_fd)
 

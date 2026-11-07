@@ -944,6 +944,67 @@ class ConversationLogMixin:
             offset += len(line)
             yield _PhysicalRow(row_number, row_offset, value)
 
+    def _repair_explicit_load_error(
+        self: ConversationStore, error: TranscriptLoadError
+    ) -> bool:
+        if not self._repair_explicit or error._source_facts is None:
+            return False
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise error
+        self._last_repair_result = repair_transcript(
+            self.directory_fd,
+            self._repair_target,
+            error._source_facts,
+            strict_reopen=self._strict_reopen_repaired_transcript,
+            memory_review_required=self._repair_target.child_run_id is None,
+        )
+        self._repair_explicit = False
+        self._load_full()
+        return True
+
+    def _repair_torn_row(
+        self: ConversationStore,
+        torn_offset: int | None,
+        validator: _FullLoadValidator,
+        stat: os.stat_result,
+        raw: bytes,
+        delta: tuple[ConversationEntry, ...],
+    ) -> bool:
+        if torn_offset is None:
+            return False
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            self._repair_torn_tail_legacy(torn_offset)
+            self._log_offset = torn_offset
+            self._publish_entries_installed(delta)
+            self._append_torn_warning_legacy()
+            return True
+        prefix = validator.validated_prefix(torn_offset)
+        source = TranscriptSourceFacts(
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            source_digest=hashlib.sha256(raw).hexdigest(),
+            prefix_digest=hashlib.sha256(raw[:torn_offset]).hexdigest(),
+            first_bad_row=len(raw[:torn_offset].splitlines()) + 1,
+            first_bad_offset=torn_offset,
+            prefix=prefix,
+            diagnosed_at=_now(),
+        )
+        self._last_repair_result = repair_transcript(
+            self.directory_fd,
+            self._repair_target,
+            source,
+            strict_reopen=self._strict_reopen_repaired_transcript,
+            memory_review_required=False,
+        )
+        warnings.warn(
+            f"dropped torn final conversation line from {self.path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        self._load_full()
+        return True
+
     def _load_full(self: ConversationStore) -> None:
         self._full_reload_count += 1
         if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
@@ -972,60 +1033,18 @@ class ConversationLogMixin:
                 validator.accept(physical_row)
             validator.finish()
         except TranscriptLoadError as error:
-            if not self._repair_explicit or error._source_facts is None:
-                raise
-            if self._storage_lease.observed_epoch != WRITER_EPOCH:
-                raise
-            self._last_repair_result = repair_transcript(
-                self.directory_fd,
-                self._repair_target,
-                error._source_facts,
-                strict_reopen=self._strict_reopen_repaired_transcript,
-                memory_review_required=self._repair_target.child_run_id is None,
-            )
-            self._repair_explicit = False
-            self._load_full()
-            return
+            if self._repair_explicit_load_error(error):
+                return
+            raise
 
         delta = (
             self._installed_delta_from_baseline(self._entries, baseline)
             if self.on_entries_installed is not None
             else ()
         )
-        if torn_offset is not None and self._storage_lease.observed_epoch != WRITER_EPOCH:
-            self._repair_torn_tail_legacy(torn_offset)
-            self._log_offset = torn_offset
-            self._publish_entries_installed(delta)
-            self._append_torn_warning_legacy()
+        if self._repair_torn_row(torn_offset, validator, stat, raw, delta):
             return
-        if torn_offset is not None:
-            prefix = validator.validated_prefix(torn_offset)
-            source = TranscriptSourceFacts(
-                device=stat.st_dev,
-                inode=stat.st_ino,
-                size=stat.st_size,
-                source_digest=hashlib.sha256(raw).hexdigest(),
-                prefix_digest=hashlib.sha256(raw[:torn_offset]).hexdigest(),
-                first_bad_row=len(raw[:torn_offset].splitlines()) + 1,
-                first_bad_offset=torn_offset,
-                prefix=prefix,
-                diagnosed_at=_now(),
-            )
-            self._last_repair_result = repair_transcript(
-                self.directory_fd,
-                self._repair_target,
-                source,
-                strict_reopen=self._strict_reopen_repaired_transcript,
-                memory_review_required=False,
-            )
-            warnings.warn(
-                f"dropped torn final conversation line from {self.path}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            self._load_full()
-            return
-        elif not self._read_only and not raw.endswith(b"\n"):
+        if not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
             self._publish_entries_installed(delta)
         else:

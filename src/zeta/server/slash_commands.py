@@ -288,6 +288,11 @@ class ServerSlashSession:
                 if self._runtime.opened is not None
                 else None
             ),
+            memory_reconciler=(
+                self._runtime.loop.memory_reconciler
+                if self._runtime.loop is not None
+                else None
+            ),
         )
         return (
             f"repaired transcript {parts[0]}"

@@ -788,18 +788,19 @@ async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_pat
 
 
 @pytest.mark.asyncio
-async def test_tui_repair_resets_and_pauses_real_automatic_memory_state(
+async def test_tui_current_session_repair_updates_live_memory_owner(
     tmp_path: Path,
 ) -> None:
     from tests.support.owned import await_or_fail
     from zeta.core.session import SessionManager
+    from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
     from zeta.project_registry import ProjectRegistry
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("recovery", "test")
     manager = SessionManager(tmp_path)
-    damaged = await await_or_fail(
+    current = await await_or_fail(
         asyncio.to_thread(
             manager.create,
             provider="codex",
@@ -808,68 +809,90 @@ async def test_tui_repair_resets_and_pauses_real_automatic_memory_state(
             project_id=project.project_id,
             auto_project=False,
         ),
-        what="create damaged session",
+        what="create current session",
     )
-    damaged.store.append_message(
+    current.store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("retained")]),
             MessageOrigin.USER,
         )
     )
-    damaged.store.close()
     automatic = registry.compare_and_swap_memory(
         project.project_id,
         expected_digest=registry.memory_digest(project.project_id),
         updates={"state.md": "automatic\n"},
         provenance={
-            "session_id": damaged.metadata.session_id,
+            "session_id": current.metadata.session_id,
             "seq_start": 1,
             "seq_end": 2,
             "model": "offline",
         },
     )
-    transcript = tmp_path / "sessions" / damaged.metadata.session_id / "conversation.jsonl"
+    transcript = current.store.path
     transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
 
-    current = await await_or_fail(
-        asyncio.to_thread(
-            manager.create, provider="codex", model="offline", cwd=tmp_path
-        ),
-        what="create current session",
-    )
-    tui = SimpleNamespace(loop=SimpleNamespace(manager=manager, store=current.store))
-    output = await SlashHandlerMixin.slash_repair_transcript(
-        tui, f"{damaged.metadata.session_id} confirm"
-    )
-    assert "repaired transcript" in output
+    async def unused_invoke(_prompt: str) -> str:
+        raise AssertionError("recovery must not invoke the memory model")
 
-    memory_state = json.loads(
-        (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
-    )
-    assert memory_state["generation"] == 1
-    assert memory_state["seq"] == 1
-    assert memory_state["transcript_bytes"] == 0
-    assert memory_state["recovery_paused"] is True
-    from zeta.memory.reconciliation_state import ReconciliationState
-
-    reloaded = ReconciliationState(
-        transcript.parent / "memory-reconcile.json",
+    reconciler = AutoMemoryReconciler(
+        registry=registry,
         project_id=project.project_id,
-        session_id=damaged.metadata.session_id,
-        diagnostics_path=transcript.parent / "memory-reconcile-errors.jsonl",
-        storage_lease=current.store._storage_lease,
+        session_id=current.metadata.session_id,
+        session_dir=current.store.session_dir,
+        invoke=unused_invoke,
+        config=AutoMemoryConfig(enabled=False),
     )
-    assert reloaded.generation == 1
-    assert reloaded.paused_for_recovery is True
-    recovery_files = list(transcript.parent.glob("conversation.recovery.*.json"))
-    assert len(recovery_files) == 1
-    recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
-    assert recovery["memory_step"] == "review_pending"
-    assert registry.overlapping_automatic_versions(
-        project.project_id,
-        session_id=damaged.metadata.session_id,
-        retained_last_sequence=1,
-    ) == (automatic.version,)
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            manager=manager,
+            store=current.store,
+            memory_reconciler=reconciler,
+        )
+    )
+    try:
+        output = await SlashHandlerMixin.slash_repair_transcript(
+            tui, f"{current.metadata.session_id} confirm"
+        )
+        assert "repaired transcript" in output
+
+        await await_or_fail(
+            asyncio.to_thread(
+                reconciler.state.record_scanner_failure,
+                seq=2,
+                cause="delayed live publication",
+                occurred_at="2026-01-01T00:00:00Z",
+            ),
+            what="publish delayed live memory failure",
+        )
+        memory_state = json.loads(
+            (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
+        )
+        quarantine_id = reconciler.state.recovery_quarantine_id
+        assert quarantine_id is not None
+        assert reconciler.state.generation == memory_state["generation"] == 1
+        assert (
+            reconciler.state.recovery_quarantine_id
+            == memory_state["recovery_quarantine_id"]
+            == quarantine_id
+        )
+        assert reconciler.state.recovery_cutoff == memory_state["recovery_cutoff"] == 1
+        assert reconciler.state.paused_for_recovery is True
+        assert memory_state["recovery_paused"] is True
+        assert memory_state["seq"] == 1
+        assert memory_state["transcript_bytes"] == 0
+
+        recovery_files = list(transcript.parent.glob("conversation.recovery.*.json"))
+        assert len(recovery_files) == 1
+        recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
+        assert recovery["memory_step"] == "review_pending"
+        assert registry.overlapping_automatic_versions(
+            project.project_id,
+            session_id=current.metadata.session_id,
+            retained_last_sequence=1,
+        ) == (automatic.version,)
+    finally:
+        await reconciler.close()
+        current.store.close()
 
 
 @pytest.mark.asyncio

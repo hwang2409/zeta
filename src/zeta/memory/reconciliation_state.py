@@ -798,6 +798,24 @@ class ReconciliationState:
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _recovery_fields(value: Mapping[str, Any]) -> dict[str, object]:
+        fields: dict[str, object] = {
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
+        }
+        quarantine_id = value.get("recovery_quarantine_id")
+        if quarantine_id is None or isinstance(quarantine_id, str) and quarantine_id:
+            fields["recovery_quarantine_id"] = quarantine_id
+        cutoff = value.get("recovery_cutoff")
+        if cutoff is None or type(cutoff) is int and cutoff >= 0:
+            fields["recovery_cutoff"] = cutoff
+        paused = value.get("recovery_paused")
+        if type(paused) is bool:
+            fields["recovery_paused"] = paused
+        return fields
+
     def _read(self) -> dict[str, Any]:
         empty: dict[str, Any] = {
             "seq": 0,
@@ -842,15 +860,7 @@ class ReconciliationState:
             ):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
-        quarantine_id = value.get("recovery_quarantine_id")
-        if quarantine_id is None or isinstance(quarantine_id, str) and quarantine_id:
-            empty["recovery_quarantine_id"] = quarantine_id
-        cutoff = value.get("recovery_cutoff")
-        if cutoff is None or type(cutoff) is int and cutoff >= 0:
-            empty["recovery_cutoff"] = cutoff
-        paused = value.get("recovery_paused")
-        if type(paused) is bool:
-            empty["recovery_paused"] = paused
+        empty.update(self._recovery_fields(value))
         for key, item in value.items():
             if key not in empty:
                 empty[key] = item

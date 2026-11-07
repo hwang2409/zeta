@@ -43,6 +43,58 @@ class MemoryRegistry(Protocol):
     ): ...
 
 
+def _run_recovery_command(
+    action: str,
+    usage: str,
+    reconciler: MemoryReconciler | None,
+    authorization: MemoryMutationAuthorization | None,
+) -> str | Awaitable[str]:
+    parts = action.split()
+    if len(parts) != 4 or parts[3] != "resume" or reconciler is None:
+        return usage
+    root_session_id, quarantine_id = parts[1:3]
+    _authorize(authorization, "recovery", f"{root_session_id} {quarantine_id}")
+    return reconciler.resume_recovery(root_session_id, quarantine_id)
+
+
+def _run_retry_command(
+    action: str,
+    usage: str,
+    reconciler: MemoryReconciler | None,
+    authorization: MemoryMutationAuthorization | None,
+) -> str:
+    if reconciler is None:
+        return "memory retry: unavailable for this session" if action == "retry" else usage
+    if action == "retry":
+        receipts = reconciler.terminal_receipts()
+        if not receipts:
+            return "memory retry: no terminal receipts"
+        return "\n".join(
+            f"{item.key} seq {item.seq_start}-{item.seq_end} "
+            f"attempts={item.attempt_count} {item.validation_summary}"
+            for item in receipts
+        )
+    prefix = action.removeprefix("retry ").strip()
+    if not prefix or " " in prefix:
+        return usage
+    matches = [
+        item.key for item in reconciler.terminal_receipts() if item.key.startswith(prefix)
+    ]
+    if len(matches) != 1:
+        return "memory retry: receipt not found or prefix is ambiguous"
+    scanner_failure = reconciler.scanner_failure
+    if scanner_failure is not None:
+        seq, cause = scanner_failure
+        return (
+            "memory retry refused: automatic project-memory reconciliation "
+            f"is blocked by {cause} (seq {seq}); repair the transcript first"
+        )
+    _authorize(authorization, "retry", matches[0])
+    if not reconciler.retry_terminal(matches[0]):
+        return "memory retry: receipt not found"
+    return f"memory retry queued: {matches[0]}"
+
+
 def run_memory_command(
     registry: MemoryRegistry,
     project_id: str,
@@ -61,45 +113,9 @@ def run_memory_command(
             else "usage: /memory [log [kind|entry-id]|retry [receipt]|undo [entry-id|version-id]|accept <entry-id>|resolve <entry-id>...]"
         )
         if action.startswith("recovery "):
-            parts = action.split()
-            if len(parts) != 4 or parts[3] != "resume" or reconciler is None:
-                return usage
-            root_session_id, quarantine_id = parts[1:3]
-            _authorize(authorization, "recovery", f"{root_session_id} {quarantine_id}")
-            return reconciler.resume_recovery(root_session_id, quarantine_id)
-        if action == "retry":
-            if reconciler is None:
-                return "memory retry: unavailable for this session"
-            receipts = reconciler.terminal_receipts()
-            if not receipts:
-                return "memory retry: no terminal receipts"
-            return "\n".join(
-                f"{item.key} seq {item.seq_start}-{item.seq_end} "
-                f"attempts={item.attempt_count} {item.validation_summary}"
-                for item in receipts
-            )
-        if action.startswith("retry "):
-            prefix = action.removeprefix("retry ").strip()
-            if reconciler is None or not prefix or " " in prefix:
-                return usage
-            matches = [
-                item.key
-                for item in reconciler.terminal_receipts()
-                if item.key.startswith(prefix)
-            ]
-            if len(matches) != 1:
-                return "memory retry: receipt not found or prefix is ambiguous"
-            scanner_failure = getattr(reconciler, "scanner_failure", None)
-            if scanner_failure is not None:
-                seq, cause = scanner_failure
-                return (
-                    "memory retry refused: automatic project-memory reconciliation "
-                    f"is blocked by {cause} (seq {seq}); repair the transcript first"
-                )
-            _authorize(authorization, "retry", matches[0])
-            if not reconciler.retry_terminal(matches[0]):
-                return "memory retry: receipt not found"
-            return f"memory retry queued: {matches[0]}"
+            return _run_recovery_command(action, usage, reconciler, authorization)
+        if action == "retry" or action.startswith("retry "):
+            return _run_retry_command(action, usage, reconciler, authorization)
         if action == "undo" or action.startswith("undo "):
             if memory_format == 2:
                 parts = action.split()

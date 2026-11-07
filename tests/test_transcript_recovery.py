@@ -6,12 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.session_files import (
-    child_directory,
-    read_session_file,
-    session_directory,
-    write_json_file,
-)
+from zeta.core.session_files import session_directory
 from zeta.core.store import ConversationStore, TranscriptLoadError
 from zeta.protocol.types import (
     Message,
@@ -269,48 +264,6 @@ def test_source_identity_change_refuses_before_creating_evidence(
             == 0
         )
     assert transcript.read_bytes() == changed
-
-
-def test_nested_target_resolution_uses_public_identity_and_no_symlinks(
-    tmp_path: Path,
-) -> None:
-    _diagnosed_store(tmp_path / "diagnosis-probe")
-    recovery = _recovery()
-    root = tmp_path / "sessions"
-    store = ConversationStore(root, session_id="root")
-    store.close()
-    with (
-        session_directory(root, "root") as (_, root_fd),
-        child_directory(root_fd, "agents", create=True) as agents_fd,
-        child_directory(agents_fd, "1", create=True) as child_fd,
-    ):
-        write_json_file(
-            child_fd,
-            "agent_lifecycle.json",
-            {"handle": "root:1"},
-        )
-    with recovery.repair_target_directory(
-        root, recovery.RepairTarget("root", "root:1")
-    ) as child_fd:
-        assert (
-            json.loads(read_session_file(child_fd, "agent_lifecycle.json"))["handle"]
-            == "root:1"
-        )
-
-    lifecycle = root / "root" / "agents" / "1" / "agent_lifecycle.json"
-    lifecycle.write_text('{"handle":"root:2"}\n', encoding="utf-8")
-    with (
-        pytest.raises(ValueError, match="identity"),
-        recovery.repair_target_directory(root, recovery.RepairTarget("root", "root:1")),
-    ):
-        pass
-    lifecycle.unlink()
-    lifecycle.symlink_to(root / "root" / "conversation.jsonl")
-    with (
-        pytest.raises(OSError),
-        recovery.repair_target_directory(root, recovery.RepairTarget("root", "root:1")),
-    ):
-        pass
 
 
 @pytest.mark.parametrize(

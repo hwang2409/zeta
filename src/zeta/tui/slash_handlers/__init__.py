@@ -801,6 +801,7 @@ class SlashHandlerMixin:
             parts[0],
             child_run_id,
             parent_store=self.loop.store,
+            memory_reconciler=getattr(self.loop, "memory_reconciler", None),
         )
         return (
             f"repaired transcript {parts[0]}"
