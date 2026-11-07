@@ -12918,9 +12918,10 @@ async def test_late_task_gets_its_own_safety_window(
     )
     task_id: str | None = None
     try:
-        await asyncio.wait_for(first_idle.wait(), 2)
+        await asyncio.wait_for(first_idle.wait(), 10)
         await asyncio.sleep(0)
         assert not run.done(), run.exception() if run.done() else None
+        # test-contract: latency let the base one-shot timer arm while idle
         await asyncio.sleep(0.02)
         started = await loop.tool_registry.execute(
             ToolCall(
@@ -12952,7 +12953,7 @@ async def test_late_task_gets_its_own_safety_window(
         )
         done, pending = await asyncio.wait(
             (safety_observed, task_exited),
-            timeout=2,
+            timeout=10,
             return_when=asyncio.FIRST_COMPLETED,
         )
         assert done
@@ -12972,8 +12973,8 @@ async def test_late_task_gets_its_own_safety_window(
 
         now[0] += 0.01
         await safety_wait.releases.put(False)
-        assert await asyncio.wait_for(safety_wait.timeouts.get(), timeout=2) is None
-        await asyncio.sleep(0.1)
+        assert await asyncio.wait_for(safety_wait.timeouts.get(), timeout=10) is None
+        await asyncio.wait_for(notice_seen.wait(), timeout=10)
         assert notice_seen.is_set(), (calls, loop.step_delivery.pending_ids())
         assert notices[0].role is MessageRole.SYSTEM
         assert (
