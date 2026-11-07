@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
@@ -15,13 +14,32 @@ from pathlib import Path
 HINT = re.compile(r"zeta storage-format advance --expected-epoch 0 --target-epoch \d+")
 
 
-def digest_session_files(home: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted((home / "sessions").rglob("*")):
-        if path.is_file():
-            digest.update(path.relative_to(home).as_posix().encode())
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
+def snapshot_home(home: Path) -> dict[str, tuple[str, bytes | None]]:
+    snapshot: dict[str, tuple[str, bytes | None]] = {}
+    for path in sorted(home.rglob("*")):
+        relative = path.relative_to(home).as_posix()
+        if path.is_dir():
+            snapshot[relative] = ("directory", None)
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+        else:
+            snapshot[relative] = ("other", None)
+    return snapshot
+
+
+def report_home_changes(
+    before: dict[str, tuple[str, bytes | None]],
+    after: dict[str, tuple[str, bytes | None]],
+) -> list[str]:
+    changes = []
+    for path in sorted(set(before) | set(after)):
+        if path not in before:
+            changes.append(f"added: {path}")
+        elif path not in after:
+            changes.append(f"removed: {path}")
+        elif before[path] != after[path]:
+            changes.append(f"changed: {path}")
+    return changes
 
 
 def run(binary: Path, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -55,6 +73,21 @@ def main() -> int:
         else:
             wheel = wheel_argument.resolve()
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        requirements = temp_root / "requirements.txt"
+        subprocess.run(
+            [
+                "uv",
+                "export",
+                "--frozen",
+                "--no-dev",
+                "--no-emit-project",
+                "--no-hashes",
+                "-o",
+                str(requirements),
+            ],
+            cwd=root,
+            check=True,
+        )
         subprocess.run(
             [
                 "uv",
@@ -62,13 +95,37 @@ def main() -> int:
                 "install",
                 "--python",
                 str(venv / "bin" / "python"),
+                "-r",
+                str(requirements),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(venv / "bin" / "python"),
+                "--no-deps",
                 str(wheel),
             ],
             check=True,
         )
+        imported = subprocess.run(
+            [str(venv / "bin" / "python"), "-c", "import zeta; print(zeta.__file__)"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        if not Path(imported).resolve().is_relative_to(venv.resolve()):
+            raise AssertionError(
+                f"zeta imported outside virtual environment: {imported}"
+            )
         binary = venv / "bin" / "zeta"
 
-        before = digest_session_files(home / "zeta")
+        zeta_home = home / "zeta"
+        before = snapshot_home(zeta_home)
         refused = run(binary, home, "session", "list")
         if refused.returncode == 0:
             raise AssertionError("old home unexpectedly started before format advance")
@@ -77,8 +134,17 @@ def main() -> int:
             raise AssertionError(
                 f"missing complete advance hint in stderr:\n{refused.stderr}"
             )
-        if digest_session_files(home / "zeta") != before:
-            raise AssertionError("refused startup changed session files")
+        changes = report_home_changes(before, snapshot_home(zeta_home))
+        if changes == ["added: .storage-format.lock"]:
+            pass
+        elif changes:
+            raise AssertionError(
+                "refused startup changed the copied home:\n" + "\n".join(changes)
+            )
+        else:
+            raise AssertionError(
+                "refused startup did not create the expected .storage-format.lock"
+            )
 
         command = hint.group(0).split()
         advanced = run(binary, home, *command[1:])
@@ -104,4 +170,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
