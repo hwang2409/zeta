@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
-SCRIPT = Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+SCRIPT = Path(
+    os.environ.get(
+        "SCRIPT", Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+    )
+)
 
 
 def run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -26,6 +31,47 @@ def repo(tmp_path: Path) -> Path:
 def commit(r: Path, message: str) -> None:
     subprocess.run(["git", "add", "."], cwd=r, check=True)
     subprocess.run(["git", "commit", "-qm", message], cwd=r, check=True)
+
+
+def test_dropped_membership_element_flagged(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        '    return event.type in ("CONFIG_CHANGED", "CHILD_MESSAGE_DELIVERED")\n'
+    )
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED", "MAIN"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "bad merge")
+    result = run(r)
+    assert result.returncode == 1
+    assert "CONFIG_CHANGED" in result.stdout
+    assert "check|event.type" in result.stdout
 
 
 def test_dropped_main_function_flagged(tmp_path: Path):
@@ -147,6 +193,130 @@ def test_new_constant_value_flagged(tmp_path: Path):
     commit(r, "merge")
     assert run(r).returncode == 1
     assert "WRITER_EPOCH" in run(r).stdout
+
+
+def _set_origin_main(r: Path) -> None:
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "main"], cwd=r, check=True
+    )
+
+
+def test_collection_lookup_is_local_for_correct_two_file_merge(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").unlink()
+    commit(r, "branch deletes z")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z", "C"}\n')
+    commit(r, "main adds a and changes z")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/z.py").unlink()
+    commit(
+        r,
+        "correct merge deletes z\n\nmerge-resolution: src/z.py collection element EVENTS -> intentional",
+    )
+    assert run(r).returncode == 0
+
+
+def test_membership_imports_resolve_and_report_only_missing_element(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/render.py").write_text('EVENTS = {"A", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text('def check(event): return event in ("A", "B")\n')
+    commit(r, "main inlines events")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "bad merge loses b")
+    result = run(r)
+    assert result.returncode == 1
+    assert "element \"'B'\"" in result.stdout
+    assert "element \"'A'\"" not in result.stdout
+
+
+def test_collection_lookup_cannot_hide_two_file_loss(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").write_text('EVENTS = {"Z", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds a")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "branch", "--", "src/a.py"], cwd=r, check=True
+    )
+    commit(
+        r,
+        "bad merge\n\nmerge-resolution: src/a.py collection element EVENTS -> intentional",
+    )
+    result = run(r)
+    assert result.returncode == 1
+    assert "src/a.py membership element check|event" in result.stdout
+
+
+def test_renamed_function_owns_no_merge_element_finding(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "rename")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds b")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "clean rename merge")
+    assert run(r).returncode == 0
 
 
 def test_non_merge_is_clean(tmp_path: Path):
