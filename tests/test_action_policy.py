@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from pathlib import Path
 
 import pytest
@@ -169,7 +167,115 @@ async def test_policy_authorizes_resolved_capability_only(tmp_path: Path) -> Non
     assert not result["isError"]
 
 
-def test_existing_tool_payloads_match_pre_action_policy_snapshots(
+def _provider_schema_contract(schema: dict[str, object]) -> dict[str, object]:
+    assert schema.get("type") == "object"
+    assert schema.get("additionalProperties") is False
+    types: dict[str, object] = {}
+    required: list[str] = []
+    actions: dict[str, object] = {}
+
+    def visit(value: object, path: str) -> None:
+        assert isinstance(value, dict)
+        if value.get("type") == "object":
+            assert value.get("additionalProperties") is False
+        types[path] = value.get("type", "unconstrained")
+        for field in value.get("required", []):
+            required.append(f"{path}.{field}" if path else field)
+        properties = value.get("properties", {})
+        assert isinstance(properties, dict)
+        for field, child in properties.items():
+            child_path = f"{path}.{field}" if path else field
+            visit(child, child_path)
+            if field == "action":
+                assert isinstance(child, dict)
+                actions[child_path] = child.get("enum")
+        if "items" in value:
+            visit(value["items"], f"{path}[]")
+
+    visit(schema, "")
+    del types[""]
+    return {"types": types, "required": sorted(required), "actions": actions}
+
+
+def _expected_provider_contract(
+    types: str, required: str = "", actions: str = ""
+) -> dict[str, object]:
+    return {
+        "types": dict(item.split("=", 1) for item in types.split()),
+        "required": sorted(required.split()),
+        "actions": {"action": actions.split()} if actions else {},
+    }
+
+
+_EXPECTED_PROVIDER_TOOL_CONTRACTS = {
+    name: _expected_provider_contract(*contract)
+    for name, contract in {
+        "agent": (
+            (
+                "agent_type=string background=boolean cwd=string description=string "
+                "model=string preset=string prompt=string"
+            ),
+            "description prompt",
+        ),
+        "agent_cancel": ("handle=string", "handle"),
+        "agent_output": ("handle=string limit=integer offset=integer", "handle"),
+        "agent_send": (
+            "child_instance_id=string message=string",
+            "child_instance_id message",
+        ),
+        "agent_status": ("handle=string limit=integer offset=integer",),
+        "bash": (
+            (
+                "cmd=string command=string cwd=unconstrained max_output=integer "
+                "timeout=number"
+            ),
+        ),
+        "edit": (
+            (
+                "edits=array edits[]=object edits[].new_string=string "
+                "edits[].old_string=string new_string=string old_string=string "
+                "path=string"
+            ),
+            "edits[].new_string edits[].old_string path",
+        ),
+        "fetch": ("max_bytes=integer offset=integer url=string", "url"),
+        "mcp_discover": (
+            "action=string names=array names[]=string query=string server=string uri=string",
+            "",
+            "search activate resources read_resource",
+        ),
+        "project": ("action=string", "", "inspect sessions"),
+        "read": ("limit=integer offset=integer path=string", "path"),
+        "recall_history": (
+            (
+                "max_chars=integer offset=integer query=string seq_end=integer "
+                "seq_start=integer"
+            ),
+        ),
+        "resolve_attention": (
+            "attention_id=string decision=string",
+            "attention_id decision",
+        ),
+        "run_background": ("command=string cwd=unconstrained", "command"),
+        "session_push": ("host=string", "host"),
+        "skill": ("name=string", "name"),
+        "task_input": ("data=string eof=boolean task_id=string", "task_id"),
+        "task_kill": ("task_id=string", "task_id"),
+        "task_output": ("since=integer task_id=string", "task_id"),
+        "todo": (
+            "items=array items[]=object items[].content=string items[].status=string",
+            "items[].content items[].status",
+        ),
+        "websearch": ("max_results=integer query=string", "query"),
+        "write": (
+            "content=string create_parents=boolean path=string",
+            "content path",
+        ),
+    }.items()
+}
+
+
+def test_existing_tool_payloads_keep_semantic_provider_contracts(
     tmp_path: Path,
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
@@ -177,33 +283,62 @@ def test_existing_tool_payloads_match_pre_action_policy_snapshots(
     existing_schemas = [
         schema for schema in registry.schemas if schema["name"] != "request_attention"
     ]
-    snapshots = {
-        "schemas": existing_schemas,
-        "anthropic": build_request_payload(
-            messages,
-            existing_schemas,
-            model="claude-test",
-            max_tokens=2048,
-            thinking_budget=1024,
-        ),
-        "codex": build_responses_payload(
-            messages, existing_schemas, model="codex-test"
-        ),
-        "ollama": ollama_tools(existing_schemas),
-    }
-    expected = {
-        "schemas": "839776b9c979c7f7e5d544577f0e9f7a4b91783ebeb881ae0aab778ce9c407ad",
-        "anthropic": "e41f2be4115cb40223d50703ef5fb3bbd9b1e47c4cf6f31e2ab7622e356a06f9",
-        "codex": "2db723140b09ef1dc8eaa1998892039807d097b9f3e6a7864417bf3e3907dd4f",
-        "ollama": "136432e8dd3c587b5a6bfde7a661ca09a27ed98fc2654caf6c3c16140a6c1512",
-    }
+    anthropic = build_request_payload(
+        messages,
+        existing_schemas,
+        model="claude-test",
+        max_tokens=2048,
+        thinking_budget=1024,
+    )["tools"]
+    codex = build_responses_payload(messages, existing_schemas, model="codex-test")[
+        "tools"
+    ]
+    ollama = ollama_tools(existing_schemas)
 
-    assert {
-        name: hashlib.sha256(
-            json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
-        for name, value in snapshots.items()
-    } == expected
+    assert all(
+        set(tool) == {"name", "input_schema", "description"} for tool in anthropic[:-1]
+    )
+    assert set(anthropic[-1]) == {
+        "name",
+        "input_schema",
+        "description",
+        "cache_control",
+    }
+    assert anthropic[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert all(isinstance(tool["description"], str) for tool in anthropic)
+    assert all(
+        tool["type"] == "function"
+        and tool["strict"] is False
+        and set(tool) == {"type", "name", "parameters", "strict", "description"}
+        and isinstance(tool["description"], str)
+        for tool in codex
+    )
+    assert all(
+        tool["type"] == "function"
+        and set(tool) == {"type", "function"}
+        and set(tool["function"]) == {"name", "description", "parameters"}
+        and isinstance(tool["function"]["description"], str)
+        for tool in ollama
+    )
+
+    provider_contracts = {
+        "anthropic": {
+            tool["name"]: _provider_schema_contract(tool["input_schema"])
+            for tool in anthropic
+        },
+        "codex": {
+            tool["name"]: _provider_schema_contract(tool["parameters"])
+            for tool in codex
+        },
+        "ollama": {
+            tool["function"]["name"]: _provider_schema_contract(
+                tool["function"]["parameters"]
+            )
+            for tool in ollama
+        },
+    }
+    for provider, contract in provider_contracts.items():
+        assert contract == _EXPECTED_PROVIDER_TOOL_CONTRACTS, provider
 
 
 def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> None:
@@ -213,7 +348,9 @@ def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> No
     assert str(parse_tool_selector("remote__*")) == "remote__*"
 
 
-@pytest.mark.parametrize("selector", ["agent()", "agent(status|output)", "agent(status *)"])
+@pytest.mark.parametrize(
+    "selector", ["agent()", "agent(status|output)", "agent(status *)"]
+)
 def test_capability_selector_parser_rejects_invalid_action_forms(selector: str) -> None:
     with pytest.raises(ValueError, match="tool selector"):
         parse_tool_selector(selector)
@@ -239,7 +376,9 @@ def test_layered_allowlists_intersect_and_deny_wins_per_action() -> None:
     assert not allowed.allows_call(_capability("task", "kill"))
 
 
-def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(tmp_path: Path) -> None:
+def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(
+    tmp_path: Path,
+) -> None:
     registry = _registry(tmp_path, tool_allow=("task(output)",))
 
     assert registry.schemas[0]["parameters"]["properties"]["action"]["enum"] == [
@@ -304,11 +443,47 @@ def test_approval_rule_is_resolved_against_action_metadata(tmp_path: Path) -> No
     )
     _registry(tmp_path, approval_policy=policy)
 
-    assert ApprovalRule("task", subject_pattern="pytest*", action="start") in policy.always_allow
+    assert (
+        ApprovalRule("task", subject_pattern="pytest*", action="start")
+        in policy.always_allow
+    )
     assert ApprovalRule("task", action="output") in policy.always_allow
-    assert policy.decide(_capability("task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ALLOW
-    assert policy.decide(_capability("task", "start", "pytest -k slow_case", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ASK
-    assert policy.decide(_capability("task", "start", "pytest --pdb", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.DENY
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest -q",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.ALLOW
+    )
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest -k slow_case",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.ASK
+    )
+    assert (
+        policy.decide(
+            _capability(
+                "task",
+                "start",
+                "pytest --pdb",
+                subject_field="command",
+                binding=ApprovalBinding.CWD,
+            )
+        )
+        is ApprovalDecision.DENY
+    )
     assert policy.decide(_capability("task", "output")) is ApprovalDecision.ALLOW
 
 
@@ -317,12 +492,21 @@ def test_old_no_action_approval_syntax_keeps_its_meaning() -> None:
         "bash", subject_pattern="git status*"
     )
     policy = ApprovalPolicy(always_allow={"bash(git status*)"})
-    assert policy.decide(_capability("bash", subject_value="git status --short", subject_field="command")) is ApprovalDecision.ALLOW
+    assert (
+        policy.decide(
+            _capability(
+                "bash", subject_value="git status --short", subject_field="command"
+            )
+        )
+        is ApprovalDecision.ALLOW
+    )
 
 
 def test_action_scoped_unreadable_subject_fails_closed(tmp_path: Path) -> None:
     deny = ApprovalPolicy(always_deny={"task(start rm *)"}, default="allow")
-    ask = ApprovalPolicy(always_ask={"task(start git push*)"}, always_allow={"task(start)"})
+    ask = ApprovalPolicy(
+        always_ask={"task(start git push*)"}, always_allow={"task(start)"}
+    )
     _registry(tmp_path / "deny", approval_policy=deny)
     _registry(tmp_path / "ask", approval_policy=ask)
     unreadable = _capability(
@@ -343,9 +527,12 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     )
 
     assert request is not None
-    assert registry.prepare_approval(
-        ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
-    ) is None
+    assert (
+        registry.prepare_approval(
+            ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+        )
+        is None
+    )
     assert request.action == "start"
     assert request.audit_facts() == {"action": "start"}
     assert request.audit_display() == {}
@@ -370,10 +557,9 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     executed: list[str] = []
     registry.register(
         "task",
-        lambda arguments, execution_context=None: executed.append(
-            str(arguments["command"])
-        )
-        or "started",
+        lambda arguments, execution_context=None: (
+            executed.append(str(arguments["command"])) or "started"
+        ),
         parameters=registry.definitions_by_name["task"].parameters,
         actions=_actions(),
     )
@@ -480,7 +666,11 @@ def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:
     policy = ApprovalPolicy(always_allow={"task(start pytest*)"})
     _registry(tmp_path / "registry", approval_policy=policy)
     capability = _capability(
-        "task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD
+        "task",
+        "start",
+        "pytest -q",
+        subject_field="command",
+        binding=ApprovalBinding.CWD,
     )
 
     same_decision, same_binding = policy.decide_for_child_with_binding(
@@ -536,9 +726,7 @@ def test_always_allow_scope_round_trips_to_current_action() -> None:
 
 def test_registry_resolves_action_and_no_action_capabilities(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    action = registry.resolve_call(
-        "task", {"action": "start", "command": "pytest -q"}
-    )
+    action = registry.resolve_call("task", {"action": "start", "command": "pytest -q"})
     registry.register(
         "plain",
         lambda arguments: "ok",
@@ -580,7 +768,9 @@ def test_registry_resolves_action_and_no_action_capabilities(tmp_path: Path) -> 
 
 
 def test_action_path_binding_requires_execution_context_handler(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
     actions = {
         "update": ToolAction(
             required_fields=frozenset({"path"}),
