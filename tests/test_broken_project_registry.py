@@ -419,22 +419,49 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
             held_close_projection,
         )
         await _collect_turn(closing_app.loop, "close")
-        close_task = asyncio.create_task(closing_app.close())
+        close_task = asyncio.create_task(
+            closing_app.close(), name="closing_app.close()"
+        )
         assert await asyncio.wait_for(
             asyncio.to_thread(close_read_entered.wait, 30), timeout=35
         )
         # test-contract: seam Prove close joins the held projection read.
         assert not close_task.done()
         close_read_release.set()
-        await asyncio.wait_for(asyncio.shield(close_task), timeout=30)
+        await _drain(close_task, 30)
     finally:
         prepare_release.set()
         close_read_release.set()
         if close_task is not None:
-            await asyncio.wait_for(asyncio.shield(close_task), timeout=30)
+            await _drain(close_task, 30)
         elif closing_app is not None:
-            await closing_app.close()
-        await app.close()
+            await _drain(
+                asyncio.create_task(
+                    closing_app.close(), name="closing_app.close()"
+                ),
+                30,
+            )
+        await _drain(asyncio.create_task(app.close(), name="app.close()"), 30)
+
+
+async def _drain(task: asyncio.Task[Any], timeout: float) -> None:
+    if task.cancelled():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except TimeoutError as exc:
+        if task.done():
+            task.result()
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), timeout=timeout
+            )
+        except TimeoutError as cancel_exc:
+            raise AssertionError(
+                f"{task.get_name()} hung after test cleanup cancellation"
+            ) from cancel_exc
+        raise AssertionError(f"{task.get_name()} hung during test cleanup") from exc
 
 
 async def _collect_turn(loop: Any, text: str) -> None:
