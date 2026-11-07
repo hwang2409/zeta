@@ -580,7 +580,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             event = signal.event
             if event is None:
                 continue
-            if event.type is StreamEventType.MESSAGE_END:
+            terminal_event = event.type is StreamEventType.MESSAGE_END and not (
+                event.data.get("truncated") is True
+                and event.data.get("stop_reason") != "max_tokens"
+            )
+            if terminal_event:
                 self._attempt_completed = True
                 self._attempt_truncated = event.data.get("truncated") is True
                 stop_reason = event.data.get("stop_reason")
@@ -595,26 +599,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 await self._finish_attempt(event.error)
                 if retry:
                     continue
+                self._closed = True
             self._observe(event)
+            if terminal_event:
+                await self._finish_attempt()
+                self._closed = True
             return event
-
-    async def _finish_completed_attempt(self) -> bool:
-        assert self._attempt is not None
-        try:
-            while True:
-                signal = await self._read_signal(self._attempt)
-                if signal.event is not None:
-                    raise RuntimeError("provider event followed completion")
-        except StopAsyncIteration:
-            await self._finish_attempt()
-            return False
-        except BaseException as error:
-            retryable_eof = self._attempt_truncated and self._attempt_stop_reason != "max_tokens"
-            retry = await self._retry(error) if retryable_eof else False
-            await self._finish_attempt(error)
-            if retry:
-                return True
-            raise
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
