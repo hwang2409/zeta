@@ -33,6 +33,7 @@ from .approval_lifecycle import (
     ApprovalKey,
     ApprovalLifecycle,
     BeginGrace,
+    Cancel,
     Decide,
     Expire,
     ExternalEnd,
@@ -421,6 +422,19 @@ class ServeControl:
             )
 
     def request_approval_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None = None,
+        reason: str = "turn_canceled",
+    ) -> Awaitable[object]:
+        return asyncio.create_task(
+            self._approvals.transition(
+                Cancel(request_id, child_instance_id, reason)
+            )
+        )
+
+    def request_approval_abort_gate(
         self,
         request_id: str,
         *,

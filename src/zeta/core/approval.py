@@ -303,7 +303,7 @@ class ApprovalAbortPolicy(Protocol):
 
 
 class _ServeApprovalControl(Protocol):
-    def request_approval_abort(
+    def request_approval_abort_gate(
         self,
         request_id: str,
         *,
@@ -370,7 +370,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> Awaitable[dict[str, str] | None] | None:
         if self._serve_control is None:
             return None
-        return self._serve_control.request_approval_abort(
+        return self._serve_control.request_approval_abort_gate(
             request_id,
             child_instance_id=child_instance_id,
             reason=reason,
