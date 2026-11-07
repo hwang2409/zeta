@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -13,7 +14,43 @@ if TYPE_CHECKING:
 
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationStore, TranscriptLoadError
+from ..core.transcript_recovery import RepairResult, RepairTarget
 from ..protocol.types import ToolResult
+
+
+def transcript_recovery_notification_id(
+    target: RepairTarget, quarantine_id: str
+) -> str:
+    """Return a stable child-instance key for one committed quarantine."""
+    child = target.child_run_id or "root"
+    digest = hashlib.sha256(
+        f"{target.root_session_id}\0{child}\0{quarantine_id}".encode()
+    ).hexdigest()[:32]
+    return f"transcript-unavailable:{digest}"
+
+
+def append_transcript_recovery_notification(
+    parent_store: ConversationStore,
+    result: RepairResult,
+    *,
+    child_session_path: str,
+) -> tuple[object, bool]:
+    """Append one durable parent notice, deduplicated by quarantine identity."""
+    if result.target.child_run_id is None:
+        raise ValueError("child target required")
+    notification_id = transcript_recovery_notification_id(
+        result.target, result.quarantine_id
+    )
+    return parent_store.append_agent_notification_if_absent(
+        notification_id,
+        child_session_path=child_session_path,
+        description="transcript recovery",
+        status="error",
+        text=(
+            f"child transcript repaired; quarantine {result.quarantine_id}; "
+            "reopen the child to continue"
+        ),
+    )
 
 
 class AgentLoopForRecovery(Protocol):
