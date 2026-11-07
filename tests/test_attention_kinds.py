@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
+from zeta import storage_format
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.skills import SkillCatalog
@@ -120,7 +121,7 @@ def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(
         ValueError,
-        match="zeta storage-format advance --expected-epoch 2 --target-epoch 4",
+        match=rf"zeta storage-format advance --expected-epoch 2 --target-epoch {storage_format.WRITER_EPOCH}",
     ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()
