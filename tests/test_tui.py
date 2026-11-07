@@ -65,11 +65,18 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.tui_render import render_full_screen as _render_full_screen
-from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from zeta.accounts import (
+    AccountError,
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    SessionAccountContext,
+)
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
+from zeta.core.login_flow import LoginError, LoginPortInUseError
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.slash import budget_for_model
@@ -13810,6 +13817,62 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     finally:
         await app.close()
         opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (
+            AccountError("a login for this provider is already in progress"),
+            (
+                "login failed: a login for this provider is already in progress; "
+                "close the other login and retry"
+            ),
+        ),
+        (
+            OSError("browser launch failed with secret-token"),
+            (
+                "login failed: local login setup failed; check browser and account "
+                "storage access, then retry"
+            ),
+        ),
+        (
+            LoginPortInUseError("codex", 1455),
+            (
+                "login failed: port 1455 is already in use for codex login — close "
+                "any other Codex login and retry"
+            ),
+        ),
+        (
+            LoginError("OAuth provider returned access_denied: secret-token"),
+            (
+                "login failed: the provider rejected the login or returned an "
+                "invalid callback; retry in a new browser window"
+            ),
+        ),
+    ],
+)
+async def test_tui_login_failure_has_safe_cause_and_recovery(
+    failure: Exception,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = object.__new__(slash_handlers_module.SlashHandlerMixin)
+    handler.loop = SimpleNamespace(
+        account_context=SimpleNamespace(home=tmp_path / "home")
+    )
+
+    def fail_login(*_args: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(slash_handlers_module, "login_named_account", fail_login)
+
+    result = await handler.slash_accounts("login codex work")
+
+    assert result == message
+    assert "secret-token" not in result
 
 
 @pytest.mark.asyncio

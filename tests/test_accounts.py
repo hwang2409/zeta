@@ -39,7 +39,7 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.agent.runner import resolve_child_backend
-from zeta.core.login_flow import LoginPublicationError
+from zeta.core.login_flow import LoginError, LoginPortInUseError, LoginPublicationError
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -836,6 +836,57 @@ def test_cli_login_decision_expiry_shows_safe_message(
     assert capsys.readouterr().err == (
         "login failed: Login could not be saved; try again.\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (
+            AccountError("a login for this provider is already in progress"),
+            (
+                "login failed: a login for this provider is already in progress; "
+                "close the other login and retry"
+            ),
+        ),
+        (
+            OSError("browser launch failed with secret-token"),
+            (
+                "login failed: local login setup failed; check browser and account "
+                "storage access, then retry"
+            ),
+        ),
+        (
+            LoginPortInUseError("codex", 1455),
+            (
+                "login failed: port 1455 is already in use for codex login — close "
+                "any other Codex login and retry"
+            ),
+        ),
+        (
+            LoginError("OAuth provider returned access_denied: secret-token"),
+            (
+                "login failed: the provider rejected the login or returned an "
+                "invalid callback; retry in a new browser window"
+            ),
+        ),
+    ],
+)
+def test_cli_login_failure_has_safe_cause_and_recovery(
+    failure: Exception,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_login(*_args: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(cli_main, "_run_login", fail_login)
+    args = SimpleNamespace(provider="codex", account="work", replace=False)
+
+    assert cli_main._handle_login(args) == 1
+    stderr = capsys.readouterr().err
+    assert stderr == f"{message}\n"
+    assert "secret-token" not in stderr
 
 
 def test_accounts_list_shows_migrated_legacy_login(
