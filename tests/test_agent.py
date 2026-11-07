@@ -1123,28 +1123,6 @@ async def test_owned_work_terminal_outcomes_drain_without_model(
 
 
 @pytest.mark.asyncio
-async def test_owned_work_deadlines_transfer_then_kill_before_terminal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    await test_child_finish_gate_model_bound_waits_for_grandchild(
-        tmp_path / "model"
-    )
-    await test_child_finish_gate_wait_timeout_adopts(
-        tmp_path / "transfer", monkeypatch
-    )
-    lifecycle_path = next(
-        (tmp_path / "transfer").glob("*/agents/1/agent_lifecycle.json")
-    )
-    child_store = ConversationStore(lifecycle_path.parent.parent, session_id="1")
-    assert child_store.agent_lifecycle()["final_result_is_receipt"] is True
-    child_store.close()
-    monkeypatch.undo()
-    await test_finish_gate_task_without_exit_reports_safety_bound(
-        tmp_path / "kill", monkeypatch
-    )
-
-
-@pytest.mark.asyncio
 async def test_background_completion_truncates_long_killed_task_id(
     tmp_path: Path,
 ) -> None:
@@ -4100,6 +4078,12 @@ async def test_child_finish_gate_wait_timeout_adopts(
     receipt = store.tool_result("child")
     assert receipt is not None
     assert "premature child answer" in receipt.content
+    lifecycle_path = next(tmp_path.glob("*/agents/1/agent_lifecycle.json"))
+    child_store = ConversationStore(lifecycle_path.parent.parent, session_id="1")
+    try:
+        assert child_store.agent_lifecycle()["final_result_is_receipt"] is True
+    finally:
+        child_store.close()
     await loop.close()
 
 
