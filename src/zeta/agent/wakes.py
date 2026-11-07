@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from ..protocol.types import Message, harness_notice
+
 WakeSessionClass = Literal["top_level", "parent_owned"]
 WakeState = Literal["scheduled", "due", "passive"]
 WakePassiveReason = Literal[
@@ -201,6 +203,13 @@ class WakeScheduler:
             ),
         )
 
+    def has_due(self) -> bool:
+        """Return whether any wake presentation is ready without changing state."""
+
+        self._require_open()
+        now = _utc(self._wall_clock())
+        return any(record.due_at_utc <= now for record in self._records.values())
+
     def poll_due(self) -> bool:
         """Mark elapsed records due and report whether idle activation is needed."""
 
@@ -227,7 +236,7 @@ class WakeScheduler:
         """Close one due cohort at the idle admission seam."""
 
         self._require_open()
-        self._assert_owned()
+        self.poll_due()
         now = _utc(self._wall_clock())
         passive = tuple(
             sorted(
@@ -277,6 +286,20 @@ class WakeScheduler:
         if admission is None and not passive:
             return None
         return WakeActivation(admission=admission, passive=passive)
+
+    def restore_activation(self, activation: WakeActivation) -> None:
+        """Restore an admitted cohort when dispatch is canceled before it starts."""
+
+        self._require_open()
+        self._assert_owned()
+        if activation.admission is not None:
+            for record in activation.admission.records:
+                self._records[record.wake_id] = replace(record, state="due")
+            self._admission_count -= 1
+        for record in activation.passive:
+            self._records[record.wake_id] = record
+        self._due_notified = False
+        self._signal_changed()
 
     def consume_due_passive(self) -> tuple[WakeRecord, ...]:
         self._require_open()
@@ -385,6 +408,34 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("wake clock must return a timezone-aware datetime")
     return value.astimezone(UTC)
+
+
+def wake_notice(activation: WakeActivation) -> Message:
+    """Build the production harness notice for one closed wake cohort."""
+
+    admitted = activation.admission.records if activation.admission is not None else ()
+    records = admitted + activation.passive
+    lines = [
+        f"- {record.note} (wake_id: {record.wake_id}"
+        f"{f', passive reason: {record.passive_reason}' if record.passive_reason else ''})"
+        for record in records
+    ]
+    return harness_notice(
+        "wake reminder",
+        "scheduled reminders are due:\n" + "\n".join(lines),
+        event="wake",
+        metadata={
+            "admission_id": (
+                activation.admission.admission_id
+                if activation.admission is not None
+                else None
+            ),
+            "wake_ids": [record.wake_id for record in records],
+            "scheduled_at": [record.scheduled_at_utc.isoformat() for record in records],
+            "due_at": [record.due_at_utc.isoformat() for record in records],
+            "admission_reason": "scheduled_due",
+        },
+    )
 
 
 def _validate_delay(value: float) -> float:

@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.wakes import (
     MAX_PARENT_ADMISSIONS_PER_PROCESS,
     MAX_PENDING_WAKES,
+    MAX_WAKE_RUN_COMPLETIONS,
     WakeAdmission,
     WakeScheduler,
 )
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import MessageOrigin, ToolCall
+from zeta.protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+)
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.wake import register_wake
+from zeta.tui.app import TUIApp
 
 
 class Clock:
@@ -43,6 +56,16 @@ class Ids:
 
 async def _execute(registry: ToolRegistry, call: ToolCall) -> dict[str, object]:
     return await asyncio.wait_for(registry.execute(call), timeout=10)
+
+
+async def _collect(stream: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
+    async def consume() -> list[StreamEvent]:
+        return [event async for event in stream]
+
+    try:
+        return await asyncio.wait_for(consume(), timeout=10)
+    finally:
+        await asyncio.wait_for(stream.aclose(), timeout=10)
 
 
 async def _close_scheduler(
@@ -298,6 +321,155 @@ async def test_timer_rechecks_utc_after_one_sixty_second_slice() -> None:
     finally:
         release_wait.set()
         await _close_scheduler(scheduler)
+
+
+@pytest.mark.asyncio
+async def test_due_wake_runs_through_production_harness_notice_path(
+    tmp_path: Path,
+) -> None:
+    """Mutation: pass the wake as user-role input; the role assertion fails."""
+
+    backend = FakeBackend([ScriptedTurn([TextContent("reminder handled")])])
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    old_scheduler = loop.wake_scheduler
+    assert old_scheduler is not None
+    await asyncio.wait_for(old_scheduler.close(), timeout=10)
+    clock = Clock()
+    scheduler = _scheduler("top_level", clock)
+    loop.wake_scheduler = scheduler
+    try:
+        scheduled = scheduler.schedule(after_seconds=10, note="check staging")
+        clock.advance(10)
+
+        notice = loop.notification_system_message()
+        assert notice is not None
+        assert notice.role is MessageRole.SYSTEM
+        assert (
+            notice.metadata[MESSAGE_ORIGIN_METADATA]
+            == MessageOrigin.HARNESS_NUDGE.value
+        )
+        assert notice.metadata["zeta_event"] == "wake"
+        assert notice.metadata["wake_ids"] == [scheduled.record.wake_id]
+        assert loop.schedule_notification_turn()
+
+        await _collect(loop.run_notification_turn())
+
+        assert len(backend.calls) == 1
+        delivered = next(
+            message
+            for message in backend.calls[0][0]
+            if message.metadata.get("zeta_event") == "wake"
+        )
+        assert delivered.role is MessageRole.SYSTEM
+        assert (
+            delivered.metadata[MESSAGE_ORIGIN_METADATA]
+            == MessageOrigin.HARNESS_NUDGE.value
+        )
+        assert all(
+            message.role is not MessageRole.USER for message in backend.calls[0][0]
+        )
+
+        output = StringIO()
+        app = TUIApp(
+            loop,
+            provider="codex",
+            model="offline",
+            console=Console(file=output, force_terminal=False),
+        )
+        app._rebuild_transcript()
+        assert "[zeta] wake reminder:" in output.getvalue()
+    finally:
+        try:
+            await asyncio.wait_for(loop.close(), timeout=10)
+        finally:
+            store.close()
+
+
+@pytest.mark.asyncio
+async def test_passive_wake_is_presented_without_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Mutation: dispatch passive due wakes to the provider; the call assertion fails."""
+
+    backend = FakeBackend([ScriptedTurn([TextContent("ordinary reply")])])
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    old_scheduler = loop.wake_scheduler
+    assert old_scheduler is not None
+    await asyncio.wait_for(old_scheduler.close(), timeout=10)
+    clock = Clock()
+    scheduler = _scheduler("top_level", clock)
+    loop.wake_scheduler = scheduler
+    try:
+        roots = [
+            scheduler.schedule(after_seconds=10, note=f"root {index}")
+            for index in range(8)
+        ]
+        scheduler.cancel(roots[0].record.wake_id)
+        passive = scheduler.schedule(after_seconds=10, note="passive reminder")
+        assert passive.autonomous is False
+        for root in roots[1:]:
+            scheduler.cancel(root.record.wake_id)
+        clock.advance(10)
+
+        notice = loop.notification_system_message()
+        assert notice is not None
+        assert loop.schedule_notification_turn()
+        events = await _collect(loop.run_notification_turn())
+
+        assert backend.calls == []
+        presented = next(
+            event.message
+            for event in events
+            if event.type is StreamEventType.MESSAGE_END
+        )
+        assert presented is not None
+        assert presented.role is MessageRole.SYSTEM
+        assert presented.metadata["zeta_event"] == "wake"
+        assert "passive reason: top_level_chain_limit" in presented.content[0].text
+    finally:
+        try:
+            await asyncio.wait_for(loop.close(), timeout=10)
+        finally:
+            store.close()
+
+
+@pytest.mark.asyncio
+async def test_wake_run_stops_after_eight_provider_completions(tmp_path: Path) -> None:
+    """Mutation: raise the wake completion cap; the call-count assertion fails."""
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(f"todo-{index}", "todo", {"items": []})])
+            for index in range(MAX_WAKE_RUN_COMPLETIONS + 1)
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    old_scheduler = loop.wake_scheduler
+    assert old_scheduler is not None
+    await asyncio.wait_for(old_scheduler.close(), timeout=10)
+    clock = Clock()
+    scheduler = _scheduler("top_level", clock)
+    loop.wake_scheduler = scheduler
+    try:
+        scheduler.schedule(after_seconds=10, note="bounded run")
+        clock.advance(10)
+        assert loop.notification_system_message() is not None
+        assert loop.schedule_notification_turn()
+
+        events = await _collect(loop.run_notification_turn())
+
+        assert len(backend.calls) == MAX_WAKE_RUN_COMPLETIONS
+        assert events[-2].error is not None
+        assert events[-2].error.code == "max_turns"
+        assert events[-2].error.message.endswith(": 8")
+    finally:
+        try:
+            await asyncio.wait_for(loop.close(), timeout=10)
+        finally:
+            store.close()
 
 
 @pytest.mark.asyncio

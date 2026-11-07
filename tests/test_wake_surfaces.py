@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 
+from zeta.agent.wakes import WakeActivation, WakeRecord, wake_notice
 from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
 from zeta.server.control import ServeControl
 from zeta.tui.render import render_event
@@ -145,8 +147,35 @@ async def test_serve_real_event_path_maps_wake_tool_with_negotiated_fidelity() -
             tool_result=result,
         )
     )
+    scheduled_at = datetime(2026, 1, 1, tzinfo=UTC)
+    notice = wake_notice(
+        WakeActivation(
+            passive=(
+                WakeRecord(
+                    wake_id="wake_1",
+                    note="retry deploy",
+                    scheduled_at_utc=scheduled_at,
+                    due_at_utc=scheduled_at,
+                    session_class="top_level",
+                    chain_id="chain_1",
+                    generation=3,
+                    state="passive",
+                    passive_reason="top_level_chain_limit",
+                ),
+            )
+        )
+    )
+    await control._event(
+        StreamEvent(StreamEventType.MESSAGE_END, message=notice),
+        session_id="session",
+        background=True,
+    )
 
-    assert [item[0] for item in published] == ["tool_start", "tool_end"]
+    assert [item[0] for item in published] == [
+        "tool_start",
+        "tool_end",
+        "assistant_message",
+    ]
     assert published[0][2]["tool_call"] == {
         "id": "wake-limit",
         "name": "wake",
@@ -161,3 +190,7 @@ async def test_serve_real_event_path_maps_wake_tool_with_negotiated_fidelity() -
         "reason": "top_level_chain_limit",
     }
     assert wire_result["structured_content_truncated"] is None
+    wire_notice = published[2][2]["message"]
+    assert isinstance(wire_notice, dict)
+    assert wire_notice["role"] == "system"
+    assert wire_notice["content"][0]["text"].startswith("[zeta] wake reminder:")
