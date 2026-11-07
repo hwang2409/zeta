@@ -6,6 +6,7 @@ import ast
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -727,6 +728,21 @@ def _transfer_is_immediate(
     return True
 
 
+def _propagated_resources(
+    call: ast.Call,
+    transfers: list[tuple[str, ResourceOpen]],
+    parents: dict[ast.AST, ast.AST],
+) -> list[ResourceOpen]:
+    called_name = _name(call.func).rsplit(".", 1)[-1]
+    return [
+        ResourceOpen(
+            _bound_name(call, parents), resource.kind, resource.owner_call, call
+        )
+        for helper_name, resource in transfers
+        if helper_name == called_name
+    ]
+
+
 def _resource_flow(
     tree: ast.AST, parents: dict[ast.AST, ast.AST]
 ) -> list[ResourceOpen]:
@@ -742,14 +758,7 @@ def _resource_flow(
         and _returned_at(resource, parents) is not None
     ]
     for call in [node for node in ast.walk(tree) if isinstance(node, ast.Call)]:
-        called_name = _name(call.func).rsplit(".", 1)[-1]
-        records.extend(
-            ResourceOpen(
-                _bound_name(call, parents), resource.kind, resource.owner_call, call
-            )
-            for helper_name, resource in transfers
-            if helper_name == called_name
-        )
+        records.extend(_propagated_resources(call, transfers, parents))
     return list(dict.fromkeys(records))
 
 
@@ -818,6 +827,19 @@ def _resource_owner_names(
     }
 
 
+def _nested_call(
+    resource: ResourceOpen,
+    parents: dict[ast.AST, ast.AST],
+    matches: Callable[[ast.Call], bool],
+) -> bool:
+    for node in _enclosing_nodes(resource.node, parents):
+        if isinstance(node, ast.stmt):
+            return False
+        if isinstance(node, ast.Call) and matches(node):
+            return True
+    return False
+
+
 def _registered_with_owner(
     resource: ResourceOpen,
     owner_names: dict[ast.AST, set[str]],
@@ -826,27 +848,22 @@ def _registered_with_owner(
     expected = {"store": "store", "async resource": "async_resource", "task": "task"}
     if resource.kind not in expected:
         terminal = {"app": "owned_app", "process": "owned_child_process"}[resource.kind]
-        return any(
-            isinstance(node, ast.Call)
-            and _name(node.func).rsplit(".", 1)[-1] == terminal
-            for node in _enclosing_nodes(resource.node, parents)
-            if not isinstance(node, ast.stmt)
+        return _nested_call(
+            resource,
+            parents,
+            lambda call: _name(call.func).rsplit(".", 1)[-1] == terminal,
         )
     function = _enclosing_function(resource.node, parents)
-    if function is None:
-        return False
-    owners = owner_names.get(function, set())
-    for node in _enclosing_nodes(resource.node, parents):
-        if isinstance(node, ast.stmt):
-            break
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if (
-            node.func.attr == expected[resource.kind]
-            and _name(node.func.value) in owners
-        ):
-            return True
-    return False
+    owners = owner_names.get(function, set()) if function is not None else set()
+    return _nested_call(
+        resource,
+        parents,
+        lambda call: (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == expected[resource.kind]
+            and _name(call.func.value) in owners
+        ),
+    )
 
 
 def _is_cleanup_call(node: ast.Call, kind: str, bound_name: str) -> bool:
@@ -935,6 +952,24 @@ def _cannot_raise_or_await(statement: ast.stmt) -> bool:
     return False
 
 
+def _following_try_cleans(
+    resource: ResourceOpen,
+    open_statement: ast.stmt,
+    statements: list[ast.stmt],
+    index: int,
+) -> bool:
+    for candidate_index in range(index + 1, len(statements)):
+        candidate = statements[candidate_index]
+        between = statements[index + 1 : candidate_index]
+        if isinstance(candidate, ast.Try):
+            return all(_cannot_raise_or_await(item) for item in between) and (
+                _try_cleans_resource(resource, candidate, open_statement)
+            )
+        if not _cannot_raise_or_await(candidate):
+            return False
+    return False
+
+
 def _cleaned_in_finally(
     resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
 ) -> bool:
@@ -953,16 +988,7 @@ def _cleaned_in_finally(
     if block is None:
         return False
     statements, index = block
-    for candidate_index in range(index + 1, len(statements)):
-        candidate = statements[candidate_index]
-        between = statements[index + 1 : candidate_index]
-        if isinstance(candidate, ast.Try):
-            return all(_cannot_raise_or_await(item) for item in between) and (
-                _try_cleans_resource(resource, candidate, open_statement)
-            )
-        if not _cannot_raise_or_await(candidate):
-            return False
-    return False
+    return _following_try_cleans(resource, open_statement, statements, index)
 
 
 def _await_drains(value: ast.AST, name: str) -> bool:
@@ -1071,6 +1097,33 @@ def _used_as_context_manager(
     return False
 
 
+def _registered_cancellation_owners(
+    callback: ast.FunctionDef | ast.AsyncFunctionDef,
+    outer: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    return {
+        _name(node.func.value)
+        for node in ast.walk(outer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "register"
+        and any(
+            isinstance(argument, ast.Name) and argument.id == callback.name
+            for argument in node.args
+        )
+    }
+
+
+def _owner_cancels(outer: ast.AST, owners: set[str]) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cancel_and_wait"
+        and _name(node.func.value) in owners
+        for node in ast.walk(outer)
+    )
+
+
 def _transferred_to_cancellation_owner(
     resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
 ) -> bool:
@@ -1090,23 +1143,7 @@ def _transferred_to_cancellation_owner(
     )
     if not inside_request:
         return False
-    owners = {
-        _name(node.func.value)
-        for node in ast.walk(outer)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "register"
-        and any(
-            isinstance(arg, ast.Name) and arg.id == callback.name for arg in node.args
-        )
-    }
-    return any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "cancel_and_wait"
-        and _name(node.func.value) in owners
-        for node in ast.walk(outer)
-    )
+    return _owner_cancels(outer, _registered_cancellation_owners(callback, outer))
 
 
 def _returned_by_helper(
@@ -1226,6 +1263,34 @@ def _scan_deadline_nodes(
     ]
 
 
+def _changed_cleanup_records(
+    records: list[ResourceOpen],
+    changed_function_nodes: list[ast.AST],
+    parents: dict[ast.AST, ast.AST],
+) -> list[ResourceOpen]:
+    changed_functions = {
+        _enclosing_function(node, parents) for node in changed_function_nodes
+    }
+    changed_calls = {
+        node for node in changed_function_nodes if isinstance(node, ast.Call)
+    }
+    selected = [
+        resource
+        for resource in records
+        if _enclosing_function(resource.node, parents) in changed_functions
+        or resource.node in changed_calls
+    ]
+    called_helpers = {_name(call.func).rsplit(".", 1)[-1] for call in changed_calls}
+    selected.extend(
+        resource
+        for resource in records
+        if (function := _enclosing_function(resource.node, parents)) is not None
+        and function.name in called_helpers
+        and not _returned_by_helper(resource, parents)
+    )
+    return selected
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -1261,26 +1326,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     )
     findings.extend(_scan_deadline_nodes(path, changed_function_nodes, lines, parents))
     records = _resource_flow(tree, parents)
-    changed_functions = {
-        _enclosing_function(node, parents) for node in changed_function_nodes
-    }
-    changed_calls = {
-        node for node in changed_function_nodes if isinstance(node, ast.Call)
-    }
-    cleanup_records = [
-        resource
-        for resource in records
-        if _enclosing_function(resource.node, parents) in changed_functions
-        or resource.node in changed_calls
-    ]
-    called_helpers = {_name(call.func).rsplit(".", 1)[-1] for call in changed_calls}
-    cleanup_records.extend(
-        resource
-        for resource in records
-        if (function := _enclosing_function(resource.node, parents)) is not None
-        and function.name in called_helpers
-        and not _returned_by_helper(resource, parents)
-    )
+    cleanup_records = _changed_cleanup_records(records, changed_function_nodes, parents)
     findings.extend(_cleanup_findings(path, tree, parents, cleanup_records))
     return sorted(
         set(findings),
