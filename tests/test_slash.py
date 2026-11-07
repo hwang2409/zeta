@@ -1209,9 +1209,22 @@ async def test_mcp_command_dispatches_status_and_reconnect() -> None:
 @pytest.mark.asyncio
 async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
-    output = StringIO()
+    status_rendered = asyncio.Event()
+
+    class StatusOutput(StringIO):
+        def write(self, value: str) -> int:
+            written = super().write(value)
+            if "session_id:" in self.getvalue():
+                status_rendered.set()
+            return written
+
+    output = StatusOutput()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -1230,10 +1243,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
         )
         run_task = asyncio.create_task(app.run(prompt))
         pipe.send_text("/status\r")
-        for _ in range(100):
-            if "session_id:" in output.getvalue():
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(status_rendered.wait(), 5)
         pipe.send_text("\x04")
         await run_task
 

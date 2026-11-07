@@ -282,9 +282,11 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
         async def nothing(*args: object, **kwargs: object) -> None:
             return None
 
+        prompt_preparation = asyncio.Event()
+
         async def prepare_prompt(*, resume_ui: bool) -> bool:
             del resume_ui
-            await asyncio.sleep(10)
+            await prompt_preparation.wait()
             return True
 
         session = object.__new__(FullScreenPromptSession)
