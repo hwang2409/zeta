@@ -234,9 +234,7 @@ def test_fd_guard_counts_only_reachable_owners(tmp_path: Path, reachable: bool) 
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_first(): pass\n"
-        "def test_second(): pass\n"
-        "def test_third(): pass\n",
+        "def test_first(): pass\ndef test_second(): pass\ndef test_third(): pass\n",
         encoding="utf-8",
     )
 
