@@ -338,4 +338,3 @@ class SlashCommandRegistry:
             description = f" — {skill.description}" if skill.description else ""
             lines.append(f"  /{skill.name}{description} (source: {skill.path})")
         return "\n".join(lines)
-
