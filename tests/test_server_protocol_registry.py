@@ -511,3 +511,36 @@ def test_structured_error_frames_match_origin_main_bytes() -> None:
     }
     for descriptor, message, fields, origin_main_frame in STRUCTURED_ERROR_FIXTURES:
         assert codec.error_response(7, descriptor, message, fields) == origin_main_frame
+
+
+def test_merged_protocol_values_match_origin_main_bytes() -> None:
+    codec = FrameCodec()
+    assert codec.response(
+        7,
+        {
+            "history": [
+                {
+                    "id": "row1",
+                    "role": "system",
+                    "event": EventDescriptor.SERVED_TURN_END,
+                    "data": {"turn_id": "turn1", "reason": "completed"},
+                }
+            ]
+        },
+    ) == b'{"jsonrpc":"2.0","id":7,"result":{"history":[{"id":"row1","role":"system","event":"served_turn_end","data":{"turn_id":"turn1","reason":"completed"}}]}}\n'
+    assert codec.response(
+        7,
+        {
+            "kind": SlashResultKindDescriptor.TEXT,
+            "text": "credential error",
+            "credential_store_error": {
+                "code": SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE,
+                "reason": "invalid_json",
+                "server": "live",
+                "credential_file": "/home/.zeta/mcp-oauth.json",
+                "operation": "load",
+                "recovery": "move_aside_then_auth",
+                "text": "credential error",
+            },
+        },
+    ) == b'{"jsonrpc":"2.0","id":7,"result":{"kind":"text","text":"credential error","credential_store_error":{"code":"mcp_credential_store","reason":"invalid_json","server":"live","credential_file":"/home/.zeta/mcp-oauth.json","operation":"load","recovery":"move_aside_then_auth","text":"credential error"}}}\n'
