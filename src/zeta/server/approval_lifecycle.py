@@ -811,7 +811,8 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
-                await asyncio.shield(self._finish_record(record, synthetic))
+                owner = asyncio.create_task(self._finish_record(record, synthetic))
+                self._change(record, publication_owner=owner)
                 return synthetic
             if owns_record:
                 await self._report_persistence_failure(
@@ -826,7 +827,8 @@ class ApprovalLifecycle:
             policy = self._policy()
             if policy is not None:
                 policy.remember_allow(grant)
-        await self._finish_record(record, resolution)
+        owner = asyncio.create_task(self._finish_record(record, resolution))
+        self._change(record, publication_owner=owner)
         return resolution
 
     def request_approval_abort(
@@ -991,7 +993,7 @@ class ApprovalLifecycle:
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
         current = self._state.records.get(record.target.key)
-        if current is None or current.token != record.token:
+        if current is None or current.token != record.token or current.live_end is not None:
             return
         owner = asyncio.current_task()
         assert owner is not None
@@ -1210,11 +1212,12 @@ class ApprovalLifecycle:
             )
             if resolution is None:
                 continue
-            if record.publication_owner is not None and not record.publication_owner.done():
-                asyncio.create_task(self._finish_record(record, resolution))
-            else:
-                owner = asyncio.create_task(self._finish_record(record, resolution))
-                self._change(record, publication_owner=owner)
+            if record.publication_owner is not None:
+                if not record.publication_owner.done():
+                    asyncio.create_task(self._finish_record(record, resolution))
+                continue
+            owner = asyncio.create_task(self._finish_record(record, resolution))
+            self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(
         self,
