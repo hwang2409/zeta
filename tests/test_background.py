@@ -27,6 +27,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import (
+    kill_group_if_present,
     read_pid_file,
     wait_for_path_command,
     wait_pid_exited,
@@ -2361,8 +2362,8 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
             await asyncio.wait_for(
                 asyncio.gather(killing, return_exceptions=True), 10
             )
-        if child_pid is not None and _group_exists(child_pid):
-            os.killpg(child_pid, signal.SIGKILL)
+        if child_pid is not None:
+            kill_group_if_present(child_pid)
         await tasks.close()
 
 
@@ -2378,13 +2379,13 @@ async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
 
     async def pause_close_stdin(record: _BackgroundRecord) -> None:
         shutdown_started.set()
-        await release_shutdown.wait()
+        await asyncio.wait_for(release_shutdown.wait(), 10)
         await original_close_stdin(record)
 
     monkeypatch.setattr(tasks, "_close_stdin", pause_close_stdin)
     closing = asyncio.create_task(tasks.close())
     try:
-        await shutdown_started.wait()
+        await asyncio.wait_for(shutdown_started.wait(), 10)
         with pytest.raises(RuntimeError, match="registry is closing"):
             await tasks.start("sleep 30", tmp_path)
         with pytest.raises(RuntimeError, match="registry is closing"):
@@ -2397,14 +2398,15 @@ async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
             os.close(directory_fd)
 
         release_shutdown.set()
-        await closing
+        await asyncio.wait_for(closing, 10)
         assert all(not _group_exists(record.pid) for record in tasks.records)
     finally:
         release_shutdown.set()
-        await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(closing, return_exceptions=True), 10
+        )
         for record in tasks.records:
-            if _group_exists(record.pid):
-                os.killpg(record.pid, signal.SIGKILL)
+            kill_group_if_present(record.pid)
 
 
 def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
@@ -2425,6 +2427,7 @@ import threading
 import time
 
 from zeta.tools._shared import background_spawn as spawn_module
+from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
@@ -2470,8 +2473,7 @@ async def main():
 tasks, pid = asyncio.run(main())
 alive = process_module._group_exists(pid)
 closed = tasks._closed
-if original_group_exists(pid):
-    os.killpg(pid, signal.SIGKILL)
+kill_group_if_present(pid)
 print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
 raise SystemExit(1 if alive or not closed else 0)
 """,
@@ -2510,18 +2512,17 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
     monkeypatch.setattr(spawn_module, "_signal_group", signal_group)
     try:
         closing = asyncio.create_task(tasks.close())
-        await term_sent.wait()
+        await asyncio.wait_for(term_sent.wait(), 10)
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await closing
+            await asyncio.wait_for(closing, 10)
 
         assert all(not _group_exists(record.pid) for record in tasks.records)
         assert await tasks.close() == ()
         assert len(task_ids) == 3
     finally:
         for record in tasks.records:
-            if _group_exists(record.pid):
-                os.killpg(record.pid, signal.SIGKILL)
+            kill_group_if_present(record.pid)
 
 
 @pytest.mark.asyncio
