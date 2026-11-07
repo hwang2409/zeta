@@ -138,15 +138,29 @@ def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
         callbacks.append(callback) or Mock()
     )
     monkeypatch.setattr(composer_module.asyncio, "get_running_loop", lambda: loop)
-    app = TUIApp.__new__(TUIApp)
-    app._stream_invalidation_handle = None
-    app._stream_invalidation_pending = False
-    app._invalidate_prompt = Mock()
+    app, transcript = _streaming_app()
+    frames: list[str] = []
+    app._invalidate_prompt = lambda: frames.append(
+        _content_text(transcript, 80, 20).strip()
+    )
 
-    app._invalidate_stream_prompt()
+    def publish(chunk: str) -> None:
+        app._consume_text(StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk))
+        app._invalidate_stream_prompt()
+
+    publish("first")
     callbacks.pop(0)()
+    assert frames == ["first"]
 
-    assert app._invalidate_prompt.call_count == 1
+    publish(" second")
+    publish(" third")
+    assert frames == ["first", "first second"]
+    callbacks.pop(0)()
+    assert frames == ["first", "first second", "first second third"]
+
+    publish(" final")
+    app._finish_stream_invalidation()
+    assert frames[-1] == "first second third final"
 
 
 def test_repaints_do_not_rescan_terminal_agent_sessions(
@@ -1370,20 +1384,6 @@ def test_streaming_thinking_uses_the_incremental_unit() -> None:
 
     assert rendered.call_count == 0
     assert "reasoning delta" in _content_text(transcript, 80, 24)
-
-
-@pytest.mark.asyncio
-async def test_streaming_repaints_are_coalesced_and_final_paint_is_immediate() -> None:
-    consumer = TurnConsumerMixin()
-    paints = Mock()
-    consumer._invalidate_prompt = paints
-
-    for _ in range(1_000):
-        consumer._invalidate_stream_prompt()
-
-    assert paints.call_count == 1
-    consumer._finish_stream_invalidation()
-    assert paints.call_count == 2
 
 
 def test_lazy_tail_disabled_when_max_lines_set() -> None:

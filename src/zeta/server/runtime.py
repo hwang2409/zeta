@@ -539,27 +539,55 @@ class ServerRuntime:
     async def close(self) -> None:
         state = self._state
         if state is not None:
-            close_task = asyncio.create_task(self._close_state(state))
+            await self._close_active_state(state)
+        await self._wait_for_setup_reapers()
+
+    async def _close_active_state(self, state: SessionState) -> None:
+        background_tasks = state.loop.tool_registry.background_tasks
+        failure_generation = background_tasks.close_failure_generation()
+        close_task = asyncio.create_task(self._close_state(state))
+        cancelled = False
+        try:
             try:
-                try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    await close_task
-                    raise
-            finally:
-                if close_task.done() and self._state is state:
-                    self._state = None
-        if self._setup_reapers:
-            pending = asyncio.gather(*self._setup_reapers)
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
-                )
-            except TimeoutError:
-                logger.error(
-                    "%d abandoned session setup task(s) still running at shutdown",
-                    len(self._setup_reapers),
-                )
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                await close_task
+        except BaseException:
+            self._release_state_without_close_failure(
+                state, background_tasks, failure_generation
+            )
+            raise
+        if cancelled:
+            self._release_state_without_close_failure(
+                state, background_tasks, failure_generation
+            )
+            raise asyncio.CancelledError
+        if self._state is state:
+            self._state = None
+
+    def _release_state_without_close_failure(
+        self, state: SessionState, background_tasks: Any, failure_generation: int
+    ) -> None:
+        if (
+            background_tasks.close_failure_generation() == failure_generation
+            and self._state is state
+        ):
+            self._state = None
+
+    async def _wait_for_setup_reapers(self) -> None:
+        if not self._setup_reapers:
+            return
+        pending = asyncio.gather(*self._setup_reapers)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(pending), _SETUP_SHUTDOWN_WAIT_SECONDS
+            )
+        except TimeoutError:
+            logger.error(
+                "%d abandoned session setup task(s) still running at shutdown",
+                len(self._setup_reapers),
+            )
 
     async def _replace(self, composition: RuntimeComposition) -> None:
         state = SessionState.from_composition(composition)
@@ -574,7 +602,8 @@ class ServerRuntime:
                 await state.loop.ensure_mcp_servers()
                 state.loop.require_allowed_tools()
         except BaseException:
-            self._state = None
+            if self._state is state:
+                self._state = None
             await self._close_state(state)
             raise
 
