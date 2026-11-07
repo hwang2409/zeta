@@ -8,9 +8,10 @@ import json
 import multiprocessing
 import os
 import signal
+import socket
 import stat
 import threading
-import time
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,10 +27,16 @@ import zeta.cli.main as cli_main
 import zeta.codex as codex_module
 import zeta.oauth as oauth_module
 import zeta.providers.anthropic as anthropic_module
+import zeta.providers.login as provider_login_module
 import zeta.server.login as server_login
-from tests.support.account_processes import crash_logout, hold_account_credential_lock
+from tests.support.account_processes import (
+    crash_logout,
+    hold_account_credential_lock,
+    hold_provider_login_lock,
+)
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.login import reject_provider_token_exchange
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
     AccountError,
@@ -41,7 +48,7 @@ from zeta.accounts import (
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionManager, account_home
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens, ProviderLoginRequiredError
 from zeta.protocol.types import (
@@ -835,6 +842,82 @@ def test_cli_login_decision_expiry_shows_safe_message(
     assert cli_main._handle_login(args) == 1
     assert capsys.readouterr().err == (
         "login failed: Login could not be saved; try again.\n"
+    )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+@pytest.mark.parametrize("invalid_response", [False, True])
+def test_cli_login_provider_failure_has_safe_cause_and_recovery(
+    provider: str,
+    invalid_response: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reject_provider_token_exchange(
+        monkeypatch, provider, invalid_response=invalid_response
+    )
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+
+    assert cli_main.main(["login", provider, "--account", "work"]) == 1
+    output = capsys.readouterr()
+    assert output.err == (
+        "login failed: the provider rejected the login or returned an invalid "
+        "callback; retry in a new browser window\n"
+    )
+    assert "secret-token-body" not in output.out + output.err
+
+
+def test_cli_login_lock_failure_has_safe_cause_and_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_provider_login_lock,
+        args=(str(account_home(home)), "anthropic", ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=10)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    try:
+        assert cli_main.main(["login", "anthropic", "--account", "work"]) == 1
+        assert capsys.readouterr().err == (
+            "login failed: a login for this provider is already in progress; "
+            "close the other login and retry\n"
+        )
+    finally:
+        release.set()
+        holder.join(timeout=10)
+    assert holder.exitcode == 0
+
+
+def test_cli_login_callback_port_failure_has_safe_cause_and_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(
+            provider_login_module,
+            "DEFAULT_CODEX_REDIRECT_URI",
+            f"http://localhost:{port}/auth/callback",
+        )
+        monkeypatch.setenv("ZETA_HOME", str(home))
+
+        assert cli_main.main(["login", "codex", "--account", "work"]) == 1
+
+    assert capsys.readouterr().err == (
+        f"login failed: port {port} is already in use for codex login — close "
+        "any other Codex login and retry\n"
     )
 
 
@@ -1843,7 +1926,9 @@ def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> Non
     assert AccountStore(tmp_path).contains(account)
 
 
-def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) -> None:
+def test_migrate_never_sweeps_registered_account_during_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     account = AccountId("codex", "work")
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     credential.save(tokens())
@@ -1857,27 +1942,40 @@ def test_migrate_never_sweeps_registered_account_during_login(tmp_path: Path) ->
     )
     holder.start()
     migration_done = threading.Event()
+    migration_waiting = threading.Event()
+    real_registry_guard = AccountStore._registry_guard
+
+    @contextmanager
+    def observed_registry_guard(store, home_fd):  # type: ignore[no-untyped-def]
+        migration_waiting.set()
+        with real_registry_guard(store, home_fd):
+            yield
+
+    # test-contract: seam observe migration waiting behind live account ownership.
+    monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
 
     def migrate() -> None:
         AccountStore(tmp_path).migrate()
         migration_done.set()
 
     thread = threading.Thread(target=migrate)
-    thread.start()
     try:
-        assert ready.wait(timeout=5)
-        time.sleep(0.05)
+        assert ready.wait(timeout=10)
+        thread.start()
+        assert migration_waiting.wait(timeout=10)
+        assert not migration_done.is_set()
         release.set()
-        assert migration_done.wait(timeout=5)
+        assert migration_done.wait(timeout=10)
         assert credential.path.exists()
         assert AccountStore(tmp_path).contains(account)
     finally:
         release.set()
-        thread.join(timeout=5)
-        holder.join(timeout=5)
+        if thread.ident is not None:
+            thread.join(timeout=10)
+        holder.join(timeout=10)
         if holder.is_alive():
             holder.kill()
-            holder.join(timeout=5)
+            holder.join(timeout=10)
         holder.close()
 
 

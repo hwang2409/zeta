@@ -1500,6 +1500,66 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_parent(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.append_message(Message(MessageRole.ASSISTANT, [TextContent("parent healthy")]))
+    corrupt = ConversationStore(root.session_dir / "agents", session_id="1")
+    corrupt.append_message(Message(MessageRole.ASSISTANT, [TextContent("corrupt child")]))
+    sibling = ConversationStore(root.session_dir / "agents", session_id="2")
+    sibling.append_message(Message(MessageRole.ASSISTANT, [TextContent("sibling healthy")]))
+    for call, child in (
+        (ToolCall("nested-corrupt", "agent", {"prompt": "corrupt"}), corrupt),
+        (ToolCall("nested-sibling", "agent", {"prompt": "sibling"}), sibling),
+    ):
+        root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        root.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={"child_session_path": str(child.session_dir)},
+                ),
+            )
+        )
+    corrupt.close()
+    sibling.close()
+    root.close()
+    child_path = root.session_dir / "agents" / "1" / "conversation.jsonl"
+    with child_path.open("ab") as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+    damaged = child_path.read_bytes()
+
+    transcript = TranscriptWidget()
+    transcript.append(Text("top-level parent usable"))
+    call = ToolCall("agent-parent", "agent", {"prompt": "inspect parent"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(root.session_dir)},
+        ),
+    )
+
+    await transcript.refresh_agent_transcripts()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+
+    assert "top-level parent usable" in rendered
+    assert "parent healthy" in rendered
+    assert "sibling healthy" in rendered
+    assert "transcript terminated invalid conversation row at row 3 (session 1)" in rendered
+    assert "must-not-leak" not in rendered
+    assert child_path.read_bytes() == damaged
+
+
+@pytest.mark.asyncio
 async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
     from zeta.tui.cards.agent import AgentCard
 
@@ -1607,6 +1667,61 @@ def test_agent_refresh_surfaces_symlinked_file_after_snapshot(tmp_path: Path) ->
             source.refresh(recursive=True)
     finally:
         source.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_failure_diagnosis_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources = []
+    for index in range(3):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
+        )
+        child.close()
+        sources.append(agent_sync_module.AgentTranscriptSource(child.session_dir))
+
+    apply_failed = threading.Event()
+    diagnosis_threads: list[int] = []
+    real_store = agent_sync_module.ConversationStore
+
+    class ObservedStore(real_store):
+        def __init__(self, *args, **kwargs) -> None:
+            if apply_failed.is_set():
+                diagnosis_threads.append(threading.get_ident())
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sync_module, "ConversationStore", ObservedStore)
+
+    class Card:
+        refresh_eligible = True
+
+        def __init__(self, source, *, fail: bool = False) -> None:
+            self.transcript_source = source
+            self.fail = fail
+            self.applied = False
+
+        def apply_transcript_snapshot(self, snapshot) -> bool:
+            self.applied = True
+            if self.fail:
+                apply_failed.set()
+                raise RuntimeError("apply failed")
+            return True
+
+    cards = [Card(sources[0]), Card(sources[1], fail=True), Card(sources[2])]
+    event_loop_thread = threading.get_ident()
+    try:
+        changes = await agent_sync_module.refresh_agent_cards(cards)
+    finally:
+        for source in sources:
+            source.close()
+
+    assert apply_failed.is_set()
+    assert [card.applied for card in cards] == [True, True, True]
+    assert changes == [True, False, True]
+    assert diagnosis_threads
+    assert event_loop_thread not in diagnosis_threads
 
 
 @pytest.mark.asyncio

@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Protocol
 
 from ..core.session import SessionManager
+from ..core.session_execution import RUNTIME_LEASE_NAME
 from ..core.session_files import SessionError, SessionInUseError, session_directory
-from ..core.store.runtime_lease import RUNTIME_LEASE_NAME
 from .errors import RemoteSyncError
 from .memory import (
     MemoryTransferResult,
@@ -137,9 +137,7 @@ class LocalTransport:
         return destination
 
     def fetch_project(self, project_id: str, destination: Path) -> str:
-        return fetch_local_project(
-            self.home, project_id, destination, peer=self.name
-        )
+        return fetch_local_project(self.home, project_id, destination, peer=self.name)
 
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str
@@ -451,15 +449,15 @@ def _tree_state(root: Path) -> tuple[int, str]:
         if relative == "transfer.json":
             continue
         digest.update(relative.encode("utf-8") + b"\0")
-        lines = _stream_file(path, digest, count_lines=path.name == "conversation.jsonl")
+        lines = _stream_file(
+            path, digest, count_lines=path.name == "conversation.jsonl"
+        )
         if path.name == "conversation.jsonl":
             last_seq += max(0, lines - 1)
     return last_seq, digest.hexdigest()
 
 
-def _stream_file(
-    path: Path, digest: _Digest, *, count_lines: bool = False
-) -> int:
+def _stream_file(path: Path, digest: _Digest, *, count_lines: bool = False) -> int:
     lines = 0
     last = b""
     with path.open("rb") as stream:
@@ -486,7 +484,9 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
                 first = source.readline(_MAX_CONVERSATION_HEADER_BYTES + 1)
                 if not first:
                     raise RemoteSyncError(f"empty conversation log: {log}")
-                if len(first) > _MAX_CONVERSATION_HEADER_BYTES or not first.endswith(b"\n"):
+                if len(first) > _MAX_CONVERSATION_HEADER_BYTES or not first.endswith(
+                    b"\n"
+                ):
                     raise RemoteSyncError(f"conversation header is too large: {log}")
                 header = json.loads(first)
                 header["data"]["cwd"] = cwd_text
@@ -539,7 +539,9 @@ def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
 def _validate_snapshot(snapshot: Path, session_id: str) -> None:
     manifest = _read_manifest(snapshot)
     if manifest.get("session_id") != session_id:
-        raise RemoteSyncError("session manifest id does not match the requested session")
+        raise RemoteSyncError(
+            "session manifest id does not match the requested session"
+        )
     for path in snapshot.rglob("*"):
         if path.is_symlink():
             raise RemoteSyncError("remote session contains a symlink")

@@ -22,11 +22,11 @@ from ..accounts import (
     AccountStore,
     AccountUsage,
 )
-from ..accounts.login import login_named_account
+from ..accounts.login import login_failure_message, login_named_account
 from ..accounts.usage import format_usage_lines, usage_json
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
-from ..core.login_flow import LoginPublicationError, run_login
+from ..core.login_flow import run_login
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
@@ -461,11 +461,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
-    except (AccountError, LoginPublicationError, ValueError) as exc:
-        print(f"login failed: {exc}", file=sys.stderr)
-        return 1
-    except Exception:
-        print("login failed", file=sys.stderr)
+    except Exception as exc:
+        print(login_failure_message(exc), file=sys.stderr)
         return 1
     print(f"logged in as {handle}" if handle else "ok")
     return 0

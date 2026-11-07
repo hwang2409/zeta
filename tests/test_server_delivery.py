@@ -937,10 +937,26 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     session_id = created[-1]["result"]["session"]["session_id"]
     await _close(first, writer)
 
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions", session_id=session_id)
-    store.append_client_delivery(
-        "restart-steer", "steer", "queued", {"accepted": True}
+    store = await asyncio.to_thread(
+        ConversationStore, tmp_path / "sessions", session_id=session_id
     )
+    accepted_message = with_message_origin(
+        Message(MessageRole.USER, [TextContent("resume this exact steer")]),
+        MessageOrigin.USER,
+    )
+    acceptance = {
+        "delivery_id": "restart-steer",
+        "method": "steer",
+        "status": "queued",
+        "outcome": {"accepted": True},
+        "accepted_message": accepted_message.to_dict(),
+    }
+    try:
+        store._append_row("client_delivery", acceptance)
+    except ValueError:
+        store.append_client_delivery(
+            "restart-steer", "steer", "queued", {"accepted": True}
+        )
     store.close()
 
     resumed = ZetaServer(provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path, "-restart-2"))
@@ -951,9 +967,18 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
             writer,
             3,
             "hello",
-            {"protocol_version": "1.1", "features": ["delivery_id"]},
+            {
+                "protocol_version": "1.2",
+                "features": ["delivery_id", "session_history_fidelity"],
+            },
         )
-        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        resumed_frames = await _request(
+            reader, writer, 4, "resume", {"session_id": session_id}
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "delivery_status"
+            for frame in resumed_frames
+        )
         status = await _request(
             reader,
             writer,
@@ -964,6 +989,21 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
         assert status[-1]["result"]["status"] == "dropped"
         delivery = resumed.runtime.opened.store.client_delivery("restart-steer")
         assert delivery.reason == "restart"
+        history = await _request(
+            reader,
+            writer,
+            6,
+            "session_history",
+            {"session_id": session_id},
+        )
+        terminal = next(
+            row
+            for row in history[-1]["result"]["messages"]
+            if row.get("delivery_id") == "restart-steer"
+        )
+        assert terminal["content"] == [
+            {"type": "text", "text": "resume this exact steer"}
+        ]
     finally:
         await _close(resumed, writer)
 

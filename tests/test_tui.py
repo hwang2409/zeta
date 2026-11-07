@@ -7,12 +7,13 @@ import errno
 import fcntl
 import gc
 import json
+import multiprocessing
 import os
 import pty
 import re
-import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,24 +56,33 @@ from rich.text import Text
 
 import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
+import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
-from tests.support.stores import open_test_store
+from tests.support.account_processes import hold_provider_login_lock
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.processes import read_pty_until, reap_process
+from tests.support.stores import open_test_store
 from tests.support.tui_render import render_full_screen as _render_full_screen
-from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from zeta.accounts import (
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    SessionAccountContext,
+)
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
@@ -105,7 +115,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -283,54 +293,6 @@ async def _agent_list_session(
     app._active_session = session
     app._install_full_screen_layout(session)
     return app, session
-
-
-def _read_pty_until(
-    master_fd: int,
-    output: bytearray,
-    needle: bytes,
-    process: subprocess.Popen[bytes | str],
-    start: int = 0,
-) -> None:
-    deadline = time.monotonic() + 10
-    while needle not in output[start:]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _terminate_process(process)
-            pytest.fail(
-                f"timed out waiting for {needle!r}; captured output:\n"
-                f"{bytes(output[start:])!r}"
-            )
-        ready, _, _ = select.select([master_fd], [], [], remaining)
-        if not ready:
-            continue
-        try:
-            chunk = os.read(master_fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        output.extend(chunk)
-    if needle not in output[start:]:
-        _terminate_process(process)
-        pytest.fail(
-            f"process exited before {needle!r}; captured output:\n"
-            f"{bytes(output[start:])!r}"
-        )
-
-
-def _wait_for_process_cleanup(process: subprocess.Popen[bytes | str]) -> None:
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def _terminate_process(process: subprocess.Popen[bytes | str]) -> None:
-    if process.poll() is None:
-        process.kill()
-    process.wait()
 
 
 def _capture_pane(socket: Path, session: str) -> str:
@@ -731,7 +693,7 @@ async def test_live_notification_presentation_survives_tui_resume(
     try:
         resumed_app._rebuild_transcript()
         visible = output.getvalue() + resumed_output.getvalue()
-        assert visible.count("child · completed") == 1
+        assert visible.count("child child-presentation · completed") == 1
     finally:
         await resumed_app.loop.close()
         reopened.close()
@@ -786,7 +748,10 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
     )
     try:
         await rendered_output.wait()
-        assert output.getvalue().count("child · completed") == 1
+        assert (
+            output.getvalue().count("child child-canceled-presentation · completed")
+            == 1
+        )
         assert not store.is_agent_notification_presented_to_tui(notification.id)
         presentation.cancel()
         await asyncio.sleep(0)
@@ -815,7 +780,7 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
             resumed_app._rebuild_transcript()
             visible = output.getvalue() + resumed_output.getvalue()
-            assert visible.count("child · completed") == 1
+            assert visible.count("child child-canceled-presentation · completed") == 1
         finally:
             await resumed_app.loop.close()
             reopened.close()
@@ -3517,7 +3482,7 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
             await open_test_store(tmp_path),
             tools={"stream": stream},
             max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -3584,7 +3549,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
             store,
             tools={"stream": stream},
             max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4419,7 +4384,7 @@ async def test_transport_failure_shapes_render_error_cards(
         AgentLoop(
             RaisedErrorBackend(error),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4452,9 +4417,9 @@ async def test_ollama_model_window_error_renders_in_tui(tmp_path: Path) -> None:
         token_counter=lambda message: (
             1
             + sum(
-            len(block.text)
-            for block in message.content
-            if isinstance(block, TextContent)
+                len(block.text)
+                for block in message.content
+                if isinstance(block, TextContent)
             )
         ),
         backend=backend,
@@ -4524,7 +4489,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
         AgentLoop(
             AlwaysErrorBackend(),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -5083,12 +5048,11 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
         data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
-    assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
+    assert "2 turns · 1.5s · completed" in render_agent_receipt(success).plain
     canceled_plain = render_agent_receipt(canceled).plain
     assert "0 turns · 0.4s · canceled" in canceled_plain
-    assert "error=false" in canceled_plain
-    assert "canceled=true" in canceled_plain
-    assert "error=true" not in canceled_plain
+    assert "error=" not in canceled_plain
+    assert "canceled=" not in canceled_plain
     assert "depth 2" in canceled_plain
 
 
@@ -5143,8 +5107,9 @@ def test_unstructured_agent_error_renders_as_error() -> None:
 
     rendered = render_agent_receipt(event)
 
-    assert "error=true" in rendered.plain
-    assert "canceled=false" in rendered.plain
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
 
 
 def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:
@@ -5502,10 +5467,11 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
-    assert "child line 4" not in rendered
-    assert "child line 5" in rendered
+    assert "child line 5" not in rendered
+    assert "… +6 lines" in rendered
+    assert "child line 6" in rendered
     assert "child line 24" in rendered
-    assert rendered.count("child line ") == 20
+    assert rendered.count("child line ") == 19
 
 
 def test_agent_cards_remain_in_sequential_order() -> None:
@@ -5529,7 +5495,7 @@ def test_agent_cards_remain_in_sequential_order() -> None:
             call.id,
             call,
             render_event(
-            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
             ),
         )
         transcript.finish_tool(call.id, render_event(event), event)
@@ -5776,7 +5742,7 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
         ),
     )
     transcript.finish_tool(call.id, render_event(event), event)
-    assert "1 turns · 0.0s · ok" in transcript.render(120)
+    assert "1 turns · 0.0s · completed" in transcript.render(120)
     assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "expand: ctrl+x ctrl+o" not in rendered
@@ -6371,7 +6337,7 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
                 base_url="https://test.invalid/codex/responses",
             ),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model=DEFAULT_CODEX_MODEL,
@@ -6656,7 +6622,7 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
             EarlyCloseRetryBackend(),
             await open_test_store(tmp_path / "sessions"),
             tool_schemas=[],
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -6710,7 +6676,7 @@ async def test_truncated_response_notice_is_printed_once(
             TruncatedBackend(),
             await open_test_store(tmp_path / "sessions"),
             tool_schemas=[],
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -7222,21 +7188,11 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        _read_pty_until(
-            master_fd,
-            output,
-            b" \xe2\x80\xba ",
-            process,
-        )
+        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
 
         os.write(master_fd, b"\x04")
-        _read_pty_until(
-            master_fd,
-            output,
-            b"\x1b[?1049l",
-            process,
-        )
-        _wait_for_process_cleanup(process)
+        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
@@ -7245,7 +7201,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     finally:
         if process.poll() is None:
             process.kill()
-            process.wait()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7272,13 +7228,7 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(
-            master_fd,
-            output,
-            needle,
-            process,
-            start,
-        )
+        read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -7298,12 +7248,12 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 
         os.write(master_fd, b"\x04")
         read_until(b"\x1b[?1049l")
-        _wait_for_process_cleanup(process)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
     finally:
         if process.poll() is None:
             process.kill()
-            process.wait()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7330,34 +7280,25 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(
-            master_fd,
-            output,
-            needle,
-            process,
-            start,
-        )
+        read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
     try:
         read_until(b" \xe2\x80\xba ")
-        os.write(master_fd, b"abc")
-        read_until(b"abc")
-
         start = len(output)
-        os.write(master_fd, b"\x1bx\r")
-        read_until(b"you said: ab", start)
+        os.write(master_fd, b"abc\x1bx\r")
+        read_until(b"the scripted test backend", start)
+        assert b"you said: ab" in output[start:]
     finally:
-        if process.poll() is None:
-            os.write(master_fd, b"\x04")
-            _read_pty_until(
-                master_fd,
-                output,
-                b"\x1b[?1049l",
-                process,
-            )
-            _wait_for_process_cleanup(process)
-        assert process.returncode == 0
-        os.close(master_fd)
+        try:
+            if process.poll() is None:
+                os.write(master_fd, b"\x04")
+                read_pty_until(
+                    master_fd, b"\x1b[?1049l", process=process, output=output
+                )
+                reap_process(process, timeout=10)
+            assert process.returncode == 0
+        finally:
+            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:
@@ -8397,11 +8338,9 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
             if not gated_once and stop_checks == 2:
                 gated_once = True
                 recovery_mutated.set()
-                assert recovery_release.wait(timeout=5)
+                assert recovery_release.wait(timeout=10)
                 assert callable(should_stop)
-                deadline = time.monotonic() + 5
-                while not should_stop() and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                assert should_stop()
             return bool(should_stop and should_stop())
 
         deliveries = recover_agent_children(loop, should_stop=observed_stop)
@@ -8422,7 +8361,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(input=pipe, output=DummyOutput())
         run_task = asyncio.create_task(app.run(session))
-        assert await asyncio.to_thread(recovery_mutated.wait, 5)
+        assert await asyncio.to_thread(recovery_mutated.wait, 10)
         assert app._input_loop_active, (
             "TUI input did not start during activation recovery"
         )
@@ -8605,7 +8544,9 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     ]
     assert prompt_toolkit_tasks == []
     assert restored == [None]
+    # test-contract: seam shutdown clears the active session reference.
     assert app._active_session is None
+    # test-contract: seam shutdown closes the application and its session store.
     assert app._closed
     assert store.directory_fd == -1
 
@@ -8686,11 +8627,9 @@ async def test_rebuild_transcript_matches_character_stream(
     ]
     app = TUIApp(
         AgentLoop(
-            FakeBackend(
-                [ScriptedTurn(content=source_parts)]
-            ),
+            FakeBackend([ScriptedTurn(content=source_parts)]),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -8843,6 +8782,33 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
+def test_rebuild_renders_closed_turn_end_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    replay = tuple(
+        SimpleNamespace(
+            type="turn_end", data={"turn_id": "0" * 32, "reason": reason}, id=reason
+        )
+        for reason in ("user_stop", "completed", "error", "disconnect")
+    )
+    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "turn stopped by the user" in rendered
+    assert "turn ended with an error" in rendered
+    assert "turn ended when the controller disconnected" in rendered
+    assert "completed" not in rendered
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
@@ -8913,21 +8879,21 @@ async def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store.append_message(
         with_message_origin(
             Message(
-            MessageRole.USER,
-            [
-                TextContent("inspect notes.txt and [Image #1]"),
-                TextContent(
-                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                    "/tmp/notes.txt",
-                    12,
-                ),
-                ImageContent(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                    "image/png",
-                    "/tmp/image.png",
-                    68,
-                ),
-            ],
+                MessageRole.USER,
+                [
+                    TextContent("inspect notes.txt and [Image #1]"),
+                    TextContent(
+                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                        "/tmp/notes.txt",
+                        12,
+                    ),
+                    ImageContent(
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                        "image/png",
+                        "/tmp/image.png",
+                        68,
+                    ),
+                ],
             ),
             MessageOrigin.USER,
         )
@@ -9145,7 +9111,7 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
         AgentLoop(
             ErrorThenSuccessBackend(),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -9249,15 +9215,15 @@ def test_rebuild_user_attachment_hides_file_content(
     store.append_message(
         with_message_origin(
             Message(
-            MessageRole.USER,
-            [
-                TextContent("inspect @notes.txt"),
-                TextContent(
-                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                    "/tmp/notes.txt",
-                    12,
-                ),
-            ],
+                MessageRole.USER,
+                [
+                    TextContent("inspect @notes.txt"),
+                    TextContent(
+                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                        "/tmp/notes.txt",
+                        12,
+                    ),
+                ],
             ),
             MessageOrigin.USER,
         )
@@ -10053,7 +10019,7 @@ def test_full_screen_footer_fits_content_column(
                 session_id="abcdef123456",
                 cwd=Path.home(),
             ),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10314,7 +10280,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
         AgentLoop(
             GateBackend(),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10427,7 +10393,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
             backend,
             await open_test_store(tmp_path / "sessions"),
             tools={"read": slow_tool},
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10475,22 +10441,27 @@ async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
 
     assert "interrupted" in states
     assert app._loop_state == "interrupted"
-    assert "interrupted" in format_status(
-        app.provider,
-        app.model,
-        app._loop_state,
-        session_id="session",
-    ).plain
+    assert (
+        "interrupted"
+        in format_status(
+            app.provider,
+            app.model,
+            app._loop_state,
+            session_id="session",
+        ).plain
+    )
 
 
 @pytest.mark.asyncio
-async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Path) -> None:
+async def test_app_surfaces_compacting_state_before_provider_output(
+    tmp_path: Path,
+) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(
             backend,
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10546,7 +10517,7 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
         AgentLoop(
             FakeBackend([ScriptedTurn(), ScriptedTurn()]),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10570,7 +10541,7 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         AgentLoop(
             GhostPreviewBackend(),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10598,7 +10569,7 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
         AgentLoop(
             FakeBackend([ScriptedTurn([TextContent("answer")])]),
             await open_test_store(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10629,7 +10600,7 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
             backend,
             await open_test_store(tmp_path / "sessions"),
             tools={"read": lambda _: "tool result"},
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10685,7 +10656,7 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
                 "bash": lambda _: "\n".join(f"line-{i}" for i in range(24)),
                 "read": lambda _: "title\nbody",
             },
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -11050,8 +11021,8 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         await wait_until(
             lambda: (
                 len(store.messages()) == 3
-            and store.messages()[-1].tool_result is not None
-        )
+                and store.messages()[-1].tool_result is not None
+            )
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
@@ -11089,8 +11060,8 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         await wait_until(
             lambda: (
                 len(store.messages()) == 3
-            and store.messages()[-1].tool_result is not None
-        )
+                and store.messages()[-1].tool_result is not None
+            )
         )
         pipe.send_text("\x04")
         await run_task
@@ -11201,8 +11172,8 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
         await wait_until(
             lambda: (
                 session is not None
-            and session.app.vi_state.input_mode.value == "vi-navigation"
-        )
+                and session.app.vi_state.input_mode.value == "vi-navigation"
+            )
         )
         pipe.send_text("\r")
         await task
@@ -11387,8 +11358,8 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
         await wait_until(
             lambda: (
                 session is not None
-            and session.app.current_buffer.text == "pasted line 1\npasted line 2"
-        )
+                and session.app.current_buffer.text == "pasted line 1\npasted line 2"
+            )
         )
         pipe.send_text("\x1b[200~\n" + long_line + "\x1b[201~\r")
         await task
@@ -11434,7 +11405,7 @@ async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
             store,
             tools={"danger": lambda _: "done"},
             approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -11632,6 +11603,7 @@ async def test_tui_close_rejects_inflight_transcript_source(
     release.set()
     await close_task
 
+    # test-contract: seam shutdown closes every transcript source.
     assert sources and sources[0]._closed
     assert sources[0]._stores == {}
     assert app._agent_navigation.transcript_control._source is None
@@ -11668,25 +11640,40 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     previous = navigation.transcript_control._snapshot
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh(*args, **kwargs):
         entered.set()
         return original_refresh(*args, **kwargs)
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public transcript-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public transcript-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public transcript-refresh lock seam exists
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late transcript cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         agent_sync._REFRESH_LOCK.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
     assert navigation.transcript_control._snapshot is previous
     assert not published.is_set()
@@ -11720,25 +11707,40 @@ async def test_tui_close_hands_off_blocked_todo_source(
     assert source is not None
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh():
         entered.set()
         return original_refresh()
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public todo-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public todo-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public todo-refresh lock seam exists
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late todo cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         source._lock.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._store is None
     assert control._snapshot is None
     assert not published.is_set()
@@ -11853,7 +11855,7 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
     child.agent_lifecycle_path.write_text(
         json.dumps(
             {"description": "Explore", "agent_type": "general", "state": "running"}
-    )
+        )
     )
     grandchild = await open_test_store(child.session_dir / "agents", session_id="1")
     grandchild.agent_lifecycle_path.write_text(
@@ -11949,14 +11951,14 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
-        )
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-            and navigation.transcript_control._snapshot is not None
-        )
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         assert session.layout.has_focus(navigation.transcript_window)
 
@@ -11964,8 +11966,8 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_window.render_info is not None
-            and navigation.transcript_window.render_info.vertical_scroll == 0
-        )
+                and navigation.transcript_window.render_info.vertical_scroll == 0
+            )
         )
         before_scroll = navigation.transcript_window.render_info.vertical_scroll
         pipe.send_text("j")
@@ -11988,14 +11990,14 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.current_path == grandchild.session_dir
-            and navigation.child_view_focused()
-        )
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == grandchild.session_dir
-            and navigation.transcript_control._snapshot is not None
-        )
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         assert navigation.list_visible
         assert navigation.entries[0].label == "main"
@@ -12007,14 +12009,14 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
-        )
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-            and navigation.transcript_control._snapshot is not None
-        )
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         child_text = Text.from_ansi(
             navigation.transcript_control.transcript.render(120)
@@ -12034,8 +12036,8 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
-        )
+                and navigation.child_view_focused()
+            )
         )
         pipe.send_text("\x1b")
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
@@ -12231,20 +12233,20 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
         original_deliver(item, result, failure)
         if item.stop:
             stop_delivered.set()
-            assert release_worker.wait(1)
+            assert release_worker.wait(10)
 
     monkeypatch.setattr(WriterLease, "publish_json", write)
     monkeypatch.setattr(persistence._writer, "_deliver", gated_deliver)
     persistence.schedule("new draft")
     shutdown = asyncio.create_task(persistence.shutdown_pending())
-    assert await asyncio.to_thread(stop_delivered.wait, 1)
+    assert await asyncio.to_thread(stop_delivered.wait, 10)
     with pytest.raises(OSError, match="disk full"):
         await shutdown
 
     persistence.flush()
     assert persistence._writer._queue.qsize() == 1
     release_worker.set()
-    await persistence._writer.flush(timeout=0.05)
+    await persistence._writer.flush(timeout=10)
 
     try:
         assert persistence.load() == "new draft"
@@ -12386,7 +12388,7 @@ async def test_dup_failure_is_reported_not_success(
     assert exceptions == []
     assert (
         caplog.messages.count(
-        "failed to persist composer draft: [Errno 24] Too many open files"
+            "failed to persist composer draft: [Errno 24] Too many open files"
         )
         == 1
     )
@@ -12428,8 +12430,10 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
     )
 
+    # test-contract: durability process exit reports a draft that could not be saved.
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
+    # test-contract: seam the process boundary consumes the expected persistence error.
     assert errors == [], "normal exit leaked the draft persistence error"
     assert "unsaved composer draft:" in stderr
     assert "copy this unsaved draft" in stderr
@@ -12489,9 +12493,12 @@ def test_new_session_continues_after_failed_draft_save(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
     )
 
+    # test-contract: durability process exit reports a draft that could not be saved.
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
+    # test-contract: seam the session transition consumes the persistence error.
     assert errors == [], "new-session transition leaked the draft persistence error"
+    # test-contract: seam the CLI transition starts exactly one replacement session.
     assert runs == 2
     assert "unsaved composer draft:" in stderr
     assert old_session_id in stderr
@@ -12586,6 +12593,7 @@ def test_failed_active_draft_is_printed_on_every_exit(
         with pytest.raises(RuntimeError, match="unexpected failure"):
             cli_main_module.main([])
     else:
+        # test-contract: durability every exit reports a draft that could not be saved.
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
     expected_drafts = 2 if with_replaced_draft else 1
@@ -12593,6 +12601,7 @@ def test_failed_active_draft_is_printed_on_every_exit(
     assert stderr.count("unsaved composer draft:") == expected_drafts
     assert stderr.count("active draft payload") == 1
     assert stderr.count("old draft payload") == int(with_replaced_draft)
+    # test-contract: seam only restart exits cross the exec-restart boundary.
     assert restart_called.is_set() is (exit_kind == "restart")
 
 
@@ -12665,11 +12674,13 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         with pytest.raises(RuntimeError, match="unexpected failure"):
             cli_main_module.main([])
     else:
+        # test-contract: durability every exit reports a draft that could not be saved.
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == 1
     assert "draft one" in stderr
+    # test-contract: seam only restart exits cross the exec-restart boundary.
     assert restart_called.is_set() is (exit_kind == "restart")
 
 
@@ -12708,7 +12719,9 @@ def test_new_session_with_successful_draft_prints_nothing(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
     )
 
+    # test-contract: durability a saved draft does not produce recovery output.
     assert cli_main_module.main([]) == 0
+    # test-contract: seam the CLI transition starts exactly one replacement session.
     assert runs == 2
     assert "unsaved composer draft:" not in capsys.readouterr().err
 
@@ -12879,8 +12892,8 @@ async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
 
     assert notices == [
         (
-        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
-        loop_thread,
+            "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+            loop_thread,
         )
     ]
 
@@ -13558,7 +13571,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
 
 
 @pytest.mark.asyncio
-async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
+async def test_tui_model_command_does_no_lock_work_on_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     manager = SessionManager(tmp_path / "home")
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
@@ -13593,30 +13608,21 @@ async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> No
         on_model_change=switch_model,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    lock_held = threading.Event()
+    owner_thread = threading.get_ident()
+    lock_threads: list[int] = []
+    metadata_lock = manager._metadata_lock
 
-    def hold_metadata_lock() -> None:
-        with manager._metadata_lock(opened.metadata.session_id) as directory_fd:
-            assert directory_fd is not None
-            lock_held.set()
-            time.sleep(0.25)
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        lock_threads.append(threading.get_ident())
+        return metadata_lock(*args, **kwargs)
 
-    holder = threading.Thread(target=hold_metadata_lock)
-    holder.start()
-    assert await asyncio.to_thread(lock_held.wait, 1)
-    event_loop = asyncio.get_running_loop()
-    started = event_loop.time()
-    callback_delays: list[float] = []
-    event_loop.call_later(
-        0.01, lambda: callback_delays.append(event_loop.time() - started)
-    )
-
+    # test-contract: seam observe lock ownership because no public seam exists.
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
 
     assert output is not None and str(output).startswith("model: gpt-5.4")
-    assert callback_delays and callback_delays[0] < 0.05
-    await asyncio.to_thread(holder.join, 1)
-    assert not holder.is_alive()
+    assert lock_threads
+    assert owner_thread not in lock_threads
     await loop.close()
     opened.store.close()
 
@@ -14162,22 +14168,36 @@ async def test_accounts_refresh_does_not_block_event_loop(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    # test-contract: seam no public headless presenter injection exists
     app._presenter.print_unit = Mock()
+    # test-contract: seam no public headless transcript injection exists
     app._transcript.replace = lambda unit, replacement: replacement
 
-    async def blocking_refresh(self):
-        time.sleep(0.2)  # noqa: ASYNC251 - proves the work runs on another thread
+    owner_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+    refresh_done = asyncio.Event()
+    # test-contract: seam no public account-picker repaint completion hook exists
+    original_repaint = app._repaint_accounts_picker
+
+    async def observed_refresh(self):
+        refresh_threads.append(threading.get_ident())
         return {}
 
-    monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
+    def repaint_and_signal() -> None:
+        original_repaint()
+        picker = app._accounts_picker
+        if picker is not None and not picker.refreshing:
+            refresh_done.set()
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", observed_refresh)
+    # test-contract: seam no public account-refresh completion event exists
+    monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        started = time.monotonic()
-        await asyncio.sleep(0.02)
-        assert time.monotonic() - started < 0.1
-        while app._accounts_picker and app._accounts_picker.refreshing:
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(refresh_done.wait(), timeout=10)
+        # test-contract: seam no public account-refresh executor identity exists
+        assert refresh_threads and refresh_threads[0] != owner_thread
     finally:
         opened.store.close()
 
@@ -14216,6 +14236,126 @@ async def test_tui_accounts_named_login_uses_supplied_label(
             == "logged in as codex:personal"
         )
         assert logins == [("codex", "personal")]
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+@pytest.mark.parametrize("invalid_response", [False, True])
+async def test_tui_login_provider_failure_has_safe_cause_and_recovery(
+    provider: str,
+    invalid_response: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reject_provider_token_exchange(
+        monkeypatch, provider, invalid_response=invalid_response
+    )
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, f"/accounts login {provider} work"
+        )
+
+        assert result == (
+            "login failed: the provider rejected the login or returned an invalid "
+            "callback; retry in a new browser window"
+        )
+        assert "secret-token-body" not in result
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_login_lock_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_provider_login_lock,
+        args=(str(account_home(home)), "anthropic", ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=10)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    account_context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = account_context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, "/accounts login anthropic work"
+        )
+
+        assert result == (
+            "login failed: a login for this provider is already in progress; "
+            "close the other login and retry"
+        )
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        await app.close()
+        opened.store.close()
+    assert holder.exitcode == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_login_callback_port_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            monkeypatch.setattr(
+                provider_login_module,
+                "DEFAULT_CODEX_REDIRECT_URI",
+                f"http://localhost:{port}/auth/callback",
+            )
+            result = await app._slash_commands.dispatch_async(
+                app, "/accounts login codex work"
+            )
+
+        assert result == (
+            f"login failed: port {port} is already in use for codex login — close "
+            "any other Codex login and retry"
+        )
     finally:
         await app.close()
         opened.store.close()

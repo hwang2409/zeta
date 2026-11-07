@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from .pending_delivery import NotificationInput
 
+from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationStore
-from ..core.store.runtime_lease import SessionOwnedError
 from ..protocol.types import ToolResult
 
 

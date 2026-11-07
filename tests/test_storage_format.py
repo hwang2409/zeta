@@ -118,9 +118,9 @@ def test_predecessor_writer_refuses_advanced_home_without_writes(
         if path.is_file()
     }
 
-    assert verify(tmp_path).writer_epoch == 2
+    assert verify(tmp_path).writer_epoch == 3
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
-        open_writer(tmp_path, capability=1)
+        open_writer(tmp_path, capability=2)
 
     after = {
         path.relative_to(tmp_path): path.read_bytes()
@@ -145,6 +145,31 @@ def test_advance_is_exclusive_across_processes(tmp_path: Path) -> None:
     process.close()
     lease.close()
     assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
+
+
+def test_advanced_home_refuses_predecessor_before_transcript_parsing(
+    tmp_path: Path,
+) -> None:
+    advance(tmp_path, expected_epoch=0)
+    session = tmp_path / "sessions" / "malformed"
+    session.mkdir(parents=True)
+    (session / "conversation.jsonl").write_bytes(b"not-json\n")
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    assert verify(tmp_path).writer_epoch == 3, "candidate advanced the home"
+    with pytest.raises(StorageFormatError, match="newer than writer capability"):
+        open_writer(tmp_path, capability=2)
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 def test_writer_lock_descriptor_is_not_inherited(tmp_path: Path) -> None:

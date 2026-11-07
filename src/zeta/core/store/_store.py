@@ -31,12 +31,7 @@ from ...protocol.types import (
     require_new_message_origin,
 )
 from ...storage_format import WriterLease, open_writer
-from ..agent_state import (
-    AgentStateMixin,
-    _apply_agent_state,
-    _parse_agent_state,
-    _session_state_mutations,
-)
+from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
@@ -44,13 +39,18 @@ from ..checkpoints import (
     active_branch,
     load_session_json,
 )
+from ..session_execution import (
+    OwnerSurface,
+    SessionExecutionLease,
+    StoreRuntimeLeaseMixin,
+    close_store_leases,
+)
 from ..session_files import (
     child_directory,
     open_session_file,
     read_session_file,
     session_directory,
     session_root,
-    write_session_file,
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import (
@@ -63,8 +63,8 @@ from ._async_writes import AsyncDurableWritesMixin
 from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import (
-    APPROVAL_RESOLUTION_REASONS,
     IncrementalValidationMixin,
+    validate_approval_reason,
 )
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
@@ -76,8 +76,10 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
+from ._turn_history import TurnHistoryMixin, validate_turn_end_data
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -87,22 +89,6 @@ from ._validation import (
     validate_notification_data,
     validate_terminal_transition_data,
 )
-from .runtime_lease import (
-    OwnerHint,
-    OwnerSurface,
-    SessionExecutionLease,
-    StoreRuntimeLeaseMixin,
-    close_store_leases,
-)
-
-
-def _validate_approval_reason(decision: str, reason: str | None) -> None:
-    if reason is not None and (
-        type(reason) is not str
-        or decision != "abort"
-        or reason not in APPROVAL_RESOLUTION_REASONS
-    ):
-        raise ValueError("invalid approval resolution reason")
 
 
 class ConversationStore(
@@ -118,8 +104,10 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
+    TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
+    SessionStatePersistenceMixin,
 ):
     def __init__(
         self,
@@ -223,15 +211,13 @@ class ConversationStore(
                     self._load()
                     self._load_session_state()
                 else:
-                    if _execution_lease is not None:
-                        self._runtime_lease = _execution_lease.retain()
-                    else:
-                        self._runtime_lease = SessionExecutionLease.acquire(
-                            self.directory_fd,
-                            session_id=self.session_id,
-                            owner=OwnerHint(_owner_surface),
-                            recovery=_recovery_owner,
-                        )
+                    self._runtime_lease = self._open_execution_lease(
+                        self.directory_fd,
+                        self.session_id,
+                        _execution_lease,
+                        _owner_surface,
+                        _recovery_owner,
+                    )
                     lease.callback(self._runtime_lease.close)
                     if _validated_log_state is not None:
                         self._install_log_state(_validated_log_state)
@@ -259,7 +245,6 @@ class ConversationStore(
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
-
         resolved = str(cwd)
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
@@ -301,18 +286,15 @@ class ConversationStore(
 
     def todo_items(self) -> list[TodoItem]:
         """Return a detached snapshot of the current session todo list."""
-
         return [dict(item) for item in self._todo_items]
 
     @property
     def todo_dismissed(self) -> bool:
         """Return whether the terminal todo receipt was dismissed."""
-
         return self._todo_dismissed
 
     def dismiss_todo(self) -> None:
         """Persist dismissal of the terminal todo receipt."""
-
         with self._append_lock():
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
@@ -382,34 +364,6 @@ class ConversationStore(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
                 )
             self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
-
-    def _write_session_state(
-        self,
-        bash_cwd: str,
-        todo_items: Iterable[TodoItem],
-        *,
-        deleted_agent_children: Iterable[str] = (),
-    ) -> None:
-        state: dict[str, Any] = {"bash_cwd": bash_cwd}
-        normalized_items = [dict(item) for item in todo_items]
-        if normalized_items:
-            state["todo_items"] = normalized_items
-        if self._todo_dismissed:
-            state["todo_dismissed"] = True
-        _apply_agent_state(
-            state,
-            agent_counter=self._agent_counter,
-            agent_children=self._agent_children,
-            agent_parent=self._agent_parent,
-            agent_canceled=self._agent_canceled,
-        )
-        mutations = _session_state_mutations(state, tuple(deleted_agent_children))
-        self._storage_lease.publish_json(
-            self.directory_fd,
-            "session_state.json",
-            mutations,
-            write_session_file,
-        )
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
@@ -598,9 +552,11 @@ class ConversationStore(
                     raise ValueError("approval resolution id must be a nonempty string")
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
-                _validate_approval_reason(decision, entry.data.get("reason"))
+                validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "approval_history":
                 validate_approval_history_data(entry.data)
+            elif entry.type == "turn_end":
+                validate_turn_end_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
@@ -1101,7 +1057,7 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
-        _validate_approval_reason(decision, reason)
+        validate_approval_reason(decision, reason)
         with self._append_lock():
             entry = self._resolve_approval_unlocked(
                 request_id,
@@ -1127,7 +1083,7 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
-        _validate_approval_reason(decision, reason)
+        validate_approval_reason(decision, reason)
         with self._append_lock():
             return (
                 self._resolve_approval_unlocked(request_id, decision, reason=reason)

@@ -39,24 +39,24 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..providers.factory import build_backend, credential_store
-from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from .background import CancellationRequest, finish_background_child
-from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
 from .presets import (
+    EXPLICIT_FINISH_GUIDANCE,
     GENERAL_PRESET,
     RUN_PRESET,
     AgentPreset,
     compose_system_prompt,
+    resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
 from .run_consumer import consume_run as consume_follow_up_run
@@ -90,7 +90,6 @@ async def consume_child(
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
-
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
@@ -243,6 +242,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if finish_gate_state is not None:
+                finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
                 final_message = Message(
@@ -305,7 +306,6 @@ async def consume_run(
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume one child run through its follow-up and idle lifecycle."""
-
     return await consume_follow_up_run(
         consume_child,
         child_loop,
@@ -377,16 +377,25 @@ async def _build_child_loop(
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
     try:
-        excluded_names = {"inbox", "request_attention", "resolve_attention"}
-        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
-            excluded_names.add("agent")
-        if preset.tool_names is not None:
-            allowed_names = set(preset.tool_names)
-            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
-                allowed_names.add("agent")
-            excluded_names.update(
-                set(loop.tool_registry.definitions_by_name) - allowed_names
-            )
+        explicit_finish = explicit_finish_eligible(
+            global_enabled=loop.explicit_finish,
+            preset=preset,
+            background=follow_up_loop,
+        )
+        runtime_tool_names = {"ask_parent"} if follow_up_loop else set()
+        if explicit_finish:
+            runtime_tool_names.update(("finish", "agent_handoff"))
+        policy_allowed_runtime_names = frozenset(
+            name
+            for name in runtime_tool_names
+            if loop.tool_registry.tool_is_allowed_by_policy(name)
+        )
+        excluded_names, profile_tool_allow = resolve_child_profile_tools(
+            child_depth=child_depth,
+            preset=preset,
+            policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
+            runtime_tool_names=policy_allowed_runtime_names,
+        )
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
@@ -396,6 +405,7 @@ async def _build_child_loop(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            profile_tool_allow=profile_tool_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
@@ -440,11 +450,6 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
-        explicit_finish = explicit_finish_eligible(
-            global_enabled=loop.explicit_finish,
-            preset=preset,
-            background=follow_up_loop,
-        )
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -850,12 +855,14 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        child_store.finish_agent_lifecycle(
-            state,
-            final_result=text,
-            turns_used=child_turns(),
-        )
-        return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
+        turns_used = child_turns()
+        if background:
+            child_store.update_agent_lifecycle(turns_used=turns_used)
+        else:
+            child_store.finish_agent_lifecycle(
+                state, final_result=text, turns_used=turns_used
+            )
+        return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
         text: str,
@@ -939,6 +946,10 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
+    loop._background_owner.causal_episodes.associate_new_member(
+        child_instance_id, loop.agent_instance_id
+    )
+    finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -948,6 +959,7 @@ async def run_agent_tool(
                 loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES
             ),
             "receipt_components": receipt_components,
+            "finish_gate_state": finish_gate_state,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
                 "description": description,
@@ -961,6 +973,7 @@ async def run_agent_tool(
             "record_report": lambda report: receipt_components.setdefault(
                 "report", report
             ),
+            "finish_gate_state": finish_gate_state,
         }
     )
     child_task = loop._create_task(
@@ -1087,6 +1100,8 @@ async def run_agent_tool(
                 background_owner=loop._background_owner,
                 max_receipt_bytes=background_receipt_bytes,
                 explicit_finish=terminal_fence is not None,
+                child_loop=child_loop,
+                finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())
@@ -1210,30 +1225,19 @@ def _child_base_system_prompt(
     return context.system_prompt
 
 
-_EXPLICIT_FINISH_GUIDANCE = (
-    "With explicit finish enabled, this run ends only when you call the `finish` "
-    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
-    "apply). Ending a turn without calling `finish` leaves you idle for "
-    "follow-ups; call it when the contract's exit criteria are met or when you "
-    "are blocked."
-)
-
-
 def _compose_child_system_prompt(
     system_prompt: str | Message,
     preset: AgentPreset,
     *,
     explicit_finish: bool = False,
 ) -> str | Message:
-    """Apply the preset preamble and custom body to the child prompt."""
-
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = load_agent(preset)
+    body = preset.prompt_suffix
     if explicit_finish:
         body = (
-            f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"
+            f"{body}\n\n{EXPLICIT_FINISH_GUIDANCE}"
             if body
-            else _EXPLICIT_FINISH_GUIDANCE
+            else EXPLICIT_FINISH_GUIDANCE
         )
     if not body:
         return composed

@@ -331,29 +331,70 @@ def test_production_spawn_does_not_inherit_execution_owner(tmp_path: Path) -> No
         owner_send,
         owner_release_recv,
     )
-    spawned_pid, first_epoch = owner_ready.recv()
-    with ready_fifo.open() as stream:
-        child_pid = int(stream.read())
-    assert child_pid == spawned_pid
+    child_pid: int | None = None
+    child_released = False
+    contender: multiprocessing.Process | None = None
+    contender_recv = contender_send = None
+    try:
+        spawned_pid, first_epoch = owner_ready.recv()
+        with ready_fifo.open() as stream:
+            child_pid = int(stream.read())
+        assert child_pid == spawned_pid
 
-    contender_recv, contender_send = multiprocessing.Pipe(duplex=False)
-    contender = _spawn(_try_open, str(home), session_id, contender_send)
-    refusal = contender_recv.recv()
-    contender.join()
+        contender_recv, contender_send = multiprocessing.Pipe(duplex=False)
+        contender = _spawn(_try_open, str(home), session_id, contender_send)
+        refusal = contender_recv.recv()
+        contender.join()
 
-    os.kill(owner.pid, signal.SIGKILL)
-    owner.join()
-    assert owner.exitcode == -signal.SIGKILL
-    os.kill(child_pid, 0)
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.join()
+        assert owner.exitcode == -signal.SIGKILL
+        os.kill(child_pid, 0)
 
-    with SessionManager(home).open(session_id).store as successor:
-        successor_epoch = _epoch(successor)
-    with release_fifo.open("wb", buffering=0) as release:
-        release.write(b"1")
-    with done_fifo.open() as done:
-        assert done.read() == "done"
-    assert first_epoch is not None and successor_epoch != first_epoch
-    assert refusal[0:2] == ("error", "SessionOwnedError")
+        with SessionManager(home).open(session_id).store as successor:
+            successor_epoch = _epoch(successor)
+        with release_fifo.open("wb", buffering=0) as release:
+            release.write(b"1")
+        child_released = True
+        with done_fifo.open() as done:
+            assert done.read() == "done"
+        assert first_epoch is not None and successor_epoch != first_epoch
+        assert refusal[0:2] == ("error", "SessionOwnedError")
+    finally:
+        if owner.is_alive():
+            owner.kill()
+        owner.join()
+        if child_pid is not None and not child_released:
+            try:
+                release_fd = os.open(release_fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                try:
+                    os.write(release_fd, b"1")
+                finally:
+                    os.close(release_fd)
+        if child_pid is not None:
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+        for connection in (
+            owner_ready,
+            owner_send,
+            owner_release_recv,
+            _owner_release_send,
+            contender_recv,
+            contender_send,
+        ):
+            if connection is not None:
+                connection.close()
+        owner.close()
+        if contender is not None:
+            contender.close()
 
 
 def test_takeover_waits_for_detached_write_to_drain(
@@ -416,7 +457,10 @@ def test_takeover_waits_for_detached_write_to_drain(
         assert _epoch(successor) is not None
 
 
-def test_format_lock_and_execution_lock_order_across_processes(tmp_path: Path) -> None:
+def test_format_socket_and_execution_lock_order_across_processes(
+    tmp_path: Path,
+) -> None:
+    from zeta.server.server import ZetaServer
     from zeta.storage_format import StorageFormatError, advance, verify
 
     home = tmp_path / "home"
@@ -466,6 +510,39 @@ def test_format_lock_and_execution_lock_order_across_processes(tmp_path: Path) -
     assert result_recv.recv()[0] == "opened"
     contender.join()
     assert contender.exitcode == 0
+
+    socket_path = tmp_path / "serve.sock"
+    socket_lock_fd = os.open(
+        f"{socket_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600
+    )
+    fcntl.flock(socket_lock_fd, fcntl.LOCK_EX)
+    blocked_server = ZetaServer(
+        home=advanced_home, socket_path=socket_path, provider="codex"
+    )
+
+    async def fail_before_session_open() -> None:
+        try:
+            with pytest.raises(RuntimeError, match="already listening"):
+                await blocked_server.start()
+        finally:
+            await blocked_server.close()
+
+    try:
+        asyncio.run(fail_before_session_open())
+    finally:
+        fcntl.flock(socket_lock_fd, fcntl.LOCK_UN)
+        os.close(socket_lock_fd)
+
+    socket_result_recv, socket_result_send = multiprocessing.Pipe(duplex=False)
+    after_socket_failure = _spawn(
+        _try_open,
+        str(advanced_home),
+        advanced_session_id,
+        socket_result_send,
+    )
+    assert socket_result_recv.recv()[0] == "opened"
+    after_socket_failure.join()
+    assert after_socket_failure.exitcode == 0
     assert verify(advanced_home).writer_epoch == 2
     for connection in (
         owner_ready,
@@ -476,8 +553,11 @@ def test_format_lock_and_execution_lock_order_across_processes(tmp_path: Path) -
         session_send,
         result_recv,
         result_send,
+        socket_result_recv,
+        socket_result_send,
     ):
         connection.close()
     owner.close()
     creator.close()
     contender.close()
+    after_socket_failure.close()

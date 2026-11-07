@@ -30,7 +30,7 @@ from ..skills.agent_catalog import AgentCatalog
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
-from .loop.skill_refresh import RuntimePrompt
+from .prompt import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
 BackgroundEventSink = Callable[[StreamEvent], None]

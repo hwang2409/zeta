@@ -3926,7 +3926,7 @@ async def test_non_http_stream_exception_is_not_remapped(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_non_http_cleanup_exception_is_not_remapped(tmp_path: Path) -> None:
+async def test_non_http_cleanup_exception_is_typed_diagnostic(tmp_path: Path) -> None:
     class Response:
         status_code = 200
 
@@ -3945,13 +3945,19 @@ async def test_non_http_cleanup_exception_is_not_remapped(tmp_path: Path) -> Non
         def stream(self, method, url, *, headers, json):
             return Stream()
 
-    with pytest.raises(ValueError, match="cleanup bug"):
-        [
-            item
-            async for item in CodexBackend(
-                client=Client(), token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
-        ]
+    diagnostics_path = tmp_path / "diagnostics.jsonl"
+    items = [
+        item
+        async for item in CodexBackend(
+            client=Client(),
+            token_store=store_for(tmp_path / "codex.json"),
+            diagnostics_path=diagnostics_path,
+        ).complete([], [])
+    ]
+    assert items[-1].type is StreamEventType.MESSAGE_END
+    record = json.loads(diagnostics_path.read_text())
+    assert record["exception"] == "builtins.ValueError"
+    assert "cleanup bug" not in diagnostics_path.read_text()
 
 
 @pytest.mark.asyncio
@@ -4040,6 +4046,61 @@ class _CleanupClient:
     async def aclose(self):
         if self.client_error is not None:
             raise self.client_error()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["response", "client"])
+@pytest.mark.parametrize("primary", [False, True])
+async def test_cleanup_failure_keeps_primary_outcome_and_is_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+    primary: bool,
+) -> None:
+    events = (
+        [
+            event("response.created", response={"id": "response-test"}),
+            event("response.unknown"),
+        ]
+        if primary
+        else message_stream()
+    )
+    client = _CleanupClient(
+        events,
+        RuntimeError if scope == "response" else None,
+        RuntimeError if scope == "client" else None,
+    )
+    diagnostics_path = tmp_path / "diagnostics.jsonl"
+    if scope == "client":
+        monkeypatch.setattr(codex_module.httpx, "AsyncClient", lambda timeout=None: client)
+        backend = CodexBackend(
+            token_store=store_for(tmp_path / "codex.json"),
+            diagnostics_path=diagnostics_path,
+        )
+    else:
+        backend = CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            diagnostics_path=diagnostics_path,
+        )
+
+    outcome: RuntimeError | None = None
+    streamed: list[object] = []
+    try:
+        streamed = [item async for item in backend.complete([], [])]
+    except RuntimeError as exc:
+        outcome = exc
+
+    if primary:
+        assert isinstance(outcome, CodexStreamError)
+    else:
+        assert outcome is None
+        assert streamed[-1].type is StreamEventType.MESSAGE_END
+    assert diagnostics_path.exists()
+    record = json.loads(diagnostics_path.read_text())
+    assert record["type"] == "provider_cleanup_failed"
+    assert record["resource"] == scope
+    assert record["primary_outcome"] == ("error" if primary else "success")
 
 
 @pytest.mark.asyncio

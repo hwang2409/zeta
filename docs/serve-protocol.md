@@ -359,12 +359,24 @@ data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
 recovery.
 
-If another zeta process owns the session, `resume` returns `-32004` with
-`data.code: "session_owned"`, the requested `session_id`, and an optional
-`owner` object containing diagnostic `surface` and `pid` fields. The rejected
-resume keeps the server's previous session active. Session ownership requires
-a local filesystem with working `flock` semantics; zeta does not use a PID or
-timeout to take ownership from a live process.
+If the transcript is corrupt or uses a newer conversation format, `resume`
+returns `-32000` with bounded data:
+
+```text
+{
+  code: "corrupt_transcript",
+  kind: "torn_tail" | "invalid_row" | "broken_links" | "unsupported_format" | "unrecoverable_header",
+  row: integer | null,
+  repairable: boolean,
+  session_id: string,
+  actions: []
+}
+```
+
+The diagnosis-only protocol has no repair request, so `actions` is always the
+empty array. The object has at most six fields and contains no transcript
+bytes, payload text, file path, digest, source identity, or arbitrary exception
+text. `row` identifies the first bad physical row when it is known.
 
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
@@ -477,11 +489,11 @@ With `session_history_fidelity`, a queued steer that is dropped emits a live
 `delivery_status` event after the terminal row commits. Terminal `delivered` and
 `dropped` rows both appear in `session_history`. Each row has `id`,
 `role: "system"`, `event: "delivery_status"`, `delivery_id`, `method: "steer"`,
-`status`, and renderable `content` such as `steer dropped: abort`. A dropped row
-also has `reason` (`restart`, `abort`, `clear`, `disconnect`, `turn_end`, or
-`failed`). Accepted steer text is not included yet; it requires a new stored row
-type after the stored-format gate is available. A missing reason in an old
-session means unknown.
+`status`, and renderable `content`. New queued steers retain their accepted text,
+so live and reloaded terminal rows render that text. Legacy rows without retained
+text keep the generic status content. A dropped row also has `reason` (`restart`,
+`abort`, `clear`, `disconnect`, `turn_end`, or `failed`). A missing reason in an
+old session means unknown.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
@@ -685,12 +697,17 @@ that gets no answer within its own timeout can treat the server as hung.
 All examples below use the common event envelope:
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
 
 `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, and
-`turn_aborted` carry `data` when the loop supplies it. `turn_end` data includes
-`turn` and `tool_calls`.
+`turn_aborted` carry `data` when the loop supplies it. When the connection
+negotiates `served_turn_end`, each `turn_start` also carries `data.turn_id`, a
+lowercase UUID hex string that identifies the whole served turn. Connections
+without that feature receive the previous `turn_start` shape. `data.turn`
+continues to number provider segments inside the served turn, so several
+`turn_start` events can have the same `turn_id`. `turn_end` data includes `turn`
+and `tool_calls`.
 
 `assistant_delta` carries `delta` (a bounded string) and `kind` (`assistant`,
 `thinking`, or another content type). `assistant_message` carries `message`,
@@ -849,7 +866,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32001` | another client owns the socket |
 | `-32002` | handshake missing or protocol version mismatch |
 | `-32003` | no active session, or a detached host-bound session cannot start a turn |
-| `-32004` | a turn is already running, or another process owns the requested session |
+| `-32004` | a turn is already running |
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
 | `-32007` | outbound frame exceeds the size limit |
@@ -963,6 +980,7 @@ Event fields are:
 | event | required fields | optional fields |
 | --- | --- | --- |
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
+| `served_turn_end` (feature `served_turn_end`) | `event`, `data: {turn_id: string, reason: "completed"|"user_stop"|"error"|"disconnect"}` | `session_id`, `id` (history only), `role` (history only) |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
@@ -1018,9 +1036,15 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
    `turn_end` ends one provider segment; it does not mean that the agent loop
-   is idle. Clients must wait for `agent_end` before idle-only requests such as
-   `new_session`; the server finalizes the turn before it publishes `agent_end`,
-   while error and abort paths end with `error` or `turn_aborted` instead.
+   is idle, and one served turn can contain several `turn_end` events. The
+   separately negotiated `served_turn_end` history event records the final
+   outcome of the whole served turn. Its `data.turn_id` matches every negotiated
+   provider-segment `turn_start` in that served turn. It occurs at most once per
+   served turn and has one closed `data.reason`: `completed`, `user_stop`,
+   `error`, or `disconnect`. Clients must wait for `agent_end` before idle-only
+   requests such as `new_session`; the server commits `served_turn_end` before
+   cleanup. Error
+   and abort paths still end with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
@@ -1253,14 +1277,19 @@ both cases.
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
 implementation for the frontend client. Two RPCs cover the surface.
 
-- `slash_list`: params `session_id`. Returns `commands` and `notices`.
+- `slash_list`: params `session_id` and optional boolean `include_unavailable`
+  (default `false`). Returns `commands` and `notices`. By default, `commands`
+  contains only commands that `slash_run` can execute. With
+  `include_unavailable: true`, it is the complete shared catalog, including
+  TUI-owned commands that serve cannot execute.
   Each command entry has `name`, `description`, `kind` (`builtin`,
   `macro-prompt`, `macro-exec`, `skill`, or `mcp-prompt`), `source`
-  (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`
-  (`true` when the command needs a client-side surface — for example a
-  picker or workspace mutation), and `unavailable` (a bounded reason
-  string, or `null` when the command runs cleanly). The frontend client renders every
-  entry so users see what is available, then routes runs by the flags.
+  (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`, and
+  `unavailable`. Runnable entries have `client_only: false` and
+  `unavailable: null`. Complete-catalog entries that need the TUI have
+  `client_only: true` and the stable machine-readable reason
+  `unavailable: "requires_tui"`. Invalid `include_unavailable` values return
+  `-32602`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
@@ -1274,14 +1303,16 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `unknown`: no command matched the leading token.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
-The scope floor served over `slash_run` is `/status`, `/compact`,
-`/model`, `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
-`kind: prompt`) plus skills. `/model` splits by argument shape: argless
-`/model` returns `client_only` so the frontend client can open Settings for the
-picker surface, while `/model <name>` dispatches server-side through the
-shared settings-apply path. Exec macros and every command in the
-`client_only` set report themselves as client-only rather than
-half-executing here.
+The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
+`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
+`/vim`. Runnable user commands also include prompt macros
+(`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
+plus skills. Argless `/model` reports the current model, while `/model <name>`
+dispatches server-side through the shared settings-apply path. TUI-owned
+built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
+commands are omitted from the default catalog. Every invocation of one of
+these unavailable commands, including `/mcp status`, reports `client_only`
+instead of half-executing.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on
@@ -1325,6 +1356,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
@@ -1347,4 +1379,4 @@ observers are limited to `list_sessions`, `status`, `session_tree`, `session_his
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
-this is serve-only; no tui surface is added. serve owns connection output. controller writes remain direct and awaited. A claimed controller's pre-`hello` output is retained in emission order, up to 256 frames or 4 MiB, and is flushed after the successful `hello` response. If that bound is exceeded, the controller receives `-32011` (`controller output overflow`) after `hello` and is closed. Observer output is bounded; an observer that exceeds the queue limit is closed with `-32011`. Requests are read and dispatched sequentially.
+this is serve-only; no tui surface is added. serve owns connection output. each claimed connection has one retained-output bound of 256 frames or 4 MiB. the bound includes the frame being written, queued ordinary frames, and one reserved overflow error. a controller that exceeds the bound receives `-32011` (`controller output overflow`) when output can progress; an observer receives `-32011` (`observer output overflow`). after the error, the connection closes. if output cannot progress within the 1.0-second overflow deadline, serve aborts the transport and closes the connection without promising delivery of the error or a websocket close frame. requests are read and dispatched sequentially.

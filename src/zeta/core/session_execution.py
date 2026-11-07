@@ -12,9 +12,9 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ...storage_format import WriterLease
-from ..checkpoints import ConversationIntegrityError
-from ..session_files import SessionInUseError, open_session_file, require_off_loop_lock
+from ..storage_format import WriterLease
+from .checkpoints import ConversationIntegrityError
+from .session_files import SessionInUseError, open_session_file, require_off_loop_lock
 
 RUNTIME_LEASE_NAME = "runtime.lease"
 OwnerSurface = Literal["tui", "headless", "serve", "child", "recovery"]
@@ -239,6 +239,23 @@ class StoreRuntimeLeaseMixin:
     """Expose the store's execution capability to mutation and recovery seams."""
 
     _runtime_lease: SessionExecutionLease | None
+
+    def _open_execution_lease(
+        self,
+        directory_fd: int,
+        session_id: str,
+        execution_lease: SessionExecutionLease | None,
+        owner_surface: OwnerSurface,
+        recovery_owner: bool,
+    ) -> SessionExecutionLease:
+        if execution_lease is not None:
+            return execution_lease.retain()
+        return SessionExecutionLease.acquire(
+            directory_fd,
+            session_id=session_id,
+            owner=OwnerHint(owner_surface),
+            recovery=recovery_owner,
+        )
 
     @property
     def execution_lease(self) -> SessionExecutionLease:
