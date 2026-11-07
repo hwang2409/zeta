@@ -798,6 +798,52 @@ class BlockingThenCaptureBackend:
         )
 
 
+class ConcurrentDelegatedApprovalBackend:
+    def __init__(self, parent_calls: list[ToolCall], child_call: ToolCall) -> None:
+        self.parent = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=parent_calls),
+                ScriptedTurn([TextContent("done")]),
+            ]
+        )
+        self.children = {
+            prompt: FakeBackend(
+                [
+                    ScriptedTurn(tool_calls=[child_call]),
+                    ScriptedTurn([TextContent("done")]),
+                ]
+            )
+            for prompt in ("read one", "read two")
+        }
+        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
+        self.release_children = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        child_prompt = next(
+            (
+                block.text
+                for message in messages
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent) and block.text in self.children
+            ),
+            None,
+        )
+        backend = self.children.get(child_prompt, self.parent)
+        if child_prompt is not None and not backend.calls:
+            self.child_started[child_prompt].set()
+            await self.release_children.wait()
+        stream = backend.complete(messages, tool_schemas)
+        if child_prompt is None and self.parent.calls:
+            await asyncio.gather(
+                *(started.wait() for started in self.child_started.values())
+            )
+            yield await anext(stream)
+            self.release_children.set()
+        async for event in stream:
+            yield event
+
+
 class DelegatedApprovalBackend:
     def __init__(
         self,
@@ -3712,24 +3758,15 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         ToolCall(
             "agent-one",
             "agent",
-            {"prompt": "read", "description": "child one", "background": True},
+            {"prompt": "read one", "description": "child one", "background": True},
         ),
         ToolCall(
             "agent-two",
             "agent",
-            {"prompt": "read", "description": "child two", "background": True},
+            {"prompt": "read two", "description": "child two", "background": True},
         ),
     ]
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=parent_calls),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
-    )
+    backend = ConcurrentDelegatedApprovalBackend(parent_calls, child_call)
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -3743,6 +3780,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         assert first["request_id"] != second["request_id"]
         assert first["tool_call"]["id"] == second["tool_call"]["id"]
         assert first["delegated"] is True
+        assert second["delegated"] is True
         rejected = await _request(
             reader,
             writer,
