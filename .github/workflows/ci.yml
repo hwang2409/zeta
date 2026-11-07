@@ -119,8 +119,7 @@ jobs:
             head="$HEAD_SHA"
             commits=$(git rev-list --merges "$base..$head")
             if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
-              commits="$commits
-$(git rev-parse HEAD)"
+              commits="$commits $(git rev-parse HEAD)"
             fi
           else
             commits="$(git rev-parse HEAD)"
