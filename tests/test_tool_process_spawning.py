@@ -212,7 +212,9 @@ async def test_launcher_exit_before_failure_preserves_spawn_error(
             tool_spawn.warnings.simplefilter("ignore", DeprecationWarning)
             watcher = tool_spawn.events.get_child_watcher()
     monkeypatch.setattr(watcher, "add_child_handler", lambda *args: None)
+    # test-contract: seam no public hook can force the transport's process-exit race
     monkeypatch.setattr(tool_spawn, "_ToolSubprocessTransport", Transport)
+    # test-contract: seam no public hook orders launcher failure after process exit
     monkeypatch.setattr(tool_spawn, "_wait_for_launcher", fail_after_process_exit)
 
     with pytest.raises(RuntimeError, match="tool subprocess launcher failed to start"):
