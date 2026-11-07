@@ -118,86 +118,80 @@ def parse_items(
                     )
                 )
 
-    def visit_body(body: list[ast.stmt], scope: str = "") -> None:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    add_memberships(node, node.name)
+    def add_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        add_memberships(node, node.name)
+        result.append(
+            Item(
+                path,
+                "async def" if isinstance(node, ast.AsyncFunctionDef) else "def",
+                node.name,
+                node.lineno,
+            )
+        )
+
+    def add_collection_items(value: ast.expr, name: str, line: int) -> None:
+        rendered = (
+            ast.unparse(value)
+            if isinstance(value, ast.Constant) and isinstance(value.value, (int, float))
+            else ""
+        )
+        result.append(
+            Item(path, "constant" if rendered else "assignment", name, line, rendered)
+        )
+        elements = _collection_elements(value)
+        if elements is not None:
+            result.extend(
+                Item(
+                    path,
+                    "collection element",
+                    name,
+                    element.lineno,
+                    ast.unparse(element),
+                )
+                for element in elements
+            )
+
+    def add_assignment(node: ast.Assign | ast.AnnAssign, scope: str) -> None:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                add_collection_items(node.value, f"{scope}{target.id}", node.lineno)
+        if isinstance(node.value, ast.Dict):
+            result.extend(
+                Item(path, "string key", key.value, key.lineno)
+                for key in node.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            )
+
+    def add_dispatch_comparisons(node: ast.AST) -> None:
+        for comparison in ast.walk(node):
+            if (
+                isinstance(comparison, ast.Compare)
+                and len(comparison.ops) == 1
+                and isinstance(comparison.ops[0], ast.Eq)
+                and isinstance(comparison.left, ast.Name)
+                and isinstance(comparison.comparators[0], ast.Constant)
+                and isinstance(comparison.comparators[0].value, str)
+            ):
                 result.append(
                     Item(
                         path,
-                        "async def"
-                        if isinstance(node, ast.AsyncFunctionDef)
-                        else ("def" if isinstance(node, ast.FunctionDef) else "class"),
-                        node.name,
-                        node.lineno,
+                        "dispatch comparison",
+                        f'{comparison.left.id} == "{comparison.comparators[0].value}"',
+                        comparison.lineno,
                     )
                 )
-                if isinstance(node, ast.ClassDef):
-                    visit_body(node.body, f"{node.name}.")
+
+    def visit_body(body: list[ast.stmt], scope: str = "") -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                add_function(node)
+            elif isinstance(node, ast.ClassDef):
+                result.append(Item(path, "class", node.name, node.lineno))
+                visit_body(node.body, f"{node.name}.")
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-                value = node.value
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        name = f"{scope}{target.id}"
-                        rendered = (
-                            ast.unparse(value)
-                            if isinstance(value, ast.Constant)
-                            and isinstance(value.value, (int, float))
-                            else ""
-                        )
-                        result.append(
-                            Item(
-                                path,
-                                "constant" if rendered else "assignment",
-                                name,
-                                node.lineno,
-                                rendered,
-                            )
-                        )
-                        elements = _collection_elements(value)
-                        if elements is not None:
-                            for element in elements:
-                                result.append(
-                                    Item(
-                                        path,
-                                        "collection element",
-                                        name,
-                                        element.lineno,
-                                        ast.unparse(element),
-                                    )
-                                )
-                    if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
-                        for key in value.keys if isinstance(value, ast.Dict) else []:
-                            if isinstance(key, ast.Constant) and isinstance(
-                                key.value, str
-                            ):
-                                result.append(
-                                    Item(path, "string key", key.value, key.lineno)
-                                )
-            for node2 in ast.walk(node):
-                if (
-                    isinstance(node2, ast.Compare)
-                    and len(node2.ops) == 1
-                    and isinstance(node2.ops[0], ast.Eq)
-                ):
-                    left, right = node2.left, node2.comparators[0]
-                    if (
-                        isinstance(left, ast.Name)
-                        and isinstance(right, ast.Constant)
-                        and isinstance(right.value, str)
-                    ):
-                        result.append(
-                            Item(
-                                path,
-                                "dispatch comparison",
-                                f'{left.id} == "{right.value}"',
-                                node2.lineno,
-                            )
-                        )
+                add_assignment(node, scope)
+            add_dispatch_comparisons(node)
 
     visit_body(tree.body)
     return result, unresolved
@@ -358,6 +352,21 @@ def _module_name(path: str) -> str:
     return path.removeprefix("src/").removesuffix(".py").replace("/", ".")
 
 
+def _index_collections(
+    tree: ast.Module, module: str, collections: dict[str, list[ast.expr]]
+) -> None:
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        elements = _collection_elements(node.value)
+        if elements is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                collections[f"{module}.{target.id}"] = elements
+
+
 def _revision_index(
     paths: set[str], sources: dict[tuple[str, str], str | None], revision: str
 ) -> tuple[dict[str, ast.Module], dict[str, list[ast.expr]]]:
@@ -369,18 +378,62 @@ def _revision_index(
             continue
         tree = ast.parse(text, filename=path)
         trees[path] = tree
-        module = _module_name(path)
-        for node in tree.body:
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            elements = _collection_elements(node.value)
-            if elements is None:
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    collections[f"{module}.{target.id}"] = elements
+        _index_collections(tree, _module_name(path), collections)
     return trees, collections
+
+
+def _lookup_import(
+    lookup: dict[str, list[ast.expr]],
+    alias: ast.alias,
+    module_collections: dict[str, list[ast.expr]],
+) -> None:
+    name = alias.asname or alias.name.rsplit(".", 1)[-1]
+    prefix = alias.name + "."
+    lookup.update(
+        {
+            f"{name}.{full[len(prefix) :]}": elements
+            for full, elements in module_collections.items()
+            if full.startswith(prefix)
+        }
+    )
+
+
+def _relative_module(module: str, node: ast.ImportFrom) -> str:
+    package = module.split(".")[:-1]
+    module_name = ".".join(package[: len(package) - node.level + 1])
+    if node.module:
+        return f"{module_name}.{node.module}" if module_name else node.module
+    return module_name
+
+
+def _lookup_from_import(
+    lookup: dict[str, list[ast.expr]],
+    node: ast.ImportFrom,
+    module: str,
+    module_collections: dict[str, list[ast.expr]],
+) -> None:
+    module_name = (
+        _relative_module(module, node)
+        if node.level
+        else (node.module or module.rsplit(".", 1)[0])
+    )
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        imported_name = alias.asname or alias.name
+        if node.module is None:
+            prefix = f"{module_name}.{alias.name}" if module_name else alias.name
+            lookup.update(
+                {
+                    f"{imported_name}.{full[len(prefix) + 1 :]}": elements
+                    for full, elements in module_collections.items()
+                    if full.startswith(f"{prefix}.")
+                }
+            )
+        else:
+            full = f"{module_name}.{alias.name}" if module_name else alias.name
+            if full in module_collections:
+                lookup[imported_name] = module_collections[full]
 
 
 def _path_lookup(
@@ -395,44 +448,9 @@ def _path_lookup(
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                name = alias.asname or alias.name.rsplit(".", 1)[-1]
-                prefix = alias.name + "."
-                lookup.update(
-                    {
-                        f"{name}.{full[len(prefix) :]}": elements
-                        for full, elements in module_collections.items()
-                        if full.startswith(prefix)
-                    }
-                )
+                _lookup_import(lookup, alias, module_collections)
         elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                package = module.split(".")[:-1]
-                module_name = ".".join(package[: len(package) - node.level + 1])
-                if node.module:
-                    module_name = (
-                        f"{module_name}.{node.module}" if module_name else node.module
-                    )
-            else:
-                module_name = node.module or module.rsplit(".", 1)[0]
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                imported_name = alias.asname or alias.name
-                if node.module is None:
-                    prefix = (
-                        f"{module_name}.{alias.name}" if module_name else alias.name
-                    )
-                    lookup.update(
-                        {
-                            f"{imported_name}.{full[len(prefix) + 1 :]}": elements
-                            for full, elements in module_collections.items()
-                            if full.startswith(f"{prefix}.")
-                        }
-                    )
-                else:
-                    full = f"{module_name}.{alias.name}" if module_name else alias.name
-                    if full in module_collections:
-                        lookup[imported_name] = module_collections[full]
+            _lookup_from_import(lookup, node, module, module_collections)
     return lookup
 
 
@@ -457,6 +475,90 @@ def parse_revisions(
             unresolved.update(unresolved_in_file)
             parsed[revision].update({item_key(item): item for item in found})
     return parsed, unresolved, None
+
+
+def _ordinary_findings(
+    main_items: dict,
+    old_items: dict,
+    branch_items: dict,
+    merge_items: dict,
+    changed: set[str],
+) -> list[Item]:
+    findings = []
+    for key, item in main_items.items():
+        if item.kind in {"collection element", "membership element"}:
+            continue
+        candidate = key not in old_items or item.path in changed
+        if candidate and key not in merge_items:
+            if key not in branch_items and key in old_items:
+                continue
+            findings.append(item)
+    return findings
+
+
+def _constant_findings(
+    main_items: dict, branch_items: dict, merge_items: dict
+) -> list[Item]:
+    return [
+        Item(item.path, item.kind, item.name, item.line, item.value)
+        for key, item in main_items.items()
+        if item.kind == "constant"
+        and key in merge_items
+        and key in branch_items
+        and merge_items[key].value not in {item.value, branch_items[key].value}
+    ]
+
+
+def _element_findings(
+    old_items: dict,
+    main_items: dict,
+    branch_items: dict,
+    merge_items: dict,
+    unresolved: set[tuple[str, str]],
+) -> list[Item]:
+    findings = []
+    for key, item in {**main_items, **branch_items}.items():
+        if item.kind not in {"collection element", "membership element"}:
+            continue
+        if key in merge_items or (
+            item.kind == "membership element" and (item.path, item.name) in unresolved
+        ):
+            continue
+        main_item = main_items.get(key)
+        branch_item = branch_items.get(key)
+        if (main_item is None or branch_item is None) and key in old_items:
+            continue
+        if _owner_was_removed(key, old_items, main_items) or _owner_was_removed(
+            key, old_items, branch_items
+        ):
+            continue
+        findings.append(item)
+    return findings
+
+
+def _render_finding(
+    finding: Item, main_items: dict, branch_items: dict, merge_items: dict
+) -> None:
+    key = item_key(finding)
+    branch_item = branch_items.get(key)
+    merged = merge_items.get(key)
+    where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merge absent"
+    if finding.kind == "constant" and merged is not None:
+        where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merged value {merged.value!r}"
+    if finding.kind in {"collection element", "membership element"}:
+        parents_with_element = []
+        main_item = main_items.get(key)
+        if main_item:
+            parents_with_element.append(f"main parent line {main_item.line}")
+        if branch_item:
+            parents_with_element.append(f"branch parent line {branch_item.line}")
+        where = "; ".join(parents_with_element) + "; merge absent"
+        print(f"{finding.path}: {finding.name} element {finding.value!r}: {where}")
+    else:
+        print(f"{finding.path}: {finding.kind} {finding.name}: {where}")
+    print(
+        f"  add: merge-resolution: {finding.path} {finding.kind} {finding.name} -> explain intended drop"
+    )
 
 
 def main() -> int:
@@ -502,76 +604,23 @@ def main() -> int:
     old_items, main_items, branch_items, merge_items = (
         parsed[revision] for revision in revisions
     )
-    findings: list[Item] = []
-    for key, item in main_items.items():
-        path, _kind, _name, _value = key
-        if item.kind in {"collection element", "membership element"}:
-            continue
-        candidate = key not in old_items or path in changed
-        if candidate and key not in merge_items:
-            if key not in branch_items and key in old_items:
-                continue
-            findings.append(item)
-    for key, item in main_items.items():
-        if (
-            item.kind == "constant"
-            and key in merge_items
-            and key in branch_items
-            and merge_items[key].value not in {item.value, branch_items[key].value}
-        ):
-            findings.append(
-                Item(item.path, item.kind, item.name, item.line, item.value)
-            )
-    for key, item in {**main_items, **branch_items}.items():
-        if (
-            item.kind not in {"collection element", "membership element"}
-            or key in merge_items
-            or (
-                item.kind == "membership element"
-                and (item.path, item.name) in unresolved
-            )
-        ):
-            continue
-        main_item = main_items.get(key)
-        branch_item = branch_items.get(key)
-        if (main_item is None or branch_item is None) and key in old_items:
-            continue
-        if _owner_was_removed(key, old_items, main_items) or _owner_was_removed(
-            key, old_items, branch_items
-        ):
-            continue
-        findings.append(item)
+    findings = _ordinary_findings(
+        main_items, old_items, branch_items, merge_items, changed
+    )
+    findings.extend(_constant_findings(main_items, branch_items, merge_items))
+    findings.extend(
+        _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
+    )
     lines = text.splitlines()
     findings = [
-        f
-        for i, f in enumerate(findings)
-        if f not in findings[:i] and not any(marker(line, f) for line in lines)
+        finding
+        for index, finding in enumerate(findings)
+        if finding not in findings[:index]
+        and not any(marker(line, finding) for line in lines)
     ]
     if findings:
         for finding in findings:
-            key = item_key(finding)
-            branch_item = branch_items.get(key)
-            merged = merge_items.get(key)
-            where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merge absent"
-            if finding.kind == "constant" and merged is not None:
-                where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merged value {merged.value!r}"
-            if finding.kind in {"collection element", "membership element"}:
-                parents_with_element = []
-                if main_item := main_items.get(key):
-                    parents_with_element.append(f"main parent line {main_item.line}")
-                if branch_item := branch_items.get(key):
-                    parents_with_element.append(
-                        f"branch parent line {branch_item.line}"
-                    )
-                where = "; ".join(parents_with_element) + "; merge absent"
-                print(
-                    f"{finding.path}: {finding.name} element {finding.value!r}: {where}"
-                )
-            else:
-                print(f"{finding.path}: {finding.kind} {finding.name}: {where}")
-            print(
-                f"  add: merge-resolution: {finding.path} {finding.kind} {finding.name} -> explain intended drop"
-            )
+            _render_finding(finding, main_items, branch_items, merge_items)
         return 1
     print(
         f"clean merge: {len(main_items)} main-side items checked across {len(all_paths)} Python files"

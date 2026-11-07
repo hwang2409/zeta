@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
-SCRIPT = Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+SCRIPT = Path(
+    os.environ.get(
+        "SCRIPT", Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+    )
+)
 
 
 def run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -249,11 +254,13 @@ def test_collection_lookup_cannot_hide_two_file_loss(tmp_path: Path):
     subprocess.run(
         ["git", "checkout", "-q", "branch", "--", "src/a.py"], cwd=r, check=True
     )
-    commit(r, "bad merge")
+    commit(
+        r,
+        "bad merge\n\nmerge-resolution: src/a.py collection element EVENTS -> intentional",
+    )
     result = run(r)
     assert result.returncode == 1
-    assert "src/a.py" in result.stdout
-    assert "B" in result.stdout
+    assert "src/a.py membership element check|event" in result.stdout
 
 
 def test_renamed_function_owns_no_merge_element_finding(tmp_path: Path):
