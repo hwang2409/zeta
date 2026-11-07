@@ -4817,6 +4817,30 @@ def test_agent_schema_uses_preset_registry(
     assert agent_type_schema["description"] == expected_description
 
 
+def test_child_registry_agent_schema_uses_its_catalog_snapshot(tmp_path: Path) -> None:
+    initial = AgentCatalog((replace(GENERAL_PRESET, name="initial"),))
+    current = AgentCatalog((replace(GENERAL_PRESET, name="nested"),))
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=initial,
+    )
+    registry.agent_catalog = current
+
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    try:
+        child = registry.clone_for_session(child_store)
+        schema = child.definition_reference("agent").schema()
+        properties = schema["parameters"]["properties"]
+        assert properties["agent_type"]["enum"] == ["nested"]
+        assert properties["preset"]["enum"] == ["nested"]
+    finally:
+        child_store.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> None:
     omitted = ConversationStore(tmp_path / "omitted", cwd=tmp_path)

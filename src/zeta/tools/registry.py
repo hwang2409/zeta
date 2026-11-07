@@ -781,6 +781,16 @@ class ToolRegistry:
         )
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
+        agent_definition = clone.definition_reference("agent")
+        if agent_definition is not None:
+            from .agent import agent_tool_schema
+
+            description, parameters = agent_tool_schema(clone.agent_catalog)
+            clone._tools["agent"] = replace(
+                agent_definition,
+                description=description,
+                parameters=parameters,
+            )
         clone.project_id = self.project_id
         clone.inbox_target_ids = self.inbox_target_ids
         clone.project_registry = self.project_registry
