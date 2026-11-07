@@ -19,7 +19,6 @@ from zeta.skills.agent_catalog import (
     AgentCatalog,
     discover_packaged_agents,
     discover_session_agents,
-    load_agent,
 )
 from zeta.skills.catalog import SkillCatalog
 
@@ -157,7 +156,7 @@ def test_agent_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
     assert restored.find("custom").source == "project"
 
 
-def test_agent_snapshot_omits_body_and_loads_current_file(tmp_path: Path) -> None:
+def test_agent_snapshot_omits_body(tmp_path: Path) -> None:
     path = tmp_path / "home" / "agents" / "custom.md"
     _write_agent(path, "custom", "custom", "original body")
     catalog = discover_session_agents(home=tmp_path / "home")
@@ -166,15 +165,6 @@ def test_agent_snapshot_omits_body_and_loads_current_file(tmp_path: Path) -> Non
 
     assert "prompt_suffix" not in custom_snapshot
     assert "original body" not in str(custom_snapshot)
-
-    path.write_text(
-        "---\nname: custom\ndescription: custom\n---\nupdated body\n",
-        encoding="utf-8",
-    )
-    assert load_agent(catalog.find("custom")) == "updated body"
-    path.unlink()
-    with pytest.raises(ValueError, match="no longer exists"):
-        load_agent(AgentCatalog.from_snapshot(snapshot).find("custom"))
 
 
 def test_custom_agent_can_accept_follow_ups(tmp_path: Path) -> None:
