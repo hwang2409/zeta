@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-MAX_AGENT_DEPTH = 2
+DEFAULT_MAX_AGENT_DEPTH = 3
+HARD_MAX_AGENT_DEPTH = 5
 
 
-def child_depth(parent_depth: int, _background: bool) -> tuple[int, str | None]:
+def child_depth(
+    parent_depth: int, max_depth: int, _background: bool
+) -> tuple[int, str | None]:
     depth = parent_depth + 1
-    if depth > MAX_AGENT_DEPTH:
-        return depth, f"agent error: maximum agent nesting depth is {MAX_AGENT_DEPTH}"
+    if depth > max_depth:
+        return depth, f"agent error: maximum agent nesting depth is {max_depth}"
     return depth, None

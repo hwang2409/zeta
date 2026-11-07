@@ -793,6 +793,11 @@ class _Client:
                 if runtime.loop is not None
                 else runtime._config(None, None).agents_explicit_finish
             ),
+            "max_agent_depth": (
+                runtime.loop.max_agent_depth
+                if runtime.loop is not None
+                else runtime._config(None, None).agents_max_depth
+            ),
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),

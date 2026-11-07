@@ -46,7 +46,6 @@ from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from .background import CancellationRequest, finish_background_child
-from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -367,6 +366,7 @@ async def _build_child_loop(
     child_store: ConversationStore,
     child_instance_id: str,
     child_depth: int,
+    child_max_depth: int,
     preset: AgentPreset,
     model: object,
     cwd_override: Path | None,
@@ -378,14 +378,11 @@ async def _build_child_loop(
     child_policy: ChildApprovalPolicy | None = None
     try:
         excluded_names = {"inbox", "request_attention", "resolve_attention"}
-        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
+        if child_depth >= child_max_depth or not preset.allow_delegation:
             excluded_names.add("agent")
         if preset.tool_names is not None:
-            allowed_names = set(preset.tool_names)
-            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
-                allowed_names.add("agent")
             excluded_names.update(
-                set(loop.tool_registry.definitions_by_name) - allowed_names
+                set(loop.tool_registry.definitions_by_name) - preset.tool_names
             )
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
@@ -463,6 +460,7 @@ async def _build_child_loop(
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
+            max_agent_depth=child_max_depth,
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -593,7 +591,9 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
+    child_depth, nesting_error = next_agent_depth(
+        loop.agent_depth, loop.max_agent_depth, background
+    )
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -781,6 +781,12 @@ async def run_agent_tool(
             child_store=child_store,
             child_instance_id=child_instance_id,
             child_depth=child_depth,
+            child_max_depth=min(
+                loop.max_agent_depth,
+                preset.max_child_depth
+                if preset.max_child_depth is not None
+                else loop.max_agent_depth,
+            ),
             preset=preset,
             model=model,
             cwd_override=cwd_override,

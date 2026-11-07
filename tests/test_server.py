@@ -1904,6 +1904,7 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
+        assert status["max_agent_depth"] == 3
     finally:
         await _close(server, writer)
 

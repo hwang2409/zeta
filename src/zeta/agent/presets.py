@@ -27,6 +27,7 @@ class AgentPreset:
     allow_delegation: bool = True
     accepts_follow_ups: bool = False
     explicit_finish: bool = False
+    max_child_depth: int | None = None
 
     @property
     def description(self) -> str:
