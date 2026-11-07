@@ -846,7 +846,11 @@ def _recover_agent_children(
         recovery_stores: dict[Path, ConversationStore] = {}
         with ExitStack() as recovery_leases:
             if not acquire_recovery_subtree(
-                loop.store, child_path, recovery_leases, recovery_stores
+                loop.store,
+                child_path,
+                recovery_leases,
+                recovery_stores,
+                notification_store=notification_store,
             ):
                 busy_child_subtrees.add(child_instance_id)
                 continue

@@ -116,6 +116,8 @@ def acquire_recovery_subtree(
     child_path: Path,
     leases: ExitStack,
     recovery_stores: dict[Path, ConversationStore],
+    *,
+    notification_store: ConversationStore,
 ) -> bool:
     """Lease a complete child subtree before any recovery mutation."""
 
@@ -123,9 +125,38 @@ def acquire_recovery_subtree(
         child_store = open_child_store(parent_store, child_path)
     except SessionOwnedError:
         return False
-    except TranscriptLoadError:
-        # keep the parent usable; the child remains unavailable until repair
-        return False
+    except TranscriptLoadError as error:
+        if error._source_facts is None:
+            return False
+        try:
+            relative = child_path.relative_to(parent_store.session_dir).parts
+            segments = tuple(
+                int(relative[index]) for index in range(1, len(relative), 2)
+            )
+            child_run_id = ":".join(
+                (parent_store.session_id, *(str(segment) for segment in segments))
+            )
+            child_store = ConversationStore(
+                child_path.parent,
+                session_id=child_path.name,
+                cwd=parent_store.cwd,
+                _storage_lease=parent_store._storage_lease,
+                _owner_surface="recovery",
+                _recovery_owner=True,
+                _repair_explicit=True,
+                _repair_target=RepairTarget(parent_store.session_id, child_run_id),
+            )
+            result = child_store.last_repair_result
+            if result is None:
+                child_store.close()
+                return False
+            append_transcript_recovery_notification(
+                notification_store,
+                result,
+                child_session_path=str(child_path),
+            )
+        except (SessionOwnedError, TranscriptLoadError, ValueError):
+            return False
     if child_store is None:
         return True
     leases.enter_context(child_store)
@@ -138,6 +169,7 @@ def acquire_recovery_subtree(
             Path(marker["child_session_path"]),
             leases,
             recovery_stores,
+            notification_store=notification_store,
         )
         for marker in child_store.agent_children().values()
     )

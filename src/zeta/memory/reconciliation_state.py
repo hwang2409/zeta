@@ -18,8 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..project_registry import ProjectRegistryError
 from ..providers.stream_diagnostics import write_stream_diagnostic
-from ..storage_format import PatchRecords, SetValue, WriterLease
+from ..storage_format import PatchRecords, SetValue, WRITER_EPOCH, WriterLease
 
 MAX_SCHEDULED_ATTEMPTS = 3
 _MAX_RECENT_TERMINAL_RECEIPTS = 100
@@ -703,6 +704,10 @@ class ReconciliationState:
                 pass
 
     def _publish(self, reason: str) -> None:
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise ProjectRegistryError(
+                "memory writes are unavailable before the writer epoch"
+            )
         self._value["session_id"] = self.session_id
         self._value["project_id"] = self.project_id
         self._value["reason"] = reason
