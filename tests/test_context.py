@@ -1343,6 +1343,7 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
     ]
 
 
+@pytest.mark.benchmark
 @pytest.mark.asyncio
 async def test_marker_replay_chain_scales_linearly(context_root: Path) -> None:
     store = ConversationStore(context_root)

@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import read_pid_file, wait_for_path_command
 from zeta.agent.background import BackgroundAgentOwner
@@ -2251,7 +2252,17 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
 
 
 @pytest.mark.asyncio
-async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
+async def test_close_terminates_many_tasks_in_one_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    termination_batches: list[int] = []
+    terminate_processes = process_module._terminate_processes
+
+    async def record_batch(processes, term_grace, *, finish):
+        termination_batches.append(len(processes))
+        return await terminate_processes(processes, term_grace, finish=finish)
+
+    monkeypatch.setattr(process_module, "_terminate_processes", record_batch)
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
         await tasks.start(
@@ -2261,11 +2272,9 @@ async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -
         for _ in range(20)
     ]
 
-    started = asyncio.get_running_loop().time()
     await tasks.close()
-    elapsed = asyncio.get_running_loop().time() - started
 
-    assert elapsed < 1
+    assert termination_batches == [len(task_ids)]
     assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
 
 

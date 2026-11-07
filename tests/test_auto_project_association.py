@@ -6,7 +6,6 @@ import multiprocessing
 import os
 import subprocess
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -294,21 +293,23 @@ def test_git_discovery_timeout_is_bounded_and_warns(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nsleep 6\n", encoding="utf-8")
-    fake_git.chmod(0o755)
+    from zeta.core import project_context
+
+    timeouts: list[float] = []
+
+    def time_out(command: list[str], *args: object, **kwargs: object):
+        timeout = float(kwargs["timeout"])
+        timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(project_context.subprocess, "run", time_out)
     plain = tmp_path / "plain"
     plain.mkdir()
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
 
-    started = time.monotonic()
     with caplog.at_level(logging.WARNING):
         opened = manager(tmp_path).create(provider="codex", model="test", cwd=plain)
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5
+    assert timeouts == [pytest.approx(2.0)]
     assert opened.metadata.project_id is None
     assert "git project discovery timed out" in caplog.text
     opened.store.close()
@@ -440,30 +441,31 @@ def test_startup_runs_git_discovery_once_for_association_and_instruction_policy(
 def test_hanging_git_frontend_startup_has_one_bounded_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from zeta.core import project_context
     from zeta.tui.app import create_app
 
+    calls = 0
+
+    def time_out(command: list[str], *args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(project_context.subprocess, "run", time_out)
     cwd = tmp_path / "plain"
     cwd.mkdir()
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
-    fake_git.chmod(0o755)
     home = tmp_path / "zeta-home"
     user_home = tmp_path / "user-home"
     user_home.mkdir()
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(cwd)
 
-    started = time.monotonic()
     with caplog.at_level(logging.WARNING):
         app = create_app(build_parser().parse_args(["--provider", "codex"]))
-    elapsed = time.monotonic() - started
     try:
-        assert elapsed < 4
         warnings = [r for r in caplog.records if "git project discovery" in r.message]
+        assert calls == 1
         assert len(warnings) == 1
     finally:
         asyncio.run(app.close())
@@ -472,6 +474,7 @@ def test_hanging_git_frontend_startup_has_one_bounded_warning(
 def test_hanging_git_registered_project_one_warning_one_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from zeta.core import project_context
     from zeta.tui.app import create_app
 
     root = repo(tmp_path)
@@ -483,23 +486,23 @@ def test_hanging_git_registered_project_one_warning_one_deadline(
     project = ProjectRegistry(home / "projects").create_project("repo", "git", root)
     private = home / "projects" / project.project_id / "AGENTS.md"
     private.write_text("PRIVATE-MUST-NOT-LOAD", encoding="utf-8")
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
-    fake_git.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    calls = 0
+
+    def time_out(command: list[str], *args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(project_context.subprocess, "run", time_out)
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(cwd)
 
-    started = time.monotonic()
     with caplog.at_level(logging.WARNING):
         app = create_app(build_parser().parse_args(["--provider", "codex"]))
-    elapsed = time.monotonic() - started
     try:
         warnings = [r for r in caplog.records if "git project discovery" in r.message]
-        assert elapsed < 4
+        assert calls == 1
         assert len(warnings) == 1
         assert app.loop.session_metadata.project_id is None
         assert "PRIVATE-MUST-NOT-LOAD" not in app.loop.context_assembler.system_prompt.content[0].text

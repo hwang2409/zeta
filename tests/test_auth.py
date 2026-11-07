@@ -464,6 +464,7 @@ def test_error_body_excerpt_handles_deep_multipart_without_recursion() -> None:
     assert max(depths) == depth
 
 
+@pytest.mark.benchmark
 def test_error_body_excerpt_joins_large_folded_header_once() -> None:
     folded = " ;\r\n" * (792_000 // 3)
     body = (
@@ -487,6 +488,7 @@ def test_error_body_excerpt_joins_large_folded_header_once() -> None:
     assert elapsed < 5.0
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize(
     ("size_kib", "budget_seconds"),
     [(512, 0.01), (4096, 0.1), (16384, 0.4)],

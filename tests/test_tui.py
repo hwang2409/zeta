@@ -103,7 +103,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -11367,13 +11367,12 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
         return original_refresh(*args, **kwargs)
 
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
         await wait_until(entered.is_set)
-        started = time.monotonic()
         await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
         assert not source._closed
     finally:
         agent_sync._REFRESH_LOCK.release()
@@ -11416,13 +11415,12 @@ async def test_tui_close_hands_off_blocked_todo_source(
         return original_refresh()
 
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
         await wait_until(entered.is_set)
-        started = time.monotonic()
         await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
         assert not source._closed
     finally:
         source._lock.release()
@@ -13759,19 +13757,21 @@ async def test_accounts_refresh_does_not_block_event_loop(
     app._presenter.print_unit = Mock()
     app._transcript.replace = lambda unit, replacement: replacement
 
-    async def blocking_refresh(self):
-        time.sleep(0.2)  # noqa: ASYNC251 - proves the work runs on another thread
+    owner_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+
+    async def observed_refresh(self):
+        refresh_threads.append(threading.get_ident())
         return {}
 
-    monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
+    monkeypatch.setattr(AccountUsage, "refresh_stale", observed_refresh)
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        started = time.monotonic()
-        await asyncio.sleep(0.02)
-        assert time.monotonic() - started < 0.1
-        while app._accounts_picker and app._accounts_picker.refreshing:
-            await asyncio.sleep(0.01)
+        await wait_until(
+            lambda: app._accounts_picker is None or not app._accounts_picker.refreshing
+        )
+        assert refresh_threads and refresh_threads[0] != owner_thread
     finally:
         opened.store.close()
 

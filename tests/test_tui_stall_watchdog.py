@@ -57,6 +57,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     loop_blocked = threading.Event()
     release_loop: queue.SimpleQueue[None] = queue.SimpleQueue()
     record_written = threading.Event()
+    clock_values = iter((0.0, 0.05, 0.05))
 
     def before_probe() -> None:
         probe_ready.set()
@@ -82,6 +83,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         probe_interval=0.01,
         stall_threshold=0.05,
         sample_interval=0.02,
+        clock=lambda: next(clock_values),
         utc_now=lambda: datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
         before_probe=before_probe,
         after_sample=after_sample,
@@ -107,7 +109,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["start_time"] == "2026-01-02T03:04:05Z"
-    assert records[0]["duration_ms"] >= 50
+    assert records[0]["duration_ms"] == 50
     assert records[0]["session_id"] == "session-123"
     assert any(
         frame["function"] == "block_loop"
