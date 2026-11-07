@@ -191,9 +191,9 @@ def test_orchestrator_can_resolve_own_attention_without_inbox(tmp_path: Path) ->
     assert repeated["structuredContent"]["already_resolved"] is True
     assert resolved.status == "resolved"
     assert resolved.decision == "Use SQLite."
-    assert len(ProjectInbox(
+    assert ProjectInbox(
         manager.project_registry, sessions_root=tmp_path / "sessions"
-    ).new_ids(project.project_id, session_id=original.store.session_id)) == 1
+    ).new_ids(project.project_id, session_id=original.store.session_id) == ()
     asyncio.run(registry.close())
     original.store.close()
 

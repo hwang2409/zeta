@@ -47,10 +47,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             )
             for index in range(3)
         )), what="create attention records")
-        payload = json.dumps(
-            [{"id": record.id, "reply": "yes"} for record in records],
-            separators=(",", ":"),
-        )
+        payload = json.dumps([{"id": record.id, "reply": "yes"} for record in records])
         response = (
             await _request(
                 reader,

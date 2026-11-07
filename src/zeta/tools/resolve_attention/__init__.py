@@ -74,9 +74,9 @@ async def _close_attention(
 ) -> StructuredToolResult:
     store = registry.session_store
     home = store.session_dir.parent.parent
-    _message_id, already_resolved = await asyncio.to_thread(
-        AttentionReplies(home, store.session_id, registry_state=registry.project_registry_state).reply,
-        arguments["attention_id"], arguments["decision"], store.session_id,
+    already_resolved = await asyncio.to_thread(
+        AttentionReplies(home, store.session_id, registry_state=registry.project_registry_state).resolve_local,
+        arguments["attention_id"], arguments["decision"],
     )
     record = await asyncio.to_thread(AttentionStore(store.session_dir).get, arguments["attention_id"])
     if already_resolved:

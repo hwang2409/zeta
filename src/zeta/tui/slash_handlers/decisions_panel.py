@@ -115,11 +115,12 @@ class DecisionsMixin:
                 return f"dismissed {attention_id}"
             if len(parts) < 3 or not parts[2].strip():
                 return "reply text must be nonempty"
-            await asyncio.to_thread(
+            _message_id, already_resolved = await asyncio.to_thread(
                 AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).reply,
                 record.id, parts[2], self.loop.store.session_id,
             )
-            self._schedule_background_wake()
+            if not already_resolved:
+                self._schedule_background_wake()
             return f"replied to {attention_id}"
         if not items:
             return "no open attention items"
@@ -177,6 +178,19 @@ class DecisionsMixin:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
+        from ...attention_replies import AttentionReplies
+
+        async def recover() -> None:
+            await asyncio.to_thread(
+                AttentionReplies(
+                    self._home,
+                    self._decisions_session_id,
+                    registry_state=_registry_state(self),
+                ).recover
+            )
+            await self._decisions_tick()
+
+        asyncio.create_task(recover())
         buffer = session.default_buffer
         self._decisions_restore_text = buffer.text
         self._decisions_restore_cursor = buffer.cursor_position
@@ -208,10 +222,12 @@ class DecisionsMixin:
 
         try:
             for session_id in self._decisions_session_ids():
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     AttentionReplies(self._home, session_id, registry_state=_registry_state(self)).flush,
                     self.loop.store.session_id,
                 )
+                if result.published:
+                    self._schedule_background_wake()
         except (OSError, ValueError) as exc:
             self._print_system(f"decisions not delivered: {exc}")
 

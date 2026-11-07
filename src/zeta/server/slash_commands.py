@@ -117,7 +117,10 @@ class ServerSlashSession:
         opened = self._runtime.opened
         if loop is None or opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        parts = args.split(maxsplit=2)
+        command, separator, remainder = args.strip().partition(" ")
+        parts = [command]
+        if separator:
+            parts.extend([remainder] if command == "batch" else remainder.split(maxsplit=1))
         registry_state = self._runtime.manager.project_registry_state
         await asyncio.to_thread(
             AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).recover
