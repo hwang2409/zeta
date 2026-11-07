@@ -1351,7 +1351,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
-| `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
+| `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |

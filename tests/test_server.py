@@ -9074,7 +9074,9 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     try:
         async with asyncio.timeout(10):
             await _request(reader, writer, 3, "send", {"text": "delegate"})
-            approval = await _event(reader, "approval_request")
+            while not _named_events(frames, "approval_request"):
+                frames.append(await _read(reader))
+            approval = _named_events(frames, "approval_request")[0]
             assert approval["delegated"] is True
             writer.write(
                 (
@@ -9099,20 +9101,44 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
-            while not (
-                _named_events(frames, "tool_end") and _named_events(frames, "turn_end")
-            ):
+            while not _named_events(frames, "approval_end"):
                 frames.append(await _read(reader))
             names = [frame.get("params", {}).get("event") for frame in frames]
+            child_start = max(
+                index for index, name in enumerate(names) if name == "turn_start"
+            )
+            approval_end = names.index("approval_end")
             assert len(_named_events(frames, "approval_end")) == 1
-            assert names.index("approval_end") < names.index("tool_end")
-            assert names.index("approval_end") < names.index("turn_end")
-            while not any(frame.get("id") == 4 for frame in frames):
-                frames.append(await _read(reader))
+            assert child_start < approval_end
+            key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
-                await settlement
-        response = next(frame for frame in frames if frame.get("id") == 4)
-        assert response["result"]["decision"] == "deny"
+                with pytest.raises(asyncio.CancelledError):
+                    await settlement
+            else:
+                while not _named_events(frames, "error"):
+                    frames.append(await _read(reader))
+                error = _named_events(frames, "error")[0]
+                names = [frame.get("params", {}).get("event") for frame in frames]
+                assert approval_end < names.index("error")
+                assert error["error"] == {
+                    "code": "server_error",
+                    "message": "approval history could not be persisted",
+                }
+                assert error["data"] == {"request_id": approval["request_id"]}
+                status_frames = await _request(reader, writer, 5, "status")
+                frames.extend(status_frames)
+                assert status_frames[-1]["result"]["state"] == "idle"
+                health = server.control._approvals.state.health
+                assert health is not None
+                assert health.code == "approval_persistence_failed"
+            names = [frame.get("params", {}).get("event") for frame in frames]
+            child_terminals = [
+                index
+                for index, name in enumerate(names)
+                if index > child_start and name in {"tool_end", "turn_end"}
+            ]
+            assert all(approval_end < index for index in child_terminals)
+            assert key not in server.control._approvals.state.records
     finally:
         history_release.set()
         await asyncio.wait_for(_close(server, writer), timeout=10)

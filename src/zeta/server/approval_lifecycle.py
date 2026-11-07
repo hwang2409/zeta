@@ -284,6 +284,19 @@ class ApprovalLifecycle:
     def _fail(self, health: SessionHealth) -> None:
         self._swap(self._state.records, health=health)
 
+    async def _report_persistence_failure(
+        self, record: ApprovalRecord, message: str
+    ) -> None:
+        self._fail(SessionHealth("approval_persistence_failed", message))
+        with contextlib.suppress(ConnectionError, OSError):
+            await self._publish(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                self._session_id(),
+                error={"code": "server_error", "message": message},
+                data={"request_id": record.wire_id},
+            )
+        self._request_turn_failure()
+
     def _replace_state(self) -> None:
         self._swap({}, health=None, generation=self._state.generation + 1)
 
@@ -794,23 +807,9 @@ class ApprovalLifecycle:
                 await self._finish_record(record, synthetic)
                 return synthetic
             if owns_record:
-                self._fail(
-                    SessionHealth(
-                        "approval_persistence_failed",
-                        "approval decision could not be persisted",
-                    )
+                await self._report_persistence_failure(
+                    record, "approval decision could not be persisted"
                 )
-                with contextlib.suppress(ConnectionError, OSError):
-                    await self._publish(
-                        event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                        self._session_id(),
-                        error={
-                            "code": "server_error",
-                            "message": "approval decision could not be persisted",
-                        },
-                        data={"request_id": record.wire_id},
-                    )
-                self._request_turn_failure()
                 record = self._health_abort(record, reason or "turn_canceled")
                 self._change(record, settlement=None)
             raise OSError("approval decision could not be persisted")
@@ -894,6 +893,8 @@ class ApprovalLifecycle:
             key: value for key, value in resolution.items() if key != "request_id"
         }
         payload = self.end(record.target.key, data=data)
+        history_failed = False
+        cancelled: asyncio.CancelledError | None = None
         try:
             if payload is not None and record.history_published:
                 assert record.target.history_store is not None
@@ -901,9 +902,15 @@ class ApprovalLifecycle:
                     await record.target.history_store.append_approval_history_async(
                         {"event": "approval_end", **payload}
                     )
-                except (OSError, asyncio.CancelledError):
+                except OSError:
+                    history_failed = True
                     logger.warning(
                         "delegated approval history write failed", exc_info=True
+                    )
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                    logger.warning(
+                        "delegated approval history write cancelled", exc_info=True
                     )
             if payload is not None and record.published:
                 publication_started.set()
@@ -914,10 +921,16 @@ class ApprovalLifecycle:
                     self._session_id(),
                     **payload,
                 )
+            if history_failed:
+                await self._report_persistence_failure(
+                    record, "approval history could not be persisted"
+                )
         finally:
             publication_started.set()
             if self._owns(record):
                 self._remove(record.target.key)
+        if cancelled is not None:
+            raise cancelled
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: str
