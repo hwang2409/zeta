@@ -73,6 +73,7 @@ from ._pending_prompts import (
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
+from ._turn_history import TurnHistoryMixin, validate_turn_end_data
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -111,6 +112,7 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
+    TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
     SessionStatePersistenceMixin,
@@ -240,7 +242,6 @@ class ConversationStore(
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
-
         resolved = str(cwd)
         if not resolved:
             raise ValueError("bash cwd must be a nonempty string")
@@ -282,18 +283,15 @@ class ConversationStore(
 
     def todo_items(self) -> list[TodoItem]:
         """Return a detached snapshot of the current session todo list."""
-
         return [dict(item) for item in self._todo_items]
 
     @property
     def todo_dismissed(self) -> bool:
         """Return whether the terminal todo receipt was dismissed."""
-
         return self._todo_dismissed
 
     def dismiss_todo(self) -> None:
         """Persist dismissal of the terminal todo receipt."""
-
         with self._append_lock():
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
@@ -554,6 +552,8 @@ class ConversationStore(
                 _validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "approval_history":
                 validate_approval_history_data(entry.data)
+            elif entry.type == "turn_end":
+                validate_turn_end_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
