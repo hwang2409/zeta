@@ -366,7 +366,7 @@ async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
         tail = await registry.output(task_id, since=cursor)
         assert tail["output"] == "DELTA\n"
     finally:
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause="test requested task stop")
         await registry.close()
 
 
@@ -386,7 +386,7 @@ async def test_snapshot_runtime_and_terminal_phase(tmp_path: Path) -> None:
         assert snap[exit_id].ended_at is not None
         assert snap[exit_id].ended_at >= snap[exit_id].started_at
     finally:
-        await registry.kill(running_id)
+        await registry.kill(running_id, cause="test requested task stop")
         await registry.close()
 
 
@@ -487,5 +487,5 @@ async def test_kill_from_panel_kills_selected_and_requires_confirm(tmp_path: Pat
     finally:
         app.close_tasks_panel()
         registry.set_notice_sink(None)
-        await registry.kill(first)
+        await registry.kill(first, cause="test requested task stop")
         await registry.close()

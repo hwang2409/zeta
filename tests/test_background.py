@@ -1156,7 +1156,7 @@ async def test_background_stdin_unknown_finished_and_kill_races(tmp_path: Path) 
         await tasks.input(task_id, "x")
     task_id, _ = await tasks.start("sleep 30", tmp_path)
     writes = [tasks.input(task_id, "x" * 100) for _ in range(10)]
-    await asyncio.gather(tasks.kill(task_id), *writes, return_exceptions=True)
+    await asyncio.gather(tasks.kill(task_id, cause="test requested task stop"), *writes, return_exceptions=True)
     assert tasks.records[-1].stdin is None
     await tasks.close()
 
@@ -2019,7 +2019,7 @@ async def test_background_task_stays_running_for_detached_group_member(
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
 
-    result = await tasks.kill(task_id)
+    result = await tasks.kill(task_id, cause="test requested task stop")
     assert result["running"] is False
     assert not _group_exists(pid)
     await tasks.close()
@@ -2032,7 +2032,7 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
         _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
         tmp_path,
     )
-    result = await tasks.kill(task_id)
+    result = await tasks.kill(task_id, cause="test requested task stop")
     assert result["running"] is False
     assert result["exit_code"] in {-signal.SIGTERM, -signal.SIGKILL}
     assert not _group_exists(tasks.records[0].pid)
@@ -2076,7 +2076,7 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
     monkeypatch.setattr(
         spawn_module, "_snapshot_descendants_sync", blocked_second_snapshot
     )
-    killing = asyncio.create_task(tasks.kill(task_id))
+    killing = asyncio.create_task(tasks.kill(task_id, cause="test requested task stop"))
     try:
         await second_snapshot_started.wait()
         killing.cancel()

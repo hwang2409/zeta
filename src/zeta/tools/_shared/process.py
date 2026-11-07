@@ -597,7 +597,7 @@ class BackgroundTaskRegistry:
 
         self._shutdown_cause = self._shutdown_cause or cause
 
-    async def kill(self, task_id: str, *, cause: str = "task killed") -> dict[str, Any]:
+    async def kill(self, task_id: str, *, cause: str) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
             phase: Literal["task_kill", "session_shutdown"] = (

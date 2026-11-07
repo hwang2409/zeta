@@ -62,7 +62,7 @@ async def test_start_state_and_notice_follow_off_loop_durable_record(
     assert writer_threads != [threading.get_ident()]
     assert [notice.phase for notice in notices] == ["started"]
     monkeypatch.setattr(registry, "_persist", original_persist)
-    await registry.kill(task_id)
+    await registry.kill(task_id, cause="test requested task stop")
     await registry.close()
 
 
@@ -86,7 +86,7 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
         assert release.wait(10)
 
     monkeypatch.setattr(registry, "_persist", gated_persist)
-    killing = asyncio.create_task(registry.kill(task_id))
+    killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
     assert await asyncio.to_thread(entered.wait, 10)
 
     before_commit = (
@@ -250,7 +250,7 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
 
     monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
     monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
-    killing = asyncio.create_task(registry.kill(task_id))
+    killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
     await cutoff.wait()
     release.set()
     await killing
@@ -281,7 +281,7 @@ async def test_terminal_notice_follows_durable_record(
     )
 
     with pytest.raises(OSError, match="disk full"):
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause="test requested task stop")
 
     assert registry.snapshot()[0].running
     assert notices == []
