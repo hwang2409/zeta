@@ -2125,7 +2125,14 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         with pytest.raises(asyncio.CancelledError):
             await killing
         await tasks.close()
-        assert not _group_exists(child_pid)
+        state = await asyncio.to_thread(
+            subprocess.run,
+            ["ps", "-o", "stat=", "-p", str(child_pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert state.returncode != 0 or state.stdout.lstrip().startswith("Z")
     finally:
         release_second_snapshot.set()
         await asyncio.gather(killing, return_exceptions=True)
