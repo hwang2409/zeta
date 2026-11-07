@@ -548,7 +548,7 @@ async def _background_event_transcript_count(
         )
     elif event == "task_kill":
         assert task_id is not None
-        needle = f"background task {task_id} exited"
+        needle = f"background task {task_id} killed"
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
