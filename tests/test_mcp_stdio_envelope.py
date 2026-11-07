@@ -486,6 +486,9 @@ async def test_cancel_during_stdio_invalidation_observes_pending_future_error(
 
     try:
         await cancel_during_cleanup()
+        callbacks_drained = loop.create_future()
+        loop.call_soon(callbacks_drained.set_result, None)
+        await callbacks_drained
         gc.collect()
         assert [
             context.get("message")
