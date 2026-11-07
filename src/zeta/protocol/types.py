@@ -710,8 +710,45 @@ class Message:
         )
 
 
+def harness_notice(
+    label: str,
+    text: str,
+    *,
+    event: str,
+    metadata: Mapping[str, Any] | None = None,
+    visible: bool = True,
+) -> Message:
+    """Build model-facing zeta guidance with explicit non-user authorship."""
+
+    return Message(
+        MessageRole.SYSTEM,
+        [TextContent(f"[zeta] {label}: {text}")],
+        metadata={
+            **(metadata or {}),
+            "zeta_event": event,
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+            "zeta.notice_visible": visible,
+        },
+    )
+
+
+def is_visible_harness_notice(message: Message | Mapping[str, Any]) -> bool:
+    """True for zeta-authored system guidance shown as a transcript notice."""
+
+    role = message.role if isinstance(message, Message) else message.get("role")
+    metadata = (
+        message.metadata if isinstance(message, Message) else message.get("metadata", {})
+    )
+    return (
+        role in {MessageRole.SYSTEM, MessageRole.SYSTEM.value}
+        and isinstance(metadata, Mapping)
+        and metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.HARNESS_NUDGE.value
+        and metadata.get("zeta.notice_visible") is True
+    )
+
+
 def is_passive_harness_message(message: Message | Mapping[str, Any]) -> bool:
-    """True for provider-visible harness input hidden from human transcript views."""
+    """True for provider-visible harness input that is not a user message."""
 
     metadata = (
         message.metadata if isinstance(message, Message) else message.get("metadata")

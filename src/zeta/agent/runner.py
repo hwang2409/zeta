@@ -40,6 +40,7 @@ from ..protocol.types import (
     is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, credential_store
+from ..runtime.offload import await_joined_offload
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -85,6 +86,7 @@ async def consume_child(
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
     notification_turn: bool = False,
+    harness_notice_message: Message | None = None,
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
@@ -193,15 +195,16 @@ async def consume_child(
         )
 
     try:
-        events = (
-            child_loop.run_notification_turn()
-            if notification_turn
-            else child_loop.run_turn(
+        if notification_turn:
+            events = child_loop.run_notification_turn()
+        elif harness_notice_message is not None:
+            events = child_loop.run_harness_notice_turn(harness_notice_message)
+        else:
+            events = child_loop.run_turn(
                 "" if delivering_prompt_id is not None else prompt,
                 origin=origin,
                 persist_user_message=delivering_prompt_id is None,
             )
-        )
         try:
             await consume_events(events)
         finally:
@@ -225,8 +228,7 @@ async def consume_child(
                 "structuredContent": structured_content,
                 "explicitFinishReport": explicit_report,
             }
-        children = owned_children()
-        tasks = owned_tasks()
+        children, tasks = owned_children(), owned_tasks()
         if (
             not child_loop.explicit_finish
             and final_message is not None
@@ -275,8 +277,7 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        text = f"agent error: {failure_message}"
-        return terminal_result(state="failed", text=text)
+        return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
@@ -472,6 +473,7 @@ async def _build_child_loop(
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
             project_registry=loop.project_registry,
+            child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
@@ -680,7 +682,7 @@ async def run_agent_tool(
             background=background,
         ),
     )
-    if loop.root_project_id is not None and loop.project_registry is not None:
+    if loop._child_lineage_publisher is not None:
         link = {
             "project_id": loop.root_project_id,
             "session_id": child_instance_id,
@@ -689,26 +691,7 @@ async def run_agent_tool(
             "transcript_path": child_path,
         }
         try:
-            from ..core.session_links import (
-                persist_pending_child_link,
-                remove_pending_child_link,
-            )
-
-            # Record the durable lineage intent in the ROOT session's pending
-            # index (directory-fsynced) BEFORE the registry append, so the root's
-            # reconciliation can recover this child link after a crash or a
-            # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(
-                loop.root_session_dir, link, loop.store._storage_lease
-            )
-            loop.project_registry.record_session(
-                loop.root_project_id,
-                session_id=child_instance_id,
-                transcript_path=child_path,
-                role="worker",
-                parent_session_id=parent_identity,
-            )
-            remove_pending_child_link(loop.root_session_dir, child_instance_id)
+            await await_joined_offload(loop._child_lineage_publisher.publish, link)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:

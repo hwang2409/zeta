@@ -9,12 +9,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..protocol.types import (
-    MESSAGE_ORIGIN_METADATA,
     Message,
-    MessageOrigin,
-    MessageRole,
     StreamEvent,
-    TextContent,
+    harness_notice,
 )
 
 if TYPE_CHECKING:
@@ -57,14 +54,7 @@ def finish_gate_message(
         "agent completes; task output remains in this child session's task archive. "
         "A finish-gate safety bound applies if a task never exits."
     )
-    return Message(
-        MessageRole.USER,
-        [TextContent(text)],
-        metadata={
-            "zeta_event": "agent_finish_gate",
-            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
-        },
-    )
+    return harness_notice("finish gate", text, event="agent_finish_gate")
 
 
 @dataclass(eq=False, slots=True)
@@ -409,10 +399,8 @@ async def _run_finish_gate(
     try:
         result = await state.run_model_turn(
             child_loop,
-            child_loop.run_turn(
-                "",
-                origin=MessageOrigin.HARNESS_NUDGE,
-                user_message=finish_gate_message(children, tasks),
+            child_loop.run_harness_notice_turn(
+                finish_gate_message(children, tasks)
             ),
             consume_events,
         )
