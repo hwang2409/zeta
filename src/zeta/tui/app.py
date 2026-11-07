@@ -60,6 +60,7 @@ from .agent_card import (
 )
 from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
+from .cards.shared import wrap_by_cells
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -73,6 +74,7 @@ from .composer import (
 from .fork_session import ForkRuntimeMixin, RuntimeResult
 from .layout import (
     CONTENT_MARGIN,
+    STATUS_CARD_MAX_WIDTH,
     content_width,
     detach_completion_menus,
     full_screen_content,
@@ -116,10 +118,23 @@ from .user import displayed_user_text
 
 
 def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
+    body: list[overlay.FragmentLine] = []
+    width = STATUS_CARD_MAX_WIDTH - 2
+    for line in _format_status(status).splitlines():
+        label, separator, value = line.partition(": ")
+        prefix = f"{label}{separator}" if separator else ""
+        wrapped = wrap_by_cells(value if separator else line, width - len(prefix))
+        body.extend(
+            [
+                overlay.value(prefix if index == 0 else " " * len(prefix)),
+                overlay.value(text),
+            ]
+            for index, text in enumerate(wrapped)
+        )
     return [
         overlay.title("Status"),
         overlay.rule(),
-        *([overlay.value(line)] for line in _format_status(status).splitlines()),
+        *body,
         overlay.rule(),
         overlay.hint("↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"),
     ]
