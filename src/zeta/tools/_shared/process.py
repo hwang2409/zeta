@@ -453,12 +453,9 @@ class BackgroundTaskRegistry:
             raise
         return task_id, process.pid
 
-    async def _register_start(
-        self, record: _BackgroundRecord, log_handle: IO[bytes]
-    ) -> None:
+    async def _register_start(self, record: _BackgroundRecord, log_handle: IO[bytes]) -> None:
         async with self._transition_lock:
             rows = self._persistence_rows((*self._records.values(), record))
-
             def publish() -> None:
                 self._records[record.task_id] = record
                 record.monitor = asyncio.create_task(self._monitor(record, log_handle))
@@ -468,8 +465,7 @@ class BackgroundTaskRegistry:
                 rows,
                 publish,
                 BackgroundTaskNotice(
-                    f"background task {record.task_id} started: "
-                    f"{command_headline(record.command)}",
+                    f"background task {record.task_id} started: {command_headline(record.command)}",
                     record.task_id,
                     "started",
                     record.owner,
@@ -902,9 +898,7 @@ class BackgroundTaskRegistry:
             if archive_error is not None:
                 raise archive_error
 
-    async def _commit_terminal(
-        self, record: _BackgroundRecord, exit_code: int | None
-    ) -> bool:
+    async def _commit_terminal(self, record: _BackgroundRecord, exit_code: int | None) -> bool:
         if not record.running:
             return False
         finalization = asyncio.create_task(self._finalize_terminal(record, exit_code))
@@ -919,9 +913,7 @@ class BackgroundTaskRegistry:
             raise asyncio.CancelledError
         return committed
 
-    async def _finalize_terminal(
-        self, record: _BackgroundRecord, exit_code: int | None
-    ) -> bool:
+    async def _finalize_terminal(self, record: _BackgroundRecord, exit_code: int | None) -> bool:
         async with self._transition_lock:
             if not record.running:
                 return False
@@ -933,12 +925,9 @@ class BackgroundTaskRegistry:
                 process=None,
                 terminal_phase=record.terminal_phase or "natural_exit",
             )
-            rows = self._persistence_rows(
-                tuple(
-                    candidate if item is record else item
-                    for item in self._records.values()
-                )
-            )
+            rows = self._persistence_rows(tuple(
+                candidate if item is record else item for item in self._records.values()
+            ))
             notice = BackgroundTaskNotice(
                 f"background task {record.task_id} exited ({candidate.exit_code}): "
                 f"{command_headline(record.command)}",
@@ -960,9 +949,7 @@ class BackgroundTaskRegistry:
         return True
 
     @staticmethod
-    def _publish_terminal(
-        record: _BackgroundRecord, candidate: _BackgroundRecord
-    ) -> None:
+    def _publish_terminal(record: _BackgroundRecord, candidate: _BackgroundRecord) -> None:
         record.running = candidate.running
         record.exit_code = candidate.exit_code
         record.ended_at = candidate.ended_at
