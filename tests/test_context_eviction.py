@@ -1973,7 +1973,6 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
             await assembly
         release_planner.set()
         assert await asyncio.to_thread(planning_finished.wait, 2)
-        await asyncio.sleep(0.2)
 
     assert store.replay() == before_entries
     assert not any(entry.type == "compaction" for entry in store.replay())

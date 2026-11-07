@@ -1085,29 +1085,21 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
         return await result if inspect.isawaitable(result) else result
 
     recovery = asyncio.create_task(recover())
-
-    def release_later() -> None:
-        time.sleep(0.25)
-        release.set()
-
-    releaser = threading.Thread(target=release_later)
-    releaser.start()
-    ticks = 0
-    while not release.is_set():
-        await asyncio.sleep(0.01)
-        if not release.is_set():
-            ticks += 1
-    result = await asyncio.wait_for(recovery, 5)
-    holder.join(timeout=1)
-    releaser.join(timeout=1)
     try:
-        assert ticks >= 3
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=5)
+        assert not recovery.done()
+
+        release.set()
+        result = await asyncio.wait_for(recovery, 5)
         assert result is not None
         persisted = read_usage(context.store, first)
         assert persisted.snapshot is not None
         assert persisted.snapshot.windows[0].used_percent == 100
     finally:
         release.set()
+        holder.join(timeout=1)
         opened.store.close()
 
 
@@ -1121,7 +1113,6 @@ async def test_switch_after_recency_refresh_applies(tmp_path: Path) -> None:
     second_backend = object()
     loop = _switch_loop(first_backend)
     assert context.manager is not None
-    await asyncio.sleep(0.01)
     assert await asyncio.to_thread(
         context.manager.refresh_recency, context.metadata.session_id
     )

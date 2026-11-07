@@ -150,19 +150,41 @@ async def test_stall_watchdog_raises_when_source_is_silent() -> None:
     await watched.aclose()
 
 
-async def test_stall_watchdog_resets_timer_on_each_item() -> None:
+async def test_stall_watchdog_resets_timer_on_each_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    waits: list[float] = []
+
+    async def manual_wait_for(awaitable, timeout):  # type: ignore[no-untyped-def]
+        started = now
+        waits.append(timeout)
+        result = await awaitable
+        if timeout is not None and now - started >= timeout:
+            raise TimeoutError
+        return result
+
     async def source():
-        for value in ("a", "b", "c"):
-            await asyncio.sleep(0.03)
+        nonlocal now
+        for advance, value in ((9.0, "a"), (9.0, "b"), (10.0, "c")):
+            now += advance
             yield value
 
+    monkeypatch.setattr(transport_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(transport_module.asyncio, "wait_for", manual_wait_for)
     watched = stall_watchdog(
         source(),
-        seconds=0.1,
+        seconds=10.0,
         on_stall=lambda elapsed: _StubError("stalled", is_stall=True),
     )
-    seen = [item async for item in watched]
-    assert seen == ["a", "b", "c"]
+
+    seen: list[str] = []
+    with pytest.raises(_StubError, match="stalled"):
+        async for item in watched:
+            seen.append(item)
+
+    assert seen == ["a", "b"]
+    assert waits == [10.0, 10.0, 10.0]
 
 
 async def test_stall_watchdog_disabled_when_seconds_nonpositive() -> None:
