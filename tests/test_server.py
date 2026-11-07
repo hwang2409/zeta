@@ -72,11 +72,13 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -4887,14 +4889,23 @@ async def test_session_history_shows_zeta_notice_as_system_message(
     try:
         store = server.runtime.opened.store
         expected = []
-        notice_id = ""
+        notice_ids: dict[str, str] = {}
+        notices = {
+            3: build_nudge_message(),
+            4: harness_notice(
+                "shell cwd",
+                "/removed/worktree was removed; continuing in /survivor",
+                event="shell_cwd_recovered",
+            ),
+        }
         for index in range(9):
-            if index == 4:
-                notice = build_nudge_message()
+            if index in notices:
+                notice = notices[index]
                 assert notice.role is MessageRole.SYSTEM
-                assert notice.content[0].text.startswith("[zeta] empty-turn recovery:")
-                notice_id = store.append_message(notice).id
-                expected.append(notice_id)
+                notice_ids[notice.metadata["zeta_event"]] = store.append_message(
+                    notice
+                ).id
+                expected.append(notice_ids[notice.metadata["zeta_event"]])
             expected.append(
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
@@ -4924,10 +4935,17 @@ async def test_session_history_shows_zeta_notice_as_system_message(
         assert [row["id"] for row in rows] == expected
         assert first["next_offset"] == 8
         assert second["next_offset"] is None
-        notice_row = next(row for row in rows if row["id"] == notice_id)
-        assert notice_row["role"] == "system"
-        assert notice_row["content"][0]["text"].startswith(
+        notice_rows = {
+            event: next(row for row in rows if row["id"] == notice_id)
+            for event, notice_id in notice_ids.items()
+        }
+        assert all(row["role"] == "system" for row in notice_rows.values())
+        assert notice_rows["empty_turn_nudge"]["content"][0]["text"].startswith(
             "[zeta] empty-turn recovery:"
+        )
+        assert notice_rows["shell_cwd_recovered"]["content"][0]["text"] == (
+            "[zeta] shell cwd: /removed/worktree was removed; "
+            "continuing in /survivor"
         )
     finally:
         await _close(server, writer)
@@ -10421,6 +10439,112 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
         assert backend.calls == []
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path) -> None:
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    call = ToolCall("non-owner-cancel", "agent_cancel", {"handle": "root:1:1"})
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "agent error: unknown child handle",
+                is_error=True,
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    assert notifications[0][0] == "tool_end"
+    result = notifications[0][1]["tool_result"]
+    assert result["content"] == "agent error: unknown child handle"
+    assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    for store, handle, target, depth in (
+        (root, "root:1", child, 1),
+        (child, "root:1:1", grandchild, 2),
+    ):
+        call = ToolCall(f"agent-{depth}", "agent", {"prompt": "inspect"})
+        target.start_agent_lifecycle(
+            handle=handle,
+            started_at=f"2026-11-08T00:00:0{depth}+00:00",
+            depth=depth,
+            agent_type="general",
+            description="nested verifier",
+        )
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("running")],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={
+                        "child_instance_id": handle,
+                        "child_session_path": str(target.session_dir),
+                    },
+                ),
+            )
+        )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    call = ToolCall("nested-status", "agent_status", {"handle": "root:1:1"})
+    result = await loop.tool_registry.execute(call)
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "serve"))
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                result["content"][0]["text"],
+                structured_content=result["structuredContent"],
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    wire_result = notifications[0][1]["tool_result"]
+    children = wire_result["structured_content"]["children"]
+    assert children[0]["handle"] == "root:1:1"
+    assert children[0]["description"] == "nested verifier"
 
 
 @pytest.mark.asyncio

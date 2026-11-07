@@ -13072,6 +13072,14 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     assert nudge.role is MessageRole.SYSTEM
     assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
     store.append_message(nudge)
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("continuing")]))
+    store.append_message(
+        harness_notice(
+            "shell cwd",
+            "/removed/worktree was removed; continuing in /survivor",
+            event="shell_cwd_recovered",
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -13089,9 +13097,11 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
         rendered = Text.from_ansi(output.getvalue()).plain
         assert "here is the answer" in rendered
         assert "[zeta] empty-turn recovery:" in rendered
+        assert "[zeta] shell cwd: /removed/worktree was removed; continuing in" in rendered
+        assert "/survivor" in rendered
         assert rendered.count("do the thing") == 1
     finally:
-        await app.loop.close()
+        await asyncio.wait_for(app.loop.close(), 10)
 
 
 @pytest.mark.asyncio
