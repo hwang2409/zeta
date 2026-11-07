@@ -1175,18 +1175,16 @@ def _child_base_system_prompt(
     loop: AgentLoop,
     cwd_override: str | None,
     child_registry: ToolRegistry | None = None,
-) -> str | Message:
-    """Compose project context from an explicit cwd that differs from the parent."""
-
+) -> tuple[str | Message, Path]:
     if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
-        return loop.context_assembler.system_prompt
+        scope = getattr(loop, "_live_config_scope", None)
+        project_dir = getattr(scope, "project_dir", Path(loop.store.cwd))
+        return loop.context_assembler.system_prompt, project_dir
     if child_registry is not None:
         child_registry.verify_cwd_identity()
-    home_hint = loop.active_home
-    zeta_home = Path(home_hint) if home_hint else env_home()
+    zeta_home = Path(loop.active_home) if loop.active_home else env_home()
     discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    registry = loop.project_registry
-    session_project = None
+    registry, session_project = loop.project_registry, None
     if loop.root_project_id is not None and registry is not None:
         try:
             session_project = registry.show_project(loop.root_project_id)
@@ -1204,7 +1202,7 @@ def _child_base_system_prompt(
         cwd_project=cwd_project,
         inbox_enabled=False,
     )
-    return context.system_prompt
+    return context.system_prompt, discovery.primary_root or discovery.cwd
 
 
 _EXPLICIT_FINISH_GUIDANCE = (

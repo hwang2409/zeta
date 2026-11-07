@@ -195,6 +195,7 @@ class EventDescriptor(StrEnum):
     USAGE = "usage"
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
+    CONFIG_CHANGED = "config_changed"
 
 
 PROTOCOL_VERSION = "1.2"
