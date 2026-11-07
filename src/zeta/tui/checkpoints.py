@@ -118,7 +118,9 @@ def _format_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024 * 1024):.2f}GB"
 
 
-def _session_replay_provider(path: Path) -> str | None:
+def session_replay_provider(path: Path) -> str | None:
+    """Resolve a session's thought provider from its meta.json; call once per replay."""
+
     try:
         metadata = load_session_json(path / "meta.json")
     except ConversationIntegrityError:
@@ -144,18 +146,11 @@ def _session_replay_provider(path: Path) -> str | None:
     return provider
 
 
-def replay_provider(
-    message: Message,
-    *,
-    session_path: Path | None = None,
-    provider: str | None = None,
-) -> str | None:
+def replay_provider(message: Message, *, provider: str | None = None) -> str | None:
     """Resolve the provider that owns one persisted thought block."""
 
     if "codex_output_items" in message.metadata:
         return "codex"
-    if session_path is not None:
-        return _session_replay_provider(session_path)
     return provider if provider in {"claude", "codex"} else None
 
 
@@ -664,7 +659,7 @@ class CheckpointTranscriptMixin:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        provider = getattr(self, "provider", None)
+        provider = session_replay_provider(self.loop.store.session_dir)
         for entry in branch:
             if entry.type == "checkpoint":
                 self._print_system(
@@ -731,7 +726,6 @@ class CheckpointTranscriptMixin:
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
                     provider=provider,
-                    session_path=self.loop.store.session_dir,
                 )
                 if not message.metadata.get(FAILED_TURN_MARKER):
                     self._failed_turn = None
@@ -759,7 +753,6 @@ class CheckpointTranscriptMixin:
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
                     provider=provider,
-                    session_path=self.loop.store.session_dir,
                 )
             yield
         self._prompt_history.replace(self.loop.store.session_dir, prompts)
@@ -776,16 +769,11 @@ def render_replayed_message(
     replay_tool_results: bool = False,
     replay_tool_starts: bool = False,
     provider: str | None = None,
-    session_path: Path | None = None,
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
     message = _sanitize_replayed_message(message)
-    provider = replay_provider(
-        message,
-        session_path=session_path,
-        provider=provider,
-    )
+    provider = replay_provider(message, provider=provider)
 
     if message.role is MessageRole.USER:
         if print_user is not None:
