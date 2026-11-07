@@ -369,13 +369,12 @@ returns `-32000` with bounded data:
   row: integer | null,
   repairable: boolean,
   session_id: string,
-  child_run_id?: string,
   actions: []
 }
 ```
 
 The diagnosis-only protocol has no repair request, so `actions` is always the
-empty array. The object has at most seven fields and contains no transcript
+empty array. The object has at most six fields and contains no transcript
 bytes, payload text, file path, digest, source identity, or arbitrary exception
 text. `row` identifies the first bad physical row when it is known.
 
