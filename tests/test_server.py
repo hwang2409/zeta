@@ -10024,6 +10024,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
         quarantine_id = repaired["quarantine_id"]
         assert repaired == {
             "session_id": session_id,
+            "child_run_id": None,
             "quarantine_id": quarantine_id,
             "retained_last_sequence": 0,
             "memory_review_required": True,
