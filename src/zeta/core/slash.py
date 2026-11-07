@@ -783,11 +783,8 @@ class SlashCommandRegistry:
                 return None
             return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
         return unknown_slash_command(
-            value,
-            name,
-            parts[1] if len(parts) == 2 else "",
-            (entry[0] for entry in self.completion_entries),
-        )
+            value, name, parts[1] if len(parts) == 2 else "",
+            (entry[0] for entry in self.completion_entries))
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
