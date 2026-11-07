@@ -2012,6 +2012,7 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
+        assert status["max_agent_depth"] == 3
     finally:
         await _close(server, writer)
 
@@ -5604,6 +5605,47 @@ async def test_list_sessions_page_touches_only_page_rows(
         assert len(preview_reads) == 1
         assert reconciliations == [sessions[-1]]
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_idle_status_resolves_config_off_event_loop_once_per_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    event_loop_thread = threading.get_ident()
+    config_threads: list[int] = []
+    original_config = server.runtime._config
+
+    def tracked_config(*args, **kwargs):
+        config_threads.append(threading.get_ident())
+        return original_config(*args, **kwargs)
+
+    # test-contract: seam verify the settings resolver leaves the serve event loop
+    monkeypatch.setattr(server.runtime, "_config", tracked_config)
+    reader, writer = await _connect(server)
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", server.port
+    )
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(observer_reader, observer_writer, 2, "hello", {
+            "protocol_version": "1.2", "role": "observer",
+            "features": ["serve_observers"],
+        })
+
+        controller_status = (await _request(reader, writer, 3, "status"))[-1]["result"]
+        observer_status = (
+            await _request(observer_reader, observer_writer, 4, "status")
+        )[-1]["result"]
+
+        assert controller_status["max_agent_depth"] == 3
+        assert observer_status["max_agent_depth"] == 3
+        assert len(config_threads) == 2
+        assert all(thread_id != event_loop_thread for thread_id in config_threads)
+    finally:
+        observer_writer.close()
+        await observer_writer.wait_closed()
         await _close(server, writer)
 
 
