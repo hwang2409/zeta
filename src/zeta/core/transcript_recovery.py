@@ -470,6 +470,22 @@ def read_recovery_record(
     return parse_recovery_record(_mapping(value, "recovery record"))
 
 
+def resume_memory_review(
+    directory_fd: int, quarantine_id: str
+) -> RecoveryRecord:
+    """Atomically clear a committed recovery's durable memory review step."""
+    record = read_recovery_record(directory_fd, quarantine_id)
+    if record is None or record.state != "committed":
+        raise TranscriptRecoveryError("recovery is not committed")
+    if record.memory_step == "resumed":
+        return record
+    if record.memory_step != "review_pending":
+        raise TranscriptRecoveryError("recovery does not require memory review")
+    resumed = replace(record, memory_step="resumed")
+    write_json_file(directory_fd, _state_name(_record_id(quarantine_id)), resumed.to_dict())
+    return resumed
+
+
 def reconcile_pending(
     directory_fd: int,
     target: RepairTarget,
