@@ -18,7 +18,7 @@ from ..core.project_context import (
     associate_project_discovery,
     discover_project,
     load_project_context,
-    resolve_project_context,
+    resolve_project_context_from_projects,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import (
@@ -206,7 +206,7 @@ class ServerRuntime:
         self._server_provider = self._config(None, None).provider
         self._test_scripted_provider = os.environ.get(TEST_SCRIPTED_PROVIDER_ENV) == "1"
         self.backend_factory = backend_factory
-        self.manager = SessionManager(self.home)
+        self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
@@ -239,7 +239,9 @@ class ServerRuntime:
         if account is not None:
             credential_kwargs["account"] = account
         elif self._state is not None:
-            credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
+            credential_kwargs = self._state.loop.account_context.backend_kwargs(
+                provider
+            )
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
             provider,
@@ -378,12 +380,26 @@ class ServerRuntime:
         associated = (
             associate_project_discovery(discovery, registry, create=False)
             if registry is not None
+            and self.manager.project_registry_unavailable is None
             else discovery
         )
-        session_project = associated.project if registry is not None else None
-        cwd_project = (
-            resolve_project_context(discovery, registry) if registry is not None else None
+        projection = (
+            registry.project_context_projection(
+                associated.project.project_id
+                if associated.project is not None
+                else None
+            )
+            if registry is not None
+            else None
         )
+        session_project = projection.session_project if projection is not None else None
+        cwd_project = (
+            resolve_project_context_from_projects(discovery, projection.projects)
+            if projection is not None
+            else None
+        )
+        if session_project is None and cwd_project is not None:
+            session_project = cwd_project
         context = load_project_context(
             cwd=session_cwd,
             repo_root=repo_root,
@@ -392,6 +408,8 @@ class ServerRuntime:
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
+            registry=registry,
+            project_projection=projection,
         )
         return config, skill_catalog, agent_catalog, context, session_project
 
@@ -406,14 +424,16 @@ class ServerRuntime:
             project_root=repo_root,
         )
         registry = self.manager.project_registry
-        session_project = None
-        if opened.metadata.project_id is not None and registry is not None:
-            try:
-                session_project = registry.show_project(opened.metadata.project_id)
-            except (OSError, ValueError):
-                pass
+        projection = (
+            registry.project_context_projection(opened.metadata.project_id)
+            if registry is not None
+            else None
+        )
+        session_project = projection.session_project if projection is not None else None
         cwd_project = (
-            resolve_project_context(discovery, registry) if registry is not None else None
+            resolve_project_context_from_projects(discovery, projection.projects)
+            if projection is not None
+            else None
         )
         resumed_prompt = resume_prompt(
             opened.metadata,
@@ -425,6 +445,8 @@ class ServerRuntime:
             session_project=session_project,
             cwd_project=cwd_project,
             project_features_enabled=registry is not None,
+            registry=registry,
+            project_projection=projection,
         )
         return config, resumed_prompt
 
@@ -483,7 +505,9 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = prepared
+                    config, skill_catalog, agent_catalog, context, session_project = (
+                        prepared
+                    )
                     kwargs = {
                         "config": config,
                         "provider": config.provider,

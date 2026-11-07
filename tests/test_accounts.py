@@ -37,6 +37,7 @@ from tests.support.account_processes import (
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
     AccountError,
@@ -292,9 +293,7 @@ def test_resolve_account_does_not_migrate(
     monkeypatch.setattr(tui_bootstrap, "env_home", lambda: tmp_path)
     sentinel = object()
     # test-contract: seam isolates migration from TUI construction
-    monkeypatch.setattr(
-        tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel
-    )
+    monkeypatch.setattr(tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel)
 
     assert tui_bootstrap.create_app(SimpleNamespace(no_session=False)) is sentinel
     assert calls == 1
@@ -554,6 +553,7 @@ def test_anthropic_email_address_captured_on_refresh(tmp_path: Path) -> None:
 
 
 def _write_legacy(home: Path, provider: str) -> Path:
+    initialize_storage_home(home)
     path = home / f"{provider}-oauth.json"
     path.write_text(json.dumps(tokens().to_dict()))
     return path
@@ -593,7 +593,7 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
 
 def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
     # a long home path (as on CI runners) must not hide the account name
-    home = tmp_path / ("h" * 150)
+    home = initialize_storage_home(tmp_path / ("h" * 150))
     provider_root = home / "accounts" / "codex"
     provider_root.mkdir(parents=True)
     for index in range(20):
@@ -1053,6 +1053,7 @@ def test_refresh_after_migration_writes_the_account_credential(
 ) -> None:
     expired = OAuthTokens("old-access", "old-refresh", 1.0)
     fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
+    initialize_storage_home(tmp_path)
     (tmp_path / "anthropic-oauth.json").write_text(json.dumps(expired.to_dict()))
     AccountStore(tmp_path).migrate()
     store = credential_store("claude", home=tmp_path)
@@ -1931,6 +1932,7 @@ def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
 
 
 def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
+    initialize_storage_home(tmp_path)
     path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
     path.parent.mkdir(parents=True)
     os.chmod(path.parent, 0o700)
@@ -1949,9 +1951,9 @@ def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> Non
     pending.write_text(
         json.dumps(
             {
-        "provider": account.provider,
-        "name": account.name,
-        "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
+                "provider": account.provider,
+                "name": account.name,
+                "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
             }
         )
         + "\n"
