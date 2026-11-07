@@ -374,6 +374,8 @@ def _create_app_with_root(
         else None
     )
     session_project = projection.session_project if projection is not None else None
+    if not resuming and session_project is not None:
+        discovery = replace(discovery, project=session_project)
     if not resuming and session_project is None and cwd_project is not None:
         session_project = cwd_project
         discovery = replace(discovery, project=cwd_project)
