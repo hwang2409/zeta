@@ -18,7 +18,6 @@ from tests.test_agent import (
     _agent_call,
     _collect,
     _run_handle_from_receipt,
-    _wait_for_notification,
 )
 from tests.test_server import _close, _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
@@ -733,7 +732,8 @@ async def test_agent_send_entry_persists_agent_send_origin(tmp_path: Path) -> No
         channel=loop._background_owner.conversation_channel,
     ) is None
     backend.release_child.set()
-    await _wait_for_notification(store, "completed")
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
+    assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     row = next(
         entry.to_dict()
