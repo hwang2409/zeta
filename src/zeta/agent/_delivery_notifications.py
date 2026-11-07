@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from ..core.checkpoints import ConversationEntry
-from ..protocol.types import Message, MessageRole, TextContent
+from ..protocol.types import Message, harness_notice
 
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
@@ -101,14 +101,15 @@ def _notification_message(
         "Continue and finish the active user request; use these updates only when "
         "relevant.\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
-    return Message(
-        MessageRole.SYSTEM,
-        [TextContent(text)],
+    return harness_notice(
+        "background update",
+        text,
+        event="agent_notifications",
         metadata={
-            "zeta_event": "agent_notifications",
             "notifications": payload,
             "zeta.step_delivery": identity,
         },
+        visible=False,
     )
 
 def _select_notification_delivery(
