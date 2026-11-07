@@ -378,6 +378,7 @@ async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
             boundary=7,
             switched=True,
         )
+        # test-contract: seam force persistence failure after competing commit
         monkeypatch.setattr(
             context.manager,
             "_write_unlocked",
