@@ -35,6 +35,7 @@ def _manager_with_prompt(
     project_memory_offset: int | None = None,
     project_memory_length: int | None = None,
     project_memory_digest: str | None = None,
+    prompt_components: dict[str, dict[str, int | str]] | None = None,
 ) -> tuple[SessionManager, str]:
     manager = SessionManager(home)
     opened = manager.create(
@@ -48,6 +49,7 @@ def _manager_with_prompt(
         project_memory_offset=project_memory_offset,
         project_memory_length=project_memory_length,
         project_memory_digest=project_memory_digest,
+        prompt_components=prompt_components,
         auto_project=False,
     )
     opened.store.close()
@@ -523,13 +525,54 @@ def test_staggered_memory_span_resumes_adopt_live_runtime(
     assert calls == [1]
 
 
+def test_custom_prompt_without_owned_skill_span_stays_unchanged_and_notices_restart(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    prompt = (
+        "custom before\n<zeta-skills>\nAvailable skills:\n- user: keep me\n"
+        "</zeta-skills>\ncustom after"
+    )
+    manager, session_id = _manager_with_prompt(
+        home, tmp_path, system_prompt=prompt, prompt_recipe="custom"
+    )
+    _write_skill(home / "skills" / "new.md")
+
+    resumed = _resume(
+        manager,
+        session_id,
+        home,
+        tmp_path,
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unexpected default rebuild: {kwargs}")
+        ),
+    )
+
+    assert resumed.context.system_prompt == prompt
+    assert resumed.context.notices.count(
+        "skills changed, but this session's prompt predates owned skill spans; "
+        "restart the session to refresh its skill index"
+    ) == 1
+
+
 def test_live_runtime_adoption_uses_current_skill_index_in_memory(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     prompt = f"identity\n\n{SkillCatalog.empty().index()}"
+    index = SkillCatalog.empty().index()
     manager, session_id = _manager_with_prompt(
-        home, tmp_path, system_prompt=prompt, prompt_recipe="custom"
+        home,
+        tmp_path,
+        system_prompt=prompt,
+        prompt_recipe="custom",
+        prompt_components={
+            "skill_index": {
+                "offset": prompt.index(index),
+                "length": len(index),
+                "digest": hashlib.sha256(index.encode()).hexdigest(),
+            }
+        },
     )
     stores: list[object] = []
 

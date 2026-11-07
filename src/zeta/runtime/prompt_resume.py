@@ -19,12 +19,9 @@ from ..core.session_files import SessionError
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
 from ..project_registry import Project
-from ..skills import (
-    SkillCatalog,
-    discover_session_skills,
-    replace_skill_index_metadata,
-)
+from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from .prompt import PromptFragment, RuntimePrompt, replace_owned_fragment
 
 ContextLoader = Callable[..., ProjectContext]
 
@@ -126,9 +123,21 @@ def _replace_context_skill_index(
             "length": context.memory_length,
             "digest": context.memory_digest,
         }
-    prompt, components = replace_skill_index_metadata(
-        context.system_prompt, catalog, components
+    if "skill_index" not in components:
+        notice = (
+            "skills changed, but this session's prompt predates owned skill spans; "
+            "restart the session to refresh its skill index"
+        )
+        notices = context.notices if notice in context.notices else (*context.notices, notice)
+        return replace(context, notices=notices)
+    updated = replace_owned_fragment(
+        RuntimePrompt(context.system_prompt, components),
+        "skill_index",
+        PromptFragment(catalog.index(), {}),
     )
+    prompt = updated.system_prompt
+    assert isinstance(prompt, str)
+    components = updated.prompt_components
     memory = components.get("project_memory")
     if memory is None:
         return replace(context, system_prompt=prompt, prompt_components=components)
