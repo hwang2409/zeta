@@ -29,15 +29,26 @@ def test_finders_implement_the_runtime_interface() -> None:
         )
 
 
-def test_runtime_finder_attributes_are_in_the_protocol() -> None:
-    runtime_path = (
-        Path(__file__).parents[1]
-        / "src/zeta/tui/transcript/finder_runtime.py"
-    )
-    tree = ast.parse(runtime_path.read_text())
+def _assert_runtime_finder_contract(source: str) -> None:
+    tree = ast.parse(source)
     runtime_attributes: set[str] = set()
+    forbidden_probe: str | None = None
 
     for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            is_probe = isinstance(node.func, ast.Name) and node.func.id in {
+                "getattr",
+                "hasattr",
+            }
+            if is_probe and node.args and (
+                isinstance(node.args[0], ast.Name) and node.args[0].id == "finder"
+                or isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Attribute)
+                and isinstance(node.args[0].func.value, ast.Name)
+                and node.args[0].func.value.id == "self"
+                and node.args[0].func.attr == "_finder_target"
+            ):
+                forbidden_probe = node.func.id
         if not isinstance(node, ast.Attribute):
             continue
         value = node.value
@@ -58,6 +69,9 @@ def test_runtime_finder_attributes_are_in_the_protocol() -> None:
         if is_finder or is_finder_target or is_active_finder:
             runtime_attributes.add(node.attr)
 
+    assert forbidden_probe is None, (
+        f"call the FinderRuntimeTarget method directly, not {forbidden_probe}"
+    )
     protocol_attributes = {
         name for name in vars(FinderRuntimeTarget) if not name.startswith("_")
     }
@@ -66,6 +80,29 @@ def test_runtime_finder_attributes_are_in_the_protocol() -> None:
         f"missing finder method(s) {sorted(missing)}; "
         "add them to FinderRuntimeTarget"
     )
+
+
+def test_runtime_finder_attributes_are_in_the_protocol() -> None:
+    runtime_path = (
+        Path(__file__).parents[1]
+        / "src/zeta/tui/transcript/finder_runtime.py"
+    )
+    _assert_runtime_finder_contract(runtime_path.read_text())
+
+
+def test_runtime_guard_rejects_finder_attribute_probes() -> None:
+    runtime_path = (
+        Path(__file__).parents[1]
+        / "src/zeta/tui/transcript/finder_runtime.py"
+    )
+    source = runtime_path.read_text()
+    mutated = source.replace(
+        "finder.finder_needs_ranking()",
+        'getattr(finder, "not_in_protocol", lambda: False)()',
+        1,
+    )
+    with pytest.raises(AssertionError, match="call the FinderRuntimeTarget method directly, not getattr"):
+        _assert_runtime_finder_contract(mutated)
 
 
 def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> HistoryFinder:

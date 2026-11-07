@@ -103,15 +103,17 @@ async def test_history_finder_ranks_multiple_batches_without_ui_error() -> None:
     app = _app_for_finder(TranscriptWidget())
     app._history_finder = HistoryFinder(lambda: None, lambda: history)
     buffer = Buffer()
-    buffer.text = "target"
 
     app._history_finder_open(buffer)
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
-    await prepare_task
+    await asyncio.gather(prepare_task, return_exceptions=True)
+    assert prepare_task.exception() is None, f"ui_error: {prepare_task.exception()}"
+    app._finder_input("target")
     rank_task = app._finder_rank_task
     assert rank_task is not None
-    await rank_task
+    await asyncio.gather(rank_task, return_exceptions=True)
+    assert rank_task.exception() is None, f"ui_error: {rank_task.exception()}"
 
     state = app._history_finder.finder_state()
     assert state is not None
