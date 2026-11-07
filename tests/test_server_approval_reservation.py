@@ -343,13 +343,13 @@ async def test_same_tick_approval_reservation_winner(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     events: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record(event: str, *args: object, **kwargs: object) -> bool:
+    def record(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record)
+    monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
         store = server.runtime.opened.store
@@ -561,13 +561,13 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
     server, _reader, writer, foreground = await _approval_server(tmp_path)
     child: ConversationStore | None = None
     notifications: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+    def record_admit(event: str, *args: object, **kwargs: object) -> object:
         notifications.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record_notify)
+    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     try:
         policy = server.runtime.policy
         assert policy is not None and server.runtime.loop is not None
@@ -1159,15 +1159,15 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         await server.control._event(_start_event(call))
         events: list[tuple[str, str | None]] = []
         aborted: list[bool] = []
-        original_notify = server.control._notify
+        original_admit = server.control._admit_controller
 
-        async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+        def record_admit(event: str, *args: object, **kwargs: object) -> object:
             error = kwargs.get("error")
             code = error.get("code") if isinstance(error, dict) else None
             events.append((event, code))
-            return await original_notify(event, *args, **kwargs)
+            return original_admit(event, *args, **kwargs)
 
-        monkeypatch.setattr(server.control, "_notify", record_notify)
+        monkeypatch.setattr(server.control, "_admit_controller", record_admit)
         assert server.runtime.loop is not None
         monkeypatch.setattr(
             server.runtime.loop,
@@ -1213,13 +1213,13 @@ async def test_persistent_failure_removes_many_live_child_approvals(
     server, _reader, writer, _call = await _approval_server(tmp_path)
     stores: list[ConversationStore] = []
     events: list[str] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+    def record_admit(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_admit(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record_notify)
+    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
     assert server.runtime.loop is not None
     monkeypatch.setattr(server.runtime.loop, "abort", lambda **kwargs: None)
     policy = server.runtime.policy
@@ -1930,16 +1930,16 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         tmp_path, protocol_version="1.2", features=["approval_reconnect"]
     )
     events: list[tuple[str, str | None]] = []
-    original = server.control._notify
+    original_admit = server.control._admit_controller
 
-    async def record(
+    def record(
         event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
+    ) -> object:
         request_id = fields.get("request_id")
         events.append((event, request_id if isinstance(request_id, str) else None))
-        return await original(event, session_id, **fields)
+        return original_admit(event, session_id, **fields)
 
-    monkeypatch.setattr(server.control, "_notify", record)
+    monkeypatch.setattr(server.control, "_admit_controller", record)
     try:
         await server.control._event(_start_event(call))
         await server.control.controller_released(reconnect=True)

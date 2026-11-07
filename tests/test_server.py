@@ -89,7 +89,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
-from zeta.server.connections import ConnectionRegistry
+from zeta.server.connections import Admission, ConnectionRegistry
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -1725,7 +1725,6 @@ async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_matched_ends(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_id = "shared-call"
     target = tmp_path / "input.txt"
@@ -1757,27 +1756,6 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    agent_ended = asyncio.Event()
-    publish_approval = server.control._approvals._publish
-    notify = server.control._notify
-
-    async def delay_delegated_approval_end(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
-        if event == "approval_end" and fields.get("request_id") != raw_id:
-            await agent_ended.wait()
-        return await publish_approval(event, session_id, **fields)
-
-    async def record_agent_end(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
-        published = await notify(event, session_id, **fields)
-        if event == "agent_end":
-            agent_ended.set()
-        return published
-
-    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
-    monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
         await _request(reader, writer, 3, "send", {"text": "both"})
@@ -1804,6 +1782,13 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             event["request_id"] for event in _named_events(frames, "approval_end")
         } == expected_end_ids
         assert server.runtime.opened is not None
+        async with asyncio.timeout(10):
+            while not any(
+                isinstance(block, TextContent) and block.text == "parent done"
+                for message in server.runtime.opened.store.messages()
+                for block in message.content
+            ):
+                frames.append(await _read(reader))
         assert any(
             isinstance(block, TextContent) and block.text == "parent done"
             for message in server.runtime.opened.store.messages()
@@ -3591,16 +3576,16 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
 
 
 def _bare_approval_lifecycle(tmp_path: Path) -> ApprovalLifecycle:
-    async def publish(*args: object, **kwargs: object) -> bool:
+    def admit(*args: object, **kwargs: object) -> Admission:
         del args, kwargs
-        return True
+        return Admission("admitted")
 
     async def offload(job: Callable[[], object]) -> object:
         return job()
 
     policy = ApprovalPolicy(store=ConversationStore(tmp_path / "parent"))
     return ApprovalLifecycle(
-        publish=publish,
+        admit=admit,
         request_turn_failure=lambda: None,
         policy=lambda: policy,
         session_id=lambda: "session",
@@ -3793,7 +3778,7 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
 
 @pytest.mark.asyncio
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
@@ -3805,12 +3790,13 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 
     client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
+    original_admit = client._admit_controller
 
-    async def notify(event: str, session_id: str | None, **fields: object) -> None:
-        del session_id
+    def admit(event: str, session_id: str | None, **fields: object) -> Admission:
         notifications.append((event, fields))
+        return original_admit(event, session_id, **fields)
 
-    client._notify = notify
+    monkeypatch.setattr(client, "_admit_controller", admit)
     call = ToolCall("missing", "write", {"path": "provider/path"})
     await client._event(
         StreamEvent(

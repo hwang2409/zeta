@@ -18,7 +18,6 @@ from . import event_contract
 from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
-Publish = Callable[..., Awaitable[bool]]
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
 
@@ -187,7 +186,6 @@ class ApprovalLifecycle:
     def __init__(
         self,
         *,
-        publish: Publish,
         request_turn_failure: Callable[[], None],
         policy: Callable[[], ApprovalPolicy | None],
         session_id: Callable[[], str | None],
@@ -196,7 +194,6 @@ class ApprovalLifecycle:
         is_closing: Callable[[], bool],
         admit: Admit | None = None,
     ) -> None:
-        self._publish = publish
         self._admit = admit or (lambda *_args, **_kwargs: Admission("admitted"))
         self._request_turn_failure = request_turn_failure
         self._policy = policy
@@ -290,8 +287,8 @@ class ApprovalLifecycle:
     ) -> None:
         self._fail(SessionHealth("approval_persistence_failed", message))
         with contextlib.suppress(ConnectionError, OSError):
-            await self._publish(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+            self._admit(
+                EventDescriptor.ERROR,
                 self._session_id(),
                 error={"code": "server_error", "message": message},
                 data={"request_id": record.wire_id},
@@ -481,7 +478,7 @@ class ApprovalLifecycle:
                     )
                 )
         for event, session_id, payload in replay:
-            await self._publish(event, session_id, **payload)
+            self._admit(event, session_id, **payload)
 
     async def _expire_grace(self) -> None:
         for record in tuple(self._state.records.values()):
@@ -1062,12 +1059,7 @@ class ApprovalLifecycle:
         finally:
             if self._owns(record):
                 current = self._state.records.get(record.target.key)
-                if current is not None and (
-                    not isinstance(record.target.key, tuple)
-                    or current.terminal_result is not None
-                    or current.live_end is not None
-                    or isinstance(history_outcome, (OSError, asyncio.CancelledError))
-                ):
+                if current is not None:
                     if current.terminal_watchdog is not None:
                         current.terminal_watchdog.cancel()
                     self._remove(record.target.key)
@@ -1130,8 +1122,8 @@ class ApprovalLifecycle:
         target = record.target
         if durable_state is None:
             self._remove(target.key)
-            await self._publish(
-                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+            self._admit(
+                EventDescriptor.ERROR,
                 session_id,
                 error={
                     "code": "approval_context_missing",
@@ -1186,7 +1178,7 @@ class ApprovalLifecycle:
             return
         record = self._mark_pending(record)
         self._change(record, settlement=None, published=True)
-        await self._publish(wire_event, session_id, **payload)
+        self._admit(wire_event, session_id, **payload)
 
     async def _settle_failed_start(self, record: ApprovalRecord) -> None:
         current = self._state.records.get(record.target.key)

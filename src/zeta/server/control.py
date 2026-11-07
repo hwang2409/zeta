@@ -122,8 +122,7 @@ class ServeControl:
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
-            publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
-            admit=self._admit_controller,
+            admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
             session_id=lambda: (
