@@ -11,6 +11,7 @@ from typing import Any, Self
 
 import pytest
 
+import zeta.tools._atomic_replace as atomic_replace_module
 import zeta.tools.edit as edit_module
 from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
@@ -19,10 +20,32 @@ from zeta.tools import ToolRegistry
 ToolInvocation = Callable[[ToolRegistry, str], Awaitable[StructuredToolResult]]
 
 
+def _observe_publication_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> asyncio.Event | None:
+    original = getattr(atomic_replace_module, "_cancel_publication", None)
+    if original is None:
+        return None
+    finished = asyncio.Event()
+
+    async def observed(publication: Any) -> bool:
+        result = await original(publication)
+        finished.set()
+        return result
+
+    # test-contract: seam coordinate after the off-loop cancellation phase
+    monkeypatch.setattr(atomic_replace_module, "_cancel_publication", observed)
+    return finished
+
+
 async def _assert_completes_before_worker_release(
     operation: asyncio.Task[StructuredToolResult],
+    cancel_finished: asyncio.Event | None,
 ) -> StructuredToolResult:
     completed = asyncio.ensure_future(asyncio.shield(operation))
+
+    if cancel_finished is not None:
+        await cancel_finished.wait()
 
     async def event_loop_checkpoint() -> None:
         loop = asyncio.get_running_loop()
@@ -296,6 +319,7 @@ async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
     main_thread = threading.get_ident()
     original_fdopen = os.fdopen
     original_unlink = os.unlink
+    cancel_finished = _observe_publication_cancel(monkeypatch)
 
     class BlockingWriter:
         def __init__(self, handle: Any) -> None:
@@ -337,7 +361,9 @@ async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
         await asyncio.to_thread(entered.wait)
         registry.abort()
 
-        result = await _assert_completes_before_worker_release(operation)
+        result = await _assert_completes_before_worker_release(
+            operation, cancel_finished
+        )
         assert result["isError"] is True
         assert result["content"][0]["text"] == "tool execution canceled"
 
@@ -365,6 +391,7 @@ async def test_abort_after_publication_reports_unconfirmed_durability(
     release = threading.Event()
     trailing_fsync_finished = threading.Event()
     original_fsync = os.fsync
+    cancel_finished = _observe_publication_cancel(monkeypatch)
 
     def blocking_directory_fsync(file_descriptor: int) -> None:
         if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
@@ -379,7 +406,9 @@ async def test_abort_after_publication_reports_unconfirmed_durability(
         await asyncio.to_thread(published.wait)
         registry.abort()
 
-        result = await _assert_completes_before_worker_release(operation)
+        result = await _assert_completes_before_worker_release(
+            operation, cancel_finished
+        )
         assert result["isError"] is True
         assert result["content"][0]["text"] == (
             "file was written; durability was not confirmed before cancellation"
