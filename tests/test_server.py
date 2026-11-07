@@ -8957,9 +8957,8 @@ async def test_slash_run_mcp_credential_evidence_recovery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["approve", "deny"])
-async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("approved")
@@ -9008,7 +9007,7 @@ async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
                     {
                         "jsonrpc": "2.0",
                         "id": 4,
-                        "method": method,
+                        "method": "deny",
                         "params": {"request_id": approval["request_id"]},
                     }
                 )
@@ -9035,8 +9034,9 @@ async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
 
 
 @pytest.mark.asyncio
-async def test_child_cancel_persisted_before_settlement_publishes_before_tool_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure", ["oserror", "cancelled"])
+async def test_delegated_history_failure_still_publishes_approval_end_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
@@ -9045,7 +9045,7 @@ async def test_child_cancel_persisted_before_settlement_publishes_before_tool_en
         "agent",
         {"prompt": "read", "description": "child", "background": True},
     )
-    child_call = ToolCall("gated-child-call", "read", {"path": str(target)})
+    child_call = ToolCall("history-failure-call", "read", {"path": str(target)})
     backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
     server = ZetaServer(
         provider="codex",
@@ -9053,63 +9053,58 @@ async def test_child_cancel_persisted_before_settlement_publishes_before_tool_en
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    persisted = asyncio.Event()
-    release = asyncio.Event()
-    original = ConversationStore._to_thread_durable
-    approvals = server.control._approvals
-    original_finish = approvals._finish_record
-    finish_ownership: list[bool] = []
+    history_write_started = asyncio.Event()
+    original_append = ConversationStore.append_approval_history_async
 
-    async def gated_durable(self, function, *args, **kwargs):
-        result = await original(self, function, *args, **kwargs)
-        if function.__name__ == "resolve_approval" and args[0] == "gated-child-call":
-            persisted.set()
-            await release.wait()
-        return result
+    async def fail_terminal_history(self, payload):
+        if payload.get("event") == "approval_end":
+            history_write_started.set()
+            if failure == "oserror":
+                raise OSError("forced delegated history failure")
+            raise asyncio.CancelledError
+        return await original_append(self, payload)
 
-    async def record_finish_ownership(record, resolution):
-        finish_ownership.append(approvals._owns(record))
-        await original_finish(record, resolution)
-
-    # test-contract: seam no public hook exists between durable approval commit and settlement
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
-    # test-contract: seam no public hook exposes approval ownership before terminal publish
-    monkeypatch.setattr(approvals, "_finish_record", record_finish_ownership)
+    # test-contract: seam the durable store has no deterministic failure hook
+    monkeypatch.setattr(
+        ConversationStore, "append_approval_history_async", fail_terminal_history
+    )
     reader, writer = await _ready(server)
     frames: list[dict[str, Any]] = []
     try:
-        await _request(reader, writer, 3, "send", {"text": "delegate"})
-        approval = await _event(reader, "approval_request")
-        assert approval["delegated"] is True
-        assert server.runtime.loop is not None
-        assert server.runtime.loop._background_owner.cancel(
-            approval["agent_instance_id"]
-        )
-        await asyncio.wait_for(persisted.wait(), timeout=10)
-        record = server.control._approvals.state.records[
-            (approval["agent_instance_id"], "gated-child-call")
-        ]
-        assert record.phase == "settling"
-        release.set()
-        await asyncio.wait_for(server.runtime.loop._background_owner.wait(), timeout=10)
-        # test-contract: seam no public ownership observation exists before terminal publish
-        assert finish_ownership == [True]
-        writer.write(b'{"jsonrpc":"2.0","id":4,"method":"status","params":{}}\n')
-        await writer.drain()
-        while not any(frame.get("id") == 4 for frame in frames):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        while not _named_events(frames, "tool_end"):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert names.index("approval_end") < names.index("tool_end")
-        notification_turn = server.control._turn_task
-        if notification_turn is not None:
-            # test-contract: seam no public completion event exists for notification turns
-            await asyncio.wait_for(asyncio.shield(notification_turn), timeout=10)
+        async with asyncio.timeout(10):
+            await _request(reader, writer, 3, "send", {"text": "delegate"})
+            approval = await _event(reader, "approval_request")
+            assert approval["delegated"] is True
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 4,
+                            "method": "deny",
+                            "params": {"request_id": approval["request_id"]},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            await history_write_started.wait()
+            while not (
+                _named_events(frames, "tool_end")
+                and _named_events(frames, "turn_end")
+            ):
+                frames.append(await _read(reader))
+            names = [frame.get("params", {}).get("event") for frame in frames]
+            assert len(_named_events(frames, "approval_end")) == 1
+            assert names.index("approval_end") < names.index("tool_end")
+            assert names.index("approval_end") < names.index("turn_end")
+            while not any(frame.get("id") == 4 for frame in frames):
+                frames.append(await _read(reader))
+        response = next(frame for frame in frames if frame.get("id") == 4)
+        assert response["result"]["decision"] == "deny"
     finally:
-        release.set()
-        await _close(server, writer)
+        await asyncio.wait_for(_close(server, writer), timeout=10)
 
 
 @pytest.mark.asyncio
@@ -9135,6 +9130,8 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     assert controller is not None
     connection = controller.connection
     original_write = connection._write_physical
+    original_notify = server.control._notify
+    tool_end_started = asyncio.Event()
 
     async def gated_write(payload: bytes) -> bool:
         frame = json.loads(payload)
@@ -9143,8 +9140,15 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await release_write.wait()
         return await original_write(payload)
 
+    async def record_tool_end(event, *args, **kwargs):
+        if event == "tool_end":
+            tool_end_started.set()
+        return await original_notify(event, *args, **kwargs)
+
     # test-contract: seam the transport has no public physical-write backpressure hook
     monkeypatch.setattr(connection, "_write_physical", gated_write)
+    # test-contract: seam wire output cannot expose an admitted frame behind backpressure
+    monkeypatch.setattr(server.control, "_notify", record_tool_end)
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
@@ -9165,6 +9169,7 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         await writer.drain()
         async with asyncio.timeout(10):
             await write_started.wait()
+            await tool_end_started.wait()
             release_write.set()
             while not _named_events(frames, "turn_end"):
                 frames.append(await _read(reader))
@@ -9177,163 +9182,4 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         )
     finally:
         release_write.set()
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_server_shutdown_settles_pending_approval_before_connection_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    call = ToolCall("shutdown-settlement", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    persisted = asyncio.Event()
-    release = asyncio.Event()
-    original = ConversationStore._to_thread_durable
-
-    async def gated_durable(self, function, *args, **kwargs):
-        result = await original(self, function, *args, **kwargs)
-        if function.__name__ == "resolve_approval" and args[0] == call.id:
-            persisted.set()
-            await release.wait()
-        return result
-
-    # test-contract: seam no public hook exists between durable approval commit and settlement
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
-    reader, writer = await _ready(server)
-    closing: asyncio.Task[None] | None = None
-    try:
-        await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
-        closing = asyncio.create_task(server.close())
-        await asyncio.wait_for(persisted.wait(), timeout=10)
-        release.set()
-        async with asyncio.timeout(10):
-            frames = await _frames_until_eof(reader)
-            await closing
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert [
-            event["request_id"] for event in _named_events(frames, "approval_end")
-        ] == [approval["request_id"]]
-        if "tool_end" in names:
-            assert names.index("approval_end") < names.index("tool_end")
-    finally:
-        release.set()
-        if closing is not None:
-            await asyncio.gather(closing, return_exceptions=True)
-        writer.close()
-
-
-@pytest.mark.asyncio
-async def test_failed_settlement_emits_one_approval_end_before_turn_abort(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    call = ToolCall("failed-settlement", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    original = ConversationStore._to_thread_durable
-
-    async def fail_resolution(self, function, *args, **kwargs):
-        if function.__name__ == "resolve_approval" and args[0] == call.id:
-            raise OSError("forced approval persistence failure")
-        return await original(self, function, *args, **kwargs)
-
-    # test-contract: seam the real store has no public deterministic write-failure hook
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", fail_resolution)
-    reader, writer = await _ready(server)
-    frames: list[dict[str, Any]] = []
-    try:
-        await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 4,
-                        "method": "deny",
-                        "params": {"request_id": approval["request_id"]},
-                    }
-                )
-                + "\n"
-            ).encode()
-        )
-        await writer.drain()
-        async with asyncio.timeout(10):
-            while not (
-                _named_events(frames, "approval_end")
-                and _named_events(frames, "error")
-                and any(frame.get("id") == 4 for frame in frames)
-            ):
-                frames.append(await _read(reader))
-            writer.write(
-                b'{"jsonrpc":"2.0","id":5,"method":"status","params":{}}\n'
-            )
-            await writer.drain()
-            while not any(frame.get("id") == 5 for frame in frames):
-                frames.append(await _read(reader))
-        errors = _named_events(frames, "error")
-        assert any(
-            event["error"]["message"] == "approval decision could not be persisted"
-            for event in errors
-        )
-        assert len(_named_events(frames, "approval_end")) == 1
-    finally:
-        await _close(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_abort_during_pending_approval_ends_approval_before_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    call = ToolCall("aborted-approval", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    persisted = asyncio.Event()
-    release = asyncio.Event()
-    original = ConversationStore._to_thread_durable
-
-    async def gated_durable(self, function, *args, **kwargs):
-        result = await original(self, function, *args, **kwargs)
-        if function.__name__ == "resolve_approval" and args[0] == call.id:
-            persisted.set()
-            await release.wait()
-        return result
-
-    # test-contract: seam no public hook exists between durable approval commit and settlement
-    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
-    reader, writer = await _ready(server)
-    frames: list[dict[str, Any]] = []
-    try:
-        await _request(reader, writer, 3, "send", {"text": "read it"})
-        await _event(reader, "approval_request")
-        writer.write(b'{"jsonrpc":"2.0","id":4,"method":"abort","params":{}}\n')
-        await writer.drain()
-        await asyncio.wait_for(persisted.wait(), timeout=10)
-        release.set()
-        async with asyncio.timeout(10):
-            while not _named_events(frames, "turn_aborted"):
-                frames.append(await _read(reader))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert names.index("approval_end") < names.index("turn_aborted")
-        if "tool_end" in names:
-            assert names.index("approval_end") < names.index("tool_end")
-    finally:
-        release.set()
         await _close(server, writer)

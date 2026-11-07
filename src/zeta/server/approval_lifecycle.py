@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -18,6 +19,8 @@ from .protocol import ProtocolError
 
 Publish = Callable[..., Awaitable[bool]]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
+
+logger = logging.getLogger(__name__)
 
 ApprovalKey = str | tuple[str, str]
 
@@ -894,9 +897,14 @@ class ApprovalLifecycle:
         try:
             if payload is not None and record.history_published:
                 assert record.target.history_store is not None
-                await record.target.history_store.append_approval_history_async(
-                    {"event": "approval_end", **payload}
-                )
+                try:
+                    await record.target.history_store.append_approval_history_async(
+                        {"event": "approval_end", **payload}
+                    )
+                except (OSError, asyncio.CancelledError):
+                    logger.warning(
+                        "delegated approval history write failed", exc_info=True
+                    )
             if payload is not None and record.published:
                 publication_started.set()
                 await self._publish(
