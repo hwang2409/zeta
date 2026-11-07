@@ -17,10 +17,10 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _frames_until_event,
     _read_raw,
@@ -131,7 +131,7 @@ async def test_approval_lifecycle_transition_rejects_unknown_event(
         with pytest.raises(AssertionError, match="unhandled approval lifecycle event"):
             await server.control._approvals.transition(object())  # type: ignore[arg-type]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 class _AbortEvent:
@@ -312,7 +312,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
                 await server.control.resolve_approval("approve", wire_id)
             assert loser.value.code == -32006
             gate.release.set()
-            await cleanup
+            await asyncio.wait_for(cleanup, 10)
             expected = "abort"
         else:
             approve = asyncio.create_task(
@@ -321,7 +321,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             await _wait_thread_gate(gate)
             assert policy.cleanup_delegated("child") is None
             gate.release.set()
-            result = await approve
+            result = await asyncio.wait_for(approve, 10)
             assert result["decision"] == "approve"
             expected = "allow"
         await server.control.wait_for_approval_settlement()
@@ -333,7 +333,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
         assert policy._delegated == {}
     finally:
         gate.release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
         store.close()
 
 
@@ -363,7 +363,7 @@ async def test_same_tick_approval_reservation_winner(
                 await server.control.resolve_approval("approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
-            await abort
+            await asyncio.wait_for(abort, 10)
         else:
             approve = asyncio.create_task(
                 server.control.resolve_approval("approve", call.id)
@@ -372,8 +372,8 @@ async def test_same_tick_approval_reservation_winner(
             abort = asyncio.create_task(server.control._terminate_pending_approvals())
             assert not abort.done()
             gate.release.set()
-            result = await approve
-            await abort
+            result = await asyncio.wait_for(approve, 10)
+            await asyncio.wait_for(abort, 10)
             assert result["decision"] == "approve"
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
@@ -385,7 +385,7 @@ async def test_same_tick_approval_reservation_winner(
         assert events.count("approval_end") == 1
     finally:
         gate.release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -419,12 +419,12 @@ async def test_always_tool_grant_waits_for_durable_approval(
         assert server.runtime.policy is not None
         assert server.runtime.policy.session_allow == frozenset()
         gate.release.set()
-        frames = await approval
+        frames = await asyncio.wait_for(approval, 10)
         assert frames[-1]["error"]["code"] == -32000
         assert server.runtime.policy.session_allow == frozenset()
     finally:
         gate.release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -468,7 +468,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
+        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
         await server.control.wait_for_approval_settlement()
 
         history = [
@@ -485,7 +485,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         assert events == []
         assert server.control.pending_approvals_now() == []
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         child.close()
 
 
@@ -549,7 +549,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
         assert writers
         assert all("persist" in caller for caller in writers)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         if child is not None:
             child.close()
 
@@ -654,7 +654,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
                 "approval_end",
             ]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         if child is not None:
             child.close()
 
@@ -711,7 +711,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
             await server.control.resolve_approval("approve", call.id)
         assert error.value.code == -32000
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -775,7 +775,7 @@ async def test_observer_status_surfaces_viewed_session_health_when_degraded(
         )[-1]
         assert mutation["error"]["data"]["code"] == "observer_read_only"
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         observer_writer.close()
         await observer_writer.wait_closed()
 
@@ -896,7 +896,7 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
         assert result == {"accepted": True, "session_id": session_id}
         assert effects == ["message", "turn"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -968,7 +968,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
         assert "result" in recovered
         assert not server.control.unhealthy()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1008,7 +1008,7 @@ async def test_failed_recovery_keeps_session_unhealthy(
         mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
         assert mutation["error"]["code"] == -32000
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1031,7 +1031,7 @@ async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
             "result"
         ]["accepted"] is True
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1056,7 +1056,7 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
         mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
         assert mutation["error"]["code"] == -32003
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1075,7 +1075,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
 
     async def gated_close(*args: object, **kwargs: object) -> tuple[str, ...]:
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         result = await original_close(*args, **kwargs)
         completed.set()
         return result
@@ -1092,7 +1092,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         assert server.runtime.state is old_state
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await resume
+            await asyncio.wait_for(resume, 10)
         assert completed.is_set()
         assert server.runtime.state is None
         assert old_store._closed
@@ -1122,7 +1122,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         release.set()
         if not old_store._closed:
             await server.runtime._close_state(old_state)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1162,7 +1162,7 @@ async def test_forced_resume_cancellation_at_each_boundary_is_clean(
         assert runtime.state is None
         assert server.control.unhealthy()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1218,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         assert later.value.code == -32000
 
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1286,7 +1286,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
         assert not server.control.has_pending_approvals()
         assert server.control._approvals.state.records == {}
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         for store in stores:
             store.close()
 
@@ -1318,7 +1318,7 @@ async def test_legacy_status_bytes_match_main_from_resident_state(
         assert b"resolution_pending" not in actual
         assert b"pending_approvals_truncated" not in actual
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1343,13 +1343,13 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
         asyncio.get_running_loop().call_soon(responsive.set)
         await asyncio.wait_for(responsive.wait(), TIMEOUT)
         gate.release.set()
-        await released
+        await asyncio.wait_for(released, 10)
         assert gate.thread_ids != [threading.get_ident()]
         resolution = server.runtime.opened.store.approval_resolution_data(call.id)
         actual = (json.dumps(resolution, separators=(",", ":")) + "\n").encode()
         assert actual == expected
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1365,7 +1365,6 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy = server.runtime.policy
     assert policy is not None
-    closed = False
     late: ConversationStore | None = None
     try:
         policy.register_delegated(request, child, child_instance_id="child")
@@ -1373,10 +1372,9 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         cleanup = policy.cleanup_delegated("child")
         assert policy._delegated == {}
         if cleanup is not None:
-            await cleanup
+            await asyncio.wait_for(cleanup, 10)
 
-        await _close(server, writer)
-        closed = True
+        await close_serve(server, writer)
         late = ConversationStore(tmp_path / "late-child")
         late_call = ToolCall("late-call", "read", {"path": "late"})
         late.append_message_with_approval_requests(
@@ -1392,8 +1390,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
-        if not closed:
-            await _close(server, writer)
+        await close_serve(server, writer)
         if late is not None:
             late.close()
         child.close()
@@ -1428,7 +1425,7 @@ async def test_slash_and_ergonomics_read_serve_control_not_store(
             )
         assert error.value.code == -32004
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 _APPROVAL_SETTLEMENT_CASES = [
@@ -1557,7 +1554,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         if competing_event != "none":
             original_resolve(call.id, "abort", reason=reasons[competing_event])
         release.set()
-        frames = await rpc
+        frames = await asyncio.wait_for(rpc, 10)
         await server.control.wait_for_approval_settlement()
 
         resolution = store.approval_resolution_data(call.id)
@@ -1588,7 +1585,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             ]
     finally:
         release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
         if child is not None:
             child.close()
 
@@ -1628,7 +1625,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
         assert not server.control._approvals.state.records
         assert not server.control.has_pending_approvals()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         child.close()
 
 
@@ -1685,7 +1682,7 @@ async def test_approval_lifecycle_has_no_records_after_release(
         assert server.control._approvals.state.records == {}
         assert server.control._approvals.active_keys() == ()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1704,7 +1701,7 @@ async def test_persistence_failure_requests_turn_cancel_without_awaiting_reentra
         await asyncio.sleep(0)
         assert called == [True]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def test_failed_delegated_request_write_settles_cleanup_owner(
@@ -1743,7 +1740,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.gather(start, *(task for task in [cleanup_task] if task))
+        await asyncio.wait_for(asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10)
 
         assert child.approval_resolution_data(call.id) == {
             "request_id": call.id,
@@ -1756,7 +1753,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
         ]
         assert history == []
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
         child.close()
 
 
@@ -1841,10 +1838,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         )
         assert len(backend.calls) == 2
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1886,7 +1880,7 @@ async def test_approval_reconnect_legacy_claim_during_grace_gets_hello_first_and
         status = json.loads(await _read_raw(replacement_reader))
         assert status["id"] == 11
     finally:
-        await _close(server, replacement or writer)
+        await close_serve(server, replacement or writer)
 
 
 @pytest.mark.asyncio
@@ -1907,7 +1901,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace = server.control._grace_task
         assert grace is not None
         grace.cancel()
-        await asyncio.gather(grace, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(grace, return_exceptions=True), 10)
         server.approval_reconnect_grace = 0
         monkeypatch.setattr(server.runtime.opened.store, gate.method, gate.call)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
@@ -1933,7 +1927,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         assert hello["id"] == 10
     finally:
         gate.release.set()
-        await _close(server, replacement or writer)
+        await close_serve(server, replacement or writer)
 
 
 @pytest.mark.asyncio
@@ -1963,7 +1957,7 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         assert events.count(("approval_request", call.id)) == 2
         assert server.control.pending_approvals_now()[0]["request_id"] == call.id
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1989,7 +1983,7 @@ async def test_approval_reconnect_expiry_aborts_once(tmp_path: Path) -> None:
             await server.control.resolve_approval("approve", call.id)
         assert late.value.code == -32006
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2021,10 +2015,10 @@ async def test_approval_reconnect_status_during_reserved_write(
             await server.control.resolve_approval("deny", call.id)
         assert competing.value.code == -32006
         gate.release.set()
-        await decision
+        await asyncio.wait_for(decision, 10)
     finally:
         gate.release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2049,4 +2043,4 @@ async def test_approval_reconnect_status_bound_is_negotiated(tmp_path: Path) -> 
         assert all("resolution_pending" not in item for item in legacy)
         assert first.id == negotiated[0]["request_id"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)

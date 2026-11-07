@@ -7,7 +7,8 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from tests.test_server import _close, _connect, _request
+from tests.support.serve_close import close_serve
+from tests.test_server import _connect, _request
 from zeta.protocol.types import (
     ImageContent,
     Message,
@@ -220,10 +221,11 @@ async def test_history_cache_is_keyed_by_row_shaping_features(
         else:
             assert attachments[0]["handle"]
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(
+            server,
+            controller_writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
@@ -245,7 +247,7 @@ async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
         reply = (await _request(reader, writer, 4, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -260,7 +262,7 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
     store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
     _, attachments, _ = await _history_with_image(reader, writer, request_id=4, session_id=session["session_id"])
     handle = attachments[0]["handle"]
-    await _close(server, writer)
+    await close_serve(server, writer)
     restarted = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(restarted)
     try:
@@ -270,7 +272,7 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
         reply = (await _request(reader, writer, 3, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
     finally:
-        await _close(restarted, writer)
+        await close_serve(restarted, writer)
 
 
 @pytest.mark.asyncio
@@ -331,10 +333,11 @@ async def test_content_read_rejects_session_id_for_controller_and_observer(
         }
         assert controller == observer == expected
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(
+            server,
+            controller_writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
@@ -364,7 +367,7 @@ async def test_handle_is_scoped_to_session_for_controller_and_observer(tmp_path:
             observer_writer.close(); await observer_writer.wait_closed()
         assert controller == observer == {"code": -32012, "message": "content not found", "data": {"code": "content_not_found"}}
     finally:
-        await _close(first, writer_a)
+        await close_serve(first, writer_a)
         await second.close()
 
 
