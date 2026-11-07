@@ -541,6 +541,7 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
 # by design. Keep this exhaustive when adding a StreamEventType member.
 BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
     StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CONFIG_CHANGED,
     StreamEventType.CHILD_MESSAGE_DELIVERED,
 })
 STREAM_EVENTS_RENDERED = frozenset({
