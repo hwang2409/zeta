@@ -82,7 +82,10 @@ class AttentionReplies:
             path = self.staged_dir / attention_id
             if path.exists():
                 if path.read_text(encoding="utf-8") != reply:
-                    raise ValueError("attention item already has a different reply in the TUI decisions popup")
+                    raise ValueError(
+                        f"attention {attention_id} has a staged reply in a TUI decisions popup; "
+                        "finish or exit that popup before acting on it here"
+                    )
                 return
             tmp = self.staged_dir / f".{attention_id}.{secrets.token_hex(8)}"
             tmp.write_text(reply, encoding="utf-8")
@@ -109,7 +112,10 @@ class AttentionReplies:
         with self._lock():
             result = self._recover_locked()
             if any(item_id == attention_id for item_id, _ in result.staged):
-                raise ValueError("attention item already has a reply in the TUI decisions popup")
+                raise ValueError(
+                    f"attention {attention_id} has a staged reply in a TUI decisions popup; "
+                    "finish or exit that popup before acting on it here"
+                )
             record = self._record(attention_id)
             if record.status == "resolved":
                 if record.decision != reply:
@@ -127,7 +133,10 @@ class AttentionReplies:
         with self._lock():
             result = self._recover_locked()
             if any(item_id == attention_id for item_id, _ in result.staged):
-                raise ValueError("attention item has a reply in the TUI decisions popup")
+                raise ValueError(
+                    f"attention {attention_id} has a staged reply in a TUI decisions popup; "
+                    "finish or exit that popup before acting on it here"
+                )
             record = self._record(attention_id)
             if record.status == "resolved":
                 return True
@@ -141,7 +150,11 @@ class AttentionReplies:
             result = self._recover_locked()
             staged = dict(result.staged)
             if any(item_id in staged for item_id, _ in replies):
-                raise ValueError("attention item already has a reply in the TUI decisions popup")
+                item_id = next(item_id for item_id, _ in replies if item_id in staged)
+                raise ValueError(
+                    f"attention {item_id} has a staged reply in a TUI decisions popup; "
+                    "finish or exit that popup before acting on it here"
+                )
             pairs = [(item_id, self._validate_reply(reply)) for item_id, reply in replies]
             for item_id, _ in pairs:
                 self._check_open(self._record(item_id))
@@ -179,16 +192,22 @@ class AttentionReplies:
             except (ValueError, IndexError): raise ValueError("invalid attention journal sequence")
         message_id = self._message_id(pairs)
         private = self.attention_dir / f".batch-{secrets.token_hex(8)}"
+        if not pairs:
+            raise ValueError("attention batch must not be empty")
         private.mkdir(mode=0o700)
         for item_id, reply in pairs:
-            (private / item_id).write_text(reply, encoding="utf-8")
+            path = private / item_id
+            path.write_text(reply, encoding="utf-8")
+            os.chmod(path, 0o600)
+        self._sync_directory(private)
         journal = self.attention_dir / f"sending-{sequence + 1:020d}-{message_id}"
         os.replace(private, journal)
         self._sync_directory()
         return journal
 
-    def _sync_directory(self) -> None:
-        fd = os.open(self.attention_dir, os.O_RDONLY | os.O_DIRECTORY)
+    def _sync_directory(self, directory: Path | None = None) -> None:
+        directory = directory or self.attention_dir
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(fd)
         finally:
@@ -196,6 +215,8 @@ class AttentionReplies:
 
     def _send_journal(self, journal: Path, *, from_session: str | None = None) -> None:
         pairs = [(path.name, path.read_text(encoding="utf-8")) for path in sorted(journal.iterdir())]
+        if not pairs:
+            raise ValueError("attention journal is empty")
         state = self.registry_state or available_project_registry(self.home / "projects")
         if state.registry is None:
             raise ValueError("project registry is unavailable")

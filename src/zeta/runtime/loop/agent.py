@@ -584,6 +584,17 @@ class AgentLoop(
             return
         self.store.bind_owner_thread()
         self._activated = True
+        # Finish sealed attention replies before accepting input. recovery is
+        # blocking filesystem and inbox work, so keep it off the event loop.
+        from ...attention_replies import AttentionReplies
+
+        await asyncio.to_thread(
+            AttentionReplies(
+                self.store.session_dir.parent.parent,
+                self.store.session_id,
+                registry_state=self.tool_registry.project_registry_state,
+            ).recover
+        )
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(

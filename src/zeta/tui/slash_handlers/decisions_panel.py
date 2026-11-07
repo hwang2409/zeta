@@ -119,6 +119,7 @@ class DecisionsMixin:
                 AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).reply,
                 record.id, parts[2], self.loop.store.session_id,
             )
+            self._schedule_background_wake()
             return f"replied to {attention_id}"
         if not items:
             return "no open attention items"
@@ -319,6 +320,7 @@ class DecisionsMixin:
                 await asyncio.to_thread(replies.stage, record.id, decision)
                 if len(self._decisions_panel.items) <= 1:
                     await asyncio.to_thread(replies.flush, self.loop.store.session_id)
+                self._schedule_background_wake()
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()

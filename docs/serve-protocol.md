@@ -1451,7 +1451,7 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
-| `decisions` | yes | read, reply to, or dismiss attention items |
+| `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
 | `approve` | no | `/approve [key]` |

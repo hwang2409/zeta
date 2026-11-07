@@ -128,6 +128,28 @@ class ServerSlashSession:
             opened.metadata.session_id,
             registry_state,
         )
+        if parts and parts[0] == "batch":
+            if len(parts) != 2:
+                return "usage: /decisions batch <json array>"
+            try:
+                submitted = json.loads(parts[1])
+                if not isinstance(submitted, list):
+                    raise TypeError
+                batch = [(item["id"], item["reply"]) for item in submitted]
+                if (
+                    any(not isinstance(item_id, str) or not isinstance(reply, str) for item_id, reply in batch)
+                    or len({item_id for item_id, _ in batch}) != len(batch)
+                ):
+                    raise TypeError
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                return "batch must be a JSON array of objects with id and reply"
+            await asyncio.to_thread(
+                AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).stage_and_flush,
+                batch,
+                opened.metadata.session_id,
+            )
+            await loop._check_project_inbox()
+            return f"replied to {len(batch)} attention item(s)"
         if parts and parts[0] in {"dismiss", "reply"}:
             if len(parts) < 2:
                 return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
@@ -146,6 +168,7 @@ class ServerSlashSession:
                 parts[2],
                 opened.metadata.session_id,
             )
+            await loop._check_project_inbox()
             return f"replied to {item.record.id}"
         if not items:
             return "no open attention items"

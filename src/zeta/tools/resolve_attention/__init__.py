@@ -48,7 +48,7 @@ async def _resolve_attention(
         store.session_id,
     )
     record = await asyncio.to_thread(
-        AttentionStore(store.session_dir).get, validated.record.id
+        AttentionStore(home / "sessions" / validated.record.session_id).get, validated.record.id
     )
     if already_resolved:
         return _success_result(

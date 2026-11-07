@@ -74,10 +74,13 @@ def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     record = _record(store, kind="answer", session_id=opened.store.session_id)
-    dismissed, already = store.dismiss(record.id, session_id=opened.store.session_id)
-    assert not already
+    from zeta.attention_replies import AttentionReplies
+
+    replies = AttentionReplies(tmp_path, opened.store.session_id)
+    assert not replies.dismiss(record.id)
+    assert replies.dismiss(record.id)
+    dismissed = store.get(record.id)
     assert dismissed.status == "resolved" and dismissed.decision is None
-    assert store.dismiss(record.id, session_id=opened.store.session_id)[1]
     opened.store.close()
 
 
@@ -85,8 +88,10 @@ def test_decision_cannot_be_dismissed(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     record = _record(store, session_id=opened.store.session_id)
+    from zeta.attention_replies import AttentionReplies
+
     with pytest.raises(ValueError, match="require a reply"):
-        store.dismiss(record.id, session_id=opened.store.session_id)
+        AttentionReplies(tmp_path, opened.store.session_id).dismiss(record.id)
     opened.store.close()
 
 
