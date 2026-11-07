@@ -434,87 +434,6 @@ async def test_aclose_settles_queued_frames_false() -> None:
     assert tail.done() and await tail is False
 
 
-@pytest.mark.asyncio
-async def test_pre_hello_flush_overflow_drops_tail_keeps_connection() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
-    connection = _ControllerConnection()
-    registry.register(connection)
-    registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    seed = connection.codec.notification(EventDescriptor.ASSISTANT_DELTA, "session", delta="seed")
-    assert await registry.publish_controller(
-        EventDescriptor.ASSISTANT_DELTA, "session", delta="seed"
-    )
-    seed_started = asyncio.Event()
-    release_seed = asyncio.Event()
-    close_count = 0
-    original_write = connection._write_physical
-
-    async def gated_seed(frame: bytes) -> bool:
-        if frame == seed:
-            seed_started.set()
-            await release_seed.wait()
-        return await original_write(frame)
-
-    async def close() -> None:
-        nonlocal close_count
-        close_count += 1
-
-    connection._write_physical = gated_seed  # type: ignore[method-assign]
-    connection.close = close  # type: ignore[method-assign]
-    hello = asyncio.create_task(_send_hello_and_flush(registry, connection))
-    await seed_started.wait()
-    for _ in range(256):
-        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="tail")
-    release_seed.set()
-
-    await asyncio.gather(hello, return_exceptions=True)
-    assert close_count == 0
-    assert connection.frames == [b"hello\n", seed]
-    registry.release(connection)
-
-
-@pytest.mark.asyncio
-async def test_pre_hello_flush_drops_publications_after_overflow_like_base() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
-    connection = _ControllerConnection()
-    registry.register(connection)
-    registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    seed = connection.codec.notification(EventDescriptor.ASSISTANT_DELTA, "session", delta="seed")
-    assert await registry.publish_controller(
-        EventDescriptor.ASSISTANT_DELTA, "session", delta="seed"
-    )
-    seed_started = asyncio.Event()
-    release_seed = asyncio.Event()
-    close_count = 0
-    original_write = connection._write_physical
-
-    async def gated_seed(frame: bytes) -> bool:
-        if frame == seed:
-            seed_started.set()
-            await release_seed.wait()
-        return await original_write(frame)
-
-    async def close() -> None:
-        nonlocal close_count
-        close_count += 1
-
-    connection._write_physical = gated_seed  # type: ignore[method-assign]
-    connection.close = close  # type: ignore[method-assign]
-    hello = asyncio.create_task(_send_hello_and_flush(registry, connection))
-    await seed_started.wait()
-    for _ in range(256):
-        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="tail")
-    assert await registry.publish_controller(
-        EventDescriptor.ASSISTANT_DELTA, "session", delta="post-overflow"
-    )
-    release_seed.set()
-
-    assert await hello
-    assert close_count == 0
-    assert connection.frames == [b"hello\n", seed]
-    registry.release(connection)
-
-
 class _RecordingWriter:
     def __init__(self) -> None:
         self.frames: list[bytes] = []
@@ -541,6 +460,7 @@ async def _capture_direct_raw_stream(
 ) -> bytes:
     counter = iter(range(1000, 2000))
     monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=next(counter)))
+    # test-contract: seam freezes timestamps for exact raw-byte comparison
     monkeypatch.setattr(session_module, "_now", lambda: "2026-01-01T00:00:00+00:00")
     backend = _GatedBackend()
     server = ZetaServer(

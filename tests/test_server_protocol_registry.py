@@ -83,24 +83,28 @@ def _annotation_name(argument: ast.arg) -> str | None:
     return argument.annotation.id if isinstance(argument.annotation, ast.Name) else None
 
 
-def _frame_codec_methods() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+def _class_methods(
+    class_name: str,
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
     tree = ast.parse(PROTOCOL_MODULE.read_text(encoding="utf-8"))
-    codec = next(
+    class_node = next(
         node
         for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "FrameCodec"
+        if isinstance(node, ast.ClassDef) and node.name == class_name
     )
     return {
         node.name: node
-        for node in codec.body
+        for node in class_node.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
 
 def test_frame_codec_is_the_typed_error_and_notification_chokepoint() -> None:
-    methods = _frame_codec_methods()
+    methods = _class_methods("FrameCodec")
+    protocol_error_descriptor = _class_methods("ProtocolError")["__init__"].args.args[1]
     error_descriptor = methods["error_response"].args.args[2]
     event_descriptor = methods["notification"].args.args[1]
+    assert _annotation_name(protocol_error_descriptor) == "ErrorDescriptor"
     assert _annotation_name(error_descriptor) == "ErrorDescriptor"
     assert _annotation_name(event_descriptor) == "EventDescriptor"
     assert not (

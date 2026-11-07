@@ -16,6 +16,7 @@ from tests.test_server import TIMEOUT, _socket_path
 from zeta.protocol.types import TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
+from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
 
 Transport = Literal["unix", "websocket"]
@@ -153,11 +154,13 @@ def _retained(output: Any) -> tuple[int, int]:
 def _offer(server: ZetaServer, state: Any, role: Role, label: str) -> Awaitable[bool]:
     if role == "controller":
         return server.connections.publish_controller(
-            "assistant_delta", "session", delta=label
+            EventDescriptor.ASSISTANT_DELTA, "session", delta=label
         )
     return server.connections.send(
         state.connection,
-        state.connection.codec.notification("assistant_delta", "session", delta=label),
+        state.connection.codec.notification(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta=label
+        ),
     )
 
 
@@ -178,8 +181,8 @@ async def test_ready_output_overflow_uses_shared_bound_and_reserved_control(
     control = server.connections._overflow_frame(role)
     payload = state.connection.codec.notification
     byte_limit = (
-        len(payload("assistant_delta", "session", delta="head"))
-        + len(payload("assistant_delta", "session", delta="tail"))
+        len(payload(EventDescriptor.ASSISTANT_DELTA, "session", delta="head"))
+        + len(payload(EventDescriptor.ASSISTANT_DELTA, "session", delta="tail"))
         + len(control)
     )
     monkeypatch.setattr(
@@ -355,7 +358,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
 
         head = asyncio.create_task(
             server.connections.publish_controller(
-                "assistant_delta", session_id, delta="head"
+                EventDescriptor.ASSISTANT_DELTA, session_id, delta="head"
             )
         )
         await asyncio.wait_for(head_started.wait(), TIMEOUT)
@@ -367,7 +370,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
         async def trigger_overflow() -> bool:
             trigger_started.set()
             return await server.connections.publish_controller(
-                "assistant_delta", session_id, delta="trigger"
+                EventDescriptor.ASSISTANT_DELTA, session_id, delta="trigger"
             )
 
         trigger = asyncio.create_task(trigger_overflow())
@@ -380,7 +383,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
                 "jsonrpc": "2.0",
                 "method": "event",
                 "params": {
-                    "event": "assistant_delta",
+                    "event": EventDescriptor.ASSISTANT_DELTA,
                     "session_id": session_id,
                     "delta": "head",
                 },
@@ -481,12 +484,12 @@ async def test_active_flush_overflow_sends_control_then_closes(
         assert output is not None
         results = [
             await server.connections.publish_controller(
-                "assistant_delta", "session", delta=f"tail-{index}"
+                EventDescriptor.ASSISTANT_DELTA, "session", delta=f"tail-{index}"
             )
             for index in range(257)
         ]
         later = await server.connections.publish_controller(
-            "assistant_delta", "session", delta="later"
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="later"
         )
 
         await _send_json(
