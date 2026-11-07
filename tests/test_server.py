@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Collection
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -3824,8 +3824,6 @@ async def test_session_swap_rejects_pending_notification_handoff(
             subprotocols=["zeta.v1", f"zeta.bearer.{server._websocket.token}"],
         )
         client = ServeClient(websocket=websocket)
-    await client.request("hello", "hello", {"protocol_version": "1.1"})
-    await client.request("new", "new_session", {"provider": "codex"})
     agent_end_published = asyncio.Event()
     release_agent_end = asyncio.Event()
     notification_captured = asyncio.Event()
@@ -3849,24 +3847,36 @@ async def test_session_swap_rejects_pending_notification_handoff(
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
     )  # test-contract: seam serve has no public notification-turn start gate
-    old_session_id = server.runtime.session_id
     try:
-        await client.request("send", "send", {"text": "start"})
-        approval = await client.event("approval_request")
+        await asyncio.wait_for(
+            client.request("hello", "hello", {"protocol_version": "1.1"}), TIMEOUT
+        )
+        await asyncio.wait_for(
+            client.request("new", "new_session", {"provider": "codex"}), TIMEOUT
+        )
+        old_session_id = server.runtime.session_id
+        await asyncio.wait_for(
+            client.request("send", "send", {"text": "start"}), TIMEOUT
+        )
+        approval = await asyncio.wait_for(client.event("approval_request"), TIMEOUT)
         assert approval["delegated"] is True
         await asyncio.wait_for(agent_end_published.wait(), timeout=TIMEOUT)
 
-        rejected = await client.request(
-            "busy-swap", "new_session", {"provider": "codex"}
+        rejected = await asyncio.wait_for(
+            client.request("busy-swap", "new_session", {"provider": "codex"}),
+            TIMEOUT,
         )
         assert rejected["error"]["code"] == -32004
 
         release_agent_end.set()
-        await client.event("agent_end")
-        await client.request(
-            "approve",
-            "approve",
-            {"request_id": approval["request_id"]},
+        await asyncio.wait_for(client.event("agent_end"), TIMEOUT)
+        await asyncio.wait_for(
+            client.request(
+                "approve",
+                "approve",
+                {"request_id": approval["request_id"]},
+            ),
+            TIMEOUT,
         )
         await asyncio.wait_for(notification_captured.wait(), timeout=TIMEOUT)
         notification_turn = server.control._turn_task
@@ -3874,18 +3884,22 @@ async def test_session_swap_rejects_pending_notification_handoff(
         release_notification.set()
         await asyncio.wait_for(asyncio.shield(notification_turn), timeout=TIMEOUT)
 
-        swapped = await client.request(
-            "swap", "new_session", {"provider": "codex"}
+        swapped = await asyncio.wait_for(
+            client.request("swap", "new_session", {"provider": "codex"}), TIMEOUT
         )
         new_session_id = swapped["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
 
-        resumed = await client.request(
-            "resume", "resume", {"session_id": old_session_id}
+        resumed = await asyncio.wait_for(
+            client.request("resume", "resume", {"session_id": old_session_id}),
+            TIMEOUT,
         )
         assert resumed["result"]["session"]["session_id"] == old_session_id
-        history = await client.request(
-            "history", "session_history", {"session_id": old_session_id}
+        history = await asyncio.wait_for(
+            client.request(
+                "history", "session_history", {"session_id": old_session_id}
+            ),
+            TIMEOUT,
         )
         assert "result" in history, history
         assert any(
@@ -3929,6 +3943,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
     setup_calls = 0
     termination_calls = 0
     wake_task: asyncio.Task[None] | None = None
+    swap: asyncio.Task[list[dict[str, Any]]] | None = None
 
     async def gated_run_setup(*args: object, **kwargs: object):
         nonlocal setup_calls
@@ -3970,7 +3985,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
     )  # test-contract: seam serve has no public notification-turn start gate
     try:
         await _request(reader, writer, 3, "send", {"text": "start child"})
-        await _event(reader, "agent_end")
+        await asyncio.wait_for(_event(reader, "agent_end"), TIMEOUT)
         await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
 
         swap = asyncio.create_task(
@@ -4012,7 +4027,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
             reader, writer, 7, "resume", {"session_id": old_session_id}
         )
         assert resumed[-1]["result"]["session"]["session_id"] == old_session_id
-        await _event(reader, "turn_end")
+        await asyncio.wait_for(_event(reader, "turn_end"), TIMEOUT)
         history = await _request(
             reader,
             writer,
@@ -4030,6 +4045,11 @@ async def test_session_swap_reserves_child_completion_during_setup(
         backend.release_child.set()
         release_setup.set()
         release_notification.set()
+        if swap is not None:
+            if not swap.done():
+                swap.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(swap, TIMEOUT)
         await _close(server, writer)
 
 

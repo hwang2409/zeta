@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -1463,6 +1464,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
     reader, writer = await _connect(server)
     started = asyncio.Event()
     release_resume = asyncio.Event()
+    resume = None
     try:
         await _hello(reader, writer, ["session_host_commands"])
         created = await _request(
@@ -1493,7 +1495,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
                 },
             )
         )
-        await started.wait()
+        await asyncio.wait_for(started.wait(), 10)
         server.runtime.opened.store.append_agent_notification(
             "wake-a",
             child_session_path="/wake-a",
@@ -1504,10 +1506,10 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
         server.control._schedule_background_wake(session_id)
         assert server.control._turn_task is None
         release_resume.set()
-        assert "result" in (await resume)[-1]
-        await entered[0].wait()
+        assert "result" in (await asyncio.wait_for(resume, 10))[-1]
+        await asyncio.wait_for(entered[0].wait(), 10)
         release_backend[0].set()
-        approval = await _event(reader, "approval_request")
+        approval = await asyncio.wait_for(_event(reader, "approval_request"), 10)
         assert approval["request_id"] == call_a.id
         await _request(
             reader,
@@ -1516,8 +1518,11 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             "approve",
             {"request_id": call_a.id},
         )
-        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-b"
-        await _event(reader, "agent_end")
+        assert (
+            _tool_stdout(await asyncio.wait_for(_event(reader, "tool_end"), 10))
+            == "snapshot-b"
+        )
+        await asyncio.wait_for(_event(reader, "agent_end"), 10)
         assert any(
             isinstance(block, TextContent) and "gamma-b" in block.text
             for message in backend.calls[1][0]
@@ -1533,9 +1538,9 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             text="wake b",
         )
         server.control._schedule_background_wake(session_id)
-        await entered[1].wait()
+        await asyncio.wait_for(entered[1].wait(), 10)
         release_backend[1].set()
-        approval = await _event(reader, "approval_request")
+        approval = await asyncio.wait_for(_event(reader, "approval_request"), 10)
         assert approval["request_id"] == call_b.id
         await _request(
             reader,
@@ -1544,8 +1549,11 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             "approve",
             {"request_id": call_b.id},
         )
-        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-b"
-        await _event(reader, "agent_end")
+        assert (
+            _tool_stdout(await asyncio.wait_for(_event(reader, "tool_end"), 10))
+            == "snapshot-b"
+        )
+        await asyncio.wait_for(_event(reader, "agent_end"), 10)
         assert any(
             isinstance(block, TextContent) and "gamma-b" in block.text
             for message in backend.calls[3][0]
@@ -1553,6 +1561,14 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             for block in message.content
         )
     finally:
+        release_resume.set()
+        for release in release_backend:
+            release.set()
+        if resume is not None:
+            if not resume.done():
+                resume.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(resume, 10)
         await _close(server, writer)
 
 
