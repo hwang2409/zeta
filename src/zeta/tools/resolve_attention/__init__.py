@@ -103,6 +103,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "resolve_attention",
         _close_attention,
+        binding="shared",
         description=(
             "Close your own pending attention item when the user answered the decision "
             "in chat. This does not send an inbox message."
@@ -124,6 +125,7 @@ def register_fork(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "resolve_attention",
         _resolve_attention,
+        binding="shared",
         description=(
             "Deliver the user's final decision to exactly the original orchestrator "
             "and resolve this attention item."

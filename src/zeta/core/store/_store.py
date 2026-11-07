@@ -1211,6 +1211,12 @@ class ConversationStore(
 
         return self._active_branch()
 
+    def resident_entries_snapshot(self) -> tuple[ConversationEntry, ...]:
+        """Return append-only entry references for work on another thread."""
+
+        self._assert_owner_thread()
+        return tuple(self._entries)
+
     @classmethod
     def _snapshot_branch(
         cls, branch: Iterable[ConversationEntry]
