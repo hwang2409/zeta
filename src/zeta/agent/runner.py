@@ -46,7 +46,6 @@ from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from .background import CancellationRequest, finish_background_child
-from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -57,6 +56,7 @@ from .presets import (
     RUN_PRESET,
     AgentPreset,
     compose_system_prompt,
+    resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
 from .run_consumer import consume_run as consume_follow_up_run
@@ -377,27 +377,25 @@ async def _build_child_loop(
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
     try:
-        excluded_names = {"inbox", "request_attention", "resolve_attention"}
-        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
-            excluded_names.add("agent")
-        staged_names = {"ask_parent"} if follow_up_loop else set()
-        resolvable_names = set(loop.tool_registry.policy_allowed_registered_names)
-        resolvable_names.difference_update(excluded_names)
-        for name in staged_names - excluded_names:
-            if loop.tool_registry.tool_is_allowed_by_policy(name):
-                resolvable_names.add(name)
-        profile_tool_allow = preset.tool_names
-        if profile_tool_allow is not None:
-            unresolved_names = profile_tool_allow - resolvable_names
-            if unresolved_names:
-                raise ValueError(
-                    f"profile {preset.name!r} requests unavailable tools: "
-                    + ", ".join(sorted(unresolved_names))
-                )
-            allowed_names = set(profile_tool_allow)
-            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
-                allowed_names.add("agent")
-            profile_tool_allow = frozenset(allowed_names)
+        explicit_finish = explicit_finish_eligible(
+            global_enabled=loop.explicit_finish,
+            preset=preset,
+            background=follow_up_loop,
+        )
+        runtime_tool_names = {"ask_parent"} if follow_up_loop else set()
+        if explicit_finish:
+            runtime_tool_names.update(("finish", "agent_handoff"))
+        policy_allowed_runtime_names = frozenset(
+            name
+            for name in runtime_tool_names
+            if loop.tool_registry.tool_is_allowed_by_policy(name)
+        )
+        excluded_names, profile_tool_allow = resolve_child_profile_tools(
+            child_depth=child_depth,
+            preset=preset,
+            policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
+            runtime_tool_names=policy_allowed_runtime_names,
+        )
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
@@ -452,11 +450,6 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
-        explicit_finish = explicit_finish_eligible(
-            global_enabled=loop.explicit_finish,
-            preset=preset,
-            background=follow_up_loop,
-        )
         child_loop = AgentLoop(
             child_backend,
             child_store,

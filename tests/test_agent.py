@@ -4442,6 +4442,92 @@ async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_finish_enabled", [True, False])
+async def test_restricted_profile_keeps_eligible_child_runtime_tools(
+    tmp_path: Path,
+    explicit_finish_enabled: bool,
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "restricted.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\n"
+        "name: restricted\n"
+        "description: restricted background profile\n"
+        "accepts_follow_ups: true\n"
+        "explicit_finish: true\n"
+        "tools: [read]\n"
+        "---\nrestricted\n",
+        encoding="utf-8",
+    )
+    preset = discover_session_agents(home=home).find("restricted")
+    child_turn = (
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall(
+                    "finish-1",
+                    "finish",
+                    {"status": "done", "summary": "finished"},
+                )
+            ]
+        )
+        if explicit_finish_enabled
+        else ScriptedTurn([TextContent("finished")])
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "restricted-1",
+                        "agent",
+                        {
+                            "prompt": "inspect the task",
+                            "description": "restricted task",
+                            "preset": "restricted",
+                            "background": True,
+                        },
+                    )
+                ]
+            ),
+            child_turn,
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog((preset,)),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = explicit_finish_enabled
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    for _ in range(100):
+        if len(backend.calls) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("background child did not reach the model")
+
+    child_tools = {schema["name"] for schema in backend.calls[1][1]}
+    assert "ask_parent" in child_tools
+    if explicit_finish_enabled:
+        assert {"finish", "agent_handoff"} <= child_tools
+    else:
+        assert {"finish", "agent_handoff"}.isdisjoint(child_tools)
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
     tmp_path: Path,
 ) -> None:
