@@ -21,6 +21,8 @@ from ..core.checkpoints import (
     load_session_json,
 )
 from ..core.fsio import write_all
+from ..core.store import ConversationStore
+from ..core.transcript_recovery import resume_memory_review
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -286,8 +288,31 @@ class AutoMemoryReconciler:
             self._drained.clear()
             self._ensure_worker()
 
-    def resume_recovery(self, retained_last_sequence: int) -> None:
-        """Resume after the user accepts the read-only overlap report."""
+    async def resume_recovery(
+        self, root_session_id: str, quarantine_id: str
+    ) -> str:
+        """Commit one recovery review, then resume scanning from its cutoff."""
+        if root_session_id != self.session_id:
+            return "memory recovery: unavailable for this session"
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise ProjectRegistryError(
+                "memory writes are unavailable before the writer epoch"
+            )
+
+        def resume() -> int:
+            with ConversationStore(
+                self.session_dir.parent,
+                session_id=self.session_id,
+                cwd=self.session_dir,
+                _storage_lease=self._storage_lease,
+                _owner_surface="recovery",
+                _recovery_owner=True,
+            ) as store, store._append_lock():
+                return resume_memory_review(
+                    store.directory_fd, quarantine_id
+                ).cutoff_sequence
+
+        retained_last_sequence = await asyncio.to_thread(resume)
         self._recovery_cutoff = retained_last_sequence
         self._paused_for_recovery = False
         self._resume_catch_up = True
@@ -295,6 +320,7 @@ class AutoMemoryReconciler:
             self._drained.clear()
             self._ensure_worker()
             self._wake.set()
+        return "memory recovery resumed"
 
     def activity(self, seq: int | None = None) -> None:
         """Report a transcript append after it has been durably persisted."""
