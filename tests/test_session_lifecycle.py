@@ -213,13 +213,11 @@ def test_session_list_shows_id_name_age_preview(
 
     first = create_app(_args())
     first.loop.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER
+        )
     )
-    manager = SessionManager(home)
-    manager.record_name(
-        SessionManager(home).open(first.loop.store.session_id).metadata,
-        name="planning",
-    )
+    SessionManager(home).rename(first.loop.store.session_id, "planning")
 
     exit_code = main(["session", "list"])
     output = capsys.readouterr().out
@@ -227,6 +225,7 @@ def test_session_list_shows_id_name_age_preview(
     assert "planning" in output
     assert first.loop.store.session_id[:8] in output
     assert "first prompt" in output
+    assert f"in use, pid {os.getpid()}" in output
 
 
 def test_session_list_shows_placeholder_for_empty_preview(
@@ -385,9 +384,7 @@ def test_resume_picker_shows_names(
     monkeypatch.chdir(tmp_path)
     first = create_app(_args())
     manager = SessionManager(home)
-    manager.record_name(
-        manager.open(first.loop.store.session_id).metadata, name="planning"
-    )
+    manager.rename(first.loop.store.session_id, "planning")
     monkeypatch.setattr(
         "zeta.tui.app.get_terminal_size",
         lambda fallback: SimpleNamespace(columns=200, lines=24),
@@ -398,6 +395,7 @@ def test_resume_picker_shows_names(
     output = capsys.readouterr().out
 
     assert "[planning]" in output
+    assert f"[in use, pid {os.getpid()}]" in output
 
 
 def test_session_metadata_rejects_bad_name_type(

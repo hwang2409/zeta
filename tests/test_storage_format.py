@@ -101,9 +101,33 @@ def test_writer_refuses_missing_and_too_new_manifest(
     monkeypatch.delenv("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT")
     with pytest.raises(StorageFormatError, match="manifest is missing"):
         open_writer(tmp_path)
-    (tmp_path / "storage-format.json").write_text('{"writer_epoch":3}\n')
+    (tmp_path / "storage-format.json").write_text(
+        json.dumps({"writer_epoch": storage_format.WRITER_EPOCH + 1}) + "\n"
+    )
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
         open_writer(tmp_path)
+
+
+def test_predecessor_writer_refuses_advanced_home_without_writes(
+    tmp_path: Path,
+) -> None:
+    advance(tmp_path, expected_epoch=0)
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    assert verify(tmp_path).writer_epoch == 3
+    with pytest.raises(StorageFormatError, match="newer than writer capability"):
+        open_writer(tmp_path, capability=2)
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 def test_advance_is_exclusive_across_processes(tmp_path: Path) -> None:
@@ -120,7 +144,7 @@ def test_advance_is_exclusive_across_processes(tmp_path: Path) -> None:
     result.join_thread()
     process.close()
     lease.close()
-    assert verify(tmp_path).writer_epoch == 2
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
 
 
 def test_advanced_home_refuses_predecessor_before_transcript_parsing(
@@ -136,9 +160,9 @@ def test_advanced_home_refuses_predecessor_before_transcript_parsing(
         if path.is_file()
     }
 
-    assert verify(tmp_path).writer_epoch > 1, "candidate advanced the home"
+    assert verify(tmp_path).writer_epoch == 3, "candidate advanced the home"
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
-        open_writer(tmp_path, capability=1)
+        open_writer(tmp_path, capability=2)
 
     after = {
         path.relative_to(tmp_path): path.read_bytes()

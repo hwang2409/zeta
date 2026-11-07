@@ -3254,7 +3254,12 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
         retained_tail=8,
         compaction_budget=200_000,
     )
-    base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
+    probe_wire = {
+        **probe.to_catalog_dict(),
+        "first_message_preview": "",
+        "in_use": False,
+    }
+    base_size = len(codec.response(0, {"sessions": [probe_wire]}))
     huge = SessionMetadata.new(
         session_id=probe.session_id,
         provider="codex",
@@ -6278,6 +6283,8 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         await _event(reader, "turn_end")
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
+        assert result["sessions"][0]["in_use"] is True
+        assert result["sessions"][0]["owner_pid"] == os.getpid()
         assert "name" not in result["sessions"][0]
     finally:
         await _close(server, writer)
@@ -6293,9 +6300,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
-        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
+        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -6309,6 +6316,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", counted_open)
+    # test-contract: seam count catalog reconciliation without changing production
     monkeypatch.setattr(
         server.runtime.manager, "_reconcile_project_link", reconciliations.append
     )
@@ -6333,7 +6341,7 @@ async def test_list_sessions_page_touches_only_page_rows(
         result = frame["result"]
         assert [row["session_id"] for row in result["sessions"]] == [sessions[-1]]
         assert len(preview_reads) == 1
-        assert reconciliations == [sessions[-1]]
+        assert reconciliations == []
     finally:
         await _close(server, writer)
 
@@ -6449,9 +6457,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
-    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
+    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -7312,6 +7320,8 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         expected.pop("name")
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
+        assert row.pop("in_use") is True
+        assert row.pop("owner_pid") == os.getpid()
         expected["updated_at"] = row["updated_at"]
         expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
