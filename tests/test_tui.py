@@ -7,12 +7,13 @@ import errno
 import fcntl
 import gc
 import json
+import multiprocessing
 import os
 import pty
 import re
-import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,23 +56,32 @@ from rich.text import Text
 
 import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
+import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
+from tests.support.account_processes import hold_provider_login_lock
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
-from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from zeta.accounts import (
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    SessionAccountContext,
+)
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
@@ -103,7 +113,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -272,54 +282,6 @@ def _agent_list_session(
     app._active_session = session
     app._install_full_screen_layout(session)
     return app, session
-
-
-def _read_pty_until(
-    master_fd: int,
-    output: bytearray,
-    needle: bytes,
-    process: subprocess.Popen[bytes | str],
-    start: int = 0,
-) -> None:
-    deadline = time.monotonic() + 10
-    while needle not in output[start:]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _terminate_process(process)
-            pytest.fail(
-                f"timed out waiting for {needle!r}; captured output:\n"
-                f"{bytes(output[start:])!r}"
-            )
-        ready, _, _ = select.select([master_fd], [], [], remaining)
-        if not ready:
-            continue
-        try:
-            chunk = os.read(master_fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        output.extend(chunk)
-    if needle not in output[start:]:
-        _terminate_process(process)
-        pytest.fail(
-            f"process exited before {needle!r}; captured output:\n"
-            f"{bytes(output[start:])!r}"
-        )
-
-
-def _wait_for_process_cleanup(process: subprocess.Popen[bytes | str]) -> None:
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def _terminate_process(process: subprocess.Popen[bytes | str]) -> None:
-    if process.poll() is None:
-        process.kill()
-    process.wait()
 
 
 def _capture_pane(socket: Path, session: str) -> str:
@@ -7067,21 +7029,15 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        _read_pty_until(
-            master_fd,
-            output,
-            b" \xe2\x80\xba ",
-            process,
+        read_pty_until(
+            master_fd, b" \xe2\x80\xba ", process=process, output=output
         )
 
         os.write(master_fd, b"\x04")
-        _read_pty_until(
-            master_fd,
-            output,
-            b"\x1b[?1049l",
-            process,
+        read_pty_until(
+            master_fd, b"\x1b[?1049l", process=process, output=output
         )
-        _wait_for_process_cleanup(process)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
@@ -7090,7 +7046,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     finally:
         if process.poll() is None:
             process.kill()
-            process.wait()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7117,12 +7073,8 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(
-            master_fd,
-            output,
-            needle,
-            process,
-            start,
+        read_pty_until(
+            master_fd, needle, process=process, output=output, start=start
         )
 
     try:
@@ -7143,12 +7095,12 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 
         os.write(master_fd, b"\x04")
         read_until(b"\x1b[?1049l")
-        _wait_for_process_cleanup(process)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
     finally:
         if process.poll() is None:
             process.kill()
-            process.wait()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7175,34 +7127,27 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(
-            master_fd,
-            output,
-            needle,
-            process,
-            start,
+        read_pty_until(
+            master_fd, needle, process=process, output=output, start=start
         )
 
     try:
         read_until(b" \xe2\x80\xba ")
-        os.write(master_fd, b"abc")
-        read_until(b"abc")
-
         start = len(output)
-        os.write(master_fd, b"\x1bx\r")
-        read_until(b"you said: ab", start)
+        os.write(master_fd, b"abc\x1bx\r")
+        read_until(b"the scripted test backend", start)
+        assert b"you said: ab" in output[start:]
     finally:
-        if process.poll() is None:
-            os.write(master_fd, b"\x04")
-            _read_pty_until(
-                master_fd,
-                output,
-                b"\x1b[?1049l",
-                process,
-            )
-            _wait_for_process_cleanup(process)
-        assert process.returncode == 0
-        os.close(master_fd)
+        try:
+            if process.poll() is None:
+                os.write(master_fd, b"\x04")
+                read_pty_until(
+                    master_fd, b"\x1b[?1049l", process=process, output=output
+                )
+                reap_process(process, timeout=10)
+            assert process.returncode == 0
+        finally:
+            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:
@@ -11365,25 +11310,40 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     previous = navigation.transcript_control._snapshot
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh(*args, **kwargs):
         entered.set()
         return original_refresh(*args, **kwargs)
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public transcript-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public transcript-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public transcript-refresh lock seam exists
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late transcript cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         agent_sync._REFRESH_LOCK.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
     assert navigation.transcript_control._snapshot is previous
     assert not published.is_set()
@@ -11414,25 +11374,40 @@ async def test_tui_close_hands_off_blocked_todo_source(
     assert source is not None
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh():
         entered.set()
         return original_refresh()
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public todo-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public todo-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
+    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public todo-refresh lock seam exists
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
-        await wait_until(entered.is_set)
-        started = time.monotonic()
-        await asyncio.wait_for(app.close(), timeout=3)
-        assert time.monotonic() - started < 3
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late todo cleanup
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         source._lock.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._store is None
     assert control._snapshot is None
     assert not published.is_set()
@@ -13761,22 +13736,36 @@ async def test_accounts_refresh_does_not_block_event_loop(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    # test-contract: seam no public headless presenter injection exists
     app._presenter.print_unit = Mock()
+    # test-contract: seam no public headless transcript injection exists
     app._transcript.replace = lambda unit, replacement: replacement
 
-    async def blocking_refresh(self):
-        time.sleep(0.2)  # noqa: ASYNC251 - proves the work runs on another thread
+    owner_thread = threading.get_ident()
+    refresh_threads: list[int] = []
+    refresh_done = asyncio.Event()
+    # test-contract: seam no public account-picker repaint completion hook exists
+    original_repaint = app._repaint_accounts_picker
+
+    async def observed_refresh(self):
+        refresh_threads.append(threading.get_ident())
         return {}
 
-    monkeypatch.setattr(AccountUsage, "refresh_stale", blocking_refresh)
+    def repaint_and_signal() -> None:
+        original_repaint()
+        picker = app._accounts_picker
+        if picker is not None and not picker.refreshing:
+            refresh_done.set()
+
+    monkeypatch.setattr(AccountUsage, "refresh_stale", observed_refresh)
+    # test-contract: seam no public account-refresh completion event exists
+    monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        started = time.monotonic()
-        await asyncio.sleep(0.02)
-        assert time.monotonic() - started < 0.1
-        while app._accounts_picker and app._accounts_picker.refreshing:
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(refresh_done.wait(), timeout=10)
+        # test-contract: seam no public account-refresh executor identity exists
+        assert refresh_threads and refresh_threads[0] != owner_thread
     finally:
         opened.store.close()
 
@@ -13812,6 +13801,126 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     try:
         assert await app.slash_accounts("login codex personal") == "logged in as codex:personal"
         assert logins == [("codex", "personal")]
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+@pytest.mark.parametrize("invalid_response", [False, True])
+async def test_tui_login_provider_failure_has_safe_cause_and_recovery(
+    provider: str,
+    invalid_response: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reject_provider_token_exchange(
+        monkeypatch, provider, invalid_response=invalid_response
+    )
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, f"/accounts login {provider} work"
+        )
+
+        assert result == (
+            "login failed: the provider rejected the login or returned an invalid "
+            "callback; retry in a new browser window"
+        )
+        assert "secret-token-body" not in result
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_login_lock_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_provider_login_lock,
+        args=(str(account_home(home)), "anthropic", ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=10)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    account_context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = account_context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, "/accounts login anthropic work"
+        )
+
+        assert result == (
+            "login failed: a login for this provider is already in progress; "
+            "close the other login and retry"
+        )
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        await app.close()
+        opened.store.close()
+    assert holder.exitcode == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_login_callback_port_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            monkeypatch.setattr(
+                provider_login_module,
+                "DEFAULT_CODEX_REDIRECT_URI",
+                f"http://localhost:{port}/auth/callback",
+            )
+            result = await app._slash_commands.dispatch_async(
+                app, "/accounts login codex work"
+            )
+
+        assert result == (
+            f"login failed: port {port} is already in use for codex login — close "
+            "any other Codex login and retry"
+        )
     finally:
         await app.close()
         opened.store.close()
