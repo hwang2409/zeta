@@ -101,8 +101,7 @@ async def approve_and_collect_grant(
                     frames.append(frame)
                     is_response = frame.get("id") == request_id
                     is_grant_event = (
-                        frame.get("params", {}).get("event")
-                        == "session_grants_changed"
+                        frame.get("params", {}).get("event") == "session_grants_changed"
                     )
                     if not is_response and not is_grant_event:
                         deferred.append(frame)

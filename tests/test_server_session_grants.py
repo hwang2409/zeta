@@ -212,7 +212,9 @@ async def test_approve_collector_restores_unrelated_frames() -> None:
         },
     }
     reader.feed_data(
-        ("\n".join(json.dumps(frame) for frame in (turn_end, response, grant)) + "\n").encode()
+        (
+            "\n".join(json.dumps(frame) for frame in (turn_end, response, grant)) + "\n"
+        ).encode()
     )
 
     class _Writer:
@@ -645,7 +647,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         async def block_observer(payload: bytes) -> bool:
             if b"session_grants_changed" in payload:
                 observer_blocked.set()
-                await release_observer.wait()
+                await asyncio.wait_for(release_observer.wait(), 10)
             return await original_write(payload)
 
         # test-contract: seam gate the real observer transport write
@@ -655,8 +657,10 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 reader, writer, 4, "call-1", "always_tool", ["bash"]
             )
         )
-        await observer_blocked.wait()
-        controller_event = await _assert_completes_in_ready_turns(approve)
+        await asyncio.wait_for(observer_blocked.wait(), 10)
+        controller_event = await asyncio.wait_for(
+            _assert_completes_in_ready_turns(approve), 10
+        )
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
@@ -673,8 +677,10 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 {"grant": "bash"},
             )
         )
-        await observer_blocked.wait()
-        revoke_frames = await _assert_completes_in_ready_turns(revoke)
+        await asyncio.wait_for(observer_blocked.wait(), 10)
+        revoke_frames = await asyncio.wait_for(
+            _assert_completes_in_ready_turns(revoke), 10
+        )
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
         revoke_event = await _event(observer_reader, "session_grants_changed")
