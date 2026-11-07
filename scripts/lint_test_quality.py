@@ -832,8 +832,11 @@ def _global_bootstrap_findings(
     return findings
 
 
-def _path_receivers(tree: ast.AST) -> set[str]:
-    """Infer path-like names; dynamic aliases remain a documented false negative."""
+def _path_annotation(node: ast.AST) -> bool:
+    return _name(node).rsplit(".", 1)[-1].endswith(("Path", "PurePath"))
+
+
+def _path_constructor_names(tree: ast.AST) -> set[str]:
     names = {"Path", "PurePath", "PosixPath", "WindowsPath", "pathlib.Path"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "pathlib":
@@ -842,31 +845,61 @@ def _path_receivers(tree: ast.AST) -> set[str]:
             item.name == "pathlib" for item in node.names
         ):
             names.add("pathlib")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            annotation = _name(node.annotation)
-            if annotation.endswith(("Path", "PurePath")):
-                names.add(node.target.id)
-        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-            if _name(node.value.func) in names:
-                names.update(
-                    target.id for target in node.targets if isinstance(target, ast.Name)
-                )
     return names
 
 
-def _is_path_receiver(node: ast.AST, path_names: set[str]) -> bool:
+def _path_attribute_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and _path_annotation(node.annotation):
+            target = _name(node.target)
+            if target:
+                names.add(target)
+    return names
+
+
+def _path_assigned_names(tree: ast.AST, constructors: set[str]) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and _name(node.value.func) in constructors
+        ):
+            names.update(
+                target for target in (_name(item) for item in node.targets) if target
+            )
+    return names
+
+
+def _path_names(tree: ast.AST) -> set[str]:
+    constructors = _path_constructor_names(tree)
+    return constructors | _path_attribute_names(tree) | _path_assigned_names(tree, constructors)
+
+
+def _is_path_receiver(
+    node: ast.AST, path_names: set[str], receivers: set[str]
+) -> bool:
     if isinstance(node, ast.Call):
         return _name(node.func) in path_names
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _is_path_receiver(node.left, path_names, receivers)
     name = _name(node)
     if not name:
         return False
-    if name in path_names or name.startswith("pathlib."):
+    if (
+        name in path_names
+        or name.rsplit(".", 1)[-1] in path_names
+        or name in receivers
+        or name.startswith("pathlib.")
+    ):
         return True
     return any(part.casefold() in ASYNC_PATH_NAME_HINTS for part in name.split("."))
 
 
-def _async_blocking_call(node: ast.Call, path_names: set[str]) -> str | None:
+def _async_blocking_call(
+    node: ast.Call, path_names: set[str], receivers: set[str]
+) -> str | None:
     name = _name(node.func)
     if name in {"os." + function for function in ASYNC_OS_FUNCTIONS}:
         return name
@@ -882,7 +915,7 @@ def _async_blocking_call(node: ast.Call, path_names: set[str]) -> str | None:
     if (
         isinstance(node.func, ast.Attribute)
         and node.func.attr in ASYNC_PATH_METHODS
-        and _is_path_receiver(node.func.value, path_names)
+        and _is_path_receiver(node.func.value, path_names, receivers)
     ):
         return f"Path.{node.func.attr}"
     if name.startswith("shutil.") and name.rsplit(".", 1)[-1] in ASYNC_SHUTIL_FUNCTIONS:
@@ -893,27 +926,39 @@ def _async_blocking_call(node: ast.Call, path_names: set[str]) -> str | None:
 def _async_blocking_findings(
     path: Path, tree: ast.AST, lines: list[str], added: set[int]
 ) -> list[Finding]:
-    path_names = _path_receivers(tree)
+    path_names = _path_names(tree)
     findings: list[Finding] = []
-    off_loop = {
-        "asyncio.to_thread",
-        "to_thread",
-        "asyncio.run_in_executor",
-        "run_in_executor",
-    }
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.function: str | None = None
             self.async_depth = 0
-            self.off_loop_depth = 0
+            self.receivers: list[set[str]] = []
+
+        @property
+        def current_receivers(self) -> set[str]:
+            return self.receivers[-1] if self.receivers else set()
+
+        def _seed_receivers(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+            names = {
+                argument.arg
+                for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+                if argument.annotation and _path_annotation(argument.annotation)
+            }
+            if node.args.vararg and node.args.vararg.annotation and _path_annotation(node.args.vararg.annotation):
+                names.add(node.args.vararg.arg)
+            if node.args.kwarg and node.args.kwarg.annotation and _path_annotation(node.args.kwarg.annotation):
+                names.add(node.args.kwarg.arg)
+            return names
 
         def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
             previous = self.function
             self.function = node.name
             self.async_depth += 1
+            self.receivers.append(self._seed_receivers(node))
             for statement in node.body:
                 self.visit(statement)
+            self.receivers.pop()
             self.async_depth -= 1
             self.function = previous
 
@@ -926,9 +971,24 @@ def _async_blocking_findings(
             if self.async_depth == 0:
                 self.generic_visit(node)
 
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if _path_annotation(node.annotation):
+                target = _name(node.target)
+                if target:
+                    self.current_receivers.add(target)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if isinstance(node.value, ast.Call) and _name(node.value.func) in path_names:
+                for target in node.targets:
+                    target_name = _name(target)
+                    if target_name:
+                        self.current_receivers.add(target_name)
+            self.generic_visit(node)
+
         def visit_Call(self, node: ast.Call) -> None:
-            if self.async_depth and not self.off_loop_depth and node.lineno in added:
-                call = _async_blocking_call(node, path_names)
+            if self.async_depth and node.lineno in added:
+                call = _async_blocking_call(node, path_names, self.current_receivers)
                 if call and not _has_marker(lines, node.lineno, {"async-blocking"}):
                     findings.append(
                         Finding(
@@ -941,15 +1001,7 @@ def _async_blocking_findings(
                             ),
                         )
                     )
-            if _name(node.func) in off_loop:
-                self.off_loop_depth += 1
-                for argument in node.args:
-                    self.visit(argument)
-                for keyword in node.keywords:
-                    self.visit(keyword.value)
-                self.off_loop_depth -= 1
-            else:
-                self.generic_visit(node)
+            self.generic_visit(node)
 
     Visitor().visit(tree)
     return findings
@@ -980,13 +1032,13 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     nodes = [node for node in ast.walk(tree) if hasattr(node, "lineno")]
     added_nodes = [node for node in nodes if _touches_added_line(node, added)]
     deadline_nodes = _deadline_nodes(nodes, added_nodes, added, parents)
+    findings = (
+        _scan_added_nodes(path, added_nodes, lines, literal_names, serialized_names)
+        if _is_test_path(path)
+        else []
+    )
     if path.parts[:2] == ("src", "zeta"):
-        findings = []
         findings.extend(_async_blocking_findings(path, tree, lines, added))
-    else:
-        findings = _scan_added_nodes(
-            path, added_nodes, lines, literal_names, serialized_names
-        )
     findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
     findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))

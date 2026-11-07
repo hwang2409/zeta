@@ -714,6 +714,72 @@ def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
     assert _lint(tmp_path, source, {3}) == []
 
 
+def test_src_zeta_keeps_existing_test_rules(tmp_path: Path) -> None:
+    source = "async def test_existing():\n    time.sleep(1)\n"
+
+    findings = _lint(tmp_path, source, path="src/zeta/example/tests/test_example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 2)]
+
+
+@pytest.mark.parametrize(
+    ("source", "method"),
+    [
+        ("async def check(value: Path):\n    value.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("class Tool:\n    x: Path\n\n    async def check(self):\n        self.x.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("class Tool:\n    def __init__(self):\n        self.x = Path('x')\n\n    async def check(self):\n        self.x.{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("async def check(root):\n    (root / 'x').{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ]
+    + [
+        ("async def check():\n    (Path('root') / 'x').{method}()\n", method)
+        for method in ("exists", "is_dir", "stat", "open", "mkdir")
+    ],
+)
+def test_tq007_path_receiver_shapes(tmp_path: Path, source: str, method: str) -> None:
+    rendered = "from pathlib import Path\n\n" + source.format(method=method)
+    findings = _lint(tmp_path, rendered, path="src/zeta/example.py")
+    call_line = next(
+        number for number, line in enumerate(rendered.splitlines(), 1) if f".{method}()" in line
+    )
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", call_line)]
+
+
+@pytest.mark.parametrize("call", [
+    "asyncio.to_thread(Path('x').exists())",
+    "asyncio.to_thread(open('x'))",
+    "loop.run_in_executor(None, open('x'))",
+])
+def test_tq007_scans_invoked_offload_arguments(tmp_path: Path, call: str) -> None:
+    source = f"from pathlib import Path\n\nasync def check():\n    await {call}\n"
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", 4)]
+
+
+def test_tq007_allows_uncalled_offload_receivers(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def check(path):
+    await asyncio.to_thread(path.exists)
+    await asyncio.to_thread(open, path)
+    await loop.run_in_executor(None, open, path)
+"""
+
+    assert _lint(tmp_path, source, path="src/zeta/example.py") == []
+
+
 def test_tq007_flags_filesystem_calls_in_async_functions(tmp_path: Path) -> None:
     source = """from pathlib import Path
 
