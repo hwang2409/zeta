@@ -669,6 +669,23 @@ written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Without the feature, the status shape and unbounded strict durable
 projection are unchanged.
 
+With the negotiated `served_turn_end` feature, the result also contains
+`last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
+outcome. Otherwise it contains the last outcome on that branch as
+`{"turn_id": string, "reason": string}`. Each status result is authoritative for
+the reported session and active branch, so clients replace any cached value even
+when the new value is `null`. The reason mapping is:
+
+| user-facing semantic | wire reason |
+| --- | --- |
+| completed | `completed` |
+| failed | `error` |
+| canceled | `user_stop` |
+| disconnected | `disconnect` |
+
+Clients use `turn_id` to correlate this durable outcome with a negotiated
+`turn_start.data.turn_id`. Without `served_turn_end`, the field is omitted.
+
 ```json
 {"jsonrpc":"2.0","id":9,"method":"status","params":{}}
 ```

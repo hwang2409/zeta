@@ -619,9 +619,12 @@ class ConnectionRegistry:
     async def read_status(
         self, connection: Any, status: dict[str, Any], session_id: str | None
     ) -> object:
+        features = self._connections[connection].features
         return await self.run_read(
             connection,
-            lambda: project_status(status),
+            lambda: project_status(
+                status, served_turn_end="served_turn_end" in features
+            ),
             session_id=session_id,
         )
 
@@ -816,12 +819,22 @@ def capture_read(
     raise ProtocolError(-32601, "method not found")
 
 
-def project_status(target: object) -> dict[str, Any]:
+def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
     status = dict(target)
     store = status.pop("store", None)
     status["compaction_markers"] = (
         store.compaction_marker_count() if store is not None else 0
     )
+    if served_turn_end:
+        entry = store.last_turn_end() if store is not None else None
+        status["last_turn_outcome"] = (
+            {
+                "turn_id": entry.data["turn_id"],
+                "reason": entry.data["reason"],
+            }
+            if entry is not None
+            else None
+        )
     return status
 
 
@@ -837,7 +850,7 @@ def perform_read(
     served_turn_end: bool = False,
 ) -> object:
     if method == "status":
-        return project_status(target[1])
+        return project_status(target[1], served_turn_end=served_turn_end)
 
     if method in {"model_catalog", "session_settings"}:
         return target[1]
