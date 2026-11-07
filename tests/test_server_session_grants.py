@@ -145,6 +145,39 @@ async def test_approve_collector_reports_structured_error_frame() -> None:
     assert "all observed frames" in message
 
 
+@pytest.mark.asyncio
+async def test_approve_collector_reports_response_without_grant_event() -> None:
+    reader = asyncio.StreamReader()
+    response = {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        },
+    }
+    reader.feed_data((json.dumps(response) + "\n").encode())
+    reader.feed_eof()
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    with pytest.raises(AssertionError) as failure:
+        await approve_and_collect_grant(
+            reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+        )
+    message = str(failure.value)
+    assert "approve response without session_grants_changed" in message
+    assert repr(response) in message
+    assert "all observed frames" in message
+
+
 async def _wait_idle(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request_id: int
 ) -> int:

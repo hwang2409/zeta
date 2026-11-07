@@ -92,45 +92,63 @@ async def approve_and_collect_grant(
     frames: list[dict[str, Any]] = []
     response: dict[str, Any] | None = None
     grant_events: list[dict[str, Any]] = []
-    while response is None or not grant_events:
-        batch = await read_until(
-            reader,
-            lambda frame: frame.get("id") == request_id
-            or frame.get("params", {}).get("event") == "session_grants_changed",
-            what="approve response or session_grants_changed event",
-        )
-        for frame in batch:
-            frames.append(frame)
-            if frame.get("id") == request_id:
-                response = frame
-                assert response.get("result", {}).get("accepted") is True, (
-                    f"approve response was not accepted: response={response!r}; "
-                    f"all observed frames={frames!r}"
-                )
-                assert response["result"].get("request_id") == approval_request_id, (
-                    f"approve response has wrong request id: response={response!r}; "
-                    f"all observed frames={frames!r}"
-                )
-                assert response["result"].get("scope") == expected_scope, (
-                    f"approve response has wrong scope: response={response!r}; "
-                    f"all observed frames={frames!r}"
-                )
-            if frame.get("params", {}).get("event") == "session_grants_changed":
-                grant_events.append(frame["params"])
-                data = frame["params"].get("data")
-                assert isinstance(data, dict), (
-                    f"grant event has no data: frame={frame!r}; "
-                    f"all observed frames={frames!r}"
-                )
-                assert data.get("change") == "grant", (
-                    f"grant event has wrong change: frame={frame!r}; "
-                    f"all observed frames={frames!r}"
-                )
-                assert data.get("changed") == expected_changed, (
-                    f"grant event has wrong data: frame={frame!r}; "
-                    f"all observed frames={frames!r}"
-                )
-    assert response is not None, f"missing approve response; all observed frames={frames!r}"
+    try:
+        while response is None or not grant_events:
+            batch = await read_until(
+                reader,
+                lambda frame: (
+                    frame.get("id") == request_id
+                    or frame.get("params", {}).get("event") == "session_grants_changed"
+                ),
+                what="approve response or session_grants_changed event",
+            )
+            for frame in batch:
+                frames.append(frame)
+                if frame.get("id") == request_id:
+                    response = frame
+                    assert response.get("result", {}).get("accepted") is True, (
+                        f"approve response was not accepted: response={response!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+                    assert (
+                        response["result"].get("request_id") == approval_request_id
+                    ), (
+                        f"approve response has wrong request id: response={response!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+                    assert response["result"].get("scope") == expected_scope, (
+                        f"approve response has wrong scope: response={response!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+                if frame.get("params", {}).get("event") == "session_grants_changed":
+                    grant_events.append(frame["params"])
+                    data = frame["params"].get("data")
+                    assert isinstance(data, dict), (
+                        f"grant event has no data: frame={frame!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+                    assert data.get("change") == "grant", (
+                        f"grant event has wrong change: frame={frame!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+                    assert data.get("changed") == expected_changed, (
+                        f"grant event has wrong data: frame={frame!r}; "
+                        f"all observed frames={frames!r}"
+                    )
+    except AssertionError:
+        if (
+            response is not None
+            and response.get("result", {}).get("accepted") is True
+            and not grant_events
+        ):
+            raise AssertionError(
+                "approve response without session_grants_changed; "
+                f"response={response!r}; all observed frames={frames!r}"
+            ) from None
+        raise
+    assert response is not None, (
+        f"missing approve response; all observed frames={frames!r}"
+    )
     assert len(grant_events) == 1, (
         f"expected exactly one grant event; all observed frames={frames!r}"
     )
