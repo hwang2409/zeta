@@ -1709,7 +1709,9 @@ async def test_slash_mcp_constructs_management_service_off_loop(
     async def fake_authorize(**kwargs: object) -> MCPOAuthToken:
         return token
 
+    # test-contract: seam avoid network while exercising the public slash command
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    # test-contract: seam avoid browser consent during the public auth command
     monkeypatch.setattr(oauth_module, "authorize", fake_authorize)
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
@@ -1747,6 +1749,7 @@ async def test_slash_mcp_status_shows_oauth_state(
     async def fake_connect_and_list(client: Any) -> list:
         return []
 
+    # test-contract: seam avoid network while exercising the public slash command
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
