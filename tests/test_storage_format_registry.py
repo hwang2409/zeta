@@ -85,24 +85,30 @@ def _assert_invalid(
 def test_every_registry_name_has_one_production_owner() -> None:
     owners: dict[str, tuple[str, int]] = {}
     for path in Path("src/zeta").rglob("*.py"):
-        if path.name == "ssh.py":
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if not (
+            name_node: ast.expr | None = None
+            if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "reject_unknown_keys"
             ):
+                assert len(node.args) >= 2, (
+                    f"{path}:{node.lineno} must use a literal stored-shape name"
+                )
+                name_node = node.args[1]
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "ACCEPTED_KEY_SETS"
+            ):
+                name_node = node.slice
+            if name_node is None:
                 continue
-            assert len(node.args) >= 2 and isinstance(node.args[1], ast.Constant), (
-                f"{path}:{node.lineno} must use a literal stored-shape name"
-            )
-            name = node.args[1].value
-            assert isinstance(name, str), (
-                f"{path}:{node.lineno} must use a literal stored-shape name"
-            )
-            owners[name] = (str(path), node.lineno)
+            assert isinstance(name_node, ast.Constant) and isinstance(
+                name_node.value, str
+            ), f"{path}:{node.lineno} must use a literal stored-shape name"
+            owners[name_node.value] = (str(path), node.lineno)
     assert set(owners) == set(ACCEPTED_KEY_SETS), {
         "missing_owners": sorted(set(ACCEPTED_KEY_SETS) - set(owners)),
         "unregistered_owners": sorted(set(owners) - set(ACCEPTED_KEY_SETS)),
