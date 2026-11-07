@@ -139,6 +139,8 @@ _TARGETS_LOCK = threading.RLock()
 _TARGETS: weakref.WeakValueDictionary[str, ConversationStore] = (
     weakref.WeakValueDictionary()
 )
+
+
 @dataclass
 class _TransientReservation:
     token: object
@@ -469,6 +471,7 @@ async def commit_conversation_async[ResultT](
         return await target._commit_address_async(command)
     token = target
     try:
+
         def commit_transient() -> CommittedDelta[ResultT]:
             from ..store._store import ConversationStore
 
