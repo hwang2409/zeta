@@ -138,6 +138,7 @@ def test_linked_session_reopen_decodes_only_matching_registry_row(
         decoded += 1
         return real_decode(value)
 
+    # test-contract: seam count decoding behind the production session-open interface
     monkeypatch.setattr(
         ProjectRegistry, "_decode_session_link", staticmethod(count_decode)
     )
