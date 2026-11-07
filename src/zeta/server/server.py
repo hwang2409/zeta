@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
+from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
@@ -594,12 +595,9 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            result, page_ids = await self.connections.run_read(
+            result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)
             )
-            if self.role != "observer":
-                # project-link repair writes, so it stays off the read-only worker
-                await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
             try:
@@ -661,6 +659,8 @@ class _Client:
                                 str(exc),
                                 {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                         except Exception as exc:
                             raise ProtocolError(
                                 ErrorDescriptor.INTERNAL_ERROR,
@@ -675,6 +675,8 @@ class _Client:
                                 str(exc),
                                 {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                     self.server.control._active_host_commands = candidate
                     self.server.control._host_binding_required = (
                         "session_host_commands" in self.features
@@ -931,6 +933,15 @@ class _Client:
             if loop is None
             else None
         )
+        project_context_health = (
+            (
+                loop.project_context_health.summary
+                if loop is not None and loop.project_context_health is not None
+                else "healthy"
+            )
+            if self.protocol_version != "1.0"
+            else None
+        )
         transcript_index_failure = (
             loop.transcript_index_failure(runtime.session_id)
             if self.protocol_version != "1.0" and loop is not None
@@ -975,14 +986,15 @@ class _Client:
                 if transcript_index_failure is not None
                 else {}
             ),
+            **(
+                {"project_context_health": project_context_health}
+                if project_context_health is not None
+                else {}
+            ),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
         status.update(suffix)
         return status
-
-    def _reconcile_project_links(self, session_ids: list[str]) -> None:
-        for session_id in session_ids:
-            self.server.runtime.manager._reconcile_project_link(session_id)
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -1001,18 +1013,26 @@ class _Client:
             available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
-            item.session_id: item.preview
+            item.session_id: item
             for item in self.server.runtime.manager.list_session_previews(
                 limit=len(metadata), sessions=metadata
             )
         }
-        sessions = [
-            {
-                **item.to_catalog_dict(),
-                "first_message_preview": previews.get(item.session_id, ""),
-            }
-            for item in metadata
-        ]
+        sessions = []
+        for item in metadata:
+            preview = previews[item.session_id]
+            sessions.append(
+                {
+                    **item.to_catalog_dict(),
+                    "first_message_preview": preview.preview,
+                    "in_use": preview.in_use,
+                    **(
+                        {"owner_pid": preview.owner_pid}
+                        if preview.owner_pid is not None
+                        else {}
+                    ),
+                }
+            )
         if self.protocol_version == "1.0":
             for item in sessions:
                 item.pop("name", None)
@@ -1053,6 +1073,28 @@ def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
+
+
+def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
+    data: dict[str, Any] = {
+        "code": "session_owned",
+        "session_id": exc.session_id,
+    }
+    owner = {
+        key: value
+        for key, value in {
+            "surface": exc.owner_surface,
+            "pid": exc.owner_pid,
+        }.items()
+        if value is not None
+    }
+    if owner:
+        data["owner"] = owner
+    return ProtocolError(
+        ErrorDescriptor.OPERATION_BUSY,
+        "session is active in another zeta process",
+        data,
+    )
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
