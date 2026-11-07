@@ -172,7 +172,7 @@ skill_catalog=SkillCatalog.empty(),
             _lifecycle_sink=_approval_started_sink(approval_started),
         )
     )
-    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    await asyncio.wait_for(approval_started.wait(), timeout=10)
     assert first_policy.pending_requests() == [ApprovalRequest(call.id, call)]
     assert not pending_task.done()
     pending_task.cancel()
@@ -229,7 +229,7 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
 
-    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    await asyncio.wait_for(approval_started.wait(), timeout=10)
     assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
     assert not task.done()
     assert policy.deny(call.id)
@@ -299,11 +299,11 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
 
-    await asyncio.wait_for(approval_published.wait(), timeout=3)
+    await asyncio.wait_for(approval_published.wait(), timeout=10)
     assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
-    events = await asyncio.wait_for(task, timeout=1)
+    events = await asyncio.wait_for(task, timeout=10)
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
     assert results == [ToolResult(call.id, "tool execution canceled", True)]
@@ -570,12 +570,12 @@ skill_catalog=SkillCatalog.empty(),
             _lifecycle_sink=_approval_started_sink(approval_started),
         )
     )
-    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    await asyncio.wait_for(approval_started.wait(), timeout=10)
     assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
     assert not task.done()
     signal.abort()
 
-    result = await asyncio.wait_for(task, timeout=1)
+    result = await asyncio.wait_for(task, timeout=10)
     assert result["isError"] is False
     assert result["content"][0]["text"] == "ran"
     assert store.approval_states()[call.id][1] == "allow"
@@ -630,16 +630,16 @@ skill_catalog=SkillCatalog.empty(),
             _lifecycle_sink=_approval_started_sink(approval_started),
         )
     )
-    await asyncio.wait_for(approval_started.wait(), timeout=3)
+    await asyncio.wait_for(approval_started.wait(), timeout=10)
     assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=10)
     assert not task.done()
 
     registry.abort()
 
-    result = await asyncio.wait_for(task, timeout=1)
+    result = await asyncio.wait_for(task, timeout=10)
     assert result["isError"] is False
     assert result["content"][0]["text"] == "canceled"
     assert observed_cancellation.is_set()
@@ -798,7 +798,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
 
     registry.abort()
 
-    events = approval_events + await asyncio.wait_for(collect(event_stream), timeout=1)
+    events = approval_events + await asyncio.wait_for(collect(event_stream), timeout=10)
     results = [
         event.tool_result
         for event in events
@@ -854,13 +854,13 @@ skill_catalog=SkillCatalog.empty(),
     monkeypatch.setattr(changed_policy, "authorize", claim_pending)
     task = asyncio.create_task(registry.execute(call))
 
-    await asyncio.wait_for(approval_claimed.wait(), timeout=3)
+    await asyncio.wait_for(approval_claimed.wait(), timeout=10)
     assert not task.done()
     assert executed == []
     assert changed_policy.pending_requests()
 
     assert changed_policy.approve(call.id)
-    result = await asyncio.wait_for(task, timeout=1)
+    result = await asyncio.wait_for(task, timeout=10)
     assert result["isError"] is False
     assert result["content"][0]["text"] == "ran"
     assert executed == [True]

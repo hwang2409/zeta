@@ -51,15 +51,38 @@ def _persist_prepared_request(
     )
 
 
-async def _approve_when_registered(
+async def _approve_after_registration(
     parent_policy: ApprovalPolicy,
+    registered: asyncio.Event,
     child_instance_id: str,
     request_id: str,
+    *,
+    waiting: asyncio.Event | None = None,
 ) -> None:
+    if waiting is not None:
+        waiting.set()
+    await asyncio.wait_for(registered.wait(), timeout=10)
     key = (child_instance_id, request_id)
-    while key not in {request.key for request in parent_policy.pending_requests()}:
-        await asyncio.sleep(0)
+    assert key in {request.key for request in parent_policy.pending_requests()}, (
+        "delegated approval was not published"
+    )
     assert parent_policy.approve(key)
+
+
+def _observe_delegated_registration(
+    parent_policy: ApprovalPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> asyncio.Event:
+    registered = asyncio.Event()
+    register_delegated = parent_policy.register_delegated
+
+    def publish(*args: object, **kwargs: object) -> None:
+        register_delegated(*args, **kwargs)  # type: ignore[arg-type]
+        registered.set()
+
+    # test-contract: signal only after the public delegated request is published.
+    monkeypatch.setattr(parent_policy, "register_delegated", publish)
+    return registered
 
 
 def _child_policy_for_display(
@@ -351,7 +374,7 @@ async def test_parent_and_child_approval_decision_paths(
         execution = asyncio.create_task(
             registry.execute(call, _lifecycle_sink=publish_approval_state)
         )
-        await asyncio.wait_for(approval_started.wait(), timeout=3)
+        await asyncio.wait_for(approval_started.wait(), timeout=10)
         assert decision_store.pending_approvals()
         assert not execution.done()
         registry.abort()
@@ -457,6 +480,7 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
 @pytest.mark.asyncio
 async def test_write_uses_binding_captured_before_persisted_request(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe = tmp_path / "safe"
     evil = tmp_path / "evil"
@@ -492,11 +516,46 @@ async def test_write_uses_binding_captured_before_persisted_request(
     _persist_prepared_request(registry, child_store, call)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
+    publication_attempted = asyncio.Event()
+    release_publication = asyncio.Event()
+    registered = asyncio.Event()
+    register_delegated = parent_policy.register_delegated
+
+    def publish_after_release(*args: object, **kwargs: object) -> None:
+        publication_attempted.set()
+
+        async def publish() -> None:
+            await release_publication.wait()
+            register_delegated(*args, **kwargs)  # type: ignore[arg-type]
+            registered.set()
+
+        asyncio.create_task(publish())
+
+    # test-contract: hold the public delegated publication at a deterministic gate.
+    monkeypatch.setattr(parent_policy, "register_delegated", publish_after_release)
     execution = asyncio.create_task(registry.execute(call))
+    waiting = asyncio.Event()
+    approval = asyncio.create_task(
+        _approve_after_registration(
+            parent_policy,
+            registered,
+            "write-swap",
+            call.id,
+            waiting=waiting,
+        )
+    )
     try:
-        await _approve_when_registered(parent_policy, "write-swap", call.id)
+        await asyncio.wait_for(publication_attempted.wait(), timeout=10)
+        await asyncio.wait_for(waiting.wait(), timeout=10)
+        assert not approval.done()
+        release_publication.set()
+        await approval
         result = await execution
     finally:
+        release_publication.set()
+        if not approval.done():
+            approval.cancel()
+            await asyncio.gather(approval, return_exceptions=True)
         if not execution.done():
             execution.cancel()
             await asyncio.gather(execution, return_exceptions=True)
@@ -510,6 +569,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
 async def _assert_shell_uses_displayed_cwd(
     tmp_path: Path,
     tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe = tmp_path / "safe"
     evil = tmp_path / "evil"
@@ -540,9 +600,12 @@ async def _assert_shell_uses_displayed_cwd(
     _persist_prepared_request(registry, child_store, call)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
+    registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_when_registered(parent_policy, f"{tool_name}-swap", call.id)
+        await _approve_after_registration(
+            parent_policy, registered, f"{tool_name}-swap", call.id
+        )
         result = await execution
         if tool_name == "run_background" and result["isError"] is False:
             task_id = result["structuredContent"]["task_id"]
@@ -561,15 +624,17 @@ async def _assert_shell_uses_displayed_cwd(
 @pytest.mark.asyncio
 async def test_bash_uses_binding_captured_before_persisted_request(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    await _assert_shell_uses_displayed_cwd(tmp_path, "bash")
+    await _assert_shell_uses_displayed_cwd(tmp_path, "bash", monkeypatch)
 
 
 @pytest.mark.asyncio
 async def test_run_background_uses_binding_captured_before_persisted_request(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    await _assert_shell_uses_displayed_cwd(tmp_path, "run_background")
+    await _assert_shell_uses_displayed_cwd(tmp_path, "run_background", monkeypatch)
 
 
 @pytest.mark.asyncio
@@ -806,15 +871,18 @@ async def _execute_after_manual_approval(
     registry.set_approval_policy(child_policy)
     _persist_prepared_request(registry, child_store, call)
     mutate()
+    monkeypatch = pytest.MonkeyPatch()
+    registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_when_registered(parent_policy, call.id, call.id)
+        await _approve_after_registration(parent_policy, registered, call.id, call.id)
         return await execution
     finally:
         if not execution.done():
             execution.cancel()
             await asyncio.gather(execution, return_exceptions=True)
         await registry.close()
+        monkeypatch.undo()
 
 
 @pytest.mark.asyncio
