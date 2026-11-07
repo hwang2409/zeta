@@ -15,9 +15,12 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
+from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -55,6 +58,12 @@ from zeta.tui.render import format_status
 
 def _python(*parts: str) -> str:
     return shlex.join((sys.executable, "-c", *parts))
+
+
+def _renderable_plain(renderable: object) -> str:
+    output = StringIO()
+    Console(file=output, width=80, force_terminal=True).print(renderable)
+    return Text.from_ansi(output.getvalue()).plain
 
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
@@ -551,8 +560,9 @@ def test_child_question_notification_renders_question() -> None:
     )
 
     assert rendered is not None
-    assert "should we deploy this change?" in rendered.plain
-    assert "unavailable" not in rendered.plain
+    plain = _renderable_plain(rendered)
+    assert "should we deploy this change?" in plain
+    assert "unavailable" not in plain
 
 
 def test_child_idle_notification_renders_one_line_notice() -> None:
@@ -626,10 +636,12 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
     )
 
     assert rendered is not None
-    assert rendered.plain == "question withdrawn: child finished"
+    plain = _renderable_plain(rendered)
+    assert "withdraw ← child :208" in plain
+    assert "b2517c6f0fbb448e86dbb8b34fe0fbc0" in plain
+    assert "question withdrawn: child finished" not in plain
 
-
-def test_child_question_notification_is_one_safe_line() -> None:
+def test_child_question_notification_strips_terminal_controls() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
     from zeta.tui.render import render_agent_notification
 
@@ -639,23 +651,24 @@ def test_child_question_notification_is_one_safe_line() -> None:
             data={
                 "kind": "child_question",
                 "child_instance_id": "root:208",
+                "question_id": "question-1",
                 "question": "first line\tsecond\x1b[2J\x9b31m\x07 words",
+                "options": [],
             },
         )
     )
 
     assert rendered is not None
-    assert "\n" not in rendered.plain
-    assert all(
-        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
-        for character in rendered.plain
-    )
-    assert "first line" in rendered.plain
-    assert "second" in rendered.plain
-    assert "words" in rendered.plain
+    plain = _renderable_plain(rendered)
+    assert "\x1b" not in plain
+    assert "\x9b" not in plain
+    assert "\x07" not in plain
+    assert "first line" in plain
+    assert "second" in plain
+    assert "words" in plain
 
 
-def test_child_question_withdrawn_notification_is_one_safe_line() -> None:
+def test_child_question_withdrawn_notification_ignores_legacy_text() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
     from zeta.tui.render import render_agent_notification
 
@@ -664,20 +677,18 @@ def test_child_question_withdrawn_notification_is_one_safe_line() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data={
                 "kind": "child_question_withdrawn",
+                "child_instance_id": "root:208",
+                "question_id": "question-1",
                 "text": "first line\tsecond\x1b[2J\x9b31m\x07 words",
             },
         )
     )
 
     assert rendered is not None
-    assert "\n" not in rendered.plain
-    assert all(
-        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
-        for character in rendered.plain
-    )
-    assert "first line" in rendered.plain
-    assert "second" in rendered.plain
-    assert "words" in rendered.plain
+    plain = _renderable_plain(rendered)
+    assert "withdraw ← child :208" in plain
+    assert "question-1" in plain
+    assert "first line" not in plain
 
 
 def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:

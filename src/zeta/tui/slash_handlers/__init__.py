@@ -152,6 +152,9 @@ class SlashHandlerMixin:
                 if self.loop.memory_reconciler is not None
                 else None
             ),
+            transcript_index_failure=self.loop.transcript_index_failure(
+                self._viewed_session_path().name
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:
