@@ -36,7 +36,12 @@ from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
-from .protocol import ProtocolError
+from .protocol import (
+    ErrorDescriptor,
+    ProtocolError,
+    SlashErrorCodeDescriptor,
+    SlashResultKindDescriptor,
+)
 from .runtime import ServerRuntime
 
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
@@ -111,7 +116,7 @@ class ServerSlashSession:
         loop = runtime.loop
         opened = runtime.opened
         if loop is None or opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         assembler = loop.context_assembler
         child_usage = assembler.descendant_usage
         pending = (
@@ -155,6 +160,7 @@ class ServerSlashSession:
             ),
             mcp_summary=loop.mcp_summary,
             explicit_finish=loop.explicit_finish,
+            connection_setup_counts=loop.connection_setup_counts(),
             max_agent_depth=loop.max_agent_depth,
             automatic_memory_failure=(
                 loop.memory_reconciler.automatic_memory_status
@@ -329,10 +335,10 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
 
     opened = runtime.opened
     if opened is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     loop = runtime.loop
     if loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
     project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
@@ -363,7 +369,10 @@ async def read_request(
     if method == "slash_list":
         include_unavailable = params.get("include_unavailable", False)
         if not isinstance(include_unavailable, bool):
-            raise ProtocolError(-32602, "include_unavailable must be a boolean")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "include_unavailable must be a boolean",
+            )
         return await list_commands(runtime, include_unavailable=include_unavailable)
     operation = accounts.request(method, runtime, require_idle, params)
     if method == "account_switch":
@@ -396,11 +405,11 @@ async def run_command(
     """Dispatch one slash invocation through the shared registry."""
 
     if not text.startswith("/") or text.startswith("//"):
-        raise ProtocolError(-32602, "text must start with '/'")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
     if not parts or not parts[0]:
-        raise ProtocolError(-32602, "text must name a command")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
     if (
@@ -424,7 +433,7 @@ async def run_command(
     registry = await asyncio.to_thread(build_registry, runtime)
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:
-        return {"kind": "client_only", "name": name}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
     if name == "mcp":
         return await _run_mcp_command(runtime, tail)
     # Prompt macros expand to user input rather than dispatch through a handler.
@@ -433,41 +442,45 @@ async def run_command(
     custom = registry.custom_command_for(name)
     if custom is not None:
         if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
-            return {"kind": "client_only", "name": name}
+            return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
         envelope = registry.input_for_model(text)
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
-        return {"kind": "client_only", "name": name}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
     session = ServerSlashSession(runtime, approval_control)
     result = await registry.dispatch_async(session, text)
     if result is None:
-        return {"kind": "unknown", "name": name}
+        return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}
     if isinstance(result, SlashPromptError):
-        return {"kind": "error", "text": result.message}
+        return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
         return _model_input_result(result, register_model_input)
     if isinstance(result, str):
-        return {"kind": "output", "text": result}
-    raise ProtocolError(-32000, "unexpected slash result type")
+        return {"kind": SlashResultKindDescriptor.OUTPUT, "text": result}
+    raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
 
 
-async def _run_mcp_command(
-    runtime: ServerRuntime, tail: str
-) -> dict[str, object]:
+async def _run_mcp_command(runtime: ServerRuntime, tail: str) -> dict[str, object]:
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
     if verb not in {"status", "auth", "logout"}:
-        return {"kind": "client_only", "name": "mcp"}
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": "mcp"}
     if runtime.loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     result = await runtime.loop.slash_mcp(stripped)
     response: dict[str, object] = {
-        "kind": "text" if stripped == "status" else "output",
+        "kind": (
+            SlashResultKindDescriptor.TEXT
+            if stripped == "status"
+            else SlashResultKindDescriptor.OUTPUT
+        ),
         "text": result,
     }
     credential_error = getattr(result, "credential_store_error", None)
     if credential_error is not None:
-        response["credential_store_error"] = credential_error
+        public_error = dict(credential_error)
+        public_error["code"] = SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE
+        response["credential_store_error"] = public_error
     return response
 
 
@@ -477,13 +490,13 @@ def _model_input_result(
 ) -> dict[str, object]:
     if register is None:
         return {
-            "kind": "model_input",
+            "kind": SlashResultKindDescriptor.MODEL_INPUT,
             "text": envelope.text,
             "display_text": envelope.display_text,
             "origin": envelope.origin.value,
         }
     return {
-        "kind": "model_input",
+        "kind": SlashResultKindDescriptor.MODEL_INPUT,
         "input_id": register(envelope),
         "display_text": envelope.display_text,
     }
