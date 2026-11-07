@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import stat
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta import project_registry as registry_module
 from zeta.core import session_files
+from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
@@ -556,14 +558,10 @@ async def test_child_lineage_reconciled_after_registry_failure(
     # Inject a registry-append failure for the child lineage records: the
     # durable intent is written and fsynced before this raises, so it must be
     # recoverable on the next open.
-    real_record = manager.project_registry.record_session
-
     def failing_record(*args: object, **kwargs: object) -> None:
-        if ":" in str(kwargs.get("session_id", "")):
-            raise ProjectRegistryError("injected append failure")
-        return real_record(*args, **kwargs)
+        raise ProjectRegistryError("injected append failure")
 
-    monkeypatch.setattr(manager.project_registry, "record_session", failing_record)
+    monkeypatch.setattr(manager.project_registry, "record_sessions", failing_record)
 
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
@@ -929,6 +927,220 @@ def test_child_reconciliation_reads_registry_once(
     )
 
 
+@pytest.mark.asyncio
+async def test_real_child_spawns_drain_stable_overflow_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import session_links
+
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repository)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="fake", cwd=repository
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project.project_id,
+        project_registry=registry,
+    )
+
+    async def stop_after_publication(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("stop after lineage publication")
+
+    monkeypatch.setattr(
+        loop.store, "append_child_run_started_async", stop_after_publication
+    )
+    event_loop_thread = threading.get_ident()
+    owner_before_collection = threading.Event()
+    first_spawn_ready = threading.Event()
+    release_owner = threading.Event()
+    all_admitted = threading.Event()
+    admission_lock = threading.Lock()
+    admissions = 0
+    owner_thread_id: int | None = None
+    real_persist = session_links.persist_pending_child_link
+    real_session_directory = session_links.session_directory
+
+    def observe_admission(*args: object, **kwargs: object) -> None:
+        nonlocal admissions, owner_thread_id
+        real_persist(*args, **kwargs)
+        with admission_lock:
+            if owner_thread_id is None:
+                owner_thread_id = threading.get_ident()
+            admissions += 1
+            if admissions == 257:
+                all_admitted.set()
+
+    calls_by_thread: dict[int, int] = {}
+
+    def gate_before_collection(*args: object, **kwargs: object):
+        thread_id = threading.get_ident()
+        calls_by_thread[thread_id] = calls_by_thread.get(thread_id, 0) + 1
+        if (
+            thread_id != event_loop_thread
+            and thread_id == owner_thread_id
+            and calls_by_thread[thread_id] == 2
+        ):
+            owner_before_collection.set()
+            first_spawn_ready.set()
+            release_owner.wait()
+        return real_session_directory(*args, **kwargs)
+
+    monkeypatch.setattr(session_links, "persist_pending_child_link", observe_admission)
+    monkeypatch.setattr(session_links, "session_directory", gate_before_collection)
+    real_read = registry._read_session_records
+    registry_reads = 0
+
+    def count_registry_read(*args: object, **kwargs: object):
+        nonlocal registry_reads
+        registry_reads += 1
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
+    signals = AbortGenerationRegistry()
+    calls = [
+        ToolCall(
+            f"child-{index}",
+            "agent",
+            {
+                "prompt": f"work {index}",
+                "description": f"child {index}",
+                "background": False,
+            },
+        )
+        for index in range(257)
+    ]
+    first = asyncio.create_task(
+        loop._run_agent_tool(
+            calls[0], calls[0].arguments, signals.new_generation(), None
+        )
+    )
+    first.add_done_callback(lambda _task: first_spawn_ready.set())
+    await asyncio.to_thread(first_spawn_ready.wait)
+    tasks = [first]
+    for call in calls[1:]:
+        task = asyncio.create_task(
+            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
+        )
+        tasks.append(task)
+        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.to_thread(all_admitted.wait)
+    if owner_before_collection.is_set():
+        release_owner.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    await loop.close()
+    opened.store.close()
+    assert all(isinstance(result, RuntimeError) for result in results)
+
+    # The gate is immediately before ready-set collection. All 257 admissions
+    # are therefore stable before the owner reads its first bounded set.
+    assert registry_reads == 2
+    records = registry.list_session_links(project.project_id, limit=10_000)
+    child_ids = [
+        record["session_id"] for record in records if ":" in str(record["session_id"])
+    ]
+    assert len(child_ids) == 257
+    assert len(set(child_ids)) == 257
+    pending = opened.store.session_dir / session_links.PENDING_CHILD_LINKS_DIRNAME
+    assert list(pending.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_child_publication_joins_before_loop_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import runner as agent_runner
+    from zeta.core import session_links
+
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repository)
+    opened = await asyncio.to_thread(
+        SessionManager(home).create, provider="codex", model="fake", cwd=repository
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project.project_id,
+        project_registry=registry,
+    )
+
+    async def finish_child(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        return {"content": [], "isError": False, "structuredContent": None}
+
+    monkeypatch.setattr(agent_runner, "consume_child", finish_child)
+    event_loop_thread = threading.get_ident()
+    worker_entered = threading.Event()
+    first_phase = threading.Event()
+    release_worker = threading.Event()
+    order: list[str] = []
+    real_persist = session_links.persist_pending_child_link
+
+    def gated_persist(*args: object, **kwargs: object) -> None:
+        if threading.get_ident() != event_loop_thread:
+            worker_entered.set()
+            first_phase.set()
+            release_worker.wait()
+        real_persist(*args, **kwargs)
+        order.append("storage_return")
+        first_phase.set()
+
+    monkeypatch.setattr(session_links, "persist_pending_child_link", gated_persist)
+    call = ToolCall(
+        "child-cancel",
+        "agent",
+        {
+            "prompt": "work",
+            "description": "cancelled child",
+            "background": False,
+        },
+    )
+    task = loop._create_task(
+        loop._run_agent_tool(
+            call,
+            call.arguments,
+            AbortGenerationRegistry().new_generation(),
+            None,
+        )
+    )
+    asyncio.get_running_loop().call_soon(lambda: order.append("heartbeat"))
+    await asyncio.to_thread(first_phase.wait)
+
+    close_task: asyncio.Task[tuple[str, ...]] | None = None
+    if worker_entered.is_set():
+        task.cancel()
+        close_task = asyncio.create_task(loop.close())
+        cancellation_observed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(cancellation_observed.set)
+        await cancellation_observed.wait()
+        assert not task.done()
+        assert not close_task.done()
+        release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if close_task is not None:
+        await close_task
+    else:
+        await loop.close()
+
+    assert order.index("heartbeat") < order.index("storage_return")
+    child_id = f"{opened.metadata.session_id}:1"
+    records = registry.list_session_links(project.project_id)
+    assert [record["session_id"] for record in records].count(child_id) == 1
+    opened.store.close()
+
+
 def test_pending_index_fsyncs_root_dir_before_record_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1076,7 +1288,7 @@ def test_quarantine_handles_max_length_filename(
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
-        lambda _fd: ([invalid_name, valid_name], [], False),
+        lambda _fd: ([invalid_name, valid_name], [], False, False),
     )
     reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
@@ -1122,7 +1334,7 @@ def test_transient_read_error_keeps_intent_and_retries(
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
-        lambda _fd: ([blocked_name, later_name], [], False),
+        lambda _fd: ([blocked_name, later_name], [], False, False),
     )
     if failure_point == "open":
         real_open = session_links.open_session_file
@@ -1381,9 +1593,12 @@ def test_invalid_entries_never_starve_valid_intents_across_passes(
     for i in range(2 * session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS):
         (pending_dir / f"invalid-{i:03d}").write_text("not json", encoding="utf-8")
 
-    def invalids_first(pending_fd: int) -> tuple[list[str], list[str], bool]:
+    def invalids_first(
+        pending_fd: int,
+    ) -> tuple[list[str], list[str], bool, bool]:
         names = sorted(os.listdir(pending_fd), key=lambda name: (name == valid_name, name))
-        return names[: session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS], [], False
+        bound = session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS
+        return names[:bound], [], False, len(names) > bound
 
     monkeypatch.setattr(session_links, "_scan_pending_entries", invalids_first)
 

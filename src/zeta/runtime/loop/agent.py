@@ -40,6 +40,7 @@ from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
 from ...core.hooks import HookManager
+from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
@@ -203,6 +204,11 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._child_lineage_publisher = (
+            ChildLineagePublisher(project_registry, self.root_session_dir)
+            if root_project_id is not None and project_registry is not None
+            else None
+        )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
