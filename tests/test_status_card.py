@@ -1,9 +1,14 @@
+import asyncio
+import json
+from dataclasses import fields
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding import KeyPress
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.output import DummyOutput
@@ -11,6 +16,8 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from zeta.attention_decisions import DecisionItem
+from zeta.attention_records import AttentionStore
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -155,6 +162,98 @@ async def test_status_card_renders_compaction_with_or_without_fact_floor(
         assert "turn 1: 1 entries" in text
         assert "retained typed facts" not in text
     finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_decisions_popup_renders_kinds_and_dismisses_information(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    attention = AttentionStore(store.session_dir)
+    decision = attention.request(
+        session_id=store.session_id,
+        project_id=None,
+        entry_id=None,
+        entry_seq=None,
+        title="choose",
+        why="choose a value",
+    )
+    information = attention.request(
+        session_id=store.session_id,
+        project_id=None,
+        entry_id=None,
+        entry_seq=None,
+        title="answer",
+        why="the answer is ready",
+    )
+    information_path = attention.directory / f"{information.id}.json"
+    information_value = json.loads(information_path.read_text())
+    information_value["kind"] = "answer"
+    information_path.write_text(json.dumps(information_value))
+    if hasattr(information, "kind"):
+        information = attention.get(information.id)
+    else:
+        information = SimpleNamespace(
+            **{field.name: getattr(information, field.name) for field in fields(information)},
+            kind="answer",
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    app._decisions_panel.set_items(
+        [
+            DecisionItem(store.session_id, None, "Unassigned", decision),
+            DecisionItem(store.session_id, None, "Unassigned", information),
+        ]
+    )
+    app.open_decisions_panel()
+    try:
+        with set_app(session.app):
+            session.app.key_processor.feed(KeyPress("j"))
+            session.app.key_processor.process_keys()
+        screen = await _render_status(session, 100, 50)
+        rows = [
+            "".join(screen.data_buffer[y][x].char for x in range(100))
+            for y in range(50)
+        ]
+        text = "\n".join(rows)
+        assert "decision" in text and "answer" in text
+        assert text.index("decision") < text.index("answer")
+        decision_row = next(row for row in rows if "decision" in row)
+        answer_row = next(row for row in rows if "answer" in row)
+        assert {
+            screen.data_buffer[rows.index(decision_row)][x].style for x in range(100)
+        } != {
+            screen.data_buffer[rows.index(answer_row)][x].style for x in range(100)
+        }
+        assert "d dismiss" in text
+        assert app._decisions_panel.selected.record.kind == "answer"
+
+        app._stop_decisions_refresh()
+        tick_done = asyncio.Event()
+        original_tick = app._decisions_tick
+
+        async def wait_for_dismissal() -> None:
+            await original_tick()
+            tick_done.set()
+
+        app._decisions_tick = wait_for_dismissal
+        with set_app(session.app):
+            session.app.key_processor.feed(KeyPress("d"))
+            session.app.key_processor.process_keys()
+        await tick_done.wait()
+        assert information.id not in {item.record.id for item in app._decisions_panel.items}
+        dismissed = attention.get(information.id)
+        assert dismissed.status == "resolved"
+        assert dismissed.decision is None
+    finally:
+        app.close_decisions_panel()
         await app.close()
 
 

@@ -16,7 +16,6 @@ from zeta.storage_format import (
     require_closed_variant,
 )
 from zeta.tools.registry import ToolRegistry
-from zeta.tui.cards.decisions import DecisionsPanel
 
 
 def _record(store: AttentionStore, *, kind: str = "decision", **kwargs):
@@ -59,18 +58,13 @@ def test_old_attention_bytes_read_as_decision_and_remain_unchanged(
     opened.store.close()
 
 
-def test_attention_kinds_sort_decisions_first_and_render_kind(tmp_path: Path) -> None:
+def test_attention_kinds_sort_decisions_first(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     answer = _record(store, kind="answer", session_id=opened.store.session_id)
     decision = _record(store, session_id=opened.store.session_id)
     items = open_decisions(tmp_path, opened.store.session_id)
     assert [item.record.kind for item in items] == ["decision", "answer"]
-    panel = DecisionsPanel()
-    panel.set_items(items)
-    panel.move(1)
-    rendered = "\n".join(text for line in panel.render_lines() for _style, text in line)
-    assert "answer" in rendered and "Kind" in rendered and "Topic" in rendered
     assert decision.id != answer.id
     opened.store.close()
 
