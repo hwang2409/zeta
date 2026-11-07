@@ -35,6 +35,7 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
+from tests.support.storage_homes import initialize_storage_home
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     event as _buffered_event,
@@ -48,7 +49,6 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
-from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -89,7 +89,12 @@ from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
-from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
+from zeta.server.protocol import (
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_ID_BYTES,
+    EventDescriptor,
+    FrameCodec,
+)
 from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
@@ -103,7 +108,7 @@ TIMEOUT = 30
 
 def _client_notifier(client: _Client):
     async def notify(
-        event: str, session_id: str | None = None, **fields: object
+        event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
         return await client._write(
             client.codec.notification(event, session_id, **fields)
@@ -324,7 +329,7 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
         async def drain(self) -> None:
             while not release.is_set():
                 try:
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
                 except asyncio.CancelledError:
                     continue
 
@@ -341,14 +346,16 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
 
     async def publish() -> None:
         try:
-            await protocol_module.finish_frame_write(codec, StubbornWriter(), b"{}")
+            await protocol_module.finish_frame_write(
+                codec, StubbornWriter(), codec.response(None, {})
+            )
         except protocol_module.FrameWriteCancelled as cancelled:
             outcomes.append(cancelled.written)
             raise
 
     task = asyncio.create_task(publish())
     try:
-        await started.wait()
+        await asyncio.wait_for(started.wait(), 10)
         task.cancel()
         done, _ = await asyncio.wait({task}, timeout=2)
         assert done == {task}
@@ -397,10 +404,14 @@ async def test_repeated_stalled_unix_writes_close_each_transport(
                 return await _original(target, payload)
 
             codec.write = write  # type: ignore[method-assign]
-            task = asyncio.create_task(
-                protocol_module.finish_frame_write(codec, writer, b"x" * (2**20))
+            large_frame = codec.response(
+                None, "x" * (protocol_module.MAX_FRAME_BYTES - 64)
             )
-            await write_started.wait()
+            assert len(large_frame) > 1_000_000
+            task = asyncio.create_task(
+                protocol_module.finish_frame_write(codec, writer, large_frame)
+            )
+            await asyncio.wait_for(write_started.wait(), 10)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 1)
@@ -411,9 +422,12 @@ async def test_repeated_stalled_unix_writes_close_each_transport(
     finally:
         for writer in [*writers, *peers]:
             writer.close()
-        await asyncio.gather(
-            *(writer.wait_closed() for writer in [*writers, *peers]),
-            return_exceptions=True,
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(writer.wait_closed() for writer in [*writers, *peers]),
+                return_exceptions=True,
+            ),
+            10,
         )
         server.close()
         await server.wait_closed()
@@ -435,7 +449,7 @@ async def test_live_slow_write_is_not_aborted(
             pass
 
         async def drain(self) -> None:
-            await release.wait()
+            await asyncio.wait_for(release.wait(), 10)
 
         class Transport:
             def abort(self) -> None:
@@ -444,8 +458,9 @@ async def test_live_slow_write_is_not_aborted(
         transport = Transport()
 
     writer = Writer()
+    codec = protocol_module.FrameCodec()
     task = asyncio.create_task(
-        protocol_module.finish_frame_write(protocol_module.FrameCodec(), writer, b"{}")
+        protocol_module.finish_frame_write(codec, writer, codec.response(None, {}))
     )
     await asyncio.sleep(0)
     await asyncio.sleep(0.03)
@@ -467,7 +482,7 @@ async def test_abort_error_still_completes_canceled_write(
             pass
 
         async def drain(self) -> None:
-            await started.wait()
+            await asyncio.wait_for(started.wait(), 10)
 
         class Transport:
             def abort(self) -> None:
@@ -476,8 +491,9 @@ async def test_abort_error_still_completes_canceled_write(
         transport = Transport()
 
     writer = Writer()
+    codec = protocol_module.FrameCodec()
     task = asyncio.create_task(
-        protocol_module.finish_frame_write(protocol_module.FrameCodec(), writer, b"{}")
+        protocol_module.finish_frame_write(codec, writer, codec.response(None, {}))
     )
     await asyncio.sleep(0)
     task.cancel()
@@ -498,12 +514,14 @@ async def test_canceled_write_surfaces_unexpected_error(
             pass
 
         async def drain(self) -> None:
-            await fail.wait()
+            await asyncio.wait_for(fail.wait(), 10)
             raise RuntimeError("codec bug")
 
     task = asyncio.create_task(
         protocol_module.finish_frame_write(
-            protocol_module.FrameCodec(), FailingWriter(), b"{}"
+            protocol_module.FrameCodec(),
+            FailingWriter(),
+            protocol_module.FrameCodec().response(None, {}),
         )
     )
     await asyncio.sleep(0)
@@ -1832,9 +1850,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    monkeypatch.setattr(
-        server.control._approvals, "_publish", delay_delegated_approval_end
-    )
+    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -2053,11 +2069,22 @@ async def test_status_surfaces_transcript_index_failure(
             return "disk full; pending changes will retry"
 
         monkeypatch.setattr(loop, "transcript_index_failure", failure, raising=False)
-        status = (await _request(reader, writer, 3, "status"))[-1]["result"]
+        status = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "status",
+                {"include_connection_setup_counts": True},
+            )
+        )[-1]["result"]
 
         assert requested == [server.runtime.session_id]
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
+        )
+        assert status["connection_setup_counts"] == list(
+            loop.connection_setup_counts()
         )
         assert status["max_agent_depth"] == 3
     finally:
@@ -3171,7 +3198,10 @@ def test_protocol_schema_documents_all_reviewed_event_contracts() -> None:
         encoding="utf-8"
     )
     rows = protocol.splitlines()
-    assert "| `-32007` | outbound frame exceeds the size limit |" in rows
+    assert (
+        "| `frame_too_large` | `-32007` | none | "
+        "outbound frame exceeds the size limit |"
+    ) in rows
     assert (
         "| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, "
         "`turn_aborted`, `compaction_start`, `compaction_end` | `event` | "
@@ -4970,7 +5000,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.wait_for(asyncio.gather(first_turn, return_exceptions=True), 10)
+        await asyncio.wait_for(
+            asyncio.gather(first_turn, return_exceptions=True), 10
+        )
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -5181,7 +5213,8 @@ async def test_close_kill_cause_reaches_live_serve_event(
 
         task_frames = history_frames
         if not any(
-            frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
+            frame.get("params", {}).get("event") == "turn_end"
+            for frame in task_frames
         ):
             task_frames += await _frames_until_event(reader, "turn_end")
         events = [
@@ -5196,9 +5229,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert task_events[0]["data"]["note"] == task_cause
-        assert {e["data"].get("kind", "agent_completion") for e in receipt_events} == {
-            "agent_completion"
-        }
+        assert {
+            e["data"].get("kind", "agent_completion") for e in receipt_events
+        } == {"agent_completion"}
         assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
@@ -5412,7 +5445,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     import base64
 
     from zeta.protocol.types import ImageContent
-    from zeta.server.ergonomics import MAX_IMAGE_BYTES
+    from zeta.server.image_delivery import MAX_IMAGE_BYTES
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
     server = ZetaServer(
@@ -5657,7 +5690,7 @@ async def test_image_names_match_verified_types(tmp_path):
 
     from PIL import Image
 
-    from zeta.server.ergonomics import DIRECTION_CONTROLS, prepare_image_delivery
+    from zeta.server.image_delivery import DIRECTION_CONTROLS, prepare_image_delivery
     from zeta.server.protocol import ProtocolError
     from zeta.server.runtime import ServerRuntime
 
@@ -5730,7 +5763,7 @@ async def test_attachment_failure_removes_entire_batch(
 
     from PIL import Image
 
-    from zeta.server import ergonomics
+    from zeta.server import image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, provider="codex")
@@ -5746,11 +5779,11 @@ async def test_attachment_failure_removes_entire_batch(
     attachments = runtime.opened.store.session_dir / "attachments"
     if existing:
         await asyncio.to_thread(
-            ergonomics.prepare_image_delivery, runtime, {"images": [item]}
+            image_delivery.prepare_image_delivery, runtime, {"images": [item]}
         )
     before = set(attachments.rglob("*"))
     original_open = os.fdopen
-    original_replace = ergonomics.os.replace
+    original_replace = image_delivery.os.replace
     writes = 0
     replacements = 0
 
@@ -5794,10 +5827,10 @@ async def test_attachment_failure_removes_entire_batch(
     try:
         with monkeypatch.context() as patch:
             patch.setattr(os, "fdopen", failing_open)
-            patch.setattr(ergonomics.os, "replace", failing_replace)
+            patch.setattr(image_delivery.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    ergonomics.prepare_image_delivery, runtime, {"images": [item, item]}
+                    image_delivery.prepare_image_delivery, runtime, {"images": [item, item]}
                 )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
@@ -7534,7 +7567,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
 async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     import base64
 
-    from zeta.server.ergonomics import prepare_image_delivery
+    from zeta.server.image_delivery import prepare_image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")
@@ -9961,8 +9994,8 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     home = tmp_path / "home"
     project = tmp_path / "project"
     home.mkdir()
-    initialize_storage_home(home)
     project.mkdir()
+    initialize_storage_home(home)
     (home / "mcp.json").write_text(
         json.dumps(
             {

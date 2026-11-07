@@ -12,8 +12,9 @@ newline. Messages are limited to 1 MiB on every transport.
 - `1.1` adds the session extensions and optional feature negotiation below.
 - `1.0` is the legacy base protocol.
 
-The server accepts one client. A second connection receives a JSON-RPC error
-with code `-32001`, then closes. The limit is shared by all enabled transports.
+The server accepts one controller plus up to eight negotiated read-only
+observers. A second controller or ninth observer receives a JSON-RPC error with
+code `-32001`, then closes. The limits are shared by all enabled transports.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
@@ -661,11 +662,17 @@ work. The result contains `cleared`, the number of removed messages.
 
 ### `status`
 
-Params: none. The result contains `session` (full metadata or `null`), `state`
-(`idle`, `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`,
-and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
-and `delegated`. Delegated approvals also have `agent_instance_id`, the child
-agent instance that owns the approval.
+Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
+the result includes `connection_setup_counts`, an array of objects with
+`provider` (string), `model` (string), and `count` (integer). Each object reports
+the number of HTTP clients created by one completion backend. The field is
+omitted when the parameter is absent or false.
+
+The result contains `session` (full metadata or `null`), `state` (`idle`,
+`running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
+`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
+`delegated`. Delegated approvals also have `agent_instance_id`, the child agent
+instance that owns the approval.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -801,9 +808,10 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
 `child_idle` carry their durable notification `data` object with the matching
-known kind. `child_message_delivered` is emitted for the parent session after a
-running child starts answering a staged `agent_send`; its data contains the
-child label and the bounded one-line message preview.
+known kind. `task_exit_notification.data.note` contains the task kill cause when
+the server stopped the task. `child_message_delivered` is emitted for the parent
+session after a running child starts answering a staged `agent_send`; its data
+contains the child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
 
@@ -878,24 +886,40 @@ failures, then returns to `idle`.
 
 ## errors
 
-Error responses use standard JSON-RPC codes where applicable:
+Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
 
-| code | meaning |
-| ---: | --- |
-| `-32700` | invalid JSON or invalid UTF-8 frame |
-| `-32600` | invalid JSON-RPC request or duplicate handshake |
-| `-32601` | method is not supported |
-| `-32602` | params have the wrong shape or value |
-| `-32000` | unexpected server failure |
-| `-32001` | another client owns the socket |
-| `-32002` | handshake missing or protocol version mismatch |
-| `-32003` | no active session, or a detached host-bound session cannot start a turn |
-| `-32004` | a turn is already running |
-| `-32005` | no turn is running for steering |
-| `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
-| `-32007` | outbound frame exceeds the size limit |
-| `-32008` | the selected account lock is held by another process |
-| `-32010` | delivery ID was accepted but its full details were evicted |
+Error descriptors are:
+
+| name | code | data.code | meaning |
+| --- | ---: | --- | --- |
+| `parse_error` | `-32700` | none | invalid JSON or invalid UTF-8 frame |
+| `invalid_request` | `-32600` | none | invalid JSON-RPC request or duplicate handshake |
+| `method_not_found` | `-32601` | none | method or negotiated feature is not supported |
+| `invalid_params` | `-32602` | none | params have the wrong shape, value, or negotiated capability |
+| `internal_error` | `-32000` | none | unexpected server or storage failure |
+| `connection_capacity` | `-32001` | none | requested controller or observer connection role is at capacity |
+| `protocol_mismatch` | `-32002` | none | handshake is missing or the protocol version does not match |
+| `no_active_session` | `-32003` | none | no active session, or the active session requires a host binding |
+| `operation_busy` | `-32004` | none | operation is blocked by active turn, tool, or background-agent work |
+| `state_unavailable` | `-32005` | none | requested turn or account state is unavailable |
+| `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
+| `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
+| `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
+| `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
+| `controller_output_overflow` | `-32011` | none | controller output overflow |
+| `observer_output_overflow` | `-32011` | none | observer output overflow |
+| `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
+| `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
+| `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
+| `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
+| `host_binding_required` | `-32003` | `host_binding_required` | the session requires a host binding |
+| `invalid_content_read` | `-32602` | `invalid_content_read` | content_read parameters are invalid |
+| `login_in_progress` | `-32005` | `login_in_progress` | a login is already pending |
+| `observer_read_only` | `-32008` | `observer_read_only` | a read-only observer requested a write method |
+| `project_not_found` | `-32602` | `project_not_found` | the requested project does not exist |
+| `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
+| `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -1009,6 +1033,7 @@ Event fields are:
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
 | `account_limit` | `event`, `data: object` | `session_id` |
+| `account_state_unknown` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
@@ -1023,6 +1048,7 @@ Event fields are:
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
+| `delivery_status` (features `delivery_id` and `session_history_fidelity`) | `event`, `id: string`, `role: "system"`, `delivery_id: string`, `method: "steer"`, `status: "dropped"`, `content: array[ContentBlock]` | `session_id`, `reason: string` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
@@ -1318,6 +1344,7 @@ implementation for the frontend client. Two RPCs cover the surface.
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `text`: `text` is the MCP status output to render as normal text.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
     an opaque `input_id` and the typed `display_text`; the resolved text and
@@ -1327,6 +1354,12 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `unknown`: no command matched the leading token.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
+Structured slash error codes are:
+
+| code | meaning |
+| --- | --- |
+| `mcp_credential_store` | an MCP credential file could not be loaded or deleted safely |
+
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
 `/inbox`, `/init`, `/memory`, `/model`, `/project`, `/project-instructions`,
 `/status`, and `/vim`. `/project` shows the current association, and `/project
@@ -1335,11 +1368,12 @@ form is rejected while a turn, child, or approval is active. Runnable user
 commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
 plus skills. Argless `/model` reports the current model, while `/model <name>`
-dispatches server-side through the shared settings-apply path. TUI-owned
-built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
-commands are omitted from the default catalog. Every invocation of one of
-these unavailable commands, including `/mcp status`, reports `client_only`
-instead of half-executing.
+dispatches server-side through the shared settings-apply path. TUI-owned built-ins, exec macros, prompt macros with inline shell spans, and
+MCP prompt commands are omitted from the default catalog. `/mcp status`,
+`/mcp auth`, and `/mcp logout` run server-side; other `/mcp` verbs report
+`client_only`. A credential-store refusal adds `credential_store_error` with
+code `mcp_credential_store`, a bounded reason, server, credential path,
+operation, recovery action, and renderable text.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on

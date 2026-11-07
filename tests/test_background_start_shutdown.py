@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import background_spawn
 from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import (
@@ -343,7 +344,7 @@ async def test_shutdown_joins_inflight_start(
         spawned.append(process)
         assert await process.stdout.readline() == b"ready\n"
         spawn_ready.set()
-        await release_spawn.wait()
+        await asyncio.wait_for(release_spawn.wait(), 10)
         return process
 
     async def shutdown():
@@ -429,14 +430,21 @@ async def test_shutdown_joins_inflight_start(
         release_spawn.set()
         release_wait.set()
         for process in spawned:
-            if _group_exists(process.pid):
-                os.killpg(process.pid, signal.SIGKILL)
+            kill_group_if_present(process.pid)
         starting.cancel()
-        await asyncio.gather(starting, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(starting, return_exceptions=True), 10
+        )
         if closing is not None:
-            await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(closing, return_exceptions=True), 10
+            )
         monitors = [record.monitor for record in registry.records if record.monitor is not None]
-        await asyncio.gather(*monitors, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*monitors, return_exceptions=True), 10
+        )
         for process in spawned:
-            await process.communicate()
-        await asyncio.gather(registry.close(), return_exceptions=True)
+            await asyncio.wait_for(process.communicate(), 10)
+        await asyncio.wait_for(
+            asyncio.gather(registry.close(), return_exceptions=True), 10
+        )
