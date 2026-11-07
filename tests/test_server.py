@@ -7627,6 +7627,43 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_resume_owned_session_returns_busy_and_keeps_active_session(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _ready(server)
+    owned = await asyncio.to_thread(
+        SessionManager(tmp_path).create,
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+    )
+    try:
+        active_session_id = server.runtime.session_id
+        response = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "resume",
+                {"session_id": owned.metadata.session_id},
+            )
+        )[-1]
+        assert response["error"] == {
+            "code": -32004,
+            "message": "session is active in another zeta process",
+            "data": {
+                "code": "session_owned",
+                "session_id": owned.metadata.session_id,
+            },
+        }
+        assert server.runtime.session_id == active_session_id
+    finally:
+        owned.store.close()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)

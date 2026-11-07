@@ -101,7 +101,14 @@ async def mutate_session(
         return {"session_id": session_id}
     if not isinstance(name, str):
         raise ProtocolError(-32602, "name must be a string")
-    metadata = await asyncio.to_thread(runtime.manager.rename, session_id, name)
+    metadata = await asyncio.to_thread(
+        runtime.manager.rename,
+        session_id,
+        name,
+        runtime.opened.store.execution_lease
+        if runtime.opened is not None and session_id == runtime.session_id
+        else None,
+    )
     if runtime.opened is not None and session_id == runtime.session_id:
         runtime.manager._copy_metadata(runtime.metadata, metadata)
     return {"session": metadata.to_dict()}

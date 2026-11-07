@@ -90,6 +90,7 @@ class AsyncDurableWritesMixin:
             _collect_persisted_appends=True,
             _validated_log_state=None if prepared is None else prepared[1],
             _storage_lease=self._storage_lease,
+            _execution_lease=self.execution_lease,
         )
 
     def _run_durable_write(
@@ -188,9 +189,7 @@ class AsyncDurableWritesMixin:
         return replace(state, log=replace(state.log, installed_delta=delta))
 
     @staticmethod
-    def _linear_suffix(
-        entries: list[ConversationEntry], baseline_count: int
-    ) -> bool:
+    def _linear_suffix(entries: list[ConversationEntry], baseline_count: int) -> bool:
         previous = entries[baseline_count - 1] if baseline_count else None
         for entry in entries[baseline_count:]:
             expected_seq = previous.seq + 1 if previous is not None else 1
@@ -217,8 +216,7 @@ class AsyncDurableWritesMixin:
         else:
             delta = self._installed_delta_from_baseline(state.entries, baseline)
         if delta != "reset" and (
-            len(delta) > 64
-            or not self._linear_suffix(state.entries, baseline[0])
+            len(delta) > 64 or not self._linear_suffix(state.entries, baseline[0])
         ):
             # Keep owner publication bounded; large or nonlinear suffixes use
             # one worker-owned state copy and an owner-thread pointer swap.
@@ -276,11 +274,9 @@ class AsyncDurableWritesMixin:
             return
         for marker_key, loaded_marker in state.agent_children.items():
             live_marker = live_markers.get(marker_key)
-            if (
-                live_marker is not None
-                and live_marker.get("child_session_path")
-                == loaded_marker.get("child_session_path")
-            ):
+            if live_marker is not None and live_marker.get(
+                "child_session_path"
+            ) == loaded_marker.get("child_session_path"):
                 loaded_marker["turns_used"] = max(
                     loaded_marker.get("turns_used", 0),
                     live_marker.get("turns_used", 0),

@@ -359,6 +359,13 @@ data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
 recovery.
 
+If another zeta process owns the session, `resume` returns `-32004` with
+`data.code: "session_owned"`, the requested `session_id`, and an optional
+`owner` object containing diagnostic `surface` and `pid` fields. The rejected
+resume keeps the server's previous session active. Session ownership requires
+a local filesystem with working `flock` semantics; zeta does not use a PID or
+timeout to take ownership from a live process.
+
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
 the message `session working directory no longer exists: <cwd>`, and the active
@@ -842,7 +849,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32001` | another client owns the socket |
 | `-32002` | handshake missing or protocol version mismatch |
 | `-32003` | no active session, or a detached host-bound session cannot start a turn |
-| `-32004` | a turn is already running |
+| `-32004` | a turn is already running, or another process owns the requested session |
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
 | `-32007` | outbound frame exceeds the size limit |

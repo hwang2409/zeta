@@ -132,8 +132,7 @@ def _persisted_fields(composition: PromptComposition) -> tuple[object, ...]:
 
 
 class PromptCompositionMixin:
-    """Own prompt composition persistence and concurrent resume coordination."""
-
+    """Own prompt composition persistence for an exclusively owned runtime."""
 
     def resume_prompt_composition(
         self,
@@ -141,44 +140,29 @@ class PromptCompositionMixin:
         store: Any,
         compose: Callable[[Any], PromptComposition],
     ) -> PromptComposition:
-        """Atomically compose or adopt a prompt and activate its runtime lease.
-
-        The metadata lock covers the lease probe, persistence, and transition
-        to a shared runtime lease. A successful exclusive probe means no other
-        runtime has this session open, so this runtime recomposes. Otherwise it
-        adopts the composition published by the live runtime.
-        """
+        """Compose and atomically persist a prompt under the runtime capability."""
 
         if store.session_id != metadata.session_id:
-            raise SessionError("prompt runtime lease does not match session metadata")
+            raise SessionError("prompt execution lease does not match session metadata")
+        store.assert_execution_owner()
         with self._metadata_lock(metadata.session_id) as directory_fd:
             current = self._read(metadata.session_id, directory_fd=directory_fd)
-            with store.prompt_resume_lease() as should_compose:
-                if should_compose:
-                    composition = compose(current)
-                    if _persisted_fields(composition) != _persisted_fields(
-                        _composition_from_metadata(current)
-                    ):
-                        current.system_prompt = composition.system_prompt
-                        current.context_files = list(composition.context_files)
-                        current.skill_catalog = composition.skill_catalog.to_snapshot()
-                        current.agent_catalog = composition.agent_catalog.to_snapshot()
-                        current.prompt_recipe = composition.prompt_recipe
-                        current.prompt_components = {
-                            key: dict(component)
-                            for key, component in composition.prompt_components.items()
-                        }
-                        current.project_memory_offset = (
-                            composition.project_memory_offset
-                        )
-                        current.project_memory_length = (
-                            composition.project_memory_length
-                        )
-                        current.project_memory_digest = (
-                            composition.project_memory_digest
-                        )
-                        self._write_unlocked(current, directory_fd=directory_fd)
-                else:
-                    composition = _composition_from_metadata(current)
-                self._copy_metadata(metadata, current)
-                return composition
+            composition = compose(current)
+            if _persisted_fields(composition) != _persisted_fields(
+                _composition_from_metadata(current)
+            ):
+                current.system_prompt = composition.system_prompt
+                current.context_files = list(composition.context_files)
+                current.skill_catalog = composition.skill_catalog.to_snapshot()
+                current.agent_catalog = composition.agent_catalog.to_snapshot()
+                current.prompt_recipe = composition.prompt_recipe
+                current.prompt_components = {
+                    key: dict(component)
+                    for key, component in composition.prompt_components.items()
+                }
+                current.project_memory_offset = composition.project_memory_offset
+                current.project_memory_length = composition.project_memory_length
+                current.project_memory_digest = composition.project_memory_digest
+                self._write_unlocked(current, directory_fd=directory_fd)
+            self._copy_metadata(metadata, current)
+            return composition

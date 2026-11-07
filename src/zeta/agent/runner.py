@@ -645,19 +645,16 @@ async def run_agent_tool(
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = loop._background_owner.store_leases.enter_context(
-        ConversationStore(
+    child_store = await loop.store._to_thread_store(
+        lambda: ConversationStore(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
             _storage_lease=loop.store._storage_lease,
+            _owner_surface="child",
         )
     )
-    try:
-        await child_store._to_thread_store(child_store.activate_runtime_lease)
-    except BaseException:
-        await child_store._to_thread_store(child_store.close)
-        raise
+    loop._background_owner.store_leases.enter_context(child_store)
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
@@ -1060,36 +1057,36 @@ async def run_agent_tool(
 
         async def finish_background() -> None:
             await finish_background_child(
-                    child_task=child_task,
-                    child_store=child_store,
-                    parent_store=loop.store,
-                    tool_call=tool_call,
-                    child_instance_id=child_instance_id,
-                    child_path=child_path,
-                    description=description,
-                    child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                        child_result(
-                            text,
-                            error=error,
-                            status=status,
-                            stats=stats,
-                            include_stats=True,
-                            notice=notice,
-                            notice_items=notice_items,
-                            max_bytes=background_receipt_bytes,
-                        )
-                    ),
-                    validate_result=validate_result,
-                    publish_event=loop._publish_background_event,
-                    cleanup=cleanup_background_child,
-                    close_child=close_background_child,
-                    error_message=error_message,
-                    marker_key=child_marker_key,
-                    agent_instance_id=loop.agent_instance_id,
-                    background_owner=loop._background_owner,
-                    max_receipt_bytes=background_receipt_bytes,
-                    explicit_finish=terminal_fence is not None,
+                child_task=child_task,
+                child_store=child_store,
+                parent_store=loop.store,
+                tool_call=tool_call,
+                child_instance_id=child_instance_id,
+                child_path=child_path,
+                description=description,
+                child_turns=child_turns,
+                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                    child_result(
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
+                    )
+                ),
+                validate_result=validate_result,
+                publish_event=loop._publish_background_event,
+                cleanup=cleanup_background_child,
+                close_child=close_background_child,
+                error_message=error_message,
+                marker_key=child_marker_key,
+                agent_instance_id=loop.agent_instance_id,
+                background_owner=loop._background_owner,
+                max_receipt_bytes=background_receipt_bytes,
+                explicit_finish=terminal_fence is not None,
             )
 
         watcher = loop._create_task(finish_background())
@@ -1233,7 +1230,11 @@ def _compose_child_system_prompt(
     composed = compose_system_prompt(system_prompt, preset.preamble)
     body = load_agent(preset)
     if explicit_finish:
-        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
+        body = (
+            f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"
+            if body
+            else _EXPLICIT_FINISH_GUIDANCE
+        )
     if not body:
         return composed
     if isinstance(composed, Message):

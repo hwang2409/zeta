@@ -11,6 +11,7 @@ from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.store import ConversationIntegrityError
+from ..core.store.runtime_lease import SessionOwnedError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -541,6 +542,8 @@ class _Client:
                             str(exc),
                             {"code": "session_not_found", "session_id": session_id},
                         ) from exc
+                    except SessionOwnedError as exc:
+                        raise _session_owned_protocol_error(exc) from exc
                     except Exception as exc:
                         raise ProtocolError(
                             -32000, "approval persistence failed"
@@ -554,6 +557,8 @@ class _Client:
                             str(exc),
                             {"code": "session_not_found", "session_id": session_id},
                         ) from exc
+                    except SessionOwnedError as exc:
+                        raise _session_owned_protocol_error(exc) from exc
                 self.server.control._active_host_commands = candidate
                 self.server.control._host_binding_required = (
                     "session_host_commands" in self.features
@@ -864,6 +869,24 @@ def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
+
+
+def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
+    data: dict[str, Any] = {
+        "code": "session_owned",
+        "session_id": exc.session_id,
+    }
+    owner = {
+        key: value
+        for key, value in {
+            "surface": exc.owner_surface,
+            "pid": exc.owner_pid,
+        }.items()
+        if value is not None
+    }
+    if owner:
+        data["owner"] = owner
+    return ProtocolError(-32004, "session is active in another zeta process", data)
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:

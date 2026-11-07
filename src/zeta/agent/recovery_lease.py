@@ -51,9 +51,7 @@ class _DetachedRecoveryLoop:
         return self._source._canceled_agent_result(tool_call_id, **kwargs)
 
 
-def open_child_store(
-    store: ConversationStore, path: Path
-) -> ConversationStore | None:
+def open_child_store(store: ConversationStore, path: Path) -> ConversationStore | None:
     try:
         parts = path.relative_to(store.session_dir).parts
     except ValueError:
@@ -65,7 +63,14 @@ def open_child_store(
         or any(not parts[index].isdigit() for index in range(1, len(parts), 2))
     ):
         return None
-    return ConversationStore(path.parent, session_id=path.name, cwd=store.cwd)
+    return ConversationStore(
+        path.parent,
+        session_id=path.name,
+        cwd=store.cwd,
+        _storage_lease=store._storage_lease,
+        _owner_surface="recovery",
+        _recovery_owner=True,
+    )
 
 
 def acquire_recovery_subtree(
@@ -148,7 +153,11 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
         from .background import _recover_agent_children
 
         with ConversationStore(
-            root.root_dir, session_id=root.session_id, cwd=root.cwd
+            root.root_dir,
+            session_id=root.session_id,
+            cwd=root.cwd,
+            _storage_lease=root._storage_lease,
+            _execution_lease=root.execution_lease,
         ) as worker_root:
             if notification is root:
                 return _recover_agent_children(
@@ -159,6 +168,8 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
                 notification.root_dir,
                 session_id=notification.session_id,
                 cwd=notification.cwd,
+                _storage_lease=notification._storage_lease,
+                _execution_lease=notification.execution_lease,
             ) as worker_notification:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification),

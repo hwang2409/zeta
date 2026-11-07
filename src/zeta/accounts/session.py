@@ -448,6 +448,7 @@ class SessionAccountContext:
         pins: Mapping[str, AccountId] | None,
     ) -> tuple[Any, bool]:
         assert self.manager is not None
+        self.store.assert_execution_owner()
         with ExitStack() as stack:
             if pins is not None:
                 stack.enter_context(self.store.pin_guard(pins))

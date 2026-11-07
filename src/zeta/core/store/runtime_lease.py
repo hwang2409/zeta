@@ -1,133 +1,265 @@
-"""Epoch-bound session runtime leases for prompt resume coordination."""
+"""Exclusive, epoch-bound ownership for mutable session runtimes."""
 
 from __future__ import annotations
 
 import fcntl
+import json
 import os
+import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
+from typing import Literal
 
 from ...storage_format import WriterLease
 from ..checkpoints import ConversationIntegrityError
-from ..session_files import open_session_file, require_off_loop_lock
+from ..session_files import SessionInUseError, open_session_file, require_off_loop_lock
 
 RUNTIME_LEASE_NAME = "runtime.lease"
+OwnerSurface = Literal["tui", "headless", "serve", "child", "recovery"]
 
 
 class RuntimeLeaseLoopThreadLockError(RuntimeError):
-    """Raised before a runtime lease can block an asyncio event-loop thread."""
+    """Raised before an execution lease can block an asyncio event-loop thread."""
+
+
+class StaleSessionOwnerError(ConversationIntegrityError):
+    """Raised when a released session capability attempts a mutation."""
+
+
+class SessionOwnedError(SessionInUseError):
+    """Raised when another runtime exclusively owns a session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        owner_surface: str | None = None,
+        owner_pid: int | None = None,
+        owner_epoch: str | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.owner_surface = owner_surface
+        self.owner_pid = owner_pid
+        self.owner_epoch = owner_epoch
+        detail = ""
+        if owner_surface is not None and owner_pid is not None:
+            detail = f" ({owner_surface} pid {owner_pid})"
+        elif owner_surface is not None:
+            detail = f" ({owner_surface})"
+        elif owner_pid is not None:
+            detail = f" (pid {owner_pid})"
+        super().__init__(
+            f"session {session_id} is active in another zeta process{detail}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerHint:
+    surface: OwnerSurface
+    pid: int = field(default_factory=os.getpid)
+
+
+@dataclass(slots=True)
+class _OwnedLease:
+    fd: int
+    identity: tuple[int, int]
+    epoch: str
+    refs: int
+    state: Literal["owned", "recovery", "releasing"]
+
+
+_REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096)
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None, None
+    if type(value) is not dict:
+        return None, None, None
+    surface = value.get("surface")
+    pid = value.get("pid")
+    epoch = value.get("execution_epoch")
+    if surface not in {"tui", "headless", "serve", "child", "recovery"}:
+        surface = None
+    if type(pid) is not int or pid <= 0:
+        pid = None
+    if type(epoch) is not str or len(epoch) != 32:
+        epoch = None
+    return surface, pid, epoch
+
+
+def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
+    record = json.dumps(
+        {
+            "execution_epoch": epoch,
+            "pid": owner.pid,
+            "process_start": None,
+            "surface": owner.surface,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, record)
+    os.fsync(fd)
+
+
+class SessionExecutionLease:
+    """One capability for a process's exclusive session execution lock."""
+
+    def __init__(self, owned: _OwnedLease, epoch: str) -> None:
+        self._owned = owned
+        self.epoch = epoch
+        self._closed = False
+
+    @classmethod
+    def acquire(
+        cls,
+        directory_fd: int,
+        *,
+        session_id: str,
+        owner: OwnerHint,
+        recovery: bool = False,
+    ) -> SessionExecutionLease:
+        """Acquire immediately or raise a typed refusal without mutating the session."""
+
+        require_off_loop_lock("session execution", RuntimeLeaseLoopThreadLockError)
+        stat = os.fstat(directory_fd)
+        identity = (stat.st_dev, stat.st_ino)
+        with _REGISTRY_LOCK:
+            local = _REGISTRY.get(identity)
+            if local is not None:
+                raise SessionOwnedError(session_id)
+            fd = open_session_file(
+                directory_fd,
+                RUNTIME_LEASE_NAME,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            )
+            os.set_inheritable(fd, False)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                surface, pid, epoch = _read_owner_hint(fd)
+                os.close(fd)
+                raise SessionOwnedError(
+                    session_id,
+                    owner_surface=surface,
+                    owner_pid=pid,
+                    owner_epoch=epoch,
+                ) from exc
+            except BaseException:
+                os.close(fd)
+                raise
+            epoch = uuid.uuid4().hex
+            try:
+                _publish_owner(fd, owner, epoch)
+            except BaseException:
+                os.close(fd)
+                raise
+            owned = _OwnedLease(
+                fd=fd,
+                identity=identity,
+                epoch=epoch,
+                refs=1,
+                state="recovery" if recovery else "owned",
+            )
+            _REGISTRY[identity] = owned
+            return cls(owned, epoch)
+
+    @classmethod
+    @contextmanager
+    def recover(
+        cls, directory_fd: int, *, session_id: str, owner: OwnerHint
+    ) -> Iterator[SessionExecutionLease | None]:
+        """Try to acquire recovery ownership, returning none for a live owner."""
+
+        try:
+            lease = cls.acquire(
+                directory_fd,
+                session_id=session_id,
+                owner=owner,
+                recovery=True,
+            )
+        except SessionOwnedError:
+            yield None
+            return
+        try:
+            yield lease
+        finally:
+            lease.close()
+
+    def retain(self) -> SessionExecutionLease:
+        """Return another capability retaining this exact kernel lock and epoch."""
+
+        self.assert_owned(self.epoch)
+        with _REGISTRY_LOCK:
+            self._owned.refs += 1
+        return type(self)(self._owned, self.epoch)
+
+    def assert_owned(self, epoch: str | None = None) -> None:
+        """Fence mutations made by closed, releasing, or replaced capabilities."""
+
+        owned = self._owned
+        expected = self.epoch if epoch is None else epoch
+        with _REGISTRY_LOCK:
+            if (
+                self._closed
+                or owned.state not in {"owned", "recovery"}
+                or expected != owned.epoch
+                or _REGISTRY.get(owned.identity) is not owned
+            ):
+                raise StaleSessionOwnerError("session execution capability is stale")
+
+    def close(self) -> None:
+        """Release this capability and close the lock after its last retained owner."""
+
+        with _REGISTRY_LOCK:
+            if self._closed:
+                return
+            self._closed = True
+            owned = self._owned
+            owned.refs -= 1
+            if owned.refs:
+                return
+            owned.state = "releasing"
+            if _REGISTRY.get(owned.identity) is owned:
+                del _REGISTRY[owned.identity]
+            fd, owned.fd = owned.fd, -1
+        os.close(fd)
 
 
 class StoreRuntimeLeaseMixin:
-    """Expose runtime lease operations through a conversation store."""
+    """Expose the store's execution capability to mutation and recovery seams."""
 
-    _runtime_lease: SessionRuntimeLease | None
+    _runtime_lease: SessionExecutionLease | None
 
-    def activate_runtime_lease(self) -> None:
-        """Mark a newly created session as owned by this runtime."""
-
+    @property
+    def execution_lease(self) -> SessionExecutionLease:
         if self._runtime_lease is None:
-            raise ConversationIntegrityError("read-only store has no runtime lease")
-        self._runtime_lease.activate()
+            raise ConversationIntegrityError("read-only store has no execution lease")
+        return self._runtime_lease
+
+    def assert_execution_owner(self) -> None:
+        self.execution_lease.assert_owned()
 
     @contextmanager
     def orphan_recovery_lease(self) -> Iterator[bool]:
-        """Hold exclusive ownership while repairing an orphaned session."""
-
         if self._runtime_lease is None:
-            raise ConversationIntegrityError("read-only store has no runtime lease")
-        with self._runtime_lease.try_recovery() as acquired:
-            yield acquired
-
-    @contextmanager
-    def prompt_resume_lease(self) -> Iterator[bool]:
-        """Coordinate prompt resume and retain this runtime's shared lease."""
-
-        if self._runtime_lease is None:
-            raise ConversationIntegrityError("read-only store has no runtime lease")
-        with self._runtime_lease.resume() as compose:
-            yield compose
-
-
-class SessionRuntimeLease:
-    """Own one runtime's advisory lease for exactly its store lifetime.
-
-    A newly opened runtime starts unlocked so prompt resume can probe for an
-    existing runtime with a non-blocking exclusive lock. After that decision,
-    the lease remains shared until ``close``. The kernel releases all modes if
-    the process exits.
-    """
-
-    def __init__(self, directory_fd: int) -> None:
-        self._fd = open_session_file(
-            directory_fd, RUNTIME_LEASE_NAME, os.O_RDWR | os.O_CREAT
-        )
-        self._shared = False
-
-    def activate(self) -> None:
-        """Hold a shared lease for a runtime that does not need resume work."""
-
-        if self._fd < 0:
-            raise RuntimeError("session runtime lease is closed")
-        if not self._shared:
-            fcntl.flock(self._fd, fcntl.LOCK_SH)
-            self._shared = True
-
-    @contextmanager
-    def try_recovery(self) -> Iterator[bool]:
-        """Try to hold an exclusive lease without waiting for a live runtime."""
-
-        require_off_loop_lock("session runtime lease", RuntimeLeaseLoopThreadLockError)
-        if self._fd < 0:
-            raise RuntimeError("session runtime lease is closed")
-        if self._shared:
-            raise RuntimeError("session runtime lease is already active")
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-
-    @contextmanager
-    def resume(self) -> Iterator[bool]:
-        """Yield whether this is the only live runtime, then remain shared.
-
-        The caller must hold the session metadata lock for this complete
-        context. This serializes the exclusive probe, prompt persistence, and
-        downgrade so a concurrent runtime cannot observe a publication gap.
-        """
-
-        if self._fd < 0:
-            raise RuntimeError("session runtime lease is closed")
-        if self._shared:
-            raise RuntimeError("session runtime lease is already active")
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            compose = True
-        except BlockingIOError:
-            fcntl.flock(self._fd, fcntl.LOCK_SH)
-            compose = False
-        try:
-            yield compose
-        finally:
-            fcntl.flock(self._fd, fcntl.LOCK_SH)
-            self._shared = True
-
-    def close(self) -> None:
-        """Release this exact runtime epoch; repeated closes are harmless."""
-
-        if self._fd >= 0:
-            fd, self._fd = self._fd, -1
-            self._shared = False
-            os.close(fd)
+            raise ConversationIntegrityError("read-only store has no execution lease")
+        self._runtime_lease.assert_owned()
+        yield self._runtime_lease._owned.state == "recovery"
 
 
 def close_store_leases(
-    runtime_lease: SessionRuntimeLease | None,
+    runtime_lease: SessionExecutionLease | None,
     directory_lease: ExitStack,
     storage_lease: WriterLease,
 ) -> None:

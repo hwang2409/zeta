@@ -26,6 +26,12 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
+from .store.runtime_lease import (
+    OwnerHint,
+    OwnerSurface,
+    SessionExecutionLease,
+    SessionOwnedError,
+)
 from .store.prompt_composition import (
     PromptCompositionMixin,
     parse_prompt_recipe,
@@ -90,7 +96,9 @@ def _valid_memory_digest(value: object) -> bool:
     return type(value) is str and _MEMORY_DIGEST.match(value) is not None
 
 
-def _account_metadata(value: Mapping[str, Any], path: Path) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+def _account_metadata(
+    value: Mapping[str, Any], path: Path
+) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
     selected = value.get("selected_accounts", {})
     sequences = value.get("account_switch_sequences", {})
     boundaries = value.get("native_context_boundaries", {})
@@ -106,9 +114,7 @@ def _account_metadata(value: Mapping[str, Any], path: Path) -> tuple[dict[str, s
         or any(
             type(items) is not dict
             or any(
-                provider not in valid_providers
-                or type(number) is not int
-                or number < 0
+                provider not in valid_providers or type(number) is not int or number < 0
                 for provider, number in items.items()
             )
             for items in (sequences, boundaries)
@@ -116,6 +122,7 @@ def _account_metadata(value: Mapping[str, Any], path: Path) -> tuple[dict[str, s
     ):
         raise SessionError(f"session account selection is invalid: {path}")
     return selected, sequences, boundaries
+
 
 def env_home() -> Path:
     """Return zeta's home, honoring the test and local override."""
@@ -179,6 +186,9 @@ class SessionMetadata:
     selected_accounts: dict[str, str] = field(default_factory=dict)
     account_switch_sequences: dict[str, int] = field(default_factory=dict)
     native_context_boundaries: dict[str, int] = field(default_factory=dict)
+    _execution_lease: SessionExecutionLease | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @classmethod
     def new(
@@ -330,7 +340,9 @@ class SessionMetadata:
                 else (() if tool_allow is None else (tool_allow,))
             )
         except (TypeError, ValueError) as exc:
-            raise SessionError(f"session metadata tool policy is invalid: {path}") from exc
+            raise SessionError(
+                f"session metadata tool policy is invalid: {path}"
+            ) from exc
         assert tool_deny is not None
         project_id = value.get("project_id")
         project_role = value.get("project_role")
@@ -340,14 +352,24 @@ class SessionMetadata:
             for item in (project_id, project_role, parent_session_id)
         ) or (project_role is not None and project_role not in _PROJECT_ROLES):
             raise SessionError(f"session project linkage is invalid: {path}")
-        raw_offset = value.get("project_memory_offset") if has_context_snapshot else None
-        raw_length = value.get("project_memory_length") if has_context_snapshot else None
-        raw_digest = value.get("project_memory_digest") if has_context_snapshot else None
+        raw_offset = (
+            value.get("project_memory_offset") if has_context_snapshot else None
+        )
+        raw_length = (
+            value.get("project_memory_length") if has_context_snapshot else None
+        )
+        raw_digest = (
+            value.get("project_memory_digest") if has_context_snapshot else None
+        )
         # The owned-memory span is all-or-none: offset, length, and digest must
         # arrive together.  A partial triple (e.g. an offset/length with no
         # digest) is treated as a legacy/absent span rather than authorizing an
         # unverifiable replacement, so all three fields drop to None.
-        present = (raw_offset is not None, raw_length is not None, raw_digest is not None)
+        present = (
+            raw_offset is not None,
+            raw_length is not None,
+            raw_digest is not None,
+        )
         if not all(present):
             memory_offset = memory_length = memory_digest = None
         else:
@@ -359,7 +381,11 @@ class SessionMetadata:
                 or not _valid_memory_digest(raw_digest)
             ):
                 raise SessionError(f"session project memory span is invalid: {path}")
-            memory_offset, memory_length, memory_digest = raw_offset, raw_length, raw_digest
+            memory_offset, memory_length, memory_digest = (
+                raw_offset,
+                raw_length,
+                raw_digest,
+            )
         prompt_recipe, prompt_components = parse_prompt_recipe(
             value,
             system_prompt=system_prompt,
@@ -475,17 +501,15 @@ class SessionMetadata:
             "project_memory_digest": self.project_memory_digest,
             "prompt_recipe": self.prompt_recipe,
             "prompt_components": self.prompt_components,
-            "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
+            "tool_allow": list(self.tool_allow)
+            if self.tool_allow is not None
+            else None,
             "tool_deny": list(self.tool_deny),
             "selected_accounts": self.selected_accounts,
             "account_switch_sequences": self.account_switch_sequences,
             "native_context_boundaries": self.native_context_boundaries,
             **(
-                {
-                    "tool_allow_layers": [
-                        list(layer) for layer in self.tool_allow_layers
-                    ]
-                }
+                {"tool_allow_layers": [list(layer) for layer in self.tool_allow_layers]}
                 if len(self.tool_allow_layers) > 1
                 else {}
             ),
@@ -511,15 +535,28 @@ class OpenedSession:
 
 class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
-    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None, project_registry_state: ProjectRegistryState | None = None) -> None:
+
+    def __init__(
+        self,
+        home: str | Path | None = None,
+        *,
+        user_home: str | Path | None = None,
+        project_registry_state: ProjectRegistryState | None = None,
+        owner_surface: OwnerSurface = "tui",
+    ) -> None:
         self.home = Path(home) if home is not None else env_home()
+        self._owner_surface = owner_surface
         self._storage_lease = open_writer(self.home)
-        self._release_storage_lease = weakref.finalize(
-            self, self._storage_lease.close
+        self._release_storage_lease = weakref.finalize(self, self._storage_lease.close)
+        self.user_home = (
+            (Path(user_home) if user_home is not None else Path.home())
+            .expanduser()
+            .resolve()
         )
-        self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
-        state = project_registry_state or available_project_registry(self.home / "projects")
+        state = project_registry_state or available_project_registry(
+            self.home / "projects"
+        )
         self.project_registry_state = state
         self.project_registry = state.registry
         self.project_registry_unavailable = state.unavailable
@@ -562,7 +599,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 )
                 project_id = project.project_id if project is not None else None
             except (ProjectRegistryError, OSError, ValueError) as exc:
-                logger.warning("project discovery unavailable; continuing without project: %s", exc)
+                logger.warning(
+                    "project discovery unavailable; continuing without project: %s", exc
+                )
                 project_id = None
         with session_root(self.sessions_dir, create=True):
             pass
@@ -656,11 +695,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 except (SessionError, OSError) as exc:
                     logger.warning("could not persist project linkage intent: %s", exc)
                 self._reconcile_project_link(session_id)
-            opened = self.open(session_id)
-            opened.store.activate_runtime_lease()
-            return opened
+            return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
-    def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
+
+    def associate_project(
+        self, metadata: SessionMetadata, project_id: str
+    ) -> SessionMetadata:
         """Associate an existing session with a project."""
         previous_project_id = metadata.project_id
         registry = self.project_registry
@@ -668,11 +708,18 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             raise ProjectRegistryError("project registry capability is unavailable")
         registry.show_project(project_id)
         bind = lambda item: setattr(item, "project_id", project_id) or item
-        current = self._mutate(metadata.session_id, bind)
+        current = self._mutate(
+            metadata.session_id, bind, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
         try:
             persist_pending_root_link(
-                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id, self._storage_lease,
+                self.sessions_dir,
+                current.session_id,
+                project_id,
+                current.project_role or "session",
+                current.parent_session_id,
+                self._storage_lease,
             )
         except (SessionError, OSError) as exc:
             logger.warning("could not persist project linkage intent: %s", exc)
@@ -696,18 +743,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
-        if (
-            not _read_only
-            and metadata.project_id is not None
-            and self.project_registry is not None
-        ):
-            # Reconcile durable linkage intent before publishing a live store;
-            # this also repairs links after a process restart.
-            self._reconcile_project_link(session_id)
-            # Child/grandchild lineage lives inside the root's agent subtree and
-            # is never visited as a top-level session; publish any durable child
-            # intents idempotently on every open.
-            self._reconcile_child_links(session_id)
         try:
             store = ConversationStore(
                 self.sessions_dir,
@@ -715,12 +750,26 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 _read_only=_read_only,
                 _must_exist=True,
                 _storage_lease=self._storage_lease,
+                _owner_surface=self._owner_surface,
             )
+        except SessionOwnedError:
+            raise
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
             store.close()
             raise SessionError(f"session {session_id} cwd does not match its metadata")
+        if _read_only:
+            return OpenedSession(metadata, store)
+        metadata._execution_lease = store.execution_lease
+        try:
+            if metadata.project_id is not None and self.project_registry is not None:
+                # Ownership precedes repairs that publish project or child links.
+                self._reconcile_project_link(session_id)
+                self._reconcile_child_links(session_id)
+        except BaseException:
+            store.close()
+            raise
         return OpenedSession(metadata, store)
 
     def _reconcile_project_link(self, session_id: str) -> None:
@@ -845,13 +894,24 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return matches[0]
 
     def touch(self, metadata: SessionMetadata) -> None:
-        current = self._mutate(metadata.session_id, lambda item: self._touch(item))
+        current = self._mutate(
+            metadata.session_id,
+            lambda item: self._touch(item),
+            execution_lease=metadata._execution_lease,
+        )
         self._copy_metadata(metadata, current)
 
-    def refresh_recency(self, session_id: str) -> bool:
+    def refresh_recency(
+        self,
+        session_id: str,
+        execution_lease: SessionExecutionLease | None = None,
+    ) -> bool:
         """Best-effort refresh recency without waiting for metadata writers."""
 
-        with self._metadata_lock(session_id, blocking=False) as directory_fd:
+        with (
+            self._execution_owner(session_id, execution_lease),
+            self._metadata_lock(session_id, blocking=False) as directory_fd,
+        ):
             if directory_fd is None:
                 return False
             current = self._touch(self._read(session_id, directory_fd=directory_fd))
@@ -874,11 +934,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             item.tool_allow_layers = tool_allow_layers
             return item
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
         return current
-
-
 
     def record_override(
         self,
@@ -919,7 +979,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 item.model = model
             return self._touch(item)
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
 
     def record_vim_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
@@ -936,7 +998,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             item.vim_mode = enabled
             return self._touch(item)
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
 
     def record_plan_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
@@ -953,7 +1017,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             item.plan_mode = enabled
             return self._touch(item)
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
 
     def record_name(self, metadata: SessionMetadata, *, name: str) -> None:
@@ -969,13 +1035,21 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             item.name = name
             return self._touch(item)
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
 
-    def rename(self, session_id: str, name: str) -> SessionMetadata:
+    def rename(
+        self,
+        session_id: str,
+        name: str,
+        execution_lease: SessionExecutionLease | None = None,
+    ) -> SessionMetadata:
         """Set a display name; whitespace clears it to the derived preview."""
         full_id = self.resolve_id(session_id)
         metadata = self.read_metadata(full_id)
+        metadata._execution_lease = execution_lease
         self.record_name(
             metadata, name=normalize_session_name(name) if name.strip() else ""
         )
@@ -1079,14 +1153,39 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         metadata.updated_at = _now()
         return metadata
 
+    @contextmanager
+    def _execution_owner(
+        self,
+        session_id: str,
+        execution_lease: SessionExecutionLease | None,
+    ):
+        if execution_lease is not None:
+            execution_lease.assert_owned()
+            yield execution_lease
+            return
+        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+            lease = SessionExecutionLease.acquire(
+                directory_fd,
+                session_id=session_id,
+                owner=OwnerHint(self._owner_surface),
+            )
+            try:
+                yield lease
+            finally:
+                lease.close()
+
     def _mutate(
         self,
         session_id: str,
         update: Callable[[SessionMetadata], SessionMetadata],
         *,
         lock_timeout: float | None = None,
+        execution_lease: SessionExecutionLease | None = None,
     ) -> SessionMetadata:
-        with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
+        with (
+            self._execution_owner(session_id, execution_lease),
+            self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd,
+        ):
             current = self._read(session_id, directory_fd=directory_fd)
             updated = update(current)
             self._write_unlocked(updated, directory_fd=directory_fd)
@@ -1097,6 +1196,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         """Adopt every persisted field into the caller's live metadata object."""
 
         for metadata_field in fields(SessionMetadata):
+            if metadata_field.name == "_execution_lease":
+                continue
             setattr(
                 target,
                 metadata_field.name,
@@ -1129,7 +1230,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return metadata
 
     def _write(self, metadata: SessionMetadata) -> None:
-        with self._metadata_lock(metadata.session_id) as directory_fd:
+        with (
+            self._execution_owner(metadata.session_id, metadata._execution_lease),
+            self._metadata_lock(metadata.session_id) as directory_fd,
+        ):
             self._write_unlocked(metadata, directory_fd=directory_fd)
 
     def _write_unlocked(self, metadata: SessionMetadata, *, directory_fd: int) -> None:
@@ -1212,6 +1316,7 @@ async def persist_metadata_change(
     """Run durable metadata work off-loop, then apply its result on-loop."""
 
     candidate = copy.deepcopy(metadata)
+    candidate._execution_lease = metadata._execution_lease
     persistence = asyncio.create_task(asyncio.to_thread(change, candidate))
     try:
         await asyncio.shield(persistence)
@@ -1231,6 +1336,7 @@ __all__ = [
     "SessionLoopThreadLockError",
     "SessionManager",
     "SessionMetadata",
+    "SessionOwnedError",
     "SessionPreview",
     "env_home",
     "find_most_recent",
