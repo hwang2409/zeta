@@ -8021,6 +8021,40 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_resume_corrupt_transcript_returns_bounded_structured_error(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    path = server.runtime.opened.store.path
+    await _request(reader, writer, 3, "new_session", {"provider": "codex"})
+    with path.open("ab") as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+    damaged = path.read_bytes()
+    try:
+        response = (
+            await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        )[-1]
+        assert response["error"] == {
+            "code": -32000,
+            "message": f"transcript terminated invalid conversation row at row 2 (session {session_id})",
+            "data": {
+                "code": "corrupt_transcript",
+                "kind": "invalid_row",
+                "row": 2,
+                "repairable": True,
+                "session_id": session_id,
+                "actions": [],
+            },
+        }
+        assert "must-not-leak" not in json.dumps(response)
+        assert str(path) not in json.dumps(response)
+        assert path.read_bytes() == damaged
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
