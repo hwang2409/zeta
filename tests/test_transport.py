@@ -25,6 +25,7 @@ from zeta.providers.transport import (
     build_response_error,
     close_transport_resources,
     retry_provider_completion,
+    stall_watchdog,
 )
 
 
@@ -127,6 +128,78 @@ async def test_transport_close_survives_overlapping_cancellation() -> None:
         reference() is None or reference().done()  # type: ignore[union-attr]
         for reference in close_refs
     )
+
+
+@pytest.mark.asyncio
+async def test_detached_close_failure_reaches_loop_diagnostics() -> None:
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    owner_ready = asyncio.Event()
+
+    async def failed_close() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("detached close canary") from None
+
+    async def cancel_then_close() -> None:
+        owner_ready.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await close_transport_resources(failed_close())
+
+    try:
+        owner = asyncio.create_task(cancel_then_close())
+        await owner_ready.wait()
+        owner.cancel()
+        await owner
+        callbacks_flushed = loop.create_future()
+        loop.call_soon(callbacks_flushed.set_result, None)
+        await callbacks_flushed
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert len(contexts) == 1
+    assert contexts[0]["message"] == "provider cleanup failed"
+    assert isinstance(contexts[0]["exception"], RuntimeError)
+
+
+class _FailingCloseIterator:
+    def __aiter__(self) -> "_FailingCloseIterator":
+        return self
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        raise RuntimeError("iterator close canary")
+
+
+@pytest.mark.asyncio
+async def test_stream_iterator_close_failure_keeps_success_and_reaches_diagnostics() -> None:
+    loop = asyncio.get_running_loop()
+    contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        values = [
+            value
+            async for value in stall_watchdog(
+                _FailingCloseIterator(),
+                seconds=0,
+                on_stall=lambda _elapsed: RuntimeError("unexpected stall"),
+            )
+        ]
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert values == []
+    assert len(contexts) == 1
+    assert contexts[0]["resource"] == "stream_iterator"
+    assert isinstance(contexts[0]["exception"], RuntimeError)
 
 
 @pytest.mark.parametrize("status_code", [520, 521, 522, 523, 524, 529])

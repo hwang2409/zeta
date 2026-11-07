@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -127,6 +128,37 @@ class StreamDiagnostics:
                 "attempt": attempt,
                 "retryable": getattr(error, "retryable", False),
                 "will_retry": will_retry,
+            },
+        )
+
+    @staticmethod
+    def record_cleanup_failure(
+        path: Path,
+        error: BaseException,
+        *,
+        provider: str,
+        resource: str,
+        primary_exception: BaseException | None,
+    ) -> None:
+        """Record a close failure without replacing the provider outcome."""
+
+        write_stream_diagnostic(
+            path,
+            {
+                "timestamp": time.time(),
+                "provider": provider,
+                "type": "provider_cleanup_failed",
+                "resource": resource,
+                "exception": f"{type(error).__module__}.{type(error).__qualname__}",
+                "primary_outcome": (
+                    "cancelled"
+                    if isinstance(primary_exception, asyncio.CancelledError)
+                    else "error"
+                    if primary_exception is not None
+                    else "success"
+                ),
+                "cancelled": isinstance(primary_exception, asyncio.CancelledError),
+                **fd_diagnostics(),
             },
         )
 
