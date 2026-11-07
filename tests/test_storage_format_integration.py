@@ -276,6 +276,10 @@ def test_real_console_start_has_one_storage_format_owner(
             assert not started
             assert return_code == 2
             assert stderr.splitlines() == [f"zeta: {expected_error}"]
+            if shape == "realistic-old":
+                startup_lock = home / ".storage-format.lock"
+                assert startup_lock.is_file()
+                startup_lock.unlink()
             assert _tree_digest(home) == before
             if shape == "legacy-oauth":
                 assert (home / "codex-oauth.json").is_file()
