@@ -161,11 +161,11 @@ def _production_spawn_owner(
     from zeta.tools._shared.tool_spawn import create_tool_subprocess_shell
 
     script = (
-        "import os; "
+        "import os, signal; "
         f"p={ready_fifo!r}; r={release_fifo!r}; d={done_fifo!r}; "
-        "open(p, 'w').write(str(os.getpid())); "
-        "open(r, 'rb').read(1); "
-        "open(d, 'w').write('done')"
+        "signal.alarm(30); open(p, 'w').write(str(os.getpid())); "
+        "signal.alarm(30); open(r, 'rb').read(1); "
+        "signal.alarm(30); open(d, 'w').write('done')"
     )
     command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
