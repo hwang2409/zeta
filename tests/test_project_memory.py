@@ -7,6 +7,7 @@ import random
 import stat
 import threading
 import time
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from zeta.core.session import SessionManager
 from zeta.project_registry import (
     MAX_MEMORY_FILE_SIZE,
     MAX_SESSION_REFERENCE_SIZE,
+    MAX_SESSION_REFERENCES,
     ProjectRegistry,
     ProjectRegistryError,
 )
@@ -111,6 +113,12 @@ def _linked_session_fixture(tmp_path: Path):
     return home, project, session_id, links_path
 
 
+def _seed_pending_link(home: Path, session_id: str) -> Path:
+    pending = home / "sessions" / session_id / "project_link_pending.json"
+    pending.write_text("{}", encoding="utf-8")
+    return pending
+
+
 def test_linked_session_reopen_decodes_only_matching_registry_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +154,82 @@ def test_linked_session_reopen_decodes_only_matching_registry_row(
     reopened.store.close()
 
     assert decoded <= 1
+
+
+def test_linked_session_reopen_preserves_pending_link_above_record_limit(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = links_path.read_bytes()
+    decoy = target.replace(session_id.encode(), b"0" * len(session_id))
+    original = target + decoy * MAX_SESSION_REFERENCES
+    links_path.write_bytes(original)
+    pending = _seed_pending_link(home, session_id)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert pending.exists()
+    assert links_path.read_bytes() == original
+
+
+def test_linked_session_reopen_preserves_pending_link_for_oversize_unrelated_row(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = links_path.read_bytes()
+    original = target + b"x" * (MAX_SESSION_REFERENCE_SIZE + 1) + b"\n"
+    links_path.write_bytes(original)
+    pending = _seed_pending_link(home, session_id)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert pending.exists()
+    assert links_path.read_bytes() == original
+
+
+def test_duplicate_session_scan_keeps_memory_below_registry_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, project, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = json.loads(links_path.read_text(encoding="utf-8"))
+    records = [target]
+    records.extend(
+        {
+            **target,
+            "session_id": f"decoy-{index}",
+            "transcript_path": f"/decoy/{index}/" + "x" * 256,
+        }
+        for index in range(9_000)
+    )
+    original = "".join(
+        f"{json.dumps(record, sort_keys=True)}\n" for record in records
+    ).encode()
+    links_path.write_bytes(original)
+    max_read = 0
+    real_read = os.read
+
+    def bounded_read(fd: int, size: int) -> bytes:
+        nonlocal max_read
+        max_read = max(max_read, size)
+        return real_read(fd, size)
+
+    # test-contract: seam observe read sizes through production record_session
+    monkeypatch.setattr(registry_module.os, "read", bounded_read)
+    tracemalloc.start()
+    try:
+        ProjectRegistry(home / "projects").record_session(
+            project.project_id,
+            session_id=session_id,
+            transcript_path=str(home / "sessions" / session_id),
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert max_read <= 64 * 1024
+    assert peak < len(original) // 2
 
 
 def test_linked_session_reopen_ignores_unrelated_malformed_registry_row(
