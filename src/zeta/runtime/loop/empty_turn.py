@@ -10,11 +10,14 @@ output-token limit mid-thinking we surface that instead of nudging.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import (
     ErrorInfo,
     Message,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolUseContent,
     harness_notice,
@@ -36,6 +39,60 @@ OUTPUT_LIMIT_ERROR_MESSAGE = (
     "the model reached its output-token limit while thinking "
     "and did not produce a reply"
 )
+MAX_EMPTY_TURN_NUDGES = 3
+MAX_EMPTY_TURN_DETAIL_CHARS = 128
+
+
+@dataclass(slots=True)
+class EmptyTurnRecoveryState:
+    nudge_count: int = 0
+    nudge_episode: int = -1
+    tool_result_episode: int = 0
+    last_tool_call: Any = None
+    last_tool_result: Any = None
+
+    def record_tool_result(self, tool_call: Any, tool_result: Any) -> None:
+        self.last_tool_call = tool_call
+        self.last_tool_result = tool_result
+        self.tool_result_episode += 1
+
+    def record_event(self, event: Any) -> None:
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            self.record_tool_result(event.tool_call, event.tool_result)
+
+
+async def complete_empty_turn(
+    transition: Any,
+    assistant_message: Message,
+    turn_number: int,
+    *,
+    foreground: bool,
+    admit_terminal: Any,
+    schedule_index: Any,
+) -> tuple[tuple[Any, ...], bool]:
+    if transition.error is not None:
+        if foreground:
+            await admit_terminal("foreground_end")
+        return (
+            (
+                StreamEvent(StreamEventType.ERROR, error=transition.error),
+                StreamEvent(StreamEventType.AGENT_END),
+            ),
+            True,
+        )
+    turn_end = StreamEvent(
+        StreamEventType.TURN_END,
+        message=assistant_message,
+        data={"turn": turn_number, "tool_calls": 0},
+    )
+    if transition.continue_turn:
+        return (turn_end,), False
+    schedule_index()
+    return (turn_end, StreamEvent(StreamEventType.AGENT_END)), True
+
+
+def _bounded_detail(value: str) -> str:
+    return value[:MAX_EMPTY_TURN_DETAIL_CHARS]
 
 
 def has_visible_output(message: Message) -> bool:
@@ -124,6 +181,8 @@ def should_nudge_empty_turn(
     stop_reason: str | None,
     notification_turn: bool,
     already_nudged: bool,
+    nudge_count: int = 0,
+    max_nudges: int = MAX_EMPTY_TURN_NUDGES,
 ) -> bool:
     """Whether a turn with no tool calls should be nudged once to recover.
 
@@ -135,6 +194,50 @@ def should_nudge_empty_turn(
     return (
         not notification_turn
         and not already_nudged
+        and nudge_count < max_nudges
         and stop_reason != "max_tokens"
         and not has_visible_output(message)
+    )
+
+
+def empty_turn_error(
+    tool_name: str | None,
+    tool_call_id: str | None,
+    tool_state: str | None,
+) -> ErrorInfo:
+    if tool_name is None or tool_call_id is None or tool_state is None:
+        return ErrorInfo("empty_turn", "child returned an empty final assistant message")
+    return ErrorInfo(
+        "empty_turn",
+        "child returned an empty final assistant message after tool "
+        f"`{_bounded_detail(tool_name)}` ({_bounded_detail(tool_call_id)}) "
+        f"{tool_state}",
+    )
+
+
+def empty_turn_tool_error(tool_call: Any, result: Any) -> ErrorInfo:
+    state = "cancelled" if result.is_canceled else "error" if result.is_error else "ok"
+    return empty_turn_error(tool_call.name, tool_call.id, state)
+
+
+def empty_turn_recovery_error(
+    message: Message,
+    *,
+    notification_turn: bool,
+    consuming_notifications: bool,
+    should_nudge: bool,
+    recovery_state: EmptyTurnRecoveryState,
+) -> ErrorInfo | None:
+    if (
+        notification_turn
+        or consuming_notifications
+        or should_nudge
+        or has_visible_output(message)
+        or recovery_state.tool_result_episode == 0
+        or recovery_state.last_tool_call is None
+        or recovery_state.last_tool_result is None
+    ):
+        return None
+    return empty_turn_tool_error(
+        recovery_state.last_tool_call, recovery_state.last_tool_result
     )
