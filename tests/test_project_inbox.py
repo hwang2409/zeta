@@ -938,6 +938,8 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         notes = _sent_status_notes(backend)
         assert len(notes) == 1
         assert backend.calls[0][0][-1] is notes[0]
+        assert notes[0].role is MessageRole.SYSTEM
+        assert notes[0].content[0].text.startswith("[zeta] inbox status:")
         assert (
             'inbox: your message "Can you review this?" to beta was claimed '
             f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"
