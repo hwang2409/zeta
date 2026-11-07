@@ -1034,21 +1034,24 @@ async def test_inline_shell_approval_covers_the_complete_batch(
         monkeypatch, app, output, "printf second"
     )
     task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    await asyncio.wait_for(approval_presented.wait(), timeout=10)
-    assert len(app.pending_approvals) == 1
-    assert "printf first" in output.getvalue()
-    assert "printf second" in output.getvalue()
-    assert policy.approve(app.pending_approvals[0].key)
-    await task
-    await app._active_task
+    try:
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+        assert len(app.pending_approvals) == 1
+        assert "printf first" in output.getvalue()
+        assert "printf second" in output.getvalue()
+        assert policy.approve(app.pending_approvals[0].key)
+        await task
+        await app._active_task
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "values first and second"
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "values first and second"
+    finally:
+        await app.close()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
