@@ -1,0 +1,22 @@
+name: CI macOS label
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+# Label events cannot cancel the normal CI run or an active macOS label run.
+concurrency:
+  group: ci-macos-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pytest:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
+    name: pytest
+    uses: ./.github/workflows/pytest.yml
+    with:
+      os: '["macos-latest"]'

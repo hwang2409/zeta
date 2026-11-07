@@ -6,64 +6,29 @@ name: CI
 # a pull-request check alone would not have caught either one.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
 
 concurrency:
   # Every main commit needs a result; superseded pull-request runs do not.
-  # Unrelated label events skip all jobs and must not cancel the real PR run.
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || (contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && github.event.label.name != 'macos') && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' && !(contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && github.event.label.name != 'macos') }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   pull-requests: read
 
 jobs:
-  test:
-    if: ${{ !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) || github.event.label.name == 'macos' }}
-    name: pytest (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      # One platform failing must still report the other; a darwin-only
-      # regression is exactly what the second runner is for (ZETA-90).
-      fail-fast: false
+  pytest:
+    name: pytest
+    uses: ./.github/workflows/pytest.yml
+    with:
       # ZETA-84 was a Linux-only bug that darwin-only testing could not see.
       # Pull requests opt into macOS with the macos label; main always runs both.
-      matrix:
-        os: ${{ fromJSON((github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: "0.13.7"
-          enable-cache: false
-
-      # uv defaults to ~/Library/Caches/uv on macOS; pin one location on both
-      # platforms so the cache step below keys the same way.
-      - name: Set uv cache location
-        run: echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
-
-      - name: Cache uv downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-          restore-keys: uv-${{ runner.os }}-
-
-      # --frozen pins the resolution to uv.lock so a transitive bump cannot
-      # turn main red without a lockfile change in the diff.
-      # Bound worker count on both runners and rebalance uneven test durations.
-      # Report slow tests so future bottlenecks are visible in the CI logs.
-      - name: Run the suite
-        run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=25
+      os: ${{ (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]' }}
 
   lint:
-    if: ${{ !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) || github.event.label.name == 'macos' }}
     name: ruff
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -86,7 +51,6 @@ jobs:
         run: uv run --frozen ruff check --output-format github
 
   browser:
-    if: ${{ !contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) || github.event.label.name == 'macos' }}
     name: browser
     runs-on: ubuntu-latest
     timeout-minutes: 15
