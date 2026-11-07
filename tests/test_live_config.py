@@ -688,7 +688,7 @@ async def test_added_profile_is_detected_with_unchanged_parent_stat(
 async def test_config_changed_projection_is_byte_exact(tmp_path: Path) -> None:
     async with contextlib.AsyncExitStack() as stack:
         from zeta.server import event_contract
-        from zeta.server.protocol import FrameCodec
+        from zeta.server.protocol import EventDescriptor, FrameCodec
 
         loop, home, _project = _loop(tmp_path, stack)
         events: list[StreamEvent] = []
@@ -704,7 +704,7 @@ async def test_config_changed_projection_is_byte_exact(tmp_path: Path) -> None:
             lambda event: {"data": dict(event.data)},
         )
         encoded = FrameCodec().notification(
-            "config_changed", "session-1", **projector(events[0])
+            EventDescriptor.CONFIG_CHANGED, "session-1", **projector(events[0])
         )
         expected = (
             '{"jsonrpc":"2.0","method":"event","params":'
