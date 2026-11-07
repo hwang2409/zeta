@@ -351,11 +351,17 @@ async def test_address_commit_owner_refusal_writes_nothing(
         if process.is_alive():
             process.terminate()
             await asyncio.to_thread(process.join, 10)
-        process.close()
         child_control.close()
         parent_control.close()
+        process.close()
         del process, child_control, parent_control
         gc.collect()
+
+    recovered = await commit_conversation_async(
+        ConversationAddress("project", "root", "root"),
+        AppendConversationRows((_warning("recovered"),)),
+    )
+    assert recovered.committed_entries[0].data["message"] == "recovered"
 
 
 @pytest.mark.asyncio
