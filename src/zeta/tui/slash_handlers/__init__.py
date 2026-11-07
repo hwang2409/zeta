@@ -7,6 +7,7 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
@@ -778,7 +779,7 @@ class SlashHandlerMixin:
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_memory_command,
             registry,
             project_id,
@@ -786,6 +787,7 @@ class SlashHandlerMixin:
             getattr(self.loop, "memory_reconciler", None),
             MemoryMutationAuthorization.direct_slash(),
         )
+        return await result if inspect.isawaitable(result) else result
 
     async def slash_repair_transcript(self, args: str) -> str:
         """Repair one corrupt root transcript after explicit confirmation."""

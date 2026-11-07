@@ -3,6 +3,7 @@ from zeta.skills import SkillCatalog
 import asyncio
 import json
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from io import StringIO
 from pathlib import Path
 
@@ -715,6 +716,118 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
     assert queued == f"memory retry queued: {receipt.key}"
     await runner.drain()
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_paths() -> None:
+    class Registry:
+        def memory_format(self, project_id: str) -> int:
+            assert project_id == "project"
+            return 1
+
+        def undo_memory(
+            self, project_id: str, *, expected_current: str | None = None
+        ) -> list[tuple[str, str]]:
+            assert project_id == "project"
+            if expected_current != "v1":
+                return [("state.md", "erased later content")]
+            raise ProjectRegistryError(
+                "memory changed since this suggestion; review /memory log"
+            )
+
+        def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+            return []
+
+        def ensure_memory_supported(self, project_id: str) -> None:
+            pass
+
+        def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+            return []
+
+    class Reconciler:
+        def __init__(self) -> None:
+            self.resumed: list[tuple[str, str]] = []
+
+        async def resume_recovery(self, root: str, quarantine: str) -> str:
+            self.resumed.append((root, quarantine))
+            return "memory recovery resumed"
+
+    from zeta.project_errors import ProjectRegistryError
+    from zeta.server.slash_commands import ServerSlashSession
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    reconciler = Reconciler()
+    registry = Registry()
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=registry,
+            session_metadata=SimpleNamespace(project_id="project"),
+            memory_reconciler=reconciler,
+        )
+    )
+    runtime = SimpleNamespace(
+        metadata=SimpleNamespace(project_id="project"),
+        manager=SimpleNamespace(project_registry=registry),
+        loop=SimpleNamespace(memory_reconciler=reconciler),
+    )
+
+    tui_resume = await SlashHandlerMixin.slash_memory(
+        tui, "recovery root quarantine resume"
+    )
+    serve_resume = await ServerSlashSession(runtime).slash_memory(
+        "recovery root quarantine resume"
+    )
+    assert tui_resume == serve_resume == "memory recovery resumed"
+    assert reconciler.resumed == [("root", "quarantine"), ("root", "quarantine")]
+
+    tui_undo = await SlashHandlerMixin.slash_memory(tui, "undo v1")
+    serve_undo = await ServerSlashSession(runtime).slash_memory("undo v1")
+    assert tui_undo == serve_undo == (
+        "memory: memory changed since this suggestion; review /memory log"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_recovery_pause_resume_uses_shared_command_path() -> None:
+    class Registry:
+        def memory_format(self, project_id: str) -> int:
+            return 1
+
+        def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+            return []
+
+        def ensure_memory_supported(self, project_id: str) -> None:
+            pass
+
+        def undo_memory(self, project_id: str) -> list[tuple[str, str]]:
+            return []
+
+        def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+            return []
+
+    class Reconciler:
+        paused = True
+
+        async def resume_recovery(self, root: str, quarantine: str) -> str:
+            assert self.paused
+            self.paused = False
+            return "memory recovery resumed"
+
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    reconciler = Reconciler()
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=Registry(),
+            session_metadata=SimpleNamespace(project_id="project"),
+            memory_reconciler=reconciler,
+        )
+    )
+    result = await SlashHandlerMixin.slash_memory(
+        tui, "recovery root quarantine resume"
+    )
+    assert result == "memory recovery resumed"
+    assert reconciler.paused is False
 
 
 def test_status_shows_last_automatic_memory_failure() -> None:
