@@ -51,6 +51,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "inbox",
         "init",
         "memory",
+        "mcp",
         "model",
         "project-instructions",
         "status",
@@ -258,6 +259,11 @@ class ServerSlashSession:
             MemoryMutationAuthorization.direct_slash(),
         )
 
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
+        if self._runtime.loop is None:
+            raise RuntimeError(_UNAVAILABLE_NOTICE)
+        return await self._runtime.loop.slash_mcp(args)
+
     def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
@@ -377,6 +383,8 @@ async def run_command(
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:
         return {"kind": "client_only", "name": name}
+    if name == "mcp":
+        return await _run_mcp_command(runtime, tail)
     # Prompt macros expand to user input rather than dispatch through a handler.
     # Inline shell spans need the client's approval loop; report those as
     # client-only rather than resolving with unapproved output here.
@@ -399,6 +407,26 @@ async def run_command(
     if isinstance(result, str):
         return {"kind": "output", "text": result}
     raise ProtocolError(-32000, "unexpected slash result type")
+
+
+async def _run_mcp_command(
+    runtime: ServerRuntime, tail: str
+) -> dict[str, object]:
+    stripped = tail.strip()
+    verb = stripped.partition(" ")[0]
+    if verb not in {"status", "auth", "logout"}:
+        return {"kind": "client_only", "name": "mcp"}
+    if runtime.loop is None:
+        raise ProtocolError(-32003, "no active session")
+    result = await runtime.loop.slash_mcp(stripped)
+    response: dict[str, object] = {
+        "kind": "text" if stripped == "status" else "output",
+        "text": result,
+    }
+    credential_error = getattr(result, "credential_store_error", None)
+    if credential_error is not None:
+        response["credential_store_error"] = credential_error
+    return response
 
 
 def _model_input_result(
