@@ -698,7 +698,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
 
     assert rendered is not None
     plain = _renderable_plain(rendered)
-    assert "withdraw ← child question withdrawn :208" in plain
+    assert "withdraw ← child :208" in plain
     assert "b2517c6f0fbb448e86dbb8b34fe0fbc0" in plain
     assert "question withdrawn: child finished" not in plain
 

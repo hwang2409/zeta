@@ -238,6 +238,9 @@ class BackgroundAgentOwner:
     def original_parent_instance_id(self, instance_id: str) -> str | None:
         return self._original_parent_ids.get(instance_id)
 
+    def description(self, instance_id: str) -> str:
+        return self._descriptions.get(instance_id, "background task")
+
     def conversation_stores(self) -> tuple[ConversationStore, ...]:
         stores = [self.notification_store, *self._stores, *self._parent_stores.values()]
         return tuple(dict.fromkeys(stores))
