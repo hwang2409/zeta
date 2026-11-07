@@ -7123,14 +7123,16 @@ def test_main_pty_normal_command_then_queued_enter_submits(
         read_until(b"the scripted test backend", start)
         assert b"you said: ab" in output[start:]
     finally:
-        if process.poll() is None:
-            os.write(master_fd, b"\x04")
-            read_pty_until(
-                master_fd, b"\x1b[?1049l", process=process, output=output
-            )
-            reap_process(process, timeout=10)
-        assert process.returncode == 0
-        os.close(master_fd)
+        try:
+            if process.poll() is None:
+                os.write(master_fd, b"\x04")
+                read_pty_until(
+                    master_fd, b"\x1b[?1049l", process=process, output=output
+                )
+                reap_process(process, timeout=10)
+            assert process.returncode == 0
+        finally:
+            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:
