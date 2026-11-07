@@ -25,6 +25,10 @@ from tests.test_server import (
     _socket_path,
 )
 from tests.test_server_observers import _controller_event_stream
+from zeta.agent.finish_gate import FinishGateState
+from zeta.agent.run_consumer import consume_run
+from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -34,11 +38,13 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import FrameCodec
 from zeta.server.server import _Client
+from zeta.skills import SkillCatalog
 
 
 class _GatedBackend(CompletionBackend):
@@ -568,6 +574,121 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
         assert server.runtime._background_wake_sink is not None
     finally:
         await server.close()
+
+
+@pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
+@pytest.mark.asyncio
+async def test_display_only_idle_reaches_serve_without_parent_turn(
+    tmp_path: Path,
+    child_instance_id: str,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.runtime.loop
+        assert root_loop is not None
+        server_sink = root_loop._background_event_sink
+        assert server_sink is not None
+        idle_events: list[StreamEvent] = []
+
+        def forward(event: StreamEvent) -> None:
+            idle_events.append(event)
+            server_sink(event)
+
+        root_loop.set_background_event_sink(forward)
+        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")
+        child_loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+            background_owner=root_loop._background_owner,
+            agent_instance_id=child_instance_id,
+            agent_depth=child_instance_id.count(":"),
+        )
+        child_loop.explicit_finish = True
+        child_loop.set_background_event_sink(root_loop._publish_background_event)
+        child_store.start_agent_lifecycle(
+            handle=child_instance_id,
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=child_instance_id.count(":"),
+            agent_type="worker",
+            description="idle worker",
+        )
+        child_loop._terminal_transition_fence = TerminalTransitionFence(
+            child_store,
+            owned_work=lambda: (),
+            delivering_prompt_id=lambda: None,
+        )
+        root_loop._background_owner.conversation_channel.register_loop(
+            child_instance_id
+        )
+        await child_loop._ensure_step_delivery()
+        idle_waiting = asyncio.Event()
+
+        async def child_result(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "content": [{"type": "text", "text": ""}],
+                "isError": False,
+                "structuredContent": {"status": "running"},
+            }
+
+        async def wait_idle(*args: object) -> bool:
+            idle_waiting.set()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+            return True
+
+        class OwnedFinishGate(FinishGateState):
+            def can_wake_again(self, loop: object) -> bool:
+                return True
+
+        run = asyncio.create_task(
+            consume_run(
+                child_result,
+                child_loop,
+                "work",
+                child_store=child_store,
+                child_turns=lambda: 1,
+                child_path=str(child_store.session_dir),
+                explicit_finish_metadata={
+                    "child_instance_id": child_instance_id,
+                    "description": "idle worker",
+                },
+                finish_gate_state=OwnedFinishGate(),
+                idle_wait=wait_idle,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            if run.done():
+                run.result()
+            await asyncio.wait_for(idle_waiting.wait(), 10)
+            assert len(idle_events) == 1
+            frame = json.loads(await _read_raw(reader))
+            assert frame["params"]["event"] == "child_idle"
+            assert frame["params"]["data"]["child_instance_id"] == child_instance_id
+            assert frame["params"]["data"]["text"] == "child is idle"
+            assert backend.calls == []
+        finally:
+            run.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(run, return_exceptions=True), 10
+            )
+            await asyncio.wait_for(child_loop.close(), 10)
+            child_store.close()
+    finally:
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio
