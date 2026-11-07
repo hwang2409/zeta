@@ -4,6 +4,8 @@ from typing import Any
 
 import pytest
 
+from tests.support.stores import open_test_store
+
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
@@ -28,8 +30,8 @@ async def test_delegated_shell_executes_in_open_approved_directory_after_path_sw
     alias = tmp_path / "cwd-alias"
     alias.symlink_to(approved_cwd, target_is_directory=True)
 
-    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=approved_cwd)
-    child_store = ConversationStore(tmp_path / "child-sessions", cwd=approved_cwd)
+    parent_store = await open_test_store(tmp_path / "parent-sessions", cwd=approved_cwd)
+    child_store = await open_test_store(tmp_path / "child-sessions", cwd=approved_cwd)
     child_store.set_bash_cwd(str(alias))
     parent_policy = ApprovalPolicy(
         store=parent_store,
@@ -74,7 +76,9 @@ async def test_delegated_shell_executes_in_open_approved_directory_after_path_sw
         arguments["cwd"] = str(alias)
 
     try:
-        result = await registry.execute(ToolCall(f"fd-{tool_name}", tool_name, arguments))
+        result = await registry.execute(
+            ToolCall(f"fd-{tool_name}", tool_name, arguments)
+        )
         assert result["isError"] is False
         if tool_name == "run_background":
             task_id = result["structuredContent"]["task_id"]

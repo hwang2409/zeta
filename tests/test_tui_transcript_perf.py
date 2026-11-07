@@ -25,6 +25,8 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
+from tests.support.stores import open_test_store
+
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -98,9 +100,7 @@ def test_discard_retry_removes_full_screen_attempt_and_invalidates_caches() -> N
     assert "failed answer" in _content_text(transcript, 80, 20)
     assert transcript.search_status()[1] == 2
 
-    app._prepare_stream_event(
-        StreamEvent(StreamEventType.ASSISTANT_RESET)
-    )
+    app._prepare_stream_event(StreamEvent(StreamEventType.ASSISTANT_RESET))
 
     assert "failed" not in _content_text(transcript, 80, 20)
     assert transcript.search_status() == (0, 0)
@@ -199,7 +199,7 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
     )
     transcript = TranscriptWidget()
     for index in range(8):
-        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child = await open_test_store(tmp_path / "agents", session_id=str(index))
         child.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("child output" * 1_000)])
         )
@@ -233,7 +233,7 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
 async def test_production_agent_refresh_keeps_event_loop_responsive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    template = ConversationStore(tmp_path / "template", session_id="0")
+    template = await open_test_store(tmp_path / "template", session_id="0")
     template.append_many(
         (
             "message",
@@ -290,21 +290,15 @@ async def test_production_agent_refresh_keeps_event_loop_responsive(
 
 def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "agents", session_id="child")
-    first = store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("first")])
-    )
-    store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("abandoned")])
-    )
+    first = store.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("abandoned")]))
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("new branch")]),
         parent_id=first.id,
     )
     store.close()
 
-    source = agent_sync_module.AgentTranscriptSource(
-        store.session_dir, message_limit=2
-    )
+    source = agent_sync_module.AgentTranscriptSource(store.session_dir, message_limit=2)
     snapshot = source.refresh().transcript(store.session_dir)
 
     assert snapshot is not None
@@ -334,7 +328,9 @@ def _open_fds_under(path: Path) -> list[int]:
                 target = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
         except (OSError, ValueError):
             continue
-        if (target == root or root in target.parents) and target.name != ".storage-format.lock":
+        if (
+            target == root or root in target.parents
+        ) and target.name != ".storage-format.lock":
             open_fds.append(fd)
     return open_fds
 
@@ -359,7 +355,7 @@ async def test_finished_agent_cards_release_transcript_sources(
     transcript = TranscriptWidget()
 
     for index in range(100):
-        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child = await open_test_store(tmp_path / "agents", session_id=str(index))
         child.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"answer {index}")])
         )
@@ -397,8 +393,7 @@ async def test_finished_agent_cards_release_transcript_sources(
 
     assert _open_fds_under(tmp_path) == []
     assert all(
-        unit.card.transcript_source is None
-        for unit in transcript._card_units.values()
+        unit.card.transcript_source is None for unit in transcript._card_units.values()
     )
     assert final_card._tail == ("assistant: answer 99",)
 
@@ -694,8 +689,7 @@ async def test_progressive_search_survives_updates_and_resizes(
 ) -> None:
     transcript = TranscriptWidget()
     units = [
-        transcript.append(Panel(Text(f"item {index} needle")))
-        for index in range(140)
+        transcript.append(Panel(Text(f"item {index} needle"))) for index in range(140)
     ]
     original = transcript._render_search_snapshot
 
@@ -721,11 +715,7 @@ async def test_progressive_search_survives_updates_and_resizes(
         await asyncio.sleep(0.001)
 
     expected = sum(
-        len(
-            find_matches(
-                transcript._searchable_text(unit, 80).splitlines(), "needle"
-            )
-        )
+        len(find_matches(transcript._searchable_text(unit, 80).splitlines(), "needle"))
         for unit in transcript._units
         if unit is not None
     )
@@ -880,7 +870,9 @@ def test_scroll_up_while_streaming_leaves_follow_mode_and_moves_up() -> None:
 
     assert before_start is not None and after_start is not None
     assert after_start < before_start
-    assert _location_order(transcript, after)[0] <= _location_order(transcript, before)[0]
+    assert (
+        _location_order(transcript, after)[0] <= _location_order(transcript, before)[0]
+    )
 
 
 def test_scroll_anchor_stable_when_heights_above_are_corrected() -> None:
@@ -1428,7 +1420,7 @@ def test_long_stream_page_up_visits_every_stream_line() -> None:
 async def test_agent_completion_before_first_refresh_publishes_final_tail(
     tmp_path: Path,
 ) -> None:
-    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child = await open_test_store(tmp_path / "agents", session_id="1")
     child.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("final child answer")])
     )
@@ -1458,19 +1450,18 @@ async def test_agent_completion_before_first_refresh_publishes_final_tail(
     await asyncio.sleep(0.05)
 
     assert "final child answer" in Text.from_ansi(transcript.render(100)).plain
-    assert "child transcript unavailable" not in Text.from_ansi(
-        transcript.render(100)
-    ).plain
+    assert (
+        "child transcript unavailable"
+        not in Text.from_ansi(transcript.render(100)).plain
+    )
 
 
 @pytest.mark.asyncio
 async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> None:
-    parent = ConversationStore(tmp_path / "agents", session_id="1")
-    grandchild = ConversationStore(parent.session_dir / "agents", session_id="1")
+    parent = await open_test_store(tmp_path / "agents", session_id="1")
+    grandchild = await open_test_store(parent.session_dir / "agents", session_id="1")
     nested = ToolCall("nested", "agent", {"prompt": "nested"})
-    parent.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(nested)])
-    )
+    parent.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(nested)]))
     parent.append_message(
         Message(
             MessageRole.TOOL_RESULT,
@@ -1512,10 +1503,8 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
     from zeta.tui.cards.agent import AgentCard
 
-    store = ConversationStore(tmp_path / "agents", session_id="oversized")
-    first = store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("first")])
-    )
+    store = await open_test_store(tmp_path / "agents", session_id="oversized")
+    first = store.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
     payload = "x" * 13_000
     for index in range(1_500):
         store.append_message(
@@ -1534,9 +1523,7 @@ async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -
     )
     assert await card.refresh_tail()
 
-    assert card._tail == (
-        "child transcript unavailable: history exceeds bounded scan",
-    )
+    assert card._tail == ("child transcript unavailable: history exceeds bounded scan",)
     console = Console(record=True, width=100)
     console.print(card.current())
     rendered = console.export_text()
@@ -1632,7 +1619,7 @@ async def test_failing_agent_source_does_not_stop_batch_or_spinner(
 
     cards = []
     for index in range(3):
-        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child = await open_test_store(tmp_path / "agents", session_id=str(index))
         child.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
         )

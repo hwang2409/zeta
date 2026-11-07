@@ -7,6 +7,8 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.stores import open_test_store
+
 from zeta.agent import runner as agent_runner
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.session import SessionManager
@@ -24,7 +26,9 @@ from zeta.skills.agent_catalog import (
 from zeta.skills.catalog import SkillCatalog
 
 
-def _write_agent(path: Path, name: str, description: str, body: str, extra: str = "") -> None:
+def _write_agent(
+    path: Path, name: str, description: str, body: str, extra: str = ""
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"---\nname: {name}\ndescription: {description}\n{extra}---\n{body}\n",
@@ -42,7 +46,13 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
     _write_agent(
         home / "agents" / "explore.md", "explore", "override", "custom explore"
     )
-    _write_agent(home / "agents" / "unknown.md", "unknown", "unknown model", "body", "model: made-up\n")
+    _write_agent(
+        home / "agents" / "unknown.md",
+        "unknown",
+        "unknown model",
+        "body",
+        "model: made-up\n",
+    )
     _write_agent(
         home / "agents" / "plain.md",
         "plain",
@@ -88,8 +98,7 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
         "allow_delegation must be a boolean" in notice for notice in catalog.notices
     )
     assert any(
-        "accepts_follow_ups must be a boolean" in notice
-        for notice in catalog.notices
+        "accepts_follow_ups must be a boolean" in notice for notice in catalog.notices
     )
     assert any("unknown model" in notice for notice in catalog.notices)
     assert any("overrides packaged preset" in notice for notice in catalog.notices)
@@ -138,9 +147,7 @@ def test_agent_discovery_accepts_official_claude_scalar_tools(
 def test_agent_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
-    _write_agent(
-        project / ".zeta" / "agents" / "custom.md", "custom", "custom", "body"
-    )
+    _write_agent(project / ".zeta" / "agents" / "custom.md", "custom", "custom", "body")
 
     original = discover_session_agents(home=home, project_dir=project).find("custom")
     restored = AgentCatalog.from_snapshot(AgentCatalog((original,)).to_snapshot())
@@ -208,9 +215,10 @@ def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
     )
     stored = AgentCatalog.from_snapshot(opened.metadata.agent_catalog)
     (home / "agents" / "custom.md").unlink()
-    reopened = SessionManager(home).open(opened.metadata.session_id)
-    assert AgentCatalog.from_snapshot(reopened.metadata.agent_catalog) == stored
+    session_id = opened.metadata.session_id
     opened.store.close()
+    reopened = SessionManager(home).open(session_id)
+    assert AgentCatalog.from_snapshot(reopened.metadata.agent_catalog) == stored
     reopened.store.close()
 
 
@@ -238,7 +246,7 @@ async def test_custom_agent_body_and_tool_allowlist_reach_child(tmp_path: Path) 
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    store = ConversationStore(tmp_path / "session")
+    store = await open_test_store(tmp_path / "session")
     loop = AgentLoop(
         backend,
         store,
@@ -281,7 +289,7 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
         expected = "http://settings.example"
     loop = AgentLoop(
         FakeBackend([]),
-        ConversationStore(project / "session"),
+        await open_test_store(project / "session"),
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
         token_budget=200_000,
@@ -328,8 +336,7 @@ async def test_model_selected_ollama_child_uses_one_effective_budget(
             return httpx.Response(
                 200,
                 content=(
-                    json.dumps({"message": {"content": "ok"}, "done": True})
-                    + "\n"
+                    json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
                 ).encode(),
             )
 
@@ -345,7 +352,7 @@ async def test_model_selected_ollama_child_uses_one_effective_budget(
     monkeypatch.setattr(agent_runner, "consume_child", consume_child)
     loop = AgentLoop(
         FakeBackend([]),
-        ConversationStore(tmp_path / "parent"),
+        await open_test_store(tmp_path / "parent"),
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=discover_packaged_agents(),
         token_budget=200_000,
@@ -408,7 +415,7 @@ async def test_cross_provider_child_uses_its_own_image_policy(
     )
     loop = AgentLoop(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
-        ConversationStore(tmp_path),
+        await open_test_store(tmp_path),
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
@@ -461,7 +468,7 @@ async def test_custom_agent_model_selects_the_child_backend(
         return child_backend, None
 
     monkeypatch.setattr(agent_runner, "resolve_child_backend", select_child)
-    store = ConversationStore(tmp_path / "session")
+    store = await open_test_store(tmp_path / "session")
     loop = AgentLoop(
         parent_backend,
         store,
@@ -497,9 +504,30 @@ def test_explicit_finish_requires_global_and_profile_opt_in() -> None:
     from zeta.agent.explicit_finish import eligible
     from zeta.agent.presets import AgentPreset
 
-    profile = AgentPreset(name="worker", tool_names=None, preamble="", selection_guidance="worker", accepts_follow_ups=True, explicit_finish=True)
+    profile = AgentPreset(
+        name="worker",
+        tool_names=None,
+        preamble="",
+        selection_guidance="worker",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
     assert eligible(global_enabled=True, preset=profile, background=True) is True
     assert eligible(global_enabled=False, preset=profile, background=True) is False
-    assert eligible(global_enabled=True, preset=replace(profile, explicit_finish=False), background=True) is False
-    assert eligible(global_enabled=True, preset=replace(profile, accepts_follow_ups=False), background=True) is False
+    assert (
+        eligible(
+            global_enabled=True,
+            preset=replace(profile, explicit_finish=False),
+            background=True,
+        )
+        is False
+    )
+    assert (
+        eligible(
+            global_enabled=True,
+            preset=replace(profile, accepts_follow_ups=False),
+            background=True,
+        )
+        is False
+    )
     assert eligible(global_enabled=True, preset=profile, background=False) is False

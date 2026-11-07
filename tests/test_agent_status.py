@@ -12,6 +12,8 @@ import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.stores import open_test_store
+
 from zeta.agent.receipt import encode_json
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
@@ -67,7 +69,7 @@ async def _status(
 
 @pytest.mark.asyncio
 async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     release_background = asyncio.Event()
 
     class GatedBackend(FakeBackend):
@@ -194,7 +196,7 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
         "agent",
         {"prompt": "inspect", "description": "child"},
     )
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
 
     def crash_before_lifecycle(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -217,24 +219,25 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
         )
 
     assert store.agent_children()
-    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child = await open_test_store(store.session_dir / "agents", session_id="1")
     assert child.agent_lifecycle() is None
     child.close()
+    session_id = store.session_id
+    await loop.close()
+    store.close()
 
     monkeypatch.undo()
-    resumed = ConversationStore(tmp_path, session_id=store.session_id)
+    resumed = await open_test_store(tmp_path, session_id=session_id)
     resumed_loop = AgentLoop(
         FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     await resumed_loop.activate()
     assert not resumed.agent_children()
-    canceled_child = ConversationStore(store.session_dir / "agents", session_id="1")
+    canceled_child = await open_test_store(store.session_dir / "agents", session_id="1")
     assert canceled_child.agent_canceled() is not None
     canceled_child.close()
     await resumed_loop.close()
     resumed.close()
-    await loop.close()
-    store.close()
 
 
 async def _collect(events):
@@ -252,7 +255,11 @@ def _persist_finished_receipt(
         "agent",
         {"prompt": "inspect", "description": call_id},
     )
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -270,14 +277,14 @@ def _persist_finished_receipt(
     )
 
 
-def _new_finished_child(
+async def _new_finished_child(
     store: ConversationStore,
     index: int,
     *,
     result: str = "done",
     step: str = "finished",
 ) -> tuple[ConversationStore, str]:
-    child = ConversationStore(store.session_dir / "agents", session_id=str(index))
+    child = await open_test_store(store.session_dir / "agents", session_id=str(index))
     handle = f"{store.session_id}:{index}"
     child.start_agent_lifecycle(
         handle=handle,
@@ -296,13 +303,13 @@ def _new_finished_child(
     return child, handle
 
 
-def _new_live_child(
+async def _new_live_child(
     store: ConversationStore,
     index: int,
     *,
     step: str = "running",
 ) -> tuple[ConversationStore, str]:
-    child = ConversationStore(store.session_dir / "agents", session_id=str(index))
+    child = await open_test_store(store.session_dir / "agents", session_id=str(index))
     handle = f"{store.session_id}:{index}"
     child.start_agent_lifecycle(
         handle=handle,
@@ -323,8 +330,8 @@ def _new_live_child(
 async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     live = child.agent_lifecycle()
     assert live is not None
@@ -341,9 +348,7 @@ async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
     assert item["tool_calls"] == 3
     assert item["current_step"] == "valid live work"
 
-    call = ToolCall(
-        "agent-1", "agent", {"prompt": "inspect", "description": "child 1"}
-    )
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "child 1"})
     rendered = AgentCard.render_receipt(
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
@@ -368,9 +373,9 @@ async def test_malformed_durable_lifecycle_keeps_valid_live_projection(
 async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     for index in range(1, 9):
-        child, handle = _new_live_child(store, index)
+        child, handle = await _new_live_child(store, index)
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
     loop_thread = threading.get_ident()
@@ -397,8 +402,8 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
 async def test_terminal_durable_record_wins_over_stale_live_progress_in_status_and_card(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1, result="terminal result")
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1, result="terminal result")
     _persist_finished_receipt(store, child, "agent-1", handle)
     terminal = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     stale = {
@@ -476,6 +481,7 @@ def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> N
         finished_at="2026-09-04T10:00:01+00:00",
     )
     first = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    child.close()
 
     reopened = ConversationStore(tmp_path, session_id="child")
     reopened.finish_agent_lifecycle(
@@ -492,8 +498,8 @@ def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> N
 async def test_elapsed_uses_monotonic_time_when_wall_clock_moves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle.update(
         {
@@ -517,9 +523,9 @@ async def test_elapsed_uses_monotonic_time_when_wall_clock_moves(
 
 @pytest.mark.asyncio
 async def test_list_all_uses_active_branch_and_bounds_payload(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     checkpoint = store.append_checkpoint("before children")
-    child, handle = _new_finished_child(
+    child, handle = await _new_finished_child(
         store,
         1,
         result="r" * 20_000,
@@ -541,12 +547,12 @@ async def test_list_all_uses_active_branch_and_bounds_payload(tmp_path: Path) ->
 async def test_list_status_counts_only_live_children_for_pagination(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path)
-    finished_child, finished_handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    finished_child, finished_handle = await _new_finished_child(store, 1)
     _persist_finished_receipt(store, finished_child, "agent-1", finished_handle)
-    first_live_child, first_live_handle = _new_live_child(store, 2)
+    first_live_child, first_live_handle = await _new_live_child(store, 2)
     _persist_finished_receipt(store, first_live_child, "agent-2", first_live_handle)
-    second_live_child, second_live_handle = _new_live_child(store, 3)
+    second_live_child, second_live_handle = await _new_live_child(store, 3)
     _persist_finished_receipt(store, second_live_child, "agent-3", second_live_handle)
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
@@ -573,9 +579,9 @@ async def test_list_status_counts_only_live_children_for_pagination(
 async def test_list_status_all_finished_reports_omission_summary(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     for index in range(1, 4):
-        child, handle = _new_finished_child(store, index)
+        child, handle = await _new_finished_child(store, index)
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
     status = await _status(
@@ -605,10 +611,10 @@ async def test_list_status_all_finished_reports_omission_summary(
 async def test_list_status_keeps_damaged_children_visible(
     tmp_path: Path, damage: str, reason: str
 ) -> None:
-    store = ConversationStore(tmp_path)
-    damaged_child, damaged_handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    damaged_child, damaged_handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, damaged_child, "agent-1", damaged_handle)
-    healthy_child, healthy_handle = _new_live_child(store, 2)
+    healthy_child, healthy_handle = await _new_live_child(store, 2)
     _persist_finished_receipt(store, healthy_child, "agent-2", healthy_handle)
 
     lifecycle_path = damaged_child.agent_lifecycle_path
@@ -662,8 +668,8 @@ async def test_list_status_keeps_damaged_children_visible(
 async def test_list_status_keeps_invalid_timestamps_visible(
     tmp_path: Path, field: str, value: object, state: str
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["state"] = state
@@ -694,8 +700,8 @@ async def test_list_status_keeps_invalid_timestamps_visible(
 async def test_list_status_keeps_invalid_numeric_metadata_visible(
     tmp_path: Path, field: str, value: object
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle[field] = value
@@ -723,8 +729,8 @@ async def test_list_status_keeps_invalid_numeric_metadata_visible(
 async def test_list_status_rejects_invalid_numeric_minimums(
     tmp_path: Path, field: str, value: int
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle[field] = value
@@ -753,8 +759,8 @@ async def test_list_status_rejects_invalid_numeric_minimums(
 async def test_list_status_rejects_non_integer_numeric_metadata(
     tmp_path: Path, field: str, value: object
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle[field] = value
@@ -776,8 +782,8 @@ async def test_list_status_rejects_non_integer_numeric_metadata(
 async def test_list_status_rejects_invalid_states(
     tmp_path: Path, state: object
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["state"] = state
@@ -796,8 +802,8 @@ async def test_list_status_rejects_invalid_states(
 
 @pytest.mark.asyncio
 async def test_list_status_rejects_missing_state(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     del lifecycle["state"]
@@ -825,8 +831,8 @@ async def test_projection_exception_with_unprintable_reason_is_safe(
         def __repr__(self) -> str:
             raise RuntimeError("cannot represent")
 
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
 
     def fail_projection(*args: object, **kwargs: object) -> dict[str, object]:
@@ -851,8 +857,8 @@ async def test_projection_exception_with_unprintable_reason_is_safe(
 async def test_list_status_tolerates_legacy_budget_metadata(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle.update({"tree_budget": "x" * 20_000, "max_turns": 25})
@@ -879,8 +885,8 @@ async def test_list_status_tolerates_legacy_budget_metadata(
 async def test_list_status_bounds_displayed_string_metadata(
     tmp_path: Path, field: str
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle[field] = "x" * 20_000
@@ -899,9 +905,9 @@ async def test_list_status_bounds_displayed_string_metadata(
 
 @pytest.mark.asyncio
 async def test_list_all_stays_bounded_for_many_live_children(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     for index in range(1, 51):
-        child, handle = _new_live_child(store, index, step="s" * 2_000)
+        child, handle = await _new_live_child(store, index, step="s" * 2_000)
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
     loop = AgentLoop(
@@ -918,8 +924,8 @@ async def test_list_all_stays_bounded_for_many_live_children(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_requested_status_bounds_result_and_step(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(
         store,
         1,
         result="r" * 20_000,
@@ -942,8 +948,8 @@ async def test_requested_status_bounds_result_and_step(tmp_path: Path) -> None:
 async def test_list_status_keeps_oversized_timestamps_visible(
     tmp_path: Path, field: str
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle[field] = "2026-09-04T10:00:00." + ("0" * 20_000) + "+00:00"
@@ -964,8 +970,8 @@ async def test_list_status_keeps_oversized_timestamps_visible(
 async def test_list_status_keeps_invalid_elapsed_visible(
     tmp_path: Path, elapsed: object
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["elapsed"] = elapsed
@@ -987,8 +993,8 @@ async def test_list_status_keeps_invalid_elapsed_visible(
 async def test_list_status_keeps_non_string_final_result_visible(
     tmp_path: Path, final_result: object
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["final_result"] = final_result
@@ -1007,8 +1013,8 @@ async def test_list_status_keeps_non_string_final_result_visible(
 
 @pytest.mark.asyncio
 async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    damaged_child, _ = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    damaged_child, _ = await _new_finished_child(store, 1)
     garbage = "x" * 20_000
     _persist_finished_receipt(store, damaged_child, "agent-1", garbage)
     lifecycle = json.loads(
@@ -1035,7 +1041,7 @@ async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> Non
     damaged_child.agent_lifecycle_path.write_text(
         json.dumps(lifecycle), encoding="utf-8"
     )
-    healthy_child, healthy_handle = _new_finished_child(store, 2)
+    healthy_child, healthy_handle = await _new_finished_child(store, 2)
     _persist_finished_receipt(store, healthy_child, "agent-2", healthy_handle)
 
     loop = AgentLoop(
@@ -1071,10 +1077,12 @@ async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> Non
 async def test_projection_damage_keeps_the_child_visible(
     tmp_path: Path, field: str, value: object
 ) -> None:
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     finished = field in {"elapsed", "final_result"}
     child, handle = (
-        _new_finished_child(store, 1) if finished else _new_live_child(store, 1)
+        await _new_finished_child(store, 1)
+        if finished
+        else await _new_live_child(store, 1)
     )
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
@@ -1094,8 +1102,8 @@ async def test_projection_damage_keeps_the_child_visible(
 
 @pytest.mark.asyncio
 async def test_projection_damage_keeps_generated_reason_visible(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     child.agent_lifecycle_path.write_text("{", encoding="utf-8")
 
@@ -1113,8 +1121,8 @@ async def test_projection_damage_keeps_generated_reason_visible(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_large_turn_count_degrades_one_row(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["turns_used"] = int("9" * 4_200)
@@ -1133,8 +1141,8 @@ async def test_large_turn_count_degrades_one_row(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_huge_monotonic_value_degrades_one_row(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_live_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle.update(
@@ -1158,8 +1166,8 @@ async def test_huge_monotonic_value_degrades_one_row(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_unicode_final_result_is_bounded_by_encoded_bytes(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    child, handle = _new_finished_child(store, 1)
+    store = await open_test_store(tmp_path)
+    child, handle = await _new_finished_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
     lifecycle["final_result"] = "漢字🙂" * 5_000
@@ -1227,7 +1235,7 @@ def _seeded_status_bucket(lifecycle: dict[str, object], handle: str) -> str:
 @pytest.mark.asyncio
 async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -> None:
     randomizer = random.Random(147)
-    store = ConversationStore(tmp_path)
+    store = await open_test_store(tmp_path)
     fields = (
         "handle",
         "state",
@@ -1247,7 +1255,7 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         "finished": set(),
         "unknown": set(),
     }
-    deterministic_child, deterministic_handle = _new_live_child(store, 0)
+    deterministic_child, deterministic_handle = await _new_live_child(store, 0)
     _persist_finished_receipt(
         store, deterministic_child, "agent-deterministic", deterministic_handle
     )
@@ -1262,9 +1270,9 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
 
     for index in range(1, 201):
         child, handle = (
-            _new_finished_child(store, index)
+            await _new_finished_child(store, index)
             if index % 2 == 0
-            else _new_live_child(store, index)
+            else await _new_live_child(store, index)
         )
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
         lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
