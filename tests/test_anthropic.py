@@ -3192,20 +3192,27 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
 
         async def aclose(self):
             close_started.set()
-            await release.wait()
+            await asyncio.wait_for(release.wait(), 10)
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         backend = AnthropicBackend(token_store=store)
-        [event async for event in backend.complete([], [])]
-        closing = asyncio.create_task(backend.aclose())
-        await close_started.wait()
-        closing.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await closing
-        release.set()
-        outcome = await backend.aclose()
+        closing = None
+        try:
+            [event async for event in backend.complete([], [])]
+            closing = asyncio.create_task(backend.aclose())
+            await asyncio.wait_for(close_started.wait(), 10)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+        finally:
+            release.set()
+            if closing is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(closing, return_exceptions=True), 10
+                )
+            outcome = await asyncio.wait_for(backend.aclose(), 10)
         assert outcome.failures == ()
 
 
@@ -3309,21 +3316,29 @@ async def test_owned_client_close_cancellation_is_separate_from_stream_error(
 
         async def aclose(self):
             cleanup_started.set()
-            await release.wait()
+            await asyncio.wait_for(release.wait(), 10)
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         backend = AnthropicBackend(token_store=store)
-        with pytest.raises(AnthropicStreamError):
-            [event async for event in backend.complete([], [])]
-        closing = asyncio.create_task(backend.aclose())
-        await cleanup_started.wait()
-        closing.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await closing
-        release.set()
-        assert (await backend.aclose()).failures == ()
+        closing = None
+        try:
+            with pytest.raises(AnthropicStreamError):
+                [event async for event in backend.complete([], [])]
+            closing = asyncio.create_task(backend.aclose())
+            await asyncio.wait_for(cleanup_started.wait(), 10)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+        finally:
+            release.set()
+            if closing is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(closing, return_exceptions=True), 10
+                )
+            outcome = await asyncio.wait_for(backend.aclose(), 10)
+        assert outcome.failures == ()
 
 
 @pytest.mark.asyncio

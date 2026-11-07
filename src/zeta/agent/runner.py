@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -489,15 +489,10 @@ async def _build_child_loop(
         return child_loop, child_policy
     except asyncio.CancelledError:
         cleanup = asyncio.create_task(close_construction())
-        cancelled = False
         while not cleanup.done():
-            try:
+            with suppress(asyncio.CancelledError):
                 await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                cancelled = True
         cleanup.result()
-        if cancelled:
-            raise
         raise
     except BaseException:
         await close_construction()
