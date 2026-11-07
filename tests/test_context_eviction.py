@@ -3105,6 +3105,65 @@ def test_evict_bash_args_keeps_recent_tail(tmp_path: Path) -> None:
 
 
 
+async def _pinned_request_eviction(
+    root: Path, monkeypatch: pytest.MonkeyPatch, *, token_cache: bool
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    store = ConversationStore(root)
+    assembler = ContextAssembler(store, token_budget=1000, retained_tail=8)
+    if not token_cache:
+        # test-contract: seam bind no messages so every count is recomputed
+        monkeypatch.setattr(assembler._token_counts, "track", lambda pairs: None)
+    store.append_message(
+        with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER)
+    )
+    old_call, old_result = tool_pair("read", "read-old", "old output\n" * 3000)
+    store.append_message(old_call)
+    store.append_message(old_result)
+    assert assembler.needs_compaction()
+    store.append_message(
+        with_message_origin(
+            text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER
+        )
+    )
+    new_call, new_result = tool_pair("read", "read-new", "new output\n" * 100)
+    store.append_message(new_call)
+    store.append_message(new_result)
+    assert assembler.needs_compaction()
+
+    context = await assembler.assemble_context()
+
+    assert context.compacted
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    return [message.to_dict() for message in context.messages], marker.data
+
+
+@pytest.mark.asyncio
+async def test_pinned_request_eviction_is_identical_with_token_cache_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached, cached_marker = await _pinned_request_eviction(
+        tmp_path / "cached", monkeypatch, token_cache=True
+    )
+    uncached, uncached_marker = await _pinned_request_eviction(
+        tmp_path / "uncached", monkeypatch, token_cache=False
+    )
+
+    assert cached == uncached
+    assert cached_marker["pinned_message"] == uncached_marker["pinned_message"]
+    assert cached_marker["view"] == uncached_marker["view"]
+    request_index = next(
+        index
+        for index, message in enumerate(cached)
+        if message["content"] == [{"type": "text", "text": "latest request verbatim"}]
+    )
+    assert cached_marker["pinned_message"]["metadata"]["source_seq"] == 4
+    assert request_index < next(
+        index
+        for index, message in enumerate(cached)
+        if message.get("tool_result", {}).get("tool_call_id") == "read-new"
+    )
+
+
 @pytest.mark.asyncio
 async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
