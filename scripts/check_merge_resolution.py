@@ -85,11 +85,9 @@ def _collection_elements(value: ast.expr) -> list[ast.expr]:
 
 
 def parse_items(
-    path: str, text: str, collection_lookup: dict[str, list[ast.expr]] | None = None
+    path: str, tree: ast.Module, collection_lookup: dict[str, list[ast.expr]]
 ) -> list[Item]:
-    tree = ast.parse(text, filename=path)
     result: list[Item] = []
-    collection_lookup = collection_lookup or {}
 
     def add_memberships(node: ast.AST, qualname: str) -> None:
         for comparison in ast.walk(node):
@@ -196,6 +194,24 @@ def parse_items(
 
     visit_body(tree.body)
     return result
+
+
+def _owner_was_removed(
+    key: tuple[str, str, str, str], old_items: dict, side_items: dict
+) -> bool:
+    _path, kind, name, _value = key
+    if kind != "membership element" or "|" not in name:
+        return False
+    owner = name.split("|", 1)[0]
+    return any(
+        item.kind in {"def", "async def"} and item.name == owner
+        for item_key, item in old_items.items()
+        if item_key[0] == key[0]
+    ) and not any(
+        item.kind in {"def", "async def"} and item.name == owner
+        for item_key, item in side_items.items()
+        if item_key[0] == key[0]
+    )
 
 
 def marker(line: str, finding: Item) -> bool:
@@ -331,6 +347,67 @@ def resolve_parent(
     return main, branch, reason
 
 
+def _module_name(path: str) -> str:
+    return path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+
+
+def _revision_index(
+    paths: set[str], sources: dict[tuple[str, str], str | None], revision: str
+) -> tuple[dict[str, ast.Module], dict[str, list[ast.expr]]]:
+    trees: dict[str, ast.Module] = {}
+    collections: dict[str, list[ast.expr]] = {}
+    for path in sorted(paths):
+        text = sources[(revision, path)]
+        if text is None:
+            continue
+        tree = ast.parse(text, filename=path)
+        trees[path] = tree
+        module = _module_name(path)
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            elements = _collection_elements(node.value)
+            if not elements:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    collections[f"{module}.{target.id}"] = elements
+    return trees, collections
+
+
+def _path_lookup(
+    path: str, tree: ast.Module, module_collections: dict[str, list[ast.expr]]
+) -> dict[str, list[ast.expr]]:
+    module = _module_name(path)
+    lookup = {
+        full.removeprefix(f"{module}."): elements
+        for full, elements in module_collections.items()
+        if full.startswith(f"{module}.")
+    }
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.rsplit(".", 1)[-1]
+                prefix = alias.name + "."
+                lookup.update(
+                    {
+                        f"{name}.{full[len(prefix) :]}": elements
+                        for full, elements in module_collections.items()
+                        if full.startswith(prefix)
+                    }
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module or module.rsplit(".", 1)[0]
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                full = f"{module_name}.{alias.name}"
+                if full in module_collections:
+                    lookup[alias.asname or alias.name] = module_collections[full]
+    return lookup
+
+
 def parse_revisions(
     revisions: list[str], paths: set[str], sources: dict[tuple[str, str], str | None]
 ) -> tuple[
@@ -339,68 +416,14 @@ def parse_revisions(
 ]:
     parsed = {revision: {} for revision in revisions}
     for revision in revisions:
-        collection_lookup: dict[str, list[ast.expr]] = {}
-        module_collections: dict[str, list[ast.expr]] = {}
-        trees: dict[str, ast.Module] = {}
-        for path in sorted(paths):
-            text = sources[(revision, path)]
-            if text is None:
-                continue
-            try:
-                tree = ast.parse(text, filename=path)
-            except SyntaxError as error:
-                return parsed, (revision, path, error)
-            trees[path] = tree
-            module = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
-            for node in tree.body:
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    continue
-                value = node.value
-                elements = _collection_elements(value)
-                if not elements:
-                    continue
-                targets = (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        collection_lookup[target.id] = elements
-                        full = f"{module}.{target.id}"
-                        module_collections[full] = elements
-                        collection_lookup[
-                            f"{module.rsplit('.', 1)[-1]}.{target.id}"
-                        ] = elements
+        try:
+            trees, module_collections = _revision_index(paths, sources, revision)
+        except SyntaxError as error:
+            return parsed, (revision, error.filename or "<unknown>", error)
         for path, tree in trees.items():
-            for node in tree.body:
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        name = alias.asname or alias.name.rsplit(".", 1)[-1]
-                        prefix = alias.name + "."
-                        for full, elements in module_collections.items():
-                            if full.startswith(prefix):
-                                collection_lookup[f"{name}.{full[len(prefix) :]}"] = (
-                                    elements
-                                )
-                elif isinstance(node, ast.ImportFrom):
-                    module_name = node.module or path.removeprefix("src/").rsplit(
-                        "/", 1
-                    )[0].replace("/", ".")
-                    for alias in node.names:
-                        if alias.name == "*":
-                            continue
-                        full = f"{module_name}.{alias.name}"
-                        if full in module_collections:
-                            collection_lookup[alias.asname or alias.name] = (
-                                module_collections[full]
-                            )
-        for path in sorted(paths):
-            text = sources[(revision, path)]
-            if text is None:
-                continue
-            try:
-                found = parse_items(path, text, collection_lookup)
-            except SyntaxError as error:
-                return parsed, (revision, path, error)
+            found = parse_items(
+                path, tree, _path_lookup(path, tree, module_collections)
+            )
             parsed[revision].update({item_key(item): item for item in found})
     return parsed, None
 
@@ -477,6 +500,10 @@ def main() -> int:
         main_item = main_items.get(key)
         branch_item = branch_items.get(key)
         if (main_item is None or branch_item is None) and key in old_items:
+            continue
+        if _owner_was_removed(key, old_items, main_items) or _owner_was_removed(
+            key, old_items, branch_items
+        ):
             continue
         findings.append(item)
     lines = text.splitlines()

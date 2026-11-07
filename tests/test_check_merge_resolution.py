@@ -162,6 +162,93 @@ def test_new_constant_value_flagged(tmp_path: Path):
     assert "WRITER_EPOCH" in run(r).stdout
 
 
+def _set_origin_main(r: Path) -> None:
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "main"], cwd=r, check=True
+    )
+
+
+def test_collection_lookup_is_local_for_correct_two_file_merge(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").write_text('EVENTS = {"Z", "C"}\n')
+    commit(r, "branch changes z")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds a")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", "branch"], cwd=r, check=True
+    )
+    assert run(r).returncode == 0
+
+
+def test_collection_lookup_cannot_hide_two_file_loss(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").write_text('EVENTS = {"Z", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds a")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "branch", "--", "src/a.py"], cwd=r, check=True
+    )
+    commit(r, "bad merge")
+    result = run(r)
+    assert result.returncode == 1
+    assert "src/a.py" in result.stdout
+    assert "B" in result.stdout
+
+
+def test_renamed_function_owns_no_merge_element_finding(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "rename")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds b")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "clean rename merge")
+    assert run(r).returncode == 0
+
+
 def test_non_merge_is_clean(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
