@@ -2080,7 +2080,9 @@ async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None
         ).dispatch_async(app, "/model faster")
     finally:
         app._active_task.cancel()
-        await asyncio.gather(app._active_task, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(app._active_task, return_exceptions=True), timeout=10
+        )
 
     assert (
         output
@@ -2570,6 +2572,7 @@ async def test_forced_override_commits_after_first_successful_request(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    # test-contract: seam avoid external model discovery while testing the real CLI flow
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
@@ -2803,8 +2806,8 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
         ("child-a", "same-request")
     ]
     await app._handle_prompt_value("/approve ('child-a', 'same-request')")
-    assert await task_a == ApprovalDecision.ALLOW
-    assert await task_b == ApprovalDecision.DENY
+    assert await asyncio.wait_for(task_a, timeout=10) == ApprovalDecision.ALLOW
+    assert await asyncio.wait_for(task_b, timeout=10) == ApprovalDecision.DENY
     signal_a.abort()
     signal_b.abort()
 
@@ -2841,7 +2844,7 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
     await wait_until(lambda: bool(app.pending_approvals))
 
     app.abort_active()
-    await asyncio.gather(turn, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=10)
 
     assert app.pending_approvals == ()
     assert opened.store.messages()[-1].tool_result is not None
@@ -2979,7 +2982,7 @@ async def test_resumed_tool_abort_active_persists_canceled_result(
     async def block(arguments: dict[str, str], abort_signal: object) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()  # type: ignore[attr-defined]
+        await asyncio.wait_for(abort_signal.wait(), timeout=10)  # type: ignore[attr-defined]
         return "unreachable"
 
     loop = AgentLoop(
@@ -3003,7 +3006,7 @@ async def test_resumed_tool_abort_active_persists_canceled_result(
     approval_task = asyncio.create_task(app._handle_prompt_value(f"/approve {call.id}"))
     await asyncio.wait_for(started.wait(), timeout=1)
     app.abort_active()
-    await approval_task
+    await asyncio.wait_for(approval_task, timeout=10)
     await wait_until(lambda: opened.store.messages()[-1].tool_result is not None)
 
     assert opened.store.messages()[-1].tool_result is not None
@@ -3024,7 +3027,7 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(
     async def block(arguments: dict[str, str]) -> str:
         del arguments
         started.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
         return "unreachable"
 
     loop = AgentLoop(
@@ -3044,10 +3047,10 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(
     task = asyncio.create_task(
         loop.resume_pending_tool(call.id, event_sink=events.append)
     )
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
     assert opened.store.messages()[-1].tool_result is not None
     assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
@@ -3494,6 +3497,7 @@ def test_new_session_stores_the_model_derived_budget(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    # test-contract: seam avoid external model discovery while testing the real CLI flow
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
@@ -3523,6 +3527,7 @@ def test_token_budget_override_pins_and_survives_resume(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    # test-contract: seam avoid external model discovery while testing the real CLI flow
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
@@ -3554,6 +3559,7 @@ def test_resume_retunes_an_unpinned_budget_to_the_model(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    # test-contract: seam avoid external model discovery while testing the real CLI flow
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
@@ -3595,6 +3601,7 @@ async def test_model_command_leaves_a_pinned_budget_alone(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    # test-contract: seam avoid external model discovery while testing the real CLI flow
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
