@@ -49,7 +49,11 @@ from ..memory.entry_store import utc_now
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
-from ..prompts import load_identity, load_packaged_identity, load_runtime_guidance
+from ..prompts import (
+    load_identity_fragment,
+    load_packaged_identity,
+    load_runtime_guidance,
+)
 from ..runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -758,13 +762,14 @@ def load_project_context(
     memory_project_id: str | None = None
 
     runtime_guidance = load_runtime_guidance().rstrip()
+    identity_fragment = None
     if system_override is not None:
         sections: list[str] = [system_override, runtime_guidance]
     else:
-        sections = [
-            load_identity(catalog=catalog, identity=home_identity),
-            runtime_guidance,
-        ]
+        identity_fragment = load_identity_fragment(
+            catalog=catalog, identity=home_identity
+        )
+        sections = [identity_fragment.text, runtime_guidance]
         # A private per-project file is outside the repository and is loaded
         # after repository instructions, so it wins on conflicts.
         deduped = _instruction_files(
@@ -921,10 +926,22 @@ def load_project_context(
     has_override = system_override is not None or system_append is not None
     components: dict[str, dict[str, int | str]] = {}
     if not has_override:
+        assert identity_fragment is not None
         components["default_context"] = {
             "offset": 0,
             "length": len(prompt),
             "digest": _owned_block_digest(prompt),
+        }
+        components["identity"] = {
+            "offset": 0,
+            "length": len(identity_fragment.text),
+            "digest": _owned_block_digest(identity_fragment.text),
+        }
+        skill_index = identity_fragment.spans["skill_index"]
+        components["skill_index"] = {
+            "offset": skill_index.offset,
+            "length": skill_index.length,
+            "digest": skill_index.digest,
         }
     if memory_offset is not None and memory_length is not None and memory_digest is not None:
         components["project_memory"] = {

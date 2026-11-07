@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import platform  # noqa: F401 - tests patch the module for paste behavior
 import shutil  # noqa: F401 - tests patch the module for paste behavior
 import subprocess  # noqa: F401 - tests patch the module for paste behavior
@@ -40,15 +39,15 @@ from ..submission.notification_retry import NotificationFailure, NotificationOut
 from . import theme
 from ._attachments import (
     ATTACHMENT_MAX_TEXT_BYTES,  # noqa: F401 - preserve the composer import
-    ATTACHMENT_TOKEN_RE,  # noqa: F401 - preserve the composer import
-    AttachmentError,
+    ATTACHMENT_TOKEN_RE,
     AttachmentRef,  # noqa: F401 - preserve the composer import
     _attachment_path,
     _image_media_type,  # noqa: F401 - preserve the composer import
     _read_attachment,  # noqa: F401 - preserve the composer import
-    attachment_refs,
+    attachment_refs,  # noqa: F401 - preserve the composer import
     build_user_message,
     paste_image,  # noqa: F401 - preserve the composer import
+    prepare_attachments,
 )
 from .completion import (
     ComposerCompleter,
@@ -447,7 +446,7 @@ class ComposerAttachmentMixin:
 
     def _restore_draft_state(self, draft: Any) -> None:
         self._pending_attachment_tokens = {
-            token: _attachment_path(path) for token, path in draft.attachment_tokens
+            token: Path(path) for token, path in draft.attachment_tokens
         }
         self._pending_attachments[:] = list(
             dict.fromkeys(self._pending_attachment_tokens.values())
@@ -524,15 +523,7 @@ class ComposerAttachmentMixin:
         self._paste_runtime.start(buffer)
 
     def _delete_staged_attachment(self, path: Path) -> None:
-        if (
-            path.parent == self.loop.store.session_dir
-            and path.name.startswith("clipboard-")
-            and path.suffix == ".png"
-        ):
-            try:
-                os.unlink(path.name, dir_fd=self.loop.store.directory_fd)
-            except FileNotFoundError:
-                pass
+        self._paste_runtime.delete(path)
 
     def _pending_paths_for(
         self,
@@ -540,7 +531,7 @@ class ComposerAttachmentMixin:
         *,
         pending_attachments: list[Path] | None = None,
         pending_attachment_tokens: dict[str, Path] | None = None,
-    ) -> list[Path]:
+    ) -> tuple[list[Path], tuple[Path, ...], dict[str, Path]]:
         attachments = (
             self._pending_attachments
             if pending_attachments is None
@@ -558,8 +549,7 @@ class ComposerAttachmentMixin:
                 del tokens[token]
                 cancelled_paths.add(path)
         remaining_mapped_paths = set(tokens.values())
-        for path in cancelled_paths - remaining_mapped_paths:
-            self._delete_staged_attachment(path)
+        discarded_paths = tuple(cancelled_paths - remaining_mapped_paths)
         attachments[:] = [
             path
             for path in attachments
@@ -574,7 +564,7 @@ class ComposerAttachmentMixin:
         selected_paths.extend(
             path for path in attachments if path not in remaining_mapped_paths
         )
-        return selected_paths
+        return selected_paths, discarded_paths, dict(tokens)
 
     async def _prepare_user_message(
         self,
@@ -585,63 +575,50 @@ class ComposerAttachmentMixin:
         attachment_value: str | None = None,
     ) -> Message | None:
         source = value if attachment_value is None else attachment_value
-        pending_paths = self._pending_paths_for(
+        pending_paths, discarded_paths, pending_tokens = self._pending_paths_for(
             source,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
         )
-        if not pending_paths and not attachment_refs(source, self.loop.store.cwd):
+        if (
+            not pending_paths
+            and not discarded_paths
+            and ATTACHMENT_TOKEN_RE.search(source) is None
+        ):
             return build_user_message(
                 value, self.loop.store.cwd, attachment_value=source
             )
+        store = self.loop.store
+        prepared_paths = self._paste_runtime.prepared_for(pending_paths)
+        for path in discarded_paths:
+            self._paste_runtime.forget(path)
 
-        notices: list[str] = []
-        try:
-            message = await asyncio.to_thread(
-                build_user_message,
-                value,
-                self.loop.store.cwd,
-                attachment_value=source,
-                session_store=self.loop.store,
-                on_reference_notice=notices.append,
-                image_policy=image_policy_for_provider(self.provider),
-            )
-        except AttachmentError as exc:
-            self._print_system(f"attachment rejected: {exc}")
-            return None
-        for notice in notices:
-            self._print_system(notice)
-
-        valid_pending: list[Path] = []
-        pending_blocks = []
-        for path in pending_paths:
-            try:
-                pending = await asyncio.to_thread(
-                    build_user_message,
-                    value,
-                    self.loop.store.cwd,
-                    (path,),
-                    attachment_value=source,
-                    session_store=self.loop.store,
+        def prepare() -> Any:
+            for path in discarded_paths:
+                self._paste_runtime._delete_staged(
+                    path, store.session_dir, store.directory_fd
                 )
-            except AttachmentError as exc:
-                self._print_system(f"pending attachment dropped: {exc}")
-            else:
-                valid_pending.append(path)
-                pending_blocks.extend(pending.content[1:])
+            return prepare_attachments(
+                value,
+                store.cwd,
+                tuple(pending_paths),
+                attachment_value=source,
+                session_store=store,
+                image_policy=image_policy_for_provider(self.provider),
+                prepared_paths=prepared_paths,
+                pending_tokens=pending_tokens,
+            )
+
+        prepared = await asyncio.to_thread(prepare)
         attachments = (
             self._pending_attachments
             if pending_attachments is None
             else pending_attachments
         )
-        attachments[:] = valid_pending
-        if not pending_blocks:
-            return message
-        return Message(
-            message.role,
-            [*message.content, *pending_blocks],
-            metadata=message.metadata,
-        )
+        attachments[:] = prepared.publication
+        for notice in prepared.notices:
+            self._print_system(notice)
+        return prepared.message
 
     def _clear_pending_attachments(self) -> None:
         mapped_paths = set(self._pending_attachment_tokens.values())

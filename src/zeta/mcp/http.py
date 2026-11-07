@@ -77,6 +77,12 @@ OAUTH_HINT = "run /mcp auth {name} to reauthorize"
 T = TypeVar("T")
 
 
+@dataclass(slots=True)
+class _ActiveRequest:
+    task: asyncio.Task[dict[str, object]] | None = None
+    response: httpx.Response | None = None
+
+
 class StreamableHTTPMCPClient(MCPClient):
     def __init__(
         self,
@@ -99,6 +105,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
+        self._active_requests: dict[asyncio.Task[object], _ActiveRequest] = {}
+        self._deadline_cleanups: set[asyncio.Task[None]] = set()
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._limits = limits or MCPCallLimits()
@@ -206,10 +214,55 @@ class StreamableHTTPMCPClient(MCPClient):
             self._notification_task.cancel()
             await asyncio.gather(self._notification_task, return_exceptions=True)
             self._notification_task = None
+        await self._drain_active_requests()
         if self._owns_client:
             await self._client.aclose()
         if self._owns_spill_store:
             self._spill_store.close()
+
+    async def _drain_active_requests(self) -> None:
+        active_tasks = tuple(
+            state.task
+            for state in self._active_requests.values()
+            if state.task is not None
+        )
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks or self._deadline_cleanups:
+            await asyncio.gather(
+                *active_tasks, *tuple(self._deadline_cleanups), return_exceptions=True
+            )
+
+    def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
+        """Close only the timed-out HTTP response and retain cleanup ownership."""
+
+        state = self._active_requests.get(owner)
+        if state is None or state.task is None:
+            return
+        cleanup = asyncio.create_task(self._cleanup_deadline_request(state))
+        self._deadline_cleanups.add(cleanup)
+        cleanup.add_done_callback(self._deadline_cleanups.discard)
+
+    async def _cleanup_deadline_request(self, state: _ActiveRequest) -> None:
+        task = state.task
+        if task is None:
+            return
+        task.cancel()
+        response = state.response
+        if response is not None:
+            try:
+                await asyncio.wait_for(response.aclose(), HTTP_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning(
+                    "failed to close an MCP HTTP deadline response", exc_info=True
+                )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(task, return_exceptions=True)),
+                HTTP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("timed out joining an MCP HTTP deadline request")
 
     async def _request(
         self,
@@ -227,9 +280,20 @@ class StreamableHTTPMCPClient(MCPClient):
             "method": method,
             "params": dict(params),
         }
-        request_task = asyncio.create_task(self._send_with_auth(payload, request_id))
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("MCP HTTP request requires an asyncio task")
+        state = _ActiveRequest()
+        request_task = asyncio.create_task(
+            self._send_with_auth(payload, request_id, state)
+        )
+        state.task = request_task
+        self._active_requests[owner] = state
         if abort_signal is None:
-            return await request_task
+            try:
+                return await request_task
+            finally:
+                self._active_requests.pop(owner, None)
         abort_task = asyncio.create_task(abort_signal.wait())
         try:
             done, _ = await asyncio.wait(
@@ -240,16 +304,24 @@ class StreamableHTTPMCPClient(MCPClient):
                 await asyncio.gather(request_task, return_exceptions=True)
                 raise MCPCanceled()
             return await request_task
+        except asyncio.CancelledError:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            raise
         finally:
+            self._active_requests.pop(owner, None)
             if not abort_task.done():
                 abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
 
     async def _send_with_auth(
-        self, payload: Mapping[str, object], request_id: int
+        self,
+        payload: Mapping[str, object],
+        request_id: int,
+        state: _ActiveRequest,
     ) -> dict[str, object]:
         return await self._with_auth(
-            lambda token: self._send(payload, request_id, token)
+            lambda token: self._send(payload, request_id, state, token)
         )
 
     async def _with_auth(
@@ -345,6 +417,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self,
         payload: Mapping[str, object],
         request_id: int,
+        state: _ActiveRequest,
         oauth_token: MCPOAuthToken | None,
     ) -> dict[str, object]:
         headers = self._auth_headers(oauth_token)
@@ -362,6 +435,7 @@ class StreamableHTTPMCPClient(MCPClient):
             async with self._client.stream(
                 "POST", self.config.url, headers=headers, json=dict(payload)
             ) as response:
+                state.response = response
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None and session_id != self._session_id:
                     self._session_id = session_id
@@ -389,6 +463,8 @@ class StreamableHTTPMCPClient(MCPClient):
                 return parse_rpc_response(value, request_id)
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
+        finally:
+            state.response = None
 
     async def _listen_notifications(self) -> None:
         if self._session_id is None:
