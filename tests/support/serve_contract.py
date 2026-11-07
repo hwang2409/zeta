@@ -127,16 +127,27 @@ class ServeContract:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        assert process.stderr is not None
-        output = bytearray()
-        while True:
-            line = await process.stderr.readline()
-            output.extend(line)
-            assert line, (
-                f"zeta serve exited before readiness: {output.decode(errors='replace')}"
-            )
-            if line.startswith(b"zeta serve: websocket ready:"):
-                break
+        try:
+            assert process.stderr is not None
+            output = bytearray()
+            while True:
+                line = await process.stderr.readline()
+                output.extend(line)
+                assert line, (
+                    "zeta serve exited before readiness: "
+                    f"{output.decode(errors='replace')}"
+                )
+                if line.startswith(b"zeta serve: websocket ready:"):
+                    break
+        except BaseException:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.communicate()
+            socket_path.unlink(missing_ok=True)
+            raise
         return cls(process, home, socket_path, transport)
 
     async def connect(self, role: Role = "controller") -> ServeClient:
@@ -155,10 +166,14 @@ class ServeContract:
         return client
 
     async def close(self) -> None:
-        for client in reversed(self._clients):
-            await client.close()
-        if self._process.returncode is None:
-            self._process.terminate()
-        stdout, stderr = await self._process.communicate()
-        assert self._process.returncode == 0, (stdout + stderr).decode(errors="replace")
-        assert not self._socket_path.exists(), "serve left its Unix socket behind"
+        try:
+            for client in reversed(self._clients):
+                await client.close()
+        finally:
+            if self._process.returncode is None:
+                self._process.terminate()
+            stdout, stderr = await self._process.communicate()
+            assert self._process.returncode == 0, (stdout + stderr).decode(
+                errors="replace"
+            )
+            assert not self._socket_path.exists(), "serve left its Unix socket behind"
