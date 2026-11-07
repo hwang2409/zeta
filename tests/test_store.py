@@ -2765,7 +2765,9 @@ from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, Too
 
 root = Path(sys.argv[1])
 session_id = "pending-approval-reentry"
-resident = ConversationStore(root, session_id=session_id)
+with ConversationStore(root, session_id=session_id):
+    pass
+resident = ConversationStore(root, session_id=session_id, _read_only=True)
 foreign = """
 from pathlib import Path
 import sys
@@ -2785,11 +2787,13 @@ observed = []
 def installed(delta):
     observed.append("reset" if delta == "reset" else [row.id for row in delta])
     resident.on_entries_installed = None
-    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
+    with ConversationStore(root, session_id=session_id) as writer:
+        writer.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
 
 
 resident.on_entries_installed = installed
 pending = resident.pending_approvals()
+resident.refresh()
 print(json.dumps({
     "observed": observed,
     "pending": [item[0] for item in pending],
@@ -2814,7 +2818,9 @@ print(json.dumps({
 
 
 def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path, session_id="shared-subprocess")
+    with ConversationStore(tmp_path, session_id="shared-subprocess"):
+        pass
+    store = ConversationStore(tmp_path, session_id="shared-subprocess", _read_only=True)
     subprocess.run(
         [
             sys.executable,
@@ -2833,12 +2839,9 @@ def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
         check=True,
     )
 
-    store.append_message(message(MessageRole.ASSISTANT, "local"))
+    store.refresh()
 
-    assert [item.content[0].text for item in store.messages()] == [
-        "external",
-        "local",
-    ]
+    assert [item.content[0].text for item in store.messages()] == ["external"]
 
 
 def test_live_store_separates_external_complete_unterminated_row(

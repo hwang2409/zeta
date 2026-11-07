@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools.agent as agent_tools
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import owned_child_process
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
@@ -527,11 +527,11 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
-        FakeBackend(
-            [
-                ScriptedTurn(tool_calls=[call]),
-                ScriptedTurn([TextContent("child done")]),
-            ]
+        PerActorFakeBackend(
+            [ScriptedTurn(tool_calls=[call])],
+            {"inspect": [ScriptedTurn([TextContent("child done")])]},
+            parent_prompt="start",
+            gated_child_call=0,
         ),
         store,
         max_turns=1,
@@ -539,7 +539,7 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
     )
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), 10)
     stats = store.agent_notifications(pending_only=False)[0].data["stats"]
 
     assert stats == {

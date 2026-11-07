@@ -14,9 +14,14 @@ from pathlib import Path
 from typing import IO, Any
 
 _LAUNCHER_START_TIMEOUT_SECONDS = 10.0
+_POSIX_SPAWN_SETSID_SUPPORTED: bool | None = None
 
 _LAUNCHER = """
-import os, sys
+import os, signal, sys
+try:
+    os.setsid()
+except PermissionError:
+    pass
 cwd_fd = int(sys.argv[1])
 ready_fd = int(sys.argv[2])
 niceness = int(sys.argv[3])
@@ -27,10 +32,22 @@ except (AttributeError, OSError):
     pass
 os.fchdir(cwd_fd)
 os.close(cwd_fd)
+inherited_targets = {ready_fd}
 for inherited_fd in sys.argv[5:]:
     source, target = map(int, inherited_fd.split(':'))
     os.dup2(source, target)
     os.close(source)
+    inherited_targets.add(target)
+for inherited_fd in os.listdir('/dev/fd'):
+    fd = int(inherited_fd)
+    if fd > 2 and fd not in inherited_targets:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+for signum in (signal.SIGPIPE, getattr(signal, 'SIGXFSZ', None)):
+    if signum is not None:
+        signal.signal(signum, signal.SIG_DFL)
 os.write(ready_fd, b'1')
 os.close(ready_fd)
 os.execvpe('/bin/sh', ['sh', '-c', sys.argv[4]], os.environ)
@@ -100,6 +117,17 @@ class _ToolSubprocessTransport(unix_events._UnixSubprocessTransport):  # type: i
         self._proc = _posix_spawn(args, stdin, stdout, stderr, **kwargs)
 
 
+def current_child_watcher(loop: asyncio.AbstractEventLoop) -> Any:
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            watcher = events.get_child_watcher()
+        if not watcher.is_active():
+            raise RuntimeError("asyncio child watcher is not active")
+    return watcher
+
+
 async def create_tool_subprocess_shell(
     command: str,
     *,
@@ -126,13 +154,7 @@ async def create_tool_subprocess_shell(
             asyncio.streams._DEFAULT_LIMIT, loop
         )
         waiter = loop.create_future()
-        watcher = getattr(loop, "_watcher", None)
-        if watcher is None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                watcher = events.get_child_watcher()
-            if not watcher.is_active():
-                raise RuntimeError("asyncio child watcher is not active")
+        watcher = current_child_watcher(loop)
         transport = _ToolSubprocessTransport(
             loop,
             protocol,
@@ -161,11 +183,12 @@ async def create_tool_subprocess_shell(
                 await asyncio.shield(cleanup)
                 raise
             raise
+        proc = transport._proc
         try:
             await waiter
-            await _wait_for_launcher(process=transport._proc)
+            await _wait_for_launcher(process=proc)
         except BaseException:
-            transport._proc.ready.close()
+            proc.ready.close()
             transport.close()
             await transport._wait()
             raise
@@ -274,16 +297,19 @@ def _file_actions(
             for source, target in zip(inherited, child_fds, strict=True)
         ),
     ]
-    actions.extend(
-        (os.POSIX_SPAWN_CLOSE, fd)
-        for fd in owner.opened - {owner.child_stdin, owner.child_stdout, owner.child_stderr}
-    )
+    actions.extend((os.POSIX_SPAWN_CLOSE, fd) for fd in owner.opened)
     return actions
 
 
 def _posix_spawn(
-    args: Sequence[str], stdin: int, stdout: int, stderr: int, *, cwd_fd: int,
-    pass_fds: Sequence[int], env: Mapping[str, str],
+    args: Sequence[str],
+    stdin: int,
+    stdout: int,
+    stderr: int,
+    *,
+    cwd_fd: int,
+    pass_fds: Sequence[int],
+    env: Mapping[str, str],
 ) -> _SpawnedProcess:
     if stdin not in (subprocess.PIPE, subprocess.DEVNULL):
         raise ValueError("tool subprocess stdin must be PIPE or DEVNULL")
@@ -298,7 +324,8 @@ def _posix_spawn(
         inherited = (cwd_fd, owner.child_ready, *pass_fds)
         unavailable = {0, 1, 2, *owner.opened, *inherited}
         child_fds = tuple(
-            fd for fd in range(3, 3 + len(unavailable) + len(inherited))
+            fd
+            for fd in range(3, 3 + len(unavailable) + len(inherited))
             if fd not in unavailable
         )[: len(inherited)]
         spawn_args = (
@@ -308,16 +335,29 @@ def _posix_spawn(
             *args[3:],
             *(
                 f"{source}:{target}"
-                for source, target in zip(
-                    child_fds[2:], pass_fds, strict=True
-                )
+                for source, target in zip(child_fds[2:], pass_fds, strict=True)
             ),
         )
-        pid = os.posix_spawn(
-            spawn_args[0], spawn_args, env,
-            file_actions=_file_actions(owner, inherited, child_fds), setsid=True,
-            setsigdef=tuple(signum for signum in (signal.SIGPIPE, getattr(signal, "SIGXFZ", None), getattr(signal, "SIGXFSZ", None)) if signum is not None),
-        )
+        spawn_kwargs = {
+            "file_actions": _file_actions(owner, inherited, child_fds),
+            "setsigdef": tuple(
+                signum
+                for signum in (signal.SIGPIPE, getattr(signal, "SIGXFSZ", None))
+                if signum is not None
+            ),
+        }
+        global _POSIX_SPAWN_SETSID_SUPPORTED
+        if _POSIX_SPAWN_SETSID_SUPPORTED is not False:
+            try:
+                pid = os.posix_spawn(
+                    spawn_args[0], spawn_args, env, setsid=True, **spawn_kwargs
+                )
+            except NotImplementedError:
+                _POSIX_SPAWN_SETSID_SUPPORTED = False
+            else:
+                _POSIX_SPAWN_SETSID_SUPPORTED = True
+                return owner.transfer(pid)
+        pid = os.posix_spawn(spawn_args[0], spawn_args, env, **spawn_kwargs)
         return owner.transfer(pid)
     except BaseException:
         if owner is not None:

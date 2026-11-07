@@ -16,7 +16,6 @@ import zeta.providers.codex as codex_module
 from tests.support.credentials import codex_credentials
 from zeta.accounts import AccountCredentials
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -43,6 +42,7 @@ from zeta.providers.codex import (
 from zeta.providers.codex_payload import _cache_affinity_json
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 
@@ -4096,11 +4096,16 @@ async def test_cleanup_failure_keeps_primary_outcome_and_is_diagnostic(
     else:
         assert outcome is None
         assert streamed[-1].type is StreamEventType.MESSAGE_END
-    assert diagnostics_path.exists()
-    record = json.loads(diagnostics_path.read_text())
-    assert record["type"] == "provider_cleanup_failed"
-    assert record["resource"] == scope
-    assert record["primary_outcome"] == ("error" if primary else "success")
+    if scope == "client":
+        close_outcome = await backend.aclose()
+        assert len(close_outcome.failures) == 1
+        assert isinstance(close_outcome.failures[0].error, RuntimeError)
+    else:
+        assert diagnostics_path.exists()
+        record = json.loads(diagnostics_path.read_text())
+        assert record["type"] == "provider_cleanup_failed"
+        assert record["resource"] == scope
+        assert record["primary_outcome"] == ("error" if primary else "success")
 
 
 @pytest.mark.asyncio
@@ -4133,12 +4138,27 @@ async def test_cleanup_control_exception_matrix(
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
         )
-    with pytest.raises(cleanup_error) as raised:
-        [item async for item in backend.complete([], [])]
-    if primary:
-        assert isinstance(raised.value.__cause__, CodexStreamError)
+    if scope == "client":
+        if primary:
+            with pytest.raises(CodexStreamError):
+                [item async for item in backend.complete([], [])]
+        else:
+            [item async for item in backend.complete([], [])]
+        if cleanup_error is asyncio.CancelledError:
+            with pytest.raises(cleanup_error) as raised:
+                await backend.aclose()
+            assert raised.value.__cause__ is None
+        else:
+            close_outcome = await backend.aclose()
+            assert len(close_outcome.failures) == 1
+            assert isinstance(close_outcome.failures[0].error, GeneratorExit)
     else:
-        assert raised.value.__cause__ is None
+        with pytest.raises(cleanup_error) as raised:
+            [item async for item in backend.complete([], [])]
+        if primary:
+            assert isinstance(raised.value.__cause__, CodexStreamError)
+        else:
+            assert raised.value.__cause__ is None
 
 
 @pytest.mark.asyncio

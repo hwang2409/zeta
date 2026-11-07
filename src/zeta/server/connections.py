@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -9,7 +8,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from . import content, ergonomics
-from .protocol import FrameWriteCancelled, ProtocolError
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameCodec,
+    FrameWriteCancelled,
+    ProtocolError,
+    _Frame,
+)
 
 OBSERVER_REQUESTS = frozenset(
     {
@@ -22,9 +28,9 @@ OBSERVER_REQUESTS = frozenset(
         "session_settings",
         "ping",
         "delivery_status",
+        "session_grants",
     }
 )
-OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
@@ -44,7 +50,7 @@ class ControllerMetadata:
 
 @dataclass
 class _OutputFrame:
-    payload: bytes
+    payload: _Frame
     future: asyncio.Future[bool] | None = None
 
 
@@ -63,7 +69,7 @@ class _OutputState:
     pending_callers: int = 0
     retained_bytes: int = 0
     retained_frames: int = 0
-    overflow_frame: bytes | None = None
+    overflow_frame: _Frame | None = None
     overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
     released: bool = False
@@ -122,22 +128,33 @@ class ConnectionRegistry:
         max_role: str = "controller",
     ) -> str:
         if requested_role not in {"controller", "observer"}:
-            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "role must be 'controller' or 'observer'",
+            )
         role = str(requested_role)
         if max_role == "observer" and role == "controller":
-            raise ProtocolError(-32602, "credential permits observer role only")
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "credential permits observer role only"
+            )
         if role == "observer" and (
             protocol_version == "1.0" or "serve_observers" not in features
         ):
             raise ProtocolError(
-                -32602, "observer requires protocol 1.1 and serve_observers"
+                ErrorDescriptor.INVALID_PARAMS,
+                "observer requires protocol 1.1 and serve_observers",
             )
         try:
             self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
-                raise ProtocolError(-32004, "observer limit reached") from exc
-            raise ProtocolError(-32001, "another client is already connected") from exc
+                raise ProtocolError(
+                    ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached"
+                ) from exc
+            raise ProtocolError(
+                ErrorDescriptor.CONNECTION_CAPACITY,
+                "another client is already connected",
+            ) from exc
         connection.role = role
         if role == "controller":
             connection.server.runtime.set_post_stream_provider_retry(
@@ -183,7 +200,7 @@ class ConnectionRegistry:
 
     async def publish_controller(
         self,
-        event: str,
+        event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
@@ -195,13 +212,15 @@ class ConnectionRegistry:
         ):
             return False
         if (
-            event == "approval_end"
+            event is EventDescriptor.APPROVAL_END
             and "approval_reconnect" not in state.features
             and isinstance(fields.get("data"), dict)
             and fields["data"].get("reason") == "grace_expired"
         ):
             return False
         frame = state.connection.codec.notification(event, session_id, **fields)
+        if frame is None:
+            return False
         output = state.output
         assert output is not None
         if output.phase not in {"claimed_buffering", "flushing", "ready"}:
@@ -217,6 +236,29 @@ class ConnectionRegistry:
             return True
         return await self._send_frame(output, frame)
 
+    async def publish_feature_event(
+        self,
+        feature: str,
+        event: EventDescriptor,
+        session_id: str,
+        *,
+        data: dict[str, object],
+    ) -> None:
+        """Queue one live event for every connection that negotiated a feature."""
+        states = tuple(
+            state
+            for state in (self._controller, *self._observers)
+            if state is not None and feature in state.features
+        )
+        for state in states:
+            frame = state.connection.codec.notification(event, session_id, data=data)
+            if frame is None:
+                continue
+            if state is self._controller:
+                await self.send(state.connection, frame)
+            else:
+                self._publish_observer(state, frame)
+
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
         if state is None:
@@ -229,7 +271,7 @@ class ConnectionRegistry:
         if output is not None:
             self._release_output(output, state.role)
 
-    async def send(self, connection: Any, frame: bytes) -> bool:
+    async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
         if state is None or state.output is None:
             return False
@@ -240,7 +282,7 @@ class ConnectionRegistry:
             return False
         return await self._send_frame(output, frame)
 
-    async def _send_hello(self, state: _Connection, frame: bytes) -> bool:
+    async def _send_hello(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         assert output is not None
         if (
@@ -272,7 +314,7 @@ class ConnectionRegistry:
         finally:
             self._finish_caller(output)
 
-    async def _send_frame(self, output: _OutputState, frame: bytes) -> bool:
+    async def _send_frame(self, output: _OutputState, frame: _Frame) -> bool:
         future = self.loop.create_future()
         item = _OutputFrame(frame, future)
         self._enqueue(output, item)
@@ -401,7 +443,18 @@ class ConnectionRegistry:
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
 
-    def _fits(self, output: _OutputState, frame: bytes) -> bool:
+    def _publish_observer(self, state: _Connection, frame: _Frame) -> None:
+        output = state.output
+        if (
+            state.connection not in self._connections
+            or output is None
+            or output.phase != "ready"
+            or not self._admit(state, frame)
+        ):
+            return
+        self._enqueue(output, _OutputFrame(frame))
+
+    def _fits(self, output: _OutputState, frame: _Frame) -> bool:
         control = output.overflow_frame
         assert control is not None
         return (
@@ -409,7 +462,7 @@ class ConnectionRegistry:
             and output.retained_frames + 2 <= OUTPUT_MAX_FRAMES
         )
 
-    def _admit(self, state: _Connection, frame: bytes) -> bool:
+    def _admit(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         assert output is not None
         if output.overflowed:
@@ -460,22 +513,17 @@ class ConnectionRegistry:
         self._finish_future(output.ready, False)
 
     @staticmethod
-    def _overflow_frame(role: str) -> bytes:
-        return (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32011, "message": f"{role} output overflow"},
-                },
-                separators=(",", ":"),
-            ).encode()
-            + b"\n"
+    def _overflow_frame(role: str) -> _Frame:
+        descriptor = (
+            ErrorDescriptor.CONTROLLER_OUTPUT_OVERFLOW
+            if role == "controller"
+            else ErrorDescriptor.OBSERVER_OUTPUT_OVERFLOW
         )
+        return FrameCodec().error_response(None, descriptor, descriptor.meaning)
 
     @staticmethod
     async def _write_physical(
-        connection: Any, payload: bytes
+        connection: Any, payload: _Frame
     ) -> tuple[bool, FrameWriteCancelled | None]:
         try:
             return await connection._write_physical(payload), None
@@ -607,7 +655,9 @@ class ConnectionRegistry:
             session_id is not None
             and connection.server.runtime.session_id != session_id
         ):
-            raise ProtocolError(-32003, "session is not active")
+            raise ProtocolError(
+                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
+            )
         return result
 
     async def read_session(
@@ -668,9 +718,14 @@ class ConnectionRegistry:
             try:
                 result = job()
             except Exception as exc:  # noqa: BLE001 - worker must return every job failure
-                self.loop.call_soon_threadsafe(self._read_done, future, None, exc)
+                result, error = None, exc
             else:
-                self.loop.call_soon_threadsafe(self._read_done, future, result, None)
+                error = None
+            try:
+                self.loop.call_soon_threadsafe(self._read_done, future, result, error)
+            except RuntimeError:
+                if not self.loop.is_closed():
+                    raise
 
     @staticmethod
     def _read_done(
@@ -703,9 +758,9 @@ class ConnectionRegistry:
             method == "list_sessions" and "project_id" in params
         ):
             raise ProtocolError(
-                -32008,
+                ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",
-                {"code": OBSERVER_READ_ONLY_CODE, "method": method},
+                {"method": method},
             )
         if method not in {
             "list_sessions",
@@ -722,7 +777,8 @@ class ConnectionRegistry:
         if method == "content_read":
             if "content_read" not in state.features:
                 raise ProtocolError(
-                    -32601, "content_read requires the negotiated content_read feature"
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "content_read requires the negotiated content_read feature",
                 )
             target = capture_read(connection, method, params)
             return True, await self.run_read(
@@ -784,6 +840,15 @@ def _active_status_parts(
         if client.protocol_version != "1.0" and loop is not None
         else None
     )
+    project_context_health = (
+        (
+            loop.project_context_health.summary
+            if loop is not None and loop.project_context_health is not None
+            else "healthy"
+        )
+        if client.protocol_version != "1.0"
+        else None
+    )
     status = {
         "session": client._session_snapshot(),
         "state": (
@@ -803,6 +868,11 @@ def _active_status_parts(
         **(
             {"transcript_index_failure": transcript_index_failure}
             if transcript_index_failure is not None
+            else {}
+        ),
+        **(
+            {"project_context_health": project_context_health}
+            if project_context_health is not None
             else {}
         ),
         "store": runtime.opened.store,
@@ -847,12 +917,13 @@ def capture_read(
     if method == "content_read":
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_CONTENT_READ,
                 "invalid content read",
-                {"code": "invalid_content_read"},
             )
         if runtime.opened is None:
-            raise ProtocolError(-32003, "session is not active")
+            raise ProtocolError(
+                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
+            )
         return runtime.session_id, runtime.opened.store
     if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
@@ -863,7 +934,7 @@ def capture_read(
         return None, ergonomics.catalog(runtime)
     if method == "session_settings":
         return runtime.session_id, ergonomics.settings(runtime)
-    raise ProtocolError(-32601, "method not found")
+    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
@@ -923,4 +994,4 @@ def perform_read(
             offset=params.get("offset", 0),
             limit=params.get("limit", content.MAX_CONTENT_READ),
         )
-    raise ProtocolError(-32601, "method not found")
+    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")

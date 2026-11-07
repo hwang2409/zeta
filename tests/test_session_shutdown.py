@@ -363,7 +363,8 @@ async def test_shutdown_releases_child_stores(
 
 @pytest.mark.usefixtures("no_gc")
 def test_recovery_and_send_release_borrowed_child_stores(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.support.fake_backend import FakeBackend
     from zeta.agent.background import recover_agent_children
@@ -375,20 +376,29 @@ def test_recovery_and_send_release_borrowed_child_stores(
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("child", "agent", {"prompt": "hello", "description": "child"})
-    with ConversationStore(opened.store.session_dir / "agents", session_id="1") as child:
+    with ConversationStore(
+        opened.store.session_dir / "agents", session_id="1"
+    ) as child:
         with ConversationStore(child.session_dir / "agents", session_id="1") as nested:
             nested.mark_agent_parent("nested")
             child.register_agent_child(
                 ToolCall("nested", "agent", {}),
-                child_session_path=str(nested.session_dir), description="nested",
+                child_session_path=str(nested.session_dir),
+                description="nested",
             )
         opened.store.register_agent_child(
-            call, child_session_path=str(child.session_dir), description="child",
-            agent_type="run", child_instance_id="child", background=True,
+            call,
+            child_session_path=str(child.session_dir),
+            description="child",
+            agent_type="run",
+            child_instance_id="child",
+            background=True,
             accepts_follow_ups=True,
         )
         opened.store.append_task_notification(
-            task_id="task-exited", command="echo done", exit_code=0,
+            task_id="task-exited",
+            command="echo done",
+            exit_code=0,
         )
     resident_child = ConversationStore(
         opened.store.session_dir / "agents", session_id="1"
@@ -417,13 +427,13 @@ def test_recovery_and_send_release_borrowed_child_stores(
             owner=loop._background_owner,
             channel=channel,
         ) is None
+        resident_child.close()
         await asyncio.to_thread(recover_agent_children, loop)
         await loop.close()
 
     asyncio.run(exercise())
     assert len(retained) == 2
     assert all(not store._release_lease.alive for store in retained)
-    resident_child.close()
     opened.store.close()
     manager.delete(opened.metadata.session_id)
 

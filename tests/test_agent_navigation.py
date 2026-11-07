@@ -22,7 +22,6 @@ from rich.text import Text
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -35,6 +34,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import agent_card
 from zeta.tui.agent_card import (

@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -24,14 +25,15 @@ from tests.test_server import (
     _frames_until_event,
     _read,
     _request,
-    _socket_path,
 )
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer, image_delivery
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 FEATURES = [
     "session_cwd",
@@ -704,7 +706,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
     heartbeat = asyncio.Event()
     heartbeat_reached_thread = threading.Event()
     decoded_after_heartbeat: list[bool] = []
-    original_decode = ergonomics.base64.b64decode
+    original_decode = image_delivery.base64.b64decode
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
@@ -712,7 +714,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
-    monkeypatch.setattr(ergonomics.base64, "b64decode", record_decode)
+    monkeypatch.setattr(image_delivery.base64, "b64decode", record_decode)
     output = io.BytesIO()
     Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
@@ -758,7 +760,7 @@ async def test_cancelled_send_images_publishes_nothing(
     worker_started = threading.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
-    original_normalize = ergonomics.normalize_image_bytes
+    original_normalize = image_delivery.normalize_image_bytes
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
@@ -768,7 +770,7 @@ async def test_cancelled_send_images_publishes_nothing(
         finally:
             worker_finished.set()
 
-    monkeypatch.setattr(ergonomics, "normalize_image_bytes", gated_normalize)
+    monkeypatch.setattr(image_delivery, "normalize_image_bytes", gated_normalize)
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -811,7 +813,7 @@ async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publication_threads: list[int] = []
-    original_publish = ergonomics.write_session_file
+    original_publish = image_delivery.write_session_file
     output = io.BytesIO()
     Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
     oversized = output.getvalue()
@@ -820,7 +822,7 @@ async def test_send_images_publication_is_off_event_loop(
         publication_threads.append(threading.get_ident())
         original_publish(*args, **kwargs)
 
-    monkeypatch.setattr(ergonomics, "write_session_file", record_publish)
+    monkeypatch.setattr(image_delivery, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
     server = _server(
         tmp_path, backend, _launch(tmp_path), provider="anthropic"
