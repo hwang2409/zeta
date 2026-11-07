@@ -11,6 +11,24 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_controller_snapshot_is_stable_and_production_readable(tmp_path: Path) -> None:
+    from scripts.eviction_replay_gate import _fixture_store, _snapshot_session
+
+    source_root = tmp_path / "source"
+    _fixture_store(source_root)
+    source = source_root / "fixture"
+    snapshot = tmp_path / "snapshot" / "fixture"
+    info = _snapshot_session(source, snapshot)
+    original = (snapshot / "conversation.jsonl").read_bytes()
+    with (source / "conversation.jsonl").open("ab") as handle:
+        handle.write(b'{"late":true}\n')
+    assert (snapshot / "conversation.jsonl").read_bytes() == original
+    assert info["row_count"] == 145
+    assert info["sha256"] == __import__("hashlib").sha256(original).hexdigest()
+
+
 def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--keep-private-artifacts", str(tmp_path / "artifacts")],

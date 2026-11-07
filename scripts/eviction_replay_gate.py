@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Replay deterministic eviction through production code without provider calls."""
+"""Replay deterministic eviction through production code without provider calls.
+
+Stored retained-floor violations are reported in the manifest but do not fail the
+ gate because they may have been written by earlier code. Violations appended by
+ the code under test fail with ``retained-floor bound check failed``. This split
+ lets the gate compare base against head without blocking sessions written before
+ the fix.
+"""
 from __future__ import annotations
 
 import argparse
@@ -70,13 +77,52 @@ def _normalize_entries(
     return result
 
 
+def _clone_file(source: Path, target: Path) -> None:
+    if sys.platform == "darwin" and shutil.which("cp"):
+        try:
+            subprocess.run(["cp", "-c", str(source), str(target)], check=True)
+            return
+        except subprocess.CalledProcessError:
+            pass
+    shutil.copy2(source, target)
+
+
 def _copy_session(source: Path, target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     for name in ("conversation.jsonl", "meta.json", "session_state.json"):
         source_file = source / name
         if source_file.exists():
-            shutil.copy2(source_file, target / name)
+            _clone_file(source_file, target / name)
     (target / ".lock").touch()
+
+
+def _snapshot_session(source: Path, target: Path) -> dict[str, int | str]:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    storage_format = Path.home() / ".zeta" / "storage-format.json"
+    if storage_format.exists():
+        _clone_file(storage_format, target.parent.parent / "storage-format.json")
+    for attempt in range(3):
+        if target.exists():
+            shutil.rmtree(target)
+        _copy_session(source, target)
+        try:
+            from zeta.core.store import ConversationStore
+
+            store = ConversationStore(target.parent, session_id=target.name, _read_only=True, _must_exist=True)
+            try:
+                row_count = len(store.replay())
+            finally:
+                store.close()
+            conversation = target / "conversation.jsonl"
+            return {
+                "row_count": row_count,
+                "sha256": hashlib.sha256(conversation.read_bytes()).hexdigest(),
+            }
+        except (OSError, ValueError, json.JSONDecodeError):
+            if attempt == 2:
+                raise
+            time.sleep(0.05)
+    raise AssertionError("unreachable")
 
 
 def _fixture_store(store_dir: Path) -> None:
@@ -303,9 +349,15 @@ def _run_in_scratch(args: argparse.Namespace, scratch: Path) -> int:
     started = time.monotonic()
     records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), args.timeout))
     import zeta
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    print(f"identity: head={head} zeta.__file__={Path(zeta.__file__).resolve()}", file=sys.stderr)
-    record = {"git_head": head, "limits": _production_limits(), "records": records, "elapsed_seconds": round(time.monotonic() - started, 3)}
+    zeta_file = Path(zeta.__file__).resolve()
+    try:
+        worktree = Path(subprocess.check_output(["git", "-C", str(zeta_file.parent), "rev-parse", "--show-toplevel"], text=True).strip())
+        head = subprocess.check_output(["git", "-C", str(worktree), "rev-parse", "HEAD"], text=True).strip()
+    except subprocess.CalledProcessError:
+        # Mutated fixture copies are intentionally not git worktrees.
+        head = "unversioned"
+    print(f"identity: head={head} zeta.__file__={zeta_file}", file=sys.stderr)
+    record = {"git_head": head, "records": records, "elapsed_seconds": round(time.monotonic() - started, 3), "limits": _production_limits()}
     print(json.dumps(record, sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -315,7 +367,14 @@ def run(args: argparse.Namespace) -> int:
         return _run_in_scratch(args, scratch.root)
 
 
-def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: Path, limits: dict[str, int] | None = None, timeout: float = 620) -> dict[str, Any] | None:
+def _worktree_head(worktree: str) -> str:
+    try:
+        return subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"], text=True).strip()
+    except subprocess.CalledProcessError:
+        return "unversioned"
+
+
+def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: Path, source: Path | None = None, limits: dict[str, int] | None = None, timeout: float = 620) -> dict[str, Any] | None:
     runner = Path(worktree) / "scripts/eviction_replay_gate.py"
     if not runner.exists():
         runner = Path(__file__).resolve()
@@ -329,7 +388,7 @@ def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: P
     if fixture:
         command.append("--fixture")
     else:
-        command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
+        command.extend(["--session", str(source or (Path.home() / ".zeta" / "sessions" / session))])
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment, start_new_session=True)
     print(f"child: label={label} pid={process.pid} pgid={process.pid}", file=sys.stderr)
     try:
@@ -349,10 +408,14 @@ def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: P
         return None
     record = json.loads(result.stdout.strip().splitlines()[-1])
     identity = next((line for line in result.stderr.splitlines() if line.startswith("identity: ")), "")
-    expected = str(Path(worktree).resolve())
-    if expected not in identity:
+    fields = dict(item.split("=", 1) for item in identity.removeprefix("identity: ").split(" ") if "=" in item)
+    zeta_file = Path(fields.get("zeta.__file__", "")).resolve()
+    expected = Path(worktree).resolve()
+    expected_head = _worktree_head(str(expected))
+    if not zeta_file.is_relative_to(expected / "src") or record.get("git_head") != expected_head:
         print(f"FAIL {session} {label}: identity outside expected worktree", file=sys.stderr)
         return None
+    print(f"identity checked: label={label} head={record['git_head']}", file=sys.stderr)
     return {"label": label, "record": record, "artifacts": scratch / "artifacts"}
 
 
@@ -384,15 +447,21 @@ def compare(args: argparse.Namespace) -> int:
         scratch_path = (Path(scratch_owner.name) if scratch_owner else Path(args.scratch_root) / session)
         scratch_path.mkdir(parents=True, exist_ok=True)
         try:
-            base = _run_side(session, "base", args.base, args.fixture, scratch_path / "base", timeout=args.timeout)
-            head = _run_side(session, "head", args.head, args.fixture, scratch_path / "head", base["record"]["limits"] if base else None, args.timeout)
+            snapshot = None
+            input_info = None
+            if not args.fixture:
+                source = Path.home() / ".zeta" / "sessions" / session
+                snapshot = scratch_path / "snapshot" / session
+                input_info = _snapshot_session(source, snapshot)
+            base = _run_side(session, "base", args.base, args.fixture, scratch_path / "base", source=snapshot, timeout=args.timeout)
+            head = _run_side(session, "head", args.head, args.fixture, scratch_path / "head", source=snapshot, limits=base["record"]["limits"] if base else None, timeout=args.timeout)
             if base is None or head is None:
                 return 1
             failure = _compare_artifacts(session, base, head)
             if failure:
                 print(f"FAIL {session}: {failure}", file=sys.stderr)
                 return 1
-            manifest["sessions"].append({"session": session, "base": base["record"], "head": head["record"], "status": "PASS"})
+            manifest["sessions"].append({"session": session, "input": input_info, "base": base["record"], "head": head["record"], "status": "PASS"})
             print(f"PASS {session} {base['record']['elapsed_seconds']}s/{head['record']['elapsed_seconds']}s")
         finally:
             if scratch_owner is not None:
