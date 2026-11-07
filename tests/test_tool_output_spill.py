@@ -44,6 +44,12 @@ def _store(tmp_path: Path, name: str = "session") -> ConversationStore:
     )
 
 
+async def _next_loop_turn() -> None:
+    resumed = asyncio.Event()
+    asyncio.get_running_loop().call_soon(resumed.set)
+    await asyncio.wait_for(resumed.wait(), 10)
+
+
 class _ByteStream(httpx.AsyncByteStream):
     def __init__(self, content: bytes) -> None:
         self.content = content
@@ -427,18 +433,13 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         async with fetch_tool._temporary_file(Spills()):
             raise AssertionError("cancelled acquisition yielded a handle")
 
-    async def next_loop_turn() -> None:
-        resumed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(resumed.set)
-        await asyncio.wait_for(resumed.wait(), 10)
-
     task = asyncio.create_task(use_temporary_file())
     try:
         assert await asyncio.to_thread(started.wait, 10)
         task.cancel()
-        await next_loop_turn()
+        await _next_loop_turn()
         task.cancel()
-        await next_loop_turn()
+        await _next_loop_turn()
         release.set()
         assert await asyncio.to_thread(entered.wait, 10)
         with pytest.raises(asyncio.CancelledError):
@@ -1059,7 +1060,7 @@ def test_cross_store_reclaim_cannot_deadlock_two_writers(tmp_path: Path) -> None
         def write_first() -> None:
             try:
                 first.write_bytes("tool", "new-first", 0, b"x")
-            except BaseException as exc:
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
                 failures.append(exc)
 
         def write_second() -> None:
@@ -1067,7 +1068,7 @@ def test_cross_store_reclaim_cannot_deadlock_two_writers(tmp_path: Path) -> None
                 second.write_group(
                     "tool", "new-second", {"0": [b"x"], "1": [b"y"]}
                 )
-            except BaseException as exc:
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
                 failures.append(exc)
 
         second_thread = threading.Thread(target=write_second, daemon=True)
@@ -1150,7 +1151,7 @@ async def test_read_after_cross_store_reclaim_reports_artifact_gone_and_repairs_
         def reclaim() -> None:
             try:
                 second.spills.write_bytes("tool", "replacement", 0, b"new")
-            except BaseException as exc:
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
                 failures.append(exc)
 
         thread = threading.Thread(target=reclaim)
@@ -1558,6 +1559,56 @@ async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
                     await write
             holder.join(timeout=10)
             spill.close()
+
+
+@pytest.mark.asyncio
+async def test_async_spill_double_cancel_joins_worker_before_close() -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    budget = spill_module.SpillByteBudget(max_bytes=minimum)
+    spill = SpillStore(byte_budget=budget)
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class GatedPart:
+        def __init__(self) -> None:
+            self._read = False
+
+        def seek(self, _offset: int) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            read_started.set()
+            assert release_read.wait(timeout=10)
+            return b"complete"
+
+    write = asyncio.create_task(spill.awrite_parts("async", "call", 0, [GatedPart()]))
+    try:
+        assert await asyncio.to_thread(read_started.wait, 10)
+        write.cancel()
+        await _next_loop_turn()
+        write.cancel()
+        await _next_loop_turn()
+
+        assert not write.done()
+        release_read.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(write, timeout=10)
+
+        retained = spill.retained_paths()
+        assert len(retained) == 1
+        assert retained[0].read_bytes() == b"complete"
+        assert budget._used_bytes == minimum
+        spill.close()
+        assert budget._used_bytes == 0
+    finally:
+        release_read.set()
+        if not write.done():
+            write.cancel()
+        await asyncio.gather(write, return_exceptions=True)
+        spill.close()
 
 
 @pytest.mark.asyncio

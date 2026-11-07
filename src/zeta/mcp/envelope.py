@@ -5,32 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from typing import BinaryIO
 
+from ..core.thread_call import run_owned_thread_call
 from ..tools._spill import SpillStore
 
 _SPILL_WRITE_SIZE = 64 * 1024
 _MEBIBYTE = 1024 * 1024
-
-
-async def _acquire_in_thread[T](
-    acquire: Callable[[], T], record: Callable[[T], None]
-) -> T:
-    worker = asyncio.create_task(asyncio.to_thread(acquire))
-    cancelled = False
-    while True:
-        try:
-            acquired = await asyncio.shield(worker)
-            break
-        except asyncio.CancelledError:
-            cancelled = True
-    record(acquired)
-    if cancelled:
-        raise asyncio.CancelledError
-    return acquired
 
 
 def _format_wire_limit(size: int) -> str:
@@ -89,14 +72,14 @@ class MCPCallEnvelope:
         if self._handle is None:
             reservation = self.total
             try:
-                await _acquire_in_thread(
+                await run_owned_thread_call(
                     partial(self.spill_store.reserve_transient, reservation),
                     lambda _result: self._record_reservation(reservation),
                 )
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
             temporary = self.spill_store.temporary_file()
-            await _acquire_in_thread(
+            await run_owned_thread_call(
                 temporary.__enter__,
                 lambda handle: self._record_temporary(temporary, handle),
             )
@@ -105,7 +88,7 @@ class MCPCallEnvelope:
         extra = self.total - self._reserved
         if extra:
             try:
-                await _acquire_in_thread(
+                await run_owned_thread_call(
                     partial(self.spill_store.reserve_transient, extra),
                     lambda _result: self._record_reservation(extra),
                 )
