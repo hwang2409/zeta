@@ -371,6 +371,7 @@ class NotificationStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
+        display_only: bool = False,
         report: dict[str, object] | None = None,
     ) -> tuple[ConversationEntry, bool]:
         """Atomically return the first completion notification or append one."""
@@ -385,6 +386,7 @@ class NotificationStateMixin:
             killed_task_count=killed_task_count,
             killed_task_ids_truncated=killed_task_ids_truncated,
             background_metadata=background_metadata,
+            display_only=display_only,
             report=report,
         )
         with self._append_lock():
