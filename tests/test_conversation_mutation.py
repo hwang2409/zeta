@@ -199,6 +199,7 @@ async def test_commit_async_defers_cancellation_until_delta_is_installed(
         return result
 
     # test-contract: seam pauses after the durable commit but before resident install
+    # test-contract: seam pauses after durable commit
     monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
     task = asyncio.create_task(
         store.commit_async(
@@ -219,7 +220,7 @@ async def test_commit_async_defers_cancellation_until_delta_is_installed(
         release.set()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await asyncio.to_thread(store.close)
 
     reopened = await asyncio.to_thread(
@@ -286,7 +287,7 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
         release.set()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await asyncio.to_thread(store.close)
 
 
@@ -469,6 +470,7 @@ async def test_address_commit_cancellation_after_resident_durable_commit(
         assert release.wait(10)
         return result
 
+    # test-contract: seam pauses after durable commit
     monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
     task = asyncio.create_task(
         commit_conversation_async(
@@ -488,7 +490,7 @@ async def test_address_commit_cancellation_after_resident_durable_commit(
         release.set()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await asyncio.to_thread(store.close)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
@@ -558,7 +560,7 @@ async def test_commit_async_cancel_before_lock_writes_nothing(
             store._async_write_lock.release()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await asyncio.to_thread(store.close)
 
 
@@ -580,6 +582,7 @@ async def test_commit_async_close_race_keeps_durable_result(
         assert release.wait(10)
         return result
 
+    # test-contract: seam pauses after durable commit
     monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
     task = asyncio.create_task(
         store.commit_async(
@@ -596,7 +599,7 @@ async def test_commit_async_close_race_keeps_durable_result(
         release.set()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(
         ConversationStore, tmp_path, session_id=store.session_id
     )
@@ -620,6 +623,7 @@ async def test_legacy_delta_patch_contains_only_declared_fields(
         observed.append(result[0])
         return result
 
+    # test-contract: seam captures the typed committed delta
     monkeypatch.setattr(store, "_run_committed_mutation", capture)
     try:
         await store._commit_method_async(store.append_pending_prompt, "declared")
@@ -690,9 +694,11 @@ async def test_address_concurrent_resident_commits_are_serialized(
         if first:
             first = False
             started.set()
+            # test-contract: seam holds the worker at an explicit event
             assert release.wait(10)
         return result
 
+    # test-contract: seam holds the first resident commit
     monkeypatch.setattr(store, "_run_committed_mutation", hold_first)
     address = ConversationAddress("project", "root", "root")
     tasks = [
@@ -717,7 +723,7 @@ async def test_address_concurrent_resident_commits_are_serialized(
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
         await asyncio.to_thread(store.close)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
@@ -751,6 +757,7 @@ async def test_address_transient_waiter_retries_after_owner_release(
         calls += 1
         if calls == 1:
             entered.set()
+            # test-contract: seam holds the worker at an explicit event
             assert release.wait(10)
         return original(self, command, generation)
 
@@ -775,7 +782,9 @@ async def test_address_transient_waiter_retries_after_owner_release(
         for task in (owner, waiter):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(owner, waiter, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(owner, waiter, return_exceptions=True), 10
+        )
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert sorted(entry.data["message"] for entry in reopened.entries) == [
