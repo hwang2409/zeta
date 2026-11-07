@@ -198,10 +198,11 @@ class StreamDiagnostics:
 
 
 def _write_cleanup_failure(path: Path, record: Mapping[str, Any]) -> None:
-    write_stream_diagnostic(
+    if not write_stream_diagnostic(
         path,
         {"timestamp": time.time(), **record, **fd_diagnostics()},
-    )
+    ):
+        raise OSError("cleanup diagnostic write failed")
 
 
 def write_stream_diagnostic(
@@ -209,14 +210,14 @@ def write_stream_diagnostic(
     record: Mapping[str, Any],
     *,
     max_bytes: int | None = None,
-) -> None:
-    """Append one bounded record without affecting stream handling."""
+) -> bool:
+    """Append one bounded record and report whether the write succeeded."""
 
     try:
         cap = STREAM_DIAGNOSTICS_MAX_BYTES if max_bytes is None else max_bytes
         encoded = _encode_record(record, cap)
         if not encoded:
-            return
+            return True
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)
         if path.exists() and path.stat().st_size + len(encoded) > cap:
@@ -227,7 +228,8 @@ def write_stream_diagnostic(
             handle.write(encoded)
         os.chmod(path, 0o600)
     except OSError:
-        return
+        return False
+    return True
 
 
 def _encode_record(record: Mapping[str, Any], cap: int) -> bytes:

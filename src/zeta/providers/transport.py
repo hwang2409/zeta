@@ -30,6 +30,9 @@ DEFAULT_STREAM_STALL_SECONDS = 90.0  # Transport idle, including missing keepali
 MODEL_PROGRESS_STALL_SECONDS = 15 * 60.0
 DEFAULT_STREAM_STALL_RETRIES = 2
 _BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
+_BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
+_MAX_BACKGROUND_CLEANUP_REPORTS = 16
+_dropped_cleanup_reports = 0
 CloseFailureReporter = Callable[[int, BaseException], None]
 
 
@@ -112,14 +115,24 @@ async def _report_cleanup_failure(
         index=index,
         primary_exception=primary_exception,
     )
-    await StreamDiagnostics.record_cleanup_failure(
-        diagnostics_path,
-        provider=provider,
-        stage=stage,
-        index=index,
-        exception_type=str(context["exception_type"]),
-        primary_outcome=str(context["primary_outcome"]),
-    )
+    try:
+        await StreamDiagnostics.record_cleanup_failure(
+            diagnostics_path,
+            provider=provider,
+            stage=stage,
+            index=index,
+            exception_type=str(context["exception_type"]),
+            primary_outcome=str(context["primary_outcome"]),
+        )
+    except asyncio.CancelledError:
+        raise
+    except BaseException as diagnostic_error:
+        _report_loop_cleanup_failure(
+            diagnostic_error,
+            stage=f"{stage}_diagnostic",
+            index=index,
+            primary_exception=primary_exception,
+        )
 
 
 def _release_background_close(
@@ -162,6 +175,16 @@ def _schedule_cleanup_failure(
     diagnostics_path: Path | None,
     provider: str,
 ) -> None:
+    global _dropped_cleanup_reports
+    if len(_BACKGROUND_CLEANUP_REPORT_TASKS) >= _MAX_BACKGROUND_CLEANUP_REPORTS:
+        _dropped_cleanup_reports += 1
+        _report_loop_cleanup_failure(
+            RuntimeError(),
+            stage=f"{stage}_diagnostic_dropped",
+            index=_dropped_cleanup_reports,
+            primary_exception=primary_exception,
+        )
+        return
     task = asyncio.create_task(
         _report_cleanup_failure(
             error,
@@ -172,6 +195,8 @@ def _schedule_cleanup_failure(
             provider=provider,
         )
     )
+    _BACKGROUND_CLEANUP_REPORT_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_CLEANUP_REPORT_TASKS.discard)
     _retain_background_closes((task,), None)
 
 
