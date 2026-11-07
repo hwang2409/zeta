@@ -4,7 +4,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 JOB = ROOT / "scripts/ci_merge_resolution.sh"
 CHECKER = ROOT / "scripts/check_merge_resolution.py"
