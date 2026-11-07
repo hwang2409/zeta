@@ -371,6 +371,7 @@ async def test_parent_and_child_approval_decision_paths(
             if state == "approval_start":
                 approval_started.set()
 
+        # test-contract: seam no public approval-start readiness event
         execution = asyncio.create_task(
             registry.execute(call, _lifecycle_sink=publish_approval_state)
         )

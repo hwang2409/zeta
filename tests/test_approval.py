@@ -41,6 +41,7 @@ async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
 
 
+# test-contract: seam no public approval-start readiness event
 def _approval_started_sink(started: asyncio.Event) -> Callable[[str], None]:
     def publish(state: str) -> None:
         if state == "approval_start":
