@@ -68,8 +68,8 @@ async def test_off_loop_resource_has_one_owner(
     resources: list[_TrackedResource] = []
     registry: ToolRegistry | None = None
     task: asyncio.Task[Any] | None = None
-    task_ready = threading.Event()
-    target_task: list[asyncio.Task[Any]] = []
+    controlled_worker: asyncio.Future[_TrackedResource] | None = None
+    controlled_result: list[_TrackedResource] = []
     event_loop = asyncio.get_running_loop()
 
     def acquire(name: str = "resource") -> _TrackedResource:
@@ -82,20 +82,28 @@ async def test_off_loop_resource_has_one_owner(
             resource.close()
             raise RuntimeError("acquire failed")
         finished.set()
-        if scenario == "cancel_after_finish":
-            assert task_ready.wait(10)
-            event_loop.call_soon_threadsafe(target_task[0].cancel)
         return resource
 
     try:
         if route == "helper":
             from zeta.core.thread_call import run_owned_thread_call
 
+            if scenario == "cancel_after_finish":
+                controlled_worker = event_loop.create_future()
+
+                def run_controlled(_executor: object, function: Any) -> Any:
+                    controlled_result.append(function())
+                    return controlled_worker
+
+                # test-contract: seam finish the worker future before its result is used.
+                monkeypatch.setattr(event_loop, "run_in_executor", run_controlled)
             task = asyncio.create_task(
                 run_owned_thread_call(acquire, _TrackedResource.close)
             )
-            target_task.append(task)
-            task_ready.set()
+            if controlled_worker is not None:
+                await asyncio.sleep(0)
+                controlled_worker.set_result(controlled_result[0])
+                task.cancel()
         else:
             registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
             if route == "cwd_bind":
@@ -162,8 +170,7 @@ async def test_off_loop_resource_has_one_owner(
                 await asyncio.wait_for(task, 10)
         else:
             if scenario == "cancel_after_finish":
-                # test-contract: seam cancel after acquisition, before worker publication.
-                assert await asyncio.to_thread(finished.wait, 10)
+                assert finished.is_set()
             else:
                 assert await asyncio.to_thread(started.wait, 10)
                 task.cancel()
