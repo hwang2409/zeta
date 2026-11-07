@@ -181,9 +181,7 @@ def test_fd_guard_rejects_cumulative_small_leaks(
 
 
 @pytest.mark.parametrize("reachable", [False, True])
-def test_fd_guard_counts_only_reachable_owners(
-    tmp_path: Path, reachable: bool
-) -> None:
+def test_fd_guard_counts_only_reachable_owners(tmp_path: Path, reachable: bool) -> None:
     probe = tmp_path / "probe"
     probe.mkdir()
     for name in ("conftest.py", "sitecustomize.py"):
@@ -205,14 +203,11 @@ def test_fd_guard_counts_only_reachable_owners(
         "@pytest.fixture(autouse=True)\n"
         "def retain_fds():\n"
         "    yield\n"
-        "    owner = Owner()\n"
-        + ("    LIVE.append(owner)\n" if reachable else ""),
+        "    owner = Owner()\n" + ("    LIVE.append(owner)\n" if reachable else ""),
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_first(): pass\n"
-        "def test_second(): pass\n"
-        "def test_third(): pass\n",
+        "def test_first(): pass\ndef test_second(): pass\ndef test_third(): pass\n",
         encoding="utf-8",
     )
 
