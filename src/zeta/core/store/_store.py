@@ -8,11 +8,16 @@ import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
 import threading
-import time
+import time  # noqa: F401 - re-exported by the compatibility store facade
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
 import weakref
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import (  # noqa: F401 - re-exported by store facade
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from contextlib import (  # noqa: F401 - re-exported by the store facade
     ExitStack,
     contextmanager,
@@ -57,6 +62,7 @@ from ._approval_history import ApprovalHistoryStoreMixin, validate_approval_hist
 from ._async_writes import AsyncDurableWritesMixin
 from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
+from ._execution_owner import ExecutionOwnerStoreMixin
 from ._incremental_validation import (
     IncrementalValidationMixin,
     validate_approval_reason,
@@ -66,7 +72,7 @@ from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
-    PendingPromptCommitTimeoutError,
+    PendingPromptCommitTimeoutError,  # noqa: F401 - re-exported by store facade
     PendingPromptQueue,
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
@@ -96,6 +102,7 @@ class ConversationStore(
     IncrementalValidationMixin,
     NotificationStateMixin,
     session_execution.StoreRuntimeLeaseMixin,
+    ExecutionOwnerStoreMixin,
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
@@ -587,51 +594,6 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"invalid payload for conversation entry {entry.id}"
             ) from exc
-
-    @contextmanager
-    def _append_lock(
-        self,
-        *,
-        deadline: float | None = None,
-        wait: bool = True,
-        observer: bool = False,
-    ) -> Iterator[bool]:
-        """Lock and synchronize the log before exposing resident state."""
-        if self._closed:
-            raise ValueError("session store is closed")
-        if not observer:
-            self.assert_execution_owner()
-        with os.fdopen(
-            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
-        ) as handle:
-            if deadline is None:
-                try:
-                    fcntl.flock(
-                        handle.fileno(),
-                        fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB,
-                    )
-                except BlockingIOError:
-                    yield False
-                    return
-            else:
-                while True:
-                    if time.monotonic() >= deadline:
-                        raise PendingPromptCommitTimeoutError(
-                            "pending prompt commit deadline exceeded"
-                        )
-                    try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        time.sleep(max(0, min(0.01, deadline - time.monotonic())))
-                    else:
-                        break
-            self._start_entries_installed()
-            try:
-                self._load()
-                yield True
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                self._finish_entries_installed()
 
     @staticmethod
     def _validate_notification_write(entry_type: str, data: Mapping[str, Any]) -> None:
