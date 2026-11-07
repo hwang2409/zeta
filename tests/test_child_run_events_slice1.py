@@ -347,7 +347,7 @@ def test_agent_card_receipt_shows_identity_and_clean_state(tmp_path: Path) -> No
     )
     assert rendered is not None
     assert rendered.plain == (
-        "general · child :1 · 2 turns · 1.5s · completed · depth 1 · gpt-5.6-luna · done"
+        "general · child :1 · 2 turns · 1.5s · completed · depth 1 · 3 tool calls · gpt-5.6-luna · done"
     )
     child.close()
 

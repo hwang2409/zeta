@@ -408,11 +408,16 @@ class AgentCard:
             ),
         )
         canonical_receipt = has_agent_receipt_suffix(result.content)
-        receipt_answer = (
-            result.content.rsplit(" · ", 5)[0]
-            if canonical_receipt
-            else result.content
-        )
+        receipt_parts = result.content.rsplit(" · ", 5) if canonical_receipt else []
+        receipt_answer = receipt_parts[0] if canonical_receipt else result.content
+        tool_calls = lifecycle.get("tool_calls") if lifecycle else None
+        if type(tool_calls) is not int or tool_calls < 0:
+            tool_calls_text = receipt_parts[3] if canonical_receipt else ""
+            tool_calls = (
+                int(tool_calls_text.removesuffix(" tool calls"))
+                if tool_calls_text.removesuffix(" tool calls").isdigit()
+                else None
+            )
         agent_type = cls._agent_type(call)
         description = structured.get("description", cls._description(call))
         fields = [str(description)]
@@ -429,6 +434,8 @@ class AgentCard:
                 f"depth {display_depth}",
             )
         )
+        if tool_calls is not None:
+            fields.append(f"{tool_calls} tool calls")
         model = structured.get("model", cls._model(call))
         if isinstance(model, str) and model:
             fields.append(model)
