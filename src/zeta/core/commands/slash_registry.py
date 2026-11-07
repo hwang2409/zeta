@@ -15,7 +15,7 @@ from ...model_input import ModelInputEnvelope, skill_model_input
 from ...protocol.types import MessageOrigin
 from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
 from ...skills.invocation import dollar_skill_mentions
-from ..slash_errors import unknown_slash_command
+from .slash_errors import unknown_slash_command
 from .custom_commands import (
     CustomCommand,
     InlineShellRunner,

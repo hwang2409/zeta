@@ -6,7 +6,7 @@ import difflib
 from collections.abc import Iterable
 from pathlib import Path
 
-from ..mcp.prompt_commands import SlashPromptError
+from ...mcp.prompt_commands import SlashPromptError
 
 
 async def unknown_slash_command(
