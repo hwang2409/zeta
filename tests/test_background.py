@@ -13,7 +13,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import AsyncIterator, Sequence
 from io import StringIO
 from pathlib import Path
@@ -2100,8 +2099,8 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         tmp_path,
     )
     child_pid = await read_pid_file(child_pid_file)
-    second_snapshot_started = asyncio.Event()
-    release_second_snapshot = asyncio.Event()
+    second_snapshot_started = threading.Event()
+    release_second_snapshot = threading.Event()
     original_snapshot = spawn_module._snapshot_descendants_sync
     snapshot_calls = 0
 
@@ -2110,16 +2109,16 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         snapshot_calls += 1
         if snapshot_calls == 2:
             second_snapshot_started.set()
-            while not release_second_snapshot.is_set():
-                time.sleep(0.001)
+            assert release_second_snapshot.wait(timeout=10)
         return original_snapshot(root_pids)
 
+    # test-contract: seam BackgroundTaskRegistry has no public descendant-snapshot event
     monkeypatch.setattr(
         spawn_module, "_snapshot_descendants_sync", blocked_second_snapshot
     )
     killing = asyncio.create_task(tasks.kill(task_id))
     try:
-        await second_snapshot_started.wait()
+        assert await asyncio.to_thread(second_snapshot_started.wait, 10)
         killing.cancel()
         release_second_snapshot.set()
         with pytest.raises(asyncio.CancelledError):
