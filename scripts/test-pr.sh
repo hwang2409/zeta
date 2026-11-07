@@ -51,8 +51,8 @@ dirty_digest=$( {
 } | sha256sum | cut -d' ' -f1 )
 
 changed=$( {
-    git diff --name-only "$(git merge-base origin/main HEAD)"
-    git diff --name-only
+    git diff --diff-filter=ACMRTUXB --name-only "$(git merge-base origin/main HEAD)"
+    git diff --diff-filter=ACMRTUXB --name-only
     git ls-files --others --exclude-standard -- tests
 } | awk '$0 ~ "^tests/.*test_[^/]*[.]py$"' | sort -u )
 
@@ -83,7 +83,7 @@ run() {
     command="$*"
     printf '\ncommand: %s\n' "$command" | tee -a "$record"
     set +e
-    output=$($@ 2>&1)
+    output=$("$@" 2>&1)
     status=$?
     set -e
     printf '%s\n' "$output"
