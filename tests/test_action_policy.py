@@ -167,43 +167,65 @@ async def test_policy_authorizes_resolved_capability_only(tmp_path: Path) -> Non
     assert not result["isError"]
 
 
+_SCHEMA_DOCUMENTATION_KEYS = frozenset(
+    {"$comment", "description", "example", "examples", "title"}
+)
+_SCHEMA_STRUCTURE_KEYS = frozenset({"items", "properties", "required", "type"})
+
+
+def _without_schema_documentation(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _without_schema_documentation(child)
+            for key, child in value.items()
+            if key not in _SCHEMA_DOCUMENTATION_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_schema_documentation(child) for child in value]
+    return value
+
+
 def _provider_schema_contract(schema: dict[str, object]) -> dict[str, object]:
-    assert schema.get("type") == "object"
-    assert schema.get("additionalProperties") is False
     types: dict[str, object] = {}
     required: list[str] = []
-    actions: dict[str, object] = {}
+    constraints: dict[str, object] = {}
 
     def visit(value: object, path: str) -> None:
-        assert isinstance(value, dict)
-        if value.get("type") == "object":
-            assert value.get("additionalProperties") is False
+        assert isinstance(value, dict), path
         types[path] = value.get("type", "unconstrained")
         for field in value.get("required", []):
             required.append(f"{path}.{field}" if path else field)
+        for key, child in value.items():
+            if key in _SCHEMA_DOCUMENTATION_KEYS | _SCHEMA_STRUCTURE_KEYS:
+                continue
+            constraint_path = f"{path}.{key}" if path else key
+            constraints[constraint_path] = _without_schema_documentation(child)
         properties = value.get("properties", {})
-        assert isinstance(properties, dict)
+        assert isinstance(properties, dict), path
         for field, child in properties.items():
             child_path = f"{path}.{field}" if path else field
             visit(child, child_path)
-            if field == "action":
-                assert isinstance(child, dict)
-                actions[child_path] = child.get("enum")
         if "items" in value:
             visit(value["items"], f"{path}[]")
 
     visit(schema, "")
     del types[""]
-    return {"types": types, "required": sorted(required), "actions": actions}
+    return {
+        "types": types,
+        "required": sorted(required),
+        "constraints": constraints,
+    }
 
 
 def _expected_provider_contract(
-    types: str, required: str = "", actions: str = ""
+    types: str,
+    required: str = "",
+    constraints: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "types": dict(item.split("=", 1) for item in types.split()),
         "required": sorted(required.split()),
-        "actions": {"action": actions.split()} if actions else {},
+        "constraints": {"additionalProperties": False, **(constraints or {})},
     }
 
 
@@ -216,19 +238,66 @@ _EXPECTED_PROVIDER_TOOL_CONTRACTS = {
                 "model=string preset=string prompt=string"
             ),
             "description prompt",
+            {
+                "agent_type.enum": ["general", "explore", "plan", "run"],
+                "preset.enum": ["general", "explore", "plan", "run"],
+                "model.enum": [
+                    "claude-fable-5",
+                    "claude-haiku-4-5",
+                    "claude-haiku-4-5-20251001",
+                    "claude-opus-4-5",
+                    "claude-opus-4-6",
+                    "claude-opus-4-7",
+                    "claude-opus-4-8",
+                    "claude-opus-5",
+                    "claude-opus-5-5",
+                    "claude-sonnet-4-5-20250929",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-5",
+                    "codex-auto-review",
+                    "gpt-5.3-codex-spark",
+                    "gpt-5.4",
+                    "gpt-5.4-mini",
+                    "gpt-5.5",
+                    "gpt-5.6-luna",
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-reserve",
+                    "qwen3:4b",
+                    "qwen3:4b-instruct",
+                ],
+            },
         ),
-        "agent_cancel": ("handle=string", "handle"),
-        "agent_output": ("handle=string limit=integer offset=integer", "handle"),
+        "agent_cancel": ("handle=string", "handle", {"handle.minLength": 1}),
+        "agent_output": (
+            "handle=string limit=integer offset=integer",
+            "handle",
+            {"handle.minLength": 1, "limit.minimum": 1, "offset.minimum": 0},
+        ),
         "agent_send": (
             "child_instance_id=string message=string",
             "child_instance_id message",
+            {"child_instance_id.minLength": 1, "message.minLength": 1},
         ),
-        "agent_status": ("handle=string limit=integer offset=integer",),
+        "agent_status": (
+            "handle=string limit=integer offset=integer",
+            "",
+            {"limit.minimum": 1, "offset.minimum": 0},
+        ),
         "bash": (
             (
                 "cmd=string command=string cwd=unconstrained max_output=integer "
                 "timeout=number"
             ),
+            "",
+            {
+                "cmd.minLength": 1,
+                "command.minLength": 1,
+                "max_output.maximum": 1048576,
+                "max_output.minimum": 1,
+                "timeout.exclusiveMinimum": 0,
+                "timeout.maximum": 3600.0,
+            },
         ),
         "edit": (
             (
@@ -237,39 +306,101 @@ _EXPECTED_PROVIDER_TOOL_CONTRACTS = {
                 "path=string"
             ),
             "edits[].new_string edits[].old_string path",
+            {
+                "edits.maxItems": 50,
+                "edits.minItems": 1,
+                "edits[].additionalProperties": False,
+                "edits[].old_string.minLength": 1,
+                "path.minLength": 1,
+            },
         ),
-        "fetch": ("max_bytes=integer offset=integer url=string", "url"),
+        "fetch": (
+            "max_bytes=integer offset=integer url=string",
+            "url",
+            {
+                "max_bytes.maximum": 104857600,
+                "max_bytes.minimum": 1,
+                "offset.minimum": 0,
+                "url.minLength": 1,
+            },
+        ),
         "mcp_discover": (
             "action=string names=array names[]=string query=string server=string uri=string",
             "",
-            "search activate resources read_resource",
+            {"action.enum": ["search", "activate", "resources", "read_resource"]},
         ),
-        "project": ("action=string", "", "inspect sessions"),
-        "read": ("limit=integer offset=integer path=string", "path"),
+        "project": (
+            "action=string",
+            "",
+            {"action.enum": ["inspect", "sessions"]},
+        ),
+        "read": (
+            "limit=integer offset=integer path=string",
+            "path",
+            {"limit.minimum": 1, "offset.minimum": 0, "path.minLength": 1},
+        ),
         "recall_history": (
             (
                 "max_chars=integer offset=integer query=string seq_end=integer "
                 "seq_start=integer"
             ),
+            "",
+            {
+                "max_chars.maximum": 20000,
+                "max_chars.minimum": 1,
+                "offset.minimum": 0,
+                "seq_end.minimum": 1,
+                "seq_start.minimum": 1,
+            },
         ),
         "resolve_attention": (
             "attention_id=string decision=string",
             "attention_id decision",
         ),
-        "run_background": ("command=string cwd=unconstrained", "command"),
-        "session_push": ("host=string", "host"),
-        "skill": ("name=string", "name"),
-        "task_input": ("data=string eof=boolean task_id=string", "task_id"),
-        "task_kill": ("task_id=string", "task_id"),
-        "task_output": ("since=integer task_id=string", "task_id"),
+        "run_background": (
+            "command=string cwd=unconstrained",
+            "command",
+            {"command.minLength": 1},
+        ),
+        "session_push": ("host=string", "host", {"host.minLength": 1}),
+        "skill": ("name=string", "name", {"name.minLength": 1}),
+        "task_input": (
+            "data=string eof=boolean task_id=string",
+            "task_id",
+            {"task_id.minLength": 1},
+        ),
+        "task_kill": (
+            "task_id=string",
+            "task_id",
+            {"task_id.minLength": 1},
+        ),
+        "task_output": (
+            "since=integer task_id=string",
+            "task_id",
+            {"since.minimum": 0, "task_id.minLength": 1},
+        ),
         "todo": (
             "items=array items[]=object items[].content=string items[].status=string",
             "items[].content items[].status",
+            {
+                "items[].additionalProperties": False,
+                "items[].status.enum": [
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "canceled",
+                ],
+            },
         ),
-        "websearch": ("max_results=integer query=string", "query"),
+        "websearch": (
+            "max_results=integer query=string",
+            "query",
+            {"max_results.minimum": 1, "query.minLength": 1},
+        ),
         "write": (
             "content=string create_parents=boolean path=string",
             "content path",
+            {"path.minLength": 1},
         ),
     }.items()
 }
@@ -283,17 +414,24 @@ def test_existing_tool_payloads_keep_semantic_provider_contracts(
     existing_schemas = [
         schema for schema in registry.schemas if schema["name"] != "request_attention"
     ]
-    anthropic = build_request_payload(
+    anthropic_payload = build_request_payload(
         messages,
         existing_schemas,
         model="claude-test",
         max_tokens=2048,
         thinking_budget=1024,
-    )["tools"]
-    codex = build_responses_payload(messages, existing_schemas, model="codex-test")[
-        "tools"
-    ]
+    )
+    codex_payload = build_responses_payload(
+        messages, existing_schemas, model="codex-test"
+    )
+    anthropic = anthropic_payload["tools"]
+    codex = codex_payload["tools"]
     ollama = ollama_tools(existing_schemas)
+
+    assert "tool_choice" not in anthropic_payload
+    assert "parallel_tool_calls" not in anthropic_payload
+    assert codex_payload["tool_choice"] == "auto"
+    assert codex_payload["parallel_tool_calls"] is True
 
     assert all(
         set(tool) == {"name", "input_schema", "description"} for tool in anthropic[:-1]
