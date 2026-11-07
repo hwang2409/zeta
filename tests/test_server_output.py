@@ -15,10 +15,11 @@ from tests import test_server_websocket as websocket
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _socket_path
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
 from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
+from zeta.server import control as control_module
 from zeta.server import server as server_module
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
@@ -291,6 +292,199 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         if new_writer is not None:
             new_writer.close()
             await new_writer.wait_closed()
+        await asyncio.wait_for(server.close(), 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_controller_handoff_deadline_refuses_then_replays_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Transport,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    old_reader, old_writer = await _connect(server, transport, "controller")
+    release_entered = asyncio.Event()
+    release_gate = asyncio.Event()
+    old_output_entered = asyncio.Event()
+    old_output_gate = asyncio.Event()
+    rejected_released = asyncio.Event()
+    old_frames_after_fence: list[dict[str, Any]] = []
+    original_release = server.control._controller_release
+    original_registry_release = server.connections.release
+    original_write = _Client._write_physical
+    old_state: Any = None
+    old_publish: asyncio.Task[bool] | None = None
+    rejected_writer: asyncio.StreamWriter | None = None
+    replay_writer: asyncio.StreamWriter | None = None
+    fenced = False
+
+    def gated_release(reconnect: bool) -> Awaitable[None]:
+        operation = original_release(reconnect)
+
+        async def wait() -> None:
+            await operation
+            release_entered.set()
+            await asyncio.wait_for(release_gate.wait(), 10)
+
+        return wait()
+
+    async def tracked_write(client: _Client, payload: bytes) -> bool:
+        frame = json.loads(payload)
+        if (
+            old_state is not None
+            and client is old_state.connection
+            and frame.get("params", {}).get("delta") == "old-controller"
+        ):
+            old_output_entered.set()
+            await asyncio.wait_for(old_output_gate.wait(), 10)
+        if fenced and client is old_state.connection:
+            old_frames_after_fence.append(frame)
+        return await original_write(client, payload)
+
+    def tracked_release(connection: object) -> None:
+        original_registry_release(connection)
+        if old_state is not None and connection is not old_state.connection:
+            rejected_released.set()
+
+    # test-contract: seam hold the real semantic handoff past its production bound
+    monkeypatch.setattr(server.control, "_controller_release", gated_release)
+    # test-contract: seam observe the rejected controller slot release without polling
+    monkeypatch.setattr(server.connections, "release", tracked_release)
+    # test-contract: seam observe raw old-controller writes after the output fence
+    monkeypatch.setattr(_Client, "_write_physical", tracked_write)
+    try:
+        hello = await _rpc(
+            old_reader,
+            old_writer,
+            transport,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["approval_reconnect"],
+            },
+        )
+        assert hello["result"]["server"] == "zeta"
+        old_state = next(iter(server.connections._connections.values()))
+        await _rpc(
+            old_reader,
+            old_writer,
+            transport,
+            2,
+            "new_session",
+            {"provider": "codex"},
+        )
+        await _rpc(
+            old_reader,
+            old_writer,
+            transport,
+            3,
+            "send",
+            {"text": "read it"},
+        )
+        approval = await _event(old_reader, transport, "approval_request")
+        assert approval["request_id"] == call.id
+
+        old_publish = asyncio.create_task(
+            server.connections.publish_controller(
+                EventDescriptor.ASSISTANT_DELTA,
+                server.runtime.session_id,
+                delta="old-controller",
+            )
+        )
+        await asyncio.wait_for(old_output_entered.wait(), 10)
+        old_writer.close()
+        await old_writer.wait_closed()
+        await asyncio.wait_for(release_entered.wait(), 10)
+        assert server.connections.controller_metadata() is None
+        fenced = True
+
+        rejected_reader, rejected_writer = await _connect(
+            server, transport, "controller", start=False
+        )
+        monkeypatch.setattr(
+            control_module,
+            "CONTROLLER_HANDOFF_DEADLINE_SECONDS",
+            0.0,
+            raising=False,
+        )
+        rejected = await _rpc(
+            rejected_reader,
+            rejected_writer,
+            transport,
+            4,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["approval_reconnect"],
+            },
+        )
+        assert type(rejected["error"]["code"]) is int
+        assert rejected["error"] == {
+            "code": -32001,
+            "message": "another client is already connected",
+        }
+        await asyncio.wait_for(rejected_released.wait(), 10)
+        assert server.connections.controller_metadata() is None
+
+        old_output_gate.set()
+        assert old_publish is not None
+        assert not await asyncio.wait_for(old_publish, 10)
+        assert await _read_or_close(old_reader, transport) is None
+        assert old_frames_after_fence == []
+
+        monkeypatch.setattr(control_module, "CONTROLLER_HANDOFF_DEADLINE_SECONDS", 10.0)
+        release_gate.set()
+        release = server.control._controller_release_task
+        assert release is not None
+        await asyncio.wait_for(asyncio.shield(release), 10)
+
+        replay_reader, replay_writer = await _connect(
+            server, transport, "controller", start=False
+        )
+        replay_hello = await _rpc(
+            replay_reader,
+            replay_writer,
+            transport,
+            5,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["approval_reconnect"],
+            },
+        )
+        assert replay_hello["result"]["server"] == "zeta"
+        replay = await _read_json(replay_reader, transport)
+        assert replay["params"]["event"] == "approval_request"
+        assert replay["params"]["request_id"] == call.id
+    finally:
+        release_gate.set()
+        old_output_gate.set()
+        if old_publish is not None and not old_publish.done():
+            old_publish.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(old_publish, 10)
+        for writer in (rejected_writer, replay_writer):
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
         await asyncio.wait_for(server.close(), 10)
 
 

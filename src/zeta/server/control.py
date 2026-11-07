@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
+CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
 
@@ -282,19 +283,24 @@ class ServeControl:
 
     async def controller_claimed(
         self, *, reconnect: bool = False, require_host_binding: bool = False
-    ) -> None:
+    ) -> bool:
         release = self._controller_release_task
         if release is not None:
-            await asyncio.shield(release)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
+                )
+            except TimeoutError:
+                return False
             if self._controller_release_task is release:
                 self._controller_release_task = None
         self._host_binding_required |= require_host_binding
         task = self._grace_task
         if task is None:
-            return
+            return True
         if self._grace_expiring:
             await asyncio.shield(task)
-            return
+            return True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
@@ -303,6 +309,7 @@ class ServeControl:
         else:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
+        return True
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:

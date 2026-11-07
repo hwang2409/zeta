@@ -400,6 +400,8 @@ class _Client:
                             exc.data,
                         )
                     )
+                    if not self.handshaken:
+                        self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
                     await self._write(
@@ -530,13 +532,19 @@ class _Client:
         if method == "hello":
             result = self._hello(params)
             if self.role == "controller":
-                self.server._client_active = True
-                self.server._client = self
                 reconnect = "approval_reconnect" in self.features
-                await self.server.control.controller_claimed(
+                claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                if not claimed:
+                    self.handshaken = False
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY,
+                        "another client is already connected",
+                    )
+                self.server._client_active = True
+                self.server._client = self
                 self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
