@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import stat
@@ -518,6 +519,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
+    previous_count = (
+        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
+    )
+    if previous_count is not None and len(after) > previous_count:
+        gc.collect()
+        after = _open_file_descriptors()
     _update_fd_owners(after, item.nodeid)
     added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
     grouped = _group_fds_by_path_prefix(added)
@@ -581,7 +588,9 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    gc.collect()
     end = _open_file_descriptors()
+    _update_fd_owners(end, "session-finish")
     _FD_RETAINED_COUNTS.append(len(end))
     start = _FD_START_COUNT if _FD_START_COUNT is not None else len(end)
     growth = len(end) - start
