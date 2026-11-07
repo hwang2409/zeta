@@ -124,9 +124,9 @@ async def _report_cleanup_failure(
             exception_type=str(context["exception_type"]),
             primary_outcome=str(context["primary_outcome"]),
         )
-    except asyncio.CancelledError:
-        raise
     except BaseException as diagnostic_error:
+        if is_control_exception(diagnostic_error):
+            raise
         _report_loop_cleanup_failure(
             diagnostic_error,
             stage=f"{stage}_diagnostic",

@@ -281,6 +281,7 @@ async def test_cleanup_diagnostic_failure_preserves_primary_and_is_secret_safe(
         "record_cleanup_failure",
         fail_diagnostic_write,
     )
+    # test-contract: seam capture the real TUI handler's diagnostic record
     monkeypatch.setattr(
         loop_errors_module,
         "_schedule_diagnostic",
@@ -324,6 +325,42 @@ async def test_cleanup_diagnostic_failure_preserves_primary_and_is_secret_safe(
     assert diagnostic_canary not in logged
     assert "primary-provider-secret-canary" not in rendered
     assert "primary-provider-secret-canary" not in logged
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_generator_exit_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts: list[dict[str, object]] = []
+
+    async def exit_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise GeneratorExit
+
+    monkeypatch.setattr(
+        stream_diagnostics_module.StreamDiagnostics,
+        "record_cleanup_failure",
+        exit_diagnostic_write,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    try:
+        with pytest.raises(GeneratorExit):
+            await cleanup_transport(
+                stream_context=None,
+                entered=False,
+                client=_FailingCloseClient(),
+                owns_client=True,
+                primary_exception=ValueError("primary-provider-secret-canary"),
+                http_error_type=RuntimeError,
+                diagnostics_path=tmp_path / "provider.jsonl",
+                provider="test-provider",
+            )
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert contexts == []
 
 
 @pytest.mark.asyncio
@@ -429,6 +466,7 @@ async def test_detached_cleanup_diagnostics_are_bounded_when_writes_stall(
         assert len(contexts) == 1
         assert contexts[0]["exception_type"] == "builtins.RuntimeError"
         assert contexts[0]["stage"] == "client_diagnostic_dropped"
+        assert contexts[0]["index"] == 1
         assert "cleanup-secret-canary" not in repr(contexts)
     finally:
         release_reports.set()
