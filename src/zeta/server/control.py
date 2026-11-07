@@ -123,6 +123,7 @@ class ServeControl:
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
             publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
+            admit=self._admit_controller,
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
             session_id=lambda: (
@@ -741,7 +742,7 @@ class ServeControl:
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
-            await self._end_stale_approvals(session_id)
+            self._end_stale_approvals(session_id)
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"
@@ -812,11 +813,12 @@ class ServeControl:
         if kind is StreamEventType.TOOL_EXECUTION_END:
             if foreground:
                 state.tool_finished()
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_end(event, fidelity=fidelity),
-            )
+            fields = event_contract.tool_end(event, fidelity=fidelity)
+            if not foreground and self._approvals.release_or_hold_terminal(
+                _approval_key(event), session_id, fields
+            ):
+                return
+            await self._notify(wire_event, session_id, **fields)
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -913,6 +915,16 @@ class ServeControl:
                 )
             )
 
+    def _admit_controller(
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
+    ) -> object:
+        connections = self.server.connections
+        if connections is None:
+            from .connections import Admission
+
+            return Admission("no_controller")
+        return connections.try_admit_controller(event, session_id, **fields)
+
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
@@ -935,8 +947,8 @@ class ServeControl:
             ExternalEnd(key, session_id, data, suppress_write_errors)
         )
 
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
-        await self._approvals._end_stale_approvals(session_id)
+    def _end_stale_approvals(self, session_id: str | None) -> None:
+        self._approvals._end_stale_approvals(session_id)
 
     async def _terminate_pending_approvals(
         self,

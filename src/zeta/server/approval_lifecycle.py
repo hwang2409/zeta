@@ -15,9 +15,11 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
+from .connections import Admission
 from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
 Publish = Callable[..., Awaitable[bool]]
+Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
 
 logger = logging.getLogger(__name__)
@@ -46,7 +48,11 @@ class ApprovalRecord:
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
-    publication_started: asyncio.Event | None = None
+    publication_owner: asyncio.Task[object] | None = None
+    live_end: Admission | None = None
+    terminal: tuple[EventDescriptor, str | None, dict[str, object]] | None = None
+    terminal_result: Admission | None = None
+    terminal_watchdog: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,8 +201,10 @@ class ApprovalLifecycle:
         parent_store: Callable[[], ConversationStore | None],
         offload: Offload,
         is_closing: Callable[[], bool],
+        admit: Admit | None = None,
     ) -> None:
         self._publish = publish
+        self._admit = admit or (lambda *_args, **_kwargs: Admission("admitted"))
         self._request_turn_failure = request_turn_failure
         self._policy = policy
         self._session_id = session_id
@@ -803,7 +811,7 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
-                await self._finish_record(record, synthetic)
+                await asyncio.shield(self._finish_record(record, synthetic))
                 return synthetic
             if owns_record:
                 await self._report_persistence_failure(
@@ -895,17 +903,101 @@ class ApprovalLifecycle:
             return exc
         return None
 
+    def _admit_end_then_terminal(
+        self,
+        key: ApprovalKey,
+        end: tuple[str, dict[str, object]] | None,
+        terminal: tuple[str, dict[str, object]] | None,
+    ) -> tuple[Admission | None, Admission | None]:
+        """Admit the end and matching terminal without an await between them."""
+        del key
+        end_result = (
+            self._admit(
+                EventDescriptor.APPROVAL_END,
+                self._session_id(),
+                **end[1],
+            )
+            if end is not None
+            else None
+        )
+        terminal_result = (
+            self._admit(
+                EventDescriptor.TOOL_EXECUTION_END,
+                self._session_id(),
+                **terminal[1],
+            )
+            if terminal is not None
+            else None
+        )
+        return end_result, terminal_result
+
+    def _release_terminal(self, record: ApprovalRecord) -> Admission | None:
+        terminal = record.terminal
+        if terminal is None or record.terminal_result is not None:
+            return record.terminal_result
+        _, session_id, fields = terminal
+        result = self._admit(
+            EventDescriptor.TOOL_EXECUTION_END, session_id, **fields
+        )
+        self._change(record, terminal_result=result, terminal=None)
+        if record.terminal_watchdog is not None:
+            record.terminal_watchdog.cancel()
+        if self._owns(record) and record.live_end is not None:
+            self._remove(record.target.key)
+        return result
+
+    async def _terminal_bound(self, key: ApprovalKey, token: int) -> None:
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=30)
+        except TimeoutError:
+            record = self._state.records.get(key)
+            if record is None or record.token != token or record.terminal is None:
+                return
+            logger.warning("approval terminal order bound exceeded", extra={"approval_key": key})
+            self._release_terminal(record)
+        except asyncio.CancelledError:
+            return
+
+    def release_or_hold_terminal(
+        self,
+        key: ApprovalKey,
+        session_id: str | None,
+        fields: dict[str, object],
+    ) -> bool:
+        """Own the matching delegated terminal and admit it exactly once."""
+        record = self._state.records.get(key)
+        if record is None or not isinstance(key, tuple):
+            return False
+        if record.terminal_result is not None:
+            return True
+        if record.live_end is not None:
+            result = self._admit(
+                EventDescriptor.TOOL_EXECUTION_END, session_id, **fields
+            )
+            self._change(record, terminal_result=result, terminal=None)
+            if self._owns(record):
+                self._remove(key)
+            return True
+        record = self._change(
+            record,
+            terminal=(EventDescriptor.TOOL_EXECUTION_END, session_id, fields),
+        )
+        if record.terminal_watchdog is None:
+            task = asyncio.create_task(self._terminal_bound(key, record.token))
+            self._change(record, terminal_watchdog=task)
+        return True
+
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
         current = self._state.records.get(record.target.key)
         if current is None or current.token != record.token:
             return
-        if current.publication_started is not None:
-            await current.publication_started.wait()
+        owner = asyncio.current_task()
+        assert owner is not None
+        if current.publication_owner is not None and current.publication_owner is not owner:
             return
-        publication_started = asyncio.Event()
-        record = self._change(current, publication_started=publication_started)
+        record = self._change(current, publication_owner=owner)
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -914,22 +1006,42 @@ class ApprovalLifecycle:
         try:
             history_outcome = await self._append_delegated_history(record, payload)
             if payload is not None and record.published:
-                publication_started.set()
-                await self._publish(
-                    event_contract.STREAM_EVENT_WIRE_EVENTS[
-                        StreamEventType.TOOL_APPROVAL_END
-                    ],
-                    self._session_id(),
-                    **payload,
-                )
+                if isinstance(record.target.key, tuple):
+                    terminal = record.terminal
+                    end_result, terminal_result = self._admit_end_then_terminal(
+                        record.target.key,
+                        ("approval_end", payload),
+                        ("tool_end", terminal[2]) if terminal is not None else None,
+                    )
+                    record = self._change(record, live_end=end_result)
+                    if terminal is not None:
+                        record = self._change(record, terminal_result=terminal_result, terminal=None)
+                else:
+                    await self._publish(
+                        event_contract.STREAM_EVENT_WIRE_EVENTS[
+                            StreamEventType.TOOL_APPROVAL_END
+                        ],
+                        self._session_id(),
+                        **payload,
+                    )
+                    record = self._change(record, live_end=Admission("admitted"))
+            elif isinstance(record.target.key, tuple):
+                self._release_terminal(record)
             if isinstance(history_outcome, OSError):
                 await self._report_persistence_failure(
                     record, "approval history could not be persisted"
                 )
         finally:
-            publication_started.set()
             if self._owns(record):
-                self._remove(record.target.key)
+                current = self._state.records.get(record.target.key)
+                if current is not None and (
+                    not isinstance(record.target.key, tuple)
+                    or current.terminal_result is not None
+                    or isinstance(history_outcome, OSError)
+                ):
+                    if current.terminal_watchdog is not None:
+                        current.terminal_watchdog.cancel()
+                    self._remove(record.target.key)
         if isinstance(history_outcome, asyncio.CancelledError):
             raise history_outcome
 
@@ -1027,7 +1139,7 @@ class ApprovalLifecycle:
         if record.disposition == "external":
             resolution = target.store.approval_resolution_data(target.store_request_id)
             if resolution is not None:
-                await self._finish_record(record, resolution)
+                await asyncio.shield(self._finish_record(record, resolution))
             else:
                 self._remove(target.key)
             return
@@ -1084,18 +1196,24 @@ class ApprovalLifecycle:
             record.target.store_request_id
         )
         if resolution is not None:
-            await self._finish_record(record, resolution)
+            await asyncio.shield(self._finish_record(record, resolution))
 
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
+    def _end_stale_approvals(self, session_id: str | None) -> None:
         del session_id
         for record in tuple(self._state.records.values()):
-            if record.phase != "pending":
+            if record.phase not in {"pending", "settling"}:
+                continue
+            if record.live_end is not None:
+                continue
+            if record.publication_owner is not None and not record.publication_owner.done():
                 continue
             resolution = record.target.store.approval_resolution_data(
                 record.target.store_request_id
             )
-            if resolution is not None:
-                await self._finish_record(record, resolution)
+            if resolution is None:
+                continue
+            owner = asyncio.create_task(self._finish_record(record, resolution))
+            self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(
         self,

@@ -41,6 +41,19 @@ async def _overflow_deadline_wait() -> None:
     await asyncio.sleep(OUTPUT_OVERFLOW_CLOSE_DEADLINE)
 
 
+@dataclass(frozen=True, slots=True)
+class Admission:
+    kind: Literal[
+        "admitted",
+        "no_controller",
+        "feature_rejected",
+        "codec_rejected",
+        "not_writable",
+        "capacity_rejected",
+    ]
+    connection: Any | None = None
+
+
 @dataclass(frozen=True)
 class ControllerMetadata:
     connection: Any
@@ -198,6 +211,65 @@ class ConnectionRegistry:
             state.connection, state.protocol_version, state.features
         )
 
+    def _controller_preflight(
+        self,
+        state: _Connection | None,
+        event: EventDescriptor,
+        session_id: str | None,
+        *,
+        required_feature: str | None,
+        fields: dict[str, object],
+    ) -> tuple[Admission, _Frame | None, _OutputState | None]:
+        if state is None:
+            return Admission("no_controller"), None, None
+        if required_feature is not None and required_feature not in state.features:
+            return Admission("feature_rejected"), None, None
+        if (
+            event is EventDescriptor.APPROVAL_END
+            and "approval_reconnect" not in state.features
+            and isinstance(fields.get("data"), dict)
+            and fields["data"].get("reason") == "grace_expired"
+        ):
+            return Admission("feature_rejected"), None, None
+        frame = state.connection.codec.notification(event, session_id, **fields)
+        if frame is None:
+            return Admission("codec_rejected"), None, None
+        output = state.output
+        if output is None or output.phase not in {
+            "claimed_buffering",
+            "flushing",
+            "ready",
+        }:
+            return Admission("not_writable"), None, None
+        return Admission("admitted", state.connection), frame, output
+
+    def try_admit_controller(
+        self,
+        event: EventDescriptor,
+        session_id: str | None,
+        *,
+        required_feature: str | None = None,
+        **fields: object,
+    ) -> Admission:
+        """Admit one controller event without waiting for physical output."""
+        outcome, frame, output = self._controller_preflight(
+            self._controller,
+            event,
+            session_id,
+            required_feature=required_feature,
+            fields=fields,
+        )
+        if outcome.kind != "admitted" or frame is None or output is None:
+            return outcome
+        if not self._admit(self._controller, frame):
+            return Admission("capacity_rejected")
+        self._enqueue(
+            output,
+            _OutputFrame(frame),
+            wake=output.phase == "flushing",
+        )
+        return outcome
+
     async def publish_controller(
         self,
         event: EventDescriptor,
@@ -206,25 +278,17 @@ class ConnectionRegistry:
         required_feature: str | None = None,
         **fields: object,
     ) -> bool:
+        outcome, frame, output = self._controller_preflight(
+            self._controller,
+            event,
+            session_id,
+            required_feature=required_feature,
+            fields=fields,
+        )
+        if outcome.kind != "admitted" or frame is None or output is None:
+            return False
         state = self._controller
-        if state is None or (
-            required_feature is not None and required_feature not in state.features
-        ):
-            return False
-        if (
-            event is EventDescriptor.APPROVAL_END
-            and "approval_reconnect" not in state.features
-            and isinstance(fields.get("data"), dict)
-            and fields["data"].get("reason") == "grace_expired"
-        ):
-            return False
-        frame = state.connection.codec.notification(event, session_id, **fields)
-        if frame is None:
-            return False
-        output = state.output
-        assert output is not None
-        if output.phase not in {"claimed_buffering", "flushing", "ready"}:
-            return False
+        assert state is not None
         if not self._admit(state, frame):
             return False
         if output.phase in {"claimed_buffering", "flushing"}:
