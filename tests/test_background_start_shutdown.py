@@ -33,29 +33,27 @@ async def test_start_state_and_notice_follow_off_loop_durable_record(
         term_grace=0.03,
         notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
     )
-    entered = threading.Event()
-    release = threading.Event()
     writer_threads: list[int] = []
+    before_commit: tuple[object, ...] | None = None
     original_persist = registry._persist
 
-    def gated_persist(rows=None) -> None:
+    def observe_persist(rows=None) -> None:
+        nonlocal before_commit
         writer_threads.append(threading.get_ident())
-        entered.set()
-        assert release.wait(10)
+        # snapshot() feeds the TUI tasks panel, while records feeds serve-owned work.
+        before_commit = (
+            registry.snapshot(),
+            registry.running_count,
+            registry.records,
+            tuple(notices),
+        )
+        if len(inspect.signature(original_persist).parameters) == 0:
+            original_persist()
+        else:
+            original_persist(rows)
 
-    monkeypatch.setattr(registry, "_persist", gated_persist)
-    starting = asyncio.create_task(registry.start("sleep 30", tmp_path))
-    assert await asyncio.to_thread(entered.wait, 10)
-
-    # snapshot() feeds the TUI tasks panel, while records feeds serve-owned work.
-    before_commit = (
-        registry.snapshot(),
-        registry.running_count,
-        registry.records,
-        tuple(notices),
-    )
-    release.set()
-    task_id, _ = await starting
+    monkeypatch.setattr(registry, "_persist", observe_persist)
+    task_id, _ = await registry.start("sleep 30", tmp_path)
 
     assert before_commit == ((), 0, (), ())
     assert [task.task_id for task in registry.snapshot()] == [task_id]

@@ -905,6 +905,8 @@ class BackgroundTaskRegistry:
     async def _commit_terminal(
         self, record: _BackgroundRecord, exit_code: int | None
     ) -> bool:
+        if not record.running:
+            return False
         finalization = asyncio.create_task(self._finalize_terminal(record, exit_code))
         cancelled = False
         while not finalization.done():
