@@ -59,10 +59,52 @@ async def test_relative_cwd_override_uses_persisted_bash_cwd(
         await parent.close()
 
 
-def test_bash_schema_explains_cwd_resolution(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_run_background_relative_cwd_uses_persisted_bash_cwd(
+    tmp_path: Path,
+) -> None:
+    process_cwd = tmp_path / "process"
+    persisted_cwd = tmp_path / "persisted"
+    (process_cwd / "child").mkdir(parents=True)
+    (persisted_cwd / "child").mkdir(parents=True)
+    registry = ToolRegistry(process_cwd, skill_catalog=SkillCatalog.empty())
+
+    try:
+        changed = await registry.execute(
+            ToolCall(
+                "change-cwd",
+                "bash",
+                {"command": f"cd {shlex.quote(str(persisted_cwd))}"},
+            )
+        )
+        started = await registry.execute(
+            ToolCall(
+                "relative-background-cwd",
+                "run_background",
+                {"command": "pwd", "cwd": "child"},
+            )
+        )
+        task_id = started["structuredContent"]["task_id"]
+        await registry.background_tasks.wait(task_id)
+        result = await registry.execute(
+            ToolCall("background-output", "task_output", {"task_id": task_id})
+        )
+
+        assert changed["structuredContent"]["cwd_after"] == str(persisted_cwd)
+        assert result["structuredContent"]["output"].strip() == str(
+            persisted_cwd / "child"
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.parametrize("tool_name", ["bash", "run_background"])
+def test_shell_schema_explains_cwd_resolution(
+    tmp_path: Path, tool_name: str
+) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    description = registry.definitions_by_name["bash"].parameters["properties"][
+    description = registry.definitions_by_name[tool_name].parameters["properties"][
         "cwd"
     ].get("description", "")
 
