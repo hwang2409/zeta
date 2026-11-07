@@ -713,6 +713,46 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     task.cancel()
             await self._drain_preserving_cancellation(operation, timer)
 
+    async def _finalize_with_task_deadline(self, awaitable: Awaitable[Any]) -> Any:
+        operation = asyncio.ensure_future(awaitable)
+        timer = (
+            asyncio.create_task(self._clock.wait_until(self._control.task_deadline))
+            if self._control.task_deadline is not None
+            else None
+        )
+        watched = (operation,) if timer is None else (operation, timer)
+        waiter = asyncio.create_task(
+            asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+        )
+        cancelled = False
+        result: Any = None
+        error: BaseException | None = None
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                cancelled = True
+        done, _ = waiter.result()
+        if operation in done:
+            try:
+                result = operation.result()
+            except BaseException as operation_error:  # noqa: BLE001
+                error = operation_error
+        else:
+            error = TaskDeadlineExceeded()
+        for task in (*watched, waiter):
+            if not task.done():
+                task.cancel()
+        try:
+            await self._drain_preserving_cancellation(*watched, waiter)
+        except asyncio.CancelledError:
+            cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        if error is not None:
+            raise error
+        return result
+
     @staticmethod
     async def _drain_preserving_cancellation(*tasks: asyncio.Future[Any]) -> None:
         drain = asyncio.gather(*tasks, return_exceptions=True)
@@ -730,7 +770,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if attempt is None:
             return
         try:
-            await self._await_with_task_deadline(attempt.aclose())
+            await self._finalize_with_task_deadline(attempt.aclose())
         except TaskDeadlineExceeded:
             if primary is None:
                 raise

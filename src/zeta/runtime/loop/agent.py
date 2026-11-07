@@ -201,6 +201,7 @@ class AgentLoop(
             )
         self.backend = backend
         self._init_backend_owners(backend)
+        self._completion_task_deadline: Callable[[], float | None] = lambda: None
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -331,6 +332,13 @@ class AgentLoop(
         self._plan_mode_prior_prompt: RuntimePrompt | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
+
+    def set_completion_task_deadline(
+        self, deadline: Callable[[], float | None]
+    ) -> None:
+        """Use the current finish-gate deadline for later provider calls."""
+
+        self._completion_task_deadline = deadline
 
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
@@ -503,9 +511,7 @@ class AgentLoop(
         return killed
 
     async def close(
-        self,
-        *,
-        cancel_background: bool = True,
+        self, *, cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
@@ -522,9 +528,7 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown(
-                    background_task_cause
-                )
+                self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
@@ -829,6 +833,7 @@ class AgentLoop(
             provider_retry_usage: dict[str, Any] | None = None
             incomplete_tool_name: str | None = None
             provider_started = False
+            task_deadline = self._completion_task_deadline()
             try:
                 account_context = getattr(self, "account_context", None)
                 if (
@@ -854,6 +859,7 @@ class AgentLoop(
                         force=retrying_context,
                         emergency=retrying_context,
                         system_append=host_instruction,
+                        task_deadline=task_deadline,
                     )
                 except BudgetExceeded:
                     if not notification_turn:
@@ -863,6 +869,7 @@ class AgentLoop(
                         force=True,
                         emergency=True,
                         system_append=host_instruction,
+                        task_deadline=task_deadline,
                     )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
@@ -927,7 +934,7 @@ class AgentLoop(
                             else ResetPolicy.NO_RESET
                         ),
                         budget=provider_retry_budget,
-                        task_deadline=None,
+                        task_deadline=task_deadline,
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery

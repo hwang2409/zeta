@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import pty
@@ -61,6 +62,7 @@ from zeta.tools._shared.process import (
     _group_exists,
     _OrderedLogWriter,
 )
+from zeta.tools._shared.task_changes import TaskChangeSignal
 from zeta.tui.render import format_status
 
 
@@ -2695,50 +2697,547 @@ async def test_registry_setup_ignores_corrupt_background_state(
     await registry.close()
 
 
-@pytest.mark.asyncio
-async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class _ControlledTaskSafetyRegistry:
+    def __init__(self) -> None:
+        self.tasks: list[SimpleNamespace] = []
+        self.kills: list[tuple[str, str]] = []
+        self.task_changes = TaskChangeSignal()
+        self.closed = False
+
+    def snapshot(self) -> tuple[SimpleNamespace, ...]:
+        return tuple(self.tasks)
+
+    async def kill(self, task_id: str, *, cause: str) -> None:
+        self.kills.append((task_id, cause))
+        next(task for task in self.tasks if task.task_id == task_id).running = False
+
+
+class _ControlledTaskSafetyWait:
+    def __init__(self) -> None:
+        self.timeouts: asyncio.Queue[float | None] = asyncio.Queue()
+        self.releases: asyncio.Queue[bool] = asyncio.Queue()
+
+    async def __call__(self, _wake, timeout: float | None) -> bool:
+        await self.timeouts.put(timeout)
+        return await self.releases.get()
+
+
+class _TaskSafetyNotices(list[str]):
+    async def publish(self, text: str) -> str:
+        self.append(text)
+        return f"warning-{len(self)}"
+
+
+async def _close_test_background_registry(
+    registry: BackgroundTaskRegistry | ToolRegistry,
 ) -> None:
-    from zeta.agent import explicit_finish
-
-    deadline = asyncio.Event()
-    sleep_started = asyncio.Event()
-
-    async def injected_deadline(timeout: float) -> None:
-        assert timeout == 7
-        sleep_started.set()
-        await asyncio.wait_for(deadline.wait(), 10)
-
-    monkeypatch.setattr(
-        explicit_finish, "asyncio", SimpleNamespace(sleep=injected_deadline)
-    )
-    wake = asyncio.Event()
-    store = ConversationStore(tmp_path)
-    registry = _notification_registry(store, wake_sink=lambda _source: wake.set())
-    first_id, _ = await asyncio.wait_for(
-        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
-    )
-    kill = asyncio.create_task(
-        explicit_finish.kill_tasks_after_deadline(registry, 7)
-    )
-    await asyncio.wait_for(sleep_started.wait(), 10)
-    second_id, _ = await asyncio.wait_for(
-        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
-    )
-
-    deadline.set()
-    killed = await asyncio.wait_for(kill, 10)
-    await asyncio.wait_for(wake.wait(), 10)
-    events = store.agent_notifications(pending_only=False)
-    cause = (
-        "explicit-finish child task safety deadline expired after 7 seconds"
-    )
-    assert killed == (first_id, second_id)
-    assert [event.data["task_id"] for event in events] == [first_id, second_id]
-    assert all(event.data["background_phase"] == "task_kill" for event in events)
-    assert all(event.data["note"] == cause for event in events)
     await asyncio.wait_for(registry.close(), 10)
-    store.close()
+
+
+async def _cancel_and_drain_background_task(task: asyncio.Task[object]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_task_safety_second_window_records_cause_for_every_task(
+    tmp_path: Path,
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+        store = ConversationStore(tmp_path / "session")
+        stack.callback(store.close)
+        wake = asyncio.Event()
+        flow = pending_delivery_module.StepDeliveryFlow(
+            store, wake_sink=lambda _source: wake.set()
+        )
+        tools = ToolRegistry(
+            tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+        )
+        stack.push_async_callback(_close_test_background_registry, tools)
+        registry = tools.background_tasks
+        registry.set_notification_sink(
+            lambda item: flow.produce(_task_notification(item))
+        )
+        task_ids = [
+            (
+                await asyncio.wait_for(
+                    registry.start(
+                        _python("import time; time.sleep(60)"), tmp_path
+                    ),
+                    10,
+                )
+            )[0]
+            for _ in range(3)
+        ]
+        started_at = [task.started_at for task in registry.snapshot()]
+        assert all(value is not None for value in started_at)
+        now = [min(value for value in started_at if value is not None)]
+        wait = _ControlledTaskSafetyWait()
+        notices = _TaskSafetyNotices()
+        lifecycle = TaskSafetyLifecycle(7, clock=lambda: now[0], wait=wait)
+        supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+        stack.push_async_callback(_cancel_and_drain_background_task, supervisor)
+
+        await asyncio.wait_for(wait.timeouts.get(), 10)
+        now[0] = max(value for value in started_at if value is not None) + 7
+        await asyncio.wait_for(wait.releases.put(False), 10)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        assert len(notices) == 1
+
+        lifecycle.delivery_completed(set())
+        await asyncio.wait_for(wait.releases.put(True), 10)
+        await asyncio.wait_for(wait.timeouts.get(), 10)
+        now[0] += 7
+        await asyncio.wait_for(wait.releases.put(False), 10)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+
+        rows = json.loads(
+            (store.session_dir / "background_tasks.json").read_text()
+        )
+        receipts = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        causes = {
+            task_id: (
+                "explicit-finish task safety limit expired at task age "
+                f"{now[0] - started:g} seconds after no owner turn for 7 seconds"
+            )
+            for task_id, started in zip(task_ids, started_at, strict=True)
+            if started is not None
+        }
+        assert {row["task_id"] for row in rows} == set(task_ids)
+        assert {receipt.data["task_id"] for receipt in receipts} == set(task_ids)
+        for row in rows:
+            assert row["terminal_phase"] == "task_kill"
+            assert row["note"] == causes[row["task_id"]]
+        for receipt in receipts:
+            assert receipt.data["background_phase"] == "task_kill"
+            assert receipt.data["note"] == causes[receipt.data["task_id"]]
+
+
+@pytest.mark.asyncio
+async def test_task_start_and_exit_wake_task_safety_supervisor(tmp_path: Path) -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    timeouts: asyncio.Queue[float | None] = asyncio.Queue()
+
+    async def observe_registry_wake(wake, timeout: float | None) -> bool:
+        await timeouts.put(timeout)
+        await wake()
+        return True
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    lifecycle = TaskSafetyLifecycle(3600, wait=observe_registry_wake)
+    notices = _TaskSafetyNotices()
+    supervisor = asyncio.create_task(lifecycle.run(registry.background_tasks, notices.publish))
+    task_id: str | None = None
+    try:
+        assert await timeouts.get() is None
+        started = await registry.execute(
+            ToolCall(
+                "start",
+                "run_background",
+                {"command": _python("import time; time.sleep(30)")},
+            )
+        )
+        task_id = started["structuredContent"]["task_id"]
+        assert await timeouts.get() == pytest.approx(3600, abs=1)
+
+        await registry.background_tasks.kill(task_id, cause="test cleanup")
+        task_id = None
+        assert await timeouts.get() is None
+        assert notices == []
+    finally:
+        if task_id is not None:
+            await registry.background_tasks.kill(task_id, cause="test cleanup")
+        await registry.close()
+        await asyncio.wait_for(supervisor, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_idle_task_safety_window_starts_with_each_running_task_period() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [7200.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() is None
+        registry.tasks.append(
+            SimpleNamespace(
+                task_id="late-task", headline="watch ci", running=True, started_at=now[0]
+            )
+        )
+        registry.task_changes.advance()
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
+        assert registry.kills == []
+
+        now[0] += 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert len(notices) == 1
+        assert notices[0].startswith(
+            "task late-task (watch ci) has run 1h; "
+            "kill it with task_kill or leave it running\n[task-safety-cohort: "
+        )
+        assert notices[0].endswith("]")
+        assert registry.kills == []
+
+        # Once all tasks end, a later task owns a new full window from its start.
+        registry.tasks[0].running = False
+        registry.task_changes.advance()
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() is None
+        now[0] += 100
+        registry.tasks.append(
+            SimpleNamespace(
+                task_id="later-task", headline="next", running=True, started_at=now[0]
+            )
+        )
+        registry.task_changes.advance()
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_delayed_wake_coalesces_all_overdue_deadlines() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.extend(
+        [
+            SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
+            SimpleNamespace(task_id="task-2", headline="second", running=True, started_at=2.0),
+        ]
+    )
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3601
+        now[0] = 3610
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert len(notices) == 1
+        assert "task task-1 (first)" in notices[0]
+        assert "task task-2 (second)" in notices[0]
+
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3601
+        assert {window.deadline for window in lifecycle._windows.values()} == {7210}
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_leaves_deadline_beyond_next_second_for_later_notice() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.extend(
+        [
+            SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
+            SimpleNamespace(task_id="task-2", headline="boundary", running=True, started_at=2.0),
+            SimpleNamespace(task_id="task-3", headline="later", running=True, started_at=2.001),
+        ]
+    )
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3601
+        now[0] = 3601
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() == pytest.approx(2.001)
+        assert len(notices) == 1
+        assert "task task-1 (first)" in notices[0]
+        assert "task task-2 (boundary)" in notices[0]
+        assert "task task-3 (later)" not in notices[0]
+
+        now[0] = 3603.001
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert len(notices) == 2
+        assert "task task-3 (later)" in notices[1]
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_rereads_terminal_state_at_deadline() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    task = SimpleNamespace(task_id="task-1", headline="done", running=True, started_at=0.0)
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(task)
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3600
+        task.running = False
+        registry.task_changes.advance()
+        now[0] = 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert notices == []
+        assert registry.kills == []
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_completion_turn_rearms_full_safety_window() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(task_id="task-1", headline="watch ci", running=True, started_at=0.0)
+    )
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait, cohort_seconds=0)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
+
+        now[0] = 7200
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert registry.kills == [
+            (
+                "task-1",
+                "explicit-finish task safety limit expired at task age 7200 seconds after no owner turn for 3600 seconds",
+            )
+        ]
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "cancel-first-lookup",
+        "cancel-produce",
+        "cancel-second-lookup",
+        "double-cancel-produce",
+        "fail-first-lookup",
+        "fail-produce-before-append",
+        "fail-produce-after-append",
+        "fail-second-lookup",
+        "restart",
+        "duplicate-input",
+    ],
+)
+@pytest.mark.asyncio
+async def test_task_safety_warning_publication_outcomes(
+    tmp_path: Path, scenario: str
+) -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+    from zeta.agent.run_consumer import _publish_task_safety_notice
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.append(
+        SimpleNamespace(
+            task_id="task-1", headline="watch ci", running=True, started_at=0.0
+        )
+    )
+    durable_store = ConversationStore(tmp_path / "session")
+    lookup_calls = 0
+    produce_calls = 0
+    lookup_entered = threading.Event()
+    lookup_release = threading.Event()
+    produce_entered = asyncio.Event()
+    produce_release = asyncio.Event()
+
+    def pending_prompts():
+        nonlocal lookup_calls
+        lookup_calls += 1
+        if scenario == "fail-first-lookup" and lookup_calls == 1:
+            raise OSError("forced first lookup failure")
+        if scenario == "fail-second-lookup" and lookup_calls == 2:
+            raise OSError("forced second lookup failure")
+        if scenario in {"restart", "duplicate-input"} and lookup_calls == 2:
+            raise OSError("forced ambiguous lookup failure")
+        if (
+            scenario == "cancel-first-lookup"
+            and lookup_calls == 1
+            or scenario == "cancel-second-lookup"
+            and lookup_calls == 2
+        ):
+            lookup_entered.set()
+            assert lookup_release.wait(10), "timed out releasing pending-prompt lookup"
+        return durable_store.pending_prompts()
+
+    store = SimpleNamespace(pending_prompts=pending_prompts)
+
+    class Channel:
+        async def produce_to(self, _target: str, item: object) -> object:
+            nonlocal produce_calls
+            produce_calls += 1
+            if scenario in {"cancel-produce", "double-cancel-produce"}:
+                produce_entered.set()
+                await asyncio.wait_for(produce_release.wait(), 10)
+            if scenario in {"fail-produce-before-append", "fail-second-lookup"}:
+                raise OSError("forced pre-append failure")
+            entry = await asyncio.wait_for(
+                asyncio.to_thread(durable_store.append_pending_prompt, item.text), 10
+            )
+            if scenario == "cancel-second-lookup" and produce_calls == 1:
+                raise asyncio.CancelledError
+            if (
+                scenario
+                in {"fail-produce-after-append", "restart", "duplicate-input"}
+                and produce_calls == 1
+            ):
+                raise OSError("forced post-append failure")
+            return SimpleNamespace(entries=[entry])
+
+    loop = SimpleNamespace(
+        agent_instance_id="root:1",
+        _background_owner=SimpleNamespace(conversation_channel=Channel()),
+    )
+
+    async def publish(text: str) -> str:
+        return await _publish_task_safety_notice(loop, store, text)
+
+    def new_lifecycle() -> TaskSafetyLifecycle:
+        return TaskSafetyLifecycle(
+            3600, clock=lambda: now[0], wait=wait, cohort_seconds=0
+        )
+
+    lifecycle = new_lifecycle()
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    supervisors = [supervisor]
+    try:
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) == 3600
+        now[0] = 3600
+        await wait.releases.put(False)
+
+        cancel_scenarios = {
+            "cancel-first-lookup",
+            "cancel-produce",
+            "cancel-second-lookup",
+            "double-cancel-produce",
+        }
+        if scenario in {"cancel-first-lookup", "cancel-second-lookup"}:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(lookup_entered.wait, 10), 10
+            )
+        elif scenario in {"cancel-produce", "double-cancel-produce"}:
+            await asyncio.wait_for(produce_entered.wait(), 10)
+
+        if scenario in cancel_scenarios:
+            supervisor.cancel()
+            if scenario == "double-cancel-produce":
+                yielded = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(yielded.set_result, None)
+                await asyncio.wait_for(yielded, 10)
+                supervisor.cancel()
+            lookup_release.set()
+            produce_release.set()
+            result = await asyncio.wait_for(
+                asyncio.gather(supervisor, return_exceptions=True), 10
+            )
+            assert isinstance(result[0], asyncio.CancelledError)
+        else:
+            next_timeout = await asyncio.wait_for(wait.timeouts.get(), 10)
+            if scenario in {
+                "fail-first-lookup",
+                "fail-produce-before-append",
+                "fail-second-lookup",
+                "restart",
+                "duplicate-input",
+            }:
+                assert next_timeout == 1
+            else:
+                assert next_timeout is None
+
+        if scenario == "duplicate-input":
+            now[0] = 3601
+            await wait.releases.put(False)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        elif scenario == "restart":
+            supervisor.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(supervisor, return_exceptions=True), 10
+            )
+            lifecycle = new_lifecycle()
+            supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+            supervisors.append(supervisor)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) == 0
+            await wait.releases.put(False)
+            assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+
+        pending = await asyncio.wait_for(
+            asyncio.to_thread(durable_store.pending_prompts), 10
+        )
+        window = lifecycle._windows["task-1"]
+        uncommitted_failures = {
+            "fail-first-lookup",
+            "fail-produce-before-append",
+            "fail-second-lookup",
+        }
+        if scenario in uncommitted_failures:
+            assert pending == []
+            assert not window.warned
+            assert window.warning_prompt_id is None
+        else:
+            expected_notices = 2 if scenario == "restart" else 1
+            assert window.warned
+            assert len(pending) == expected_notices
+            assert window.warning_prompt_id == pending[-1].id
+    finally:
+        lookup_release.set()
+        produce_release.set()
+        for task in supervisors:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(asyncio.gather(*supervisors, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
