@@ -424,6 +424,7 @@ async def test_agent_output_read_does_not_block_event_loop(
         return raw
 
     monkeypatch.setattr(agent_tools, "read_session_file", blocked_read)
+    # test-contract: seam the thread-only file-read boundary
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
@@ -435,13 +436,24 @@ async def test_agent_output_read_does_not_block_event_loop(
         _agent_output_cache=OrderedDict(),
     )
     ticks = 0
+    tick_condition = threading.Condition()
 
     async def heartbeat() -> None:
         nonlocal ticks
         while not release.is_set():
-            ticks += 1
+            with tick_condition:
+                ticks += 1
+                tick_condition.notify_all()
             await asyncio.sleep(0)
 
+    def release_after_heartbeat() -> None:
+        assert started.wait(10)
+        with tick_condition:
+            tick_condition.wait_for(lambda: ticks > 0, timeout=10)
+        release.set()
+
+    release_thread = threading.Thread(target=release_after_heartbeat)
+    release_thread.start()
     heartbeat_task = asyncio.create_task(heartbeat())
     output_task = asyncio.create_task(
         agent_tools._agent_output(
@@ -459,6 +471,8 @@ async def test_agent_output_read_does_not_block_event_loop(
         assert result["content"][0]["text"] == "assistant: answer\n"
     finally:
         release.set()
+        release_thread.join(10)
+        assert not release_thread.is_alive()
         if not output_task.done():
             output_task.cancel()
         await asyncio.wait_for(asyncio.gather(output_task, return_exceptions=True), 10)
@@ -472,6 +486,7 @@ async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_appe
 ) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("first")]))
+    # test-contract: seam the receipt lookup to isolate transcript caching
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
