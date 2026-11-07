@@ -114,6 +114,7 @@ def test_entrypoint_shutdown_releases_every_lease(
     monkeypatch.setattr(manager, "delete", delete_after_shutdown)
     if failure == "close":
         monkeypatch.setattr(AgentLoop, "close", close)
+    # test-contract: seam Patch the CLI TUI application lifecycle seam.
     monkeypatch.setattr("zeta.cli.main._create_tui_app", lambda args, _parser: build_app(args))
     monkeypatch.setattr("zeta.tui.app.create_app", build_app)
     monkeypatch.setattr(TUIApp, "_make_session", lambda self: PromptSession(

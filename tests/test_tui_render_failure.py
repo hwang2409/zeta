@@ -86,7 +86,7 @@ def test_render_failure_exits_without_input_and_restores_session(
         nonlocal startup_canceled, startup_canceled_before_close, startup_started
         startup_started = True
         try:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
         finally:
             startup_canceled = True
             startup_canceled_before_close = not app._closed
