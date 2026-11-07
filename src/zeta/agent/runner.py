@@ -39,6 +39,7 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..providers.factory import build_backend, credential_store
+from ..runtime.offload import await_joined_offload
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -471,6 +472,7 @@ async def _build_child_loop(
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
             project_registry=loop.project_registry,
+            child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
@@ -678,7 +680,7 @@ async def run_agent_tool(
             background=background,
         ),
     )
-    if loop.root_project_id is not None and loop.project_registry is not None:
+    if loop._child_lineage_publisher is not None:
         link = {
             "project_id": loop.root_project_id,
             "session_id": child_instance_id,
@@ -687,26 +689,7 @@ async def run_agent_tool(
             "transcript_path": child_path,
         }
         try:
-            from ..core.session_links import (
-                persist_pending_child_link,
-                remove_pending_child_link,
-            )
-
-            # Record the durable lineage intent in the ROOT session's pending
-            # index (directory-fsynced) BEFORE the registry append, so the root's
-            # reconciliation can recover this child link after a crash or a
-            # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(
-                loop.root_session_dir, link, loop.store._storage_lease
-            )
-            loop.project_registry.record_session(
-                loop.root_project_id,
-                session_id=child_instance_id,
-                transcript_path=child_path,
-                role="worker",
-                parent_session_id=parent_identity,
-            )
-            remove_pending_child_link(loop.root_session_dir, child_instance_id)
+            await await_joined_offload(loop._child_lineage_publisher.publish, link)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
