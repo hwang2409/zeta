@@ -129,18 +129,19 @@ class MCPSession:
             if isinstance(schema.get("name"), str)
         }
         if not self._provided_tool_schemas:
-            self.tool_schemas = tuple(self.tool_registry.schemas)
-            self._mcp_schema_names = current_names
-            return
-        names_to_replace = self._mcp_schema_names | current_names
-        self.tool_schemas = tuple(
-            schema
-            for schema in self.tool_schemas
-            if not (
-                isinstance(schema.get("name"), str)
-                and schema["name"] in names_to_replace
-            )
-        ) + tuple(current_mcp)
+            schemas = tuple(self.tool_registry.schemas)
+        else:
+            names_to_replace = self._mcp_schema_names | current_names
+            schemas = tuple(
+                schema
+                for schema in self.tool_schemas
+                if not (
+                    isinstance(schema.get("name"), str)
+                    and schema["name"] in names_to_replace
+                )
+            ) + tuple(current_mcp)
+        if schemas != self.tool_schemas:
+            self.tool_schemas = schemas
         self._mcp_schema_names = current_names
 
     async def ensure_mcp_servers(self) -> None:
