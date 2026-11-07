@@ -35,6 +35,42 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
     ("mcp-tokens", "zeta.mcp.oauth_store"),
 )
 
+# Persisted mappings that reject unknown keys.  Names are wire-shape names, not
+# Python type names, so a conditional variant can be compared independently.
+ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
+    "hook_config": frozenset({"hook"}),
+    "todo_item": frozenset({"content", "status"}),
+    "notification_marker": frozenset({"notification_id"}),
+    "turn_history": frozenset({"turn_id", "reason"}),
+    "prompt_component": frozenset({"offset", "length", "digest"}),
+    "approval_fact": frozenset({"action"}),
+    "approval_display": frozenset({"effective_cwd", "resolved_path", "utf8_bytes"}),
+    "child_run": frozenset({"run_id", "parent_run_id", "name", "task", "started_at"}),
+    "response_action": frozenset({"action"}),
+    "response_action_report": frozenset({"action", "report"}),
+    "response_report": frozenset({"status", "summary", "head_sha", "verdict"}),
+    "child_idle_notification": frozenset(
+        {"origin", "kind", "child_instance_id", "child_session_path", "description", "status", "text", "ask_parent_question_id", "display_only"}
+    ),
+    "project_registry_update": frozenset({"description", "repo", "repo_agents"}),
+    "project_registry_record": frozenset({"id", "name", "description", "repo", "repo_agents"}),
+    "memory_sync_digest": frozenset({"kind", "digests"}),
+    "memory_sync_entry": frozenset({"kind", "entry_ids", "digests"}),
+    "memory_reconciliation": frozenset({"changes"}),
+    "memory_reconciliation_change": frozenset({"path", "content", "action"}),
+    "memory_reconciliation_source": frozenset({"project_id", "session_id", "entry_id"}),
+    "memory_operations": frozenset({"operations"}),
+    "memory_entry": frozenset({"id", "kind", "content", "created_at", "updated_at"}),
+    "account_credential": frozenset({"provider", "name", "sha256"}),
+    "client_delivery_queued": frozenset({"delivery_id", "method", "status"}),
+    "client_delivery_delivered": frozenset({"delivery_id", "method", "status"}),
+    "client_delivery_failed": frozenset({"delivery_id", "method", "status", "reason"}),
+    "client_delivery_queued_steer_acceptance": frozenset(
+        {"delivery_id", "method", "status", "reason"}
+    ),
+}
+
+
 BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
     "memory-current.json": frozenset({("history",)}),
     "meta.json": frozenset({("prompt_components",)}),
@@ -92,6 +128,57 @@ def require_closed_variant(shape: str, value: object) -> object:
     if value not in accepted:
         raise StorageFormatError(f"unsupported stored variant for {shape}: {value!r}")
     return value
+
+
+def registry_dump() -> dict[str, object]:
+    """Return the deterministic compatibility registry for this release."""
+
+    return {
+        "writer_epoch": WRITER_EPOCH,
+        "closed_variants": {
+            name: sorted(values, key=lambda value: (type(value).__name__, repr(value)))
+            for name, values in sorted(CLOSED_VARIANTS.items())
+        },
+        "broad_owned_subtrees": {
+            name: sorted(".".join(path) for path in paths)
+            for name, paths in sorted(BROAD_OWNED_SUBTREES.items())
+        },
+        "accepted_key_sets": {
+            name: sorted(values) for name, values in sorted(ACCEPTED_KEY_SETS.items())
+        },
+    }
+
+
+def compare_registry_dumps(
+    predecessor: Mapping[str, object], candidate: Mapping[str, object]
+) -> None:
+    """Reject registry changes unless the candidate epoch is strictly newer."""
+
+    previous_epoch = predecessor.get("writer_epoch")
+    candidate_epoch = candidate.get("writer_epoch")
+    if type(previous_epoch) is not int or type(candidate_epoch) is not int:
+        raise StorageFormatError("registry dump has an invalid writer_epoch")
+    changes: list[str] = []
+    for registry_name, label in (
+        ("closed_variants", "registry value"),
+        ("broad_owned_subtrees", "broad-owned subtree"),
+        ("accepted_key_sets", "accepted key"),
+    ):
+        before = predecessor.get(registry_name, {})
+        after = candidate.get(registry_name, {})
+        if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+            raise StorageFormatError(f"registry dump has invalid {registry_name}")
+        for shape in sorted(set(before) | set(after)):
+            old = set(before.get(shape, ()))
+            new = set(after.get(shape, ()))
+            for value in sorted(old ^ new, key=repr):
+                changes.append(f"shape {shape}: {label} {value!r} changed")
+    if changes and candidate_epoch <= previous_epoch:
+        raise StorageFormatError(
+            "; ".join(changes)
+            + "; candidate WRITER_EPOCH must be greater than the predecessor's; "
+            "bump the epoch in src/zeta/storage_format.py"
+        )
 
 
 @dataclass(frozen=True, slots=True)
