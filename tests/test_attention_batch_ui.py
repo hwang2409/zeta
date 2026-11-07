@@ -20,10 +20,9 @@ from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
-from zeta.runtime.loop import AgentLoop
 from zeta.core.session import SessionManager
-from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 
@@ -129,7 +128,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(tmp_p
         )
         inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
         assert len(inbox.new_ids(project.project_id, session_id=owner.store.session_id)) == 1
-        assert len(wakes) == 3
+        assert len(wakes) == 1
     finally:
         owner.store.close()
         answerer.store.close()

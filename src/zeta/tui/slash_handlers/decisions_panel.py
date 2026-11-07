@@ -325,8 +325,9 @@ class DecisionsMixin:
                     if item.session_id == record.session_id
                 }
                 if item_ids <= {item_id for item_id, _reply in staged.staged}:
-                    await asyncio.to_thread(replies.flush, self.loop.store.session_id)
-                self._schedule_background_wake()
+                    result = await asyncio.to_thread(replies.flush, self.loop.store.session_id)
+                    if result.published:
+                        self._schedule_background_wake()
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()

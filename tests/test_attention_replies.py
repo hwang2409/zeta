@@ -11,13 +11,9 @@ from typing import Any
 import pytest
 
 from zeta.attention_records import AttentionRecord, AttentionStore
+from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox, SentMessageTracker
-
-try:
-    from zeta.attention_replies import AttentionReplies
-except ModuleNotFoundError:  # The fail-first base predates durable reply batches.
-    AttentionReplies = None  # type: ignore[assignment,misc]
 
 
 @dataclass
@@ -30,7 +26,6 @@ class ReplyFixture:
 
     @property
     def replies(self) -> Any:
-        assert AttentionReplies is not None
         return AttentionReplies(self.home, self.session_id)
 
     @property
@@ -125,43 +120,15 @@ def test_attention_reply_behavior_on_pre_batch_surface(
     """Keep behavior-level fail-first checks runnable before the batch module exists."""
     fixture = _fixture(tmp_path, count=2)
     if case == "batch":
-        if AttentionReplies is None:
-            from zeta.attention_forks import deliver_attention_decision
-
-            for record, value in zip(fixture.records, ("first", "second"), strict=True):
-                deliver_attention_decision(
-                    fixture.home,
-                    record,
-                    value,
-                    from_session=fixture.session_id,
-                )
-        else:
-            _stage_all(fixture, ["first", "second"])
-            fixture.replies.flush(fixture.session_id)
+        _stage_all(fixture, ["first", "second"])
+        fixture.replies.flush(fixture.session_id)
         assert len(fixture.inbox_messages()) == 1
         return
 
     record = fixture.records[0]
-    if AttentionReplies is None:
-        from zeta.attention_forks import deliver_attention_decision
-
-        deliver_attention_decision(
-            fixture.home,
-            record,
-            "popup answer",
-            from_session=fixture.session_id,
-        )
-        with pytest.raises(ValueError, match="TUI decisions popup"):
-            deliver_attention_decision(
-                fixture.home,
-                record,
-                "different answer",
-                from_session=fixture.session_id,
-            )
-    else:
-        fixture.replies.stage(record.id, "popup answer")
-        with pytest.raises(ValueError, match="TUI decisions popup"):
-            fixture.replies.reply(record.id, "different answer", fixture.session_id)
+    fixture.replies.stage(record.id, "popup answer")
+    with pytest.raises(ValueError, match="TUI decisions popup"):
+        fixture.replies.reply(record.id, "different answer", fixture.session_id)
 
 
 _FAULT_ROWS = [

@@ -20,12 +20,9 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from zeta.attention_decisions import DecisionItem, open_decisions
-from zeta.attention_forks import (
-    create_discussion_fork,
-    deliver_attention_decision,
-    release_discussion_fork,
-)
+from zeta.attention_forks import create_discussion_fork, release_discussion_fork
 from zeta.attention_records import AttentionStore
+from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
@@ -331,8 +328,8 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     answerer = _session(tmp_path, project.project_id)
     record = _request(asker, project.project_id, "Pick DB", "Choose one.")
 
-    message_id, _, already = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    message_id, already = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
     assert already is False
 
@@ -344,8 +341,8 @@ def test_quick_answer_delivers_to_asking_session_and_closes(tmp_path: Path) -> N
     assert AttentionStore(asker.store.session_dir).get(record.id).status == "resolved"
 
     # A repeat is idempotent and reports the prior delivery.
-    _, _, again = deliver_attention_decision(
-        tmp_path, record, "Use SQLite.", from_session=answerer.store.session_id
+    _, again = AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=answerer.store.session_id
     )
     assert again is True
 
@@ -443,11 +440,8 @@ def test_return_after_decision_keeps_resolved_binding(tmp_path: Path) -> None:
         entry_seq=anchor.seq,
     )
     fork_id = create_discussion_fork(tmp_path, asker.store.session_id, record.id)
-    deliver_attention_decision(
-        tmp_path,
-        AttentionStore(asker.store.session_dir).get(record.id),
-        "Use SQLite.",
-        from_session=fork_id,
+    AttentionReplies(tmp_path, asker.store.session_id).reply(
+        record.id, "Use SQLite.", from_session=fork_id
     )
     source = release_discussion_fork(tmp_path, fork_id)
     assert source == asker.store.session_id
