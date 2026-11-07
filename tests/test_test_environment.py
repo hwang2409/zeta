@@ -11,7 +11,34 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.conftest import _cleanup_leak_failure
+
 COLLECTION_HOME = Path.home()
+
+
+@pytest.mark.parametrize(
+    ("stores", "descriptors"),
+    [(1, 0), (0, 2), (3, 4)],
+)
+def test_cleanup_leak_failure_names_the_owner(stores: int, descriptors: int) -> None:
+    failure = _cleanup_leak_failure(
+        "tests/test_probe.py::test_leak", stores, descriptors, frozenset()
+    )
+
+    assert failure == (
+        f"{stores} stores / {descriptors} fds left open by this test; open them "
+        "with `async with owned_resources() as owner: owner.store(...)`"
+    )
+
+
+def test_cleanup_leak_ratchet_only_shrinks() -> None:
+    nodeid = "tests/test_probe.py::test_known_leak"
+    ratchet = frozenset({nodeid})
+
+    assert _cleanup_leak_failure(nodeid, 1, 4, ratchet) is None
+    assert _cleanup_leak_failure(nodeid, 0, 0, ratchet) == (
+        f"{nodeid} no longer leaks; remove it from tests/test_cleanup_leak_ratchet.txt"
+    )
 
 
 def test_console_defaults_are_suite_stable() -> None:
@@ -33,7 +60,12 @@ def test_teardown_guard_defaults_to_collection_home(live_home_write_guard) -> No
 
 @pytest.mark.parametrize(
     ("leak_path", "during_collection"),
-    [(None, False), ("unexpected", False), (".zeta/history", False), ("import-leak", True)],
+    [
+        (None, False),
+        ("unexpected", False),
+        (".zeta/history", False),
+        ("import-leak", True),
+    ],
 )
 def test_session_home_guard_ignores_external_writes_and_catches_home_leaks(
     tmp_path: Path, leak_path: str | None, during_collection: bool
@@ -154,9 +186,7 @@ def test_fd_guard_rejects_cumulative_small_leaks(
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_first(): pass\n"
-        "def test_second(): pass\n"
-        "def test_third(): pass\n",
+        "def test_first(): pass\ndef test_second(): pass\ndef test_third(): pass\n",
         encoding="utf-8",
     )
 
@@ -293,8 +323,7 @@ def test_fd_guard_propagates_worker_breach_to_xdist_controller(
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_leaker(): pass\n"
-        "def test_other_worker(): pass\n",
+        "def test_leaker(): pass\ndef test_other_worker(): pass\n",
         encoding="utf-8",
     )
 
@@ -812,9 +841,7 @@ def test_fd_guard_tolerates_crashed_xdist_worker(tmp_path: Path) -> None:
     for name in ("conftest.py", "sitecustomize.py"):
         shutil.copyfile(Path(__file__).with_name(name), probe / name)
     (probe / "test_probe.py").write_text(
-        "import os\n"
-        "def test_crash(): os._exit(17)\n"
-        "def test_other_worker(): pass\n",
+        "import os\ndef test_crash(): os._exit(17)\ndef test_other_worker(): pass\n",
         encoding="utf-8",
     )
 

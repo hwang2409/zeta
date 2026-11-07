@@ -13,7 +13,7 @@ from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
-from functools import wraps
+from functools import lru_cache, wraps
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
@@ -26,6 +26,8 @@ from rich.console import Console
 
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
+_CLEANUP_LEAK_RATCHET_PATH = _TEST_SITE_PACKAGES / "test_cleanup_leak_ratchet.txt"
+_CLEANUP_LEAK_RATCHET_LABEL = Path("tests/test_cleanup_leak_ratchet.txt")
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
 os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
@@ -519,9 +521,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
-    previous_count = (
-        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
-    )
+    previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
         gc.collect()
         after = _open_file_descriptors()
@@ -710,8 +710,33 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         manager._release_storage_lease()
 
 
+@lru_cache(maxsize=1)
+def _cleanup_leak_ratchet() -> frozenset[str]:
+    return frozenset(
+        line.strip()
+        for line in _CLEANUP_LEAK_RATCHET_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    )
+
+
+def _cleanup_leak_failure(
+    nodeid: str, stores: int, descriptors: int, ratchet: frozenset[str]
+) -> str | None:
+    leaked = bool(stores or descriptors)
+    if leaked and nodeid not in ratchet:
+        return (
+            f"{stores} stores / {descriptors} fds left open by this test; open them "
+            "with `async with owned_resources() as owner: owner.store(...)`"
+        )
+    if not leaked and nodeid in ratchet:
+        return f"{nodeid} no longer leaks; remove it from {_CLEANUP_LEAK_RATCHET_LABEL}"
+    return None
+
+
 @pytest.fixture
-async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
+async def close_direct_test_runtime_owners(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+):
     """Close runtime owners constructed during repository tests."""
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
@@ -839,6 +864,9 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
+    before_cleanup = _open_file_descriptors()
+    tracked_stores = {id(store): store for store in (*stores, *composed_stores)}
+    leaked_stores = sum(not store._closed for store in tracked_stores.values())
     for loop in reversed(loops):
         if not loop._closed:
             try:
@@ -864,8 +892,18 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             pass
     for manager in reversed(managers):
         manager._release_storage_lease()
+    after_cleanup = _open_file_descriptors()
+    leaked_descriptors = len(before_cleanup.keys() - after_cleanup.keys())
+    failure = _cleanup_leak_failure(
+        request.node.nodeid,
+        leaked_stores,
+        leaked_descriptors,
+        _cleanup_leak_ratchet(),
+    )
     for lease in test_home_leases.values():
         lease.close()
+    if failure is not None:
+        pytest.fail(failure, pytrace=False)
 
 
 @pytest.fixture
