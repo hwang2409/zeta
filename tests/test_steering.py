@@ -143,14 +143,22 @@ def test_open_editor_binding_can_be_remapped() -> None:
 
 
 def test_agent_loop_rejects_non_user_steering(tmp_path: Path) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
+    )
     with pytest.raises(ValueError, match="user role"):
         loop.steer(Message(MessageRole.ASSISTANT, [TextContent("bad")]))
 
 
 def test_agent_loop_abort_clears_steering(tmp_path: Path) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
-    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("later")]), MessageOrigin.USER))
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
+    )
+    loop.steer(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("later")]), MessageOrigin.USER
+        )
+    )
     assert loop.has_pending_steering is True
     loop.abort()
     assert loop.has_pending_steering is False
@@ -180,7 +188,13 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"noop": noop_tool},
+        max_turns=3,
+        skill_catalog=SkillCatalog.empty(),
+    )
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
@@ -188,7 +202,11 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
-    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("steer-1")]), MessageOrigin.USER))
+    loop.steer(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("steer-1")]), MessageOrigin.USER
+        )
+    )
     backend.release_turn1.set()
     await task
 
@@ -204,11 +222,11 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
     # The steering user message lands strictly after the tool_use assistant
     # AND after its tool_result — never between them.
     assert roles == [
-        MessageRole.USER,         # initial prompt
-        MessageRole.ASSISTANT,    # tool_use turn
+        MessageRole.USER,  # initial prompt
+        MessageRole.ASSISTANT,  # tool_use turn
         MessageRole.TOOL_RESULT,  # tool_result
-        MessageRole.USER,         # steering-injected
-        MessageRole.ASSISTANT,    # response to steering
+        MessageRole.USER,  # steering-injected
+        MessageRole.ASSISTANT,  # response to steering
     ]
     assert texts == ["prompt", "steer-1"]
     # The second provider call MUST have seen the steer message in context.
@@ -232,18 +250,32 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"noop": noop_tool},
+        max_turns=3,
+        skill_catalog=SkillCatalog.empty(),
+    )
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
             pass
 
     task = asyncio.create_task(run())
-    await backend.turn1_streaming.wait()
-    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("a")]), MessageOrigin.USER))
-    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("b")]), MessageOrigin.USER))
+    await asyncio.wait_for(backend.turn1_streaming.wait(), 10)
+    loop.steer(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("a")]), MessageOrigin.USER
+        )
+    )
+    loop.steer(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("b")]), MessageOrigin.USER
+        )
+    )
     backend.release_turn1.set()
-    await task
+    await asyncio.wait_for(task, 10)
 
     user_texts = [
         block.text
@@ -341,7 +373,7 @@ class _NotificationBackend(CompletionBackend):
         self.calls.append(list(messages))
         self.call_started[index].set()
         if index in self.blocked:
-            await self.release[index].wait()
+            await asyncio.wait_for(self.release[index].wait(), 10)
         if error := self.exceptions.get(index):
             raise error
         if index in self.failures or index in self.errors:
@@ -422,10 +454,9 @@ def _capture_notification_timers(monkeypatch):
 
     def call_later(delay, callback, *args, context=None):
         # test-contract: seam notification retry has no public timer publication event
-        if (
-            getattr(callback, "__name__", "") == "_fire"
-            and callback.__module__.endswith("notification_retry")
-        ):
+        if getattr(
+            callback, "__name__", ""
+        ) == "_fire" and callback.__module__.endswith("notification_retry"):
             timer = _CapturedTimer(lambda: callback(*args))
             timers.append((delay, timer))
             captured.put_nowait(timer)
@@ -449,7 +480,6 @@ def _watch_system_message(app: TUIApp, text: str) -> asyncio.Event:
     # test-contract: seam system notices have no public publication event
     app._print_system = print_system
     return published
-
 
 
 @pytest.mark.asyncio
@@ -553,15 +583,15 @@ def test_error_info_explicit_cause_cycle_terminates() -> None:
         ErrorInfo("permission_error", "permission denied"),
         PermissionError("permission denied"),
         OSError(errno.EACCES, "permission denied"),
-        _caused_by(RuntimeError("backend failed"), PermissionError("permission denied")),
+        _caused_by(
+            RuntimeError("backend failed"), PermissionError("permission denied")
+        ),
         _caused_by(TimeoutError("timed out"), PermissionError("permission denied")),
         _caused_by(
             OSError(errno.EMFILE, "too many open files"),
             PermissionError("permission denied"),
         ),
-        _caused_by(
-            _StreamError("stream failed"), PermissionError("permission denied")
-        ),
+        _caused_by(_StreamError("stream failed"), PermissionError("permission denied")),
         ErrorInfo("max_turns", "maximum turns reached"),
         ErrorInfo("unknown_error", "unknown failure"),
         "refusal",
@@ -589,7 +619,9 @@ def test_error_info_explicit_cause_cycle_terminates() -> None:
     ],
 )
 async def test_permanent_notification_failure_is_not_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: ErrorInfo | str | BaseException
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: ErrorInfo | str | BaseException,
 ) -> None:
     backend: CompletionBackend
     normalize = isinstance(failure, BaseException) and failure.__cause__ is not None
@@ -714,7 +746,10 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     app._submissions.wake()
     await _await(backend.call_started[1])
     # test-contract: seam notification order proves the second wake saw both entries
-    assert [entry.data["child_instance_id"] for entry in app.loop.store.agent_notifications()] == [
+    assert [
+        entry.data["child_instance_id"]
+        for entry in app.loop.store.agent_notifications()
+    ] == [
         "child-1",
         "child-2",
     ]
@@ -727,9 +762,10 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     assert len(backend.calls) == 2
     assert timers == []
     assert app.console.file.getvalue().count("automatic retry stopped") == 1
-    assert [entry.data["child_instance_id"] for entry in app.loop.store.agent_notifications()] == [
-        "child-2"
-    ]
+    assert [
+        entry.data["child_instance_id"]
+        for entry in app.loop.store.agent_notifications()
+    ] == ["child-2"]
     assert any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
@@ -751,7 +787,10 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         await captured.get()
     entries = app.loop.store.entries
     assert [entry.type for entry in entries].count("notification_ack") == 0
-    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
+    assert (
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        == 1
+    )
     assert not any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
@@ -765,7 +804,10 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     assert len(backend.calls) == 2
     assert timers[1][0] == 2.0
     assert app.console.file.getvalue().count("provider stopped") == 1
-    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
+    assert (
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        == 1
+    )
 
     timers[1][1].fire()
     await _await(backend.call_started[2])
@@ -775,13 +817,21 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         await provider_task
     # test-contract: seam provider call count proves the successful retry dispatched once
     assert len(backend.calls) == 3
-    assert sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages()) == 1
-    assert sum(
-        message.role is MessageRole.ASSISTANT
-        and not message.metadata.get("turn_failed")
-        for message in app.loop.store.messages()
+    assert (
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        == 1
+    )
+    assert (
+        sum(
+            message.role is MessageRole.ASSISTANT
+            and not message.metadata.get("turn_failed")
+            for message in app.loop.store.messages()
+        )
+        == 1
+    )
+    assert [entry.type for entry in app.loop.store.entries].count(
+        "notification_ack"
     ) == 1
-    assert [entry.type for entry in app.loop.store.entries].count("notification_ack") == 1
 
     app.loop.store.append_agent_notification(
         "child-2",
@@ -889,7 +939,13 @@ async def test_pipeline_routes_default_submission_as_steer(
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            tools={"noop": noop_tool},
+            max_turns=3,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -940,7 +996,13 @@ async def test_backslash_prefix_defers_to_after_turn_end(
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            tools={"noop": noop_tool},
+            max_turns=3,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -990,7 +1052,13 @@ async def test_abort_drops_pending_steering(
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            tools={"noop": noop_tool},
+            max_turns=3,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -1038,10 +1106,10 @@ class TextOnlyBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=text)
         if index == 0:
             self.turn1_streaming.set()
-            await self.release_turn1.wait()
+            await asyncio.wait_for(self.release_turn1.wait(), 10)
         elif index == 1:
             self.turn2_streaming.set()
-            await self.release_turn2.wait()
+            await asyncio.wait_for(self.release_turn2.wait(), 10)
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [text]),
@@ -1272,7 +1340,13 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"noop": noop_tool},
+        max_turns=3,
+        skill_catalog=SkillCatalog.empty(),
+    )
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
@@ -1280,7 +1354,11 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
-    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER))
+    loop.steer(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER
+        )
+    )
     backend.release_turn1.set()
     await task
 
@@ -1293,7 +1371,7 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
     assert second_messages[: len(first_messages)] == first_messages
     # The tail added between calls is the assistant tool-use turn, the
     # tool_result, and the steer user message — nothing else.
-    tail = second_messages[len(first_messages):]
+    tail = second_messages[len(first_messages) :]
     tail_roles = [entry["role"] for entry in tail]
     assert tail_roles == ["assistant", "tool_result", "user"]
     steer_user = tail[-1]
@@ -1338,7 +1416,7 @@ async def test_open_editor_binding_wires_to_buffer_open_in_editor() -> None:
             pipe.send_text("draft\x18\x05")  # ...draft, Ctrl+X, Ctrl+E
             await _await(fired)
             session.app.exit()
-            await task
+            await asyncio.wait_for(task, 10)
     finally:
         Buffer.open_in_editor = original  # type: ignore[method-assign]
 
@@ -1350,9 +1428,7 @@ def test_open_in_editor_round_trip_replaces_buffer_text(tmp_path: Path) -> None:
     picks up the new content on return."""
 
     editor_script = tmp_path / "editor.sh"
-    editor_script.write_text(
-        "#!/bin/sh\nprintf 'edited via script' > \"$1\"\n"
-    )
+    editor_script.write_text("#!/bin/sh\nprintf 'edited via script' > \"$1\"\n")
     editor_script.chmod(editor_script.stat().st_mode | stat.S_IXUSR)
 
     buffer = Buffer()
@@ -1451,7 +1527,13 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            approval_policy=policy,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         approval_policy=policy,
