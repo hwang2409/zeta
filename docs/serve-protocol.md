@@ -1274,15 +1274,14 @@ implementation for the frontend client. Two RPCs cover the surface.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
 `/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
-`/vim`. Runnable user
-commands also include prompt macros (`.zeta/commands/*.md` with `kind: prompt`)
-that do not use inline shell spans, plus skills. `/model` splits by argument
-shape: argless `/model` returns `client_only` so the frontend client can open
-Settings for the picker surface, while `/model <name>` dispatches server-side
-through the shared settings-apply path. TUI-owned built-ins, exec macros,
-prompt macros with inline shell spans, and MCP prompt commands are omitted
-from the default catalog. They report
-`client_only` instead of half-executing if a client invokes them directly.
+`/vim`. Runnable user commands also include prompt macros
+(`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
+plus skills. Argless `/model` reports the current model, while `/model <name>`
+dispatches server-side through the shared settings-apply path. TUI-owned
+built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
+commands are omitted from the default catalog. Every invocation of one of
+these unavailable commands, including `/mcp status`, reports `client_only`
+instead of half-executing.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on

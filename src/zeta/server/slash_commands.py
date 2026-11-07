@@ -371,19 +371,9 @@ async def run_command(
             runtime,
             approval_control is not None and approval_control.has_pending_approvals(),
         )
-    if name == "model" and not tail.strip():
-        # Argless `/model` opens the client's picker surface (Settings on
-        # the frontend client) rather than returning a bare text notice — the doc
-        # contract at docs/serve-protocol.md. `/model <name>` still
-        # dispatches server-side through the shared apply-settings path.
-        return {"kind": "client_only", "name": name}
     if runtime.loop is not None:
         await runtime.loop.refresh_skills()
     registry = await asyncio.to_thread(build_registry, runtime)
-    if name == "mcp" and tail.strip() == "status":
-        if runtime.loop is None:
-            raise ProtocolError(-32003, "no active session")
-        return {"kind": "text", "text": await runtime.loop.slash_mcp("status")}
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:
         return {"kind": "client_only", "name": name}

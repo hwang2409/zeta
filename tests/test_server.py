@@ -6315,18 +6315,14 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
 
-        arguments = {"model": "not-a-real-model"}
         for number, name in enumerate(runnable_by_name, 10):
-            text = f"/{name}"
-            if argument := arguments.get(name):
-                text += f" {argument}"
             response = (
                 await _request(
                     reader,
                     writer,
                     number,
                     "slash_run",
-                    {"session_id": sid, "text": text},
+                    {"session_id": sid, "text": f"/{name}"},
                 )
             )[-1]
             assert "result" in response, (name, response)
@@ -6336,6 +6332,29 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
                 result,
             )
             assert "unsupported" not in str(result).lower()
+
+        model_with_name = (
+            await _request(
+                reader,
+                writer,
+                "model-with-name",
+                "slash_run",
+                {"session_id": sid, "text": "/model not-a-real-model"},
+            )
+        )[-1]["result"]
+        assert model_with_name["kind"] == "output"
+        assert "unsupported" not in str(model_with_name).lower()
+
+        mcp_status = (
+            await _request(
+                reader,
+                writer,
+                "mcp-status",
+                "slash_run",
+                {"session_id": sid, "text": "/mcp status"},
+            )
+        )[-1]["result"]
+        assert mcp_status == {"kind": "client_only", "name": "mcp"}
 
         invalid = (
             await _request(
@@ -6545,11 +6564,12 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result["kind"] == "model_input"
         assert result["text"]
 
-        # /model without arguments hands off to the client's picker
-        # surface (Settings on the frontend client); it never returns a bare text
-        # notice a user cannot act on.
+        # /model without arguments reports the current model.
         result = (await run("/model"))["result"]
-        assert result == {"kind": "client_only", "name": "model"}
+        assert result == {
+            "kind": "output",
+            "text": f"model: {server.runtime.model} (open Settings to switch)",
+        }
 
         # /model switching applies through the shared settings path.
         result = (await run("/model gpt-5.6-sol"))["result"]
@@ -7006,11 +7026,10 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
-        # `/model` with no args is read-only — must still hand off to the
-        # client's picker (never the mutation guard).
+        # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
-            "kind": "client_only",
-            "name": "model",
+            "kind": "output",
+            "text": f"model: {server.runtime.model} (open Settings to switch)",
         }
     finally:
         await _close(server, writer)
