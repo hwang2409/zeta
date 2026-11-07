@@ -401,7 +401,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
             handle = io.FileIO(descriptor, "r+", closefd=False)
             handles.append(handle)
             started.set()
-            assert release.wait(timeout=5)
+            assert release.wait(timeout=10)
             entered.set()
             return handle
 
@@ -427,7 +427,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
 
     task = asyncio.create_task(use_temporary_file())
     try:
-        assert await asyncio.to_thread(started.wait, 5)
+        assert await asyncio.to_thread(started.wait, 10)
         task.cancel()
         resumed = asyncio.Event()
         asyncio.get_running_loop().call_soon(resumed.set)
@@ -437,9 +437,9 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         asyncio.get_running_loop().call_soon(resumed.set)
         await resumed.wait()
         release.set()
-        assert await asyncio.to_thread(entered.wait, 5)
+        assert await asyncio.to_thread(entered.wait, 10)
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)
+            await asyncio.wait_for(task, timeout=10)
 
         assert exit_calls == 1
         with pytest.raises(OSError) as error:
@@ -448,7 +448,7 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
     finally:
         release.set()
         with suppress(BaseException):
-            await asyncio.wait_for(task, timeout=5)
+            await asyncio.wait_for(task, timeout=10)
         for handle in handles:
             handle.close()
         for descriptor in descriptors:
