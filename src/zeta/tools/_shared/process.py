@@ -24,11 +24,11 @@ from ...core.session_files import (
     session_root,
     write_session_json,
 )
+from . import process_output
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
-    BackgroundSpawnNotAdmittedError,
     _group_exists,
     _terminate_process,
     _terminate_processes,
@@ -199,8 +199,7 @@ class BackgroundTaskRegistry:
         self._task_start_generation = 0
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
-        self._closing_for_shutdown = False
-        self._shutdown_cause = "background task registry closed"
+        self._shutdown_cause: str | None = None
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
@@ -403,26 +402,6 @@ class BackgroundTaskRegistry:
                     term_grace=self.term_grace,
                     cleanup_timeout=self.term_grace + self.stdin_drain_timeout,
                 )
-            except (asyncio.CancelledError, BackgroundSpawnNotAdmittedError) as exc:
-                if notify_on_exit:
-                    cause = (
-                        "zeta stopped the task because its start was canceled "
-                        "before registry admission"
-                        if isinstance(exc, asyncio.CancelledError)
-                        else "zeta stopped the task because its registry closed "
-                        "before spawn admission"
-                    )
-                    await self._notify_exit(
-                        task_id,
-                        command,
-                        None,
-                        "",
-                        effective_log_path,
-                        cause,
-                        owner=owner,
-                        phase="task_kill",
-                    )
-                raise
             except OSError as exc:
                 # run_background's failed tool result is the canonical receipt;
                 # persisting task_exited would render the same failure twice.
@@ -613,18 +592,16 @@ class BackgroundTaskRegistry:
                 "retry": False,
             }
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self, cause: str = "session shutdown") -> None:
         """Mark cancellations caused by session teardown as shutdown kills."""
 
-        self._closing_for_shutdown = True
+        self._shutdown_cause = self._shutdown_cause or cause
 
-    async def kill(
-        self, task_id: str, *, cause: str = "task killed"
-    ) -> dict[str, Any]:
+    async def kill(self, task_id: str, *, cause: str = "task killed") -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
             phase: Literal["task_kill", "session_shutdown"] = (
-                "session_shutdown" if self._closing_for_shutdown else "task_kill"
+                "session_shutdown" if self._shutdown_cause else "task_kill"
             )
             await self._terminate(
                 record,
@@ -633,9 +610,7 @@ class BackgroundTaskRegistry:
             )
         return self._status(record)
 
-    async def close(
-        self, *, cause: str = "background task registry closed"
-    ) -> tuple[str, ...]:
+    async def close(self) -> tuple[str, ...]:
         if self._closed:
             return ()
         done = self._close_done
@@ -647,9 +622,6 @@ class BackgroundTaskRegistry:
             self._closing = True
             done = asyncio.get_running_loop().create_future()
             self._close_done = done
-            self._shutdown_cause = (
-                "session shutdown" if self._closing_for_shutdown else cause
-            )
             try:
                 result = await self._shutdown()
             except asyncio.CancelledError:
@@ -715,7 +687,7 @@ class BackgroundTaskRegistry:
             for record in records:
                 record.notify_on_exit = False
                 record.terminal_phase = "session_shutdown"
-                record.note = self._shutdown_cause
+                record.note = self._shutdown_cause or "background task registry closed"
             await finish(
                 asyncio.gather(
                     *(self._close_stdin(record) for record in records)
@@ -957,14 +929,8 @@ class BackgroundTaskRegistry:
             rows = self._persistence_rows(tuple(
                 candidate if item is record else item for item in self._records.values()
             ))
-            notice_text = (
-                f"background task {record.task_id} exited ({candidate.exit_code}): "
-                f"{command_headline(record.command)}"
-            )
-            if candidate.note:
-                notice_text += f"; {candidate.note}"
             notice = BackgroundTaskNotice(
-                notice_text,
+                process_output.task_exit_headline(record.task_id, candidate.exit_code, record.command, candidate.note),
                 record.task_id,
                 candidate.terminal_phase,
                 record.owner,

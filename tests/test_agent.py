@@ -98,6 +98,12 @@ async def _collect(events):
     return [event async for event in events]
 
 
+def _rendered_text(rendered: object) -> str:
+    output = StringIO()
+    Console(file=output, width=160, color_system=None).print(rendered)
+    return output.getvalue()
+
+
 def _finish_gate_hang_guard(test: Callable) -> Callable:
     @wraps(test)
     async def guarded(*args: object, **kwargs: object) -> None:
@@ -1565,9 +1571,10 @@ async def test_background_completion_wakes_idle_parent(
     assert receipt.data["text"].count("canceled=false") == 1
     rendered = render_event(receipt)
     assert rendered is not None
-    assert rendered.plain.startswith("⏺ background research · completed · ")
-    assert "error=false" not in rendered.plain
-    assert "canceled=false" not in rendered.plain
+    rendered_text = _rendered_text(rendered)
+    assert "background research :1 · completed" in rendered_text
+    assert "error=false" not in rendered_text
+    assert "canceled=false" not in rendered_text
     terminal = next(
         event
         for event in background_events
@@ -2171,8 +2178,9 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     assert terminal.tool_result.is_canceled is True
     rendered = render_event(terminal)
     assert rendered is not None
-    assert rendered.plain.count("error=false") == 1
-    assert rendered.plain.count("canceled=true") == 1
+    assert "canceled" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_canceled() == {
         "tool_call_id": call.id,
@@ -5555,8 +5563,9 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
         )
     )
     assert rendered is not None
-    assert rendered.plain.count("error=true") == 1
-    assert rendered.plain.count("canceled=false") == 1
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
 
 
 @pytest.mark.asyncio
@@ -5591,8 +5600,9 @@ async def test_failed_background_receipt_matches_error_flag(
     assert terminal.tool_result.is_canceled is False
     rendered = render_event(terminal)
     assert rendered is not None
-    assert rendered.plain.count("error=true") == 1
-    assert rendered.plain.count("canceled=false") == 1
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     await loop.close()
 
 
@@ -5677,8 +5687,9 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
         )
     )
     assert rendered is not None
-    assert rendered.plain.count("error=false") == 1
-    assert rendered.plain.count("canceled=true") == 1
+    assert "canceled" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
     child_state = (
         store.session_dir / "agents" / "1" / "session_state.json"
     ).read_text()

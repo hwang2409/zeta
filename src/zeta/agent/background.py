@@ -1073,13 +1073,11 @@ async def finish_background_child(
                 )
         # Closing the child after its final turn terminates any task it still
         # owns and returns task ids for the parent receipt.
-        reported_cause = result.get("backgroundTaskKillCause")
-        if isinstance(reported_cause, str):
-            close_cause = reported_cause
-        elif status == "canceled":
-            close_cause = "background child cancellation cleanup"
-        else:
-            close_cause = "background child completion cleanup"
+        close_cause = (
+            "background child cancellation cleanup"
+            if status == "canceled"
+            else "background child completion cleanup"
+        )
         killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.

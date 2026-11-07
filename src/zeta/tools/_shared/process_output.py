@@ -12,6 +12,11 @@ def command_headline(command: str, limit: int = 80) -> str:
     return headline[: max(0, limit - 3)] + "..."
 
 
+def task_exit_headline(task_id: str, exit_code: int | None, command: str, note: str) -> str:
+    text = f"background task {task_id} exited ({exit_code}): {command_headline(command)}"
+    return f"{text}; {note}" if note else text
+
+
 def output_tail(output: bytearray | None) -> str:
     if not output:
         return ""

@@ -835,7 +835,8 @@ class ToolRegistry:
                 await callback()
         finally:
             try:
-                killed = await self.background_tasks.close(cause=background_task_cause)
+                self.background_tasks.begin_shutdown(background_task_cause)
+                killed = await self.background_tasks.close()
             finally:
                 self.spills.close()
                 cwd_fd = self._cwd_fd

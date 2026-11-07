@@ -85,6 +85,7 @@ from ..backend_state import (
     effective_backend_budget,
     prepare_backend_state,
 )
+from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -112,7 +113,7 @@ from .empty_turn import (
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import RuntimePrompt, SkillRefreshMixin
+from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -305,7 +306,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: str | Message | None = None
+        self._plan_mode_prior_prompt: RuntimePrompt | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -460,9 +461,8 @@ class AgentLoop(
     ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
-            killed = await self.tool_registry.close(
-                background_task_cause=background_task_cause
-            )
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
+            killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
                 done, pending = await asyncio.wait(
@@ -491,7 +491,7 @@ class AgentLoop(
         self,
         *,
         cancel_background: bool = True,
-        background_task_cause: str = "agent loop closed",
+        background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
 
@@ -507,7 +507,9 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown()
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
