@@ -4,7 +4,6 @@ import base64
 import json
 import threading
 from tempfile import TemporaryDirectory
-from time import perf_counter
 
 import pytest
 
@@ -22,7 +21,7 @@ from zeta.context_accounting import (
     compact_json_length,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
@@ -1343,30 +1342,49 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
     ]
 
 
-@pytest.mark.asyncio
-async def test_marker_replay_chain_scales_linearly(context_root: Path) -> None:
-    store = ConversationStore(context_root)
-    previous_id: str | None = None
+def test_marker_replay_chain_uses_bounded_id_comparisons(
+    context_root: Path,
+) -> None:
+    class CountingId(str):
+        comparisons = 0
+
+        def __eq__(self, other: object) -> bool:
+            type(self).comparisons += 1
+            return super().__eq__(other)
+
+        __hash__ = str.__hash__
+
     chain_length = 100
-    for index in range(chain_length):
-        marker = store.append_compaction_marker(
-            f"summary {index}",
-            1,
-            1,
-            replaces=[] if previous_id is None else [previous_id],
+    entries = [
+        ConversationEntry(
+            seq=index + 1,
+            id=CountingId(f"marker-{index}"),
+            parent_id=None,
+            lane="main",
+            type="compaction",
+            data={
+                "summary": f"summary {index}",
+                "source_seq_start": 1,
+                "source_seq_end": 1,
+                "replaces": []
+                if index == 0
+                else [CountingId(f"marker-{index - 1}")],
+            },
         )
-        previous_id = marker.id
+        for index in range(chain_length)
+    ]
+    assembler = ContextAssembler(
+        ConversationStore(context_root), token_budget=10_000, retained_tail=1
+    )
 
-    assembler = ContextAssembler(store, token_budget=10_000, retained_tail=1)
-    started = perf_counter()
-    messages = await assembler.assemble()
-    elapsed = perf_counter() - started
+    items = assembler._visible_items(entries)
 
-    assert elapsed < chain_length / 100
-    assert [message.role for message in messages] == [
+    assert [item.message.role for item in items] == [
         MessageRole.COMPACTION,
         MessageRole.ASSISTANT,
     ]
+    # test-contract: complexity comparison count proves marker projection stays linear
+    assert CountingId.comparisons <= chain_length
 
 
 def test_zero_retained_tail_is_rejected(context_root: Path) -> None:

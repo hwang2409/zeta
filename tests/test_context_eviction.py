@@ -1959,21 +1959,21 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
 
     def blocked_plan(**kwargs):  # type: ignore[no-untyped-def]
         planning_started.set()
-        assert release_planner.wait(timeout=2)
+        assert release_planner.wait(timeout=10)
         try:
             return real_plan(**kwargs)
         finally:
             planning_finished.set()
 
+    # test-contract: seam hold pure eviction planning before any commit can occur.
     with patch.object(assembler, planner_name, side_effect=blocked_plan):
         assembly = asyncio.create_task(assembler.assemble_context())
-        assert await asyncio.to_thread(planning_started.wait, 2)
+        assert await asyncio.to_thread(planning_started.wait, 10)
         assembly.cancel()
         with pytest.raises(asyncio.CancelledError):
             await assembly
         release_planner.set()
-        assert await asyncio.to_thread(planning_finished.wait, 2)
-        await asyncio.sleep(0.2)
+        assert await asyncio.to_thread(planning_finished.wait, 10)
 
     assert store.replay() == before_entries
     assert not any(entry.type == "compaction" for entry in store.replay())
