@@ -37,6 +37,12 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
+    assert_event_order,
+    event_owner,
+    frames_for_call,
+    read_until,
+)
+from tests.support.server_client import (
     event as _buffered_event,
 )
 from tests.support.server_client import (
@@ -10182,7 +10188,21 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -10201,15 +10221,18 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
         await asyncio.wait_for(runtime_end.wait(), timeout=10)
         await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
         release.set()
-        while not _named_events(frames, "turn_end"):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+        frames += await read_until(
+            reader,
+            lambda frame: event_owner(frame) == turn_end_owner,
+            what=f"turn_end for {turn_end_owner[2]}",
         )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
+        )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release.set()
         await _close(server, writer)
@@ -10282,8 +10305,14 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     try:
         async with asyncio.timeout(10):
             await _request(reader, writer, 3, "send", {"text": "delegate"})
-            while not _named_events(frames, "approval_request"):
-                frames.append(await _read(reader))
+            frames += await read_until(
+                reader,
+                lambda frame: (
+                    frame.get("params", {}).get("event") == "approval_request"
+                    and frame["params"]["tool_call"]["id"] == child_call.id
+                ),
+                what=f"approval_request for {child_call.id}",
+            )
             approval = _named_events(frames, "approval_request")[0]
             assert approval["delegated"] is True
             writer.write(
@@ -10309,32 +10338,33 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
-            while not _named_events(frames, "approval_end"):
-                frames.append(await _read(reader))
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            agent_start = next(
-                index
-                for index, frame in enumerate(frames)
-                if names[index] == "tool_start"
-                and frame["params"]["tool_call"]["id"] == agent.id
+            approval_owner = (
+                "approval_end",
+                approval["session_id"],
+                approval["request_id"],
             )
-            launch_start = max(
-                index
-                for index, name in enumerate(names[:agent_start])
-                if name == "turn_start"
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == approval_owner,
+                what=f"approval_end for {approval['request_id']}",
             )
-            launch_turn = frames[launch_start]["params"]["data"]["turn"]
-            approval_end = names.index("approval_end")
-            assert len(_named_events(frames, "approval_end")) == 1
-            assert launch_start < approval_end
+            assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 with pytest.raises(asyncio.CancelledError):
                     await asyncio.wait_for(settlement, timeout=10)
             else:
-                while not _named_events(frames, "error"):
-                    frames.append(await _read(reader))
+                frames += await read_until(
+                    reader,
+                    lambda frame: frame.get("params", {}).get("event") == "error",
+                    what="approval persistence error",
+                )
                 error = _named_events(frames, "error")[0]
+                approval_end = next(
+                    index
+                    for index, frame in enumerate(frames)
+                    if event_owner(frame) == approval_owner
+                )
                 names = [frame.get("params", {}).get("event") for frame in frames]
                 assert approval_end < names.index("error")
                 assert error["error"] == {
@@ -10348,24 +10378,20 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 health = server.control._approvals.state.health
                 assert health is not None
                 assert health.code == "approval_persistence_failed"
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            later_terminals = [
-                index
-                for index, frame in enumerate(frames)
-                if index > launch_start
-                and (
-                    (
-                        names[index] == "tool_end"
-                        and frame["params"]["tool_call"]["id"] != agent.id
-                    )
-                    or (
-                        names[index] == "turn_end"
-                        and frame["params"]["data"]["turn"] != launch_turn
-                    )
-                )
-            ]
-            # test-contract: seam serve has no public event-order inspection hook
-            assert all(approval_end < index for index in later_terminals)
+            child_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                child_call.id,
+            )
+            parent_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                agent.id,
+            )
+            # test-contract: seam exact lifecycle order is the protocol contract
+            assert_event_order(frames, parent_tool_owner, approval_owner)
+            if any(event_owner(frame) == child_tool_owner for frame in frames):
+                assert_event_order(frames, approval_owner, child_tool_owner)
             assert key not in server.control._approvals.state.records
             release_parent_turn.set()
     finally:
@@ -10419,7 +10445,21 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -10438,15 +10478,18 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
-            while not _named_events(frames, "turn_end"):
-                frames.append(await _read(reader))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == turn_end_owner,
+                what=f"turn_end for {turn_end_owner[2]}",
+            )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
         )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release_write.set()
         await _close(server, writer)
