@@ -23,6 +23,7 @@ from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashCommandRegistry,
     SlashStatus,
+    SlashSurface,
     _format_status,
     compaction_history,
     create_slash_registry,
@@ -337,7 +338,7 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         project_dir=project_dir,
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
-        surface="serve",
+        surface=SlashSurface.SERVE,
     )
 
 

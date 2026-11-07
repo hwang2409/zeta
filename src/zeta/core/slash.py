@@ -7,6 +7,7 @@ import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -622,6 +623,11 @@ class ServeSlash:
     mutates: Callable[[str], bool] = _never
 
 
+class SlashSurface(StrEnum):
+    TUI = "tui"
+    SERVE = "serve"
+
+
 @dataclass(frozen=True, slots=True)
 class SlashCommand:
     """One named command in the input-time registry."""
@@ -638,9 +644,7 @@ class SlashCommand:
 class SlashCommandRegistry:
     """Map registered command names to their handlers for one surface."""
 
-    def __init__(self, surface: str = "tui") -> None:
-        if surface not in {"tui", "serve"}:
-            raise ValueError(f"unknown slash-command surface: {surface}")
+    def __init__(self, surface: SlashSurface = SlashSurface.TUI) -> None:
         self.surface = surface
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
@@ -702,7 +706,7 @@ class SlashCommandRegistry:
     def available(self, command: SlashCommand) -> bool:
         """Return whether a builtin is available on this registry's surface."""
 
-        return self.surface == "tui" or command.serve is not None
+        return self.surface is SlashSurface.TUI or command.serve is not None
 
     @property
     def completion_entries(self) -> tuple[tuple[str, str, str], ...]:
@@ -1223,7 +1227,7 @@ def create_slash_registry(
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
-    surface: str = "tui",
+    surface: SlashSurface = SlashSurface.TUI,
 ) -> SlashCommandRegistry:
     """Register shared builtins before custom commands and skills."""
 
