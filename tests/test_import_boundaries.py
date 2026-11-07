@@ -22,14 +22,6 @@ FORBIDDEN = {
 }
 
 
-# These imports are intentionally computed: each name is discovered within its own package.
-DYNAMIC_IMPORT_ALLOWLIST = {
-    "runtime/__init__.py:21": "lazy-load one of runtime's declared exports",
-    "tools/registry.py:108": "load the package being scanned",
-    "tools/registry.py:122": "load a discovered tool module",
-}
-
-
 def _module_name(file_path: Path, root: Path = ROOT) -> str:
     relative = file_path.relative_to(root).with_suffix("")
     parts = ("zeta", *relative.parts)
@@ -53,6 +45,106 @@ def _import_from_target(
     return package
 
 
+def _import_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
+    importlib_names = {"importlib"}
+    import_module_names: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if alias.name == "importlib":
+                    importlib_names.add(alias.asname or alias.name)
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "importlib":
+            for alias in statement.names:
+                if alias.name == "import_module":
+                    import_module_names.add(alias.asname or alias.name)
+    return importlib_names, import_module_names
+
+
+def _relative_target(name: str, package: tuple[str, ...]) -> tuple[str, ...]:
+    level = len(name) - len(name.lstrip("."))
+    package = package[: len(package) - level + 1]
+    return (*package, *name.lstrip(".").split("."))
+
+
+def _package_argument(node: ast.Call) -> ast.AST | None:
+    if len(node.args) > 1:
+        return node.args[1]
+    for keyword in node.keywords:
+        if keyword.arg == "package":
+            return keyword.value
+    return None
+
+
+def _is_name_derived_package(argument: ast.AST) -> bool:
+    if isinstance(argument, ast.Name):
+        return argument.id in {"__package__", "__name__"}
+    if isinstance(argument, ast.Subscript):
+        argument = argument.value
+    return (
+        isinstance(argument, ast.Call)
+        and isinstance(argument.func, ast.Attribute)
+        and isinstance(argument.func.value, ast.Name)
+        and argument.func.value.id == "__name__"
+        and argument.func.attr in {"partition", "rpartition", "rsplit"}
+    )
+
+
+def _dynamic_target(
+    node: ast.Call,
+    importlib_names: set[str],
+    import_module_names: set[str],
+    file_package: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    function = node.func
+    is_import_module = (
+        isinstance(function, ast.Name) and function.id in import_module_names
+    ) or (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id in importlib_names
+        and function.attr == "import_module"
+    )
+    is_dunder_import = isinstance(function, ast.Name) and function.id == "__import__"
+    if not (is_import_module or is_dunder_import) or not node.args:
+        return None
+    module = node.args[0]
+    if not isinstance(module, ast.Constant) or not isinstance(module.value, str):
+        return ()
+    name = module.value
+    if name.startswith("."):
+        package = file_package
+        if is_import_module:
+            package_argument = _package_argument(node)
+            if isinstance(package_argument, ast.Constant) and isinstance(
+                package_argument.value, str
+            ):
+                package = tuple(package_argument.value.split("."))
+            elif _is_name_derived_package(package_argument):
+                package = file_package
+            else:
+                package = ()
+        if not package:
+            return ()
+        name = ".".join(_relative_target(name, package))
+    target = tuple(name.split("."))
+    if is_dunder_import:
+        for keyword in node.keywords:
+            if keyword.arg == "fromlist" and isinstance(
+                keyword.value, (ast.List, ast.Tuple)
+            ):
+                target += tuple(
+                    item.value
+                    for item in keyword.value.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                )
+    return target
+
+
+def _has_reason_marker(source_line: str) -> bool:
+    marker = "# import-boundary:"
+    return marker in source_line and bool(source_line.split(marker, 1)[1].strip())
+
+
 def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
     relative = file_path.relative_to(root)
     bucket = relative.parts[0] if len(relative.parts) > 1 else relative.stem
@@ -63,70 +155,13 @@ def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
     if not forbidden:
         return []
 
-    violations: list[str] = []
-    tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
-    importlib_names = {"importlib"}
-    import_module_names = set()
-    for statement in tree.body:
-        if isinstance(statement, ast.Import):
-            for alias in statement.names:
-                if alias.name == "importlib":
-                    importlib_names.add(alias.asname or alias.name)
-        elif isinstance(statement, ast.ImportFrom) and statement.module == "importlib":
-            for alias in statement.names:
-                if alias.name == "import_module":
-                    import_module_names.add(alias.asname or alias.name)
-
+    source = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(file_path))
+    importlib_names, import_module_names = _import_aliases(tree)
     file_package = ("zeta", *relative.with_suffix("").parts)
-    if file_package[-1] == "__init__":
+    if relative.stem != "__init__":
         file_package = file_package[:-1]
-
-    def dynamic_target(node: ast.Call) -> tuple[str, ...] | None:
-        function = node.func
-        is_import_module = (
-            isinstance(function, ast.Name) and function.id in import_module_names
-        ) or (
-            isinstance(function, ast.Attribute)
-            and isinstance(function.value, ast.Name)
-            and function.value.id in importlib_names
-            and function.attr == "import_module"
-        )
-        is_dunder_import = (
-            isinstance(function, ast.Name) and function.id == "__import__"
-        )
-        if not (is_import_module or is_dunder_import) or not node.args:
-            return None
-        module = node.args[0]
-        if not isinstance(module, ast.Constant) or not isinstance(module.value, str):
-            return ()
-        name = module.value
-        if name.startswith("."):
-            package = file_package
-            if is_import_module:
-                for keyword in node.keywords:
-                    if (
-                        keyword.arg == "package"
-                        and isinstance(keyword.value, ast.Constant)
-                        and isinstance(keyword.value.value, str)
-                    ):
-                        package = tuple(keyword.value.value.split("."))
-            level = len(name) - len(name.lstrip("."))
-            package = package[: len(package) - level + 1]
-            name = ".".join((*package, name.lstrip(".")))
-        target = tuple(name.split("."))
-        if is_dunder_import:
-            for keyword in node.keywords:
-                if keyword.arg == "fromlist" and isinstance(
-                    keyword.value, (ast.List, ast.Tuple)
-                ):
-                    target += tuple(
-                        item.value
-                        for item in keyword.value.elts
-                        if isinstance(item, ast.Constant)
-                        and isinstance(item.value, str)
-                    )
-        return target
-
+    violations: list[str] = []
     for node in ast.walk(tree):
         targets: list[tuple[str, ...]] = []
         if isinstance(node, ast.Import):
@@ -137,11 +172,14 @@ def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
             if node.module is None:
                 targets.extend((*target, alias.name) for alias in node.names)
         elif isinstance(node, ast.Call):
-            target = dynamic_target(node)
+            target = _dynamic_target(
+                node, importlib_names, import_module_names, file_package
+            )
             if target == ():
-                marker = f"{relative}:{node.lineno}"
-                if marker not in DYNAMIC_IMPORT_ALLOWLIST:
-                    violations.append(f"{marker}: non-literal dynamic import")
+                if not _has_reason_marker(source.splitlines()[node.lineno - 1]):
+                    violations.append(
+                        f"{relative}:{node.lineno}: non-literal dynamic import"
+                    )
                 continue
             if target is not None:
                 targets.append(target)
@@ -223,16 +261,54 @@ import importlib as il; il.import_module("zeta.tools")
 from importlib import import_module as load; load("zeta.tools")
 name = "zeta.tools"; load(name)
 value = "tools"; __import__(f"zeta.{value}")
+load("..tools", __package__)
+load("..tools", package=__package__)
 """,
         encoding="utf-8",
     )
 
     violations = _forbidden_imports(path, root)
 
-    assert sum("zeta.tools" in violation for violation in violations) == 4
+    assert sum("zeta.tools" in violation for violation in violations) == 6
     assert (
         sum("non-literal dynamic import" in violation for violation in violations) == 2
     )
+
+
+def test_dynamic_import_reason_markers_are_line_stable(tmp_path: Path) -> None:
+    root = tmp_path / "zeta"
+    (root / "core").mkdir(parents=True)
+    path = root / "core" / "fixture.py"
+    path.write_text(
+        "from importlib import import_module as load\nload(name)  # import-boundary: discovered by the fixture\n",
+        encoding="utf-8",
+    )
+
+    assert _forbidden_imports(path, root) == []
+
+    path.write_text(
+        "from importlib import import_module as load\nload(name)  # import-boundary:\n",
+        encoding="utf-8",
+    )
+    assert len(_forbidden_imports(path, root)) == 1
+
+    path.write_text("\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+    assert len(_forbidden_imports(path, root)) == 1
+
+
+def test_name_derived_relative_import_is_checked(tmp_path: Path) -> None:
+    root = tmp_path / "zeta"
+    (root / "core").mkdir(parents=True)
+    path = root / "core" / "fixture.py"
+    path.write_text(
+        "from importlib import import_module as load\n"
+        'load("..tools", package=__name__.rpartition(".")[0])\n',
+        encoding="utf-8",
+    )
+
+    violations = _forbidden_imports(path, root)
+
+    assert any("zeta.tools" in violation for violation in violations)
 
 
 def test_websearch_import_does_not_load_providers() -> None:
