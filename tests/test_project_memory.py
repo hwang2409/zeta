@@ -30,6 +30,13 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 
+async def _cancel_and_drain(tasks: list[asyncio.Task[object]]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+
+
 def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
@@ -1011,25 +1018,38 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
         )
         for index in range(257)
     ]
-    first = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[0], calls[0].arguments, signals.new_generation(), None
+    tasks: list[asyncio.Task[object]] = []
+    try:
+        first = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[0], calls[0].arguments, signals.new_generation(), None
+            )
         )
-    )
-    await asyncio.to_thread(owner_before_collection.wait)
-    tasks = [first]
-    for call in calls[1:]:
-        task = asyncio.create_task(
-            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
+        tasks.append(first)
+        assert await asyncio.to_thread(
+            owner_before_collection.wait, 10
+        ), "owner_before_collection not reached"
+        for call in calls[1:]:
+            task = asyncio.create_task(
+                loop._run_agent_tool(
+                    call, call.arguments, signals.new_generation(), None
+                )
+            )
+            tasks.append(task)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        release_owner.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
         )
-        tasks.append(task)
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-    release_owner.set()
-    results = await asyncio.wait_for(
-        asyncio.gather(*tasks, return_exceptions=True), 10
-    )
-    await loop.close()
-    opened.store.close()
+    finally:
+        release_owner.set()
+        try:
+            await _cancel_and_drain(tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
 
     assert all(isinstance(result, RuntimeError) for result in results)
     assert registry_reads == 2
@@ -1110,32 +1130,45 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         )
         for index in range(257)
     ]
-    first = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[0], calls[0].arguments, signals.new_generation(), None
+    tasks: list[asyncio.Task[object]] = []
+    try:
+        first = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[0], calls[0].arguments, signals.new_generation(), None
+            )
         )
-    )
-    await asyncio.to_thread(first_batch_ready.wait)
-    tasks = [first]
-    for call in calls[1:256]:
-        task = asyncio.create_task(
-            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
+        tasks.append(first)
+        assert await asyncio.to_thread(
+            first_batch_ready.wait, 10
+        ), "first_batch_ready not reached"
+        for call in calls[1:256]:
+            task = asyncio.create_task(
+                loop._run_agent_tool(
+                    call, call.arguments, signals.new_generation(), None
+                )
+            )
+            tasks.append(task)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        last = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[256], calls[256].arguments, signals.new_generation(), None
+            )
         )
-        tasks.append(task)
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-    last = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[256], calls[256].arguments, signals.new_generation(), None
+        tasks.append(last)
+        await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
+        release_first_batch.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
         )
-    )
-    tasks.append(last)
-    await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
-    release_first_batch.set()
-    results = await asyncio.wait_for(
-        asyncio.gather(*tasks, return_exceptions=True), 10
-    )
-    await loop.close()
-    opened.store.close()
+    finally:
+        release_first_batch.set()
+        try:
+            await _cancel_and_drain(tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
     assert all(isinstance(result, RuntimeError) for result in results)
 
     # The first ready set is already collected when publication blocks. The
@@ -1197,115 +1230,134 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             },
         )
 
-    root_calls = [call("child-a"), call("child-b")]
-    root_tasks = [
-        asyncio.create_task(
-            loop._run_agent_tool(
-                item, item.arguments, signals.new_generation(), None
-            )
-        )
-        for item in root_calls
-    ]
-    await asyncio.wait_for(children_ready.wait(), 10)
-
-    async def stop_after_publication(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("stop after lineage publication")
-
-    for child_loop in child_loops:
-        monkeypatch.setattr(
-            child_loop.store, "append_child_run_started_async", stop_after_publication
-        )
-
-    first_batch_ready = threading.Event()
-    second_owner_entered = asyncio.Event()
-    event_loop = asyncio.get_running_loop()
     release_batches = threading.Event()
-    record_lock = threading.Lock()
-    active_records = 0
-    max_active_records = 0
-    record_calls = 0
-    registry_reads = 0
-    real_record_sessions = registry.record_sessions
-    real_read = registry._read_session_records
+    root_tasks: list[asyncio.Task[object]] = []
+    grand_tasks: list[asyncio.Task[object]] = []
+    second_owner_wait: asyncio.Task[object] | None = None
+    try:
+        root_calls = [call("child-a"), call("child-b")]
+        root_tasks = [
+            asyncio.create_task(
+                loop._run_agent_tool(
+                    item, item.arguments, signals.new_generation(), None
+                )
+            )
+            for item in root_calls
+        ]
+        await asyncio.wait_for(children_ready.wait(), 10)
 
-    def gate_batches(*args: object, **kwargs: object) -> None:
-        nonlocal active_records, max_active_records, record_calls
-        with record_lock:
-            record_calls += 1
-            active_records += 1
-            max_active_records = max(max_active_records, active_records)
-            if record_calls == 1:
-                first_batch_ready.set()
-            elif record_calls == 2:
-                event_loop.call_soon_threadsafe(second_owner_entered.set)
-        release_batches.wait()
-        try:
-            real_record_sessions(*args, **kwargs)
-        finally:
+        async def stop_after_publication(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("stop after lineage publication")
+
+        for child_loop in child_loops:
+            monkeypatch.setattr(
+                child_loop.store, "append_child_run_started_async", stop_after_publication
+            )
+
+        first_batch_ready = threading.Event()
+        second_owner_entered = asyncio.Event()
+        event_loop = asyncio.get_running_loop()
+        record_lock = threading.Lock()
+        active_records = 0
+        max_active_records = 0
+        record_calls = 0
+        registry_reads = 0
+        real_record_sessions = registry.record_sessions
+        real_read = registry._read_session_records
+
+        def gate_batches(*args: object, **kwargs: object) -> None:
+            nonlocal active_records, max_active_records, record_calls
             with record_lock:
-                active_records -= 1
+                record_calls += 1
+                active_records += 1
+                max_active_records = max(max_active_records, active_records)
+                if record_calls == 1:
+                    first_batch_ready.set()
+                elif record_calls == 2:
+                    event_loop.call_soon_threadsafe(second_owner_entered.set)
+            if not release_batches.wait(10):
+                raise TimeoutError("release_batches not reached")
+            try:
+                real_record_sessions(*args, **kwargs)
+            finally:
+                with record_lock:
+                    active_records -= 1
 
-    def count_registry_read(*args: object, **kwargs: object):
-        nonlocal registry_reads
-        registry_reads += 1
-        return real_read(*args, **kwargs)
+        def count_registry_read(*args: object, **kwargs: object):
+            nonlocal registry_reads
+            registry_reads += 1
+            return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "record_sessions", gate_batches)
-    # test-contract: seam count registry scans behind real nested spawn calls
-    monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
-    grand_calls = [call(f"grandchild-{index}") for index in range(4)]
-    grand_tasks = [
-        asyncio.create_task(
-            child_loops[0]._run_agent_tool(
-                grand_calls[0],
-                grand_calls[0].arguments,
-                signals.new_generation(),
-                None,
+        monkeypatch.setattr(registry, "record_sessions", gate_batches)
+        # test-contract: seam count registry scans behind real nested spawn calls
+        monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
+        grand_calls = [call(f"grandchild-{index}") for index in range(4)]
+        grand_tasks = [
+            asyncio.create_task(
+                child_loops[0]._run_agent_tool(
+                    grand_calls[0],
+                    grand_calls[0].arguments,
+                    signals.new_generation(),
+                    None,
+                )
+            )
+        ]
+        assert await asyncio.to_thread(
+            first_batch_ready.wait, 10
+        ), "first_batch_ready not reached"
+        second = asyncio.create_task(
+            child_loops[1]._run_agent_tool(
+                grand_calls[1], grand_calls[1].arguments, signals.new_generation(), None
             )
         )
-    ]
-    await asyncio.to_thread(first_batch_ready.wait)
-    second = asyncio.create_task(
-        child_loops[1]._run_agent_tool(
-            grand_calls[1], grand_calls[1].arguments, signals.new_generation(), None
+        grand_tasks.append(second)
+        second_owner_wait = asyncio.create_task(second_owner_entered.wait())
+        done, _ = await asyncio.wait_for(
+            asyncio.wait(
+                {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
+            ),
+            10,
         )
-    )
-    grand_tasks.append(second)
-    second_owner_wait = asyncio.create_task(second_owner_entered.wait())
-    done, _ = await asyncio.wait_for(
-        asyncio.wait(
-            {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
-        ),
-        10,
-    )
-    grand_tasks.extend(
-        asyncio.create_task(
-            child_loops[index % 2]._run_agent_tool(
-                grand_calls[index],
-                grand_calls[index].arguments,
-                signals.new_generation(),
-                None,
+        grand_tasks.extend(
+            asyncio.create_task(
+                child_loops[index % 2]._run_agent_tool(
+                    grand_calls[index],
+                    grand_calls[index].arguments,
+                    signals.new_generation(),
+                    None,
+                )
             )
+            for index in range(2, 4)
         )
-        for index in range(2, 4)
-    )
-    await asyncio.wait_for(
-        asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
-    )
-    release_batches.set()
-    results = await asyncio.wait_for(
-        asyncio.gather(*grand_tasks, return_exceptions=True), 10
-    )
-    if second_owner_wait not in done:
-        second_owner_wait.cancel()
         await asyncio.wait_for(
-            asyncio.gather(second_owner_wait, return_exceptions=True), 10
+            asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
         )
-    release_children.set()
-    await asyncio.wait_for(asyncio.gather(*root_tasks), 10)
-    await loop.close()
-    opened.store.close()
+        release_batches.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*grand_tasks, return_exceptions=True), 10
+        )
+        if second_owner_wait not in done:
+            second_owner_wait.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(second_owner_wait, return_exceptions=True), 10
+            )
+        release_children.set()
+        await asyncio.wait_for(asyncio.gather(*root_tasks), 10)
+    finally:
+        release_batches.set()
+        release_children.set()
+        cleanup_tasks = [*grand_tasks, *root_tasks]
+        if second_owner_wait is not None:
+            cleanup_tasks.append(second_owner_wait)
+        try:
+            await _cancel_and_drain(cleanup_tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
+
 
     assert all(isinstance(result, RuntimeError) for result in results)
     assert max_active_records == 1
@@ -1381,31 +1433,45 @@ async def test_cancelled_child_publication_joins_before_loop_close(
             None,
         )
     )
-    asyncio.get_running_loop().call_soon(lambda: order.append("heartbeat"))
-    await asyncio.to_thread(first_phase.wait)
-
     close_task: asyncio.Task[tuple[str, ...]] | None = None
-    if worker_entered.is_set():
-        task.cancel()
-        close_task = asyncio.create_task(loop.close())
-        cancellation_observed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(cancellation_observed.set)
-        await asyncio.wait_for(cancellation_observed.wait(), 10)
-        assert not task.done()
-        assert not close_task.done()
+    try:
+        asyncio.get_running_loop().call_soon(lambda: order.append("heartbeat"))
+        assert await asyncio.to_thread(
+            first_phase.wait, 10
+        ), "first_phase not reached"
+
+        if worker_entered.is_set():
+            task.cancel()
+            close_task = asyncio.create_task(loop.close())
+            cancellation_observed = asyncio.Event()
+            asyncio.get_running_loop().call_soon(cancellation_observed.set)
+            await asyncio.wait_for(cancellation_observed.wait(), 10)
+            assert not task.done()
+            assert not close_task.done()
+            release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        if close_task is not None:
+            await asyncio.wait_for(close_task, 10)
+        else:
+            await asyncio.wait_for(loop.close(), 10)
+    finally:
         release_worker.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    if close_task is not None:
-        await asyncio.wait_for(close_task, 10)
-    else:
-        await loop.close()
+        try:
+            await _cancel_and_drain([task])
+        finally:
+            try:
+                if close_task is not None and not close_task.done():
+                    await asyncio.wait_for(close_task, 10)
+                else:
+                    await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
 
     assert order.index("heartbeat") < order.index("storage_return")
     child_id = f"{opened.metadata.session_id}:1"
     records = registry.list_session_links(project.project_id)
     assert [record["session_id"] for record in records].count(child_id) == 1
-    opened.store.close()
 
 
 def test_pending_index_fsyncs_root_dir_before_record_session(
