@@ -131,3 +131,43 @@ def test_closed_capability_is_stale(tmp_path: Path) -> None:
 
     with SessionManager(home).open(session_id).store as successor:
         assert successor.execution_lease.epoch != capability.epoch
+
+
+def test_stale_store_and_metadata_capabilities_cannot_publish(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    manager = SessionManager(home)
+    opened = manager.open(session_id)
+    stale = opened.store.execution_lease
+    stale.close()
+
+    with pytest.raises(StaleSessionOwnerError):
+        opened.store.append_pending_prompt("blocked")
+    with pytest.raises(StaleSessionOwnerError):
+        manager._mutate(
+            session_id,
+            lambda metadata: metadata,
+            execution_lease=stale,
+        )
+    opened.store.close()
+
+    with manager.open(session_id).store as successor:
+        assert successor.pending_prompts() == []
+
+
+def test_execution_descriptor_is_not_inheritable(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    with SessionManager(home).open(session_id).store as store:
+        assert os.get_inheritable(store.execution_lease._owned.fd) is False
+
+
+def test_detached_writer_retains_the_resident_epoch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_id = _created_session(home, tmp_path)
+    with SessionManager(home).open(session_id).store as resident:
+        detached = resident._new_persistent_durable_writer()
+        try:
+            assert detached.execution_lease.epoch == resident.execution_lease.epoch
+        finally:
+            detached.close()

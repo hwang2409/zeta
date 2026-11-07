@@ -73,7 +73,7 @@ should mean “available for more work,” not “destroy this run.”
 - a live child holds an asyncio run and its backend, store, registry, and tool
   state. it holds at least three fds: the session-directory fd in
   `ConversationStore`, the separate `runtime.lease` file fd held by its
-  `SessionRuntimeLease`, and one cwd fd in its cloned `ToolRegistry`
+  `SessionExecutionLease`, and one cwd fd in its cloned `ToolRegistry`
   (`src/zeta/core/store/_store.py:159-178`,
   `src/zeta/core/store/runtime_lease.py:38-51`,
   `src/zeta/tools/registry.py:650-672`). pr #498 fixed those registry fds

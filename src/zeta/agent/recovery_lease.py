@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .pending_delivery import NotificationInput
 
 from ..core.store import ConversationStore
+from ..core.store.runtime_lease import SessionOwnedError
 from ..protocol.types import ToolResult
 
 
@@ -81,7 +82,10 @@ def acquire_recovery_subtree(
 ) -> bool:
     """Lease a complete child subtree before any recovery mutation."""
 
-    child_store = open_child_store(parent_store, child_path)
+    try:
+        child_store = open_child_store(parent_store, child_path)
+    except SessionOwnedError:
+        return False
     if child_store is None:
         return True
     leases.enter_context(child_store)

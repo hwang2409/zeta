@@ -109,9 +109,14 @@ def test_entrypoint_shutdown_releases_every_lease(
         monkeypatch.setattr(AgentLoop, "close", close)
     monkeypatch.setattr("zeta.cli.main.create_app", build_app)
     monkeypatch.setattr("zeta.tui.app.create_app", build_app)
-    monkeypatch.setattr(TUIApp, "_make_session", lambda self: PromptSession(
-        input=DummyInput(), output=DummyOutput(),
-    ))
+    monkeypatch.setattr(
+        TUIApp,
+        "_make_session",
+        lambda self: PromptSession(
+            input=DummyInput(),
+            output=DummyOutput(),
+        ),
+    )
     if entry == "tui-new":
         monkeypatch.setattr(TUIApp, "_read_prompt", prompt)
     monkeypatch.setattr(TUIApp, "_rebuild_transcript_async", startup_async)
@@ -127,7 +132,9 @@ def test_entrypoint_shutdown_releases_every_lease(
         finally:
             await server.close()
 
-    expected = pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    expected = (
+        pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    )
     with expected:
         if entry == "server":
             asyncio.run(server())
@@ -154,12 +161,16 @@ def test_entrypoint_shutdown_releases_every_lease(
 @pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("opened_snapshots", [False, True])
 async def test_closed_app_rejects_snapshot_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened_snapshots: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opened_snapshots: bool,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     if opened_snapshots:
         app._snapshots()
     await app.close()
@@ -172,7 +183,9 @@ async def test_closed_app_rejects_snapshot_access(
 @pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("failure", [None, "client", "server", "wait_closed"])
 async def test_server_cleanup_continues_after_close_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -202,7 +215,9 @@ async def test_server_cleanup_continues_after_close_error(
         monkeypatch.setattr(listener, "close", fail_close)
     elif failure == "wait_closed":
         monkeypatch.setattr(listener, "wait_closed", fail_wait_closed)
-    expected = pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    expected = (
+        pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    )
     try:
         with expected:
             await server.close()
@@ -220,8 +235,11 @@ async def test_server_cleanup_continues_after_close_error(
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("failure", ["loop", "composition", "frontend"])
 def test_construction_failure_releases_storage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    entry: str, resume: bool, failure: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    resume: bool,
+    failure: str,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -271,7 +289,9 @@ def test_construction_failure_releases_storage(
 def test_snapshot_close_releases_its_independent_lease(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "home")
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
-    snapshots = WorkspaceSnapshotStore(opened.store.session_dir, opened.store.session_id)
+    snapshots = WorkspaceSnapshotStore(
+        opened.store.session_dir, opened.store.session_id
+    )
     opened.store.close()
     with pytest.raises(SessionInUseError):
         manager.delete(opened.metadata.session_id)
@@ -282,12 +302,16 @@ def test_snapshot_close_releases_its_independent_lease(tmp_path: Path) -> None:
 @pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("component", ["submissions", "draft", "registry", "snapshots"])
 async def test_tui_cleanup_continues_after_close_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
-    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     snapshots = app._snapshots()
     registry = app.loop.tool_registry.background_tasks
     original_registry_close = registry.close
@@ -322,7 +346,9 @@ async def test_tui_cleanup_continues_after_close_error(
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("startup_failure", [False, True])
 async def test_shutdown_releases_child_stores(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, background: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background: bool,
     startup_failure: bool,
 ) -> None:
     from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -337,12 +363,20 @@ async def test_shutdown_releases_child_stores(
     loop = runtime.loop
     assert loop is not None
     loop.backend = FakeBackend([ScriptedTurn(content=[TextContent("child done")])])
-    call = ToolCall("child", "agent", {
-        "prompt": "hello", "description": "child", "background": background,
-    })
+    call = ToolCall(
+        "child",
+        "agent",
+        {
+            "prompt": "hello",
+            "description": "child",
+            "background": background,
+        },
+    )
     if startup_failure:
+
         def fail(*args, **kwargs):
             raise RuntimeError("injected child setup")
+
         monkeypatch.setattr("zeta.runtime.loop.agent.ContextAssembler", fail)
     result = await loop._run_agent_tool(call, call.arguments, AbortSignal(), None)
     assert result["isError"] is startup_failure
@@ -356,7 +390,8 @@ async def test_shutdown_releases_child_stores(
 
 @pytest.mark.usefixtures("no_gc")
 def test_recovery_and_send_release_borrowed_child_stores(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.support.fake_backend import FakeBackend
     from zeta.agent.background import recover_agent_children
@@ -368,20 +403,29 @@ def test_recovery_and_send_release_borrowed_child_stores(
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("child", "agent", {"prompt": "hello", "description": "child"})
-    with ConversationStore(opened.store.session_dir / "agents", session_id="1") as child:
+    with ConversationStore(
+        opened.store.session_dir / "agents", session_id="1"
+    ) as child:
         with ConversationStore(child.session_dir / "agents", session_id="1") as nested:
             nested.mark_agent_parent("nested")
             child.register_agent_child(
                 ToolCall("nested", "agent", {}),
-                child_session_path=str(nested.session_dir), description="nested",
+                child_session_path=str(nested.session_dir),
+                description="nested",
             )
         opened.store.register_agent_child(
-            call, child_session_path=str(child.session_dir), description="child",
-            agent_type="run", child_instance_id="child", background=True,
+            call,
+            child_session_path=str(child.session_dir),
+            description="child",
+            agent_type="run",
+            child_instance_id="child",
+            background=True,
             accepts_follow_ups=True,
         )
         opened.store.append_task_notification(
-            task_id="task-exited", command="echo done", exit_code=0,
+            task_id="task-exited",
+            command="echo done",
+            exit_code=0,
         )
     resident_child = ConversationStore(
         opened.store.session_dir / "agents", session_id="1"
@@ -399,18 +443,20 @@ def test_recovery_and_send_release_borrowed_child_stores(
         await flow.initialize()
         channel.register_delivery_flow("child", flow)
         monkeypatch.setattr(ConversationStore, "__init__", record)
-        assert await send_to_run(
-            opened.store,
-            "child",
-            "follow-up",
-            channel=channel,
-        ) is None
+        assert (
+            await send_to_run(
+                opened.store,
+                "child",
+                "follow-up",
+                channel=channel,
+            )
+            is None
+        )
         await asyncio.to_thread(recover_agent_children, loop)
         await loop.close()
 
     asyncio.run(exercise())
-    assert len(retained) == 2
-    assert all(not store._release_lease.alive for store in retained)
+    assert retained == []
     resident_child.close()
     opened.store.close()
     manager.delete(opened.metadata.session_id)
@@ -419,18 +465,23 @@ def test_recovery_and_send_release_borrowed_child_stores(
 @pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("run", ["close", "full-screen"])
 async def test_closed_tui_drops_callbacks_without_gc(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run: str,
 ) -> None:
     import weakref
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
-    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     app._snapshots()
     loop = app.loop
     reference = weakref.ref(app)
     if run == "full-screen":
         from prompt_toolkit.application import create_app_session
+
         with create_app_session(input=DummyInput(), output=DummyOutput()):
             app._make_session()
     await app.close()
@@ -447,7 +498,9 @@ async def test_closed_tui_drops_pending_paste_callbacks_without_gc(
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
-    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     loop = app.loop
     session = app._make_session()
     app._active_session = session
