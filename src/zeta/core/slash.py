@@ -530,6 +530,7 @@ class SlashStatus:
     automatic_memory_failure: str | None = None
     transcript_index_failure: str | None = None
     explicit_finish: bool = False
+    max_agent_depth: int = 3
 
 
 class SlashSession(Protocol):
@@ -924,6 +925,7 @@ def _format_status(status: SlashStatus) -> str:
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"explicit_finish: {'on' if status.explicit_finish else 'off'}",
+        f"max_agent_depth: {status.max_agent_depth}",
         f"retained_tail: {status.retained_tail}",
         f"tokens_used_this_session: {status.tokens_used_this_session + child_tokens}",
         f"tokens_in_current_context: {context_tokens}",

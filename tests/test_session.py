@@ -1675,7 +1675,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
     first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     transcript_path = first.loop.store.path
-    first.loop.store.close()
+    await first.close()
     fixture = Path(__file__).parent / "fixtures" / "legacy_browser_transcript.jsonl"
     with transcript_path.open("ab") as transcript:
         transcript.write(fixture.read_bytes())
@@ -2288,6 +2288,32 @@ def test_resume_picker_stays_within_shared_content_width(
         for line in output
     )
     assert cell_len(prompts[0][CONTENT_MARGIN:]) <= content_width(terminal_width)
+
+
+def test_main_resume_renders_bounded_corrupt_transcript_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    path = first.loop.store.path
+    first.loop.store.close()
+    with path.open("ab") as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+
+    assert main(["--resume", session_id]) == 1
+
+    rendered = capsys.readouterr()
+    assert (
+        f"transcript terminated invalid conversation row at row 2 (session {session_id})"
+        in rendered.err
+    )
+    assert "must-not-leak" not in rendered.err
+    assert str(path) not in rendered.err
+    assert "Traceback" not in rendered.err
 
 
 def test_resume_rejects_an_unknown_session(

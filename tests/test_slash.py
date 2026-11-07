@@ -463,6 +463,7 @@ skill_catalog=SkillCatalog.empty(),
     assert f"model: {app.model}" in output
     assert "vim_mode: on" in output
     assert "explicit_finish: on" in output
+    assert "max_agent_depth: 3" in output
     assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
     assert (
         f"tokens_used_this_session: {loop.context_assembler.tokens_used_this_session}"
