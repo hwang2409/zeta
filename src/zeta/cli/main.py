@@ -32,7 +32,7 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
 from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
-from ..terminal_errors import TerminalRenderError
+from ..core.errors import TerminalRenderError
 
 
 def _tool_patterns_arg(value: str) -> str:

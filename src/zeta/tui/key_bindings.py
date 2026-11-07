@@ -32,7 +32,7 @@ from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.output import Output
 
-from ..terminal_errors import TerminalRenderError
+from ..core.errors import TerminalRenderError
 from .word_wrap import WordWrapWindow
 
 # --- keybinding remap layer ------------------------------------------------

@@ -1,4 +1,4 @@
-"""Errors raised while controlling the terminal."""
+"""Shared runtime errors."""
 
 from __future__ import annotations
 
