@@ -150,9 +150,12 @@ async def test_unregistered_descriptors_do_not_break_live_connection(
         tmp_path, transport, "controller"
     )
     try:
-        invalid_event = await asyncio.gather(
-            server.connections.publish_controller("unregistered", "session"),
-            return_exceptions=True,
+        invalid_event = await asyncio.wait_for(
+            asyncio.gather(
+                server.connections.publish_controller("unregistered", "session"),
+                return_exceptions=True,
+            ),
+            10,
         )
         assert invalid_event == [False]
 
