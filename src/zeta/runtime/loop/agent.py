@@ -194,6 +194,7 @@ class AgentLoop(
         skill_home: Path | None = None,
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
+        parent_owned_wake_eligible: bool = False,
     ) -> None:
         if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
             raise ValueError(
@@ -275,6 +276,7 @@ class AgentLoop(
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
+        self._initialize_wake_scheduler(parent_owned_wake_eligible)
         self.tool_registry._agent_owner = self._background_owner
         self.tool_registry.bind_session_store(store)
         # Route model-owned task exits into this loop's depth-aware wake so a
@@ -520,6 +522,8 @@ class AgentLoop(
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        if self.wake_scheduler is not None:
+            await self.wake_scheduler.close()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
@@ -736,6 +740,7 @@ class AgentLoop(
         notification_turn: bool = False,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        max_completions: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         await self.refresh_skills()
@@ -746,7 +751,7 @@ class AgentLoop(
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None and not notification_turn:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
-        elif system_message is None and not notification_turn and persist_user_message:
+        if not notification_turn and persist_user_message and user_text:
             user_message = user_message_for_turn(
                 user_text,
                 origin=origin,
@@ -755,7 +760,7 @@ class AgentLoop(
             )
         elif user_message is not None and user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
-        if system_message is None and persist_user_message:
+        if user_message is not None and persist_user_message:
             await self._append_turn_message(user_message)
         await self._flush_skill_refresh_notices()
         setup_error: ErrorInfo | None = None
@@ -802,7 +807,7 @@ class AgentLoop(
         recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
-        while (
+        while (max_completions is None or turn_number < max_completions) and (
             self.max_turns is None
             or turn_number < self.max_turns
             or step_delivery.has_pending_edge
@@ -1240,7 +1245,10 @@ class AgentLoop(
             )
         yield StreamEvent(
             StreamEventType.ERROR,
-            error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),
+            error=ErrorInfo(
+                "max_turns",
+                f"maximum turns reached: {max_completions or self.max_turns}",
+            ),
         )
         if self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
