@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from ..core.session_files import SessionError, child_directory, open_session_file
+from ..core.session_files import SessionFileReplaced, child_directory, open_session_file
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
@@ -187,9 +187,8 @@ class SpillByteBudget:
                 artifact.directory.inode,
             ):
                 return
-            with _spill_advisory_lock(directory_fd):
-                self._unlink_if_safe(directory_fd, artifact.name)
-        except (OSError, SessionError):
+            self._unlink_if_safe(directory_fd, artifact.name)
+        except OSError:
             return
         finally:
             os.close(directory_fd)
@@ -542,9 +541,12 @@ class SpillStore:
         if not self.contains(path):
             raise ValueError("path is not in this session's spill directory")
         with self._lock:
-            return open_session_file(
-                self._ensure_directory(), path.name, os.O_RDONLY
-            )
+            directory_fd = self._ensure_directory()
+            try:
+                return open_session_file(directory_fd, path.name, os.O_RDONLY)
+            except (FileNotFoundError, SessionFileReplaced) as exc:
+                self._byte_budget.forget(self._directory(), path.name)
+                raise ValueError("spill artifact is gone") from exc
 
     def _name(self, tool: str, call_id: str, artifact: str) -> str:
         if self._closed:

@@ -936,6 +936,177 @@ async def test_cross_store_reclaim_removes_owner_metadata(
             await root.close()
 
 
+def test_cross_store_reclaim_cannot_deadlock_two_writers(tmp_path: Path) -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    budget = spill_module.SpillByteBudget(max_bytes=minimum * 3)
+    with _store(tmp_path, "first") as first_store, _store(
+        tmp_path, "second"
+    ) as second_store:
+        first = SpillStore(
+            session_dir=first_store.session_dir,
+            directory_fd=first_store.directory_fd,
+            byte_budget=budget,
+        )
+        second = SpillStore(
+            session_dir=second_store.session_dir,
+            directory_fd=second_store.directory_fd,
+            byte_budget=budget,
+        )
+        second.write_bytes("tool", "old-second", 0, b"b")
+        first.write_bytes("tool", "old-first-1", 0, b"a")
+        first.write_bytes("tool", "old-first-2", 0, b"a")
+
+        second_has_lock = threading.Event()
+        resume_second = threading.Event()
+        first_selected_second = threading.Event()
+        resume_first_reclaim = threading.Event()
+        second_selected_first = threading.Event()
+        real_second_write_staged = second._write_staged
+        real_reopen_and_unlink = budget._reopen_and_unlink
+
+        def gated_second_write_staged(*args: object, **kwargs: object) -> None:
+            second_has_lock.set()
+            assert resume_second.wait(timeout=10)
+            real_second_write_staged(*args, **kwargs)  # type: ignore[arg-type]
+
+        def gated_reopen_and_unlink(
+            artifact: spill_module._RetainedArtifact,
+        ) -> None:
+            if artifact.directory == second._directory():
+                first_selected_second.set()
+                assert resume_first_reclaim.wait(timeout=10)
+            elif artifact.directory == first._directory():
+                second_selected_first.set()
+            real_reopen_and_unlink(artifact)
+
+        second._write_staged = gated_second_write_staged  # type: ignore[method-assign]
+        budget._reopen_and_unlink = gated_reopen_and_unlink  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+
+        def write_first() -> None:
+            try:
+                first.write_bytes("tool", "new-first", 0, b"x")
+            except BaseException as exc:
+                failures.append(exc)
+
+        def write_second() -> None:
+            try:
+                second.write_group(
+                    "tool", "new-second", {"0": [b"x"], "1": [b"y"]}
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        second_thread = threading.Thread(target=write_second, daemon=True)
+        first_thread = threading.Thread(target=write_first, daemon=True)
+        second_thread.start()
+        assert second_has_lock.wait(timeout=10)
+        first_thread.start()
+        assert first_selected_second.wait(timeout=10)
+        resume_second.set()
+        assert second_selected_first.wait(timeout=10)
+        resume_first_reclaim.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+
+        # The timeout is only a deadlock guard; completion is the behavior under test.
+        finished = not first_thread.is_alive() and not second_thread.is_alive()
+        try:
+            assert finished
+            assert failures == []
+            retained = first.retained_paths() + second.retained_paths()
+            expected = sum(
+                max(path.stat().st_size, minimum) for path in retained if path.exists()
+            )
+            assert budget._used_bytes == expected <= budget.max_bytes
+        finally:
+            if finished:
+                first.close()
+                second.close()
+
+
+@pytest.mark.asyncio
+async def test_read_after_cross_store_reclaim_reports_artifact_gone_and_repairs_view(
+    tmp_path: Path,
+) -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            tool_allow=["read"],
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        budget = first.spills._byte_budget
+        budget.max_bytes = minimum
+        victim = first.spills.write_bytes("tool", "victim", 0, b"victim")
+        reader_fd = first.spills.open_read(victim)
+        reclaim_unlinked = threading.Event()
+        release_reclaim = threading.Event()
+        real_forget = budget.forget
+        reclaim_thread_id: list[int] = []
+
+        def gated_forget(
+            directory: spill_module._SpillDirectory, name: str
+        ) -> None:
+            if name == victim.name and not reclaim_thread_id:
+                reclaim_thread_id.append(threading.get_ident())
+                reclaim_unlinked.set()
+                assert release_reclaim.wait(timeout=10)
+            real_forget(directory, name)
+
+        budget.forget = gated_forget  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+
+        def reclaim() -> None:
+            try:
+                second.spills.write_bytes("tool", "replacement", 0, b"new")
+            except BaseException as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=reclaim)
+        thread.start()
+        try:
+            assert reclaim_unlinked.wait(timeout=10)
+            assert not victim.exists()
+            assert os.read(reader_fd, 6) == b"victim"
+            assert first.spills.retained_paths() == (victim,)
+
+            result = await first.execute(
+                ToolCall("read-gone", "read", {"path": str(victim)})
+            )
+
+            assert result["isError"] is True
+            assert "spill artifact is gone" in result["content"][0]["text"]
+            assert first.spills.retained_paths() == ()
+        finally:
+            os.close(reader_fd)
+            release_reclaim.set()
+            thread.join(timeout=10)
+            await second.close()
+            await first.close()
+            await root.close()
+        assert not thread.is_alive()
+        assert failures == []
+        assert budget._used_bytes == minimum
+
+
 @pytest.mark.asyncio
 async def test_child_spills_share_one_root_byte_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
