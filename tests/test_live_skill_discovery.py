@@ -75,9 +75,7 @@ def _session_loop(
     project.mkdir()
     catalog = discover_session_skills(home=home, project_dir=project)
     manager = SessionManager(home)
-    runtime_prompt = _owned_runtime_prompt(
-        f"identity\n\n{catalog.index()}", catalog
-    )
+    runtime_prompt = _owned_runtime_prompt(f"identity\n\n{catalog.index()}", catalog)
     opened = manager.create(
         provider="codex",
         model="offline",
@@ -351,9 +349,7 @@ async def test_new_skill_reaches_provider_prompt_on_actual_next_turn(
         backend,
         store,
         skill_catalog=catalog,
-        runtime_prompt=_owned_runtime_prompt(
-            f"identity\n\n{catalog.index()}", catalog
-        ),
+        runtime_prompt=_owned_runtime_prompt(f"identity\n\n{catalog.index()}", catalog),
         **_live_skill_kwargs(home, project),
     )
     _install_live_skill(home)
@@ -372,7 +368,9 @@ async def test_new_skill_reaches_provider_prompt_on_actual_next_turn(
 
 
 @pytest.mark.asyncio
-async def test_tui_submit_discovers_new_skill_slash_before_parse(tmp_path: Path) -> None:
+async def test_tui_submit_discovers_new_skill_slash_before_parse(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     project.mkdir()
@@ -412,7 +410,9 @@ async def test_tui_submit_discovers_new_skill_slash_before_parse(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_serve_discovers_new_skill_for_slash_list_then_run(tmp_path: Path) -> None:
+async def test_serve_discovers_new_skill_for_slash_list_then_run(
+    tmp_path: Path,
+) -> None:
     project = _seed_slash_fixtures(tmp_path)
     home = tmp_path / "home"
     server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
@@ -450,7 +450,9 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
     tmp_path: Path,
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
+    loop, manager, home, _ = await asyncio.to_thread(
+        lambda: _session_loop(tmp_path, backend)
+    )
     # test-contract: seam no public metadata-lock holder seam exists
     release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
     _install_live_skill(home)
@@ -479,7 +481,9 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
     tmp_path: Path,
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
+    loop, manager, home, _ = await asyncio.to_thread(
+        lambda: _session_loop(tmp_path, backend)
+    )
     original_prompt = loop.session_metadata.system_prompt
     original_catalog = loop.session_metadata.skill_catalog
     _install_live_skill(home)
@@ -487,9 +491,11 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
 
     other = SessionManager(home).open(loop.session_metadata.session_id)
     try:
-        await asyncio.to_thread(lambda: SessionManager(home).record_override(
-            other.metadata, provider=None, model="new-model"
-        ))
+        await asyncio.to_thread(
+            lambda: SessionManager(home).record_override(
+                other.metadata, provider=None, model="new-model"
+            )
+        )
     finally:
         other.store.close()
     await asyncio.to_thread(lambda: manager.touch(loop.session_metadata))
@@ -550,379 +556,6 @@ async def test_runtime_prompt_does_not_read_session_prompt_components(
 
 @pytest.mark.asyncio
 async def test_concurrent_resume_keeps_live_prompt_components_with_live_config(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = SkillCatalog.empty()
-    memory = "project memory"
-    prompt = f"identity\n\n{catalog.index()}\n\n{memory}"
-    memory_offset = prompt.index(memory)
-    memory_digest = hashlib.sha256(memory.encode()).hexdigest()
-    manager = SessionManager(home)
-    first = await asyncio.to_thread(lambda: manager.create(
-        provider="codex",
-        model="offline",
-        cwd=project,
-        system_prompt=prompt,
-        skill_catalog=catalog,
-        project_memory_offset=memory_offset,
-        project_memory_length=len(memory),
-        project_memory_digest=memory_digest,
-        prompt_recipe="custom",
-        prompt_components=_owned_runtime_prompt(
-            prompt,
-            catalog,
-            {
-                "project_memory": {
-                    "offset": memory_offset,
-                    "length": len(memory),
-                    "digest": memory_digest,
-                }
-            },
-        ).prompt_components,
-        auto_project=False,
-    ))
-    _install_live_skill(home, "first", "first description")
-    second = manager.open(first.metadata.session_id)
-    resumed = await asyncio.to_thread(lambda: resume_prompt(
-        second.metadata,
-        manager=manager,
-        store=second.store,
-        home=home,
-        repo_root=project,
-        inbox_enabled=False,
-        context_loader=lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError(f"unexpected default rebuild: {kwargs}")
-        ),
-    ))
-    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-    config = resolve(
-        load_settings(home=home).settings,
-        cli_provider="codex",
-        cli_model="offline",
-        cli_yolo=None,
-        cli_token_budget=None,
-        cli_auto_memory=False,
-    )
-    runtime = await asyncio.to_thread(
-        compose_runtime,
-        home=home,
-        cwd=project,
-        manager=manager,
-        config=config,
-        provider="codex",
-        model="offline",
-        project_context=resumed.context,
-        backend_builder=lambda *_args, **_kwargs: (backend, "offline"),
-        opened=first,
-        skill_catalog=resumed.skill_catalog,
-        agent_catalog=resumed.agent_catalog,
-        auto_project=False,
-    )
-    second.store.close()
-    _install_live_skill(home, "second", "second description")
-    try:
-        _ = [
-            event
-            async for event in runtime.loop.run_turn(
-                "use both", origin=MessageOrigin.USER
-            )
-        ]
-        system_text = "\n".join(
-            block.text
-            for message in backend.calls[0][0]
-            if message.role is MessageRole.SYSTEM
-            for block in message.content
-            if isinstance(block, TextContent)
-        )
-        component = runtime.loop._runtime_prompt.prompt_components["project_memory"]
-        offset = int(component["offset"])
-        length = int(component["length"])
-        assert "first description" in system_text
-        assert "second description" in system_text
-        assert system_text[offset : offset + length] == memory
-        assert component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
-    finally:
-        await runtime.loop.close()
-        first.store.close()
-
-
-@pytest.mark.asyncio
-async def test_resume_replaces_live_skill_index_and_refreshes_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = SkillCatalog.empty()
-    memory = "old memory"
-    prompt = f"identity\n\n{catalog.index()}\n\n{memory}\n"
-    memory_offset = prompt.index(memory)
-    memory_digest = hashlib.sha256(memory.encode()).hexdigest()
-    manager = SessionManager(home)
-    opened = await asyncio.to_thread(lambda: manager.create(
-        provider="codex",
-        model="offline",
-        cwd=project,
-        system_prompt=prompt,
-        skill_catalog=catalog,
-        project_memory_offset=memory_offset,
-        project_memory_length=len(memory),
-        project_memory_digest=memory_digest,
-        prompt_recipe="custom",
-        prompt_components=_owned_runtime_prompt(
-            prompt,
-            catalog,
-            {
-                "project_memory": {
-                    "offset": memory_offset,
-                    "length": len(memory),
-                    "digest": memory_digest,
-                }
-            },
-        ).prompt_components,
-        auto_project=False,
-    ))
-    loop = AgentLoop(
-        FakeBackend([]),
-        opened.store,
-        skill_catalog=catalog,
-        runtime_prompt=_owned_runtime_prompt(
-            prompt,
-            catalog,
-            {
-                "project_memory": {
-                    "offset": memory_offset,
-                    "length": len(memory),
-                    "digest": memory_digest,
-                }
-            },
-        ),
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    loop.manager = manager
-    loop.session_metadata = opened.metadata
-    _install_live_skill(home)
-    await loop.refresh_live_config()
-    assert "live description" in loop.context_assembler.system_prompt.content[0].text
-    assert manager.read_metadata(opened.metadata.session_id).system_prompt == prompt
-    await loop.close()
-    opened.store.close()
-
-    refreshed_memory = "current project memory"
-    monkeypatch.setattr(
-        "zeta.runtime.prompt_resume.refresh_project_memory",
-        lambda value, **kwargs: value.replace(memory, refreshed_memory),
-    )
-    resumed = manager.open(opened.metadata.session_id)
-    try:
-        result = await asyncio.to_thread(lambda: resume_prompt(
-            resumed.metadata,
-            manager=manager,
-            store=resumed.store,
-            home=home,
-            repo_root=project,
-            inbox_enabled=False,
-            context_loader=lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError(f"unexpected default rebuild: {kwargs}")
-            ),
-        ))
-        component = result.context.prompt_components["project_memory"]
-        offset = int(component["offset"])
-        length = int(component["length"])
-        assert "live description" in result.context.system_prompt
-        assert result.context.system_prompt[offset : offset + length] == refreshed_memory
-        assert component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
-        saved = manager.read_metadata(opened.metadata.session_id)
-        assert saved.system_prompt == result.context.system_prompt
-        assert saved.project_memory_offset == offset
-        assert saved.project_memory_length == length
-        assert saved.project_memory_digest == component["digest"]
-        assert saved.skill_catalog[0]["name"] == "live"
-    finally:
-        resumed.store.close()
-
-async def test_live_skill_refresh_ignores_user_skill_marker_and_replaces_owned_index(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    user_block = (
-        "<zeta-skills>\nAvailable skills:\n- user: keep this text\n</zeta-skills>"
-    )
-    home.mkdir()
-    (home / "AGENTS.md").write_text(
-        f"home identity before\n{user_block}\nhome identity after\n",
-        encoding="utf-8",
-    )
-    catalog = discover_session_skills(home=home, project_dir=project)
-    context = load_project_context(
-        cwd=project,
-        repo_root=project,
-        zeta_home=home,
-        catalog=catalog,
-        inbox_enabled=False,
-    )
-    loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions", cwd=project),
-        skill_catalog=catalog,
-        runtime_prompt=RuntimePrompt(context.system_prompt, context.prompt_components),
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    _install_live_skill(home)
-
-    try:
-        await loop.refresh_live_config()
-        updated = loop._runtime_prompt
-        text = "".join(
-            block.text
-            for block in updated.system_prompt.content
-            if isinstance(block, TextContent)
-        )
-    finally:
-        await loop.close()
-        loop.store.close()
-
-    assert user_block in text
-    assert "live description" in text
-    assert text.index(user_block) < text.index("live description")
-    for key in ("identity", "skill_index", "default_context"):
-        component = updated.prompt_components[key]
-        offset = int(component["offset"])
-        length = int(component["length"])
-        value = text[offset : offset + length]
-        assert component["digest"] == hashlib.sha256(value.encode()).hexdigest()
-
-
-async def test_live_skill_refresh_discards_stale_plan_prompt(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    prompt = f"identity\n\n{catalog.index()}"
-    loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions", cwd=project),
-        skill_catalog=catalog,
-        runtime_prompt=_owned_runtime_prompt(prompt, catalog),
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    _install_live_skill(home)
-    scanned = threading.Event()
-    release = threading.Event()
-    original_scan = loop._live_config_watcher.prepare
-
-    def paused_prepare(base, *, force: bool = False):
-        result = original_scan(base, force=force)
-        scanned.set()
-        assert release.wait(timeout=5)
-        return result
-
-    loop._live_config_watcher.prepare = paused_prepare
-    refresh = asyncio.create_task(loop.refresh_live_config())
-    assert await asyncio.to_thread(scanned.wait, 10)
-    loop.set_plan_mode(True)
-    release.set()
-    await asyncio.wait_for(refresh, timeout=10)
-
-    assert loop.plan_mode is True
-    assert "live description" not in _runtime_text(loop)
-    assert not any(
-        skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
-    )
-
-    await loop.refresh_live_config()
-    assert loop.plan_mode is True
-    assert "live description" in _runtime_text(loop)
-    await loop.close()
-    loop.store.close()
-
-
-async def test_live_skill_refresh_discards_stale_memory_prompt(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    memory = "memory before"
-    prompt = f"identity\n\n{catalog.index()}\n\n{memory}"
-    memory_offset = prompt.index(memory)
-    runtime_prompt = _owned_runtime_prompt(
-        prompt,
-        catalog,
-        {
-            "project_memory": {
-                "offset": memory_offset,
-                "length": len(memory),
-                "digest": hashlib.sha256(memory.encode()).hexdigest(),
-            }
-        },
-    )
-    loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions", cwd=project),
-        skill_catalog=catalog,
-        runtime_prompt=runtime_prompt,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    _install_live_skill(home)
-    scanned = threading.Event()
-    release = threading.Event()
-    original_scan = loop._live_config_watcher.prepare
-
-    def paused_prepare(base, *, force: bool = False):
-        result = original_scan(base, force=force)
-        scanned.set()
-        assert release.wait(timeout=5)
-        return result
-
-    loop._live_config_watcher.prepare = paused_prepare
-    refresh = asyncio.create_task(loop.refresh_live_config())
-    assert await asyncio.to_thread(scanned.wait, 10)
-    changed_memory = "memory changed while refresh prepared"
-    changed_prompt = prompt.replace(memory, changed_memory)
-    changed_offset = changed_prompt.index(changed_memory)
-    loop._set_runtime_prompt(
-        _owned_runtime_prompt(
-            changed_prompt,
-            catalog,
-            {
-                "project_memory": {
-                    "offset": changed_offset,
-                    "length": len(changed_memory),
-                    "digest": hashlib.sha256(changed_memory.encode()).hexdigest(),
-                }
-            },
-        )
-    )
-    release.set()
-    await asyncio.wait_for(refresh, timeout=10)
-
-    assert changed_memory in _runtime_text(loop)
-    assert "live description" not in _runtime_text(loop)
-    assert not any(
-        skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
-    )
-
-    await loop.refresh_live_config()
-    assert changed_memory in _runtime_text(loop)
-    assert "live description" in _runtime_text(loop)
-    await loop.close()
-    loop.store.close()
-
-
-async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -1025,3 +658,107 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_skill_refresh
         await runtime.loop.close()
         first.store.close()
 
+
+@pytest.mark.asyncio
+async def test_resume_replaces_live_skill_index_and_refreshes_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    catalog = SkillCatalog.empty()
+    memory = "old memory"
+    prompt = f"identity\n\n{catalog.index()}\n\n{memory}\n"
+    memory_offset = prompt.index(memory)
+    memory_digest = hashlib.sha256(memory.encode()).hexdigest()
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(
+            provider="codex",
+            model="offline",
+            cwd=project,
+            system_prompt=prompt,
+            skill_catalog=catalog,
+            project_memory_offset=memory_offset,
+            project_memory_length=len(memory),
+            project_memory_digest=memory_digest,
+            prompt_recipe="custom",
+            prompt_components=_owned_runtime_prompt(
+                prompt,
+                catalog,
+                {
+                    "project_memory": {
+                        "offset": memory_offset,
+                        "length": len(memory),
+                        "digest": memory_digest,
+                    }
+                },
+            ).prompt_components,
+            auto_project=False,
+        )
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=catalog,
+        runtime_prompt=_owned_runtime_prompt(
+            prompt,
+            catalog,
+            {
+                "project_memory": {
+                    "offset": memory_offset,
+                    "length": len(memory),
+                    "digest": memory_digest,
+                }
+            },
+        ),
+        live_config_home=home,
+        live_config_project_dir=project,
+    )
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    _install_live_skill(home)
+    await loop.refresh_live_config()
+    assert "live description" in loop.context_assembler.system_prompt.content[0].text
+    assert manager.read_metadata(opened.metadata.session_id).system_prompt == prompt
+    await loop.close()
+    opened.store.close()
+
+    refreshed_memory = "current project memory"
+    monkeypatch.setattr(
+        "zeta.runtime.prompt_resume.refresh_project_memory",
+        lambda value, **kwargs: value.replace(memory, refreshed_memory),
+    )
+    resumed = manager.open(opened.metadata.session_id)
+    try:
+        result = await asyncio.to_thread(
+            lambda: resume_prompt(
+                resumed.metadata,
+                manager=manager,
+                store=resumed.store,
+                home=home,
+                repo_root=project,
+                inbox_enabled=False,
+                context_loader=lambda **kwargs: (_ for _ in ()).throw(
+                    AssertionError(f"unexpected default rebuild: {kwargs}")
+                ),
+            )
+        )
+        component = result.context.prompt_components["project_memory"]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert "live description" in result.context.system_prompt
+        assert (
+            result.context.system_prompt[offset : offset + length] == refreshed_memory
+        )
+        assert (
+            component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
+        )
+        saved = manager.read_metadata(opened.metadata.session_id)
+        assert saved.system_prompt == result.context.system_prompt
+        assert saved.project_memory_offset == offset
+        assert saved.project_memory_length == length
+        assert saved.project_memory_digest == component["digest"]
+        assert saved.skill_catalog[0]["name"] == "live"
+    finally:
+        resumed.store.close()
