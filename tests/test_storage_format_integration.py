@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +16,7 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.runtime.loop.persistence import DraftPersistence
-from zeta.storage_format import StorageFormatError
+from zeta.storage_format import WRITER_EPOCH, StorageFormatError
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
 
@@ -25,6 +28,48 @@ def _inject(path: Path) -> None:
 
 def _assert_future(path: Path) -> None:
     assert json.loads(path.read_text())["future"] == {"nested": {"value": 7}}
+
+
+def _run_cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["ZETA_HOME"] = str(home)
+    environment.pop("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", None)
+    return subprocess.run(
+        [str(Path(sys.executable).with_name("zeta")), *arguments],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_bare_home_error_names_exact_storage_format_advance_command(
+    tmp_path: Path,
+) -> None:
+    result = _run_cli(
+        tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
+    )
+
+    assert result.returncode != 0
+    assert (
+        f"zeta storage-format advance --expected-epoch 0 --target-epoch {WRITER_EPOCH}"
+        in result.stderr
+    )
+
+
+def test_storage_format_advance_defaults_to_writer_epoch(tmp_path: Path) -> None:
+    result = _run_cli(tmp_path, "storage-format", "advance", "--expected-epoch", "0")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads((tmp_path / "storage-format.json").read_text()) == {
+        "writer_epoch": WRITER_EPOCH
+    }
+
+    following_start = _run_cli(
+        tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
+    )
+    assert "stored-format manifest is missing" not in following_start.stderr
 
 
 def test_every_session_mapping_writer_preserves_unknown_nested_keys(
