@@ -196,17 +196,17 @@ class DecisionsMixin:
 
     def _decisions_key(self, key: str) -> None:
         panel = self._decisions_panel
-        if panel.mode == "answer":
-            self._decisions_answer_key(key)
-            return
-        if key == "escape":
-            self.close_decisions_panel()
-            return
         if key == "pageup":
             self._decisions_panel_control.page(-1)
         elif key == "pagedown":
             self._decisions_panel_control.page(1)
-        elif key in {"up", "k"}:
+        elif panel.mode == "answer":
+            self._decisions_answer_key(key)
+            return
+        elif key == "escape":
+            self.close_decisions_panel()
+            return
+        if key in {"up", "k"}:
             panel.move(-1)
         elif key in {"down", "j"}:
             panel.move(1)
@@ -235,14 +235,14 @@ class DecisionsMixin:
         elif key == "backspace":
             self._decisions_answer_buffer = self._decisions_answer_buffer[:-1]
             self._decisions_panel.set_answer(self._decisions_answer_buffer)
-        self._refresh_decisions_panel()
+        self._refresh_decisions_panel(keep_offset=True)
 
     def _decisions_answer_input(self, text: str) -> None:
         if self._decisions_panel.mode != "answer":
             return
         self._decisions_answer_buffer += text
         self._decisions_panel.set_answer(self._decisions_answer_buffer)
-        self._refresh_decisions_panel()
+        self._refresh_decisions_panel(keep_offset=True)
 
     def _refresh_decisions_panel(self, *, keep_offset: bool = False) -> None:
         if not self._decisions_panel_open:
