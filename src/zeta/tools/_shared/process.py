@@ -926,7 +926,7 @@ class BackgroundTaskRegistry:
         try:
             await self._notify_terminal_exit(candidate)
         finally:
-            self.task_changes.wake()
+            self.task_changes.advance()
         return True
 
     def _publish_terminal(
@@ -937,7 +937,6 @@ class BackgroundTaskRegistry:
         record.ended_at = candidate.ended_at
         record.process = candidate.process
         record.terminal_phase = candidate.terminal_phase
-        self.task_changes.advance(wake=False)
 
     async def _retry_pending_terminals(self) -> None:
         pending = tuple(self._pending_terminals.items())
@@ -962,7 +961,7 @@ class BackgroundTaskRegistry:
                 await self._notify_terminal_exit(candidate)
         finally:
             if pending:
-                self.task_changes.wake()
+                self.task_changes.advance()
 
     async def _read_output(
         self,

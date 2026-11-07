@@ -22,9 +22,6 @@ class TaskChangeSignal:
         self.closed = True
         self.advance()
 
-    def wake(self) -> None:
-        self._changed.set()
-
     async def wait(self, generation: int) -> None:
         while self.generation == generation:
             self._changed.clear()

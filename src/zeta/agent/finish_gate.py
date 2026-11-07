@@ -263,7 +263,11 @@ class FinishGateState:
         return None
 
     async def wait_transition(
-        self, child_loop: AgentLoop, *, tasks_running: bool
+        self,
+        child_loop: AgentLoop,
+        *,
+        tasks_running: bool,
+        task_generation: int | None = None,
     ) -> FinishGateResult | None:
         loop = asyncio.get_running_loop()
         deadline = None if tasks_running else self._child_deadline()
@@ -274,16 +278,36 @@ class FinishGateState:
             ).pending:
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
-        try:
-            if deadline is None:
-                await child_loop._background_owner.conversation_channel.wait(
+        async def wait_change() -> None:
+            conversation = asyncio.create_task(
+                child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
+            )
+            if task_generation is None:
+                await conversation
+                return
+            task_change = asyncio.create_task(
+                child_loop.tool_registry.background_tasks.task_changes.wait(
+                    task_generation
+                )
+            )
+            try:
+                await asyncio.wait(
+                    (conversation, task_change), return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for wait in (conversation, task_change):
+                    if not wait.done():
+                        wait.cancel()
+                await asyncio.gather(conversation, task_change, return_exceptions=True)
+
+        try:
+            if deadline is None:
+                await wait_change()
             else:
                 async with asyncio.timeout_at(deadline):
-                    await child_loop._background_owner.conversation_channel.wait(
-                        child_loop.agent_instance_id or ""
-                    )
+                    await wait_change()
         except TimeoutError:
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
@@ -330,14 +354,14 @@ async def await_owned_work(
     gate = state or FinishGateState()
     gate.start(child_loop)
     while True:
+        task_changes = child_loop.tool_registry.background_tasks.task_changes
+        task_generation = task_changes.generation
         children = gate.owned_children(child_loop)
         tasks = gate.owned_tasks(child_loop)
         if not children and not tasks:
             return
         if tasks:
-            await child_loop._background_owner.conversation_channel.wait(
-                child_loop.agent_instance_id or ""
-            )
+            await task_changes.wait(task_generation)
             continue
         deadline = gate._child_deadline()
         if asyncio.get_running_loop().time() >= deadline:
@@ -413,9 +437,22 @@ async def _wait_for_finish(
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
 ) -> FinishGateResult:
+    waited_task_generation: int | None = None
     while not failed():
+        task_generation = (
+            child_loop.tool_registry.background_tasks.task_changes.generation
+        )
         children = state.owned_children(child_loop)
         tasks = state.owned_tasks(child_loop)
+        if tasks and waited_task_generation is None:
+            waited_task_generation = task_generation
+        elif not tasks and waited_task_generation == task_generation:
+            await child_loop.tool_registry.background_tasks.task_changes.wait(
+                task_generation
+            )
+            continue
+        elif not tasks:
+            waited_task_generation = None
         state.note_task_outlived_child_bound(bool(tasks))
         state.begin_post_task_turns(bool(tasks))
         pending_notification = child_loop.notification_system_message() is not None
@@ -433,7 +470,9 @@ async def _wait_for_finish(
         if terminal is not None:
             return terminal
         if state.should_wait_without_model(bool(tasks)):
-            result = await state.wait_transition(child_loop, tasks_running=True)
+            result = await state.wait_transition(
+                child_loop, tasks_running=True, task_generation=task_generation
+            )
         elif pending_notification or delivery_pending:
             result = await _handle_pending_notification(
                 state,
@@ -444,7 +483,9 @@ async def _wait_for_finish(
             )
         else:
             result = await state.wait_transition(
-                child_loop, tasks_running=bool(tasks)
+                child_loop,
+                tasks_running=bool(tasks),
+                task_generation=task_generation if tasks else None,
             )
         if result is not None:
             return result
