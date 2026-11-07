@@ -1519,10 +1519,10 @@ async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_paren
     child = ConversationStore(root.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
     child.close()
-    with (root.session_dir / "agents" / "1" / "conversation.jsonl").open(
-        "ab"
-    ) as stream:
+    child_path = root.session_dir / "agents" / "1" / "conversation.jsonl"
+    with child_path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
+    damaged = child_path.read_bytes()
 
     source = agent_sync_module.AgentTranscriptSource(root.session_dir / "agents" / "1")
     with pytest.raises(Exception) as raised:
@@ -1541,6 +1541,7 @@ async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_paren
     )
     assert "must-not-leak" not in rendered
     assert root.messages()[0].content[0].text == "parent healthy"
+    assert child_path.read_bytes() == damaged
     card.release_transcript_source()
     source.close()
     root.close()

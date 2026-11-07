@@ -7710,6 +7710,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
     await _request(reader, writer, 3, "new_session", {"provider": "codex"})
     with path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
+    damaged = path.read_bytes()
     try:
         response = (
             await _request(reader, writer, 4, "resume", {"session_id": session_id})
@@ -7728,6 +7729,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
         }
         assert "must-not-leak" not in json.dumps(response)
         assert str(path) not in json.dumps(response)
+        assert path.read_bytes() == damaged
     finally:
         await _close(server, writer)
 
