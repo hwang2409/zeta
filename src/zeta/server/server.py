@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
-from ..core.store import ConversationIntegrityError
+from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -404,6 +404,12 @@ class _Client:
                             -32000,
                             str(exc),
                             {"code": exc.code, "retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptLoadError as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id, -32000, str(exc), exc.protocol_data()
                         )
                     )
                 except ConversationIntegrityError as exc:
