@@ -81,6 +81,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend

@@ -153,6 +153,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    harness_notice,
     with_message_origin,
 )
 from zeta.tui import theme
