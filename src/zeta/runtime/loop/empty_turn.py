@@ -88,7 +88,7 @@ async def complete_empty_turn(
     if transition.continue_turn:
         return (turn_end,), False
     schedule_index()
-    return (turn_end, "agent_end"), True
+    return (turn_end, StreamEvent(StreamEventType.AGENT_END)), True
 
 
 def _bounded_detail(value: str) -> str:
