@@ -3977,7 +3977,11 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
 
         state, _configured_timeout = deadlines.started[0]
         deadlines.expire_model_bound(state)
-        result = await asyncio.wait_for(model_turn, 10)
+        done, _ = await asyncio.wait({model_turn}, timeout=10)
+        assert model_turn in done, (
+            "model turn did not finish after the injected finish_gate_timeout expired"
+        )
+        result = model_turn.result()
 
         assert result is None
         assert clients[0].stream_context.close_cancelled.is_set()
@@ -4018,7 +4022,11 @@ async def test_finish_gate_real_transport_close_obeys_task_deadline(
 
         state, _configured_timeout = deadlines.started[0]
         deadlines.expire_model_bound(state)
-        result = await asyncio.wait_for(model_turn, 10)
+        done, _ = await asyncio.wait({model_turn}, timeout=10)
+        assert model_turn in done, (
+            "model turn did not finish after the injected finish_gate_timeout expired"
+        )
+        result = model_turn.result()
         await asyncio.sleep(0)
 
         assert result is None
