@@ -203,6 +203,7 @@ class ConnectionRegistry:
         session_id: str | None,
         *,
         required_feature: str | None = None,
+        admitted: asyncio.Event | None = None,
         **fields: object,
     ) -> bool:
         state = self._controller
@@ -232,8 +233,10 @@ class ConnectionRegistry:
                 _OutputFrame(frame),
                 wake=output.phase == "flushing",
             )
+            if admitted is not None:
+                admitted.set()
             return True
-        return await self._send_frame(output, frame)
+        return await self._send_frame(output, frame, admitted=admitted)
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
@@ -290,10 +293,18 @@ class ConnectionRegistry:
         finally:
             self._finish_caller(output)
 
-    async def _send_frame(self, output: _OutputState, frame: _Frame) -> bool:
+    async def _send_frame(
+        self,
+        output: _OutputState,
+        frame: _Frame,
+        *,
+        admitted: asyncio.Event | None = None,
+    ) -> bool:
         future = self.loop.create_future()
         item = _OutputFrame(frame, future)
         self._enqueue(output, item)
+        if admitted is not None:
+            admitted.set()
         self._begin_caller(output)
         try:
             return await asyncio.shield(future)

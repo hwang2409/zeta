@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 from uuid import uuid4
@@ -46,7 +46,8 @@ class ApprovalRecord:
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
-    publication_started: asyncio.Event | None = None
+    publication_admitted: asyncio.Event = field(default_factory=asyncio.Event)
+    publication_owner: asyncio.Task[object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -758,6 +759,9 @@ class ApprovalLifecycle:
         *,
         grant: ApprovalRequest | None = None,
     ) -> dict[str, str]:
+        owner = asyncio.current_task()
+        assert owner is not None
+        record = self._change(record, publication_owner=owner)
         token = record.token
         generation = record.generation
         target = record.target
@@ -895,17 +899,28 @@ class ApprovalLifecycle:
             return exc
         return None
 
+    async def wait_for_terminal_order(self, key: ApprovalKey) -> None:
+        """Wait until this approval's terminal frame has entered wire order."""
+        record = self._state.records.get(key)
+        if record is not None:
+            await record.publication_admitted.wait()
+
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
         current = self._state.records.get(record.target.key)
         if current is None or current.token != record.token:
             return
-        if current.publication_started is not None:
-            await current.publication_started.wait()
+        owner = asyncio.current_task()
+        assert owner is not None
+        if (
+            current.publication_owner is not None
+            and current.publication_owner is not owner
+            and not current.publication_owner.done()
+        ):
+            await current.publication_admitted.wait()
             return
-        publication_started = asyncio.Event()
-        record = self._change(current, publication_started=publication_started)
+        record = self._change(current, publication_owner=owner)
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -914,12 +929,12 @@ class ApprovalLifecycle:
         try:
             history_outcome = await self._append_delegated_history(record, payload)
             if payload is not None and record.published:
-                publication_started.set()
                 await self._publish(
                     event_contract.STREAM_EVENT_WIRE_EVENTS[
                         StreamEventType.TOOL_APPROVAL_END
                     ],
                     self._session_id(),
+                    admitted=record.publication_admitted,
                     **payload,
                 )
             if isinstance(history_outcome, OSError):
@@ -927,7 +942,7 @@ class ApprovalLifecycle:
                     record, "approval history could not be persisted"
                 )
         finally:
-            publication_started.set()
+            record.publication_admitted.set()
             if self._owns(record):
                 self._remove(record.target.key)
         if isinstance(history_outcome, asyncio.CancelledError):
