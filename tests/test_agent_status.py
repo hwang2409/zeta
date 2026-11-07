@@ -5,14 +5,18 @@ import os
 import random
 import threading
 import weakref
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 import zeta.tools.agent as agent_tools
+from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent.presets import AGENT_PRESETS
 from zeta.agent.receipt import encode_json
+from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.agent_progress import (
@@ -183,6 +187,98 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     assert unknown["isError"] is True
     assert "unknown child handle" in unknown["content"][0]["text"]
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_status_reports_child_while_finish_is_being_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finish_accepted = asyncio.Event()
+    release_finish = asyncio.Event()
+    original_accept_finish = TerminalTransitionFence.accept_finish
+
+    async def accept_finish_and_hold(
+        fence: TerminalTransitionFence, report: dict[str, object]
+    ) -> str | None:
+        reason = await original_accept_finish(fence, report)
+        if reason is None:
+            finish_accepted.set()
+            await asyncio.wait_for(release_finish.wait(), timeout=10)
+        return reason
+
+    monkeypatch.setattr(
+        TerminalTransitionFence, "accept_finish", accept_finish_and_hold
+    )
+    monkeypatch.setitem(
+        AGENT_PRESETS,
+        "run",
+        replace(AGENT_PRESETS["run"], explicit_finish=True),
+    )
+    run_call = ToolCall(
+        "run-1",
+        "agent",
+        {
+            "prompt": "finish the task",
+            "description": "finishing child",
+            "agent_type": "run",
+            "background": True,
+        },
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[run_call]),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "finish-1",
+                        "finish",
+                        {"status": "done", "summary": "finished"},
+                    )
+                ]
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(finish_accepted.wait(), timeout=10)
+        running_result = next(
+            message.tool_result
+            for message in store.messages()
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == run_call.id
+        )
+        assert running_result.structured_content is not None
+        handle = running_result.structured_content["child_instance_id"]
+        assert isinstance(handle, str)
+
+        status = await _status(loop, handle)
+        child = status["structuredContent"]["children"][0]
+
+        assert status["isError"] is False
+        assert child["state"] == "finishing"
+        assert child["finished_at"] is None
+        assert child["started_at"] != "unknown"
+        assert child["depth"] == 1
+        assert child["agent_type"] == "run"
+        assert child["current_step"] == "finishing"
+        assert "reason" not in child
+
+        release_finish.set()
+        await wait_background_owner(loop)
+        terminal_status = await _status(loop, handle)
+        terminal_child = terminal_status["structuredContent"]["children"][0]
+        assert terminal_child["state"] == "completed"
+        assert terminal_child["finished_at"] is not None
+    finally:
+        release_finish.set()
+        try:
+            await wait_background_owner(loop)
+        finally:
+            await asyncio.wait_for(loop.close(), timeout=10)
 
 
 @pytest.mark.asyncio
