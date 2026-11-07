@@ -84,6 +84,7 @@ async def consume_child(
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
     notification_turn: bool = False,
+    harness_notice_message: Message | None = None,
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
@@ -193,15 +194,16 @@ async def consume_child(
         )
 
     try:
-        events = (
-            child_loop.run_notification_turn()
-            if notification_turn
-            else child_loop.run_turn(
+        if notification_turn:
+            events = child_loop.run_notification_turn()
+        elif harness_notice_message is not None:
+            events = child_loop.run_harness_notice_turn(harness_notice_message)
+        else:
+            events = child_loop.run_turn(
                 "" if delivering_prompt_id is not None else prompt,
                 origin=origin,
                 persist_user_message=delivering_prompt_id is None,
             )
-        )
         try:
             await consume_events(events)
         finally:

@@ -4395,27 +4395,25 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_passive_harness_message(
+async def test_session_history_shows_zeta_notice_as_system_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
     monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
         expected = []
+        notice_id = ""
         for index in range(9):
             if index == 4:
-                store.append_message(
-                    with_message_origin(
-                        Message(
-                            MessageRole.USER,
-                            [TextContent("hidden inbox status")],
-                            metadata={"zeta_event": "project_inbox_sent_status"},
-                        ),
-                        MessageOrigin.HARNESS_NUDGE,
-                    )
-                )
+                notice = build_nudge_message()
+                assert notice.role is MessageRole.SYSTEM
+                assert notice.content[0].text.startswith("[zeta] empty-turn recovery:")
+                notice_id = store.append_message(notice).id
+                expected.append(notice_id)
             expected.append(
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
@@ -4441,11 +4439,15 @@ async def test_session_history_hides_passive_harness_message(
             )
         )[-1]["result"]
 
-        assert [row["id"] for row in first["messages"]] == expected[:8]
+        rows = [*first["messages"], *second["messages"]]
+        assert [row["id"] for row in rows] == expected
         assert first["next_offset"] == 8
-        assert [row["id"] for row in second["messages"]] == expected[8:]
         assert second["next_offset"] is None
-        assert "hidden inbox status" not in json.dumps([first, second])
+        notice_row = next(row for row in rows if row["id"] == notice_id)
+        assert notice_row["role"] == "system"
+        assert notice_row["content"][0]["text"].startswith(
+            "[zeta] empty-turn recovery:"
+        )
     finally:
         await _close(server, writer)
 
