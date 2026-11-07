@@ -43,11 +43,7 @@ def test_child_handshake_success_restores_file_descriptors() -> None:
 
     with child_handshake() as handshake:
         process = _spawn_with_handshake(f"import os; {_READY_WRITE}", handshake)
-        try:
-            handshake.wait_sync()
-        except AssertionError as error:
-            status = reap_process(process)
-            raise AssertionError(f"{error}; child exit code: {status}") from error
+        handshake.wait_sync(process=process)
         assert reap_process(process) == 0
 
     assert _fd_count() == baseline
@@ -85,7 +81,7 @@ os.read({release_read}, 1)
                 await asyncio.to_thread(os.read, marker_read, 64) == b"marker-created"
             )
             assert marker.exists()  # The legacy existence assertion can run too early.
-            ready = asyncio.create_task(handshake.wait())
+            ready = asyncio.create_task(handshake.wait(process=process))
             await asyncio.sleep(0)
             assert not ready.done()
 
@@ -105,12 +101,10 @@ def test_child_handshake_eof_names_child_status_and_restores_fds() -> None:
 
     with child_handshake() as handshake:
         process = _spawn_with_handshake("raise SystemExit(7)", handshake)
+        assert process.wait() == 7
         with pytest.raises(AssertionError, match="eof before ready token") as error:
-            handshake.wait_sync()
-        status = reap_process(process)
-        assert f"{error.value}; child exit code: {status}".endswith(
-            "child exit code: 7"
-        )
+            handshake.wait_sync(process=process)
+        assert str(error.value).endswith("child exit code: 7")
 
     assert _fd_count() == baseline
 
@@ -121,9 +115,10 @@ def test_child_handshake_rejects_a_wrong_token() -> None:
             "import os; os.write(int(os.environ['ZETA_TEST_READY_FD']), b'wrong')",
             handshake,
         )
-        with pytest.raises(AssertionError, match="wrong token: b'wrong'"):
-            handshake.wait_sync()
-        assert reap_process(process) == 0
+        assert process.wait() == 0
+        with pytest.raises(AssertionError, match="wrong token: b'wrong'") as error:
+            handshake.wait_sync(process=process)
+        assert str(error.value).endswith("child exit code: 0")
 
 
 def test_child_handshake_timeout_restores_file_descriptors() -> None:
@@ -131,8 +126,9 @@ def test_child_handshake_timeout_restores_file_descriptors() -> None:
 
     with child_handshake() as handshake:
         process = _spawn_with_handshake("import time; time.sleep(120)", handshake)
-        with pytest.raises(AssertionError, match="timed out"):
-            handshake.wait_sync(timeout=0)
+        with pytest.raises(AssertionError, match="timed out") as error:
+            handshake.wait_sync(process=process, timeout=0)
+        assert str(error.value).endswith("child still running")
         assert reap_process(process, timeout=0) < 0
 
     assert _fd_count() == baseline

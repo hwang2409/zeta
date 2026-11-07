@@ -27,10 +27,14 @@ class ChildHandshake:
     def child_env(self, name: str = "ZETA_TEST_READY_FD") -> dict[str, str]:
         return {name: str(self.child_fd)}
 
-    async def wait(self, *, timeout: float = 30) -> None:
-        await asyncio.to_thread(self.wait_sync, timeout=timeout)
+    async def wait(
+        self, *, process: subprocess.Popen[object], timeout: float = 30
+    ) -> None:
+        await asyncio.to_thread(self.wait_sync, process=process, timeout=timeout)
 
-    def wait_sync(self, *, timeout: float = 30) -> None:
+    def wait_sync(
+        self, *, process: subprocess.Popen[object], timeout: float = 30
+    ) -> None:
         if self._waited:
             raise AssertionError("child handshake can only be awaited once")
         self._waited = True
@@ -38,16 +42,28 @@ class ChildHandshake:
 
         with selectors.DefaultSelector() as selector:
             selector.register(self._parent_fd, selectors.EVENT_READ)
-            if not selector.select(timeout):
+            ready = selector.select(timeout)
+            return_code = process.poll()
+            child_status = (
+                "child still running"
+                if return_code is None
+                else f"child exit code: {return_code}"
+            )
+            if not ready:
                 raise AssertionError(
-                    f"child handshake timed out after {timeout}s waiting for ready token"
+                    f"child handshake timed out after {timeout}s waiting for ready token; "
+                    f"{child_status}"
                 )
             token = os.read(self._parent_fd, 4096)
 
         if not token:
-            raise AssertionError("child handshake reached eof before ready token")
+            raise AssertionError(
+                f"child handshake reached eof before ready token; {child_status}"
+            )
         if token != _READY_TOKEN:
-            raise AssertionError(f"child handshake received wrong token: {token!r}")
+            raise AssertionError(
+                f"child handshake received wrong token: {token!r}; {child_status}"
+            )
 
     def _close_child_fd(self) -> None:
         if self.child_fd >= 0:
