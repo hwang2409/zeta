@@ -1461,7 +1461,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
             await _cancel_and_drain([task])
         finally:
             try:
-                if close_task is not None and not close_task.done():
+                if close_task is not None:
                     await asyncio.wait_for(close_task, 10)
                 else:
                     await asyncio.wait_for(loop.close(), 10)
