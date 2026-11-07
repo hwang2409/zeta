@@ -1004,6 +1004,12 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         assert _mtimes(server.home) == before
 
         await _request(reader, writer, 7, "new_session", {})
+        # test-contract: seam wait for expected background MCP startup before the read-only probe
+        state = server.runtime._state
+        assert state is not None
+        mount_task = state.loop._mcp_mount_task
+        assert mount_task is not None
+        await mount_task
         attached_before = _mtimes(server.home)
         attached = (await _request(
             reader, writer, 8, "project_show", {"project_id": alpha.project_id}
