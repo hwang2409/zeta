@@ -271,6 +271,7 @@ async def test_agent_output_matches_main_equality_table(
         parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("x")]))
+    # test-contract: seam isolate receipt discovery for the equality table
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
@@ -589,11 +590,13 @@ async def test_agent_output_does_not_cache_outputs_over_byte_bound(
         parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("large")]))
+    # test-contract: seam isolate receipt discovery for cache bound coverage
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
         lambda store: {"parent:1": child.session_dir},
     )
+    # test-contract: seam force the byte-bound branch deterministically
     monkeypatch.setattr(agent_tools, "_AGENT_OUTPUT_CACHE_MAX_CHARS", 1)
     registry = SimpleNamespace(
         max_output_chars=10_000,
@@ -613,6 +616,7 @@ async def test_agent_output_does_not_cache_append_during_read(
     parent = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(parent.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("old")]))
+    # test-contract: seam inject an append between read and post-read fstat
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
