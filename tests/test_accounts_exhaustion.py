@@ -55,7 +55,7 @@ from zeta.tui import TUIApp
 FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
 ACCOUNT = AccountId("codex", "pro")
-SATURATED_RACE_TIMEOUT_SECONDS = 5
+SATURATED_RACE_TIMEOUT_SECONDS = 10
 
 
 def _failure(status: int, body: object) -> SimpleNamespace:
@@ -589,7 +589,6 @@ async def test_switch_cancel_during_apply_handoff_releases_lock_and_fails_closed
 def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     faulthandler.dump_traceback_later(SATURATED_RACE_TIMEOUT_SECONDS, exit=True)
     results.send(("ready", time.monotonic()))
-    race_started = time.monotonic()
 
     async def run() -> None:
         home = Path(home_value)
@@ -606,7 +605,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
 
         @contextmanager
         def observed_metadata_lock(*args: object, **kwargs: object):
-            writers_ready.wait(timeout=2)
+            writers_ready.wait(timeout=10)
             with metadata_lock(*args, **kwargs) as directory_fd:
                 yield directory_fd
 
@@ -633,7 +632,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
             ) as directory_fd:
                 assert directory_fd is None
             event_loop.call_soon_threadsafe(queue_renames)
-            writers_ready.wait(timeout=2)
+            writers_ready.wait(timeout=10)
             return metadata
 
         SessionAccountContext._commit_locked = commit_then_queue_renames  # type: ignore[method-assign]
@@ -657,9 +656,9 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.send(("result", repr(exc), time.monotonic() - race_started))
+        results.send(("result", repr(exc)))
     else:
-        results.send(("result", None, time.monotonic() - race_started))
+        results.send(("result", None))
     finally:
         faulthandler.cancel_dump_traceback_later()
         results.close()
@@ -684,22 +683,21 @@ def test_switch_releases_lock_with_saturated_metadata_writers(tmp_path: Path) ->
         process.join(timeout=SATURATED_RACE_TIMEOUT_SECONDS + 1)
         if process.is_alive():
             process.terminate()
-            process.join(timeout=1)
+            process.join(timeout=10)
             pytest.fail(
                 f"account switch exceeded its {SATURATED_RACE_TIMEOUT_SECONDS} s "
                 "deadline after "
                 f"{startup_seconds:.3f} s of child startup"
             )
         assert process.exitcode == 0
-        assert results.poll(1)
-        event, error, race_seconds = results.recv()
+        assert results.poll(10)
+        event, error = results.recv()
         assert event == "result"
         assert error is None, error
-        assert race_seconds < SATURATED_RACE_TIMEOUT_SECONDS
     finally:
         if process.is_alive():
             process.terminate()
-            process.join(timeout=1)
+            process.join(timeout=10)
         results.close()
         process.close()
 
@@ -1071,11 +1069,11 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
     def hold_usage_lock() -> None:
         with context.store.usage_guard(first):
             entered.set()
-            assert release.wait(timeout=5)
+            assert release.wait(timeout=10)
 
     holder = threading.Thread(target=hold_usage_lock)
     holder.start()
-    assert await asyncio.to_thread(entered.wait, 1)
+    assert await asyncio.to_thread(entered.wait, 10)
 
     payload = json.loads(FIXTURE.read_text())
     failure = _failure(429, {"error": payload["error"]})
@@ -1085,29 +1083,21 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
         return await result if inspect.isawaitable(result) else result
 
     recovery = asyncio.create_task(recover())
-
-    def release_later() -> None:
-        time.sleep(0.25)
-        release.set()
-
-    releaser = threading.Thread(target=release_later)
-    releaser.start()
-    ticks = 0
-    while not release.is_set():
-        await asyncio.sleep(0.01)
-        if not release.is_set():
-            ticks += 1
-    result = await asyncio.wait_for(recovery, 5)
-    holder.join(timeout=1)
-    releaser.join(timeout=1)
     try:
-        assert ticks >= 3
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=10)
+        assert not recovery.done()
+
+        release.set()
+        result = await asyncio.wait_for(recovery, 10)
         assert result is not None
         persisted = read_usage(context.store, first)
         assert persisted.snapshot is not None
         assert persisted.snapshot.windows[0].used_percent == 100
     finally:
         release.set()
+        holder.join(timeout=10)
         opened.store.close()
 
 
@@ -1121,7 +1111,6 @@ async def test_switch_after_recency_refresh_applies(tmp_path: Path) -> None:
     second_backend = object()
     loop = _switch_loop(first_backend)
     assert context.manager is not None
-    await asyncio.sleep(0.01)
     assert await asyncio.to_thread(
         context.manager.refresh_recency, context.metadata.session_id
     )

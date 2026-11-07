@@ -220,5 +220,9 @@ class ServeContract:
                 ("process termination", terminate),
                 ("process reap", reap),
                 ("server shutdown validation", validate_shutdown),
+                (
+                    "socket lock cleanup",
+                    lambda: Path(f"{self._socket_path}.lock").unlink(missing_ok=True),
+                ),
             )
         )

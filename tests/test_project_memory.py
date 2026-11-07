@@ -719,7 +719,7 @@ def _reconcile_fixture(tmp_path: Path):
 
 
 def _write_child_intent(
-    sessions_dir: Path,
+    manager: SessionManager,
     root_id: str,
     project_id: str,
     session_id: str,
@@ -735,7 +735,9 @@ def _write_child_intent(
         "parent_session_id": parent,
         "transcript_path": f"/sessions/{session_id}",
     }
-    persist_pending_child_link(sessions_dir / root_id, link)
+    persist_pending_child_link(
+        manager.sessions_dir / root_id, link, manager._storage_lease
+    )
 
 
 def _child_link_ids(registry: ProjectRegistry, project_id: str) -> list[str]:
@@ -804,7 +806,7 @@ def test_child_reconciliation_makes_progress_across_budgeted_passes(
     ids = [f"{root_id}:{i}" for i in range(1, total + 1)]
     for sid in ids:
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, sid, root_id
+            manager, root_id, project.project_id, sid, root_id
         )
     # A tight per-pass bound truncates each pass, but because published entries
     # leave the index every pass makes forward progress.
@@ -840,7 +842,7 @@ def test_child_reconciliation_does_not_walk_agents_tree(
     ids = [f"{root_id}:{i}" for i in range(1, 4)]
     for sid in ids:
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, sid, root_id
+            manager, root_id, project.project_id, sid, root_id
         )
     # Plant an agents subtree that would trip any traversal: if reconciliation
     # ever opened it the spy below would record the visit.
@@ -880,7 +882,7 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
     ids = [f"{root_id}:{i}" for i in range(1, 4)]
     for sid in ids:
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, sid, root_id
+            manager, root_id, project.project_id, sid, root_id
         )
     registry = manager.project_registry
 
@@ -909,7 +911,7 @@ def test_child_reconciliation_reads_registry_once(
     total = 5
     for i in range(1, total + 1):
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, f"{root_id}:{i}", root_id
+            manager, root_id, project.project_id, f"{root_id}:{i}", root_id
         )
     registry = manager.project_registry
     original = registry._read_session_records
@@ -972,7 +974,9 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
         "transcript_path": f"/sessions/{child_id}",
     }
     # Mirror the runner's ordering: persist the durable intent, then append.
-    persist_pending_child_link(manager.sessions_dir / root_id, link)
+    persist_pending_child_link(
+        manager.sessions_dir / root_id, link, manager._storage_lease
+    )
     registry.record_session(
         project.project_id,
         session_id=child_id,
@@ -1001,7 +1005,7 @@ def test_invalid_entries_are_quarantined_not_deleted(
     valid_ids = [f"{root_id}:{i}" for i in range(1, 4)]
     # Seed one valid intent first so the durable index directory exists.
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, valid_ids[0], root_id
+        manager, root_id, project.project_id, valid_ids[0], root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
 
@@ -1021,7 +1025,7 @@ def test_invalid_entries_are_quarantined_not_deleted(
     # Seed the remaining valid intents behind the invalid ones.
     for sid in valid_ids[1:]:
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, sid, root_id
+            manager, root_id, project.project_id, sid, root_id
         )
 
     reordered_pending_scandir(pending_dir)
@@ -1066,7 +1070,7 @@ def test_quarantine_handles_max_length_filename(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_id = f"{root_id}:later-valid"
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, valid_id, root_id
+        manager, root_id, project.project_id, valid_id, root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     valid_name = session_links._encode_link_name(valid_id)
@@ -1110,7 +1114,7 @@ def test_transient_read_error_keeps_intent_and_retries(
     later_id = f"{root_id}:later"
     for child_id in (blocked_id, later_id):
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, child_id, root_id
+            manager, root_id, project.project_id, child_id, root_id
         )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     blocked_name = session_links._encode_link_name(blocked_id)
@@ -1174,7 +1178,7 @@ def test_directory_entries_do_not_stall_reconciliation(
     valid_ids = [f"{root_id}:valid-{i}" for i in range(2)]
     for child_id in valid_ids:
         _write_child_intent(
-            manager.sessions_dir, root_id, project.project_id, child_id, root_id
+            manager, root_id, project.project_id, child_id, root_id
         )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     directory_names = [f"invalid-directory-{i}" for i in range(5)]
@@ -1216,7 +1220,7 @@ def test_hardlinked_entry_is_quarantined(tmp_path: Path) -> None:
     manager, project, root_id = _reconcile_fixture(tmp_path)
     child_id = f"{root_id}:hardlinked"
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, child_id, root_id
+        manager, root_id, project.project_id, child_id, root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     name = session_links._encode_link_name(child_id)
@@ -1248,7 +1252,7 @@ def test_temp_files_count_toward_pass_budget(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     # Create the durable index directory, then leave only in-flight temp files.
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+        manager, root_id, project.project_id, f"{root_id}:seed", root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     for name in list(os.listdir(pending_dir)):
@@ -1273,7 +1277,7 @@ def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, f"{root_id}:1", root_id
+        manager, root_id, project.project_id, f"{root_id}:1", root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
 
@@ -1312,7 +1316,7 @@ def test_quarantine_never_clobbers_existing_entry(tmp_path: Path) -> None:
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+        manager, root_id, project.project_id, f"{root_id}:seed", root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     for entry in pending_dir.iterdir():
@@ -1339,7 +1343,7 @@ def test_quarantine_is_unbounded_and_never_deletes(tmp_path: Path) -> None:
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+        manager, root_id, project.project_id, f"{root_id}:seed", root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     for entry in pending_dir.iterdir():
@@ -1374,7 +1378,7 @@ def test_invalid_entries_never_starve_valid_intents_across_passes(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_id = f"{root_id}:valid"
     _write_child_intent(
-        manager.sessions_dir, root_id, project.project_id, valid_id, root_id
+        manager, root_id, project.project_id, valid_id, root_id
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     valid_name = session_links._encode_link_name(valid_id)
@@ -1406,7 +1410,7 @@ def test_reconciliation_reads_pending_intent_until_eof(
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     child_id = f"{root_id}:short-read"
-    _write_child_intent(manager.sessions_dir, root_id, project.project_id, child_id, root_id)
+    _write_child_intent(manager, root_id, project.project_id, child_id, root_id)
     pending_path = (
         manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     )

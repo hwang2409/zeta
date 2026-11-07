@@ -45,7 +45,6 @@ from ._store import (
     uuid,
     warnings,
     weakref,
-    write_session_json,
 )
 
 __all__ = [
@@ -95,5 +94,4 @@ __all__ = [
     "uuid",
     "warnings",
     "weakref",
-    "write_session_json",
 ]

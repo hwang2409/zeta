@@ -287,6 +287,7 @@ class ConversationChannel:
             "question_id": question_id,
             "question": question,
             "description": "child question",
+            "agent_description": self._owner.description(child_instance_id),
             "status": "pending",
             "text": (
                 f"child {child_instance_id} asks: {question}\n"

@@ -39,7 +39,6 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..providers.factory import build_backend, credential_store
-from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -655,6 +654,7 @@ async def run_agent_tool(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
+            _storage_lease=loop.store._storage_lease,
         )
     )
     try:
@@ -699,7 +699,9 @@ async def run_agent_tool(
             # index (directory-fsynced) BEFORE the registry append, so the root's
             # reconciliation can recover this child link after a crash or a
             # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(loop.root_session_dir, link)
+            persist_pending_child_link(
+                loop.root_session_dir, link, loop.store._storage_lease
+            )
             loop.project_registry.record_session(
                 loop.root_project_id,
                 session_id=child_instance_id,
@@ -1233,7 +1235,7 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = load_agent(preset)
+    body = preset.prompt_suffix
     if explicit_finish:
         body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
     if not body:

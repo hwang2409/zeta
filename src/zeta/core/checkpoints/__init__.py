@@ -28,7 +28,6 @@ class ConversationIntegrityError(ValueError):
 
 
 MAX_SESSION_JSON_DEPTH = 64
-
 # entry types accepted by ConversationStore._validate_entry_payload.
 CONVERSATION_ENTRY_TYPES = frozenset(
     {
@@ -119,8 +118,10 @@ class ConversationEntry:
             )
         if type(lane) is not str or lane != "main":
             raise ConversationIntegrityError("conversation lane must be 'main'")
-        if type(entry_type) is not str or not entry_type:
-            raise ConversationIntegrityError("conversation type must be a nonempty string")
+        if type(entry_type) is not str or entry_type not in CONVERSATION_ENTRY_TYPES:
+            raise ConversationIntegrityError(
+                f"unsupported conversation entry type: {entry_type!r}"
+            )
         if type(data) is not dict:
             raise ConversationIntegrityError("conversation data must be an object")
         normalized_data = dict(data)

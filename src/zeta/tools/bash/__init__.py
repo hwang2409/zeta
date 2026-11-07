@@ -21,7 +21,7 @@ from .._shared.process import (
     spawn_background,
     tool_subprocess_env,
 )
-from .._shared.sandbox import expand_user_path
+from .._shared.sandbox import resolve_shell_cwd
 from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
@@ -101,18 +101,6 @@ def _extract_command(arguments: BashArguments) -> str:
     raise ValueError("command is required (accepts legacy alias cmd)")
 
 
-def _start_cwd(registry: ToolRegistry, arguments: BashArguments) -> str:
-    cwd = arguments.get("cwd")
-    if cwd is None:
-        return registry.bash_cwd
-    if type(cwd) is not str or not cwd:
-        raise ValueError("cwd must be a nonempty string or null")
-    candidate = Path(expand_user_path(cwd))
-    if not candidate.is_absolute():
-        candidate = registry.cwd / candidate
-    return os.path.abspath(candidate)
-
-
 async def _read_pipe(
     pipe: asyncio.StreamReader,
     capture: _OutputCapture,
@@ -183,7 +171,7 @@ async def _bash(
     start_cwd = (
         approved_cwd.cwd
         if approved_cwd is not None
-        else _start_cwd(registry, arguments)
+        else resolve_shell_cwd(registry.bash_cwd, arguments.get("cwd"))
     )
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get(
@@ -429,7 +417,12 @@ def register(registry: ToolRegistry) -> None:
                     "minLength": 1,
                     "description": "Deprecated alias for command.",
                 },
-                "cwd": {},
+                "cwd": {
+                    "description": (
+                        "Working directory override. Relative paths resolve from the "
+                        "persisted session cwd. Absolute paths are used as given."
+                    )
+                },
                 "timeout": {
                     "type": "number",
                     "exclusiveMinimum": 0,

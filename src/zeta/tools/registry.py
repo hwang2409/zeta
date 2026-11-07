@@ -318,6 +318,9 @@ class ToolRegistry:
             if session_store is not None
             else None,
             command_niceness=command_niceness,
+            storage_lease=(
+                session_store._storage_lease if session_store is not None else None
+            ),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -744,6 +747,7 @@ class ToolRegistry:
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             command_niceness=clone.command_niceness,
+            storage_lease=store._storage_lease,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -805,7 +809,9 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
+        self.background_tasks.bind_session_dir(
+            store.session_dir, store.directory_fd, store._storage_lease
+        )
         self.bash_cwd = store.bash_cwd
 
     @property

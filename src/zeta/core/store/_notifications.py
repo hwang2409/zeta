@@ -277,6 +277,15 @@ class NotificationStateMixin:
                                 "child_instance_id": child_instance_id,
                                 "question_id": question.data["question_id"],
                                 "description": "child question withdrawn",
+                                **(
+                                    {
+                                        "agent_description": question.data[
+                                            "agent_description"
+                                        ]
+                                    }
+                                    if "agent_description" in question.data
+                                    else {}
+                                ),
                                 "status": "withdrawn",
                                 "text": f"question withdrawn: child {reason}",
                             },

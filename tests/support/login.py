@@ -5,10 +5,62 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
+import httpx
 import pytest
 
 from zeta.core import login_flow
+from zeta.providers import login as provider_login
+
+
+def reject_provider_token_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    *,
+    invalid_response: bool,
+) -> None:
+    """Drive the real provider exchange against a rejected HTTP response."""
+
+    real_client = httpx.AsyncClient
+    status = 200 if invalid_response else 401
+
+    def rejected_client(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    status,
+                    content=b"secret-token-body",
+                    request=request,
+                )
+            )
+        )
+
+    monkeypatch.setattr(login_flow.httpx, "AsyncClient", rejected_client)
+    if provider == "anthropic":
+        redirect_name = "ANTHROPIC_REDIRECT_URI"
+        builder_name = "build_anthropic_authorization_url"
+        path = "/callback"
+    else:
+        redirect_name = "DEFAULT_CODEX_REDIRECT_URI"
+        builder_name = "build_codex_authorization_url"
+        path = "/auth/callback"
+    monkeypatch.setattr(provider_login, redirect_name, f"http://localhost:0{path}")
+    real_builder = getattr(provider_login, builder_name)
+
+    def authorize(state: str, challenge: str, redirect_uri: str) -> str:
+        def callback() -> None:
+            with urlopen(
+                f"{redirect_uri}?{urlencode({'code': 'code', 'state': state})}",
+                timeout=2,
+            ) as response:
+                assert response.status == 200
+
+        threading.Thread(target=callback, daemon=True).start()
+        return real_builder(state, challenge, redirect_uri)
+
+    monkeypatch.setattr(provider_login, builder_name, authorize)
 
 
 def block_loop_until_publication_decision_expires(
