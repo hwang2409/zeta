@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-import zeta.tools._shared.shell_cwd as shell_cwd
-from tests.support.owned import owned_app
+from tests.support.owned import await_or_fail
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._shared import shell_cwd
 
 
 async def _wait_for_bind(
@@ -32,7 +32,9 @@ async def _wait_for_bind(
     monkeypatch.setattr(shell_cwd, "bind_shell_cwd", blocked)
     arguments = {"command": "true"}
     task = asyncio.create_task(registry.execute(ToolCall("cwd-test", tool_name, arguments)))
-    assert await asyncio.to_thread(entered.wait, 10)
+    assert await await_or_fail(
+        asyncio.to_thread(entered.wait, 10), what="shell cwd bind to start"
+    )
     return task, entered, release, fd_holder
 
 
@@ -49,9 +51,9 @@ async def test_shell_bind_does_not_block_the_event_loop(
         )
         ready = asyncio.Event()
         asyncio.get_running_loop().call_soon(ready.set)
-        await asyncio.wait_for(ready.wait(), timeout=10)
+        await await_or_fail(ready.wait(), what="event loop readiness")
         release.set()
-        result = await asyncio.wait_for(task, timeout=10)
+        result = await await_or_fail(task, what="shell command completion")
         assert result["isError"] is False
     finally:
         release.set()
@@ -72,8 +74,10 @@ async def test_canceled_shell_bind_closes_fd_without_state_change(
         task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=10)
-        assert await asyncio.wait_for(asyncio.to_thread(lambda: bool(fd_holder)), 10)
+            await await_or_fail(task, what="canceled shell bind")
+        assert await await_or_fail(
+            asyncio.to_thread(lambda: bool(fd_holder)), what="shell bind cleanup"
+        )
         assert registry.bash_cwd == baseline
         with pytest.raises(OSError) as error:
             os.fstat(fd_holder[0])
