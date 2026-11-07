@@ -802,9 +802,10 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
 `child_idle` carry their durable notification `data` object with the matching
-known kind. `child_message_delivered` is emitted for the parent session after a
-running child starts answering a staged `agent_send`; its data contains the
-child label and the bounded one-line message preview.
+known kind. `task_exit_notification.data.note` contains the task kill cause when
+the server stopped the task. `child_message_delivered` is emitted for the parent
+session after a running child starts answering a staged `agent_send`; its data
+contains the child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
 
