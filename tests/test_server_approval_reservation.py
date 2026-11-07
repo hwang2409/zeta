@@ -17,6 +17,7 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -362,7 +363,7 @@ async def test_same_tick_approval_reservation_winner(
                 await server.control.resolve_approval("approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
-            await asyncio.wait_for(abort, 10)
+            await await_or_fail(abort, what="abort-first terminate_pending_approvals")
         else:
             approve = asyncio.create_task(
                 server.control.resolve_approval("approve", call.id)
@@ -371,8 +372,8 @@ async def test_same_tick_approval_reservation_winner(
             abort = asyncio.create_task(server.control._terminate_pending_approvals())
             assert not abort.done()
             gate.release.set()
-            result = await asyncio.wait_for(approve, 10)
-            await asyncio.wait_for(abort, 10)
+            result = await await_or_fail(approve, what="resolve_approval approve")
+            await await_or_fail(abort, what="terminate_pending_approvals")
             assert result["decision"] == "approve"
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
@@ -419,7 +420,7 @@ async def test_cancelled_before_durable_commit_retries_abort(
         finally:
             store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(settlement, 10)
+            await await_or_fail(settlement, what="cancelled settlement before commit")
         assert store.approval_resolution_data(call.id) is None
         retry = server.control._terminate_pending_approvals()
         assert retry is not None
@@ -460,7 +461,7 @@ async def test_cancelled_after_durable_commit_keeps_decision(
         settlement.cancel()
         gate.release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(settlement, 10)
+            await await_or_fail(settlement, what="cancelled settlement after commit")
         resolution = store.approval_resolution_data(call.id)
         assert resolution is not None and resolution["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
