@@ -41,7 +41,6 @@ from ..core.slash import (
     create_slash_registry,
 )
 from ..diagnostics.tui_stalls import start_tui_stall_watchdog
-from ..mcp.management import MCPManagementService
 from ..protocol.types import (
     Message,
     StreamEvent,
@@ -342,11 +341,7 @@ class TUIApp(
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
-        self._mcp_manager = MCPManager(
-            MCPManagementService(
-                home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
-            )
-        )
+        self._mcp_manager = MCPManager(self.loop._mcp_management)
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)

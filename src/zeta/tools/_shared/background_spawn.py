@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import select
+import selectors
 import signal
 import subprocess
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -96,6 +99,70 @@ def _signal_pids(pids: dict[int, str], signal_number: int) -> None:
             logger.debug("could not signal background descendant %s", pid, exc_info=True)
 
 
+def _pid_has_identity(pid: int, start: str) -> bool:
+    current = _snapshot_descendants_sync(None)
+    return current.get(pid) == start
+
+
+def _wait_pid_exited_sync(pid: int, start: str, timeout: float) -> None:
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            if not _pid_has_identity(pid, start):
+                return
+            with selectors.DefaultSelector() as selector:
+                selector.register(pidfd, selectors.EVENT_READ)
+                if selector.select(timeout):
+                    return
+        finally:
+            os.close(pidfd)
+    elif hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            try:
+                queue.control([event], 0, 0)
+            except ProcessLookupError:
+                return
+            if not _pid_has_identity(pid, start):
+                return
+            if queue.control(None, 1, timeout):
+                return
+        finally:
+            queue.close()
+    else:
+        deadline = time.monotonic() + timeout
+        while _pid_has_identity(pid, start):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        else:
+            return
+    if not _pid_has_identity(pid, start):
+        return
+    raise TimeoutError(f"background descendant {pid} survived SIGKILL")
+
+
+def _wait_for_group_exit_sync(
+    process_id: int, descendants: dict[int, str], timeout: float
+) -> None:
+    deadline = time.monotonic() + timeout
+    for pid, start in descendants.items():
+        _wait_pid_exited_sync(pid, start, max(0, deadline - time.monotonic()))
+    while _group_exists(process_id):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"background process group {process_id} survived SIGKILL")
+        time.sleep(0.05)
+
+
 async def _terminate_processes(
     processes: Sequence[asyncio.subprocess.Process],
     term_grace: float,
@@ -124,6 +191,7 @@ async def _terminate_processes(
     except TimeoutError:
         pass
     current = await snapshot(asyncio.to_thread(_snapshot_descendants_sync, None))
+    cleanup: list[Awaitable[None]] = []
     for process in processes:
         _signal_group(process, signal.SIGKILL)
         survivors = (
@@ -136,6 +204,16 @@ async def _terminate_processes(
             }
         )
         _signal_pids(survivors, signal.SIGKILL)
+        cleanup.append(
+            asyncio.to_thread(_wait_for_group_exit_sync, process.pid, survivors, 10)
+        )
+    try:
+        await snapshot(asyncio.wait_for(asyncio.gather(*cleanup), timeout=10))
+    except TimeoutError as exc:
+        process_ids = ", ".join(str(process.pid) for process in processes)
+        raise RuntimeError(
+            f"background process groups survived cleanup: {process_ids}"
+        ) from exc
 
 
 async def _terminate_process(
