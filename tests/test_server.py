@@ -5331,7 +5331,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     import base64
 
     from zeta.protocol.types import ImageContent
-    from zeta.server.ergonomics import MAX_IMAGE_BYTES
+    from zeta.server.image_delivery import MAX_IMAGE_BYTES
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
     server = ZetaServer(
@@ -5576,7 +5576,7 @@ async def test_image_names_match_verified_types(tmp_path):
 
     from PIL import Image
 
-    from zeta.server.ergonomics import DIRECTION_CONTROLS, prepare_image_delivery
+    from zeta.server.image_delivery import DIRECTION_CONTROLS, prepare_image_delivery
     from zeta.server.protocol import ProtocolError
     from zeta.server.runtime import ServerRuntime
 
@@ -5649,7 +5649,7 @@ async def test_attachment_failure_removes_entire_batch(
 
     from PIL import Image
 
-    from zeta.server import ergonomics
+    from zeta.server import image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, provider="codex")
@@ -5665,11 +5665,11 @@ async def test_attachment_failure_removes_entire_batch(
     attachments = runtime.opened.store.session_dir / "attachments"
     if existing:
         await asyncio.to_thread(
-            ergonomics.prepare_image_delivery, runtime, {"images": [item]}
+            image_delivery.prepare_image_delivery, runtime, {"images": [item]}
         )
     before = set(attachments.rglob("*"))
     original_open = os.fdopen
-    original_replace = ergonomics.os.replace
+    original_replace = image_delivery.os.replace
     writes = 0
     replacements = 0
 
@@ -5713,10 +5713,10 @@ async def test_attachment_failure_removes_entire_batch(
     try:
         with monkeypatch.context() as patch:
             patch.setattr(os, "fdopen", failing_open)
-            patch.setattr(ergonomics.os, "replace", failing_replace)
+            patch.setattr(image_delivery.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    ergonomics.prepare_image_delivery, runtime, {"images": [item, item]}
+                    image_delivery.prepare_image_delivery, runtime, {"images": [item, item]}
                 )
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
@@ -7453,7 +7453,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
 async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     import base64
 
-    from zeta.server.ergonomics import prepare_image_delivery
+    from zeta.server.image_delivery import prepare_image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")
