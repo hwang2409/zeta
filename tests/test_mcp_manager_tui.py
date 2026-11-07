@@ -502,6 +502,14 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
         f"MCP credential file is malformed for 'live': {credential_file.absolute()}. "
         "Move this file aside, then run '/mcp auth live'."
     )
+    refreshed = asyncio.Event()
+    original_refresh = app._refresh_mcp_manager
+
+    def record_refresh() -> None:
+        original_refresh()
+        refreshed.set()
+
+    app._refresh_mcp_manager = record_refresh
 
     with create_pipe_input() as pipe, create_app_session(
         input=pipe, output=DummyOutput()
@@ -514,13 +522,8 @@ async def test_real_prompt_mcp_status_renders_malformed_credential_error(tmp_pat
             while not get_app().is_running:
                 await asyncio.sleep(0)
         pipe.send_text("/mcp\r")
-        async with asyncio.timeout(5):
-            while (
-                not app._mcp_manager_open
-                or getattr(app._mcp_manager, "credential_store_error", None) is None
-            ):
-                await asyncio.sleep(0)
-        error = app._mcp_manager.credential_store_error
+        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        error = getattr(app._mcp_manager, "credential_store_error", None)
         assert error == {
             "code": "mcp_credential_store",
             "reason": "malformed",
