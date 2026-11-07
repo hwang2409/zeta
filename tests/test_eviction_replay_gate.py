@@ -170,14 +170,67 @@ def test_compare_rejects_import_outside_expected_worktree(tmp_path: Path) -> Non
     assert "identity outside expected worktree" in result.stderr
 
 
-def test_fixture_compare_reports_stored_floor_violation_without_failing() -> None:
-    from scripts.eviction_replay_gate import _floor_metrics
+def test_compare_reports_stored_floor_violation_in_manifest(tmp_path: Path) -> None:
+    from scripts.eviction_replay_gate import _assembler, _fixture_store
+    from zeta.core.store import ConversationStore
 
-    floor = {"version": 1, "oldest": [], "newest": [{"fact": {"type": "pr", "pr": 1}, "first_seq": 1, "last_seq": 1, "value_rank": [1, 0]}]}
-    violations: list[str] = []
-    metrics = _floor_metrics([{"seq": 1, "data": {"fact_floor": floor}}], {"oldest": 8, "newest": 0, "chars": 4096, "tokens": 4096}, "persisted", violations)
-    assert metrics == [{"oldest": 0, "newest": 1, "chars": 28, "tokens": 29}]
-    assert violations == ["seq=1 oldest=0 newest=1 chars=28 tokens=29"]
+    home = tmp_path / "home"
+    source = home / ".zeta" / "sessions" / "fixture"
+    source.parent.mkdir(parents=True)
+    _fixture_store(source.parent)
+    import asyncio
+
+    store = ConversationStore(source.parent, session_id="fixture")
+    try:
+        assembler = _assembler(store, budget=4000, tail=3)
+        asyncio.run(assembler.assemble_context(backend=None, force=True, bypass_eviction_hysteresis=True))
+        rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+        marker = rows[-1]
+        assert marker["seq"] == 146
+        store.append_compaction_marker("superseding marker", 1, 146, replaces=[marker["id"]])
+        rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+        marker = next(row for row in rows if row.get("seq") == 146)
+        floor = {
+            "version": 1,
+            "oldest": [
+                {"fact": {"type": "child_head", "handle": f"child-{number}-" + "x" * 70, "sha": "a" * 40}, "first_seq": number, "last_seq": number, "value_rank": [number, 0]}
+                for number in range(1, 10)
+            ],
+            "newest": [
+                {"fact": {"type": "child_head", "handle": f"child-{number}-" + "x" * 70, "sha": "b" * 40}, "first_seq": number, "last_seq": number, "value_rank": [number, 0]}
+                for number in range(25, 9, -1)
+            ],
+        }
+        marker["data"]["fact_floor"] = floor
+        store.path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
+    finally:
+        store.close()
+    (source / "meta.json").write_text(json.dumps({"compaction_budget": 4000, "retained_tail": 3, "provider": "anthropic"}))
+    head = _mutated_ref(tmp_path, [])
+    fact_floor = head / "src/zeta/context_eviction/_fact_floor.py"
+    fact_floor.write_text(fact_floor.read_text().replace("_OLDEST_LIMIT = 8", "_OLDEST_LIMIT = 4"))
+    script = head / "scripts/eviction_replay_gate.py"
+    script.write_text(script.read_text().replace('"oldest": _fact_floor._OLDEST_LIMIT,', '"oldest": 8,', 1).replace('"tokens": _fact_floor.FACT_FLOOR_TOKEN_CAP,', '"tokens": 831,', 1))
+
+    result = _compare(
+        ROOT,
+        head,
+        tmp_path,
+        env={"HOME": str(home)},
+        extra=["--session", "fixture", "--timeout", "10"],
+        fixture=False,
+    )
+    assert result.returncode == 0, result.stderr
+    session = json.loads((tmp_path / "manifest.json").read_text())["sessions"][0]
+    assert session["status"] == "PASS"
+    for side in ("base", "head"):
+        violations = [
+            item
+            for record in session[side]["records"]
+            for item in record["trace"]["stored_floor_violations"]
+        ]
+        assert violations
+        assert set(violations) == {"seq=146 invalid"}
 
 
 def test_fixture_compare_fails_when_code_appends_floor_violation() -> None:
