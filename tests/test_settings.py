@@ -753,15 +753,17 @@ def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) ->
     ).inbox_enabled is False
 
 
-def test_agent_depth_defaults_to_three_and_rejects_above_hard_maximum(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
+def test_agent_depth_defaults_to_three(tmp_path: Path) -> None:
     default_depth = getattr(
-        load_settings(home=home).settings, "agents_max_depth", None
+        load_settings(home=tmp_path / "home").settings,
+        "agents_max_depth",
+        None,
     )
     assert default_depth == 3
 
+
+def test_agent_depth_above_hard_maximum_has_clear_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
     _write(home, "[agents]\nmax_depth = 9\n")
     with pytest.raises(
         SettingsError,
