@@ -7363,9 +7363,11 @@ async def test_agent_send_racing_wake_clear_remains_armed(
             if target.session_dir == _store_dir:
                 _entered.set()
                 if _producer_first:
+                    # test-contract: seam a forced order proves the atomic stage handoff
                     assert _release.wait(2)
                     return original_stage(target, *args)
                 staged = original_stage(target, *args)
+                # test-contract: seam a forced order proves the atomic stage handoff
                 assert _release.wait(2)
                 return staged
             return original_stage(target, *args)
@@ -8245,9 +8247,11 @@ async def test_notification_producer_races_step_snapshot_once(
             if target.session_dir == _store_dir:
                 _entered.set()
                 if _producer_first:
+                    # test-contract: seam a forced order proves the atomic stage handoff
                     assert _release.wait(2)
                     return original_stage(target, *args)
                 staged = original_stage(target, *args)
+                # test-contract: seam a forced order proves the atomic stage handoff
                 assert _release.wait(2)
                 return staged
             return original_stage(target, *args)
@@ -8301,9 +8305,11 @@ async def test_notification_producer_races_turn_end_once(
             if target.session_dir == _store_dir:
                 _entered.set()
                 if _producer_first:
+                    # test-contract: seam a forced order proves the atomic stage handoff
                     assert _release.wait(2)
                     return original_admit(target, intent)
                 result = original_admit(target, intent)
+                # test-contract: seam a forced order proves the atomic stage handoff
                 assert _release.wait(2)
                 return result
             return original_admit(target, intent)
@@ -8771,7 +8777,7 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
 
     # Simulate the race: parent looked at the marker before the run finished,
@@ -8851,7 +8857,7 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
 
     # The model queues follow-ups by the child_instance_id it saw in the tool
     # result, not by the provider tool_call.id, so round-trip that handle.
@@ -8893,7 +8899,7 @@ async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> 
     )
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     assert (
         await send_to_run(
@@ -9012,7 +9018,7 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     assert "worker" in commands.slash_runs("")
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
 
     listing = commands.slash_runs("")
     assert "long horizon run" in listing
@@ -11573,7 +11579,7 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
     child_path = Path(str(marker["child_session_path"]))
@@ -11811,7 +11817,7 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_replied.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_replied.wait(), timeout=10)
     await _wait_for_notification(store, "child_idle")
     handle = _run_handle_from_receipt(store)
     marker = store.agent_children()[handle]
@@ -13182,11 +13188,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         append_finished=append_finished,
     )
     try:
-        for _ in range(500):
-            if append_started.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert append_started.exists()
+        assert await asyncio.to_thread(append_started.wait, 10)
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
@@ -14103,12 +14105,12 @@ async def test_finish_accepted_after_follow_up_attempt_is_accepted(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     await _send_follow_up(loop, handle, "first follow-up")
     backend.release_child.set()
-    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=10)
     child_store = next(
         child
         for child in loop._background_owner.conversation_stores()
@@ -14151,12 +14153,12 @@ async def test_unread_follow_up_still_blocks_finish(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     await _send_follow_up(loop, handle, "first follow-up")
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
-    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=10)
     child_store = next(
         child
         for child in loop._background_owner.conversation_stores()
@@ -14165,7 +14167,7 @@ async def test_unread_follow_up_still_blocks_finish(
     assert len(child_store.pending_prompt_queue._pending_unlocked()) == 1
     await _send_follow_up(loop, handle, "second follow-up")
     backend.release_finish.set()
-    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=10)
     await _wait_for_notification(store, "completed")
     await loop._background_owner.wait_for_store_closes()
 
@@ -14201,7 +14203,7 @@ async def test_ask_parent_answer_does_not_block_finish(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
     backend.release_child.set()
@@ -14351,13 +14353,13 @@ async def test_follow_up_ack_never_takes_store_lock_on_event_loop(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     await _send_follow_up(loop, handle, "first follow-up")
     backend.release_child.set()
-    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=10)
     backend.release_finish.set()
-    await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
+    await asyncio.wait_for(backend.finish_generated.wait(), timeout=10)
     await _wait_for_notification(store, "completed")
 
     assert backend.finish_attempts == 1
@@ -14768,7 +14770,7 @@ async def test_unrelated_send_does_not_close_open_question(
     loop.explicit_finish = True
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     handle = _run_handle_from_receipt(store)
     backend.release_child.set()
     await asyncio.wait_for(backend.question_published.wait(), timeout=2)

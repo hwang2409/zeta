@@ -68,6 +68,7 @@ async def test_owner_cancel_follows_reparented_deep_descendants(tmp_path: Path) 
     owner = BackgroundAgentOwner(await open_test_store(tmp_path))
     canceled: list[str] = []
     tasks = {
+        # test-contract: latency long sleeps keep tasks pending for cancellation
         name: asyncio.create_task(asyncio.sleep(10))
         for name in (
             "survivor",
