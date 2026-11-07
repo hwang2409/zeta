@@ -1,4 +1,5 @@
 """The provider-neutral agent loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -48,9 +49,7 @@ from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
-from ...mcp import (
-    MCPMount,
-)
+from ...mcp import MCPManagementService, MCPMount
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
@@ -84,12 +83,7 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ..backend_state import (
-    PreparedBackendState,
-    apply_backend_state,
-    effective_backend_budget,
-    prepare_backend_state,
-)
+from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
@@ -107,6 +101,7 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
+from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
@@ -149,6 +144,7 @@ class _ToollessTransition:
 
 
 class AgentLoop(
+    BackendOwnerMixin,
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
@@ -204,6 +200,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -269,8 +266,9 @@ class AgentLoop(
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = (
-            Path(self.store.cwd).expanduser().resolve()
+        self._mcp_project_dir_value: Path | None = Path(self.store.cwd)
+        self._mcp_management = MCPManagementService(
+            project_dir=self._mcp_project_dir_value
         )
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
@@ -375,15 +373,6 @@ class AgentLoop(
             else _sanitize_account_message(message)
             for message in messages
         ]
-
-    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
-        return prepare_backend_state(self, backend)
-
-    def current_backend_state(self) -> PreparedBackendState:
-        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
-
-    def apply_backend_state(self, state: PreparedBackendState) -> None:
-        apply_backend_state(self, state)
 
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
@@ -565,6 +554,7 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
+            await self.close_backend_owners(stage="runtime_close")
             killed = await self._close_delivery_resources(
                 background_task_cause=background_task_cause
             )

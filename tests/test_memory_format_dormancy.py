@@ -187,10 +187,14 @@ def test_format_two_views_are_available_after_per_project_activation(
             features=frozenset({"projects-memory-v2"}),
         )
         assert "memory" in result if method == "project_show" else "versions" in result
-    code, message, _ = project_request_error(
+    descriptor, message, data = project_request_error(
         UnsupportedMemoryFormatError(UNSUPPORTED_FORMAT_2)
     )
-    assert (code, message) == (-32000, UNSUPPORTED_FORMAT_2)
+    reply = json.loads(FrameCodec().error_response(3, descriptor, message, data))
+    assert (reply["error"]["code"], reply["error"]["message"]) == (
+        -32000,
+        UNSUPPORTED_FORMAT_2,
+    )
 
     remote = tmp_path / "remote"
     remote.mkdir()

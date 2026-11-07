@@ -14,14 +14,12 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Literal, TypedDict
-from urllib.parse import quote
 
 from ..core.session import env_home
+from ..storage_format import WriterLease, mapping_mutations, open_writer
 from .client import MCPError
+from .filename import encode_mcp_filename
 
-_SAFE_FILENAME_CHARS = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
-)
 _MAX_CREDENTIAL_RECORD_BYTES = 64 * 1024
 _LOCK_TIMEOUT_SECONDS = 1.0
 REFRESH_LEEWAY_SECONDS = 30.0
@@ -160,17 +158,13 @@ def public_credential_store_error(
     }
 
 
-def _credential_filename(name: str) -> str:
-    return quote(name, safe=_SAFE_FILENAME_CHARS)
-
-
 def token_store_dir(home: str | Path | None = None) -> Path:
     root = Path(home).expanduser() if home is not None else env_home()
     return root / "mcp-tokens"
 
 
 def token_store_path(name: str, home: str | Path | None = None) -> Path:
-    return token_store_dir(home) / f"{_credential_filename(name)}.json"
+    return token_store_dir(home) / f"{encode_mcp_filename(name)}.json"
 
 
 class MCPCredentialStore:
@@ -338,14 +332,15 @@ class MCPCredentialStore:
         self, name: str, token: MCPOAuthToken
     ) -> CredentialSnapshot:
         operation: CredentialOperation = "save_login"
-        lock_fd = self._lock(name, operation, exclusive=True)
-        try:
-            current = self._read_locked(name, operation)
-            snapshot = CredentialSnapshot(current.generation + 1, token)
-            self._write_locked(name, operation, snapshot)
-            return snapshot
-        finally:
-            self._unlock(lock_fd)
+        with open_writer(self._home_root()) as lease:
+            lock_fd = self._lock(name, operation, exclusive=True)
+            try:
+                current = self._read_locked(name, operation)
+                snapshot = CredentialSnapshot(current.generation + 1, token)
+                self._write_locked(name, operation, snapshot, lease)
+                return snapshot
+            finally:
+                self._unlock(lock_fd)
 
     def _save_if_current_transaction(
         self,
@@ -354,43 +349,79 @@ class MCPCredentialStore:
         replacement: MCPOAuthToken,
     ) -> SaveIfCurrentResult:
         operation: CredentialOperation = "save_if_current"
-        lock_fd = self._lock(name, operation, exclusive=True)
-        try:
-            current = self._read_locked(name, operation)
-            if current.token is None:
-                return SaveIfCurrentResult(SaveDisposition.DELETED, current)
-            if current.generation != expected_generation:
-                return SaveIfCurrentResult(SaveDisposition.STALE, current)
-            snapshot = CredentialSnapshot(current.generation + 1, replacement)
-            self._write_locked(name, operation, snapshot)
-            return SaveIfCurrentResult(SaveDisposition.COMMITTED, snapshot)
-        finally:
-            self._unlock(lock_fd)
+        with open_writer(self._home_root()) as lease:
+            lock_fd = self._lock(name, operation, exclusive=True)
+            try:
+                current = self._read_locked(name, operation)
+                if current.token is None:
+                    return SaveIfCurrentResult(SaveDisposition.DELETED, current)
+                if current.generation != expected_generation:
+                    return SaveIfCurrentResult(SaveDisposition.STALE, current)
+                snapshot = CredentialSnapshot(current.generation + 1, replacement)
+                self._write_locked(name, operation, snapshot, lease)
+                return SaveIfCurrentResult(SaveDisposition.COMMITTED, snapshot)
+            finally:
+                self._unlock(lock_fd)
 
     def _delete_transaction(self, name: str) -> CredentialSnapshot:
         operation: CredentialOperation = "delete"
-        lock_fd = self._lock(name, operation, exclusive=True)
-        try:
-            current = self._read_locked(name, operation)
-            snapshot = CredentialSnapshot(current.generation + 1, None)
-            self._write_locked(name, operation, snapshot)
-            return snapshot
-        finally:
-            self._unlock(lock_fd)
+        with open_writer(self._home_root()) as lease:
+            lock_fd = self._lock(name, operation, exclusive=True)
+            try:
+                current = self._read_locked(name, operation)
+                snapshot = CredentialSnapshot(current.generation + 1, None)
+                self._write_locked(name, operation, snapshot, lease)
+                return snapshot
+            finally:
+                self._unlock(lock_fd)
+
+    def _home_root(self) -> Path:
+        return Path(self._home).expanduser() if self._home is not None else env_home()
 
     def _write_locked(
         self,
         name: str,
         operation: CredentialOperation,
         snapshot: CredentialSnapshot,
+        lease: WriterLease,
     ) -> None:
         directory = token_store_dir(self._home)
-        target = token_store_path(name, self._home)
-        payload = _snapshot_json(snapshot)
+        directory_fd = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        publication_error: list[BaseException] = []
+
+        def publish(parent_fd: int, filename: str, payload: bytes) -> None:
+            try:
+                self._publish_locked(name, operation, parent_fd, filename, payload)
+            except BaseException as exc:  # noqa: BLE001 - re-raise after shape unlock
+                publication_error.append(exc)
+
+        try:
+            lease.publish_json(
+                directory_fd,
+                token_store_path(name, self._home).name,
+                mapping_mutations(_snapshot_value(snapshot)),
+                publish,
+            )
+        finally:
+            os.close(directory_fd)
+        if publication_error:
+            raise publication_error[0]
+
+    def _publish_locked(
+        self,
+        server: str,
+        operation: CredentialOperation,
+        directory_fd: int,
+        filename: str,
+        payload: bytes,
+    ) -> None:
         if len(payload) > _MAX_CREDENTIAL_RECORD_BYTES:
             raise self._error(
-                name, operation, CredentialStoreErrorReason.CANDIDATE_OVERSIZED
+                server, operation, CredentialStoreErrorReason.CANDIDATE_OVERSIZED
             )
+        directory = token_store_dir(self._home)
         tmp_path: Path | None = None
         try:
             fd, tmp_name = tempfile.mkstemp(
@@ -407,26 +438,27 @@ class MCPCredentialStore:
                     os.fsync(fd)
                 except OSError as exc:
                     raise self._error(
-                        name, operation, CredentialStoreErrorReason.DURABILITY
+                        server, operation, CredentialStoreErrorReason.DURABILITY
                     ) from exc
             finally:
                 os.close(fd)
-            os.replace(tmp_path, target)
+            os.replace(
+                tmp_path.name,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
             tmp_path = None
-            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                try:
-                    os.fsync(directory_fd)
-                except OSError as exc:
-                    raise self._error(
-                        name, operation, CredentialStoreErrorReason.DURABILITY
-                    ) from exc
-            finally:
-                os.close(directory_fd)
+                os.fsync(directory_fd)
+            except OSError as exc:
+                raise self._error(
+                    server, operation, CredentialStoreErrorReason.DURABILITY
+                ) from exc
         except MCPCredentialStoreError:
             raise
         except OSError as exc:
-            raise self._error(name, operation, CredentialStoreErrorReason.IO) from exc
+            raise self._error(server, operation, CredentialStoreErrorReason.IO) from exc
         finally:
             if tmp_path is not None:
                 try:
@@ -435,15 +467,12 @@ class MCPCredentialStore:
                     pass
 
 
-def _snapshot_json(snapshot: CredentialSnapshot) -> bytes:
+def _snapshot_value(snapshot: CredentialSnapshot) -> dict[str, object]:
     token: dict[str, object] | None = None
     if snapshot.token is not None:
         token = asdict(snapshot.token)
         token.pop("client_secret", None)
-    return (
-        json.dumps({"generation": snapshot.generation, "token": token}, sort_keys=True)
-        + "\n"
-    ).encode()
+    return {"generation": snapshot.generation, "token": token}
 
 
 def _snapshot_from_json(value: object) -> CredentialSnapshot:
@@ -452,11 +481,7 @@ def _snapshot_from_json(value: object) -> CredentialSnapshot:
     if "generation" not in value:
         return CredentialSnapshot(0, _token_from_json(value))
     generation = value.get("generation")
-    if (
-        type(generation) is not int
-        or generation < 0
-        or set(value) != {"generation", "token"}
-    ):
+    if type(generation) is not int or generation < 0:
         raise ValueError("invalid credential generation")
     raw_token = value.get("token")
     return CredentialSnapshot(

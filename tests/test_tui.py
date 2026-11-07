@@ -80,9 +80,9 @@ from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
-from zeta.core.slash import budget_for_model
+from zeta.core.slash import SlashStatus, budget_for_model
+from zeta.core.slash import UsageSnapshot as SlashUsageSnapshot
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
@@ -94,6 +94,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
@@ -6283,6 +6284,80 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     assert rendered.count("\n  plan") == 1
 
 
+def test_status_card_output_fixture_uses_shared_status_text() -> None:
+    status = SlashStatus(
+        session_id="status-fixture",
+        provider="codex",
+        model="gpt-5.6-luna",
+        retained_tail=6,
+        tokens_used_this_session=150,
+        tokens_in_current_context=120,
+        compaction_marker_count=1,
+        pending_approvals=("approval-1 (bash)",),
+        checkpoint_count=2,
+        cache_read_input_tokens=60,
+        cache_creation_input_tokens=30,
+        uncached_input_tokens=10,
+        output_tokens_this_session=50,
+        context_files=("/repo/AGENTS.md",),
+        hooks=("stop: true",),
+        usage_history=(
+            SlashUsageSnapshot(
+                turn=1,
+                input_tokens=10,
+                output_tokens=50,
+                cache_read_input_tokens=60,
+                cache_creation_input_tokens=30,
+                model="gpt-5.6-luna",
+                estimated_cost_usd=0.000123,
+            ),
+        ),
+        usage_cost_by_model=(
+            SlashUsageSnapshot(
+                turn=0,
+                input_tokens=10,
+                output_tokens=50,
+                cache_read_input_tokens=60,
+                cache_creation_input_tokens=30,
+                model="gpt-5.6-luna",
+                estimated_cost_usd=0.000123,
+            ),
+        ),
+        model_window=1_050_000,
+        mcp_summary="mcp: 1 mounted, 0 failed",
+        explicit_finish=True,
+    )
+
+    rendered = "\n".join(
+        "".join(text for _style, text in line)
+        for line in tui_app_module._status_card_lines(status)
+    )
+
+    assert rendered == (
+        "Status\n\0overlay-rule\0\n"
+        "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "completion_client_setups: none\n"
+        "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
+        "retained_tail: 6\ntokens_used_this_session: 150\n"
+        "tokens_in_current_context: 120\ncompaction_marker_count: 1\n"
+        "checkpoint_count: 2\nlive_pending_approvals: 1 (approval-1 (bash))\n"
+        "mcp: 1 mounted, 0 failed\nusage:\n  input_tokens: 10\n"
+        "  output_tokens: 50\n  cache_read_tokens: 60\n  cache_write_tokens: 30\n"
+        "  cache_hit_rate: 60.0%\n  child_cache_read_tokens: 0\n"
+        "  child_cache_write_tokens: 0\n  child_uncached_input_tokens: 0\n"
+        "  child_output_tokens: 0\n  child_cache_hit_rate: n/a\n"
+        "  cache_hit_trend: 1:60%\n  estimated_cost_usd: $0.000123\n"
+        "prompt_cache_read: 60\nprompt_cache_write: 30\n"
+        "prompt_cache_uncached_input: 10\nprompt_cache_hit_rate: 60.0%\n"
+        "output_tokens_this_session: 50\ncontext:\n  window: 120 / 1050000\n"
+        "  fill: [--------------------] 0%\ncompaction_history:\n  none\n"
+        "context_files: /repo/AGENTS.md\n"
+        "hooks: stop: true\nautomatic_memory_failure: none\n"
+        "transcript_index_failure: none\n\0overlay-rule\0\n"
+        "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
+    )
+
+
 @pytest.mark.asyncio
 async def test_status_card_renders_viewed_session_transcript_index_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -6305,15 +6380,24 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         return "disk full; pending changes will retry"
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
-
-    lines = tui_app_module._status_card_lines(app.slash_status())
-    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
-
-    assert requested == ["child-session"]
-    assert (
-        "transcript_index_failure: disk full; pending changes will retry" in rendered
+    monkeypatch.setattr(
+        AgentLoop,
+        "connection_setup_counts",
+        lambda _loop: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+        raising=False,
     )
-    await app.close()
+
+    try:
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+
+        assert requested == ["child-session"]
+        assert (
+            "transcript_index_failure: disk full; pending changes will retry" in rendered
+        )
+        assert "completion_client_setups: codex/gpt-test=1" in rendered
+    finally:
+        await app.close()
 
 
 @pytest.mark.parametrize(
@@ -9018,7 +9102,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from tempfile import TemporaryDirectory
 
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
+        from zeta.runtime.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
@@ -13133,8 +13217,13 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            backend.client = client
-            [event async for event in backend.complete([], [])]
+            probe = OllamaBackend(
+                model=backend.model,
+                base_url=backend.base_url,
+                client=client,
+                token_budget=expected_budget,
+            )
+            [event async for event in probe.complete([], [])]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget
@@ -13680,7 +13769,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         "last_attempt_at": "2020-01-01T00:00:00Z",
         "last_error": "rate limited; retry later",
     }
-    store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
+    await asyncio.to_thread(
+        store._write_usage_bytes, account, (json.dumps(usage) + "\n").encode()
+    )
     manager = SessionManager(home)
     opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(
@@ -14302,7 +14393,14 @@ async def test_history_finder_does_not_cross_session_boundaries(
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
-    candidates = await second._history_finder.build_finder_candidates(request)
+    batches = [
+        batch
+        async for batch, complete in second._history_finder.build_finder_candidate_batches(
+            request
+        )
+        if complete
+    ]
 
-    assert [candidate.text for candidate in candidates.candidates] == []
+    assert len(batches) == 1
+    assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
