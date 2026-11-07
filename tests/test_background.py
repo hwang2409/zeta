@@ -16,6 +16,7 @@ import threading
 from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -112,7 +113,10 @@ def _task_notification(item: TaskExitInput) -> pending_delivery_module.Notificat
     if item.note is not None:
         data["note"] = item.note
     return pending_delivery_module.NotificationInput(
-        "task_exit", data, dedupe_key=item.task_id
+        "task_exit",
+        data,
+        dedupe_key=item.task_id,
+        tui_presented=item.tui_presented,
     )
 
 
@@ -229,15 +233,15 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
 
     async def terminate_after_archive(*args, **kwargs) -> None:
         await original_terminate_process(*args, **kwargs)
-        await archive_entered.wait()
+        await asyncio.wait_for(archive_entered.wait(), 10)
 
     async def gated_archive_record(record, log_handle) -> None:
         archive_entered.set()
         try:
-            await release_archive.wait()
+            await asyncio.wait_for(release_archive.wait(), 10)
         except asyncio.CancelledError:
             monitor_cancelled.set()
-            await release_archive.wait()
+            await asyncio.wait_for(release_archive.wait(), 10)
             await original_archive_record(record, log_handle)
             raise
         await original_archive_record(record, log_handle)
@@ -248,7 +252,9 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
-    killer = asyncio.create_task(registry.kill(task_id))
+    killer = asyncio.create_task(
+        registry.kill(task_id, cause="test requested task stop")
+    )
     try:
         await asyncio.wait_for(archive_entered.wait(), 10)
         await asyncio.wait_for(monitor_cancelled.wait(), 10)
@@ -275,18 +281,20 @@ async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
 
     async def wait_for_task() -> None:
         wait_started.set()
-        await registry.wait(task_id)
+        await asyncio.wait_for(registry.wait(task_id), 10)
 
     waiter = asyncio.create_task(wait_for_task())
     try:
-        await wait_started.wait()
+        await asyncio.wait_for(wait_started.wait(), 10)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await waiter
+            await asyncio.wait_for(waiter, 10)
         assert registry.snapshot()[0].running is True
     finally:
-        await registry.kill(task_id)
-        await registry.close()
+        await asyncio.wait_for(
+            registry.kill(task_id, cause="test requested task stop"), 10
+        )
+        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -342,9 +350,9 @@ async def test_background_exit_persists_task_notification(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
-    # S1: whole-session shutdown kills running tasks and returns their ids, but
-    # must NOT create task_exited notifications.
+async def test_registry_close_persists_specific_kill_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path / "session")
     wakes = 0
 
@@ -352,12 +360,45 @@ async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
         nonlocal wakes
         wakes += 1
 
-    registry = _notification_registry(store, wake_sink=lambda _source: wake())
+    flow = pending_delivery_module.StepDeliveryFlow(
+        store, wake_sink=lambda _source: wake()
+    )
+    tools = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    registry = tools.background_tasks
+    registry.set_notification_sink(
+        lambda item: flow.produce(_task_notification(item))
+    )
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
-    killed = await registry.close()
-    assert task_id in killed
-    assert store.agent_notifications() == []
-    assert wakes == 0
+    terminate_processes = process_module._terminate_processes
+
+    async def assert_cause_before_signal(processes, term_grace, *, finish):
+        rows = json.loads((store.session_dir / "background_tasks.json").read_text())
+        row = next(row for row in rows if row["task_id"] == task_id)
+        assert row["running"] is True
+        assert row["terminal_phase"] == "task_kill"
+        assert row["note"] == "tool registry closed"
+        return await terminate_processes(processes, term_grace, finish=finish)
+
+    # test-contract: seam inspect the durable record immediately before signaling
+    monkeypatch.setattr(
+        process_module, "_terminate_processes", assert_cause_before_signal
+    )
+    try:
+        registry.begin_shutdown("tool registry closed")
+        killed = await asyncio.wait_for(tools.close(), 10)
+
+        assert task_id in killed
+        notifications = store.agent_notifications(pending_only=False)
+        assert len(notifications) == 1
+        assert notifications[0].data["task_id"] == task_id
+        assert notifications[0].data["background_phase"] == "task_kill"
+        assert notifications[0].data["note"] == "tool registry closed"
+        assert wakes == 1
+    finally:
+        await asyncio.wait_for(tools.close(), 10)
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -446,12 +487,23 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> None:
-    # S6: killing a modeled task notifies exactly once.
+async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")
-    registry = _notification_registry(store)
-    task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
-    await registry.kill(task_id)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    registry = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    registry.background_tasks.set_notification_sink(
+        lambda item: flow.produce(_task_notification(item))
+    )
+    task_id, _ = await registry.background_tasks.start(
+        _python("import time; time.sleep(30)"), Path.cwd()
+    )
+
+    await registry.execute(
+        ToolCall("kill", "task_kill", {"task_id": task_id})
+    )
+
     task_exits = [
         entry
         for entry in store.agent_notifications(pending_only=False)
@@ -459,14 +511,73 @@ async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> No
     ]
     assert len(task_exits) == 1
     assert task_exits[0].data["task_id"] == task_id
+    assert task_exits[0].data["note"] == "task_kill tool requested by the agent"
+    assert store.is_agent_notification_presented_to_tui(task_exits[0].id)
     await registry.close()
-    # Closing after the kill must not append a second notification.
-    task_exits = [
-        entry
-        for entry in store.agent_notifications(pending_only=False)
-        if entry.data.get("kind") == "task_exited"
-    ]
-    assert len(task_exits) == 1
+    assert len(store.agent_notifications(pending_only=False)) == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_task_exit_recovers_original_receipt_after_store_closes(
+    tmp_path: Path,
+) -> None:
+    from tests.support.fake_backend import FakeBackend
+
+    store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    tools.background_tasks.set_notification_sink(
+        lambda item: flow.produce(_task_notification(item))
+    )
+    task_id, _ = await tools.background_tasks.start("sleep 30", tmp_path)
+    cause = "test closed-store kill cause"
+    try:
+        store.close()
+        await tools.background_tasks.kill(
+            task_id, cause=cause, tui_presented=True
+        )
+    finally:
+        await asyncio.wait_for(tools.close(), 10)
+
+    archived_rows = json.loads(
+        (store.session_dir / "background_tasks.json").read_text()
+    )
+
+    resumed_store = ConversationStore(
+        tmp_path / "session", session_id=store.session_id
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        resumed_store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        await loop.activate()
+        receipts = [
+            entry
+            for entry in resumed_store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert len(receipts) == 1
+        assert archived_rows[0]["receipt_pending"] is True
+        assert archived_rows[0]["note"] == cause
+        assert archived_rows[0]["terminal_phase"] == "task_kill"
+        assert archived_rows[0]["tui_presented"] is True
+        assert receipts[0].data["task_id"] == task_id
+        assert receipts[0].data["note"] == cause
+        assert receipts[0].data["background_phase"] == "task_kill"
+        assert resumed_store.is_agent_notification_presented_to_tui(receipts[0].id)
+        rows = json.loads(
+            (resumed_store.session_dir / "background_tasks.json").read_text()
+        )
+        assert rows[0]["receipt_pending"] is False
+    finally:
+        await loop.close()
+        resumed_store.close()
 
 
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
@@ -1170,7 +1281,9 @@ async def test_background_stdin_serializes_writes_and_bounds_input(tmp_path: Pat
         tmp_path,
     )
     parts = [f"{index:03d}" for index in range(20)]
-    await asyncio.gather(*(tasks.input(task_id, part) for part in parts))
+    await asyncio.wait_for(
+        asyncio.gather(*(tasks.input(task_id, part) for part in parts)), 10
+    )
     await tasks.input(task_id, eof=True)
     await _wait_for_exit(tasks, task_id)
     assert (await tasks.output(task_id))["output"] == "".join(parts)
@@ -1193,23 +1306,42 @@ async def test_background_stdin_ownership_is_session_local(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_background_stdin_unknown_finished_and_kill_races(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry()
-    with pytest.raises(ValueError, match="unknown background task"):
-        await tasks.input("not-owned", "x")
-    task_id, _ = await tasks.start("true", tmp_path)
-    await _wait_for_exit(tasks, task_id)
-    with pytest.raises(ValueError, match="not running"):
-        await tasks.input(task_id, "x")
-    task_id, _ = await tasks.start("sleep 30", tmp_path)
-    writes = [tasks.input(task_id, "x" * 100) for _ in range(10)]
-    await asyncio.gather(tasks.kill(task_id), *writes, return_exceptions=True)
-    assert tasks.records[-1].stdin is None
-    await tasks.close()
+    try:
+        with pytest.raises(ValueError, match="unknown background task"):
+            await tasks.input("not-owned", "x")
+        task_id, _ = await tasks.start("true", tmp_path)
+        await _wait_for_exit(tasks, task_id)
+        with pytest.raises(ValueError, match="not running"):
+            await tasks.input(task_id, "x")
+        task_id, _ = await tasks.start("sleep 30", tmp_path)
+        writes = [tasks.input(task_id, "x" * 100) for _ in range(10)]
+        await asyncio.wait_for(
+            asyncio.gather(
+                tasks.kill(task_id, cause="test requested task stop"),
+                *writes,
+                return_exceptions=True,
+            ),
+            10,
+        )
+        assert tasks.records[-1].stdin is None
+    finally:
+        await asyncio.wait_for(tasks.close(), 10)
 
     shutting_down = BackgroundTaskRegistry()
-    shutdown_id, _ = await shutting_down.start("sleep 30", tmp_path)
-    shutdown_writes = [shutting_down.input(shutdown_id, "x" * 100) for _ in range(10)]
-    await asyncio.gather(shutting_down.close(), *shutdown_writes, return_exceptions=True)
-    assert shutting_down.records[-1].stdin is None
+    try:
+        shutdown_id, _ = await shutting_down.start("sleep 30", tmp_path)
+        shutdown_writes = [
+            shutting_down.input(shutdown_id, "x" * 100) for _ in range(10)
+        ]
+        await asyncio.wait_for(
+            asyncio.gather(
+                shutting_down.close(), *shutdown_writes, return_exceptions=True
+            ),
+            10,
+        )
+        assert shutting_down.records[-1].stdin is None
+    finally:
+        await asyncio.wait_for(shutting_down.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -2126,11 +2258,12 @@ async def test_background_task_stays_running_for_detached_group_member(
         ),
         tmp_path,
     )
+    # test-contract: latency allow the detached child to enter the process group.
     await asyncio.sleep(0.1)
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
 
-    result = await tasks.kill(task_id)
+    result = await tasks.kill(task_id, cause="test requested task stop")
     assert result["running"] is False
     assert not _group_exists(pid)
     await tasks.close()
@@ -2143,7 +2276,7 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
         _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
         tmp_path,
     )
-    result = await tasks.kill(task_id)
+    result = await tasks.kill(task_id, cause="test requested task stop")
     assert result["running"] is False
     assert result["exit_code"] in {-signal.SIGTERM, -signal.SIGKILL}
     assert not _group_exists(tasks.records[0].pid)
@@ -2190,17 +2323,21 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         monkeypatch.setattr(
             spawn_module, "_snapshot_descendants_sync", blocked_second_snapshot
         )
-        killing = asyncio.create_task(tasks.kill(task_id))
+        killing = asyncio.create_task(
+            tasks.kill(task_id, cause="test requested task stop")
+        )
         assert await asyncio.to_thread(second_snapshot_started.wait, 10)
         killing.cancel()
         release_second_snapshot.set()
         with pytest.raises(asyncio.CancelledError):
-            await killing
+            await asyncio.wait_for(killing, 10)
         await wait_pid_exited(child_pid)
     finally:
         release_second_snapshot.set()
         if killing is not None:
-            await asyncio.gather(killing, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(killing, return_exceptions=True), 10
+            )
         if child_pid is not None and _group_exists(child_pid):
             os.killpg(child_pid, signal.SIGKILL)
         await tasks.close()
@@ -2420,16 +2557,21 @@ async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path)
     gate = tmp_path / "release"
     try:
         command = wait_for_path_command(gate)
-        task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
+        task_ids = [
+            await asyncio.wait_for(tasks.start(command, tmp_path), 10)
+            for _ in range(12)
+        ]
         assert len(task_ids) == 12
         assert tasks.running_count == 12
 
         gate.touch()
-        await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
+        await asyncio.wait_for(
+            asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids)), 10
+        )
         assert tasks.running_count == 0
     finally:
         gate.touch()
-        await tasks.close()
+        await asyncio.wait_for(tasks.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -2450,7 +2592,7 @@ async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
         ToolCall("output", "task_output", {"task_id": task_id})
     )
     assert output["structuredContent"]["running"] is False
-    assert "previous session" in output["structuredContent"]["note"]
+    assert output["structuredContent"]["note"] == "tool registry closed"
     await resumed.close()
 
 
@@ -2529,24 +2671,48 @@ async def test_registry_setup_ignores_corrupt_background_state(
 
 
 @pytest.mark.asyncio
-async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Path) -> None:
-    from zeta.agent.explicit_finish import kill_tasks_after_deadline
+async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import explicit_finish
 
+    deadline = asyncio.Event()
+    sleep_started = asyncio.Event()
+
+    async def injected_deadline(timeout: float) -> None:
+        assert timeout == 7
+        sleep_started.set()
+        await asyncio.wait_for(deadline.wait(), 10)
+
+    monkeypatch.setattr(
+        explicit_finish, "asyncio", SimpleNamespace(sleep=injected_deadline)
+    )
     wake = asyncio.Event()
     store = ConversationStore(tmp_path)
-    registry = _notification_registry(
-        store, wake_sink=lambda _source: wake.set()
+    registry = _notification_registry(store, wake_sink=lambda _source: wake.set())
+    first_id, _ = await asyncio.wait_for(
+        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
     )
-    task_id, _ = await registry.start(
-        _python("import time; time.sleep(60)"), tmp_path
+    kill = asyncio.create_task(
+        explicit_finish.kill_tasks_after_deadline(registry, 7)
     )
-    killed = await kill_tasks_after_deadline(registry, 0.01)
-    await asyncio.wait_for(wake.wait(), timeout=1)
-    event = store.agent_notifications()[0]
-    assert killed == (task_id,)
-    assert event.data["task_id"] == task_id
-    assert event.data["background_phase"] == "task_kill"
-    await registry.close()
+    await asyncio.wait_for(sleep_started.wait(), 10)
+    second_id, _ = await asyncio.wait_for(
+        registry.start(_python("import time; time.sleep(60)"), tmp_path), 10
+    )
+
+    deadline.set()
+    killed = await asyncio.wait_for(kill, 10)
+    await asyncio.wait_for(wake.wait(), 10)
+    events = store.agent_notifications(pending_only=False)
+    cause = (
+        "explicit-finish child task safety deadline expired after 7 seconds"
+    )
+    assert killed == (first_id, second_id)
+    assert [event.data["task_id"] for event in events] == [first_id, second_id]
+    assert all(event.data["background_phase"] == "task_kill" for event in events)
+    assert all(event.data["note"] == cause for event in events)
+    await asyncio.wait_for(registry.close(), 10)
     store.close()
 
 
