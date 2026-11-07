@@ -145,7 +145,22 @@ class ContextMarkerMixin:
             if index % 4 == 3:
                 cooperative_pause()
         if pinned is not None and not inserted:
-            if type(pinned_seq) is not int and any(message == pinned for message in messages):
+            if type(pinned_seq) is not int and any(
+                message.role is pinned.role
+                and message.content == pinned.content
+                and message.tool_result == pinned.tool_result
+                and {
+                    key: value
+                    for key, value in message.metadata.items()
+                    if key != "source_seq"
+                }
+                == {
+                    key: value
+                    for key, value in pinned.metadata.items()
+                    if key != "source_seq"
+                }
+                for message in messages
+            ):
                 return messages
             if type(pinned_seq) is not int:
                 # Legacy markers may not have the original row. This preserves the old safe fallback.
