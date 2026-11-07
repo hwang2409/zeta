@@ -97,14 +97,15 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
             strict_reopen=lambda: _strict_reopen(root, "damaged"),
             memory_review_required=True,
         )
+        payload_before = (
+            root / "damaged" / f"conversation.quarantine.{result.quarantine_id}.jsonl"
+        ).read_bytes()
+        assert payload_before == damaged
         manifest = recovery.read_evidence_manifest(directory_fd, result.quarantine_id)
         record = recovery.read_recovery_record(directory_fd, result.quarantine_id)
         status_before = recovery.recovery_status(directory_fd, target)
         evidence_before = (
             root / "damaged" / f"conversation.quarantine.{result.quarantine_id}.json"
-        ).read_bytes()
-        payload_before = (
-            root / "damaged" / f"conversation.quarantine.{result.quarantine_id}.jsonl"
         ).read_bytes()
         assert recovery.reconcile_pending(
             directory_fd,
@@ -121,7 +122,6 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
         assert warning.data["quarantine_id"] == result.quarantine_id
     finally:
         repaired.close()
-    assert payload_before == damaged
     assert manifest.payload_digest == hashlib.sha256(damaged).hexdigest()
     assert record is not None and record.state == "committed"
     assert record.memory_step == "review_pending"
