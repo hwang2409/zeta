@@ -6039,10 +6039,9 @@ async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_
 async def test_cross_provider_missing_credentials_returns_rpc_error(
     tmp_path, monkeypatch, target
 ):
-    from zeta.oauth import OAuthTokens
-
     from zeta.accounts import AccountCredentials
     from zeta.codex import CodexCredentialDriver
+    from zeta.oauth import OAuthTokens
     from zeta.providers.anthropic import AnthropicCredentialDriver
     from zeta.providers.factory import credential_store
 
@@ -6905,7 +6904,6 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
 @pytest.mark.asyncio
 async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
     from zeta.codex import CodexAuthError
-
     from zeta.server import model_selection
 
     server = ZetaServer(
