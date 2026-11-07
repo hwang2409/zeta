@@ -106,6 +106,8 @@ from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
     build_tool_limit_recovery_message,
+    empty_turn_error,
+    has_visible_output,
     output_limit_error,
     read_turn_metadata,
     should_nudge_empty_turn,
@@ -141,6 +143,9 @@ class _ToollessTransition:
     consuming_notifications: bool
     nudged_empty_turn: bool
     nudge_turn_pending: bool
+    empty_nudge_count: int
+    empty_nudge_episode: int
+    error: ErrorInfo | None = None
 
 
 class AgentLoop(
@@ -694,6 +699,11 @@ class AgentLoop(
         iteration_consuming_notifications: bool,
         notification_turn: bool,
         nudged_empty_turn: bool,
+        empty_nudge_count: int,
+        empty_nudge_episode: int,
+        tool_result_episode: int,
+        last_tool_call: ToolCall | None,
+        last_tool_result: ToolResult | None,
     ) -> _ToollessTransition:
         should_nudge = (
             not iteration_consuming_notifications
@@ -701,9 +711,31 @@ class AgentLoop(
                 assistant_message,
                 stop_reason=self._turn_stop_reason,
                 notification_turn=notification_turn,
-                already_nudged=nudged_empty_turn,
+                already_nudged=empty_nudge_episode == tool_result_episode,
+                nudge_count=empty_nudge_count,
             )
         )
+        exhausted_after_tool = (
+            not notification_turn
+            and not iteration_consuming_notifications
+            and not should_nudge
+            and not has_visible_output(assistant_message)
+            and tool_result_episode > 0
+            and last_tool_call is not None
+            and last_tool_result is not None
+        )
+        error = None
+        if exhausted_after_tool:
+            state = (
+                "cancelled"
+                if last_tool_result.is_canceled
+                else "error"
+                if last_tool_result.is_error
+                else "ok"
+            )
+            error = empty_turn_error(
+                last_tool_call.name, last_tool_call.id, f"{state}"
+            )
         if should_nudge:
             await step_delivery.admit_terminal("nudge")
             await self._append_turn_message(build_nudge_message())
@@ -715,6 +747,9 @@ class AgentLoop(
             consuming_notifications=consume_pending,
             nudged_empty_turn=nudged_empty_turn or should_nudge,
             nudge_turn_pending=should_nudge,
+            empty_nudge_count=empty_nudge_count + int(should_nudge),
+            empty_nudge_episode=(tool_result_episode if should_nudge else empty_nudge_episode),
+            error=error,
         )
 
     async def _run_turn_impl(
@@ -792,6 +827,11 @@ class AgentLoop(
         provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
         nudged_empty_turn = False
+        empty_nudge_count = 0
+        empty_nudge_episode = -1
+        tool_result_episode = 0
+        last_tool_call: ToolCall | None = None
+        last_tool_result: ToolResult | None = None
         nudge_turn_pending = False
         recovering_tool_limit = False
         consuming_notifications = False
@@ -1189,9 +1229,22 @@ class AgentLoop(
                     ),
                     notification_turn=notification_turn,
                     nudged_empty_turn=nudged_empty_turn,
+                    empty_nudge_count=empty_nudge_count,
+                    empty_nudge_episode=empty_nudge_episode,
+                    tool_result_episode=tool_result_episode,
+                    last_tool_call=last_tool_call,
+                    last_tool_result=last_tool_result,
                 )
                 nudged_empty_turn = transition.nudged_empty_turn
+                empty_nudge_count = transition.empty_nudge_count
+                empty_nudge_episode = transition.empty_nudge_episode
                 nudge_turn_pending = transition.nudge_turn_pending
+                if transition.error is not None:
+                    yield StreamEvent(StreamEventType.ERROR, error=transition.error)
+                    if self.agent_instance_id is None:
+                        await step_delivery.admit_terminal("foreground_end")
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
                 yield StreamEvent(
                     StreamEventType.TURN_END,
                     message=assistant_message,
@@ -1212,6 +1265,10 @@ class AgentLoop(
             )
             try:
                 async for event in dispatch:
+                    if event.type is StreamEventType.TOOL_EXECUTION_END:
+                        last_tool_call = event.tool_call
+                        last_tool_result = event.tool_result
+                        tool_result_episode += 1
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is durable before dispatch starts. If

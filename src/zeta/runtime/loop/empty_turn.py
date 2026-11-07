@@ -36,6 +36,7 @@ OUTPUT_LIMIT_ERROR_MESSAGE = (
     "the model reached its output-token limit while thinking "
     "and did not produce a reply"
 )
+MAX_EMPTY_TURN_NUDGES = 3
 
 
 def has_visible_output(message: Message) -> bool:
@@ -124,6 +125,8 @@ def should_nudge_empty_turn(
     stop_reason: str | None,
     notification_turn: bool,
     already_nudged: bool,
+    nudge_count: int = 0,
+    max_nudges: int = MAX_EMPTY_TURN_NUDGES,
 ) -> bool:
     """Whether a turn with no tool calls should be nudged once to recover.
 
@@ -135,6 +138,21 @@ def should_nudge_empty_turn(
     return (
         not notification_turn
         and not already_nudged
+        and nudge_count < max_nudges
         and stop_reason != "max_tokens"
         and not has_visible_output(message)
+    )
+
+
+def empty_turn_error(
+    tool_name: str | None,
+    tool_call_id: str | None,
+    tool_state: str | None,
+) -> ErrorInfo:
+    if tool_name is None or tool_call_id is None or tool_state is None:
+        return ErrorInfo("empty_turn", "child returned an empty final assistant message")
+    return ErrorInfo(
+        "empty_turn",
+        "child returned an empty final assistant message after tool "
+        f"`{tool_name}` ({tool_call_id}) {tool_state}",
     )

@@ -10388,6 +10388,136 @@ async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_subagent_empty_reply_after_tool_names_last_tool(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child-call")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-call", "ping", {})]),
+            ScriptedTurn(
+                [ThinkingContent("planning", "sig-1")], stop_reason="end_turn"
+            ),
+            ScriptedTurn(
+                [ThinkingContent("still empty", "sig-2")], stop_reason="end_turn"
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register(
+        "ping",
+        lambda _arguments: "pong",
+        description="ping",
+        requires_approval=False,
+    )
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error
+    assert "empty final assistant message after tool `ping`" in result.content
+    assert "ping-call" in result.content
+    assert "ok" in result.content
+
+
+@pytest.mark.asyncio
+async def test_subagent_empty_after_tools_stops_at_recovery_cap(
+    tmp_path: Path,
+) -> None:
+    turns = [ScriptedTurn(tool_calls=[_agent_call("child-call")])]
+    for index in range(4):
+        turns.extend(
+            [
+                ScriptedTurn(tool_calls=[ToolCall(f"ping-{index}", "ping", {})]),
+                ScriptedTurn(
+                    [ThinkingContent(f"empty-{index}", f"sig-{index}")],
+                    stop_reason="end_turn",
+                ),
+            ]
+        )
+    backend = FakeBackend(turns)
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register(
+        "ping",
+        lambda _arguments: "pong",
+        description="ping",
+        requires_approval=False,
+    )
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error
+    assert "ping-3" in result.content
+    assert len(backend.calls) == 9
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_recovery_works_after_earlier_empty_nudge(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child-call")]),
+            ScriptedTurn([ThinkingContent("early", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn(tool_calls=[ToolCall("ping-call", "ping", {})]),
+            ScriptedTurn([ThinkingContent("late", "sig-2")], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("child recovered")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register(
+        "ping",
+        lambda _arguments: "pong",
+        description="ping",
+        requires_approval=False,
+    )
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert not result.is_error
+    assert "child recovered" in result.content
+    assert len(backend.calls) == 5
+
+
+@pytest.mark.asyncio
 async def test_subagent_thinking_only_reply_is_nudged_before_failing(
     tmp_path: Path,
 ) -> None:
