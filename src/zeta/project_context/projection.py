@@ -87,13 +87,16 @@ class ProjectContextProjectionMixin:
             try:
                 directory_fd = self._project_dir(root_fd, name)
                 try:
-                    record = self._read_fd(directory_fd, "project.json")
+                    try:
+                        record = self._read_fd(directory_fd, "project.json")
+                    except ProjectRegistryError as exc:
+                        if isinstance(exc.__cause__, FileNotFoundError):
+                            continue
+                        raise
                     projects.append(self._decode(record, name))
                 finally:
                     os.close(directory_fd)
-            except ProjectRegistryError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
-                    continue
+            except ProjectRegistryError:
                 malformed.append(_health("malformed_project", name, "project.json"))
             except OSError:
                 malformed.append(_health("malformed_project", name, "project.json"))

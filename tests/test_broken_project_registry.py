@@ -22,7 +22,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
-from zeta.project_errors import ProjectRegistryBusyError
+from zeta.project_errors import ProjectRegistryBusyError, ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.project_registry_state import (
@@ -326,6 +326,33 @@ async def test_new_tui_keeps_healthy_project_context(
         assert healthy_id in prompt
     finally:
         await app.close()
+
+
+def test_missing_project_directory_is_not_silently_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def registry_with_disappearing_project() -> ProjectRegistry:
+        registry = ProjectRegistry(tmp_path / "projects")
+        registry.create_project("disappearing", "git")
+        original_project_dir = registry._project_dir
+
+        def disappear(root_fd: int, project_id: str, *, create: bool = False) -> int:
+            shutil.rmtree(registry.root / project_id)
+            return original_project_dir(root_fd, project_id, create=create)
+
+        # test-contract: seam force directory disappearance after enumeration.
+        monkeypatch.setattr(registry, "_project_dir", disappear)
+        return registry
+
+    strict = registry_with_disappearing_project()
+    with pytest.raises(ProjectRegistryError):
+        strict.list_projects()
+
+    tolerant = registry_with_disappearing_project()
+    projection = tolerant.project_context_projection(None)
+    assert projection.projects == ()
+    assert projection.health is not None
+    assert projection.health.code == "malformed_project"
 
 
 def test_new_tui_ignores_crash_leftover_and_auto_creates_project(
