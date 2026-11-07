@@ -6,8 +6,8 @@ import threading
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_server import (
-    _close,
     _connect,
     _frames_until_event,
     _request,
@@ -106,7 +106,7 @@ async def test_indexed_notification_append_keeps_receipt_and_callback(tmp_path) 
         assert len(receipts) == 1
         assert callback_calls == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -144,7 +144,7 @@ async def test_notification_turn_consumes_context_once_before_provider_call(
         assert CONTEXT in first[-1].content[0].text
         assert CONTEXT not in second[-1].content[0].text
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize("with_context", [False, True])
@@ -221,7 +221,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         assert store.agent_notifications() == []
     finally:
         release_append.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -299,7 +299,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         assert store.agent_notifications() == []
     finally:
         release_append.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,7 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
         ]
         assert len(persisted) == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 def test_newer_context_survives_release_of_in_flight_claim() -> None:
@@ -426,7 +426,7 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
 
         assert CONTEXT in _context_messages(backend, 0)[0].content[0].text
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -481,7 +481,7 @@ async def test_session_switch_keeps_pending_contexts_separate(
         assert second_context not in _context_messages(backend, 1)[0].content[0].text
         assert second_session != first_session
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -519,7 +519,7 @@ async def test_send_turn_does_not_consume_pending_context(tmp_path) -> None:
         assert all(CONTEXT not in str(message.to_dict()) for message in backend.calls[0][0])
         assert CONTEXT in _context_messages(backend, 1)[0].content[0].text
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -547,7 +547,7 @@ async def test_turn_context_replacement_and_clearing(tmp_path) -> None:
         await _notify(server, reader, "child-2")
         assert CONTEXT not in _context_messages(backend, 1)[0].content[0].text
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -565,7 +565,7 @@ async def test_turn_context_size_is_bounded_by_utf8_bytes(tmp_path) -> None:
         assert rejected[-1]["error"]["code"] == -32602
         assert "4096 UTF-8 bytes" in rejected[-1]["error"]["message"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -586,7 +586,7 @@ async def test_turn_context_is_persisted_as_non_user_notification_input(tmp_path
         assert persisted[0].metadata["zeta_event"] == "agent_notifications"
         assert persisted[0].metadata["turn_context"] is True
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -600,4 +600,4 @@ async def test_set_turn_context_requires_negotiated_feature(tmp_path) -> None:
         assert rejected[-1]["error"]["code"] == -32601
         assert "negotiated turn_context feature" in rejected[-1]["error"]["message"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)

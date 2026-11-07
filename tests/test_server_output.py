@@ -13,6 +13,7 @@ import pytest
 
 from tests import test_server_websocket as websocket
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_server import TIMEOUT, _socket_path
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -241,9 +242,7 @@ async def test_unregistered_descriptors_do_not_break_live_connection(
         )
         assert (await _read_json(reader, transport))["id"] == 4
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
 
 def _retained(output: Any) -> tuple[int, int]:

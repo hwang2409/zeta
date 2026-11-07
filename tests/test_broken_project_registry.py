@@ -17,6 +17,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager
@@ -157,9 +158,7 @@ async def _serve_hello(home: Path) -> dict[str, object]:
         response = json.loads(await reader.readline())
         return response["result"]
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
 
 @pytest.mark.parametrize(("_case", "corrupt"), _CORRUPTIONS, ids=_CASE_IDS)

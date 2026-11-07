@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as server_event
 from tests.support.server_client import request as server_request
@@ -178,9 +179,7 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
         await server_request(reader, writer, 5, "send", {"text": "fail this turn"})
         await server_event(reader, "error")
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
     source = runner.session_dir.parent / session_id / "conversation.jsonl"
     target.write_bytes(source.read_bytes())

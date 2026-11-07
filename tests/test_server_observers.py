@@ -12,7 +12,8 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.test_server import TIMEOUT, _close, _connect, _read, _request, _socket_path
+from tests.support.serve_close import close_serve
+from tests.test_server import TIMEOUT, _connect, _read, _request, _socket_path
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -112,7 +113,7 @@ async def test_observer_catalog_matches_controller_with_paging(tmp_path: Path) -
         assert observer_tail["next_offset"] is None
         assert "first_message_preview" in observer_page["sessions"][0]
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         observer_writer.close()
         await observer_writer.wait_closed()
 
@@ -173,9 +174,7 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
         assert (await history)[-1]["result"]["messages"] == []
     finally:
         release.set()
-        observer_writer.close()
-        await observer_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer, observer_writer)
 
 
 @pytest.mark.asyncio
@@ -212,7 +211,7 @@ async def test_observer_project_and_account_requests_are_read_only(
             assert response["error"]["data"]["code"] == "observer_read_only"
         assert (await _request(reader, writer, 99, "status"))[-1]["result"]["session"]
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         writer.close()
         await writer.wait_closed()
 
@@ -246,9 +245,7 @@ async def test_observer_hello_has_no_controller_side_effects(
             "session"
         ] is None
     finally:
-        writer.close()
-        await writer.wait_closed()
-        await server.close()
+        await close_serve(server, writer)
 
 
 async def _wait_thread(event: threading.Event) -> None:
@@ -361,10 +358,11 @@ async def test_observer_disconnects_keep_controller_approval(
         )[-1]
         assert approved["result"]["decision"] == "approve"
     finally:
-        for _, writer in sockets:
-            writer.close()
-            await writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(
+            server,
+            controller_writer,
+            *[writer for _, writer in sockets],
+        )
 
 
 @pytest.mark.asyncio
@@ -437,9 +435,7 @@ async def test_controller_history_does_not_block_other_clients(
         watchdog.join()
         ping.cancel()
         await asyncio.gather(ping, return_exceptions=True)
-        observer_writer.close()
-        await observer_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer, observer_writer)
 
 
 @pytest.mark.asyncio
@@ -516,9 +512,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
             assert session_b != session_a
     finally:
         release.set()
-        observer_writer.close()
-        await observer_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer, observer_writer)
 
 
 @pytest.mark.asyncio
@@ -619,12 +613,11 @@ async def test_pre_hello_connections_are_bounded(tmp_path: Path) -> None:
         assert server.connections is not None
         assert len(server.connections._connections) == MAX_PRE_HELLO_CONNECTIONS
     finally:
-        extra_writer.close()
-        await extra_writer.wait_closed()
-        for _, socket_writer in sockets:
-            socket_writer.close()
-            await socket_writer.wait_closed()
-        await server.close()
+        await close_serve(
+            server,
+            extra_writer,
+            *[socket_writer for _, socket_writer in sockets],
+        )
 
 
 async def _read_raw_until(
@@ -723,8 +716,7 @@ async def _controller_event_stream(
     finally:
         if observer_socket is not None:
             observer_socket[1].close()
-            await observer_socket[1].wait_closed()
-        await _close(server, writer)
+            await close_serve(server, writer, observer_socket[1])
 
 
 @pytest.mark.asyncio
@@ -759,7 +751,7 @@ async def test_controller_slot_releases_after_cleanup_only(tmp_path: Path) -> No
         )[-1]
         assert response["error"]["code"] == -32001
     finally:
-        await _close(server, first_writer)
+        await close_serve(server, first_writer)
         second_writer.close()
         await second_writer.wait_closed()
 
@@ -799,8 +791,7 @@ async def test_observer_cap_and_reconnect(tmp_path: Path) -> None:
         await observers[0][1].wait_closed()
         replacement = await _observer(server, 30)
         replacement[1].close()
-        await replacement[1].wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer, replacement[1])
         for _, writer in observers[1:]:
             writer.close()
             await writer.wait_closed()
@@ -842,7 +833,7 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
         await asyncio.wait_for(reader.read(), TIMEOUT)
         assert reader.at_eof() or writer.is_closing()
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         writer.close()
         await writer.wait_closed()
 
@@ -903,7 +894,7 @@ async def test_session_tree_uses_one_store_snapshot(
             ]
         }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -926,7 +917,7 @@ async def test_observer_read_workers_do_not_block_serve_loop_or_default_executor
         assert response["result"]["session"]
         assert await asyncio.wait_for(asyncio.to_thread(lambda: True), TIMEOUT)
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         writer.close()
         await writer.wait_closed()
 
@@ -937,9 +928,7 @@ async def test_stuck_observer_read_does_not_block_serve_exit(tmp_path: Path) -> 
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
     _reader, writer = await _observer(server)
-    writer.close()
-    await writer.wait_closed()
-    await server.close()
+    await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -981,7 +970,7 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
         assert answered_while_held == [True]
     finally:
         release.set()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         writer.close()
         await writer.wait_closed()
 
@@ -1014,7 +1003,7 @@ async def test_all_connection_output_is_registry_owned(tmp_path: Path) -> None:
         assert response["result"]["protocol_version"]
         assert hasattr(server, "connections")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1061,7 +1050,7 @@ async def test_observer_hello_advertises_only_callable_requests(
                 reply,
             )
     finally:
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer)
         writer.close()
         await writer.wait_closed()
 
@@ -1122,8 +1111,4 @@ async def test_observer_history_shape_matches_negotiated_backward_feature(
         assert "next_offset" in forward["result"]
         assert "next_before" not in forward["result"]
     finally:
-        backward_writer.close()
-        forward_writer.close()
-        await backward_writer.wait_closed()
-        await forward_writer.wait_closed()
-        await _close(server, controller_writer)
+        await close_serve(server, controller_writer, backward_writer, forward_writer)

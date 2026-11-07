@@ -17,6 +17,7 @@ from tests.support.scripted_provider import (
     load_fake_script,
     parse_fake_script,
 )
+from tests.support.serve_close import close_serve
 from tests.support.server_client import event as _event
 from tests.support.server_client import request as _request
 from zeta.cli.main import build_parser
@@ -349,9 +350,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         await _event(reader, "turn_end")
         return end["tool_result"]
     finally:
-        writer.close()
-        await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
-        await asyncio.wait_for(server.close(), TIMEOUT)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -405,9 +404,7 @@ async def test_serve_scripted_provider_error_reaches_client(
         assert error["error"]["code"] == "rate_limit_error"
         assert error["error"]["message"] == "slow down"
     finally:
-        writer.close()
-        await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
-        await asyncio.wait_for(server.close(), TIMEOUT)
+        await close_serve(server, writer)
 
 
 def test_headless_scripted_tool_respects_allowlist_and_approval(

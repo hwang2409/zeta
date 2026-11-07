@@ -16,9 +16,9 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _read_raw,
     _request,
@@ -645,7 +645,7 @@ async def test_detached_turn_uses_current_controller_projection(tmp_path: Path) 
         backend.release.set()
         if replacement is not None:
             await replacement.close()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -689,7 +689,7 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
         await asyncio.wait_for(backend.later_woke.wait(), TIMEOUT)
     finally:
         backend.release_finalization.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
