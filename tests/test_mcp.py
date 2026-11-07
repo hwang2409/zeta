@@ -273,15 +273,77 @@ def _failing_stdio_config(name: str = "fail") -> MCPServerConfig:
     return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
 
 
-def _descendant_stdio_config(marker: Path) -> MCPServerConfig:
-    child_source = (
-        f"import time; time.sleep(0.6); open({str(marker)!r}, 'w').write('alive')"
+def _gated_stdio_config(
+    name: str,
+    release: Path,
+    *,
+    descendant_address: tuple[str, int] | None = None,
+) -> MCPServerConfig:
+    descendant = ""
+    if descendant_address is not None:
+        child_source = f"""
+import socket
+sock = socket.create_connection({descendant_address!r})
+sock.recv(1)
+"""
+        descendant = f"subprocess.Popen([sys.executable, '-c', {child_source!r}]); "
+    source = f"""
+import json
+import pathlib
+import subprocess
+import sys
+import time
+armed = False
+while True:
+    if armed:
+        while not pathlib.Path({str(release)!r}).exists():
+            time.sleep(0.01)
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized" or method == "notifications/cancelled":
+        continue
+    if method == "initialize":
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}}}}}
+    elif method == "tools/list":
+        result = {{"tools": [{{"name": "echo", "description": "", "inputSchema": {{"type": "object"}}}}]}}
+        armed = True
+    elif method == "tools/call":
+        {descendant}print(json.dumps({{"jsonrpc": "2.0", "method": "zeta/test/request-received"}}), flush=True)
+        continue
+    else:
+        result = {{"content": [], "isError": False}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+"""
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
+def _capture_stdio_call(
+    client: StdioMCPClient, monkeypatch: pytest.MonkeyPatch
+) -> tuple[asyncio.Event, asyncio.Event]:
+    original_write = client._write_request
+    request_written = asyncio.Event()
+    request_received = asyncio.Event()
+
+    async def write_request(
+        process: asyncio.subprocess.Process,
+        request: dict[str, object],
+        response: asyncio.Future[dict[str, object]],
+        request_id: int,
+    ) -> None:
+        await original_write(process, request, response, request_id)
+        if request.get("method") == "tools/call":
+            request_written.set()
+
+    monkeypatch.setattr(client, "_write_request", write_request)
+    client.set_notification_sink(
+        lambda method: (
+            request_received.set() if method == "zeta/test/request-received" else None
+        )
     )
-    source = _stdio_source().replace(
-        '        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
-        f'        import subprocess; subprocess.Popen([sys.executable, "-c", {child_source!r}]); sys.exit(0)',
-    )
-    return MCPServerConfig("descendant", "stdio", sys.executable, ("-u", "-c", source))
+    return request_written, request_received
 
 
 class _FakeClient:
@@ -793,7 +855,14 @@ async def test_stdio_rejects_unterminated_line_beyond_named_limit(
 
     monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
+    source = """
+import json
+import sys
+request = json.loads(sys.stdin.readline())
+assert request["method"] == "initialize"
+sys.stdout.write("x" * 2048)
+sys.stdout.flush()
+"""
     client = StdioMCPClient(
         MCPServerConfig("unterminated", "stdio", sys.executable, ("-u", "-c", source))
     )
@@ -902,19 +971,24 @@ for line in sys.stdin:
 async def test_stdio_abort_returns_canceled_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = _stdio_source().replace(
-        'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
-        'import time; time.sleep(5); result = {"content": [], "isError": False}',
-    )
+    release = tmp_path / "receive-call"
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    config = MCPServerConfig("abort", "stdio", sys.executable, ("-u", "-c", source))
-    client = StdioMCPClient(config)
+    client = StdioMCPClient(_gated_stdio_config("abort", release))
     await client.connect()
+    await client.list_tools()
+    request_written, request_received = _capture_stdio_call(client, monkeypatch)
     signal = AbortSignal()
     task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
-    await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(request_written.wait(), timeout=10)
+    assert not task.done()
+    assert not request_received.is_set()
+    assert client._invalidation is None
+    release.touch()
+    await asyncio.wait_for(request_received.wait(), timeout=10)
     signal.abort()
     result = await task
+
     assert result["content"][0]["text"] == "tool execution canceled"
     await client.close()
 
@@ -923,12 +997,9 @@ async def test_stdio_abort_returns_canceled_result(
 async def test_stdio_abort_marks_mount_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = _stdio_source().replace(
-        'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
-        'import time; time.sleep(5); result = {"content": [], "isError": False}',
-    )
+    release = tmp_path / "receive-call"
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    config = MCPServerConfig("abort", "stdio", sys.executable, ("-u", "-c", source))
+    config = _gated_stdio_config("abort", release)
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
     )
@@ -936,6 +1007,8 @@ async def test_stdio_abort_marks_mount_failed(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"abort": config}),
     )
+    client = mount._clients["abort"]
+    request_written, request_received = _capture_stdio_call(client, monkeypatch)
     signal = AbortSignal()
     task = asyncio.create_task(
         registry.execute(
@@ -943,15 +1016,25 @@ async def test_stdio_abort_marks_mount_failed(
             abort_signal=signal,
         )
     )
-    await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(request_written.wait(), timeout=10)
+    assert not task.done()
+    assert not request_received.is_set()
+    assert client._invalidation is None
+    release.touch()
+    await asyncio.wait_for(request_received.wait(), timeout=10)
     signal.abort()
     result = await task
+    degraded = asyncio.Event()
+
+    def schema_refresh(current: MCPMount) -> None:
+        if current.statuses["abort"].state == "degraded":
+            degraded.set()
+
+    mount.set_schema_refresh(schema_refresh)
+    await asyncio.wait_for(degraded.wait(), timeout=10)
 
     assert result["isError"] is True
-    for _ in range(100):
-        if mount.statuses["abort"].state == "degraded":
-            break
-        await asyncio.sleep(0.01)
     assert mount.statuses["abort"].state == "degraded"
     assert mount.statuses["abort"].tool_count == 1
     assert mount.clients == ()
@@ -964,20 +1047,45 @@ async def test_stdio_abort_marks_mount_failed(
 async def test_stdio_abort_kills_descendant_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "descendant-alive"
-    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    client = StdioMCPClient(_descendant_stdio_config(marker))
-    await client.connect()
-    signal = AbortSignal()
-    task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
-    await asyncio.sleep(0.1)
-    signal.abort()
-    result = await task
-    await asyncio.sleep(0.9)
+    release = tmp_path / "receive-call"
+    descendant_connected: asyncio.Future[
+        tuple[asyncio.StreamReader, asyncio.StreamWriter]
+    ] = asyncio.get_running_loop().create_future()
 
-    assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
-    await client.close()
+    def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        descendant_connected.set_result((reader, writer))
+
+    server = await asyncio.start_server(connected, host="127.0.0.1", port=0)
+    address = server.sockets[0].getsockname()[:2]
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    client = StdioMCPClient(
+        _gated_stdio_config("descendant", release, descendant_address=address)
+    )
+    try:
+        await client.connect()
+        await client.list_tools()
+        request_written, request_received = _capture_stdio_call(client, monkeypatch)
+        signal = AbortSignal()
+        task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
+
+        await asyncio.wait_for(request_written.wait(), timeout=10)
+        assert not task.done()
+        assert not request_received.is_set()
+        assert client._invalidation is None
+        release.touch()
+        await asyncio.wait_for(request_received.wait(), timeout=10)
+        reader, writer = await asyncio.wait_for(descendant_connected, timeout=10)
+        signal.abort()
+        result = await task
+
+        assert result["content"][0]["text"] == "tool execution canceled"
+        assert await asyncio.wait_for(reader.read(), timeout=10) == b""
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await client.close()
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -2474,15 +2582,19 @@ async def test_stdio_exit_updates_mount_status(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"dead": _stdio_config("dead")}),
     )
+    degraded = asyncio.Event()
+
+    def schema_refresh(current: MCPMount) -> None:
+        if current.statuses["dead"].state == "degraded":
+            degraded.set()
+
+    mount.set_schema_refresh(schema_refresh)
     client = mount._clients["dead"]
     process = client._process
     assert process is not None
     process.terminate()
     await process.wait()
-    for _ in range(100):
-        if mount.statuses["dead"].state == "degraded":
-            break
-        await asyncio.sleep(0.01)
+    await asyncio.wait_for(degraded.wait(), timeout=10)
 
     assert mount.statuses["dead"].state == "degraded"
     assert "dead__echo" not in {schema["name"] for schema in registry.schemas}
