@@ -16,9 +16,7 @@ from . import connection as mcp_connection
 from .client import MCPClient, MCPPrompt, MCPResource, MCPResourceContent, MCPTool
 from .config import (
     MCPConfig,
-    MCPConfigError,
     MCPServerConfig,
-    load_mcp_config,
     tool_prefix,
 )
 from .envelope import MCPCallLimits
@@ -361,10 +359,8 @@ class MCPMount:
         *,
         source: Path,
         notice_sink: NoticeSink | None = None,
-        prepare: Callable[[], None] | None = None,
-        rollback: Callable[[], None] | None = None,
     ) -> MCPServerStatus:
-        """Commit a config entry, then start its lifecycle actor."""
+        """Start the lifecycle actor for an already committed config entry."""
 
         name = server_config.name
         async with self._config_lock:
@@ -372,8 +368,6 @@ class MCPMount:
                 raise ValueError("MCP mount is closed")
             if name in self.configs:
                 raise ValueError(f"MCP server already configured: {name}")
-            if prepare is not None:
-                prepare()
             self.configs[name] = server_config
             self.sources[name] = source
             if not self._server_allowed(name):
@@ -398,70 +392,8 @@ class MCPMount:
                     self.sources.pop(name, None)
                     self._clients.pop(name, None)
                     self._refresh_schemas()
-                    if rollback is not None:
-                        try:
-                            rollback()
-                        except BaseException:
-                            logger.exception("failed to roll back MCP config %s", name)
             await actor.close()
             raise
-
-    async def replace_server(
-        self,
-        name: str,
-        *,
-        persist: Callable[[Path], None],
-        replacement: Callable[[Path], tuple[MCPServerConfig, Path] | None],
-        notice_sink: NoticeSink | None = None,
-    ) -> None:
-        """Commit a config replacement and reconcile its lifecycle actor."""
-
-        actor_to_remove: MCPServerActor | None = None
-        actor_to_start: MCPServerActor | None = None
-        async with self._config_lock:
-            if name not in self.configs:
-                raise ValueError(f"unknown MCP server: {name}")
-            actor = self._actors.get(name)
-            source = self.sources.get(name)
-            if source is None:
-                raise ValueError(f"unknown MCP server: {name}")
-            next_server = replacement(source)
-            persist(source)
-            if next_server is None:
-                self._actors.pop(name, None)
-                self.configs.pop(name, None)
-                self.statuses.pop(name, None)
-                self.sources.pop(name, None)
-                self._clients.pop(name, None)
-                actor_to_remove = actor
-            else:
-                server_config, next_source = next_server
-                self.configs[name] = server_config
-                self.sources[name] = next_source
-                if not self._server_allowed(name):
-                    self._actors.pop(name, None)
-                    self._clients.pop(name, None)
-                    self.statuses[name] = self._skipped_status(server_config)
-                    actor_to_remove = actor
-                    self._notice_skipped((name,), notice_sink)
-                elif actor is None:
-                    actor_to_start = self._make_actor(server_config, next_source)
-                    self._actors[name] = actor_to_start
-                    actor_to_start.start()
-            self._refresh_schemas()
-        if actor_to_remove is not None:
-            await actor_to_remove.remove_when_idle()
-        if next_server is None:
-            return
-        if actor_to_start is not None:
-            await actor_to_start.wait_started(notice_sink)
-            return
-        if actor is not None and actor_to_remove is None:
-            await actor.replace(
-                server_config,
-                next_source,
-                notice_sink=notice_sink,
-            )
 
     async def remove_server(self, name: str) -> None:
         """Remove one configured server and await its actor cleanup."""
@@ -593,19 +525,12 @@ class MCPMount:
 
 async def mount_mcp_servers(
     registry: ToolRegistry,
-    config: MCPConfig | None = None,
+    config: MCPConfig,
     *,
     notice_sink: NoticeSink | None = None,
     home: str | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
-
-    if config is None:
-        try:
-            config = load_mcp_config()
-        except MCPConfigError as exc:
-            logger.error("%s", exc)
-            return MCPMount(registry, {}, {}, home=home)
 
     enabled_configs = {
         name: server_config
