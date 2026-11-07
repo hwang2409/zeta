@@ -6018,8 +6018,8 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(
 ):
     from zeta.accounts import AccountCredentials
     from zeta.codex import CodexCredentialDriver
+    from zeta.oauth import OAuthTokens
     from zeta.providers.anthropic import AnthropicCredentialDriver
-    from zeta.providers.auth import OAuthTokens
     from zeta.providers.factory import credential_store
 
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
@@ -6509,7 +6509,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             completions.append(self.model)
             if self.model == "gpt-5.4-mini":
                 if raise_error:
-                    from zeta.providers.codex_errors import CodexHTTPError
+                    from zeta.codex import CodexHTTPError
 
                     raise CodexHTTPError(detail, status_code=status_code)
                 yield StreamEvent(
@@ -6832,7 +6832,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
 
 @pytest.mark.asyncio
 async def test_return_to_fallback_does_not_restore_itself(tmp_path):
-    from zeta.providers.codex_errors import CodexHTTPError
+    from zeta.codex import CodexHTTPError
 
     class DeniedBackend(FakeBackend):
         async def complete(self, messages, tool_schemas):
@@ -6877,7 +6877,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
-    from zeta.providers.codex_errors import CodexAuthError
+    from zeta.codex import CodexAuthError
     from zeta.server import model_selection
 
     server = ZetaServer(
