@@ -12,7 +12,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.server_client import approve_and_collect_grant
+from tests.support.server_client import approve_and_collect_grant, read
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -158,7 +158,13 @@ async def test_approve_collector_reports_response_without_grant_event() -> None:
             "scope": "always_tool",
         },
     }
+    turn_end = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"event": "turn_end", "data": {"turn_id": "turn-1"}},
+    }
     reader.feed_data((json.dumps(response) + "\n").encode())
+    reader.feed_data((json.dumps(turn_end) + "\n").encode())
     reader.feed_eof()
 
     class _Writer:
@@ -175,7 +181,51 @@ async def test_approve_collector_reports_response_without_grant_event() -> None:
     message = str(failure.value)
     assert "approve response without session_grants_changed" in message
     assert repr(response) in message
+    assert repr(turn_end) in message
     assert "all observed frames" in message
+
+
+@pytest.mark.asyncio
+async def test_approve_collector_restores_unrelated_frames() -> None:
+    reader = asyncio.StreamReader()
+    turn_end = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"event": "turn_end", "data": {"turn_id": "turn-1"}},
+    }
+    response = {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "result": {
+            "accepted": True,
+            "decision": "approve",
+            "request_id": "call-1",
+            "scope": "always_tool",
+        },
+    }
+    grant = {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "event": "session_grants_changed",
+            "data": {"change": "grant", "changed": ["bash"]},
+        },
+    }
+    reader.feed_data(
+        ("\n".join(json.dumps(frame) for frame in (turn_end, response, grant)) + "\n").encode()
+    )
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    await approve_and_collect_grant(
+        reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+    )
+    assert await asyncio.wait_for(read(reader), 10) == turn_end
 
 
 async def _wait_idle(
@@ -601,23 +651,12 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         # test-contract: seam gate the real observer transport write
         monkeypatch.setattr(observer_connection, "_write_physical", block_observer)
         approve = asyncio.create_task(
-            _request(
-                reader,
-                writer,
-                4,
-                "approve",
-                {"request_id": "call-1", "scope": "always_tool"},
+            approve_and_collect_grant(
+                reader, writer, 4, "call-1", "always_tool", ["bash"]
             )
         )
         await observer_blocked.wait()
-        approve_frames = await _assert_completes_in_ready_turns(approve)
-        assert approve_frames[-1]["result"] == {
-            "accepted": True,
-            "decision": "approve",
-            "request_id": "call-1",
-            "scope": "always_tool",
-        }
-        controller_event = await _event(reader, "session_grants_changed")
+        controller_event = await _assert_completes_in_ready_turns(approve)
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
