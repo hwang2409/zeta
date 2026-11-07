@@ -413,7 +413,6 @@ class AgentLoop(
     @property
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
-
     def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
             self._background_event_sink(event)
