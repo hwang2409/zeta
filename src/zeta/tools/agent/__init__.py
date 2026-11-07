@@ -896,10 +896,10 @@ async def _agent_output(
             max_bytes=max_bytes,
             cached=cached,
         )
+        previous = registry._agent_output_cache.pop(child_path, None)
+        if previous is not None:
+            registry._agent_output_cache_chars -= len(previous[1])
         if cacheable and len(output) <= _AGENT_OUTPUT_CACHE_MAX_CHARS:
-            previous = registry._agent_output_cache.pop(child_path, None)
-            if previous is not None:
-                registry._agent_output_cache_chars -= len(previous[1])
             registry._agent_output_cache[child_path] = (identity, output)
             registry._agent_output_cache_chars += len(output)
             registry._agent_output_cache.move_to_end(child_path)

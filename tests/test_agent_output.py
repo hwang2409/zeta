@@ -243,6 +243,59 @@ async def test_post_clone_setup_failure_releases_registry_directory(
     await loop.close()
 
 
+@pytest.mark.parametrize(
+    ("case", "arguments", "max_output_chars", "expected_text", "expected_error"),
+    [
+        ("unknown", {"handle": "missing:1"}, 10_000, "agent error: unknown child handle", True),
+        ("offset-past-end", {"handle": "parent:1", "offset": 99}, 10_000, "", False),
+        ("invalid-offset", {"handle": "parent:1", "offset": "x"}, 10_000, "agent error: offset must be a nonnegative integer", True),
+        ("invalid-limit", {"handle": "parent:1", "limit": 0}, 10_000, "agent error: limit must be a positive integer", True),
+        ("valid-page", {"handle": "parent:1", "limit": 100}, 10_000, "assistant: x\n", False),
+        ("invalid-row", {"handle": "parent:1"}, 10_000, "agent error: could not read child transcript", True),
+        ("read-error", {"handle": "parent:1"}, 10_000, "agent error: could not read child transcript", True),
+        ("too-small-page", {"handle": "parent:1"}, 1, "agent error: response exceeds response limit", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_output_matches_main_equality_table(
+    case: str,
+    arguments: dict[str, object],
+    max_output_chars: int,
+    expected_text: str,
+    expected_error: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(
+        parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("x")]))
+    monkeypatch.setattr(
+        agent_tools,
+        "_active_agent_receipts",
+        lambda store: {"parent:1": child.session_dir}
+        if case != "unknown"
+        else {},
+    )
+    if case == "invalid-row":
+        (child.session_dir / "conversation.jsonl").write_bytes(
+            (child.session_dir / "conversation.jsonl").read_bytes() + b"bad\n"
+        )
+    elif case == "read-error":
+        (child.session_dir / "conversation.jsonl").unlink()
+    registry = SimpleNamespace(
+        max_output_chars=max_output_chars,
+        session_store=parent,
+        _agent_output_cache=OrderedDict(),
+        _agent_output_cache_chars=0,
+    )
+    result = await agent_tools._agent_output(registry, arguments, object())
+    content = result["content"][0]
+    assert content["text"] == expected_text
+    assert result["isError"] is expected_error
+
+
 @pytest.mark.asyncio
 async def test_agent_output_reads_finished_child_with_roles_and_pages(
     tmp_path: Path,
@@ -527,6 +580,32 @@ async def test_agent_output_reuses_unchanged_transcript_and_refreshes_after_appe
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_agent_output_does_not_cache_outputs_over_byte_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(
+        parent.session_dir / "agents", session_id="1", _storage_lease=parent._storage_lease
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("large")]))
+    monkeypatch.setattr(
+        agent_tools,
+        "_active_agent_receipts",
+        lambda store: {"parent:1": child.session_dir},
+    )
+    monkeypatch.setattr(agent_tools, "_AGENT_OUTPUT_CACHE_MAX_CHARS", 1)
+    registry = SimpleNamespace(
+        max_output_chars=10_000,
+        session_store=parent,
+        _agent_output_cache=OrderedDict(),
+        _agent_output_cache_chars=0,
+    )
+    await agent_tools._agent_output(registry, {"handle": "parent:1"}, object())
+    assert not registry._agent_output_cache
+    assert registry._agent_output_cache_chars == 0
+
+
 @pytest.mark.asyncio
 async def test_agent_output_does_not_cache_append_during_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
