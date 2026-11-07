@@ -1329,6 +1329,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
             assert release_append.wait(timeout=5)
         return result
 
+    # test-contract: seam pauses after durable inbox status commit
     monkeypatch.setattr(store, "_run_committed_mutation", pause_after_status_commit)
     try:
         await loop._check_project_inbox()
@@ -1338,6 +1339,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
             await first_turn
+        # test-contract: seam releases the next turn from the injected pause
         monkeypatch.setattr(store, "_run_committed_mutation", original_durable_write)
         await _collect_turn(loop, "second")
 

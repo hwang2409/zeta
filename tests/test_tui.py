@@ -806,6 +806,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             assert release_ack.wait(timeout=5)
         return result
 
+    # test-contract: seam pauses after durable acknowledgement commit
     monkeypatch.setattr(
         ConversationStore, "_run_committed_mutation", pause_after_ack_commit
     )

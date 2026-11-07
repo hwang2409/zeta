@@ -543,6 +543,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
                 writers.append(tuple(frame.function for frame in inspect.stack()))
             return await original_commit(method, *args, **kwargs)
 
+        # test-contract: seam records the settlement-owned durable write
         monkeypatch.setattr(store, "_commit_method_async", record_writer)
         assert abort() is None
         await asyncio.sleep(0)

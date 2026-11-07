@@ -3142,3 +3142,34 @@ def test_store_accepts_and_reopens_new_history_shapes(
         finally:
             reopened.close()
     assert accepted, f"candidate accepted {entry_type} shape"
+
+
+@pytest.mark.asyncio
+async def test_async_store_dispatches_a_typed_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    observed: list[object] = []
+    if hasattr(store, "_run_committed_mutation"):
+        original = store._run_committed_mutation
+
+        def capture(command: object, *args: object, **kwargs: object) -> object:
+            observed.append(command)
+            return original(command, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_run_committed_mutation", capture)
+    else:
+        original = store._run_durable_write
+
+        def capture(method_name: str, *args: object, **kwargs: object) -> object:
+            observed.append(method_name)
+            return original(method_name, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_run_durable_write", capture)
+    try:
+        await store.append_message_async(message(MessageRole.ASSISTANT, "typed"))
+
+        assert observed
+        assert not isinstance(observed[0], str)
+    finally:
+        await asyncio.to_thread(store.close)

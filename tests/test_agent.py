@@ -9771,6 +9771,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
             assert release_ack.wait(timeout=5)
         return result
 
+    # test-contract: seam pauses after durable acknowledgement commit
     monkeypatch.setattr(type(store), "_run_committed_mutation", pause_after_ack_commit)
 
     def publications(value: object):

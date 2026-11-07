@@ -18,8 +18,8 @@ from zeta.core.store import (
     ConversationGenerationConflict,
     ConversationIntegrityError,
     ConversationRow,
-    ConversationTargetOwned,
     ConversationStore,
+    ConversationTargetOwned,
     commit_conversation_async,
 )
 
@@ -182,6 +182,7 @@ async def test_commit_async_defers_cancellation_until_delta_is_installed(
         assert release.wait(10)
         return result
 
+    # test-contract: seam pauses after the durable commit but before resident install
     monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
     task = asyncio.create_task(
         store.commit_async(
@@ -237,7 +238,9 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
         reached.set()
         assert release.wait(10)
 
+    # test-contract: seam records the worker's cancellation gate
     monkeypatch.setattr(store, "_start_committed_mutation", capture_cancellation)
+    # test-contract: seam pauses the worker before its first durable write
     monkeypatch.setattr(store, "_before_committed_mutation", pause_before_write)
     before = (
         store.path.read_bytes(),

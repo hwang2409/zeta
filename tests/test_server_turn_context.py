@@ -182,6 +182,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             assert release_append.wait(timeout=5)
         return result
 
+    # test-contract: seam pauses after durable notification commit
     monkeypatch.setattr(
         type(store), "_run_committed_mutation", pause_after_notification_commit
     )
@@ -206,6 +207,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
+        # test-contract: seam releases retry from the injected commit pause
         monkeypatch.setattr(
             type(store), "_run_committed_mutation", original_durable_write
         )
@@ -271,6 +273,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
             assert release_append.wait(timeout=5)
         return result
 
+    # test-contract: seam pauses after durable notification commit
     monkeypatch.setattr(
         type(store), "_run_committed_mutation", pause_after_notification_commit
     )
@@ -293,6 +296,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
+        # test-contract: seam releases retry from the injected commit pause
         monkeypatch.setattr(
             type(store), "_run_committed_mutation", original_durable_write
         )
@@ -489,6 +493,7 @@ async def test_session_switch_keeps_pending_contexts_separate(
         await _frames_until_event(reader, "error")
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
+        # test-contract: seam restores delivery staging before the retry
         monkeypatch.setattr(
             type(first_store), "_stage_delivery_request", original_stage
         )
