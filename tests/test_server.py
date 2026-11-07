@@ -1850,6 +1850,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
+    # test-contract: seam forces approval-end publication ordering
     monkeypatch.setattr(
         server.control._approvals, "_publish", delay_delegated_approval_end
     )
