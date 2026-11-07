@@ -8600,6 +8600,7 @@ async def test_agent_send_racing_wake_clear_remains_armed(
             return original_stage(target, *args)
 
         gated_stage.__name__ = "_stage_delivery_request"
+        # test-contract: seam force delivery staging across the race boundary
         monkeypatch.setattr(ConversationStore, "_stage_delivery_request", gated_stage)
         if producer_first:
             await flow.produce(
@@ -9482,6 +9483,7 @@ async def test_notification_producer_races_step_snapshot_once(
             return original_stage(target, *args)
 
         gated_stage.__name__ = "_stage_delivery_request"
+        # test-contract: seam force delivery staging across the race boundary
         monkeypatch.setattr(ConversationStore, "_stage_delivery_request", gated_stage)
         if producer_first:
             await flow.produce(_task_exit_input("task-race"))

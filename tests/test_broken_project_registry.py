@@ -74,6 +74,7 @@ def test_registry_lock_wait_is_bounded(
     lock = root / ".lock"
     fd = os.open(lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
+    # test-contract: seam force the registry lock-timeout path
     monkeypatch.setattr(
         "zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05
     )
