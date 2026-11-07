@@ -4624,16 +4624,15 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    hello_frames = await _request(
+        reader, writer, 4, "hello", {"protocol_version": "1.2"}
+    )
     store = server.runtime.opened.store
     task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
-    store.append_task_notification(
-        task_id="task-1",
-        command="printf hi",
-        exit_code=0,
-        output_tail="hi",
-        note=task_cause,
-        background_metadata=("run_background", "task_kill"),
-    )
     store.append_agent_notification(
         "child-1",
         child_session_path="/tmp/child-1",
@@ -4641,25 +4640,27 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         status="completed",
         text="child done",
     )
+    registry = server.runtime.loop.tool_registry.background_tasks
+    task_id, _pid = await registry.start("sleep 30", tmp_path)
+    kill_options = (
+        {"cause": task_cause}
+        if "cause" in inspect.signature(registry.kill).parameters
+        else {}
+    )
+    await registry.kill(task_id, **kill_options)
+    task_frames = await _frames_until_event(reader, "turn_end")
     try:
-        writer.close()
-        await writer.wait_closed()
-        await asyncio.sleep(0.05)
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        frames = await _request(
-            reader, writer, 4, "hello", {"protocol_version": "1.2"}
-        )
-        frames += await _frames_until_event(reader, "turn_end")
+        frames = hello_frames
         events = [
             frame["params"]
-            for frame in frames
+            for frame in task_frames + frames
             if frame.get("params", {}).get("event")
             in {"task_exit_notification", "sub_agent_receipt"}
         ]
         task_events = [e for e in events if e["event"] == "task_exit_notification"]
         receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
         assert len(task_events) == 1
-        assert task_events[0]["data"]["task_id"] == "task-1"
+        assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
         assert task_events[0]["data"]["note"] == task_cause
         assert {
