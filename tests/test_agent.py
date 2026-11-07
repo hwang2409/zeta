@@ -13574,9 +13574,8 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
     )
     loop.explicit_finish = True
     register_finish(registry, child_loop=loop)
-    owned = asyncio.create_task(
-        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
-    )
+    # test-contract: seam task intentionally stays live until owner cancellation
+    owned = asyncio.create_task(asyncio.Event().wait())
     loop._background_owner.register(
         "root:1:1",
         owned.cancel,
@@ -14016,9 +14015,8 @@ async def test_idle_with_open_work_does_not_notify_parent(
             ),
         )
     elif wake_source in {"child", "idle_child"}:
-        owned_child = asyncio.create_task(
-            asyncio.wait_for(asyncio.Event().wait(), timeout=10)
-        )
+        # test-contract: seam task intentionally stays live until owner cancellation
+        owned_child = asyncio.create_task(asyncio.Event().wait())
         if wake_source == "idle_child":
             owned_child_store = ConversationStore(tmp_path / "idle-owned-child")
             child.register_agent_child(
@@ -14565,9 +14563,8 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
             ),
         )
     else:
-        owned_child = asyncio.create_task(
-            asyncio.wait_for(asyncio.Event().wait(), timeout=10)
-        )
+        # test-contract: seam task intentionally stays live until owner cancellation
+        owned_child = asyncio.create_task(asyncio.Event().wait())
         loop._background_owner.register(
             "root:1:1",
             lambda: None,
@@ -16894,12 +16891,10 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     parent = ConversationStore(tmp_path / "parent")
     grandchild = ConversationStore(tmp_path / "grandchild")
     owner = BackgroundAgentOwner(root)
-    parent_task = asyncio.create_task(
-        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
-    )
-    grandchild_task = asyncio.create_task(
-        asyncio.wait_for(asyncio.Event().wait(), timeout=10)
-    )
+    # test-contract: seam task intentionally stays live until owner cancellation
+    parent_task = asyncio.create_task(asyncio.Event().wait())
+    # test-contract: seam task intentionally stays live until owner cancellation
+    grandchild_task = asyncio.create_task(asyncio.Event().wait())
     owner.register(
         "root:1",
         parent_task.cancel,
