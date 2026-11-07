@@ -144,7 +144,9 @@ def test_await_deadline_rule_catches_pr_765_original_bare_task_await(
 
     findings = _lint(tmp_path, source)
 
-    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 3)]
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ004"
+    ] == [("TQ004", 3)]
 
 
 def test_await_deadline_rule_catches_both_pr_772_notification_gates(
@@ -597,6 +599,262 @@ rename to tests/test_example.py
 """
 
     assert _lint(tmp_path, source, diff=diff) == []
+
+
+@pytest.mark.parametrize(
+    ("opening", "kind", "owner_text"),
+    [
+        ("TUIApp(loop)", "app", "owned_app"),
+        ("ConversationStore(tmp_path)", "store", "owner.store"),
+        ("AgentLoop(backend, store)", "async resource", "owner.async_resource"),
+        ("ToolRegistry(tmp_path)", "async resource", "owner.async_resource"),
+        ("await ServeContract.start()", "async resource", "owner.async_resource"),
+        (
+            "await asyncio.start_server(handler)",
+            "async resource",
+            "owner.async_resource",
+        ),
+        ("asyncio.create_task(run())", "task", "owner.task"),
+        ("asyncio.ensure_future(run())", "task", "owner.task"),
+        ("multiprocessing.Process(target=run)", "process", "owned_child_process"),
+        ("subprocess.Popen(command)", "process", "owned_child_process"),
+        (
+            "await asyncio.create_subprocess_exec(*command)",
+            "process",
+            "owned_child_process",
+        ),
+    ],
+)
+def test_tq006_names_exact_owner_for_each_closeable(
+    tmp_path: Path, opening: str, kind: str, owner_text: str
+) -> None:
+    source = f"async def test_resource():\n    resource = {opening}\n    await ready.wait()\n"
+
+    findings = _lint(tmp_path, source)
+    cleanup = [finding for finding in findings if finding.code == "TQ006"]
+
+    assert [(finding.line, finding.message) for finding in cleanup] == [
+        (
+            2,
+            (
+                f"closeable {kind} is not failure-safe; open it with "
+                f"{quality.CLEANUP_OWNERS[kind]} so timeout, cancellation, and "
+                "assertion paths always clean up"
+            ),
+        )
+    ]
+    assert owner_text in cleanup[0].message
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def test_pr774():
+    async with owned_resources() as owner:
+        root = owner.store(ConversationStore(tmp_path))
+        loop = owner.async_resource(AgentLoop(backend, root), what="agent loop")
+        async with owned_child_process(context, target=child) as process:
+            await await_or_fail(loop.run(process), what="process result")
+""",
+        """async def test_pr792():
+    async with owned_resources() as owner:
+        store = owner.store(ConversationStore(tmp_path))
+        loop = owner.async_resource(AgentLoop(backend, store), what="agent loop")
+        task = owner.task(asyncio.create_task(loop.run()))
+        await await_or_fail(task, what="background owner")
+""",
+        """async def test_pr806():
+    async with owned_resources() as owner:
+        parent = owner.store(ConversationStore(tmp_path / "parent"))
+        child = owner.store(ConversationStore(tmp_path / "child"))
+        registry = owner.async_resource(ToolRegistry(tmp_path), what="registry")
+        loop = owner.async_resource(AgentLoop(backend, parent), what="agent loop")
+        task = owner.task(asyncio.create_task(loop.run_turn("start")))
+        await await_or_fail(task, what="agent turn")
+""",
+    ],
+)
+def test_tq006_owner_migrated_historical_bodies_are_quiet(
+    tmp_path: Path, source: str
+) -> None:
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """@pytest.fixture
+async def resource_fixture(tmp_path):
+    store = ConversationStore(tmp_path)
+    try:
+        yield store
+    finally:
+        store.close()
+""",
+        """async def test_nested_finally(tmp_path):
+    try:
+        store = ConversationStore(tmp_path)
+        await run(store)
+    finally:
+        try:
+            await stop_worker()
+        finally:
+            store.close()
+""",
+    ],
+)
+def test_tq006_accepts_fixture_and_nested_finally_cleanup(
+    tmp_path: Path, source: str
+) -> None:
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_immediate_try_after_open(tmp_path: Path) -> None:
+    source = """async def test_store(tmp_path):
+    store = ConversationStore(tmp_path)
+    try:
+        await run(store)
+    finally:
+        store.close()
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        "await ready.wait()",
+        "assert ready.is_set()",
+        "store = replacement",
+    ],
+)
+def test_tq006_rejects_risk_or_reassignment_before_cleanup_try(
+    tmp_path: Path, between: str
+) -> None:
+    source = f"""async def test_store(tmp_path):
+    store = ConversationStore(tmp_path)
+    {between}
+    try:
+        await run(store)
+    finally:
+        store.close()
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 2)]
+
+
+def test_tq006_propagates_local_helper_resource_and_checks_pre_return_await(
+    tmp_path: Path,
+) -> None:
+    source = """async def _run_until_ready():
+    run = asyncio.create_task(work())
+    await asyncio.wait_for(ready.wait(), 10)
+    return run, ready
+
+async def test_idle():
+    run, ready = await _run_until_ready()
+    try:
+        assert ready.is_set()
+    finally:
+        await _cancel_and_drain(run)
+"""
+
+    findings = _lint(tmp_path, source, added_lines={7})
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 2), ("TQ006", 7)]
+
+
+def test_tq006_accepts_local_helper_without_risk_before_return(tmp_path: Path) -> None:
+    source = """def _open_store(tmp_path):
+    store = ConversationStore(tmp_path)
+    return store
+
+def test_store(tmp_path):
+    store = _open_store(tmp_path)
+    try:
+        assert store.messages() == []
+    finally:
+        store.close()
+"""
+
+    assert [
+        finding
+        for finding in _lint(tmp_path, source, added_lines={6})
+        if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_rejects_cleanup_after_await_even_inside_finally(tmp_path: Path) -> None:
+    source = """async def test_store(tmp_path):
+    try:
+        store = ConversationStore(tmp_path)
+        await run(store)
+    finally:
+        await stop_worker()
+        store.close()
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 3)]
+
+
+def test_tq006_checks_whole_changed_function_but_not_unchanged_function(
+    tmp_path: Path,
+) -> None:
+    source = """async def test_changed(tmp_path):
+    store = ConversationStore(tmp_path)
+    assert state == "new"
+
+async def test_unchanged(tmp_path):
+    other = ConversationStore(tmp_path)
+"""
+
+    findings = _lint(tmp_path, source, added_lines={3})
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 2)]
+
+
+def test_tq006_ratchet_rejects_new_and_removed_hits(tmp_path: Path) -> None:
+    source = """def test_existing(tmp_path):
+    store = ConversationStore(tmp_path)
+
+def test_new(tmp_path):
+    task = asyncio.create_task(run())
+"""
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(source)
+    ratchet = tmp_path / quality.CLEANUP_RATCHET_PATH
+    ratchet.write_text(
+        "tests/test_example.py::test_existing::store\n"
+        "tests/test_example.py::test_removed::process\n"
+    )
+
+    findings = quality.lint_all(tmp_path)
+
+    assert [(finding.code, finding.path, finding.line) for finding in findings] == [
+        ("TQ006", quality.CLEANUP_RATCHET_PATH, 1),
+        ("TQ006", Path("tests/test_example.py"), 5),
+    ]
+    assert "remove it from tests/test_cleanup_owner_ratchet.txt" in findings[0].message
 
 
 def test_all_mode_reads_function_ratchet(tmp_path: Path) -> None:
