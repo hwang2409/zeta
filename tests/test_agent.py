@@ -41,6 +41,7 @@ from zeta.agent.background import (
     recover_agent_children,
 )
 from zeta.agent.conversation_channel import ConversationChannel
+from zeta.agent.explicit_finish import TaskSafetyLifecycle
 from zeta.agent.finish_gate import (
     FinishGateControl,
     FinishGateResult,
@@ -86,6 +87,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
+from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
@@ -3585,50 +3587,47 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
 async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadlines = _hold_finish_gate_deadlines(monkeypatch)
-    store = ConversationStore(tmp_path)
-    owner = BackgroundAgentOwner(store, finish_gate_timeout=0.01)
-    task = SimpleNamespace(task_id="task-1", headline="collect evidence", running=True)
-    registry = SimpleNamespace(
-        snapshot=lambda: (task,), task_start_generation=1, running_count=1
-    )
-    child_loop = SimpleNamespace(
-        _background_owner=owner,
-        agent_instance_id="child-1",
-        tool_registry=SimpleNamespace(background_tasks=registry),
-    )
-    state = FinishGateState()
-    state.start(child_loop)
+    async with contextlib.AsyncExitStack() as stack:
+        deadlines = _hold_finish_gate_deadlines(monkeypatch)
+        model_started = asyncio.Event()
+        cancellation_started = asyncio.Event()
+        release_cancellation = asyncio.Event()
 
-    model_started = asyncio.Event()
+        class Backend(CompletionBackend):
+            async def complete(self, messages, tool_schemas):
+                del messages, tool_schemas
+                try:
+                    model_started.set()
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_started.set()
+                    await asyncio.wait_for(release_cancellation.wait(), 10)
+                    raise
+                if False:
+                    yield StreamEvent(StreamEventType.MESSAGE_END)
 
-    async def events() -> AsyncIterator[StreamEvent]:
-        try:
-            model_started.set()
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            task.running = False
-            registry.running_count = 0
-            raise
-        if False:
-            yield StreamEvent(StreamEventType.MESSAGE_END)
+        harness = await _task_safety_provider_harness(stack, tmp_path, Backend())
+        model_turn = asyncio.create_task(
+            harness.state.run_model_turn(
+                harness.loop,
+                _finish_gate_agent_events(harness.loop),
+                _consume_finish_gate_agent_turn,
+            )
+        )
+        stack.push_async_callback(_cancel_and_drain_test_task, model_turn)
+        await asyncio.wait_for(model_started.wait(), 10)
+        await _warn_and_rearm_provider_task(harness)
 
-    async def consume(
-        stream: AsyncIterator[StreamEvent], control: object
-    ) -> None:
-        del control
-        async for _event in stream:
-            pass
+        state, _configured_timeout = deadlines.started[0]
+        deadlines.expire_model_bound(state)
+        await asyncio.wait_for(cancellation_started.wait(), 10)
+        await _kill_provider_task_at_second_window(harness)
+        assert not model_turn.done()
 
-    model_turn = asyncio.create_task(
-        state.run_model_turn(child_loop, events(), consume)
-    )
-    await model_started.wait()
-    deadlines.expire_model_bound(state)
-    result = await model_turn
+        release_cancellation.set()
+        result = await asyncio.wait_for(model_turn, 10)
 
-    assert result is None
-    store.close()
+        assert result is None
 
 
 @pytest.mark.asyncio
@@ -3794,6 +3793,238 @@ def _finish_gate_with_running_task(
     state = FinishGateState()
     state.start(child_loop)
     return store, child_loop, state
+
+
+async def _consume_finish_gate_agent_turn(
+    stream: AsyncIterator[StreamEvent], control: FinishGateControl | None
+) -> None:
+    async for event in stream:
+        if (
+            event.type is StreamEventType.TURN_END
+            and control is not None
+            and control.turn_ended()
+        ):
+            return
+
+
+def _finish_gate_agent_events(loop: AgentLoop) -> AsyncIterator[StreamEvent]:
+    return loop.run_harness_notice_turn(
+        Message(MessageRole.SYSTEM, [TextContent("finish pending work")])
+    )
+
+
+async def _task_safety_provider_harness(
+    stack: contextlib.AsyncExitStack,
+    tmp_path: Path,
+    backend: CompletionBackend,
+) -> SimpleNamespace:
+    store = ConversationStore(tmp_path)
+    stack.callback(store.close)
+    owner = BackgroundAgentOwner(store, finish_gate_timeout=60)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        background_owner=owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    stack.push_async_callback(_close_test_agent_loop, loop)
+    loop.agent_instance_id = "child-1"
+    result = await asyncio.wait_for(
+        loop.tool_registry.execute(
+            ToolCall(
+                "start-provider-task",
+                "run_background",
+                {"command": _python("import time; time.sleep(30)")},
+            )
+        ),
+        10,
+    )
+    task_id = result["structuredContent"]["task_id"]
+    registry = loop.tool_registry.background_tasks
+    registry._record(task_id).started_at = 100.0
+    registry._persist()
+    now = [100.0]
+    wait = _ConsumeTaskSafetyWait()
+    notices: list[str] = []
+
+    async def publish(text: str) -> str:
+        notices.append(text)
+        return f"warning-{len(notices)}"
+
+    lifecycle = TaskSafetyLifecycle(
+        10, clock=lambda: now[0], wait=wait, cohort_seconds=0
+    )
+    supervisor = asyncio.create_task(lifecycle.run(registry, publish))
+    stack.push_async_callback(_cancel_and_drain_test_task, supervisor)
+    assert await asyncio.wait_for(wait.timeouts.get(), 10) == 10
+    state = FinishGateState()
+    state.start(loop)
+    return SimpleNamespace(
+        store=store,
+        loop=loop,
+        registry=registry,
+        task_id=task_id,
+        now=now,
+        wait=wait,
+        notices=notices,
+        lifecycle=lifecycle,
+        state=state,
+    )
+
+
+async def _warn_and_rearm_provider_task(harness: SimpleNamespace) -> None:
+    harness.now[0] = 110.0
+    await harness.wait.releases.put(False)
+    assert await asyncio.wait_for(harness.wait.timeouts.get(), 10) is None
+    assert len(harness.notices) == 1
+    assert f"task {harness.task_id} (" in harness.notices[0]
+    harness.lifecycle.delivery_completed(set())
+    await harness.wait.releases.put(True)
+    assert await asyncio.wait_for(harness.wait.timeouts.get(), 10) == 10
+
+
+async def _kill_provider_task_at_second_window(
+    harness: SimpleNamespace,
+) -> None:
+    harness.now[0] = 120.0
+    await harness.wait.releases.put(False)
+    assert await asyncio.wait_for(harness.wait.timeouts.get(), 10) is None
+    receipts = [
+        entry
+        for entry in harness.store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+        and entry.data.get("task_id") == harness.task_id
+    ]
+    assert len(receipts) == 1
+    assert receipts[0].data["background_phase"] == "task_kill"
+    assert receipts[0].data["note"] == (
+        "explicit-finish task safety limit expired at task age 20 seconds "
+        "after no owner turn for 10 seconds"
+    )
+
+
+@pytest.mark.asyncio
+@_finish_gate_hang_guard
+async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        deadlines = _hold_finish_gate_deadlines(monkeypatch)
+        stream_started = asyncio.Event()
+
+        class Response:
+            status_code = 200
+
+            async def aiter_bytes(self) -> AsyncIterator[bytes]:
+                stream_started.set()
+                yield b'{"message":{"content":"partial"}}\n'
+                await asyncio.Event().wait()
+
+        class StreamContext:
+            def __init__(self) -> None:
+                self.close_started = asyncio.Event()
+                self.close_cancelled = asyncio.Event()
+
+            async def __aenter__(self) -> Response:
+                return Response()
+
+            async def __aexit__(self, *args: object) -> None:
+                self.close_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.close_cancelled.set()
+                    raise
+
+        class OwnedClient:
+            def __init__(self, **kwargs: object) -> None:
+                self.stream_context = StreamContext()
+                self.close_started = asyncio.Event()
+                self.close_cancelled = asyncio.Event()
+                self.release_close = asyncio.Event()
+                clients.append(self)
+
+            def stream(self, *args: object, **kwargs: object) -> StreamContext:
+                return self.stream_context
+
+            async def aclose(self) -> None:
+                self.close_started.set()
+                try:
+                    await self.release_close.wait()
+                except asyncio.CancelledError:
+                    self.close_cancelled.set()
+                    raise
+
+        clients: list[OwnedClient] = []
+        monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", OwnedClient)
+        harness = await _task_safety_provider_harness(
+            stack, tmp_path, OllamaBackend(stall_seconds=0)
+        )
+        stack.callback(clients[0].release_close.set)
+        model_turn = asyncio.create_task(
+            harness.state.run_model_turn(
+                harness.loop,
+                _finish_gate_agent_events(harness.loop),
+                _consume_finish_gate_agent_turn,
+            )
+        )
+        stack.push_async_callback(_cancel_and_drain_test_task, model_turn)
+        await asyncio.wait_for(stream_started.wait(), 10)
+        await _warn_and_rearm_provider_task(harness)
+        await _kill_provider_task_at_second_window(harness)
+        assert not model_turn.done()
+
+        state, _configured_timeout = deadlines.started[0]
+        deadlines.expire_model_bound(state)
+        result = await asyncio.wait_for(model_turn, 10)
+
+        assert result is None
+        assert clients[0].stream_context.close_cancelled.is_set()
+        assert not clients[0].close_started.is_set()
+        assert not clients[0].close_cancelled.is_set()
+        clients[0].release_close.set()
+
+
+@pytest.mark.asyncio
+@_finish_gate_hang_guard
+async def test_finish_gate_real_transport_close_obeys_task_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        deadlines = _hold_finish_gate_deadlines(monkeypatch)
+        transport = _BlockingTransportClose()
+
+        class Backend(CompletionBackend):
+            async def complete(self, messages, tool_schemas):
+                del messages, tool_schemas
+                async for event in transport.events():
+                    yield event
+
+        harness = await _task_safety_provider_harness(stack, tmp_path, Backend())
+        before = set(asyncio.all_tasks())
+        model_turn = asyncio.create_task(
+            harness.state.run_model_turn(
+                harness.loop,
+                _finish_gate_agent_events(harness.loop),
+                _consume_finish_gate_agent_turn,
+            )
+        )
+        stack.push_async_callback(_cancel_and_drain_test_task, model_turn)
+        await asyncio.wait_for(transport.response_started.wait(), 10)
+        await _warn_and_rearm_provider_task(harness)
+        await _kill_provider_task_at_second_window(harness)
+        assert not model_turn.done()
+
+        state, _configured_timeout = deadlines.started[0]
+        deadlines.expire_model_bound(state)
+        result = await asyncio.wait_for(model_turn, 10)
+        await asyncio.sleep(0)
+
+        assert result is None
+        assert transport.response_closed.is_set()
+        assert transport.client_closed.is_set()
+        assert set(asyncio.all_tasks()) <= before
 
 
 @pytest.mark.asyncio

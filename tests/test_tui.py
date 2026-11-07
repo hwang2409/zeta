@@ -6325,15 +6325,24 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         return "disk full; pending changes will retry"
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
-
-    lines = tui_app_module._status_card_lines(app.slash_status())
-    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
-
-    assert requested == ["child-session"]
-    assert (
-        "transcript_index_failure: disk full; pending changes will retry" in rendered
+    monkeypatch.setattr(
+        AgentLoop,
+        "connection_setup_counts",
+        lambda _loop: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+        raising=False,
     )
-    await app.close()
+
+    try:
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+
+        assert requested == ["child-session"]
+        assert (
+            "transcript_index_failure: disk full; pending changes will retry" in rendered
+        )
+        assert "completion_client_setups: codex/gpt-test=1" in rendered
+    finally:
+        await app.close()
 
 
 @pytest.mark.parametrize(
@@ -13153,8 +13162,13 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            backend.client = client
-            [event async for event in backend.complete([], [])]
+            probe = OllamaBackend(
+                model=backend.model,
+                base_url=backend.base_url,
+                client=client,
+                token_budget=expected_budget,
+            )
+            [event async for event in probe.complete([], [])]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget
@@ -13700,7 +13714,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         "last_attempt_at": "2020-01-01T00:00:00Z",
         "last_error": "rate limited; retry later",
     }
-    store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
+    await asyncio.to_thread(
+        store._write_usage_bytes, account, (json.dumps(usage) + "\n").encode()
+    )
     manager = SessionManager(home)
     opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(

@@ -661,11 +661,17 @@ work. The result contains `cleared`, the number of removed messages.
 
 ### `status`
 
-Params: none. The result contains `session` (full metadata or `null`), `state`
-(`idle`, `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`,
-and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
-and `delegated`. Delegated approvals also have `agent_instance_id`, the child
-agent instance that owns the approval.
+Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
+the result includes `connection_setup_counts`, an array of objects with
+`provider` (string), `model` (string), and `count` (integer). Each object reports
+the number of HTTP clients created by one completion backend. The field is
+omitted when the parameter is absent or false.
+
+The result contains `session` (full metadata or `null`), `state` (`idle`,
+`running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
+`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
+`delegated`. Delegated approvals also have `agent_instance_id`, the child agent
+instance that owns the approval.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -1328,8 +1334,11 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
-`/vim`. Runnable user commands also include prompt macros
+`/inbox`, `/init`, `/memory`, `/model`, `/project`, `/project-instructions`,
+`/status`, and `/vim`. `/project` shows the current association, and `/project
+init` discovers the working directory and associates the session. The mutating
+form is rejected while a turn, child, or approval is active. Runnable user
+commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
 plus skills. Argless `/model` reports the current model, while `/model <name>`
 dispatches server-side through the shared settings-apply path. TUI-owned
