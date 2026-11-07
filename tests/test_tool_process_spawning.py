@@ -135,6 +135,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
 async def test_tool_spawn_paths_preserve_process_contract(
     monkeypatch: pytest.MonkeyPatch, spawn_path: str, scenario: str
 ) -> None:
+    await asyncio.to_thread(lambda: None)
     baseline_fds = len(os.listdir("/dev/fd"))
     spawned_pids: list[int] = []
     spawn_attempts: list[bool] = []
