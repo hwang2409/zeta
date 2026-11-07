@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .auth import error_body_excerpt
+from ..oauth import error_body_excerpt
 
 _OVERLOADED_CODES = frozenset({"server_is_overloaded", "slow_down"})
 
