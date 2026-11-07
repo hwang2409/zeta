@@ -573,29 +573,29 @@ class _Client:
                         initial_model = _required_string(params, "model")
                     model_selection.validate(initial_model, initial_mode)
                 candidate = self._host_commands(params)
-                await self.server.control.require_idle()
-                cwd = None
-                if "cwd" in params:
-                    self._require_feature("session_cwd", "cwd")
-                    cwd = _directory(params, "cwd")
-                await self.server.control._terminate_pending_approvals()
-                await self.server.runtime.create_session(
-                    provider=_optional_string(params, "provider"),
-                    model=initial_model,
-                    cwd=cwd,
-                )
-                if initial_model is not None and initial_mode is not None:
-                    await model_selection.apply_rpc(
-                        self.server.runtime, initial_model, initial_mode
+                with self.server.control.reserve_session_swap():
+                    cwd = None
+                    if "cwd" in params:
+                        self._require_feature("session_cwd", "cwd")
+                        cwd = _directory(params, "cwd")
+                    await self.server.control._terminate_pending_approvals()
+                    await self.server.runtime.create_session(
+                        provider=_optional_string(params, "provider"),
+                        model=initial_model,
+                        cwd=cwd,
                     )
-                self.server.control._active_host_commands = candidate
-                self.server.control._host_binding_required = (
-                    "session_host_commands" in self.features
-                )
-                self.server.control.session_replaced()
-                self.server.control.clear_approvals()
-                await self.server.control.controller_ready()
-                return {"session": self._session_snapshot()}
+                    if initial_model is not None and initial_mode is not None:
+                        await model_selection.apply_rpc(
+                            self.server.runtime, initial_model, initial_mode
+                        )
+                    self.server.control._active_host_commands = candidate
+                    self.server.control._host_binding_required = (
+                        "session_host_commands" in self.features
+                    )
+                    self.server.control.session_replaced()
+                    self.server.control.clear_approvals()
+                    await self.server.control.controller_ready()
+                    return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
@@ -604,43 +604,46 @@ class _Client:
         if method == "resume":
             try:
                 candidate = self._host_commands(params)
-                await self.server.control.require_idle()
-                session_id = _required_string(params, "session_id")
-                unhealthy_same_session = (
-                    self.server.control.unhealthy()
-                    and self.server.runtime.session_id == session_id
-                )
-                await self.server.control._terminate_pending_approvals()
-                if unhealthy_same_session:
-                    try:
-                        await self.server.runtime.resume_session(session_id, force=True)
-                    except SessionNotFoundError as exc:
-                        raise ProtocolError(
-                            ErrorDescriptor.SESSION_NOT_FOUND,
-                            str(exc),
-                            {"session_id": session_id},
-                        ) from exc
-                    except Exception as exc:
-                        raise ProtocolError(
-                            ErrorDescriptor.INTERNAL_ERROR, "approval persistence failed"
-                        ) from exc
-                else:
-                    try:
-                        await self.server.runtime.resume_session(session_id)
-                    except SessionNotFoundError as exc:
-                        raise ProtocolError(
-                            ErrorDescriptor.SESSION_NOT_FOUND,
-                            str(exc),
-                            {"session_id": session_id},
-                        ) from exc
-                self.server.control._active_host_commands = candidate
-                self.server.control._host_binding_required = (
-                    "session_host_commands" in self.features
-                )
-                self.server.control.session_replaced()
-                self.server.control.clear_approvals()
-                await self.server.control.controller_ready()
-                return {"session": self._session_snapshot()}
+                with self.server.control.reserve_session_swap():
+                    session_id = _required_string(params, "session_id")
+                    unhealthy_same_session = (
+                        self.server.control.unhealthy()
+                        and self.server.runtime.session_id == session_id
+                    )
+                    await self.server.control._terminate_pending_approvals()
+                    if unhealthy_same_session:
+                        try:
+                            await self.server.runtime.resume_session(
+                                session_id, force=True
+                            )
+                        except SessionNotFoundError as exc:
+                            raise ProtocolError(
+                                ErrorDescriptor.SESSION_NOT_FOUND,
+                                str(exc),
+                                {"session_id": session_id},
+                            ) from exc
+                        except Exception as exc:
+                            raise ProtocolError(
+                                ErrorDescriptor.INTERNAL_ERROR,
+                                "approval persistence failed",
+                            ) from exc
+                    else:
+                        try:
+                            await self.server.runtime.resume_session(session_id)
+                        except SessionNotFoundError as exc:
+                            raise ProtocolError(
+                                ErrorDescriptor.SESSION_NOT_FOUND,
+                                str(exc),
+                                {"session_id": session_id},
+                            ) from exc
+                    self.server.control._active_host_commands = candidate
+                    self.server.control._host_binding_required = (
+                        "session_host_commands" in self.features
+                    )
+                    self.server.control.session_replaced()
+                    self.server.control.clear_approvals()
+                    await self.server.control.controller_ready()
+                    return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None

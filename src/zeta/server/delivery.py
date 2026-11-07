@@ -324,6 +324,7 @@ class DeliveryRequests:
         if control.server.runtime.state is state:
             state.turn_finished()
         if control._turn_task is owner_task:
+            control._turn_handoff_task = owner_task
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (

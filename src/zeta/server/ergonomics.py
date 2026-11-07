@@ -35,6 +35,7 @@ from ..protocol.types import (
     MessageRole,
     TextContent,
     is_passive_harness_message,
+    is_visible_harness_notice,
     with_message_origin,
 )
 from . import event_contract
@@ -390,8 +391,10 @@ def history_projection(
                     for request in entry.data.get("approval_requests", [])
                 }
             )
-        if entry.type == "message" and is_passive_harness_message(
-            entry.data["message"]
+        if (
+            entry.type == "message"
+            and is_passive_harness_message(entry.data["message"])
+            and not is_visible_harness_notice(entry.data["message"])
         ):
             continue
         if entry.type in {"message", "notification"}:
