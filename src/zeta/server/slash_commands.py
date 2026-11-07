@@ -162,6 +162,11 @@ class ServerSlashSession:
             transcript_index_failure=loop.transcript_index_failure(
                 opened.metadata.session_id
             ),
+            project_context_health=(
+                loop.project_context_health.summary
+                if loop.project_context_health is not None
+                else None
+            ),
         )
 
     async def slash_accounts(self, args: str) -> str:
@@ -410,9 +415,7 @@ async def run_command(
     raise ProtocolError(-32000, "unexpected slash result type")
 
 
-async def _run_mcp_command(
-    runtime: ServerRuntime, tail: str
-) -> dict[str, object]:
+async def _run_mcp_command(runtime: ServerRuntime, tail: str) -> dict[str, object]:
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
     if verb not in {"status", "auth", "logout"}:

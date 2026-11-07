@@ -106,6 +106,7 @@ class BackgroundAgentOwner:
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
+        self.project_context_loops: dict[str, Any] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._cancel_requested: set[str] = set()

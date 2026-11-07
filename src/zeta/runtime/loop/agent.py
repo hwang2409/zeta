@@ -90,7 +90,6 @@ from ..backend_state import (
     effective_backend_budget,
     prepare_backend_state,
 )
-from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -117,8 +116,9 @@ from .empty_turn import (
 )
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import SkillRefreshMixin
+from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -156,6 +156,7 @@ class AgentLoop(
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
+    ProjectContextRecoveryMixin,
     MCPSession,
 ):
     post_stream_provider_retry = True
@@ -218,6 +219,9 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_project_context_recovery(
+            registry=None, project_id=None, health=None, prepare=None
+        )
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -331,7 +335,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: RuntimePrompt | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -520,6 +524,7 @@ class AgentLoop(
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        await self._close_project_context_recovery()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
@@ -738,6 +743,7 @@ class AgentLoop(
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
+        self._advance_project_context_recovery()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
