@@ -99,11 +99,10 @@ async def consume_child(
     def terminal_result(
         *, state: TerminalState, text: str, **result_options: object
     ) -> dict[str, object]:
-        stats = finish_lifecycle(state, text)
         return child_result(
             text,
             state=state,
-            stats=stats,
+            stats=finish_lifecycle(state, text),
             **result_options,
         )
 
@@ -200,8 +199,7 @@ async def consume_child(
             events = child_loop.run_harness_notice_turn(harness_notice_message)
         else:
             events = child_loop.run_turn(
-                "" if delivering_prompt_id is not None else prompt,
-                origin=origin,
+                "" if delivering_prompt_id is not None else prompt, origin=origin,
                 persist_user_message=delivering_prompt_id is None,
             )
         try:
@@ -211,9 +209,7 @@ async def consume_child(
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
-            state: TerminalState = (
-                "failed" if report_status == "failed" else "completed"
-            )
+            state: TerminalState = "failed" if report_status == "failed" else "completed"
             text = f"{report_status}: {summary}"
             finish_lifecycle(state, text)
             structured_content = {

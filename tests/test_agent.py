@@ -13045,6 +13045,7 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
         asyncio.get_running_loop().call_soon(release_commit.set)
         return True
 
+    # test-contract: seam force input commit to overlap stalled admission
     monkeypatch.setattr(child, "_to_thread_durable", blocked_durable)
     monkeypatch.setattr(channel, "publish_idle", observed_idle)
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
