@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from zeta.core.loop import AgentLoop
 
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
@@ -47,6 +46,7 @@ from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
 from zeta.providers.codex import CodexBackend
 from zeta.providers.completion import CompletionRetryBudget
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import TUIApp
 

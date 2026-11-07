@@ -16,7 +16,6 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
-from zeta.core.loop import AgentLoop
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support.fake_backend import FakeBackend
@@ -38,6 +37,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.completion import owned_completion
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop._completion import _error_info
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp

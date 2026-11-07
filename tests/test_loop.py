@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from zeta.core.loop import AgentLoop
 
 import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
@@ -43,6 +42,7 @@ from zeta.protocol.types import (
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
     build_nudge_message,
@@ -1938,14 +1938,19 @@ async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: P
             del messages, tool_schemas
             self.calls += 1
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(ToolCall("tool-1", "echo", {}))],
+                    ),
+                )
+                raise failure
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(
-                    MessageRole.ASSISTANT,
-                    [ToolUseContent(ToolCall("tool-1", "echo", {}))],
-                ),
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
             )
-            raise failure
 
     backend = Backend()
     store = ConversationStore(tmp_path)
@@ -1954,7 +1959,7 @@ async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: P
             "start", origin=MessageOrigin.USER
         )
     )
-    assert backend.calls == 1
+    assert backend.calls == 2
     assert not any(event.type is StreamEventType.RETRY for event in events)
 
 

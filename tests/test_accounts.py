@@ -21,7 +21,6 @@ import httpx
 import pytest
 from rich.console import Console
 from rich.text import Text
-from zeta.core.loop import AgentLoop
 
 import zeta.accounts.store as account_store
 import zeta.cli.main as cli_main
@@ -61,6 +60,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion, retryable_provider_error
 from zeta.providers.factory import build_backend, credential_store
+from zeta.runtime.loop import AgentLoop
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
