@@ -113,6 +113,7 @@ class CommandRuntimeMixin:
             self._handle_tool_event(event)
             self._invalidate_prompt()
 
+        log_path.touch()
         try:
             result = await run_shell_macro(
                 self.loop.tool_registry,
@@ -224,6 +225,7 @@ class CommandRuntimeMixin:
             self._handle_tool_event(event)
             self._invalidate_prompt()
 
+        log_path.touch()
         try:
             result = await run_shell_macro(
                 self.loop.tool_registry,

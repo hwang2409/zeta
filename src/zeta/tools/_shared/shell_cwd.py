@@ -78,52 +78,16 @@ async def bind_shell_cwd_async(
 ) -> tuple[str, int]:
     """Bind a shell cwd without blocking the runtime event loop."""
 
-    recovery = await asyncio.to_thread(
-        _find_removed_cwd, registry, requested_cwd, approved_cwd
-    )
-    if recovery is not None:
-        registry.recover_shell_cwd(recovery)
     binding = asyncio.create_task(
-        asyncio.to_thread(
-            bind_shell_cwd,
-            registry,
-            requested_cwd,
-            approved_cwd,
-            recover=False,
-        )
+        asyncio.to_thread(bind_shell_cwd, registry, requested_cwd, approved_cwd)
     )
     try:
         return await asyncio.shield(binding)
     except BaseException:
-        if binding.done():
-            _close_binding(binding)
-        else:
-            binding.add_done_callback(_close_binding)
-        raise
-
-
-def _find_removed_cwd(
-    registry: ToolRegistry,
-    requested_cwd: object,
-    approved_cwd: ApprovedCwdExecution | None,
-) -> str | None:
-    if approved_cwd is not None or requested_cwd is not None:
-        return None
-    if registry.bash_cwd == str(registry.cwd):
         try:
-            registry.verify_cwd_identity()
-        except SessionCwdRemoved:
-            return registry.bash_cwd
-        if not registry.cwd.is_dir():
-            return registry.bash_cwd
-        return None
-    resolved = resolve_shell_cwd(registry.bash_cwd, requested_cwd)
-    if not Path(resolved).is_dir():
-        return resolved
-    return None
-
-
-def _close_binding(binding: asyncio.Task[tuple[str, int]]) -> None:
-    if binding.cancelled() or binding.exception() is not None:
-        return
-    os.close(binding.result()[1])
+            result = await asyncio.shield(binding)
+        except BaseException:
+            pass
+        else:
+            os.close(result[1])
+        raise
