@@ -192,7 +192,7 @@ def test_interrupt_cleanup_through_cli(tmp_path: Path) -> None:
         while time.monotonic() < deadline:
             if (scratch / "fixture" / "head" / "sessions").exists():
                 break
-            time.sleep(0.01)
+            time.sleep(0.01)  # test-contract: latency wait for child scratch readiness
         os.kill(process.pid, signal.SIGINT)
         _stdout, stderr = process.communicate(timeout=10)
     finally:
