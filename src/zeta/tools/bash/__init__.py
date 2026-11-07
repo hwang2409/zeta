@@ -21,7 +21,6 @@ from .._shared.process import (
     spawn_background,
     tool_subprocess_env,
 )
-from .._shared.sandbox import resolve_shell_cwd
 from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
@@ -171,7 +170,7 @@ async def _bash(
     start_cwd = (
         approved_cwd.cwd
         if approved_cwd is not None
-        else resolve_shell_cwd(registry.bash_cwd, arguments.get("cwd"))
+        else registry.resolve_shell_cwd(arguments.get("cwd"))
     )
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get(
@@ -183,7 +182,7 @@ async def _bash(
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
-        registry.verify_cwd_identity()
+        registry.verify_cwd_identity(allow_removed=True)
         cwd_fd = (
             _open_approved_cwd(registry, approved_cwd)
             if approved_cwd is not None
@@ -237,7 +236,7 @@ async def _bash(
     try:
         if log_path is not None:
             log_handle = registry.background_tasks.open_log(log_path)
-        registry.verify_cwd_identity()
+        registry.verify_cwd_identity(allow_removed=True)
         if approved_cwd is not None:
             cwd_fd = _open_approved_cwd(registry, approved_cwd)
             try:
@@ -262,7 +261,7 @@ async def _bash(
         else:
             spawn = create_tool_subprocess_shell(
                 command,
-                cwd=registry.cwd,
+                cwd=start_cwd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

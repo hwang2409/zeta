@@ -80,8 +80,14 @@ from ._results import (
     _success_result,
     text_block,
 )
+from ._shared.cwd_state import (
+    SessionCwdRemoved,
+    nearest_existing_directory,
+    open_session_cwd,
+    open_verified_directory,
+)
 from ._shared.process import BackgroundTaskRegistry
-from ._shared.sandbox import SandboxPolicy
+from ._shared.sandbox import SandboxPolicy, resolve_shell_cwd
 from ._spill import SpillStore
 from ._validation import (
     MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
@@ -325,6 +331,7 @@ class ToolRegistry:
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
+        self._cwd_recovery_notices: list[tuple[str, str]] = []
         self._tools: dict[str, ToolDefinition] = {}
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
@@ -885,6 +892,20 @@ class ToolRegistry:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
 
+    def resolve_shell_cwd(self, requested_cwd: object) -> str:
+        resolved = resolve_shell_cwd(self.bash_cwd, requested_cwd)
+        if requested_cwd is not None or Path(resolved).is_dir():
+            return resolved
+        fallback = nearest_existing_directory(resolved)
+        self.update_bash_cwd(fallback)
+        self._cwd_recovery_notices.append((resolved, fallback))
+        return fallback
+
+    def take_cwd_recovery_notices(self) -> tuple[tuple[str, str], ...]:
+        notices = tuple(self._cwd_recovery_notices)
+        self._cwd_recovery_notices.clear()
+        return notices
+
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")
@@ -1043,6 +1064,8 @@ class ToolRegistry:
                     kind="invalid_arguments",
                 )
             )
+        if tool_call.name in {"bash", "run_background"}:
+            self.resolve_shell_cwd(arguments.get("cwd"))
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
@@ -1205,40 +1228,18 @@ class ToolRegistry:
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
 
-    def verify_cwd_identity(self) -> None:
-        """Fail closed if the pathname no longer names the captured cwd."""
+    def verify_cwd_identity(self, *, allow_removed: bool = False) -> None:
+        """Fail closed if the pathname names a directory other than the captured cwd."""
 
-        cwd_fd = self._open_cwd()
+        try:
+            cwd_fd = self._open_cwd()
+        except SessionCwdRemoved:
+            if allow_removed:
+                return
+            raise
         os.close(cwd_fd)
 
-    @staticmethod
-    def open_verified_directory(path: str | Path, identity: tuple[int, int]) -> int:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            stat_result = os.fstat(fd)
-        except OSError as exc:
-            if "fd" in locals():
-                os.close(fd)
-            raise ValueError("approved shell cwd was replaced") from exc
-        if (stat_result.st_dev, stat_result.st_ino) != identity:
-            os.close(fd)
-            raise ValueError("approved shell cwd was replaced")
-        return fd
+    open_verified_directory = staticmethod(open_verified_directory)
 
     def _open_cwd(self) -> int:
-        try:
-            cwd_fd = os.open(
-                self.cwd,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-        except OSError as exc:
-            raise ValueError("session cwd was replaced") from exc
-        try:
-            cwd_stat = os.fstat(cwd_fd)
-        except OSError as exc:
-            os.close(cwd_fd)
-            raise ValueError("session cwd was replaced") from exc
-        if (cwd_stat.st_dev, cwd_stat.st_ino) != self._cwd_identity:
-            os.close(cwd_fd)
-            raise ValueError("session cwd was replaced")
-        return cwd_fd
+        return open_session_cwd(self.cwd, self._cwd_identity)
