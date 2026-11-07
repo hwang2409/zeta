@@ -12,6 +12,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.server_client import approve_and_collect_grant
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -108,6 +109,42 @@ class _GatedBackend(FakeBackend):
             yield event
 
 
+@pytest.mark.asyncio
+async def test_approve_collector_reports_structured_error_frame() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "error": {
+                        "code": -32000,
+                        "message": "approval request is no longer pending",
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    with pytest.raises(AssertionError) as failure:
+        await approve_and_collect_grant(
+            reader, _Writer(), 4, "call-1", "always_tool", ["bash"]
+        )
+    message = str(failure.value)
+    assert "approve response" in message
+    assert "approval request is no longer pending" in message
+    assert "all observed frames" in message
+
+
 async def _wait_idle(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request_id: int
 ) -> int:
@@ -186,16 +223,9 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
         await _request(reader, writer, 3, "send", {"text": "first"})
         assert (await _event(reader, "approval_request"))["request_id"] == "call-1"
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "call-1", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        grant_event = await _event(reader, "session_grants_changed")
-        assert grant_event["data"]["change"] == "grant"
-        assert grant_event["data"]["changed"] == ["bash"]
 
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot == {
@@ -420,17 +450,9 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
             _event(reader, "approval_request"), TIMEOUT
         )
         assert first_approval["request_id"] == "call-1"
-        await asyncio.wait_for(
-            _request(
-                reader,
-                writer,
-                4,
-                "approve",
-                {"request_id": "call-1", "scope": "always_tool"},
-            ),
-            TIMEOUT,
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        await asyncio.wait_for(_event(reader, "session_grants_changed"), TIMEOUT)
         await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
         await asyncio.wait_for(_wait_idle(reader, writer, 5), TIMEOUT)
 
@@ -904,14 +926,9 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "parent-bash", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "parent-bash", "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
         await _wait_idle(reader, writer, 20)
 
@@ -972,14 +989,9 @@ async def test_duplicate_grant_emits_no_event_before_positive_fifo_sentinel(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "first call"})
         first = await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": first["request_id"], "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, first["request_id"], "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
         assert server.runtime.opened is not None
         server.runtime.opened.store.append_approval_request("call-2", calls[1])
@@ -1039,14 +1051,9 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         await _hello_and_create(reader, writer)
         await _request(reader, writer, 3, "send", {"text": "grant"})
         await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {"request_id": "call-1", "scope": "always_tool"},
+        await approve_and_collect_grant(
+            reader, writer, 4, "call-1", "always_tool", ["bash"]
         )
-        await _event(reader, "session_grants_changed")
         await _frames_until_event(reader, "turn_end")
 
         assert server.connections is not None

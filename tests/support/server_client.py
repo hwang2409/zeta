@@ -63,6 +63,80 @@ async def request(
         buffered.append(frame)
 
 
+async def approve_and_collect_grant(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str | int,
+    approval_request_id: str,
+    expected_scope: str,
+    expected_changed: list[str],
+) -> dict[str, Any]:
+    """Collect the approve response and its grant event as one transaction."""
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "approve",
+                    "params": {
+                        "request_id": approval_request_id,
+                        "scope": expected_scope,
+                    },
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    await asyncio.wait_for(writer.drain(), TIMEOUT)
+    frames: list[dict[str, Any]] = []
+    response: dict[str, Any] | None = None
+    grant_events: list[dict[str, Any]] = []
+    while response is None or not grant_events:
+        batch = await read_until(
+            reader,
+            lambda frame: frame.get("id") == request_id
+            or frame.get("params", {}).get("event") == "session_grants_changed",
+            what="approve response or session_grants_changed event",
+        )
+        for frame in batch:
+            frames.append(frame)
+            if frame.get("id") == request_id:
+                response = frame
+                assert response.get("result", {}).get("accepted") is True, (
+                    f"approve response was not accepted: response={response!r}; "
+                    f"all observed frames={frames!r}"
+                )
+                assert response["result"].get("request_id") == approval_request_id, (
+                    f"approve response has wrong request id: response={response!r}; "
+                    f"all observed frames={frames!r}"
+                )
+                assert response["result"].get("scope") == expected_scope, (
+                    f"approve response has wrong scope: response={response!r}; "
+                    f"all observed frames={frames!r}"
+                )
+            if frame.get("params", {}).get("event") == "session_grants_changed":
+                grant_events.append(frame["params"])
+                data = frame["params"].get("data")
+                assert isinstance(data, dict), (
+                    f"grant event has no data: frame={frame!r}; "
+                    f"all observed frames={frames!r}"
+                )
+                assert data.get("change") == "grant", (
+                    f"grant event has wrong change: frame={frame!r}; "
+                    f"all observed frames={frames!r}"
+                )
+                assert data.get("changed") == expected_changed, (
+                    f"grant event has wrong data: frame={frame!r}; "
+                    f"all observed frames={frames!r}"
+                )
+    assert response is not None, f"missing approve response; all observed frames={frames!r}"
+    assert len(grant_events) == 1, (
+        f"expected exactly one grant event; all observed frames={frames!r}"
+    )
+    return grant_events[0]
+
+
 async def frames_until_event(
     reader: asyncio.StreamReader, name: str
 ) -> list[dict[str, Any]]:
