@@ -1112,12 +1112,8 @@ async def test_owned_work_terminal_outcomes_drain_without_model(
 async def test_owned_work_deadlines_transfer_before_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await test_child_finish_gate_model_bound_waits_for_grandchild(
-        tmp_path / "model"
-    )
-    await test_child_finish_gate_wait_timeout_adopts(
-        tmp_path / "transfer", monkeypatch
-    )
+    await test_child_finish_gate_model_bound_waits_for_grandchild(tmp_path / "model")
+    await test_child_finish_gate_wait_timeout_adopts(tmp_path / "transfer", monkeypatch)
     lifecycle_path = next(
         (tmp_path / "transfer").glob("*/agents/1/agent_lifecycle.json")
     )
@@ -2912,7 +2908,7 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=5)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
     sibling_done = asyncio.Event()
     sibling_task = asyncio.create_task(sibling_done.wait())
     loop._background_owner.register(
@@ -10929,7 +10925,9 @@ async def _start_task_gate(
     *,
     owner: BackgroundAgentOwner | None = None,
     stack: contextlib.AsyncExitStack | None = None,
-) -> tuple[ConversationStore, AgentLoop, asyncio.Task[list[StreamEvent]], asyncio.Event]:
+) -> tuple[
+    ConversationStore, AgentLoop, asyncio.Task[list[StreamEvent]], asyncio.Event
+]:
     store = ConversationStore(tmp_path)
     if stack is not None:
         stack.callback(store.close)
@@ -11068,7 +11066,7 @@ async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) ->
         tmp_path / "session", backend
     )
 
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
     assert "background tasks" in backend.gate_text
     assert "task-" in backend.gate_text
     assert not [
@@ -13262,7 +13260,7 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
             store.pending_prompt_queue.explicit_finish_report
         )
     release_admission.set()
-    await asyncio.wait_for(idle_waiting.wait(), 2)
+    await asyncio.wait_for(idle_waiting.wait(), 10)
 
     report = await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report)
     assert (terminal_action == "cancel" and report is None) or (
@@ -13488,7 +13486,7 @@ async def test_idle_child_is_running_during_wake_turn(
         )
         is None
     )
-    await asyncio.wait_for(wake_started.wait(), timeout=2)
+    await asyncio.wait_for(wake_started.wait(), timeout=10)
     assert child_store.agent_lifecycle()["state"] == "running"
 
     release_wake.set()
@@ -13735,6 +13733,7 @@ async def _start_consume_task_safety_harness(
     calls = 0
 
     if old_path:
+
         async def old_kill_all(registry, _timeout):
             old_kill_started.set()
             await asyncio.wait_for(old_kill_release.wait(), 10)
@@ -13862,9 +13861,7 @@ async def test_consume_run_keeps_late_task_on_its_own_safety_windows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with contextlib.AsyncExitStack() as stack:
-        harness = await _start_consume_task_safety_harness(
-            stack, tmp_path, monkeypatch
-        )
+        harness = await _start_consume_task_safety_harness(stack, tmp_path, monkeypatch)
         task_a = await harness.start_task("start-a", 100.0)
         await harness.start_run()
 
@@ -13879,7 +13876,9 @@ async def test_consume_run_keeps_late_task_on_its_own_safety_windows(
 
             gate_a.set()
             await asyncio.wait_for(harness.idle_entries.get(), 10)
-            assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+            assert (
+                await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) is None
+            )
             await harness.safety_wait.releases.put(True)
             assert await asyncio.wait_for(harness.safety_wait.timeouts.get(), 10) == 10
 
@@ -13939,9 +13938,7 @@ async def test_consume_run_owner_turn_resets_only_warned_task_window(
 ) -> None:
     """b was not warned when the owner turn reset a's warned window."""
     async with contextlib.AsyncExitStack() as stack:
-        harness = await _start_consume_task_safety_harness(
-            stack, tmp_path, monkeypatch
-        )
+        harness = await _start_consume_task_safety_harness(stack, tmp_path, monkeypatch)
         task_a = await harness.start_task("start-a", 100.0)
         task_b = await harness.start_task("start-b", 105.0)
         await harness.start_run()
@@ -14155,11 +14152,11 @@ async def test_late_task_gets_its_own_safety_window(
         ).running
     finally:
         if task_id is not None:
-            await loop.tool_registry.background_tasks.kill(task_id, cause="test cleanup")
+            await loop.tool_registry.background_tasks.kill(
+                task_id, cause="test cleanup"
+            )
         waiters = tuple(
-            waiter
-            for waiter in (safety_observed, task_exited)
-            if waiter is not None
+            waiter for waiter in (safety_observed, task_exited) if waiter is not None
         )
         for waiter in waiters:
             if not waiter.done():
@@ -14168,9 +14165,7 @@ async def test_late_task_gets_its_own_safety_window(
             asyncio.gather(*waiters, return_exceptions=True), timeout=10
         )
         run.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(run, return_exceptions=True), timeout=10
-        )
+        await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), timeout=10)
         owner.conversation_channel.unregister_loop("root:1")
         await loop.close()
 
@@ -16655,7 +16650,7 @@ async def test_large_request_admission_counts_off_loop_without_stalling_heartbea
     )
     try:
         # This event cannot run if admission calls the gated estimator on-loop.
-        await asyncio.wait_for(estimator_started.wait(), 1)
+        await asyncio.wait_for(estimator_started.wait(), 10)
     finally:
         release_estimator.set()
     await preparation

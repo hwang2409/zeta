@@ -1538,6 +1538,7 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
+
 @pytest.mark.asyncio
 async def test_task_safety_notice_and_kill_render_through_real_paths(
     tmp_path: Path,
@@ -8551,6 +8552,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         replay_completed.append(None)
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    # test-contract: seam Observe transcript rebuild through the application boundary.
     monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
     # test-contract: seam Observe the production heap-freeze boundary.
     monkeypatch.setattr(
@@ -12497,6 +12499,7 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
     _patch_draft_publish(monkeypatch, fail_write)
     # test-contract: seam Run the CLI against the controlled application.
     monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12558,6 +12561,7 @@ def test_new_session_continues_after_failed_draft_save(
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12647,7 +12651,9 @@ def test_failed_active_draft_is_printed_on_every_exit(
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12729,7 +12735,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12778,6 +12786,7 @@ def test_new_session_with_successful_draft_prints_nothing(
 
     # test-contract: seam Run the CLI against controlled session applications.
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
