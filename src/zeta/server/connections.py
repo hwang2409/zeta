@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -16,6 +17,8 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
+
+CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
 OBSERVER_REQUESTS = frozenset(
     {
@@ -86,6 +89,7 @@ class _OutputState:
     overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
     released: bool = False
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -127,6 +131,7 @@ class ConnectionRegistry:
         output = _OutputState()
         output.ready = self.loop.create_future()
         output.callers_settled.set()
+        output.drained.set()
         state.output = output
         self._connections[connection] = state
         output.writer_task = asyncio.create_task(self._output_writer(state))
@@ -397,6 +402,17 @@ class ConnectionRegistry:
         finally:
             self._finish_caller(output)
 
+    async def flush(
+        self,
+        connection: Any,
+        timeout: float = CONNECTION_FLUSH_DEADLINE_SECONDS,
+    ) -> None:
+        state = self._connections.get(connection)
+        if state is None or state.output is None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(state.output.drained.wait(), timeout)
+
     async def wait_until_settled(self, connection: Any) -> None:
         state = self._connections.get(connection)
         if state is not None and state.output is not None:
@@ -419,6 +435,7 @@ class ConnectionRegistry:
     def _enqueue(
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
     ) -> None:
+        output.drained.clear()
         output.queue.append(frame)
         self._charge(output, frame)
         if wake:
@@ -434,6 +451,7 @@ class ConnectionRegistry:
                     await self._write_output_frame(
                         state, output, output.queue.popleft()
                     )
+                output.drained.set()
                 output.wake.clear()
                 if await self._complete_output_phase(state, output):
                     return

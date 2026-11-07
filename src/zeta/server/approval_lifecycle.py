@@ -1037,7 +1037,7 @@ class ApprovalLifecycle:
                 if current is not None and (
                     not isinstance(record.target.key, tuple)
                     or current.terminal_result is not None
-                    or isinstance(history_outcome, OSError)
+                    or isinstance(history_outcome, (OSError, asyncio.CancelledError))
                 ):
                     if current.terminal_watchdog is not None:
                         current.terminal_watchdog.cancel()
@@ -1205,15 +1205,16 @@ class ApprovalLifecycle:
                 continue
             if record.live_end is not None:
                 continue
-            if record.publication_owner is not None and not record.publication_owner.done():
-                continue
             resolution = record.target.store.approval_resolution_data(
                 record.target.store_request_id
             )
             if resolution is None:
                 continue
-            owner = asyncio.create_task(self._finish_record(record, resolution))
-            self._change(record, publication_owner=owner)
+            if record.publication_owner is not None and not record.publication_owner.done():
+                asyncio.create_task(self._finish_record(record, resolution))
+            else:
+                owner = asyncio.create_task(self._finish_record(record, resolution))
+                self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(
         self,

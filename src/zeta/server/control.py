@@ -817,6 +817,9 @@ class ServeControl:
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
+                await self._notify(
+                    wire_event, session_id, _admitted=True, **fields
+                )
                 return
             await self._notify(wire_event, session_id, **fields)
             return
@@ -928,6 +931,8 @@ class ServeControl:
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
+        if fields.pop("_admitted", False):
+            return True
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
         connections = self.server.connections
