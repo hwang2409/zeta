@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import sys
@@ -160,6 +161,40 @@ def test_project_context_seeds_home_identity_and_walks_repo_files(
     )
     assert "repo rules" in context.system_prompt
     assert context.notices == ()
+
+
+def test_default_context_records_nested_identity_and_skill_index(
+    tmp_path: Path,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    catalog = SkillCatalog.empty()
+
+    context = load_project_context(
+        cwd=tmp_path, repo_root=tmp_path, zeta_home=zeta_home, catalog=catalog
+    )
+
+    assert set(context.prompt_components) >= {
+        "default_context",
+        "identity",
+        "skill_index",
+    }
+    expected = {
+        "default_context": context.system_prompt,
+        "identity": load_identity(catalog=catalog),
+        "skill_index": catalog.index(),
+    }
+    for key, value in expected.items():
+        component = context.prompt_components[key]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert context.system_prompt[offset : offset + length] == value
+        assert component["digest"] == hashlib.sha256(value.encode()).hexdigest()
+    identity = context.prompt_components["identity"]
+    skill_index = context.prompt_components["skill_index"]
+    assert int(identity["offset"]) <= int(skill_index["offset"])
+    assert int(skill_index["offset"]) + int(skill_index["length"]) <= (
+        int(identity["offset"]) + int(identity["length"])
+    )
 
 
 def test_learned_line_present_with_existing_home_identity(

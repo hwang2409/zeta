@@ -11,6 +11,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ...agent.receipt import has_agent_receipt_suffix, terminal_state
 from ...protocol.types import StreamEvent, ToolCall
 from .. import theme
 from .agent import AGENT_TOOL_NAME
@@ -29,7 +30,7 @@ class AgentIdentity:
 
     @property
     def label(self) -> str:
-        return f"{self.description} {self.short_handle}"
+        return " ".join(value for value in (self.description, self.short_handle) if value)
 
 
 class AgentIdentityIndex:
@@ -72,11 +73,14 @@ class AgentIdentityIndex:
             or not description
         ):
             return
+        previous = self._identities.get(handle)
         self._identities[handle] = AgentIdentity(
-            description,
+            _identity_description(description),
             short_agent_handle(handle),
-            _optional_text(item.get("agent_type")),
-            _optional_text(item.get("model")),
+            _optional_text(item.get("agent_type"))
+            or (previous.agent_type if previous is not None else None),
+            _optional_text(item.get("model"))
+            or (previous.model if previous is not None else None),
         )
 
     def resolve(self, handle: str) -> AgentIdentity:
@@ -94,24 +98,30 @@ class AgentIdentityIndex:
                 )
                 model = arguments.get("model") if isinstance(arguments, dict) else None
                 identity = AgentIdentity(
-                    description,
+                    _identity_description(description),
                     short_agent_handle(handle),
                     _optional_text(marker.get("agent_type")),
                     _optional_text(model),
                 )
                 self._identities[handle] = identity
                 return identity
-        return AgentIdentity("child", short_agent_handle(handle))
+        identity = AgentIdentity("child", short_agent_handle(handle))
+        self._identities[handle] = identity
+        return identity
 
 
 def _optional_text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _identity_description(value: str) -> str:
+    return " ".join(safe_text(value, style=theme.BODY, wrap=True).plain.split())
+
+
 def _state_style(state: str) -> str:
-    if state == "error":
+    if state in {"error", "failed", "canceled"}:
         return theme.ERROR
-    if state in {"queued", "delivered", "sent"}:
+    if state in {"queued", "delivered", "sent", "completed"}:
         return theme.SUCCESS
     return theme.NOTICE
 
@@ -158,66 +168,398 @@ def render_agent_tool_message(
     call = event.tool_call
     if call is None:
         return None
-    name = call.name.casefold()
-    if name == "agent_send":
-        handle = call.arguments.get("child_instance_id")
-        message = call.arguments.get("message")
-        if not isinstance(handle, str) or not isinstance(message, str):
-            return None
-        identity = (identity_index or AgentIdentityIndex()).resolve(handle)
-        answer_to = answer_question_id(message)
-        result = event.tool_result
-        if running or result is None:
-            state = "sending"
-        elif result.is_error:
-            state = "error"
-        elif result.content.casefold().startswith("delivered"):
-            state = "delivered"
-        else:
-            state = "queued"
+    renderer = {
+        "agent_send": _render_agent_send,
+        "ask_parent": _render_ask_parent,
+        "agent_status": _render_agent_status,
+        "agent_output": _render_agent_output,
+        "agent_cancel": _render_agent_cancel,
+    }.get(call.name.casefold())
+    if renderer is None:
+        return None
+    return renderer(event, running, identity_index or AgentIdentityIndex())
+
+
+def _render_agent_send(
+    event: StreamEvent,
+    running: bool,
+    identities: AgentIdentityIndex,
+) -> Panel | None:
+    call = event.tool_call
+    if call is None:
+        return None
+    handle = call.arguments.get("child_instance_id")
+    message = call.arguments.get("message")
+    if not isinstance(handle, str) or not isinstance(message, str):
+        return None
+    result = event.tool_result
+    if running or result is None:
+        state = "sending"
+    elif result.is_error:
+        state = "error"
+    elif result.content.casefold().startswith("delivered"):
+        state = "delivered"
+    else:
+        state = "queued"
+    return render_agent_message(
+        agent_header(
+            "send",
+            "→",
+            identities.resolve(handle),
+            state=state,
+            answer_to=answer_question_id(message),
+        ),
+        body=message,
+        result=result.content if result is not None and result.is_error else None,
+        state="error" if result is not None and result.is_error else state,
+    )
+
+
+def _render_ask_parent(
+    event: StreamEvent,
+    running: bool,
+    _identities: AgentIdentityIndex,
+) -> Panel | None:
+    call = event.tool_call
+    if call is None:
+        return None
+    question = call.arguments.get("question")
+    options = call.arguments.get("options", ())
+    if (
+        not isinstance(question, str)
+        or not isinstance(options, (list, tuple))
+        or any(not isinstance(option, str) for option in options)
+    ):
+        return None
+    result = event.tool_result
+    if running or result is None:
+        state, receipt = "pending", None
+    elif result.is_error:
+        state, receipt = "error", result.content
+    else:
+        state = "sent"
+        structured = result.structured_content
+        question_id = (
+            structured.get("question_id") if isinstance(structured, dict) else None
+        )
+        receipt = (
+            f"question {question_id}"
+            if isinstance(question_id, str)
+            else "question sent"
+        )
+    header = Text("ask → parent", style=theme.AGENT_MAIN)
+    header.append(f" · {state}", style=_state_style(state))
+    return render_agent_message(
+        header,
+        body=question,
+        options=options,
+        result=receipt,
+        state="error" if state == "error" else state,
+    )
+
+
+def _control_handle(event: StreamEvent) -> str | None:
+    result = event.tool_result
+    structured = result.structured_content if result is not None else None
+    value = structured.get("handle") if isinstance(structured, dict) else None
+    if not isinstance(value, str) and event.tool_call is not None:
+        value = event.tool_call.arguments.get("handle")
+    return value if isinstance(value, str) else None
+
+
+def _agent_status_row(
+    child: Mapping[str, Any], identities: AgentIdentityIndex
+) -> str | None:
+    handle = child.get("handle")
+    if not isinstance(handle, str):
+        return None
+    identity = identities.resolve(handle)
+    fields = [identity.label]
+    for value in (
+        child.get("agent_type") or identity.agent_type,
+        child.get("model") or identity.model,
+        child.get("state"),
+    ):
+        if isinstance(value, str) and value:
+            fields.append(value)
+    return " · ".join(fields)
+
+
+def _render_agent_status(
+    event: StreamEvent,
+    running: bool,
+    identities: AgentIdentityIndex,
+) -> Panel | None:
+    call = event.tool_call
+    result = event.tool_result
+    structured = result.structured_content if result is not None else None
+    children = structured.get("children") if isinstance(structured, dict) else None
+    if call is not None and call.arguments and not isinstance(children, list):
+        return None
+    if running or not isinstance(children, list):
+        state = "error" if result is not None and result.is_error else "running"
         return render_agent_message(
-            agent_header("send", "→", identity, state=state, answer_to=answer_to),
-            body=message,
+            Text(f"agent_status · {state}", style=_state_style(state)),
             result=result.content if result is not None and result.is_error else None,
-            state="error" if result is not None and result.is_error else state,
+            state=state,
         )
-    if name == "ask_parent":
-        question = call.arguments.get("question")
-        options = call.arguments.get("options", ())
-        if (
-            not isinstance(question, str)
-            or not isinstance(options, (list, tuple))
-            or any(not isinstance(option, str) for option in options)
-        ):
-            return None
-        result = event.tool_result
-        if running or result is None:
-            state = "pending"
-            receipt = None
-        elif result.is_error:
-            state = "error"
-            receipt = result.content
-        else:
-            state = "sent"
-            structured = result.structured_content
-            question_id = (
-                structured.get("question_id") if isinstance(structured, dict) else None
-            )
-            receipt = (
-                f"question {question_id}"
-                if isinstance(question_id, str)
-                else "question sent"
-            )
-        header = Text("ask → parent", style=theme.AGENT_MAIN)
-        header.append(f" · {state}", style=_state_style(state))
+    rows = [
+        row
+        for child in children
+        if isinstance(child, Mapping)
+        and (row := _agent_status_row(child, identities)) is not None
+    ]
+    noun = "child" if len(rows) == 1 else "children"
+    header = Text(f"agent_status · {len(rows)} {noun}", style=theme.AGENT_MAIN)
+    total = structured.get("total")
+    pagination: list[str] = []
+    if type(total) is int and total >= 0 and (
+        structured.get("truncated") is True or total != len(rows)
+    ):
+        pagination.append(f"showing {len(rows)} of {total}")
+    next_offset = structured.get("next_offset")
+    if type(next_offset) is int and next_offset >= 0:
+        pagination.append(f"next offset {next_offset}")
+    finished_omitted = structured.get("finished_omitted")
+    if type(finished_omitted) is int and finished_omitted > 0:
+        pagination.append(f"{finished_omitted} finished omitted")
+    body_rows = ([" · ".join(pagination)] if pagination else []) + rows
+    body = "\n".join(body_rows) or "no children"
+    return render_agent_message(header, body=body)
+
+
+def _render_agent_output(
+    event: StreamEvent,
+    running: bool,
+    identities: AgentIdentityIndex,
+) -> Panel | None:
+    handle = _control_handle(event)
+    if handle is None:
+        return None
+    identity = identities.resolve(handle)
+    result = event.tool_result
+    if running or result is None:
         return render_agent_message(
-            header,
-            body=question,
-            options=options,
-            result=receipt,
-            state="error" if state == "error" else state,
+            agent_header("output", "←", identity, state="reading")
         )
+    structured = result.structured_content
+    offset = structured.get("offset") if isinstance(structured, dict) else None
+    total = structured.get("total") if isinstance(structured, dict) else None
+    header = agent_header(
+        "output", "←", identity, state="error" if result.is_error else None
+    )
+    if type(offset) is int and type(total) is int:
+        end = min(total, offset + len(result.content))
+        page = f"page {offset + 1}-{end} of {total}" if end > offset else f"page {offset} of {total}"
+        header.append(f" · {page}", style=theme.NOTICE)
+    return render_agent_message(
+        header,
+        body=result.content,
+        state="error" if result.is_error else None,
+    )
+
+
+def _render_agent_cancel(
+    event: StreamEvent,
+    running: bool,
+    identities: AgentIdentityIndex,
+) -> Panel | None:
+    handle = _control_handle(event)
+    if handle is None:
+        return None
+    identity = identities.resolve(handle)
+    result = event.tool_result
+    if running or result is None:
+        outcome = "canceling"
+    elif result.is_error:
+        outcome = "error"
+    else:
+        structured = result.structured_content
+        status = structured.get("status") if isinstance(structured, dict) else None
+        outcome = {
+            "cancellation_confirmed": "canceled",
+            "already_finished": "already_finished",
+        }.get(status, status if isinstance(status, str) else "canceled")
+    return render_agent_message(
+        agent_header("cancel", "→", identity, state=outcome),
+        result=result.content if result is not None and result.is_error else None,
+        state="error" if result is not None and result.is_error else outcome,
+    )
+
+
+def render_agent_notification_message(
+    event: StreamEvent,
+    identity_index: AgentIdentityIndex | None,
+) -> Panel | Text | None:
+    """Render child notification kinds owned by the shared agent card."""
+
+    kind = event.data.get("kind", "agent_completion")
+    identities = identity_index or AgentIdentityIndex()
+    if kind == "child_question":
+        return _render_child_question(event, identities)
+    if kind == "child_question_withdrawn":
+        return _render_child_question_withdrawn(event, identities)
+    if kind == "child_idle":
+        return _render_child_idle(event, identities)
+    if kind == "agent_completion":
+        return _render_child_completion(event, identities)
     return None
+
+
+def _notification_identity(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> AgentIdentity | None:
+    handle = event.data.get("child_instance_id")
+    description = event.data.get("description")
+    if not isinstance(handle, str):
+        if isinstance(description, str) and description:
+            return AgentIdentity(_identity_description(description), "")
+        return None
+    resolved = identities.resolve(handle)
+    if resolved.description == "child" and isinstance(description, str) and description:
+        return AgentIdentity(
+            _identity_description(description),
+            resolved.short_handle,
+            resolved.agent_type,
+            resolved.model,
+        )
+    return resolved
+
+
+def _unavailable_notification() -> Text:
+    return Text("background agent notification unavailable", style=theme.ERROR)
+
+
+def _render_child_question(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    question = event.data.get("question")
+    question_id = event.data.get("question_id")
+    options = event.data.get("options", ())
+    if (
+        identity is None
+        or not isinstance(question, str)
+        or not isinstance(question_id, str)
+        or not isinstance(options, (list, tuple))
+        or any(not isinstance(option, str) for option in options)
+    ):
+        return _unavailable_notification()
+    return render_agent_message(
+        agent_header("ask", "←", identity, state="pending"),
+        body=question,
+        options=options,
+        result=f"question {question_id}",
+        state="pending",
+    )
+
+
+def _render_child_question_withdrawn(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    question_id = event.data.get("question_id")
+    if identity is None or not isinstance(question_id, str):
+        return _unavailable_notification()
+    return render_agent_message(
+        agent_header("withdraw", "←", identity, state="withdrawn"),
+        result=f"question {question_id}",
+        state="withdrawn",
+    )
+
+
+def _render_child_idle(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    report = event.data.get("text")
+    if identity is None or not isinstance(report, str):
+        return _unavailable_notification()
+    return render_agent_message(
+        agent_header("idle", "←", identity, state="idle"),
+        body=report,
+        state="idle",
+    )
+
+
+def _notification_stats(data: Mapping[str, Any]) -> list[str]:
+    stats = data.get("stats")
+    if not isinstance(stats, Mapping):
+        return []
+    parts: list[str] = []
+    elapsed = stats.get("elapsed")
+    if type(elapsed) in {int, float} and elapsed >= 0:
+        seconds = round(float(elapsed), 1)
+        if seconds >= 3600:
+            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
+        elif seconds >= 60:
+            minutes, remainder = divmod(int(seconds), 60)
+            parts.append(f"{minutes}m{remainder:02d}s")
+        else:
+            parts.append(f"{seconds:.1f}s")
+    turns = stats.get("turns_used")
+    if type(turns) is int and turns >= 0:
+        noun = "turn" if turns == 1 else "turns"
+        parts.append(f"{turns} {noun}")
+    return parts
+
+
+def _completion_state(data: Mapping[str, Any]) -> tuple[str, bool]:
+    status = data.get("status")
+    if not isinstance(status, str):
+        raise TypeError
+    state = terminal_state(status=status)
+    stats = data.get("stats")
+    if not isinstance(stats, Mapping) or not ({"error", "canceled"} & stats.keys()):
+        return state, False
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    conflict = (
+        type(error) is not bool
+        or type(canceled) is not bool
+        or (error and canceled)
+        or error != (state == "failed")
+        or canceled != (state == "canceled")
+    )
+    return ("failed" if conflict else state), conflict
+
+
+def _render_child_completion(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    if identity is None:
+        return _unavailable_notification()
+    try:
+        state, state_conflict = _completion_state(event.data)
+    except (TypeError, ValueError):
+        return _unavailable_notification()
+    header = agent_header("complete", "←", identity, state=state)
+    for stat in _notification_stats(event.data):
+        header.append(f" · {stat}", style=theme.NOTICE)
+    text = event.data.get("text")
+    if isinstance(text, str) and has_agent_receipt_suffix(text):
+        text = text.rsplit(" · ", 5)[0]
+    if state in {"failed", "canceled"}:
+        reason = "conflicting completion state" if state_conflict else text
+        body = f"reason: {reason}" if isinstance(reason, str) and reason else None
+    else:
+        lines: list[str] = []
+        verdict = event.data.get("verdict")
+        summary = event.data.get("summary")
+        if isinstance(verdict, str) and verdict:
+            lines.append(f"verdict: {verdict}")
+        if isinstance(summary, str) and summary:
+            lines.append(f"summary: {summary}")
+        elif isinstance(text, str) and text:
+            lines.append(text)
+        body = "\n".join(lines) or None
+    return render_agent_message(header, body=body, state=state)
 
 
 def render_agent_message(
