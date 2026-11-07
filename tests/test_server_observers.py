@@ -24,6 +24,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.server import ZetaServer, ergonomics
+from zeta.server.protocol import EventDescriptor
 
 MAX_PRE_HELLO_CONNECTIONS = 10
 
@@ -593,8 +594,10 @@ async def test_observer_outbound_limits_count_and_bytes(tmp_path: Path) -> None:
     reader, writer = await _observer(server)
     try:
         assert server.connections is not None
-        frame = (json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"event": "x"}}) + "\n").encode()
         observer = next(state.connection for state in server.connections._connections.values() if state.role == "observer")
+        frame = observer.codec.notification(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="x"
+        )
         gate = asyncio.Event()
         async def blocked_write(payload: bytes) -> bool:
             await gate.wait()

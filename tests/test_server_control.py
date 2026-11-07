@@ -111,6 +111,12 @@ class _ControllerConnection:
         pass
 
 
+def _frame(connection: _ControllerConnection, label: str) -> bytes:
+    return connection.codec.notification(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta=label
+    )
+
+
 @pytest.mark.asyncio
 async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
@@ -123,7 +129,7 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
     control._notify = lambda event, session_id=None, **fields: registry.publish_controller(event, session_id, **fields)
     control._publish_memory_notice("session", "updated")
     await asyncio.sleep(0)
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["params"]["event"] == "memory_updated"
     registry.release(connection)
     await registry.aclose()
@@ -158,7 +164,7 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="x")
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["params"]["event"] == EventDescriptor.ASSISTANT_DELTA
     registry.release(connection)
 
@@ -171,7 +177,7 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for value in ("a", "b", "c"):
         await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta=value)
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     assert [json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]] == [
         "a",
         "b",
@@ -186,7 +192,7 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     connection.frames.clear()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -225,7 +231,7 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
     registry.negotiate_role(
         connection, "observer", "1.2", frozenset({"serve_observers"})
     )
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     connection.frames.clear()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -238,15 +244,22 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
         return await original_write(frame)
 
     connection._write_physical = gated_write  # type: ignore[method-assign]
-    first = asyncio.create_task(registry.send(connection, b"first\n"))
+    first = asyncio.create_task(
+        registry.send(connection, _frame(connection, "first"))
+    )
     await first_started.wait()
-    second = asyncio.create_task(registry.send(connection, b"second\n"))
+    second = asyncio.create_task(
+        registry.send(connection, _frame(connection, "second"))
+    )
     await asyncio.sleep(0)
     assert connection.frames == []
     release_first.set()
     assert await first
     assert await second
-    assert connection.frames == [b"first\n", b"second\n"]
+    assert [json.loads(frame)["params"]["delta"] for frame in connection.frames] == [
+        "first",
+        "second",
+    ]
     registry.release(connection)
     await registry.aclose()
 
@@ -262,8 +275,8 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     second = _ControllerConnection()
     registry.register(second)
     registry.negotiate_role(second, "controller", "1.2", frozenset())
-    assert await registry.send(second, b"hello\n")
-    assert second.frames == [b"hello\n"]
+    assert await registry.send(second, _frame(second, "hello"))
+    assert json.loads(second.frames[0])["params"]["delta"] == "hello"
     registry.release(second)
 
 
@@ -275,7 +288,7 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for _ in range(257):
         await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="x")
-    assert not await registry.send(connection, b"hello\n")
+    assert not await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["error"]["code"] == -32011
     registry.release(connection)
 
@@ -283,7 +296,7 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
 async def _send_hello_and_flush(
     registry: ConnectionRegistry, connection: _ControllerConnection
 ) -> bool:
-    sent = await registry.send(connection, b"hello\n")
+    sent = await registry.send(connection, _frame(connection, "hello"))
     controller_ready = getattr(registry, "controller_ready", None)
     if controller_ready is None:
         return sent
@@ -338,8 +351,8 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
     connection._write_physical = write_then_release  # type: ignore[method-assign]
 
-    assert await registry.send(connection, b"delivered\n")
-    assert connection.frames == [b"delivered\n"]
+    assert await registry.send(connection, _frame(connection, "delivered"))
+    assert json.loads(connection.frames[0])["params"]["delta"] == "delivered"
 
 
 @pytest.mark.asyncio
@@ -358,9 +371,13 @@ async def test_controller_release_completes_queued_frames_like_base() -> None:
         return True
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
-    head = asyncio.create_task(registry.send(connection, b"head\n"))
+    head = asyncio.create_task(
+        registry.send(connection, _frame(connection, "head"))
+    )
     await write_started.wait()
-    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    tail = asyncio.create_task(
+        registry.send(connection, _frame(connection, "tail"))
+    )
     await asyncio.sleep(0)
 
     registry.release(connection)
@@ -377,7 +394,7 @@ async def test_observer_release_matches_base() -> None:
     registry.negotiate_role(
         connection, "observer", "1.2", frozenset({"serve_observers"})
     )
-    assert await registry.send(connection, b"hello\n")
+    assert await registry.send(connection, _frame(connection, "hello"))
     write_started = asyncio.Event()
 
     async def blocked_write(frame: bytes) -> bool:
@@ -386,9 +403,13 @@ async def test_observer_release_matches_base() -> None:
         return True
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
-    current = asyncio.create_task(registry.send(connection, b"current\n"))
+    current = asyncio.create_task(
+        registry.send(connection, _frame(connection, "current"))
+    )
     await write_started.wait()
-    queued = asyncio.create_task(registry.send(connection, b"queued\n"))
+    queued = asyncio.create_task(
+        registry.send(connection, _frame(connection, "queued"))
+    )
     await asyncio.sleep(0)
 
     registry.release(connection)
@@ -422,9 +443,13 @@ async def test_aclose_settles_queued_frames_false() -> None:
 
     connection._write_physical = blocked_write  # type: ignore[method-assign]
     connection.close = close  # type: ignore[method-assign]
-    head = asyncio.create_task(registry.send(connection, b"head\n"))
+    head = asyncio.create_task(
+        registry.send(connection, _frame(connection, "head"))
+    )
     await write_started.wait()
-    tail = asyncio.create_task(registry.send(connection, b"tail\n"))
+    tail = asyncio.create_task(
+        registry.send(connection, _frame(connection, "tail"))
+    )
     await asyncio.sleep(0)
 
     await registry.aclose()
@@ -543,7 +568,10 @@ async def _replace_registry_controller(
         replacement.features,
     )
     replacement.handshaken = True
-    assert await server.connections.send(replacement, b"hello\n")
+    frame = replacement.codec.notification(
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="hello"
+    )
+    assert await server.connections.send(replacement, frame)
     writer.frames.clear()
     writer.queue.get_nowait()
     return replacement, writer

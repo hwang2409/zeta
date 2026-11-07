@@ -224,42 +224,52 @@ class _RawFrameBypassVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         for target in node.targets:
-            if isinstance(target, ast.Name):
-                if isinstance(node.value, ast.Dict):
-                    self.mapping_keys[target.id] = _wire_keys(node.value)
-                if (
-                    isinstance(node.value, ast.Name)
-                    and node.value.id == "ProtocolError"
-                ):
-                    self.protocol_error_aliases.add(target.id)
-                if (
-                    isinstance(node.value, ast.Call)
-                    and _call_name(node.value.func) == "notification_wire_event"
-                ) or _event_descriptor_expression(node.value):
-                    self.derived_events.add(target.id)
-                if _error_descriptor_expression(node.value):
-                    self.derived_errors.add(target.id)
-            elif (
-                isinstance(target, (ast.Tuple, ast.List))
-                and isinstance(node.value, ast.Call)
-                and _call_name(node.value.func) == "project_request_error"
-                and target.elts
-                and isinstance(target.elts[0], ast.Name)
-            ):
-                self.derived_errors.add(target.elts[0].id)
-            elif (
-                isinstance(target, ast.Subscript)
-                and isinstance(target.value, ast.Name)
-                and isinstance(target.slice, ast.Constant)
-                and isinstance(target.slice.value, str)
-            ):
-                keys = self.mapping_keys.setdefault(target.value.id, set())
-                keys.add(target.slice.value)
-                if _is_wire_error_or_notification(keys):
-                    self._add(
-                        target, "build error and notification frames through FrameCodec"
-                    )
+            self._record_assignment(target, node.value)
         self.generic_visit(node.value)
+
+    def _record_assignment(self, target: ast.expr, value: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            self._record_name_assignment(target, value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            self._record_sequence_assignment(target, value)
+        elif isinstance(target, ast.Subscript):
+            self._record_subscript_assignment(target)
+
+    def _record_name_assignment(self, target: ast.Name, value: ast.expr) -> None:
+        if isinstance(value, ast.Dict):
+            self.mapping_keys[target.id] = _wire_keys(value)
+        if isinstance(value, ast.Name) and value.id == "ProtocolError":
+            self.protocol_error_aliases.add(target.id)
+        if (
+            isinstance(value, ast.Call)
+            and _call_name(value.func) == "notification_wire_event"
+        ) or _event_descriptor_expression(value):
+            self.derived_events.add(target.id)
+        if _error_descriptor_expression(value):
+            self.derived_errors.add(target.id)
+
+    def _record_sequence_assignment(
+        self, target: ast.Tuple | ast.List, value: ast.expr
+    ) -> None:
+        if (
+            isinstance(value, ast.Call)
+            and _call_name(value.func) == "project_request_error"
+            and target.elts
+            and isinstance(target.elts[0], ast.Name)
+        ):
+            self.derived_errors.add(target.elts[0].id)
+
+    def _record_subscript_assignment(self, target: ast.Subscript) -> None:
+        if not (
+            isinstance(target.value, ast.Name)
+            and isinstance(target.slice, ast.Constant)
+            and isinstance(target.slice.value, str)
+        ):
+            return
+        keys = self.mapping_keys.setdefault(target.value.id, set())
+        keys.add(target.slice.value)
+        if _is_wire_error_or_notification(keys):
+            self._add(target, "build error and notification frames through FrameCodec")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in RAW_FRAME_BUILDERS:
