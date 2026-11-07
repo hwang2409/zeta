@@ -728,76 +728,79 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         manager._release_storage_lease()
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call":
+        item._zeta_call_report = report
+
+
 @pytest.fixture
-async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
-    """Close runtime owners constructed during repository tests."""
-    from zeta.accounts import AccountStore
+async def close_direct_test_runtime_owners(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+):
+    """Track direct runtime owners and report leaks after every test."""
+    from tests.support.owned import await_or_fail
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
-    from zeta.memory.auto import AutoMemoryReconciler
-    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
     from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
-    loops: list[AgentLoop] = []
-    stores: list[ConversationStore] = []
+    tracked: list[dict[str, object]] = []
     composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
-    managers: list[SessionManager] = []
-    memory_reconcilers: list[AutoMemoryReconciler] = []
-    workspaces: list[WorkspaceSnapshotStore] = []
-    registries: list[ToolRegistry] = []
-    test_home_leases = {}
+    test_home_leases: dict[Path, object] = {}
+
+    def site() -> str:
+        frame = sys._getframe(2)
+        return f"{Path(frame.f_code.co_filename).resolve()}:{frame.f_lineno}"
+
+    def add(obj: object, kind: str, owner: str, is_open: object, close: object) -> None:
+        tracked.append({"object": obj, "kind": kind, "site": site(), "owner": owner,
+                        "is_open": is_open, "close": close})
+
     loop_init = AgentLoop.__init__
-    loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
-    project_registry_init = ProjectRegistry.__init__
-    account_store_init = AccountStore.__init__
-    memory_reconciler_init = AutoMemoryReconciler.__init__
+    workspace_init = WorkspaceSnapshotStore.__init__
+    registry_init = ToolRegistry.__init__
+    background_init = BackgroundTaskRegistry.__init__
+
+    def ensure_format(home: Path) -> None:
+        canonical = home.resolve()
+        if canonical in test_home_leases:
+            return
+        result: list[object] = []
+        error: list[BaseException] = []
+
+        def open_test_writer() -> None:
+            try:
+                result.append(open_writer(home))
+            except BaseException as exc:  # noqa: BLE001
+                error.append(exc)
+
+        thread = threading.Thread(target=open_test_writer)
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise TimeoutError("test storage writer did not open within 10 seconds")
+        if error:
+            raise error[0]
+        test_home_leases[canonical] = result[0]
 
     @wraps(loop_init)
     def tracked_loop_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
-        loops.append(loop)
-
-    workspace_init = WorkspaceSnapshotStore.__init__
-    registry_init = ToolRegistry.__init__
-    background_init = BackgroundTaskRegistry.__init__
-    store_close = ConversationStore.close
-    registry_close = ToolRegistry.close
-
-    def ensure_format(home: Path) -> None:
-        canonical = home.resolve()
-        if canonical not in test_home_leases:
-            result = []
-            error: list[BaseException] = []
-
-            def open_test_writer() -> None:
-                try:
-                    result.append(open_writer(home))
-                except BaseException as exc:  # noqa: BLE001 - preserve thread errors
-                    error.append(exc)
-
-            thread = threading.Thread(target=open_test_writer)
-            thread.start()
-            thread.join(timeout=10)
-            if thread.is_alive():
-                raise TimeoutError("test storage writer did not open within 10 seconds")
-            if error:
-                raise error[0]
-            test_home_leases[canonical] = result[0]
+        add(loop, "AgentLoop", "owned_resources().async_resource(loop, what=...)",
+            lambda: not loop._closed, loop.close)
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
         root_value = args[0] if args else kwargs.get("session_dir")
-        root = (
-            Path(root_value)
-            if root_value is not None
-            else Path(os.environ["ZETA_HOME"]) / "sessions"
-        )
+        root = Path(root_value) if root_value is not None else Path(os.environ["ZETA_HOME"]) / "sessions"
         home = root
         while home.name != "sessions" and home != home.parent:
             home = home.parent
@@ -805,45 +808,18 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         store_init(store, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
         if _is_repository_test_path(caller):
-            stores.append(store)
+            add(store, "ConversationStore", "owned_resources().store(store)",
+                lambda: not store._closed, store.close)
         else:
             composed_stores.add(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
-        home = (
-            Path(args[0])
-            if args and args[0] is not None
-            else Path(os.environ["ZETA_HOME"])
-        )
+        home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
         ensure_format(home)
         manager_init(manager, *args, **kwargs)
-        managers.append(manager)
-
-    def on_event_loop() -> bool:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return False
-        return True
-
-    @wraps(project_registry_init)
-    def tracked_project_registry_init(registry, *args, **kwargs):
-        if on_event_loop():
-            root = Path(args[0] if args else kwargs["root"])
-            ensure_format(root.parent)
-        project_registry_init(registry, *args, **kwargs)
-
-    @wraps(account_store_init)
-    def tracked_account_store_init(store, *args, **kwargs):
-        home = Path(args[0] if args else kwargs["home"])
-        ensure_format(home)
-        account_store_init(store, *args, **kwargs)
-
-    @wraps(memory_reconciler_init)
-    def tracked_memory_reconciler_init(reconciler, *args, **kwargs):
-        memory_reconciler_init(reconciler, *args, **kwargs)
-        memory_reconcilers.append(reconciler)
+        add(manager, "SessionManager", "owned_resources().release_with(manager._release_storage_lease)",
+            lambda: manager._release_storage_lease.alive, manager._release_storage_lease)
 
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
@@ -853,7 +829,14 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else session_dir.parent)
         workspace_init(workspace, *args, **kwargs)
-        workspaces.append(workspace)
+        add(workspace, "WorkspaceSnapshotStore", "owned_resources().store(workspace)",
+            lambda: workspace._release_lease.alive, workspace.close)
+
+    @wraps(registry_init)
+    def tracked_registry_init(registry, *args, **kwargs):
+        registry_init(registry, *args, **kwargs)
+        add(registry, "ToolRegistry", "owned_resources().async_resource(registry, what=...)",
+            lambda: not registry._closed, registry.close)
 
     @wraps(background_init)
     def tracked_background_init(background, *args, **kwargs):
@@ -863,69 +846,64 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = session_path.parent
             while home.name != "sessions" and home != home.parent:
                 home = home.parent
-            home = home.parent if home.name == "sessions" else session_path.parent
-            ensure_format(home)
+            ensure_format(home.parent if home.name == "sessions" else session_path.parent)
             kwargs["storage_lease"] = test_home_leases[home.resolve()]
         background_init(background, *args, **kwargs)
+        add(background, "BackgroundTaskRegistry", "owned_resources().async_resource(background, what=...)",
+            lambda: not background._closed, background.close)
 
-    @wraps(registry_init)
-    def tracked_registry_init(registry, *args, **kwargs):
-        registry_init(registry, *args, **kwargs)
-        registries.append(registry)
-
-    # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
-    # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
-    # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
-    # test-contract: seam acquires the test home lease before direct registry setup
-    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_registry_init)
-    # test-contract: seam acquires the test home lease before direct account setup
-    monkeypatch.setattr(AccountStore, "__init__", tracked_account_store_init)
-    # test-contract: seam tracks process-owned resources created across tests
-    monkeypatch.setattr(
-        AutoMemoryReconciler, "__init__", tracked_memory_reconciler_init
-    )
-    # test-contract: seam tracks and closes workspace stores created by tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
-    # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
-    # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
-    for reconciler in reversed(memory_reconcilers):
+
+    first_error: BaseException | None = None
+    leaked: list[dict[str, object]] = []
+    for record in reversed(tracked):
+        if not record["is_open"]():
+            continue
+        leaked.append(record)
         try:
-            await reconciler.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for loop in reversed(loops):
-        if not loop._closed:
-            try:
-                await loop_close(loop)
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for registry in reversed(registries):
-        if not registry._closed:
-            try:
-                await registry_close(registry)
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for store in reversed((*stores, *composed_stores)):
+            await await_or_fail(record["close"](), what=f"closing {record['kind']}") if asyncio.iscoroutinefunction(record["close"]) else await await_or_fail(asyncio.to_thread(record["close"]), what=f"closing {record['kind']}")
+        except BaseException as exc:  # noqa: BLE001
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(f"additional cleanup error: {type(exc).__name__}: {exc}")
+    for store in tuple(composed_stores):
         if not store._closed:
             try:
-                store_close(store)
-            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-                pass
-    for workspace in reversed(workspaces):
-        try:
-            workspace.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for manager in reversed(managers):
-        manager._release_storage_lease()
+                store.close()
+            except BaseException as exc:  # noqa: BLE001
+                if first_error is None:
+                    first_error = exc
+                else:
+                    first_error.add_note(f"additional cleanup error: {type(exc).__name__}: {exc}")
     for lease in test_home_leases.values():
         lease.close()
+
+    report = getattr(request.node, "_zeta_call_report", None)
+    ratchet = Path(__file__).with_name("test_cleanup_net_ratchet.txt")
+    ratcheted = request.node.nodeid in ratchet.read_text().splitlines() if ratchet.exists() else False
+    if first_error is not None:
+        if report is not None and report.failed:
+            report.longrepr.addsection("runtime owner cleanup", str(first_error))
+        else:
+            raise first_error
+    elif leaked and not (report is not None and report.failed):
+        if not ratcheted:
+            raise AssertionError("\n".join(
+                f"{r['kind']} created at {r['site']} was left open; open it with {r['owner']}"
+                for r in leaked
+            ))
+    elif leaked and report is not None and report.failed:
+        report.longrepr.addsection(
+            "runtime owner leak",
+            "\n".join(f"{r['kind']} created at {r['site']} was left open" for r in leaked),
+        )
 
 
 @pytest.fixture
