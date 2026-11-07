@@ -792,11 +792,16 @@ class SlashHandlerMixin:
     async def slash_repair_transcript(self, args: str) -> str:
         """Repair one corrupt root transcript after explicit confirmation."""
         parts = args.split()
-        if len(parts) != 2 or parts[1] != "confirm":
-            return "usage: /repair-transcript <session-id> confirm"
-        result = await asyncio.to_thread(self.loop.manager.repair_transcript, parts[0])
+        if len(parts) not in {2, 3} or parts[-1] != "confirm":
+            return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
+        child_run_id = parts[1] if len(parts) == 3 else None
+        result = await asyncio.to_thread(
+            self.loop.manager.repair_transcript, parts[0], child_run_id
+        )
         return (
-            f"repaired transcript {parts[0]}; quarantine "
+            f"repaired transcript {parts[0]}"
+            + (f" child {child_run_id}" if child_run_id is not None else "")
+            + "; quarantine "
             f"{result.quarantine_id}; retained through sequence "
             f"{result.retained_last_sequence}"
         )

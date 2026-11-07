@@ -841,11 +841,21 @@ class _Client:
                     "repair_transcript requires confirm=true",
                 )
             session_id = _required_string(params, "session_id")
-            result = await asyncio.to_thread(
-                runtime.manager.repair_transcript, session_id
-            )
+            child_run_id = params.get("child_run_id")
+            if child_run_id is not None and not isinstance(child_run_id, str):
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "child_run_id must be a string",
+                )
+            try:
+                result = await asyncio.to_thread(
+                    runtime.manager.repair_transcript, session_id, child_run_id
+                )
+            except (ValueError, SessionError) as exc:
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
             return {
                 "session_id": session_id,
+                "child_run_id": child_run_id,
                 "quarantine_id": result.quarantine_id,
                 "retained_last_sequence": result.retained_last_sequence,
                 "memory_review_required": result.memory_review_required,

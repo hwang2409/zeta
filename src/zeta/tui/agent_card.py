@@ -508,6 +508,24 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
+def _repair_command(path: Path) -> str:
+    parts = path.parts
+    try:
+        sessions = parts.index("sessions")
+        root = parts[sessions + 1]
+        relative = parts[sessions + 2 :]
+    except (ValueError, IndexError):
+        return ""
+    segments = [
+        relative[index + 1]
+        for index in range(0, len(relative) - 1, 2)
+        if relative[index] == "agents"
+    ]
+    if not root or not segments:
+        return ""
+    return f"/repair-transcript {root} {root}:{':'.join(segments)}"
+
+
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
     """Read one agent's direct transcript, without nested child sessions."""
 
@@ -519,7 +537,10 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     ]
     if bounded.marker is not None:
         result.insert(0, bounded.marker)
-    return result or ["transcript unavailable"]
+    if result:
+        return result
+    command = _repair_command(path)
+    return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 
 class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):

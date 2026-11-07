@@ -40,6 +40,25 @@ _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
 
 
+def _repair_command(path: Path) -> str:
+    """Build the bounded repair command from a validated child path."""
+    parts = path.parts
+    try:
+        sessions = parts.index("sessions")
+        root = parts[sessions + 1]
+        relative = parts[sessions + 2 :]
+    except (ValueError, IndexError):
+        return ""
+    segments = [
+        relative[index + 1]
+        for index in range(0, len(relative) - 1, 2)
+        if relative[index] == "agents"
+    ]
+    if not root or not segments:
+        return ""
+    return f"/repair-transcript {root} {root}:{':'.join(segments)}"
+
+
 def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
     try:
         state = json.loads((path / "session_state.json").read_bytes())
@@ -582,7 +601,12 @@ class AgentTranscriptSource:
                 pass
         self._log_refresh_error(error, traceback=True)
         reason = (
-            str(error)
+            (
+                "transcript corrupt; run "
+                + command
+                if (command := _repair_command(path))
+                else str(error)
+            )
             if isinstance(error, TranscriptLoadError)
             else _REFRESH_UNAVAILABLE
         )
