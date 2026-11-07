@@ -209,8 +209,9 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
             claim_attempted.set()
         original_claim(connection, role, protocol_version, features)
 
-    # test-contract: seam force a replacement hello while real disconnect cleanup waits
+    # test-contract: seam hold real disconnect cleanup before registry release
     monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
+    # test-contract: seam observe the replacement claim without timing assumptions
     monkeypatch.setattr(server.connections, "_claim", tracked_claim)
     hello: asyncio.Task[dict[str, Any]] | None = None
     try:
