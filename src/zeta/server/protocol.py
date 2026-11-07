@@ -115,6 +115,16 @@ class ErrorDescriptor(Enum):
         return data
 
 
+class SlashResultKindDescriptor(StrEnum):
+    """One documented slash_run result kind."""
+
+    OUTPUT = "output"
+    MODEL_INPUT = "model_input"
+    CLIENT_ONLY = "client_only"
+    UNKNOWN = "unknown"
+    ERROR = "error"
+
+
 class EventDescriptor(StrEnum):
     """One documented JSON-RPC event name."""
 

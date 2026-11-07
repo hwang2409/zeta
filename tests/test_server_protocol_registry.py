@@ -4,7 +4,12 @@ import ast
 import re
 from pathlib import Path
 
-from zeta.server.protocol import ErrorDescriptor, EventDescriptor, FrameCodec
+from zeta.server.protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameCodec,
+    SlashResultKindDescriptor,
+)
 
 ROOT = Path(__file__).parents[1]
 PROTOCOL_DOC = ROOT / "docs" / "serve-protocol.md"
@@ -44,6 +49,11 @@ def _documented_events(document: str) -> set[str]:
     return names
 
 
+def _documented_slash_result_kinds(document: str) -> set[str]:
+    section = _section(document, "Returns a `kind` discriminator:", "The built-ins")
+    return set(re.findall(r"^  - `([a-z_]+)`:", section, re.MULTILINE))
+
+
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     documented_errors = _documented_errors(document)
@@ -64,6 +74,9 @@ def test_protocol_registry_matches_documented_errors_and_events() -> None:
         "add exactly one event in src/zeta/server/protocol.py and one matching event row "
         "in docs/serve-protocol.md"
     )
+    assert _documented_slash_result_kinds(document) == {
+        kind.value for kind in SlashResultKindDescriptor
+    }, "register and document each slash_run result kind"
 
 
 def _annotation_name(argument: ast.arg) -> str | None:
