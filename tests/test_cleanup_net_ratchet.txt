@@ -2589,3 +2589,7 @@ tests/test_webtools.py::test_fetch_decodes_supported_content_encodings[deflate-x
 tests/test_webtools.py::test_fetch_decodes_supported_content_encodings[gzip-\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xffK\xaf\xca,P(J-.\xc8\xcf+N\x05\x00\x05\x88\xf1\xb6\r\x00\x00\x00-gzip response]
 tests/test_webtools.py::test_fetch_passes_text_and_json_through[application/json-{"ok": true}]
 tests/test_webtools.py::test_fetch_passes_text_and_json_through[text/plain-plain text]
+tests/test_context.py::test_token_cache_on_and_off_give_identical_turns_across_eviction
+tests/test_context.py::test_turn_after_eviction_counts_only_new_messages
+tests/test_context.py::test_turn_counts_only_new_messages_after_the_first_turn
+tests/test_context_eviction.py::test_pinned_request_eviction_is_identical_with_token_cache_off
