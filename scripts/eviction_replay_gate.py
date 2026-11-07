@@ -301,7 +301,7 @@ def _run_in_scratch(args: argparse.Namespace, scratch: Path) -> int:
         artifact_dir = scratch / "artifacts"
         artifact_dir.mkdir()
     started = time.monotonic()
-    records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), 600))
+    records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), args.timeout))
     import zeta
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     print(f"identity: head={head} zeta.__file__={Path(zeta.__file__).resolve()}", file=sys.stderr)
@@ -315,14 +315,14 @@ def run(args: argparse.Namespace) -> int:
         return _run_in_scratch(args, scratch.root)
 
 
-def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: Path, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
+def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: Path, limits: dict[str, int] | None = None, timeout: float = 620) -> dict[str, Any] | None:
     runner = Path(worktree) / "scripts/eviction_replay_gate.py"
     if not runner.exists():
         runner = Path(__file__).resolve()
     scratch.mkdir(parents=True, exist_ok=True)
     tmpdir = scratch / "tmp"
     tmpdir.mkdir()
-    command = [sys.executable, str(runner), "run", "--scratch-root", str(scratch)]
+    command = [sys.executable, str(runner), "run", "--scratch-root", str(scratch), "--timeout", str(timeout)]
     environment = {**os.environ, "TMPDIR": str(tmpdir), "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
     if limits is not None:
         command.extend(["--limits-json", json.dumps(limits, sort_keys=True)])
@@ -331,10 +331,14 @@ def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: P
     else:
         command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment, start_new_session=True)
+    print(f"child: label={label} pid={process.pid} pgid={process.pid}", file=sys.stderr)
     try:
-        stdout, stderr = process.communicate(timeout=620)
+        stdout, stderr = process.communicate(timeout=timeout + 20)
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         stdout, stderr = process.communicate()
         print(f"FAIL {session} {label}: child terminated", file=sys.stderr)
         return None
@@ -376,10 +380,12 @@ def compare(args: argparse.Namespace) -> int:
     manifest: dict[str, Any] = {"phase": "compare", "sessions": []}
     sessions = ["fixture"] if args.fixture else args.session
     for session in sessions:
-        with tempfile.TemporaryDirectory(prefix="eviction-compare-") as scratch:
-            scratch_path = Path(scratch)
-            base = _run_side(session, "base", args.base, args.fixture, scratch_path / "base")
-            head = _run_side(session, "head", args.head, args.fixture, scratch_path / "head", base["record"]["limits"] if base else None)
+        scratch_owner = tempfile.TemporaryDirectory(prefix="eviction-compare-") if not args.scratch_root else None
+        scratch_path = (Path(scratch_owner.name) if scratch_owner else Path(args.scratch_root) / session)
+        scratch_path.mkdir(parents=True, exist_ok=True)
+        try:
+            base = _run_side(session, "base", args.base, args.fixture, scratch_path / "base", timeout=args.timeout)
+            head = _run_side(session, "head", args.head, args.fixture, scratch_path / "head", base["record"]["limits"] if base else None, args.timeout)
             if base is None or head is None:
                 return 1
             failure = _compare_artifacts(session, base, head)
@@ -388,6 +394,11 @@ def compare(args: argparse.Namespace) -> int:
                 return 1
             manifest["sessions"].append({"session": session, "base": base["record"], "head": head["record"], "status": "PASS"})
             print(f"PASS {session} {base['record']['elapsed_seconds']}s/{head['record']['elapsed_seconds']}s")
+        finally:
+            if scratch_owner is not None:
+                scratch_owner.cleanup()
+            elif scratch_path.exists():
+                shutil.rmtree(scratch_path)
     out.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     print(f"PASS manifest={out}")
     return 0
@@ -402,6 +413,7 @@ def main() -> int:
     run_parser.add_argument("--keep-private-artifacts")
     run_parser.add_argument("--limits-json")
     run_parser.add_argument("--scratch-root")
+    run_parser.add_argument("--timeout", type=float, default=600)
     run_parser.set_defaults(func=run)
     compare_parser = sub.add_parser("compare")
     compare_parser.add_argument("--base", required=True)
@@ -409,6 +421,8 @@ def main() -> int:
     compare_parser.add_argument("--session", action="append")
     compare_parser.add_argument("--out", required=True)
     compare_parser.add_argument("--fixture", action="store_true")
+    compare_parser.add_argument("--timeout", type=float, default=620)
+    compare_parser.add_argument("--scratch-root")
     compare_parser.set_defaults(func=compare)
     args = parser.parse_args()
     return args.func(args)

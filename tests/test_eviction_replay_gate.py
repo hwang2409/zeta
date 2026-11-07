@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).parents[1]
 def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) -> None:
@@ -126,6 +131,90 @@ def test_fixture_replay_fails_when_stability_cap_is_not_reached(tmp_path: Path) 
     )
     assert result.returncode != 0
     assert "did not stabilize within 8 invocations" in result.stderr
+
+
+def _failure_copy(tmp_path: Path, mode: str) -> Path:
+    head = _mutated_ref(tmp_path, [])
+    script = head / "scripts/eviction_replay_gate.py"
+    marker = 'assembler = _assembler(store, budget=budget, tail=tail, system_prompt=meta.get("system_prompt", ""))'
+    if mode == "raise":
+        replacement = 'raise RuntimeError("fixture side failure")'
+    elif mode == "crash":
+        replacement = "os._exit(3)"
+    else:
+        replacement = "time.sleep(60)"
+    text = script.read_text()
+    assert text.count(marker) == 1
+    script.write_text(text.replace(marker, replacement))
+    return head
+
+
+def _bytes(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+@pytest.mark.parametrize("mode", ["success", "raise", "crash", "timeout"])
+def test_failure_mode_cleanup_through_cli(tmp_path: Path, mode: str) -> None:
+    head = ROOT if mode == "success" else _failure_copy(tmp_path, mode)
+    controlled = tmp_path / mode
+    tmpdir = controlled / "tmp"
+    scratch = controlled / "scratch"
+    tmpdir.mkdir(parents=True)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "compare", "--base", str(ROOT), "--head", str(head), "--fixture", "--timeout", str(0.2 if mode == "timeout" else 60), "--scratch-root", str(scratch), "--out", str(controlled / "manifest.json")],
+        cwd=ROOT, env={**os.environ, "TMPDIR": str(tmpdir)}, capture_output=True, text=True, check=False,
+    )
+    if mode == "success":
+        assert result.returncode == 0
+    else:
+        assert result.returncode != 0
+        assert "FAIL fixture" in result.stderr
+    assert _bytes(tmpdir) == 0
+    assert _bytes(scratch) == 0
+    for line in result.stderr.splitlines():
+        if "pgid=" in line:
+            pgid = int(line.rsplit("pgid=", 1)[1])
+            with pytest.raises(ProcessLookupError):
+                os.killpg(pgid, 0)
+
+
+def test_interrupt_cleanup_through_cli(tmp_path: Path) -> None:
+    head = _failure_copy(tmp_path, "interrupt")
+    controlled = tmp_path / "interrupt"
+    tmpdir, scratch = controlled / "tmp", controlled / "scratch"
+    tmpdir.mkdir(parents=True)
+    process = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "compare", "--base", str(ROOT), "--head", str(head), "--fixture", "--timeout", "60", "--scratch-root", str(scratch), "--out", str(controlled / "manifest.json")],
+        cwd=ROOT, env={**os.environ, "TMPDIR": str(tmpdir)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if (scratch / "fixture" / "head" / "sessions").exists():
+                break
+            time.sleep(0.01)
+        os.kill(process.pid, signal.SIGINT)
+        _stdout, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert process.returncode != 0
+    assert "FAIL fixture" in stderr
+    assert _bytes(tmpdir) == 0
+    assert _bytes(scratch) == 0
+    for line in stderr.splitlines():
+        if "pgid=" in line:
+            with pytest.raises(ProcessLookupError):
+                os.killpg(int(line.rsplit("pgid=", 1)[1]), 0)
+
+
+def test_child_run_does_not_create_tmp_paths(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    scratch = tmp_path / "scratch"
+    empty.mkdir()
+    subprocess.run([sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--scratch-root", str(scratch)], cwd=ROOT, env={**os.environ, "TMPDIR": str(empty)}, check=True, capture_output=True, text=True)
+    assert _bytes(empty) == 0
 
 
 def test_summary_guard_is_installed_on_every_assembler() -> None:
