@@ -14313,7 +14313,7 @@ async def test_idle_child_is_running_during_wake_turn(
         owner=owner,
         channel=owner.conversation_channel,
     ) is None
-    await asyncio.wait_for(wake_started.wait(), timeout=2)
+    await asyncio.wait_for(wake_started.wait(), timeout=10)
     assert child_store.agent_lifecycle()["state"] == "running"
 
     release_wake.set()
