@@ -896,9 +896,7 @@ async def test_status_renders_unavailable_accounts_through_tui(
         ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
-    loop.account_context = SimpleNamespace(
-        unavailable_accounts=("codex:missing",)
-    )
+    loop.account_context = SimpleNamespace(unavailable_accounts=("codex:missing",))
     app = TUIApp(
         loop,
         provider="codex",
@@ -1566,6 +1564,7 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
 
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
@@ -13790,9 +13789,10 @@ async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
         assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         output = StringIO()
         Console(file=output, force_terminal=False, width=80).print(rendered[0])
-        assert "codex:missing  unavailable: credentials missing" in Text.from_ansi(
-            output.getvalue()
-        ).plain
+        assert (
+            "codex:missing  unavailable: credentials missing"
+            in Text.from_ansi(output.getvalue()).plain
+        )
     finally:
         opened.store.close()
 
@@ -13852,7 +13852,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     app.accounts_picker_move(1)
     task = app.accounts_picker_select()
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
     assert off_loop_calls == ["list", "list"]
     assert await asyncio.to_thread(resolver.resolve, "codex") == second
