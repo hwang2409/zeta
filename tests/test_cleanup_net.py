@@ -6,14 +6,32 @@ import sys
 from pathlib import Path
 
 PROBE = """
+import asyncio
 import pytest
 from pathlib import Path
 from zeta.core.store import ConversationStore
 from tests.support.owned import owned_resources
 
+MODE = {mode!r}
+
+@pytest.fixture
+async def fixture_manager(tmp_path):
+    if MODE != 'fixture-owned':
+        yield None
+        return
+    manager = await asyncio.to_thread(
+        __import__('zeta.core.session', fromlist=['SessionManager']).SessionManager,
+        tmp_path / 'fixture-home',
+    )
+    try:
+        yield manager
+    finally:
+        manager._release_storage_lease()
+
 @pytest.mark.asyncio
-async def test_case(tmp_path):
-    MODE = {mode!r}
+async def test_case(tmp_path, fixture_manager):
+    if MODE == 'fixture-owned':
+        return
     if MODE == 'cleanup-error':
         def fail_close(self):
             raise RuntimeError('cleanup failed')
@@ -55,6 +73,11 @@ def test_open_resource_fails_with_owner_and_creation_site(tmp_path: Path) -> Non
     output = result.stdout + result.stderr
     assert "ConversationStore created at" in output
     assert "owned_resources().store(store)" in output
+
+
+def test_fixture_owned_resource_is_not_reported(tmp_path: Path) -> None:
+    result = _run_probe(tmp_path, "fixture-owned")
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_leak_is_closed_before_teardown_failure(tmp_path: Path) -> None:

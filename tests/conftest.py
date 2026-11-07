@@ -728,6 +728,22 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         manager._release_storage_lease()
 
 
+@pytest.hookimpl
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    item._zeta_phase = "setup"
+
+
+@pytest.hookimpl
+def pytest_runtest_call(item: pytest.Item) -> None:
+    item._zeta_phase = "call"
+
+
+@pytest.hookimpl
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    del nextitem
+    item._zeta_phase = "teardown"
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
     outcome = yield
@@ -755,11 +771,12 @@ async def close_direct_test_runtime_owners(
     test_home_leases: dict[Path, object] = {}
 
     def site() -> str:
-        frame = sys._getframe(2)
+        frame = sys._getframe(3)
         return f"{Path(frame.f_code.co_filename).resolve()}:{frame.f_lineno}"
 
     def add(obj: object, kind: str, owner: str, is_open: object, close: object) -> None:
         tracked.append({"object": obj, "kind": kind, "site": site(), "owner": owner,
+                        "phase": getattr(request.node, "_zeta_phase", "unknown"),
                         "is_open": is_open, "close": close})
 
     loop_init = AgentLoop.__init__
@@ -852,11 +869,17 @@ async def close_direct_test_runtime_owners(
         add(background, "BackgroundTaskRegistry", "owned_resources().async_resource(background, what=...)",
             lambda: not background._closed, background.close)
 
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
 
@@ -864,6 +887,8 @@ async def close_direct_test_runtime_owners(
     leaked: list[dict[str, object]] = []
     for record in reversed(tracked):
         if not record["is_open"]():
+            continue
+        if record["phase"] != "call":
             continue
         leaked.append(record)
         try:
