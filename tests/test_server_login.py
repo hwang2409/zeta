@@ -15,9 +15,9 @@ from tests.test_server import _close, _connect, _request
 from zeta.accounts import AccountStore
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginPortInUseError
+from zeta.oauth import OAuthTokens
 from zeta.providers import anthropic
 from zeta.providers import login as providers
-from zeta.providers.auth import OAuthTokens
 from zeta.providers.factory import credential_store
 from zeta.server import ZetaServer
 from zeta.server import login as server_login

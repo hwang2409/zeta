@@ -16,7 +16,6 @@ import zeta.providers.codex as codex_module
 from tests.support.credentials import codex_credentials
 from zeta.accounts import AccountCredentials
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -43,6 +42,7 @@ from zeta.providers.codex import (
 from zeta.providers.codex_payload import _cache_affinity_json
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 

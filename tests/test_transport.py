@@ -14,6 +14,7 @@ from rich.console import Console
 
 import zeta.providers.retry_policy as retry_policy_module
 import zeta.providers.stream_diagnostics as stream_diagnostics_module
+from zeta.codex import CodexHTTPError, CodexStreamError
 from zeta.protocol.types import (
     ErrorInfo,
     Message,
@@ -25,7 +26,6 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
-from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (

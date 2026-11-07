@@ -26,10 +26,12 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
         skill_catalog=SkillCatalog.empty(),
         **kwargs,
     )
-    registry.register("read", lambda arguments: "read")
-    registry.register("bash", lambda arguments: "bash")
-    registry.register("remote__click", lambda arguments: "clicked")
-    registry.register("remote__type", lambda arguments: "typed")
+    registry.register("read", lambda arguments: "read", binding="shared")
+    registry.register("bash", lambda arguments: "bash", binding="shared")
+    registry.register(
+        "remote__click", lambda arguments: "clicked", binding="shared"
+    )
+    registry.register("remote__type", lambda arguments: "typed", binding="shared")
     return registry
 
 

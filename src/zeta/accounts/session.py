@@ -436,7 +436,9 @@ class SessionAccountContext:
     ) -> SessionMetadata | None:
         assert self.manager is not None
         session_id = state.metadata.session_id
+        execution_lease = self.metadata._execution_lease
         current = self.manager._read(session_id, directory_fd=directory_fd)
+        current._execution_lease = execution_lease
         if not self._metadata_equal(current, state.previous_metadata):
             return current
         # Recency refreshes write ``updated_at`` without touching this copy;
@@ -447,7 +449,9 @@ class SessionAccountContext:
         except BaseException as exc:  # noqa: BLE001 - authoritative reread decides
             logger.debug("session transition write reported failure: %s", exc)
         try:
-            return self.manager._read(session_id, directory_fd=directory_fd)
+            authoritative = self.manager._read(session_id, directory_fd=directory_fd)
+            authoritative._execution_lease = execution_lease
+            return authoritative
         except BaseException:  # noqa: BLE001 - disk outcome cannot be proven
             return None
 
@@ -506,6 +510,9 @@ class SessionAccountContext:
         pins: Mapping[str, AccountId] | None,
     ) -> tuple[Any, bool, Any]:
         assert self.manager is not None
+        execution_lease = self.metadata._execution_lease
+        if execution_lease is not None:
+            execution_lease.assert_owned()
         with ExitStack() as stack:
             if pins is not None:
                 stack.enter_context(self.store.pin_guard(pins))

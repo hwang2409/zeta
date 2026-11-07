@@ -464,6 +464,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
+    except StorageFormatError:
+        raise
     except Exception as exc:
         print(login_failure_message(exc), file=sys.stderr)
         return 1
@@ -827,6 +829,8 @@ def _create_tui_app(
         return create_app(args)
     except SessionError as exc:
         parser.error(str(exc))
+    except StorageFormatError:
+        raise
     except ValueError as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return None
@@ -926,10 +930,10 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
-def _run_account_frontend(run: Callable[[], int]) -> int:
+def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
-    except AccountError as exc:
+    except (AccountError, StorageFormatError) as exc:
         print(f"zeta: {exc}", file=sys.stderr)
         return 2
 
@@ -972,7 +976,7 @@ async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     return await run_fork_stack(app, build_fork)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     original_argv = list(sys.argv[1:] if argv is None else argv)
     entrypoint = sys.argv[0]
     parser = build_parser()
@@ -996,21 +1000,32 @@ def main(argv: list[str] | None = None) -> int:
                 if server_command[:1] == ["--"]:
                     server_command.pop(0)
                 command = server_command[0] if server_command else None
-                result = service.add(
-                    args.name,
-                    scope=args.scope,
-                    command=command,
-                    args=tuple(server_command[1:]),
-                    url=args.url,
-                    oauth=args.oauth,
-                    env=dict(item.split("=", 1) for item in args.env),
-                    headers=dict(item.split("=", 1) for item in args.header),
+                result = asyncio.run(
+                    service.add(
+                        args.name,
+                        scope=args.scope,
+                        command=command,
+                        args=tuple(server_command[1:]),
+                        url=args.url,
+                        oauth=args.oauth,
+                        env=dict(item.split("=", 1) for item in args.env),
+                        headers=dict(item.split("=", 1) for item in args.header),
+                    )
                 )
-                print(json.dumps(result.as_json(), sort_keys=True))
+                item = next(
+                    value
+                    for value in result.entries
+                    if value.name == args.name and value.scope == args.scope
+                )
+                print(json.dumps(item.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
-                asyncio.run(service.refresh_credentials())
-                values = [item.as_json() for item in service.list(scope=args.scope)]
+                view = asyncio.run(service.refresh_credentials())
+                values = [
+                    item.as_json()
+                    for item in view.entries
+                    if args.scope == "effective" or item.scope == args.scope
+                ]
                 output = (
                     json.dumps(values, sort_keys=True)
                     if args.json
@@ -1023,7 +1038,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.mcp_action == "show":
                 asyncio.run(service.refresh_credentials())
-                value = service.show(args.name, scope=args.scope).as_json()
+                value = asyncio.run(
+                    service.resolve(args.name, scope=args.scope)
+                ).as_json()
                 output = (
                     json.dumps(value, indent=2, sort_keys=True)
                     if args.json
@@ -1032,20 +1049,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action in {"enable", "disable"}:
-                service.set_enabled(
-                    args.name,
-                    scope=args.scope,
-                    enabled=args.mcp_action == "enable",
+                asyncio.run(
+                    service.set_enabled(
+                        args.name,
+                        scope=args.scope,
+                        enabled=args.mcp_action == "enable",
+                    )
                 )
                 return 0
             if args.mcp_action == "remove":
-                service.remove(args.name, scope=args.scope)
+                asyncio.run(service.remove(args.name, scope=args.scope))
                 return 0
             if args.mcp_action == "trust":
-                service.trust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=True))
                 return 0
             if args.mcp_action == "untrust":
-                service.untrust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=False))
                 return 0
             if args.mcp_action == "logout":
                 asyncio.run(service.logout(args.name, scope=args.scope))
@@ -1116,7 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
-            return _run_account_frontend(lambda: asyncio.run(run_server(server)) or 0)
+            asyncio.run(run_server(server))
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
@@ -1141,12 +1160,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt is not None:
         from ..runtime.headless import run_headless
 
-        return _run_account_frontend(lambda: run_headless(args, args.prompt))
+        return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    return _run_account_frontend(
-        lambda: _run_tui_command(args, parser, entrypoint, original_argv)
-    )
+    return _run_tui_command(args, parser, entrypoint, original_argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _run_console(lambda: _main(argv))
 
 
 __all__ = ["build_parser", "main"]

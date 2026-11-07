@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
+from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
@@ -22,6 +23,7 @@ from . import (
     model_selection,
     slash_commands,
 )
+from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
@@ -54,6 +56,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "deny",
         "fork_message",
         "rename_session",
+        "revoke_session_grants",
         "send",
         "send_images",
         "set_compaction",
@@ -527,6 +530,20 @@ class _Client:
             self, request_id, method, params
         )
 
+    async def _dispatch_session_grants(
+        self, method: str, params: dict[str, Any]
+    ) -> object:
+        session_grants.require_feature(self.features)
+        runtime = self.server.runtime
+        if method == session_grants.READ:
+            return session_grants.read(runtime.policy, runtime.session_id, params)
+        result, change = session_grants.revoke(
+            runtime.policy, runtime.session_id, params
+        )
+        if change.changed:
+            await self.server.control.publish_session_grant_change(change)
+        return result
+
     async def _dispatch(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
@@ -573,12 +590,9 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            result, page_ids = await self.connections.run_read(
+            result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)
             )
-            if self.role != "observer":
-                # project-link repair writes, so it stays off the read-only worker
-                await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
             try:
@@ -612,6 +626,7 @@ class _Client:
                     self.server.control.session_replaced()
                     self.server.control.clear_approvals()
                     await self.server.control.controller_ready()
+                    await self.server.control.publish_session_grant_reset()
                     return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
@@ -639,6 +654,8 @@ class _Client:
                                 str(exc),
                                 {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                         except Exception as exc:
                             raise ProtocolError(
                                 ErrorDescriptor.INTERNAL_ERROR,
@@ -653,6 +670,8 @@ class _Client:
                                 str(exc),
                                 {"session_id": session_id},
                             ) from exc
+                        except SessionOwnedError as exc:
+                            raise _session_owned_protocol_error(exc) from exc
                     self.server.control._active_host_commands = candidate
                     self.server.control._host_binding_required = (
                         "session_host_commands" in self.features
@@ -660,12 +679,15 @@ class _Client:
                     self.server.control.session_replaced()
                     self.server.control.clear_approvals()
                     await self.server.control.controller_ready()
+                    await self.server.control.publish_session_grant_reset()
                     return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
                     self.server.control._host_binding_required = False
                 raise
+        if method in {session_grants.READ, session_grants.REVOKE}:
+            return await self._dispatch_session_grants(method, params)
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":
@@ -775,6 +797,8 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+            if session_grants.FEATURE in self.features:
+                requests += [session_grants.READ, session_grants.REVOKE]
         requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
@@ -848,6 +872,7 @@ class _Client:
                 _required_string(params, "text"),
                 register_model_input=register,
                 approval_control=self.server.control,
+                run_blocking=self.server.control._run_blocking,
             )
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":
@@ -952,10 +977,6 @@ class _Client:
         status.update(suffix)
         return status
 
-    def _reconcile_project_links(self, session_ids: list[str]) -> None:
-        for session_id in session_ids:
-            self.server.runtime.manager._reconcile_project_link(session_id)
-
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
     ) -> tuple[dict[str, object], list[str]]:
@@ -973,18 +994,26 @@ class _Client:
             available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
-            item.session_id: item.preview
+            item.session_id: item
             for item in self.server.runtime.manager.list_session_previews(
                 limit=len(metadata), sessions=metadata
             )
         }
-        sessions = [
-            {
-                **item.to_catalog_dict(),
-                "first_message_preview": previews.get(item.session_id, ""),
-            }
-            for item in metadata
-        ]
+        sessions = []
+        for item in metadata:
+            preview = previews[item.session_id]
+            sessions.append(
+                {
+                    **item.to_catalog_dict(),
+                    "first_message_preview": preview.preview,
+                    "in_use": preview.in_use,
+                    **(
+                        {"owner_pid": preview.owner_pid}
+                        if preview.owner_pid is not None
+                        else {}
+                    ),
+                }
+            )
         if self.protocol_version == "1.0":
             for item in sessions:
                 item.pop("name", None)
@@ -1022,6 +1051,28 @@ def _home() -> Path:
     from ..core.session import env_home
 
     return env_home().expanduser().resolve()
+
+
+def _session_owned_protocol_error(exc: SessionOwnedError) -> ProtocolError:
+    data: dict[str, Any] = {
+        "code": "session_owned",
+        "session_id": exc.session_id,
+    }
+    owner = {
+        key: value
+        for key, value in {
+            "surface": exc.owner_surface,
+            "pid": exc.owner_pid,
+        }.items()
+        if value is not None
+    }
+    if owner:
+        data["owner"] = owner
+    return ProtocolError(
+        ErrorDescriptor.OPERATION_BUSY,
+        "session is active in another zeta process",
+        data,
+    )
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
