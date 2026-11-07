@@ -63,7 +63,7 @@ async def test_start_state_and_notice_follow_off_loop_durable_record(
     assert writer_threads != [threading.get_ident()]
     assert [notice.phase for notice in notices] == ["started"]
     monkeypatch.setattr(registry, "_persist", original_persist)
-    await registry.kill(task_id)
+    await registry.kill(task_id, cause="test requested task stop")
     await registry.close()
 
 
@@ -87,7 +87,7 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
         assert release.wait(10)
 
     monkeypatch.setattr(registry, "_persist", gated_persist)
-    killing = asyncio.create_task(registry.kill(task_id))
+    killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
     assert await asyncio.to_thread(entered.wait, 10)
 
     before_commit = (
@@ -97,7 +97,7 @@ async def test_terminal_state_and_notice_follow_off_loop_durable_record(
         tuple(notices),
     )
     release.set()
-    await killing
+    await asyncio.wait_for(killing, 10)
 
     assert before_commit == (True, 1, True, ())
     assert not registry.snapshot()[0].running
@@ -235,7 +235,7 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
     def gated_terminal_persist(rows=None) -> None:
         nonlocal persist_calls
         persist_calls += 1
-        if persist_calls == 1:
+        if persist_calls == 2:
             entered.set()
             assert release.wait(10)
         original_persist(rows)
@@ -251,10 +251,10 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
 
     monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
     monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
-    killing = asyncio.create_task(registry.kill(task_id))
-    await cutoff.wait()
+    killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
+    await asyncio.wait_for(cutoff.wait(), 10)
     release.set()
-    await killing
+    await asyncio.wait_for(killing, 10)
 
     rows = json.loads((tmp_path / "background_tasks.json").read_text())
     assert len(rows) == 1
@@ -282,14 +282,14 @@ async def test_terminal_notice_follows_durable_record(
     )
 
     with pytest.raises(OSError, match="disk full"):
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause="test requested task stop")
 
     assert registry.snapshot()[0].running
     assert notices == []
     monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.close()
     assert not registry.snapshot()[0].running
-    assert [notice.phase for notice in notices] == ["task_kill"]
+    assert [notice.phase for notice in notices] == ["task_kill", "session_shutdown"]
 
 
 @pytest.mark.asyncio
@@ -344,7 +344,7 @@ async def test_shutdown_joins_inflight_start(
         spawned.append(process)
         assert await process.stdout.readline() == b"ready\n"
         spawn_ready.set()
-        await release_spawn.wait()
+        await asyncio.wait_for(release_spawn.wait(), 10)
         return process
 
     async def shutdown():
@@ -432,11 +432,19 @@ async def test_shutdown_joins_inflight_start(
         for process in spawned:
             kill_group_if_present(process.pid)
         starting.cancel()
-        await asyncio.gather(starting, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(starting, return_exceptions=True), 10
+        )
         if closing is not None:
-            await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(closing, return_exceptions=True), 10
+            )
         monitors = [record.monitor for record in registry.records if record.monitor is not None]
-        await asyncio.gather(*monitors, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*monitors, return_exceptions=True), 10
+        )
         for process in spawned:
-            await process.communicate()
-        await asyncio.gather(registry.close(), return_exceptions=True)
+            await asyncio.wait_for(process.communicate(), 10)
+        await asyncio.wait_for(
+            asyncio.gather(registry.close(), return_exceptions=True), 10
+        )
