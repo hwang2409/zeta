@@ -128,6 +128,7 @@ def safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
             style=style,
             overflow="fold" if wrap else "ellipsis",
             no_wrap=not wrap,
+            tab_size=8,
         )
     return Text.from_ansi(
         clean,

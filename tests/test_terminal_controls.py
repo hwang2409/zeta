@@ -1,7 +1,9 @@
+import io
 import random
 import re
 import sys
 
+from rich.console import Console
 from rich.text import Text
 
 from zeta.tui.cards.base import UNSAFE_CONTROL_RE, safe_text, strip_terminal_controls
@@ -130,7 +132,25 @@ def test_safe_text_matches_ansi_decoder_for_card_text_corpus() -> None:
                 overflow="fold" if wrap else "ellipsis",
                 no_wrap=not wrap,
             )
-            assert actual == expected, (repr(value), wrap)
+            actual_output = io.StringIO()
+            expected_output = io.StringIO()
+            for text, output in ((actual, actual_output), (expected, expected_output)):
+                Console(
+                    file=output,
+                    force_terminal=True,
+                    color_system=None,
+                    tab_size=4,
+                    width=20,
+                ).print(text, end="")
+            assert actual_output.getvalue() == expected_output.getvalue(), (
+                repr(value),
+                wrap,
+            )
+            assert actual.style == expected.style, (repr(value), wrap, "style")
+            assert actual.tab_size == expected.tab_size, (repr(value), wrap, "tab_size")
+            assert actual.end == expected.end, (repr(value), wrap, "end")
+            assert actual.overflow == expected.overflow, (repr(value), wrap, "overflow")
+            assert actual.no_wrap == expected.no_wrap, (repr(value), wrap, "no_wrap")
 
 
 def test_clean_text_skips_the_character_loop() -> None:
