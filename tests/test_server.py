@@ -10041,7 +10041,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
         assert recovery["quarantine_id"] == quarantine_id
         assert recovery["session_id"] == session_id
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
