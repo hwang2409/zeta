@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from prompt_toolkit.document import Document
@@ -329,29 +330,37 @@ def test_output_tail_is_bounded_to_recent_lines() -> None:
 # -- registry seam ----------------------------------------------------------
 
 
-def test_snapshot_reports_status_and_line_count() -> None:
+@pytest.mark.asyncio
+async def test_snapshot_reports_status_and_line_count() -> None:
     registry = BackgroundTaskRegistry()
-    # A record recovered from a previous session has no start time.
-    info = _info("task-x")
-    assert info.started_at == 0.0
-    assert registry.snapshot() == ()
-
-
-async def _wait_output(registry: BackgroundTaskRegistry, task_id: str, size: int) -> None:
-    for _ in range(500):
-        if registry.snapshot()[0].output_bytes >= size:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("timed out waiting for output")
+    try:
+        # A record recovered from a previous session has no start time.
+        info = _info("task-x")
+        assert info.started_at == 0.0
+        assert registry.snapshot() == ()
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
-async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
+async def test_output_tail_reads_only_new_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("cat", tmp_path)
+    task_id = None
     try:
+        task_id, _ = await registry.start("cat", tmp_path)
+        output_ready = asyncio.Event()
+        original_append = registry._append
+
+        def signal_output(record: Any, chunk: bytes) -> None:
+            original_append(record, chunk)
+            output_ready.set()
+
+        # test-contract: seam BackgroundTaskRegistry has no public output-ready event
+        monkeypatch.setattr(registry, "_append", signal_output)
         await registry.input(task_id, "x" * 5000 + "\n")
-        await _wait_output(registry, task_id, 5001)
+        await asyncio.wait_for(output_ready.wait(), timeout=10)
         # Drain the backlog fully, tracking the cursor as the panel does.
         cursor = 0
         while True:
@@ -361,11 +370,87 @@ async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
                 break
         # Appending more and reading *from the last cursor* returns only the
         # new bytes, never a re-read of the 5 KB backlog.
+        output_ready.clear()
         await registry.input(task_id, "DELTA\n", eof=True)
-        await _wait_output(registry, task_id, cursor + 6)
+        await asyncio.wait_for(output_ready.wait(), timeout=10)
         tail = await registry.output(task_id, since=cursor)
         assert tail["output"] == "DELTA\n"
     finally:
+        if task_id is not None:
+            await registry.kill(task_id)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_panel_refresh_owns_output_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _app(tmp_path)
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    registry = app.loop.tool_registry.background_tasks
+    task_id, _ = await registry.start("cat", tmp_path)
+    output_appended = asyncio.Event()
+    original_append = registry._append
+
+    def append_output(record: Any, chunk: bytes) -> None:
+        original_append(record, chunk)
+        output_appended.set()
+
+    monkeypatch.setattr(registry, "_append", append_output)
+    await registry.input(task_id, "first\n")
+    await output_appended.wait()
+    output_appended.clear()
+
+    first_read = asyncio.Event()
+    release_first_read = asyncio.Event()
+    original_output = registry.output
+    read_count = 0
+
+    async def controlled_output(
+        selected_task_id: str, since: int | None = None, *, max_chars: int | None = None
+    ) -> dict[str, object]:
+        nonlocal read_count
+        result = await original_output(selected_task_id, since, max_chars=max_chars)
+        read_count += 1
+        if read_count == 1:
+            first_read.set()
+            await release_first_read.wait()
+        return result
+
+    monkeypatch.setattr(registry, "output", controlled_output)
+    app.open_tasks_panel()
+    app._stop_tasks_refresh()
+    app._tasks_key("enter")
+
+    refresh = asyncio.create_task(app._tasks_tick())
+    try:
+        await first_read.wait()
+        await registry.input(task_id, "second\n")
+        await output_appended.wait()
+
+        # Paint from the current immutable snapshot while the only output read
+        # is paused. Painting must not start another read or move its cursor.
+        app._refresh_tasks_panel(keep_offset=True)
+        release_first_read.set()
+        await refresh
+        settled = asyncio.Event()
+        asyncio.get_running_loop().call_soon(settled.set)
+        await settled.wait()
+        await app._tasks_tick()
+
+        rendered = "\n".join(_text(app._tasks_panel))
+        assert rendered.count("first") == 1
+        assert rendered.count("second") == 1
+        assert rendered.index("first") < rendered.index("second")
+    finally:
+        release_first_read.set()
+        if not refresh.done():
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        app.close_tasks_panel()
+        registry.set_notice_sink(None)
         await registry.kill(task_id)
         await registry.close()
 

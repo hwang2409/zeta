@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import weakref
 
 import httpx
 import pytest
@@ -475,6 +476,13 @@ for line in sys.stdin:
 async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_path, monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
+    services = []
+    service_type = MCPManagementService
+
+    def track_service(*args, **kwargs):
+        service = service_type(*args, **kwargs)
+        services.append(weakref.ref(service))
+        return service
 
     async def slow_mount(registry, config=None, *, notice_sink=None, home=None):
         del config, notice_sink
@@ -483,6 +491,7 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_
         return MCPMount(registry, {}, {}, home=home)
 
     monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", slow_mount)
+    monkeypatch.setattr("zeta.runtime.loop.mcp_session.MCPManagementService", track_service)
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
@@ -494,6 +503,9 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_
     await loop.ensure_mcp_servers()
     assert await loop.slash_mcp("status") == await loop.slash_mcp("")
     await loop.close()
+
+    assert services
+    assert all(reference() is None for reference in services)
 
 
 @pytest.mark.asyncio
@@ -545,23 +557,17 @@ async def test_login_skips_oauth_flow_blocked_by_session_policy(
         await registry.close()
 
 
-def test_logout_validates_explicit_scope_without_removing_definition(
-    tmp_path, monkeypatch
-):
+@pytest.mark.asyncio
+async def test_logout_validates_explicit_scope_without_removing_definition(tmp_path):
     manager = service(tmp_path)
     manager.add("oauth", scope="project", url="https://project.example.test", oauth=True)
-    deleted = []
-    monkeypatch.setattr(
-        "zeta.mcp.oauth_store.delete_token",
-        lambda name, *, home: deleted.append((name, home)),
-    )
 
     with pytest.raises(MCPManagementError, match="unknown MCP server"):
-        manager.logout("oauth", scope="user")
-    assert deleted == []
+        await manager.logout("oauth", scope="user")
 
-    manager.logout("oauth", scope="project")
-    assert deleted == [("oauth", manager.home)]
+    await manager.logout("oauth", scope="project")
+    token_file = manager.home / "mcp-tokens" / "oauth.json"
+    assert json.loads(token_file.read_text()) == {"generation": 1, "token": None}
     assert manager.show("oauth", scope="project").name == "oauth"
 
 

@@ -179,6 +179,7 @@ class CheckpointTranscriptMixin:
                 self.loop.store.session_dir,
                 self.loop.store.session_id,
                 cap=self._workspace_snapshot_cap,
+                storage_lease=self.loop.store._storage_lease,
             )
         return self._workspace_snapshot_store
 
@@ -680,6 +681,16 @@ class CheckpointTranscriptMixin:
                     "[compaction marker: entries "
                     f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
                 )
+                yield
+                continue
+            if entry.type == "turn_end":
+                text = {
+                    "user_stop": "turn stopped by the user",
+                    "error": "turn ended with an error",
+                    "disconnect": "turn ended when the controller disconnected",
+                }.get(entry.data["reason"])
+                if text is not None:
+                    self._print_system(text)
                 yield
                 continue
             if entry.type != "message":
