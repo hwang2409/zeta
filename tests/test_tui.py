@@ -117,7 +117,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_shutdown, agent_sync
+from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -11712,7 +11712,8 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     navigation.selected_index = 1
     navigation.open_selected()
     assert navigation.transcript_control._sync_task is not None
-    await navigation.transcript_control._sync_task
+    # test-contract: seam no public transcript-sync completion event exists
+    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
     source = navigation.transcript_control._source
     assert source is not None
     previous = navigation.transcript_control._snapshot
@@ -11736,6 +11737,38 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     monkeypatch.setattr(source, "refresh", blocked_refresh)
     # test-contract: seam no public transcript-source closed event exists
     monkeypatch.setattr(source, "close", close_and_signal)
+    transcript_handed_off = asyncio.Event()
+    todo_cleanup_release = asyncio.Event()
+    transcript_cleanup_tasks: set[asyncio.Task[None]] = set()
+    finish_transcript_cleanup = agent_lifetime.finish_cleanup_or_handoff
+    finish_todo_cleanup = agent_sync.finish_cleanup_or_handoff
+
+    async def record_transcript_cleanup(tasks, close, *, deadline, label) -> None:
+        before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+        try:
+            await finish_transcript_cleanup(
+                tasks, close, deadline=deadline, label=label
+            )
+            transcript_cleanup_tasks.update(
+                agent_shutdown._LATE_CLEANUP_TASKS - before
+            )
+        finally:
+            transcript_handed_off.set()
+
+    async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
+        await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
+        # Keep the empty todo cleanup pending until both owners have handed off.
+        blocker = asyncio.create_task(
+            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
+        )
+        await finish_todo_cleanup(
+            (blocker, *tasks), close, deadline=deadline, label=label
+        )
+
+    monkeypatch.setattr(
+        agent_lifetime, "finish_cleanup_or_handoff", record_transcript_cleanup
+    )
+    monkeypatch.setattr(agent_sync, "finish_cleanup_or_handoff", block_todo_cleanup)
     # test-contract: seam no public shutdown-budget injection exists
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
@@ -11747,9 +11780,17 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
         await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
         # test-contract: durability shutdown retains one late transcript cleanup
-        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
+        assert len(transcript_cleanup_tasks) == 1 and transcript_cleanup_tasks <= (
+            agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        )
     finally:
         agent_sync._REFRESH_LOCK.release()
+        todo_cleanup_release.set()
+        late_cleanup_tasks = agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        if late_cleanup_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*late_cleanup_tasks, return_exceptions=True), timeout=10
+            )
 
     assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
@@ -12345,6 +12386,24 @@ async def test_later_successful_snapshot_clears_earlier_failure(
     first_finished = threading.Event()
     writes = 0
     original_write = persistence_module.write_json_file
+    original_mark_persisted = persistence._mark_persisted
+    mark_started = asyncio.Event()
+    release_mark = asyncio.Event()
+    mark_finished = asyncio.Event()
+    mark_task: asyncio.Task[None] | None = None
+
+    async def finish_mark(revision: int) -> None:
+        await asyncio.wait_for(release_mark.wait(), 10)
+        original_mark_persisted(revision)
+        mark_finished.set()
+
+    def gated_mark_persisted(revision: int) -> None:
+        nonlocal mark_task
+        mark_started.set()
+        mark_task = asyncio.create_task(finish_mark(revision))
+
+    # test-contract: seam no public event reports that pending draft state was cleared
+    monkeypatch.setattr(persistence, "_mark_persisted", gated_mark_persisted)
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -12357,20 +12416,28 @@ async def test_later_successful_snapshot_clears_earlier_failure(
             first_finished.set()
 
     monkeypatch.setattr(persistence_module, "write_json_file", write)
-    persistence.schedule("first")
-    assert await asyncio.to_thread(first_finished.wait, 1)
-    persistence.schedule("second")
-    error: OSError | None = None
     try:
-        await persistence.flush_pending()
-    except OSError as exc:
-        error = exc
+        persistence.schedule("first")
+        assert await asyncio.to_thread(first_finished.wait, 10)
+        persistence.schedule("second")
+        error: OSError | None = None
+        try:
+            await persistence.flush_pending()
+        except OSError as exc:
+            error = exc
 
-    assert error is None, (
-        "a successful newer snapshot retained the earlier write failure"
-    )
-    assert persistence.load() == "second"
-    assert persistence._pending_text is None
+        assert error is None, (
+            "a successful newer snapshot retained the earlier write failure"
+        )
+        await asyncio.wait_for(mark_started.wait(), 10)
+        assert persistence.load() == "second"
+        release_mark.set()
+        await asyncio.wait_for(mark_finished.wait(), 10)
+        assert persistence.pending_text is None
+    finally:
+        release_mark.set()
+        if mark_task is not None:
+            await asyncio.wait_for(mark_task, 10)
 
 
 @pytest.mark.asyncio

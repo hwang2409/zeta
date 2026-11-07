@@ -12,7 +12,8 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.test_server import TIMEOUT, _close, _connect, _read, _request, _socket_path
+from tests.support.sockets import short_socket_path as _socket_path
+from tests.test_server import TIMEOUT, _close, _connect, _read, _request
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -25,6 +26,8 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer, ergonomics
 from zeta.server.protocol import EventDescriptor
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 MAX_PRE_HELLO_CONNECTIONS = 10
 

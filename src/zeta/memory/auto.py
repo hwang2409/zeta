@@ -20,6 +20,7 @@ from ..core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
+from ..core.fsio import write_all
 from ..oauth import ProviderLoginRequiredError
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -888,7 +889,7 @@ class AutoMemoryReconciler:
         )
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, payload)
+            write_all(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1

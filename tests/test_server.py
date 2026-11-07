@@ -56,6 +56,7 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
@@ -111,6 +112,8 @@ from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 # A hang guard for waits on real frames, not a speed limit: a loaded CI
 # runner can take more than a few seconds between frames.
@@ -711,17 +714,6 @@ def test_delegated_approval_payload_includes_execution_context() -> None:
             "resolved_path": "/worktree/src/file.py",
         }
     }
-
-
-def _socket_path(tmp_path: Path) -> Path:
-    # macOS limits Unix socket paths to 104 bytes; pytest's tmp_path is longer.
-    return Path("/tmp") / f"zeta-{tmp_path.name}.sock"
-
-
-@pytest.fixture(autouse=True)
-def _remove_test_socket_lock(tmp_path: Path):
-    yield
-    Path(f"{_socket_path(tmp_path)}.lock").unlink(missing_ok=True)
 
 
 async def _connect(server: ZetaServer):

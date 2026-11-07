@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -25,7 +26,6 @@ from tests.test_server import (
     _frames_until_event,
     _read,
     _request,
-    _socket_path,
 )
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
@@ -34,6 +34,8 @@ from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, image_delivery
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 FEATURES = [
     "session_cwd",

@@ -20,6 +20,7 @@ from tests.support.scripted_provider import (
 )
 from tests.support.server_client import event as _event
 from tests.support.server_client import request as _request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import (
     Message,
@@ -31,6 +32,8 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.headless import run_headless
 from zeta.server import ZetaServer
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "scripted-provider"
 TIMEOUT = 5
@@ -289,10 +292,6 @@ def test_text_and_thinking_stream_in_chunks() -> None:
         "abcdef",
         "hello world",
     ]
-
-
-def _socket_path(tmp_path: Path) -> Path:
-    return Path("/tmp") / f"zeta-sf-{tmp_path.name}.sock"
 
 
 async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:

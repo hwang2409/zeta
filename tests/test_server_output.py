@@ -13,7 +13,8 @@ import pytest
 
 from tests import test_server_websocket as websocket
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.test_server import TIMEOUT, _socket_path
+from tests.support.sockets import short_socket_path as _socket_path
+from tests.test_server import TIMEOUT
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
@@ -21,6 +22,8 @@ from zeta.server import connections as connections_module
 from zeta.server import server as server_module
 from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
