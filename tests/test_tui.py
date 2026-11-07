@@ -885,6 +885,36 @@ def test_other_background_notices_remain_visible() -> None:
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
+@pytest.mark.asyncio
+async def test_status_renders_unavailable_accounts_through_tui(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.account_context = SimpleNamespace(
+        unavailable_accounts=("codex:missing",)
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        rendered = await app._slash_commands.dispatch_async(app, "/status")
+        assert isinstance(rendered, str)
+        app._handle_slash_output(rendered)
+
+        assert "unavailable_accounts: codex:missing" in output.getvalue()
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),

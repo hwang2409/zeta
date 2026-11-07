@@ -174,21 +174,23 @@ class SessionAccountContext:
                 raise AccountError(
                     f"session account {selected} no longer exists; choose another with /accounts"
                 )
-            if not self._frozen:
-                self.store.require_available(selected)
             return selected
         if self._frozen:
             raise AccountError(
                 f"child account snapshot has no {canonical} account; start a new child"
             )
         selected = self.store.resolve_account(provider)
-        self.store.require_available(selected)
         if self.store.contains(selected):
             with self.store.pin_guard({canonical: selected}):
                 self._pins[canonical] = selected
                 assert self.manager is not None
                 self.manager.record_account_selection(self.metadata, selected, boundary=0)
         return selected
+
+    def require_active_available(self, provider: str) -> None:
+        selected = self.resolve(provider)
+        if self.store.contains(selected):
+            self.store.require_available(selected)
 
     def backend_kwargs(self, provider: str) -> dict[str, object]:
         result: dict[str, object] = {"home": self.home}
