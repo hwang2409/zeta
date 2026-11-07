@@ -587,6 +587,7 @@ async def test_bash_recovers_when_session_cwd_is_removed_during_bind(
         session_cwd.rmdir()
         return original_open()
 
+    # test-contract: seam force removal after identity verification but before fd open.
     monkeypatch.setattr(registry, "_open_cwd", remove_then_open)
     try:
         result = await registry.execute(

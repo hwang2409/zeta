@@ -2140,7 +2140,7 @@ async def test_canceled_macro_creates_log_before_shell_bind(
         release.set()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await registry.close()
 
 
