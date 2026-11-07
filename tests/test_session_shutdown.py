@@ -416,7 +416,8 @@ def test_recovery_and_send_release_borrowed_child_stores(
         await loop.close()
 
     asyncio.run(exercise())
-    assert retained == []
+    assert len(retained) == 2
+    assert all(not store._release_lease.alive for store in retained)
     resident_child.close()
     opened.store.close()
     manager.delete(opened.metadata.session_id)

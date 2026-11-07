@@ -764,7 +764,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
             resumed_app._rebuild_transcript()
             visible = output.getvalue() + resumed_output.getvalue()
-            assert visible.count("child child-canceled-presentation · completed") == 1
+            assert (
+                visible.count("child child-canceled-presentation · completed") == 1
+            )
         finally:
             await resumed_app.loop.close()
             reopened.close()
@@ -3444,7 +3446,7 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
             ConversationStore(tmp_path),
             tools={"stream": stream},
             max_turns=1,
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -3508,7 +3510,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
             store,
             tools={"stream": stream},
             max_turns=1,
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4327,7 +4329,7 @@ async def test_transport_failure_shapes_render_error_cards(
         AgentLoop(
             RaisedErrorBackend(error),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4357,13 +4359,10 @@ async def test_ollama_model_window_error_renders_in_tui(tmp_path: Path) -> None:
         token_budget=10,
         retained_tail=1,
         system_prompt="system prompt is much too large",
-        token_counter=lambda message: (
-            1
-            + sum(
-                len(block.text)
-                for block in message.content
-                if isinstance(block, TextContent)
-            )
+        token_counter=lambda message: 1 + sum(
+            len(block.text)
+            for block in message.content
+            if isinstance(block, TextContent)
         ),
         backend=backend,
     )
@@ -4431,7 +4430,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
         AgentLoop(
             AlwaysErrorBackend(),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -5401,13 +5400,9 @@ def test_agent_cards_remain_in_sequential_order() -> None:
                 structured_content={"turns_used": index + 1, "child_session_path": ""},
             ),
         )
-        transcript.start_tool(
-            call.id,
-            call,
-            render_event(
-                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
-            ),
-        )
+        transcript.start_tool(call.id, call, render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        ))
         transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
@@ -6235,7 +6230,7 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
                 base_url="https://test.invalid/codex/responses",
             ),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model=DEFAULT_CODEX_MODEL,
@@ -6515,7 +6510,7 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
             EarlyCloseRetryBackend(),
             ConversationStore(tmp_path / "sessions"),
             tool_schemas=[],
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -6569,7 +6564,7 @@ async def test_truncated_response_notice_is_printed_once(
             TruncatedBackend(),
             ConversationStore(tmp_path / "sessions"),
             tool_schemas=[],
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -7036,10 +7031,14 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
+        read_pty_until(
+            master_fd, b" \xe2\x80\xba ", process=process, output=output
+        )
 
         os.write(master_fd, b"\x04")
-        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
+        read_pty_until(
+            master_fd, b"\x1b[?1049l", process=process, output=output
+        )
         reap_process(process, timeout=10)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
@@ -7076,7 +7075,9 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(master_fd, needle, process=process, output=output, start=start)
+        read_pty_until(
+            master_fd, needle, process=process, output=output, start=start
+        )
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -7128,7 +7129,9 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(master_fd, needle, process=process, output=output, start=start)
+        read_pty_until(
+            master_fd, needle, process=process, output=output, start=start
+        )
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -8148,9 +8151,11 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
             if not gated_once and stop_checks == 2:
                 gated_once = True
                 recovery_mutated.set()
-                assert recovery_release.wait(timeout=10)
+                assert recovery_release.wait(timeout=5)
                 assert callable(should_stop)
-                assert should_stop()
+                deadline = time.monotonic() + 5
+                while not should_stop() and time.monotonic() < deadline:
+                    time.sleep(0.01)
             return bool(should_stop and should_stop())
 
         deliveries = recover_agent_children(loop, should_stop=observed_stop)
@@ -8171,10 +8176,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(input=pipe, output=DummyOutput())
         run_task = asyncio.create_task(app.run(session))
-        assert await asyncio.to_thread(recovery_mutated.wait, 10)
-        assert app._input_loop_active, (
-            "TUI input did not start during activation recovery"
-        )
+        assert await asyncio.to_thread(recovery_mutated.wait, 5)
+        assert app._input_loop_active, "TUI input did not start during activation recovery"
         app.request_exit()
         await activation_cancelled.wait()
         recovery_release.set()
@@ -8344,9 +8347,7 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     ]
     assert prompt_toolkit_tasks == []
     assert restored == [None]
-    # test-contract: seam shutdown clears the active session reference.
     assert app._active_session is None
-    # test-contract: seam shutdown closes the application and its session store.
     assert app._closed
     assert store.directory_fd == -1
 
@@ -8424,9 +8425,11 @@ async def test_rebuild_transcript_matches_character_stream(
     ]
     app = TUIApp(
         AgentLoop(
-            FakeBackend([ScriptedTurn(content=source_parts)]),
+            FakeBackend(
+                [ScriptedTurn(content=source_parts)]
+            ),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -8661,26 +8664,23 @@ async def test_run_keeps_empty_resumed_transcript_blank(
 def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        with_message_origin(
-            Message(
-                MessageRole.USER,
-                [
-                    TextContent("inspect notes.txt and [Image #1]"),
-                    TextContent(
-                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                        "/tmp/notes.txt",
-                        12,
-                    ),
-                    ImageContent(
-                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                        "image/png",
-                        "/tmp/image.png",
-                        68,
-                    ),
-                ],
-            ),
-            MessageOrigin.USER,
-        )
+        with_message_origin(Message(
+            MessageRole.USER,
+            [
+                TextContent("inspect notes.txt and [Image #1]"),
+                TextContent(
+                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                    "/tmp/notes.txt",
+                    12,
+                ),
+                ImageContent(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                    "image/png",
+                    "/tmp/image.png",
+                    68,
+                ),
+            ],
+        ), MessageOrigin.USER)
     )
     read_call = ToolCall("resume-read", "read", {"path": "README.md"})
     agent_call = ToolCall(
@@ -8881,7 +8881,7 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
         AgentLoop(
             ErrorThenSuccessBackend(),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -8979,20 +8979,17 @@ def test_rebuild_user_attachment_hides_file_content(
     monkeypatch.setenv("COLORTERM", "truecolor")
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        with_message_origin(
-            Message(
-                MessageRole.USER,
-                [
-                    TextContent("inspect @notes.txt"),
-                    TextContent(
-                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                        "/tmp/notes.txt",
-                        12,
-                    ),
-                ],
-            ),
-            MessageOrigin.USER,
-        )
+        with_message_origin(Message(
+            MessageRole.USER,
+            [
+                TextContent("inspect @notes.txt"),
+                TextContent(
+                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                    "/tmp/notes.txt",
+                    12,
+                ),
+            ],
+        ), MessageOrigin.USER)
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -9777,7 +9774,7 @@ def test_full_screen_footer_fits_content_column(
                 session_id="abcdef123456",
                 cwd=Path.home(),
             ),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10031,7 +10028,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
         AgentLoop(
             GateBackend(),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10132,7 +10129,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
             backend,
             ConversationStore(tmp_path / "sessions"),
             tools={"read": slow_tool},
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10176,27 +10173,22 @@ async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
 
     assert "interrupted" in states
     assert app._loop_state == "interrupted"
-    assert (
-        "interrupted"
-        in format_status(
-            app.provider,
-            app.model,
-            app._loop_state,
-            session_id="session",
-        ).plain
-    )
+    assert "interrupted" in format_status(
+        app.provider,
+        app.model,
+        app._loop_state,
+        session_id="session",
+    ).plain
 
 
 @pytest.mark.asyncio
-async def test_app_surfaces_compacting_state_before_provider_output(
-    tmp_path: Path,
-) -> None:
+async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10252,7 +10244,7 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
         AgentLoop(
             FakeBackend([ScriptedTurn(), ScriptedTurn()]),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10276,7 +10268,7 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         AgentLoop(
             GhostPreviewBackend(),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10302,7 +10294,7 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
         AgentLoop(
             FakeBackend([ScriptedTurn([TextContent("answer")])]),
             ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10333,7 +10325,7 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
             backend,
             ConversationStore(tmp_path / "sessions"),
             tools={"read": lambda _: "tool result"},
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10387,7 +10379,7 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
                 "bash": lambda _: "\n".join(f"line-{i}" for i in range(24)),
                 "read": lambda _: "title\nbody",
             },
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10758,10 +10750,8 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         await tool_started.wait()
         pipe.send_text("\x03")
         await wait_until(
-            lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
-            )
+            lambda: len(store.messages()) == 3
+            and store.messages()[-1].tool_result is not None
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
@@ -10792,10 +10782,8 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         await backend.tool_update.wait()
         pipe.send_text("\x03")
         await wait_until(
-            lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
-            )
+            lambda: len(store.messages()) == 3
+            and store.messages()[-1].tool_result is not None
         )
         pipe.send_text("\x04")
         await run_task
@@ -10894,10 +10882,8 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
         await wait_until(lambda: session is not None and session.app.current_buffer.text == "keep this buffer")
         pipe.send_text("\x1b")
         await wait_until(
-            lambda: (
-                session is not None
-                and session.app.vi_state.input_mode.value == "vi-navigation"
-            )
+            lambda: session is not None
+            and session.app.vi_state.input_mode.value == "vi-navigation"
         )
         pipe.send_text("\r")
         await task
@@ -11076,10 +11062,8 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
         await asyncio.sleep(0)
         pipe.send_text("\x1b[200~pasted line 1\npasted line 2\x1b[201~")
         await wait_until(
-            lambda: (
-                session is not None
-                and session.app.current_buffer.text == "pasted line 1\npasted line 2"
-            )
+            lambda: session is not None
+            and session.app.current_buffer.text == "pasted line 1\npasted line 2"
         )
         pipe.send_text("\x1b[200~\n" + long_line + "\x1b[201~\r")
         await task
@@ -11123,7 +11107,7 @@ async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
             store,
             tools={"danger": lambda _: "done"},
             approval_policy=policy,
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -11322,7 +11306,6 @@ async def test_tui_close_rejects_inflight_transcript_source(
     release.set()
     await close_task
 
-    # test-contract: seam shutdown closes every transcript source.
     assert sources and sources[0]._closed
     assert sources[0]._stores == {}
     assert app._agent_navigation.transcript_control._source is None
@@ -11559,9 +11542,7 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps(
-            {"description": "Explore", "agent_type": "general", "state": "running"}
-        )
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
     )
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     grandchild.agent_lifecycle_path.write_text(
@@ -11645,25 +11626,19 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 
         pipe.send_text("\r")
         await wait_until(
-            lambda: (
-                navigation.current_path == child.session_dir
-                and navigation.child_view_focused()
-            )
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
         )
         await wait_until(
-            lambda: (
-                navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
-            )
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
         )
         assert session.layout.has_focus(navigation.transcript_window)
 
         pipe.send_text("g")
         await wait_until(
-            lambda: (
-                navigation.transcript_window.render_info is not None
-                and navigation.transcript_window.render_info.vertical_scroll == 0
-            )
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll == 0
         )
         before_scroll = navigation.transcript_window.render_info.vertical_scroll
         pipe.send_text("j")
@@ -11680,16 +11655,12 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         )
         pipe.send_text("\r")
         await wait_until(
-            lambda: (
-                navigation.current_path == grandchild.session_dir
-                and navigation.child_view_focused()
-            )
+            lambda: navigation.current_path == grandchild.session_dir
+            and navigation.child_view_focused()
         )
         await wait_until(
-            lambda: (
-                navigation.transcript_control._path == grandchild.session_dir
-                and navigation.transcript_control._snapshot is not None
-            )
+            lambda: navigation.transcript_control._path == grandchild.session_dir
+            and navigation.transcript_control._snapshot is not None
         )
         assert navigation.list_visible
         assert navigation.entries[0].label == "main"
@@ -11699,16 +11670,12 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 
         pipe.send_text("h")
         await wait_until(
-            lambda: (
-                navigation.current_path == child.session_dir
-                and navigation.child_view_focused()
-            )
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
         )
         await wait_until(
-            lambda: (
-                navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
-            )
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
         )
         child_text = Text.from_ansi(
             navigation.transcript_control.transcript.render(120)
@@ -11726,10 +11693,8 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         await wait_until(navigation.list_focused)
         pipe.send_text("\r")
         await wait_until(
-            lambda: (
-                navigation.current_path == child.session_dir
-                and navigation.child_view_focused()
-            )
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
         )
         pipe.send_text("\x1b")
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
@@ -12091,12 +12056,9 @@ async def test_dup_failure_is_reported_not_success(
         storage_lease.close()
 
     assert exceptions == []
-    assert (
-        caplog.messages.count(
-            "failed to persist composer draft: [Errno 24] Too many open files"
-        )
-        == 1
-    )
+    assert caplog.messages.count(
+        "failed to persist composer draft: [Errno 24] Too many open files"
+    ) == 1
     assert DraftPersistence(tmp_path / "draft").load() == "first"
 
 
@@ -12131,10 +12093,8 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
 
-    # test-contract: durability process exit reports a draft that could not be saved.
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
-    # test-contract: seam the process boundary consumes the expected persistence error.
     assert errors == [], "normal exit leaked the draft persistence error"
     assert "unsaved composer draft:" in stderr
     assert "copy this unsaved draft" in stderr
@@ -12192,12 +12152,9 @@ def test_new_session_continues_after_failed_draft_save(
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
 
-    # test-contract: durability process exit reports a draft that could not be saved.
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
-    # test-contract: seam the session transition consumes the persistence error.
     assert errors == [], "new-session transition leaked the draft persistence error"
-    # test-contract: seam the CLI transition starts exactly one replacement session.
     assert runs == 2
     assert "unsaved composer draft:" in stderr
     assert old_session_id in stderr
@@ -12290,7 +12247,6 @@ def test_failed_active_draft_is_printed_on_every_exit(
         with pytest.raises(RuntimeError, match="unexpected failure"):
             cli_main_module.main([])
     else:
-        # test-contract: durability every exit reports a draft that could not be saved.
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
     expected_drafts = 2 if with_replaced_draft else 1
@@ -12298,7 +12254,6 @@ def test_failed_active_draft_is_printed_on_every_exit(
     assert stderr.count("unsaved composer draft:") == expected_drafts
     assert stderr.count("active draft payload") == 1
     assert stderr.count("old draft payload") == int(with_replaced_draft)
-    # test-contract: seam only restart exits cross the exec-restart boundary.
     assert restart_called.is_set() is (exit_kind == "restart")
 
 
@@ -12369,13 +12324,11 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         with pytest.raises(RuntimeError, match="unexpected failure"):
             cli_main_module.main([])
     else:
-        # test-contract: durability every exit reports a draft that could not be saved.
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == 1
     assert "draft one" in stderr
-    # test-contract: seam only restart exits cross the exec-restart boundary.
     assert restart_called.is_set() is (exit_kind == "restart")
 
 
@@ -12410,9 +12363,7 @@ def test_new_session_with_successful_draft_prints_nothing(
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
 
-    # test-contract: durability a saved draft does not produce recovery output.
     assert cli_main_module.main([]) == 0
-    # test-contract: seam the CLI transition starts exactly one replacement session.
     assert runs == 2
     assert "unsaved composer draft:" not in capsys.readouterr().err
 
@@ -12577,12 +12528,10 @@ async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
     with pytest.raises(OSError, match="disk unavailable"):
         await persistence.flush_pending()
 
-    assert notices == [
-        (
-            "composer draft was not saved; your text remains unsaved. copy it before exiting.",
-            loop_thread,
-        )
-    ]
+    assert notices == [(
+        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+        loop_thread,
+    )]
 
 
 @pytest.mark.asyncio
@@ -12999,6 +12948,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     assert backend.max_active == 1
     await app._submissions.close()
     await app.loop.close()
+
 
 
 @pytest.mark.asyncio

@@ -750,11 +750,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             yield execution_lease
             return
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-            lease = SessionExecutionLease.acquire(
-                directory_fd,
-                session_id=session_id,
-                owner=OwnerHint(self._owner_surface),
-            )
+            lease = SessionExecutionLease.retain_resident(directory_fd)
+            if lease is None:
+                lease = SessionExecutionLease.acquire(
+                    directory_fd,
+                    session_id=session_id,
+                    owner=OwnerHint(self._owner_surface),
+                )
             try:
                 yield lease
             finally:
@@ -850,6 +852,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         timeout: float | None = None,
     ):
         if blocking:
+            # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
             require_off_loop_lock("session metadata", SessionLoopThreadLockError)
         self._validate_id(session_id)
         if timeout is not None:

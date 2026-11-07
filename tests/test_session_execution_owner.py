@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from zeta.core.session import SessionManager
+from zeta.core.session_execution import OwnerHint, SessionExecutionLease
 
 _WAIT_TIMEOUT_SECONDS = 10.0
 
@@ -205,6 +206,37 @@ def _open_with_format_lock_probe(home: str, session_id: str, result: Any) -> Non
             result.send(("opened", _epoch(store)))
     except Exception as exc:  # noqa: BLE001 - report across the process boundary
         result.send(("error", type(exc).__name__, str(exc)))
+
+
+def test_execution_acquire_uses_only_nonblocking_flock_and_never_fsyncs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations: list[int] = []
+    fsync_calls: list[int] = []
+    real_flock = fcntl.flock
+
+    def record_flock(fd: int, operation: int) -> None:
+        operations.append(operation)
+        real_flock(fd, operation)
+
+    def record_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+
+    monkeypatch.setattr(fcntl, "flock", record_flock)
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        lease = SessionExecutionLease.acquire(
+            directory_fd,
+            session_id="session",
+            owner=OwnerHint("headless"),
+        )
+        lease.close()
+    finally:
+        os.close(directory_fd)
+
+    assert operations == [fcntl.LOCK_EX | fcntl.LOCK_NB]
+    assert fsync_calls == []
 
 
 def test_second_process_cannot_open_owned_session(tmp_path: Path) -> None:

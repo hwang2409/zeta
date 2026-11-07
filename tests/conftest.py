@@ -688,12 +688,6 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
-    # test-contract: seam cleanup must track every direct runtime constructor
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
-    # test-contract: seam cleanup tracks this runtime constructor
     # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     # test-contract: seam tracks and closes session managers created by tests
@@ -828,17 +822,6 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
-    # test-contract: seam cleanup must track every direct runtime constructor
-    monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
-    # test-contract: seam cleanup tracks this runtime constructor
-    monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
-    # test-contract: seam cleanup tracks this runtime constructor
     # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     # test-contract: seam tracks and closes stores created by tests

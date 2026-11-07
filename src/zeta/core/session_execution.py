@@ -14,14 +14,10 @@ from typing import Literal
 
 from ..storage_format import WriterLease
 from .checkpoints import ConversationIntegrityError
-from .session_files import SessionInUseError, open_session_file, require_off_loop_lock
+from .session_files import SessionInUseError, open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"
 OwnerSurface = Literal["tui", "headless", "serve", "child", "recovery"]
-
-
-class RuntimeLeaseLoopThreadLockError(RuntimeError):
-    """Raised before an execution lease can block an asyncio event-loop thread."""
 
 
 class StaleSessionOwnerError(ConversationIntegrityError):
@@ -130,13 +126,16 @@ class SessionExecutionLease:
     ) -> SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
 
-        require_off_loop_lock("session execution", RuntimeLeaseLoopThreadLockError)
+        # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
         stat = os.fstat(directory_fd)
         identity = (stat.st_dev, stat.st_ino)
         with _REGISTRY_LOCK:
             local = _REGISTRY.get(identity)
             if local is not None:
-                raise SessionOwnedError(session_id)
+                if local.state not in {"owned", "recovery"}:
+                    raise SessionOwnedError(session_id)
+                local.refs += 1
+                return cls(local, local.epoch)
             fd = open_session_file(
                 directory_fd,
                 RUNTIME_LEASE_NAME,
@@ -172,6 +171,19 @@ class SessionExecutionLease:
             )
             _REGISTRY[identity] = owned
             return cls(owned, epoch)
+
+    @classmethod
+    def retain_resident(cls, directory_fd: int) -> SessionExecutionLease | None:
+        """Retain this process's resident owner, if one exists."""
+
+        stat = os.fstat(directory_fd)
+        identity = (stat.st_dev, stat.st_ino)
+        with _REGISTRY_LOCK:
+            owned = _REGISTRY.get(identity)
+            if owned is None or owned.state not in {"owned", "recovery"}:
+                return None
+            owned.refs += 1
+            return cls(owned, owned.epoch)
 
     @classmethod
     @contextmanager

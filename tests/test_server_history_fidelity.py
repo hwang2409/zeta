@@ -583,7 +583,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
             and isinstance(args[1].get("turn_id"), str)
         ):
             committed.set()
-            assert release.wait(timeout=10)
+            assert release.wait(timeout=5)
         return result
 
     # test-contract: durability pauses after commit to prove publication ordering
@@ -603,16 +603,13 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
         await request(reader, writer, 11, "send", {"text": "finish"})
         announcement = asyncio.create_task(event(reader, "agent_end"))
-        assert await asyncio.to_thread(committed.wait, 10)
+        assert await asyncio.to_thread(committed.wait, 5)
 
         def reopened_rows():
             from zeta.core.store import ConversationStore
 
             reopened = ConversationStore(
-                store.root_dir,
-                session_id=session_id,
-                _must_exist=True,
-                _read_only=True,
+                store.root_dir, session_id=session_id, _must_exist=True
             )
             try:
                 return reopened.replay()

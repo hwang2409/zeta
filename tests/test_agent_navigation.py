@@ -1425,14 +1425,7 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     release.set()
     await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
-    await asyncio.wait_for(asyncio.gather(*tuple(app._child_send_tasks)), timeout=10)
-    target = app.loop._background_owner.conversation_channel._delivery_targets[
-        "root:worker"
-    ]
-    assert [
-        entry.data["text"]
-        for entry in target.flow.store.pending_prompt_queue._pending_unlocked()
-    ] == ["follow up"]
+    assert [entry.data["text"] for entry in await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts)] == ["follow up"]
     assert store.messages() == []
     assert "queued message for root:worker" in notices
     await app.close()

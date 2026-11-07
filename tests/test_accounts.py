@@ -2009,6 +2009,7 @@ def test_cli_logout_refuses_account_pinned_by_live_session(
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     manager.record_account_selection(opened.metadata, account, boundary=0)
+    opened.store.activate_runtime_lease()
     monkeypatch.setattr(cli_main, "env_home", lambda: home)
     try:
         assert cli_main.main(["accounts", "logout", "codex:work"]) == 1
@@ -2031,6 +2032,7 @@ def test_logout_refuses_account_pinned_by_live_child(tmp_path: Path) -> None:
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     manager.record_account_selection(opened.metadata, current, boundary=0)
     child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
     child.start_agent_lifecycle(
         handle=f"{opened.metadata.session_id}:1",
         started_at="2026-01-01T00:00:00Z",
@@ -2058,6 +2060,7 @@ def test_logout_cannot_race_live_child_pin_publication(
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.activate_runtime_lease()
     scan_finished = threading.Event()
     publish_finished = threading.Event()
     original_scan = account_store._live_session_pins

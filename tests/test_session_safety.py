@@ -14,12 +14,7 @@ import pytest
 
 from zeta.cli.main import main
 from zeta.core import session as session_module
-from zeta.core.session import (
-    SessionError,
-    SessionInUseError,
-    SessionManager,
-    SessionOwnedError,
-)
+from zeta.core.session import SessionError, SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore, TranscriptLoadError
 from zeta.protocol.types import (
     Message,
@@ -80,21 +75,26 @@ def test_rename_refuses_aberrant_files(tmp_path, name, kind):
     assert sentinel.read_text() == "keep"
 
 
-def test_delete_refuses_open_store_until_owner_closes(tmp_path, monkeypatch):
+def test_delete_refuses_every_open_store_until_last_close(tmp_path, monkeypatch):
     manager, sid = closed_session(tmp_path)
     monkeypatch.setenv("ZETA_HOME", str(manager.home))
     first = manager.open(sid).store
-    with pytest.raises(SessionOwnedError):
-        ConversationStore(manager.sessions_dir, session_id=sid)
+    second = ConversationStore(manager.sessions_dir, session_id=sid)
     try:
         with pytest.raises(SessionInUseError):
             manager.delete(sid)
         assert main(["session", "delete", sid, "--force"]) == 1
         first.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("still writable")]), MessageOrigin.USER))
+        first.close()
+        with pytest.raises(SessionInUseError):
+            manager.delete(sid)
     finally:
         first.close()
+        second.close()
     assert main(["session", "delete", sid, "--force"]) == 0
     assert not (manager.sessions_dir / sid).exists()
+    with pytest.raises(ValueError, match="closed"):
+        second.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("too late")]), MessageOrigin.USER))
 
 
 def test_crashed_store_releases_lease(tmp_path):
@@ -419,7 +419,7 @@ def test_storage_operations_never_pass_full_session_paths_to_os(tmp_path, monkey
         store._agent_lifecycle = {"state": "completed"}
         store._write_agent_lifecycle()
         store._load_session_state()
-        assert manager.rename(sid, "renamed", store.execution_lease).name == "renamed"
+        assert manager.rename(sid, "renamed").name == "renamed"
         assert "saved" in manager.export(sid)
         assert [item.session_id for item in manager.list_sessions()] == [sid]
         store.close()
@@ -616,9 +616,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         draft.clear()
         message = build_user_message("log", tmp_path, (store.session_dir / "background.log",), session_store=store)
         assert "background" in message.content[1].text
-        renamed = await asyncio.to_thread(
-            runtime.manager.rename, sid, "renamed", store.execution_lease
-        )
+        renamed = await asyncio.to_thread(runtime.manager.rename, sid, "renamed")
         assert renamed.name == "renamed"
         store.append_checkpoint("audit")
         await runtime.close()

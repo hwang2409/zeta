@@ -1791,7 +1791,7 @@ async def _accept_model_change(model: str) -> SimpleNamespace:
 async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
-        AgentLoop(backend, await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1838,7 +1838,7 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
 @pytest.mark.asyncio
 async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1865,7 +1865,7 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1897,7 +1897,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1921,7 +1921,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="gpt-5.4",
         on_model_change=_accept_model_change,
@@ -1937,7 +1937,7 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset(),
@@ -1951,7 +1951,7 @@ async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
     )
@@ -1969,7 +1969,7 @@ async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions")
+    store = ConversationStore(tmp_path / "sessions")
     policy = ApprovalPolicy(store=store)
     call = ToolCall("pending-model-swap", "echo", {})
     store.append_message_with_approval_requests(
@@ -1992,7 +1992,7 @@ async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions")
+    store = ConversationStore(tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
     assembler = ContextAssembler(
@@ -2721,11 +2721,11 @@ async def test_cancel_honors_approval_won_by_other_writer(
         lambda: app._submissions.approval_owners.get(call.id) == submission.id
     )
 
-    context = multiprocessing.get_context("fork")
-    ready = context.Event()
-    process = context.Process(
+    writer = opened.store._new_persistent_durable_writer()
+    ready = threading.Event()
+    process = threading.Thread(
         target=_allow_approval_while_holding_lock,
-        args=(root, opened.store.session_id, call.id, ready, 0.25),
+        args=(writer, call.id, ready, 0.25),
     )
     process.start()
     assert ready.wait(timeout=2)
@@ -2989,11 +2989,11 @@ async def test_resume_does_not_act_on_stale_state_while_writer_holds_lock(
         [(call.id, call)],
     )
     assert policy.approve(call.id)
-    context = multiprocessing.get_context("fork")
-    ready = context.Event()
-    process = context.Process(
+    writer = store._new_persistent_durable_writer()
+    ready = threading.Event()
+    process = threading.Thread(
         target=_append_tool_result_while_holding_lock,
-        args=(root, call.id, ready, 0.25),
+        args=(writer, call.id, ready, 0.25),
     )
     process.start()
     assert ready.wait(timeout=2)
@@ -3451,8 +3451,11 @@ def test_copy_metadata_adopts_every_dataclass_field(tmp_path: Path) -> None:
     for metadata_field in dataclasses.fields(SessionMetadata):
         copied = getattr(target, metadata_field.name)
         original = getattr(source, metadata_field.name)
-        assert copied == original
-        assert copied is not original
+        if metadata_field.name == "_execution_lease":
+            assert copied is None
+        else:
+            assert copied == original
+            assert copied is not original
 
 
 def test_prompt_component_digest_must_match_owned_span(tmp_path: Path) -> None:
