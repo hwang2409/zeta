@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import pty
@@ -31,6 +32,7 @@ from tests.support.processes import (
     wait_pid_exited,
 )
 from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -39,6 +41,7 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolSchema,
@@ -46,6 +49,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.server import event_contract
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import background_spawn as spawn_module
@@ -58,16 +62,16 @@ from zeta.tools._shared.process import (
     _group_exists,
     _OrderedLogWriter,
 )
-from zeta.tui.render import format_status
+from zeta.tui.render import format_status, render_event
 
 
 def _python(*parts: str) -> str:
     return shlex.join((sys.executable, "-c", *parts))
 
 
-def _renderable_plain(renderable: object) -> str:
+def _renderable_plain(renderable: object, *, width: int = 80) -> str:
     output = StringIO()
-    Console(file=output, width=80, force_terminal=True).print(renderable)
+    Console(file=output, width=width, force_terminal=True).print(renderable)
     return Text.from_ansi(output.getvalue()).plain
 
 
@@ -514,35 +518,85 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "session")
-    flow = pending_delivery_module.StepDeliveryFlow(store)
-    registry = ToolRegistry(
-        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
-    )
-    registry.background_tasks.set_notification_sink(
-        lambda item: flow.produce(_task_notification(item))
-    )
-    task_id, _ = await registry.background_tasks.start(
-        _python("import time; time.sleep(30)"), Path.cwd()
-    )
+@pytest.mark.parametrize("surface", ["tool_result", "tui", "serve"])
+async def test_task_kill_tool_reports_agent_cause_on_every_surface(
+    tmp_path: Path, surface: str
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        store = ConversationStore(tmp_path / "session")
+        stack.callback(store.close)
+        flow = pending_delivery_module.StepDeliveryFlow(store)
+        registry = ToolRegistry(
+            tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+        )
+        stack.push_async_callback(registry.close)
+        registry.background_tasks.set_notification_sink(
+            lambda item: flow.produce(_task_notification(item))
+        )
+        task_id, _ = await registry.background_tasks.start(
+            _python("import time; time.sleep(30)"), Path.cwd()
+        )
 
-    await registry.execute(
-        ToolCall("kill", "task_kill", {"task_id": task_id})
-    )
+        call = ToolCall("kill", "task_kill", {"task_id": task_id})
+        result = await registry.execute(call)
+        text = result["content"][0]["text"]
+        cause = "task_kill tool requested by the agent"
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=receipt_tool_result(call.id, result),
+        )
+        if surface == "tool_result":
+            assert text == f"background task {task_id} killed ({cause}), exit -15"
+            assert result["structuredContent"]["note"] == cause
+        elif surface == "tui":
+            rendered = render_event(event)
+            assert rendered is not None
+            card = _renderable_plain(rendered, width=120)
+            assert "killed" in card
+            assert cause in card
+        else:
+            projected = event_contract.tool_end(event)
+            assert projected["tool_result"]["content"] == (
+                f"background task {task_id} killed ({cause}), exit -15"
+            )
+            assert projected["tool_result"]["structured_content"]["note"] == cause
 
-    task_exits = [
-        entry
-        for entry in store.agent_notifications(pending_only=False)
-        if entry.data.get("kind") == "task_exited"
-    ]
-    assert len(task_exits) == 1
-    assert task_exits[0].data["task_id"] == task_id
-    assert task_exits[0].data["note"] == "task_kill tool requested by the agent"
-    assert store.is_agent_notification_presented_to_tui(task_exits[0].id)
-    await registry.close()
-    assert len(store.agent_notifications(pending_only=False)) == 1
-    store.close()
+        task_exits = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert len(task_exits) == 1
+        assert task_exits[0].data["task_id"] == task_id
+        assert task_exits[0].data["note"] == cause
+        assert store.is_agent_notification_presented_to_tui(task_exits[0].id)
+        await registry.close()
+        assert len(store.agent_notifications(pending_only=False)) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_kill_tool_reports_task_that_already_exited(tmp_path: Path) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        stack.push_async_callback(registry.close)
+        task_id, _ = await registry.background_tasks.start(
+            _python("raise SystemExit(7)"), Path.cwd()
+        )
+        await _wait_for_exit(registry.background_tasks, task_id)
+
+        result = await registry.execute(
+            ToolCall("kill", "task_kill", {"task_id": task_id})
+        )
+
+        assert result["content"][0]["text"] == (
+            f"background task {task_id} exited, exit 7"
+        )
+        assert result["structuredContent"] == {
+            "task_id": task_id,
+            "running": False,
+            "exit_code": 7,
+        }
 
 
 @pytest.mark.asyncio

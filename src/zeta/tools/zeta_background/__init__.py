@@ -120,14 +120,21 @@ async def _task_kill(
     registry: ToolRegistry,
     arguments: dict[str, Any],
 ) -> StructuredToolResult:
+    cause = "task_kill tool requested by the agent"
     result = await registry.background_tasks.kill(
         arguments["task_id"],
-        cause="task_kill tool requested by the agent",
+        cause=cause,
         tui_presented=True,
     )
-    status = "running" if result["running"] else "exited"
+    if result.get("note") == cause:
+        status = f"killed ({result['note']})"
+    else:
+        status = "running" if result["running"] else "exited"
+    exit_status = (
+        f", exit {result['exit_code']}" if result["exit_code"] is not None else ""
+    )
     return _result(
-        f"background task {result['task_id']} {status}",
+        f"background task {result['task_id']} {status}{exit_status}",
         result,
     )
 
