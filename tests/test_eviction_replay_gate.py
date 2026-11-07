@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,7 +28,37 @@ def test_controller_snapshot_is_stable_and_production_readable(tmp_path: Path) -
         handle.write(b'{"late":true}\n')
     assert (snapshot / "conversation.jsonl").read_bytes() == original
     assert info["row_count"] == 145
-    assert info["sha256"] == __import__("hashlib").sha256(original).hexdigest()
+    assert info["sha256"] == hashlib.sha256(original).hexdigest()
+    assert info["sha256"] != hashlib.sha256((source / "conversation.jsonl").read_bytes()).hexdigest()
+
+
+def test_compare_manifest_uses_one_snapshot_for_both_sides(tmp_path: Path) -> None:
+    from scripts.eviction_replay_gate import _fixture_store
+
+    home = tmp_path / "home"
+    source = home / ".zeta" / "sessions" / "fixture"
+    source.parent.mkdir(parents=True)
+    _fixture_store(source.parent)
+    original = (source / "conversation.jsonl").read_bytes()
+    (source / "meta.json").write_text(json.dumps({"compaction_budget": 4000, "retained_tail": 3, "provider": "anthropic"}))
+    (home / ".zeta" / "storage-format.json").write_text(json.dumps({"writer_epoch": 2}))
+    head = _mutated_ref(tmp_path, [])
+    script = head / "scripts/eviction_replay_gate.py"
+    marker = "    root = Path(args.session).expanduser() if args.session else None\n"
+    mutation = marker + '    if os.environ.get("EVICTION_MUTATE_SOURCE"):\n        source = Path(os.environ["EVICTION_MUTATE_SOURCE"])\n        row = json.loads(source.read_text().splitlines()[-1])\n        row.update(id="00000000000000000000000000000093", parent_id="00000000000000000000000000000092", seq=146)\n        with source.open("ab") as handle:\n            handle.write((json.dumps(row) + "\\n").encode())\n'
+    script.write_text(script.read_text().replace(marker, mutation, 1))
+    result = _compare(
+        ROOT, head, tmp_path, fixture=False,
+        env={"HOME": str(home), "EVICTION_MUTATE_SOURCE": str(source / "conversation.jsonl")},
+        extra=["--session", "fixture"],
+    )
+    assert result.returncode == 0, result.stderr
+    session = json.loads((tmp_path / "manifest.json").read_text())["sessions"][0]
+    input_info = session["input"]
+    # the source mutation occurs after the controller snapshot; both sides use its digest
+    assert input_info["row_count"] == 145
+    assert input_info["sha256"] == hashlib.sha256(original).hexdigest()
+    assert input_info["sha256"] != hashlib.sha256((source / "conversation.jsonl").read_bytes()).hexdigest()
 
 
 def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) -> None:
@@ -98,15 +130,60 @@ def _mutated_ref(tmp_path: Path, replacements: list[tuple[str, str]]) -> Path:
     return ref
 
 
-def _compare(base: Path, head: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+def _compare(base: Path, head: Path, tmp_path: Path, *, env: dict[str, str] | None = None, extra: list[str] | None = None, fixture: bool = True) -> subprocess.CompletedProcess[str]:
+    fixture_arg = ["--fixture"] if fixture else []
     return subprocess.run(
-        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "compare", "--base", str(base), "--head", str(head), "--fixture", "--out", str(tmp_path / "manifest.json")],
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "compare", "--base", str(base), "--head", str(head), *fixture_arg, "--out", str(tmp_path / "manifest.json"), *(extra or [])],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
-        env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")},
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), **(env or {})},
     )
+
+
+def test_compare_records_exact_identity_for_each_worktree(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    subprocess.run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(["git", "worktree", "add", "--detach", str(head), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(head), "commit", "--allow-empty", "-m", "identity test"], check=True, capture_output=True, text=True)
+        result = _compare(base, head, tmp_path)
+        assert result.returncode == 0, result.stderr
+        manifest = json.loads((tmp_path / "manifest.json").read_text())["sessions"][0]
+        assert manifest["base"]["git_head"] == subprocess.check_output(["git", "-C", str(base), "rev-parse", "HEAD"], text=True).strip()
+        assert manifest["head"]["git_head"] == subprocess.check_output(["git", "-C", str(head), "rev-parse", "HEAD"], text=True).strip()
+        assert manifest["base"]["git_head"] != manifest["head"]["git_head"]
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(head)], cwd=ROOT, check=False, capture_output=True)
+        subprocess.run(["git", "worktree", "remove", "--force", str(base)], cwd=ROOT, check=False, capture_output=True)
+
+
+def test_compare_rejects_import_outside_expected_worktree(tmp_path: Path) -> None:
+    head = _mutated_ref(tmp_path, [])
+    shutil.rmtree(head / "src" / "zeta")
+    result = _compare(ROOT, head, tmp_path)
+    assert result.returncode != 0
+    assert "identity outside expected worktree" in result.stderr
+
+
+def test_fixture_compare_reports_stored_floor_violation_without_failing() -> None:
+    from scripts.eviction_replay_gate import _floor_metrics
+
+    floor = {"version": 1, "oldest": [], "newest": [{"fact": {"type": "pr", "pr": 1}, "first_seq": 1, "last_seq": 1, "value_rank": [1, 0]}]}
+    violations: list[str] = []
+    metrics = _floor_metrics([{"seq": 1, "data": {"fact_floor": floor}}], {"oldest": 8, "newest": 0, "chars": 4096, "tokens": 4096}, "persisted", violations)
+    assert metrics == [{"oldest": 0, "newest": 1, "chars": 28, "tokens": 29}]
+    assert violations == ["seq=1 oldest=0 newest=1 chars=28 tokens=29"]
+
+
+def test_fixture_compare_fails_when_code_appends_floor_violation() -> None:
+    from scripts.eviction_replay_gate import _floor_metrics
+
+    floor = {"version": 1, "oldest": [], "newest": [{"fact": {"type": "pr", "pr": 1}, "first_seq": 1, "last_seq": 1, "value_rank": [1, 0]}]}
+    with pytest.raises(RuntimeError, match="retained-floor bound check failed"):
+        _floor_metrics([{"seq": 1, "data": {"fact_floor": floor}}], {"oldest": 8, "newest": 0, "chars": 4096, "tokens": 4096}, "appended")
 
 
 def test_fixture_compare_rejects_receipt_mutation_without_values(tmp_path: Path) -> None:
