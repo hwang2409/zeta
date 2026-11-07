@@ -26,9 +26,7 @@ def delivery_status_row(
     }
     if "reason" in data:
         row["reason"] = data["reason"]
-        row["content"] = [
-            {"type": "text", "text": f"{text}: {data['reason']}"}
-        ]
+        row["content"] = [{"type": "text", "text": f"{text}: {data['reason']}"}]
     if accepted_message is not None:
         row["content"] = accepted_message.to_dict()["content"]
     return row
@@ -40,7 +38,10 @@ def served_turn_end_row(entry: ConversationEntry) -> dict[str, object]:
         "id": entry.id,
         "role": "system",
         "event": "served_turn_end",
-        "data": {"reason": entry.data["reason"]},
+        "data": {
+            "turn_id": entry.data["turn_id"],
+            "reason": entry.data["reason"],
+        },
     }
 
 
@@ -82,6 +83,7 @@ def project_tool_value(value: object) -> tuple[object, bool]:
         return result, truncated
     return value, False
 
+
 LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
@@ -114,6 +116,7 @@ AUXILIARY_WIRE_EVENTS = {
     AuxiliaryEvent.USAGE: "usage",
     AuxiliaryEvent.USER_MESSAGE: "user_message",
 }
+
 
 # Custom projections in server.py use this exhaustive contract.
 def _tool_call(event: StreamEvent) -> dict[str, object] | None:
@@ -194,8 +197,10 @@ def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]
             if structured is not None:
                 projected_structured, wire_truncated = project_tool_value(structured)
                 projected["structured_content"] = projected_structured
-                projected["structured_content_truncated"] = structured_content_truncated(
-                    structured, wire_truncated=wire_truncated
+                projected["structured_content_truncated"] = (
+                    structured_content_truncated(
+                        structured, wire_truncated=wire_truncated
+                    )
                 )
             result = projected
     return {

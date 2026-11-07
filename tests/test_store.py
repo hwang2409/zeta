@@ -3014,8 +3014,10 @@ def test_all_agent_notifications_copy_only_notification_rows(
             },
         ),
         *(
-            ("turn_end", {"reason": reason})
-            for reason in ("completed", "user_stop", "error", "disconnect")
+            ("turn_end", {"turn_id": f"{index:032x}", "reason": reason})
+            for index, reason in enumerate(
+                ("completed", "user_stop", "error", "disconnect")
+            )
         ),
     ],
 )
@@ -3045,7 +3047,14 @@ def test_store_accepts_and_reopens_new_history_shapes(
                 legacy = reopened.active_branch_snapshot()[-1]
                 assert "accepted_message" not in legacy.data
             else:
-                for invalid in ({}, {"reason": "unknown"}):
+                for invalid in (
+                    {},
+                    {"turn_id": "0" * 32, "reason": "unknown"},
+                    {"turn_id": "0" * 31, "reason": "completed"},
+                    {"turn_id": "A" * 32, "reason": "completed"},
+                    {"turn_id": "g" * 32, "reason": "completed"},
+                    {"turn_id": "0" * 32, "reason": "completed", "extra": True},
+                ):
                     with pytest.raises(ValueError, match="invalid payload"):
                         reopened._append_row("turn_end", invalid)
         finally:

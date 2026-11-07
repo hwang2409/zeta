@@ -8581,7 +8581,9 @@ def test_rebuild_renders_closed_turn_end_reasons(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     replay = tuple(
-        SimpleNamespace(type="turn_end", data={"reason": reason}, id=reason)
+        SimpleNamespace(
+            type="turn_end", data={"turn_id": "0" * 32, "reason": reason}, id=reason
+        )
         for reason in ("user_stop", "completed", "error", "disconnect")
     )
     monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)

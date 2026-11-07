@@ -39,7 +39,7 @@ def test_predecessor_store_rejects_new_history_shapes_without_mutation(
                 "accepted_message": accepted_message.to_dict(),
             },
         )
-        store._append_row("turn_end", {"reason": "disconnect"})
+        store._append_row("turn_end", {"turn_id": "0" * 32, "reason": "disconnect"})
         store.close()
         reopened = ConversationStore(
             sessions, session_id="history-fidelity", _must_exist=True

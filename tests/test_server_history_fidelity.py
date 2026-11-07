@@ -305,6 +305,7 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
     )
     try:
         await request(reader, writer, 3, "send", {"text": "hello"})
+        first_start = await event(reader, "turn_start")
         await event(reader, "approval_request")
         await request(
             reader,
@@ -316,6 +317,7 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         provider_end = await event(reader, "turn_end")
         assert set(provider_end["data"]) >= {"turn", "tool_calls"}
         assert "reason" not in provider_end["data"]
+        second_start = await event(reader, "turn_start")
         second_provider_end = await event(reader, "turn_end")
         assert set(second_provider_end["data"]) >= {"turn", "tool_calls"}
         await event(reader, "agent_end")
@@ -323,7 +325,13 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         rows = await _history(reader, writer, session_id)
         served = [row for row in rows if row.get("event") == "served_turn_end"]
         assert len(served) == 1
-        assert served[0]["data"] == {"reason": "completed"}
+        live_turn_id = first_start["data"].get("turn_id")
+        assert isinstance(live_turn_id, str)
+        assert second_start["data"].get("turn_id") == live_turn_id
+        assert served[0]["data"] == {
+            "turn_id": live_turn_id,
+            "reason": "completed",
+        }
 
         writer.close()
         await writer.wait_closed()
@@ -338,6 +346,53 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         assert "served_turn_end" not in hello[-1]["result"]["capabilities"]["features"]
         rows = await _history(reader, writer, session_id)
         assert not any(row.get("event") == "served_turn_end" for row in rows)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_sequential_served_turns_have_distinct_correlated_ids(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("second")]),
+        ]
+    )
+    server, reader, writer, session_id = await _open(
+        tmp_path, backend, features=["served_turn_end"]
+    )
+    try:
+        live: list[tuple[int, object]] = []
+        for request_id, text in ((3, "first"), (4, "second")):
+            await request(reader, writer, request_id, "send", {"text": text})
+            started = await event(reader, "turn_start")
+            live.append((started["data"]["turn"], started["data"].get("turn_id")))
+            await event(reader, "agent_end")
+
+        rows = await _history(reader, writer, session_id)
+        history_ids = [
+            row["data"].get("turn_id")
+            for row in rows
+            if row.get("event") == "served_turn_end"
+        ]
+        assert [turn for turn, _ in live] == [1, 1]
+        assert all(isinstance(turn_id, str) for _, turn_id in live)
+        assert live[0][1] != live[1][1]
+        assert history_ids == [turn_id for _, turn_id in live]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_legacy_turn_start_omits_turn_id(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, _ = await _open(tmp_path, backend, features=[])
+    try:
+        await request(reader, writer, 3, "send", {"text": "hello"})
+        started = await event(reader, "turn_start")
+        assert started["data"].get("turn_id") is None
     finally:
         await _close(server, writer)
 
@@ -388,6 +443,9 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
         )
         assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
         await request(reader, writer, 11, "send", {"text": "finish"})
+        started = await event(reader, "turn_start")
+        live_turn_id = started["data"].get("turn_id")
+        assert isinstance(live_turn_id, str)
         if isinstance(backend, _BlockingBackend):
             await backend.started.wait()
         if reason == "user_stop":
@@ -409,11 +467,9 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
                 {"protocol_version": "1.2", "features": ["served_turn_end"]},
             )
         rows = await _history(reader, writer, session_id)
-        assert [
-            row["data"]["reason"]
-            for row in rows
-            if row.get("event") == "served_turn_end"
-        ] == [reason]
+        served = [row for row in rows if row.get("event") == "served_turn_end"]
+        assert [row["data"]["reason"] for row in served] == [reason]
+        assert served[0]["data"].get("turn_id") == live_turn_id
     finally:
         await _close(server, writer)
 
@@ -472,14 +528,20 @@ async def test_background_finalizers_persist_served_turn_end(
                 "approve",
                 {"request_id": call.id, "scope": "once"},
             )
+        live_turn_id = None
+        if finalizer == "notification":
+            started = await event(reader, "turn_start")
+            live_turn_id = started["data"].get("turn_id")
+            assert isinstance(live_turn_id, str)
         await finalized.wait()
 
         rows = await _history(reader, writer, session_id)
-        assert [
-            row["data"]["reason"]
-            for row in rows
-            if row.get("event") == "served_turn_end"
-        ] == ["completed"]
+        served = [row for row in rows if row.get("event") == "served_turn_end"]
+        assert [row["data"]["reason"] for row in served] == ["completed"]
+        stored_turn_id = served[0]["data"].get("turn_id")
+        assert isinstance(stored_turn_id, str)
+        if live_turn_id is not None:
+            assert stored_turn_id == live_turn_id
     finally:
         await _close(server, writer)
 
@@ -499,14 +561,17 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
 
     def gate_after_commit(self, method_name, args, kwargs):
         result = original_durable_write(self, method_name, args, kwargs)
-        if method_name == "_append_row" and args == (
-            "turn_end",
-            {"reason": "completed"},
+        if (
+            method_name == "_append_row"
+            and args[0] == "turn_end"
+            and args[1].get("reason") == "completed"
+            and isinstance(args[1].get("turn_id"), str)
         ):
             committed.set()
             assert release.wait(timeout=5)
         return result
 
+    # test-contract: durability pauses after commit to prove publication ordering
     monkeypatch.setattr(type(store), "_run_durable_write", gate_after_commit)
     announcement: asyncio.Task[dict] | None = None
     try:
@@ -538,7 +603,9 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
 
         durable_rows = await asyncio.to_thread(reopened_rows)
         assert any(
-            row.type == "turn_end" and row.data == {"reason": "completed"}
+            row.type == "turn_end"
+            and row.data.get("reason") == "completed"
+            and isinstance(row.data.get("turn_id"), str)
             for row in durable_rows
         )
         assert server.runtime.state.status == "running"
@@ -568,9 +635,13 @@ async def test_history_projects_all_closed_served_turn_end_reasons(
     )
     try:
         store = server.runtime.opened.store
-        for reason in ("completed", "user_stop", "error", "disconnect"):
+        for index, reason in enumerate(
+            ("completed", "user_stop", "error", "disconnect")
+        ):
             try:
-                store._append_row("turn_end", {"reason": reason})
+                store._append_row(
+                    "turn_end", {"turn_id": f"{index:032x}", "reason": reason}
+                )
             except ValueError:
                 pass
 

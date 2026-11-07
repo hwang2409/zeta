@@ -678,12 +678,17 @@ that gets no answer within its own timeout can treat the server as hung.
 All examples below use the common event envelope:
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
 
 `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, and
-`turn_aborted` carry `data` when the loop supplies it. `turn_end` data includes
-`turn` and `tool_calls`.
+`turn_aborted` carry `data` when the loop supplies it. When the connection
+negotiates `served_turn_end`, each `turn_start` also carries `data.turn_id`, a
+lowercase UUID hex string that identifies the whole served turn. Connections
+without that feature receive the previous `turn_start` shape. `data.turn`
+continues to number provider segments inside the served turn, so several
+`turn_start` events can have the same `turn_id`. `turn_end` data includes `turn`
+and `tool_calls`.
 
 `assistant_delta` carries `delta` (a bounded string) and `kind` (`assistant`,
 `thinking`, or another content type). `assistant_message` carries `message`,
@@ -956,7 +961,7 @@ Event fields are:
 | event | required fields | optional fields |
 | --- | --- | --- |
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
-| `served_turn_end` (feature `served_turn_end`) | `event`, `data: {reason: "completed"|"user_stop"|"error"|"disconnect"}` | `session_id`, `id` (history only), `role` (history only) |
+| `served_turn_end` (feature `served_turn_end`) | `event`, `data: {turn_id: string, reason: "completed"|"user_stop"|"error"|"disconnect"}` | `session_id`, `id` (history only), `role` (history only) |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
@@ -1014,10 +1019,12 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `turn_end` ends one provider segment; it does not mean that the agent loop
    is idle, and one served turn can contain several `turn_end` events. The
    separately negotiated `served_turn_end` history event records the final
-   outcome of the whole served turn. It occurs at most once per served turn and
-   has one closed `data.reason`: `completed`, `user_stop`, `error`, or
-   `disconnect`. Clients must wait for `agent_end` before idle-only requests such
-   as `new_session`; the server commits `served_turn_end` before cleanup. Error
+   outcome of the whole served turn. Its `data.turn_id` matches every negotiated
+   provider-segment `turn_start` in that served turn. It occurs at most once per
+   served turn and has one closed `data.reason`: `completed`, `user_stop`,
+   `error`, or `disconnect`. Clients must wait for `agent_end` before idle-only
+   requests such as `new_session`; the server commits `served_turn_end` before
+   cleanup. Error
    and abort paths still end with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
