@@ -918,6 +918,123 @@ def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> Non
     assert "pr-line" in modified.stdout
 
 
+def _public_line_case(
+    r: Path, base_text: str, branch_text: str, main_text: str, merge_text: str, final_text: str
+) -> tuple[str, str]:
+    repo(r)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(base_text)
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(main_text)
+    (r / "main-note.txt").write_text("main\n")
+    commit(r, "main")
+    main = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text(merge_text)
+    commit(r, "merge")
+    merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    (r / "src/a.py").write_text(final_text)
+    (r / "final-note.txt").write_text("final\n")
+    commit(r, "final")
+    final = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    return merge, final
+
+
+def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
+    cases = [
+        (
+            "two identical lines lost, final restores one",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            1,
+            "emit()",
+        ),
+        (
+            "two identical lines lost, final restores both",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n    emit()\n",
+            0,
+            "moved/restored later",
+        ),
+        (
+            "pr-line unique move under final",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def g():\n    one()\n    emit()\n",
+            0,
+            "moved/restored later",
+        ),
+        (
+            "ambiguous move",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n    emit()\n",
+            "def f():\n    one()\n",
+            "def f():\n    one()\n",
+            "def g():\n    emit()\n    one()\ndef h():\n    emit()\n",
+            1,
+            "emit()",
+        ),
+        (
+            "insertion inside main replacement",
+            "one()\ntwo()\n",
+            "one()\nadded()\ntwo()\n",
+            "main()\n",
+            "main()\n",
+            "main()\n",
+            0,
+            "clean merge",
+        ),
+    ]
+    for name, base, branch, main, merge_text, final, expected, needle in cases:
+        r = tmp_path / name.replace(" ", "_")
+        r.mkdir()
+        merge, final_revision = _public_line_case(r, base, branch, main, merge_text, final)
+        result = run(r, merge, "--final", final_revision)
+        output = result.stdout + result.stderr
+        assert result.returncode == expected, name
+        assert needle in output, name
+
+
+def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> None:
+    for revision in ("628344f0", "f8ccd8fb"):
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+            cwd=Path(__file__).parents[1], check=False,
+        )
+        if present.returncode:
+            pytest.skip(f"historical commit {revision} is absent from this checkout")
+    repo_root = Path(__file__).parents[1]
+    first = run(repo_root, "628344f0")
+    first_output = first.stdout + first.stderr
+    assert "pr-line SlashHandlerMixin._show_accounts_picker" in first_output
+    assert "pr-line ServerSlashSession.slash_accounts" in first_output
+    assert "main parent line" not in first_output
+    assert "pr/branch parent line" in first_output
+    second = run(repo_root, "f8ccd8fb")
+    second_output = second.stdout + second.stderr
+    for expected in (
+        "tests/test_server_mcp_tool_filter.py: pr-line <module>@",
+        "tests/test_mcp_oauth.py: pr-line <module>@",
+        "tests/test_mcp_oauth.py: pr-line _monkey_home@",
+        "src/zeta/tui/cards/mcp_manager.py: pr-line <module>@",
+    ):
+        assert expected in second_output
+
+
+
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     r = repo(tmp_path)
     (r / "src").mkdir()
