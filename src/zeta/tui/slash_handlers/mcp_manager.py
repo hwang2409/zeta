@@ -48,6 +48,7 @@ class MCPManagerMixin:
             error = public_credential_store_error(exc)
             self._mcp_manager.credential_store_error = error
             self._mcp_manager.last_result = error["text"]
+        await self._mcp_manager.refresh()
         self._refresh_mcp_manager()
 
     def _refresh_mcp_manager(self) -> None:

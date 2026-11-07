@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .auth import OAuthTokens, _display_metadata, error_body_excerpt
+from ..oauth import OAuthTokens, _display_metadata, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_BASE64_CHARACTERS,
     ANTHROPIC_MAX_IMAGE_DIMENSION,

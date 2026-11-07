@@ -40,15 +40,25 @@ def _assert_runtime_finder_contract(source: str) -> None:
                 "getattr",
                 "hasattr",
             }
-            if is_probe and node.args and (
-                isinstance(node.args[0], ast.Name) and node.args[0].id == "finder"
-                or isinstance(node.args[0], ast.Call)
-                and isinstance(node.args[0].func, ast.Attribute)
-                and isinstance(node.args[0].func.value, ast.Name)
-                and node.args[0].func.value.id == "self"
-                and node.args[0].func.attr == "_finder_target"
-            ):
-                forbidden_probe = node.func.id
+            if is_probe and node.args:
+                target = node.args[0]
+                is_finder_holder = (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and target.attr.endswith("finder")
+                )
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "finder"
+                ) or (
+                    isinstance(target, ast.Call)
+                    and isinstance(target.func, ast.Attribute)
+                    and isinstance(target.func.value, ast.Name)
+                    and target.func.value.id == "self"
+                    and target.func.attr == "_finder_target"
+                ) or is_finder_holder:
+                    forbidden_probe = node.func.id
         if not isinstance(node, ast.Attribute):
             continue
         value = node.value
@@ -90,6 +100,13 @@ def test_runtime_finder_attributes_are_in_the_protocol() -> None:
     _assert_runtime_finder_contract(runtime_path.read_text())
 
 
+def test_runtime_guard_rejects_finder_holder_probes() -> None:
+    with pytest.raises(AssertionError, match="call the FinderRuntimeTarget method directly, not getattr"):
+        _assert_runtime_finder_contract(
+            'def probe(self):\n    return getattr(self._active_finder, "missing", None)\n'
+        )
+
+
 def test_runtime_guard_rejects_finder_attribute_probes() -> None:
     runtime_path = (
         Path(__file__).parents[1]
@@ -112,8 +129,11 @@ def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> Hist
 async def _open(finder: HistoryFinder, buffer: Buffer) -> None:
     request = finder.open_finder(buffer)
     assert request is not None
-    snapshot = await finder.build_finder_candidates(request)
-    assert finder.finder_publish_candidates(request, snapshot)
+    batches = [batch async for batch, _complete in finder.build_finder_candidate_batches(request)]
+    assert len(batches) == 1
+    assert finder.finder_publish_candidate_batch(
+        request, batches[0], complete=True
+    )
     result = finder.finder_rank()
     assert result is not None
     assert finder.finder_publish(result)

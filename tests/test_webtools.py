@@ -12,10 +12,10 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from zeta.core.approval import ApprovalPolicy
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.core.tool_dispatch import dispatch_tool_calls
 from zeta.protocol.types import StreamEventType, ToolCall, flatten_tool_content
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, websearch

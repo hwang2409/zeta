@@ -25,8 +25,8 @@ import pytest
 from zeta.cli.main import build_parser
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
+from zeta.oauth import OAuthTokens
 from zeta.providers import login as provider_login
-from zeta.providers.auth import OAuthTokens
 from zeta.providers.codex import (
     build_authorization_url as build_codex_authorization_url,
 )
