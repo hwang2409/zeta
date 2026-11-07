@@ -109,7 +109,7 @@ def _start_cwd(registry: ToolRegistry, arguments: BashArguments) -> str:
         raise ValueError("cwd must be a nonempty string or null")
     candidate = Path(expand_user_path(cwd))
     if not candidate.is_absolute():
-        candidate = registry.cwd / candidate
+        candidate = Path(registry.bash_cwd) / candidate
     return os.path.abspath(candidate)
 
 
@@ -429,7 +429,12 @@ def register(registry: ToolRegistry) -> None:
                     "minLength": 1,
                     "description": "Deprecated alias for command.",
                 },
-                "cwd": {},
+                "cwd": {
+                    "description": (
+                        "Working directory override. Relative paths resolve from the "
+                        "persisted session cwd. Absolute paths are used as given."
+                    )
+                },
                 "timeout": {
                     "type": "number",
                     "exclusiveMinimum": 0,
