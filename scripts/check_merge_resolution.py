@@ -406,34 +406,55 @@ def _relative_module(module: str, node: ast.ImportFrom) -> str:
     return module_name
 
 
-def _lookup_from_import(
+def _lookup_from_package(
     lookup: dict[str, list[ast.expr]],
     node: ast.ImportFrom,
     module: str,
     module_collections: dict[str, list[ast.expr]],
 ) -> None:
     module_name = (
-        _relative_module(module, node)
-        if node.level
-        else (node.module or module.rsplit(".", 1)[0])
+        _relative_module(module, node) if node.level else module.rsplit(".", 1)[0]
     )
     for alias in node.names:
         if alias.name == "*":
             continue
         imported_name = alias.asname or alias.name
-        if node.module is None:
-            prefix = f"{module_name}.{alias.name}" if module_name else alias.name
-            lookup.update(
-                {
-                    f"{imported_name}.{full[len(prefix) + 1 :]}": elements
-                    for full, elements in module_collections.items()
-                    if full.startswith(f"{prefix}.")
-                }
-            )
-        else:
-            full = f"{module_name}.{alias.name}" if module_name else alias.name
-            if full in module_collections:
-                lookup[imported_name] = module_collections[full]
+        prefix = f"{module_name}.{alias.name}" if module_name else alias.name
+        lookup.update(
+            {
+                f"{imported_name}.{full[len(prefix) + 1 :]}": elements
+                for full, elements in module_collections.items()
+                if full.startswith(f"{prefix}.")
+            }
+        )
+
+
+def _lookup_from_module(
+    lookup: dict[str, list[ast.expr]],
+    node: ast.ImportFrom,
+    module: str,
+    module_collections: dict[str, list[ast.expr]],
+) -> None:
+    module_name = node.module or module.rsplit(".", 1)[0]
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        imported_name = alias.asname or alias.name
+        full = f"{module_name}.{alias.name}" if module_name else alias.name
+        if full in module_collections:
+            lookup[imported_name] = module_collections[full]
+
+
+def _lookup_from_import(
+    lookup: dict[str, list[ast.expr]],
+    node: ast.ImportFrom,
+    module: str,
+    module_collections: dict[str, list[ast.expr]],
+) -> None:
+    if node.module is None:
+        _lookup_from_package(lookup, node, module, module_collections)
+    else:
+        _lookup_from_module(lookup, node, module, module_collections)
 
 
 def _path_lookup(
@@ -561,6 +582,34 @@ def _render_finding(
     )
 
 
+def _parse_merge_data(commit: str, main: str, branch: str, args):
+    base = git("merge-base", main, branch).strip()
+    text = "\n".join(
+        [git("log", "-1", "--format=%B", commit)]
+        + ([args.allow.read()] if args.allow else [])
+        + ([args.pr_body_file.read()] if args.pr_body_file else [])
+    )
+    changed = set(git("diff", "--name-only", base, main).splitlines())
+    all_paths = set()
+    for left, right in ((base, main), (base, branch), (commit, main)):
+        all_paths.update(git("diff", "--name-only", left, right).splitlines())
+    all_paths = {p for p in all_paths if p.endswith(".py") and p.startswith(ROOTS)}
+    revisions = [base, main, branch, commit]
+    sources = load_sources(revisions, all_paths)
+    parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
+    return text, changed, all_paths, parsed, unresolved, error, revisions
+
+
+def _filter_findings(findings: list[Item], text: str) -> list[Item]:
+    lines = text.splitlines()
+    return [
+        finding
+        for index, finding in enumerate(findings)
+        if finding not in findings[:index]
+        and not any(marker(line, finding) for line in lines)
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
@@ -580,20 +629,9 @@ def main() -> int:
     if resolved is None:
         return 2
     main, branch, _reason = resolved
-    base = git("merge-base", main, branch).strip()
-    text = "\n".join(
-        [git("log", "-1", "--format=%B", commit)]
-        + ([args.allow.read()] if args.allow else [])
-        + ([args.pr_body_file.read()] if args.pr_body_file else [])
+    text, changed, all_paths, parsed, unresolved, error, revisions = _parse_merge_data(
+        commit, main, branch, args
     )
-    changed = set(git("diff", "--name-only", base, main).splitlines())
-    all_paths = set()
-    for left, right in ((base, main), (base, branch), (commit, main)):
-        all_paths.update(git("diff", "--name-only", left, right).splitlines())
-    all_paths = {p for p in all_paths if p.endswith(".py") and p.startswith(ROOTS)}
-    revisions = [base, main, branch, commit]
-    sources = load_sources(revisions, all_paths)
-    parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
     if error:
         revision, path, syntax = error
         print(
@@ -611,13 +649,7 @@ def main() -> int:
     findings.extend(
         _element_findings(old_items, main_items, branch_items, merge_items, unresolved)
     )
-    lines = text.splitlines()
-    findings = [
-        finding
-        for index, finding in enumerate(findings)
-        if finding not in findings[:index]
-        and not any(marker(line, finding) for line in lines)
-    ]
+    findings = _filter_findings(findings, text)
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)
