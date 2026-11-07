@@ -10766,11 +10766,11 @@ async def _start_task_gate(
     return store, loop, run, completion_published
 
 
-# quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see this PR)
+# quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see PR #861)
 @pytest.mark.xfail(
     raises=AssertionError,
     strict=False,
-    reason="quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see this PR)",
+    reason="quarantined: known product race - process.py publishes running=False before the exit evidence is durably pending; runtime-small process owner design r5 row 4 removes this marker (see PR #861)",
 )
 @pytest.mark.asyncio
 @_finish_gate_hang_guard
