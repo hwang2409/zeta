@@ -48,21 +48,6 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
 
 def _test_files() -> list[Path]:
     root = _TESTS_ROOT.parent
-    try:
-        subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except FileNotFoundError:
-        return sorted(_TESTS_ROOT.rglob("*.py"))
-    except subprocess.CalledProcessError as error:
-        if error.returncode == 128 and "not a git repository" in (error.stderr or ""):
-            return sorted(_TESTS_ROOT.rglob("*.py"))
-        raise
     result = subprocess.run(
         ["git", "ls-files", "--", "tests/*.py", "tests/**/*.py"],
         cwd=root,
@@ -102,24 +87,10 @@ def test_close_serve_guard_ignores_untracked_runtime_probe() -> None:
         probe.unlink()
 
 
-def test_test_files_falls_back_outside_git_checkout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        assert command == ["git", "rev-parse", "--is-inside-work-tree"]
-        raise subprocess.CalledProcessError(128, command, stderr="not a git repository")
-
-    monkeypatch.setattr(subprocess, "run", run)
-
-    assert _TESTS_ROOT / "test_serve_close.py" in _test_files()
-
-
 def test_test_files_fails_on_git_listing_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if command[:2] == ["git", "rev-parse"]:
-            return subprocess.CompletedProcess(command, 0, stdout="true\n")
         raise subprocess.CalledProcessError(1, command, stderr="git listing failed")
 
     monkeypatch.setattr(subprocess, "run", run)
