@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta import remote_sync as remote_sync_module
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.memory.entry_store import _KIND_KEY
@@ -195,6 +196,130 @@ async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
     assert result["isError"] is True
     assert result["structuredContent"]["error"]["retryable"] is True
     opened.store.close()
+
+
+def test_session_push_releases_append_locks_before_destination_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    opened = SessionManager(local).create(provider="codex", model="fake", cwd=repo)
+    session_id = opened.metadata.session_id
+    child = ConversationStore(
+        opened.store.session_dir / "agents", session_id="1", cwd=repo
+    )
+    opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("root before snapshot")]),
+            MessageOrigin.USER,
+        )
+    )
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("child before snapshot")])
+    )
+
+    destination_copy_started = threading.Event()
+    release_destination_copy = threading.Event()
+    original_copyfile = remote_sync_module.shutil.copyfile
+
+    def block_destination_copy(
+        source: str | Path,
+        destination: str | Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> str:
+        destination_path = Path(destination)
+        if (
+            destination_path.name == "conversation.jsonl"
+            and opened.store.session_dir.parent not in destination_path.parents
+            and not destination_copy_started.is_set()
+        ):
+            destination_copy_started.set()
+            assert release_destination_copy.wait(timeout=30)
+        return original_copyfile(
+            source, destination, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(remote_sync_module.shutil, "copyfile", block_destination_copy)
+
+    root_appended = threading.Event()
+    child_appended = threading.Event()
+
+    def append_root() -> None:
+        opened.store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("root after snapshot")]),
+                MessageOrigin.USER,
+            )
+        )
+        root_appended.set()
+
+    def append_child() -> None:
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("child after snapshot")])
+        )
+        child_appended.set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        pushed = executor.submit(
+            push_session, local, LocalTransport(remote), session_id=session_id
+        )
+        assert destination_copy_started.wait(timeout=30)
+        root_append = executor.submit(append_root)
+        child_append = executor.submit(append_child)
+        try:
+            assert root_appended.wait(timeout=30)
+            assert child_appended.wait(timeout=30)
+        finally:
+            release_destination_copy.set()
+        root_append.result(timeout=30)
+        child_append.result(timeout=30)
+        result = pushed.result(timeout=30)
+
+    opened.store.close()
+    child.close()
+    destination = remote / "sessions" / result.session_id
+    root_lines = (destination / "conversation.jsonl").read_text().splitlines()
+    child_lines = (
+        destination / "agents" / "1" / "conversation.jsonl"
+    ).read_text().splitlines()
+    assert all(json.loads(line) for line in [*root_lines, *child_lines])
+    assert "root before snapshot" in "".join(root_lines)
+    assert "child before snapshot" in "".join(child_lines)
+    assert "root after snapshot" not in "".join(root_lines)
+    assert "child after snapshot" not in "".join(child_lines)
+
+
+@pytest.mark.parametrize(
+    "publication_error",
+    [RemoteSyncError("publication failed"), asyncio.CancelledError()],
+    ids=["failure", "cancellation"],
+)
+def test_session_push_removes_local_staging_after_publication_stops(
+    tmp_path: Path,
+    publication_error: BaseException,
+) -> None:
+    local = tmp_path / "local"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    opened = SessionManager(local).create(provider="codex", model="fake", cwd=repo)
+    session_id = opened.metadata.session_id
+
+    class StoppedTransport(LocalTransport):
+        def publish_session(self, snapshot: Path, *, force: bool) -> Path:
+            raise publication_error
+
+    with pytest.raises(type(publication_error)):
+        push_session(
+            local,
+            StoppedTransport(tmp_path / "remote"),
+            session_id=session_id,
+        )
+
+    opened.store.close()
+    assert not list((local / "sessions").glob(f".{session_id}.push-staging-*"))
 
 
 def test_session_push_copies_consistent_history_and_excludes_credentials(
