@@ -962,7 +962,9 @@ def test_prepare_with_digest_does_not_recompute_state_cache_key(
         return entry_store.canonical_state_bytes(value)
 
     monkeypatch.setattr(entry_request, "state_digest", counted_digest, raising=False)
+    # test-contract: seam cache-key work is observed through prepare
     monkeypatch.setattr(entry_request, "_cached_entries", counted_cached_entries)
+    # test-contract: seam serialization work is observed through prepare
     monkeypatch.setattr(entry_store, "canonical_state_bytes", counted_bytes)
     _prepare_request_impl(
         _transcript(_row(1, "ordinary row")),
