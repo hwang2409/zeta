@@ -13,13 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ..session_execution import SessionOwnedError
+from ..session_files import read_session_file, session_directory
 from . import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
-from ..session_execution import SessionOwnedError
-from ..session_files import read_session_file, session_directory
 from .entry_types import sent_message_receipts
 
 if TYPE_CHECKING:
