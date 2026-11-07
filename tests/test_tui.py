@@ -5376,10 +5376,11 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
-    assert "child line 4" not in rendered
-    assert "child line 5" in rendered
+    assert "child line 5" not in rendered
+    assert "… +6 lines" in rendered
+    assert "child line 6" in rendered
     assert "child line 24" in rendered
-    assert rendered.count("child line ") == 20
+    assert rendered.count("child line ") == 19
 
 
 def test_agent_cards_remain_in_sequential_order() -> None:
@@ -13176,7 +13177,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
 
 
 @pytest.mark.asyncio
-async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> None:
+async def test_tui_model_command_does_no_lock_work_on_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     manager = SessionManager(tmp_path / "home")
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="gpt-5.6-luna", cwd=tmp_path
@@ -13213,30 +13216,21 @@ async def test_tui_model_command_does_no_lock_work_on_loop(tmp_path: Path) -> No
         on_model_change=switch_model,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    lock_held = threading.Event()
+    owner_thread = threading.get_ident()
+    lock_threads: list[int] = []
+    metadata_lock = manager._metadata_lock
 
-    def hold_metadata_lock() -> None:
-        with manager._metadata_lock(opened.metadata.session_id) as directory_fd:
-            assert directory_fd is not None
-            lock_held.set()
-            time.sleep(0.25)
+    def observed_metadata_lock(*args: object, **kwargs: object):
+        lock_threads.append(threading.get_ident())
+        return metadata_lock(*args, **kwargs)
 
-    holder = threading.Thread(target=hold_metadata_lock)
-    holder.start()
-    assert await asyncio.to_thread(lock_held.wait, 1)
-    event_loop = asyncio.get_running_loop()
-    started = event_loop.time()
-    callback_delays: list[float] = []
-    event_loop.call_later(
-        0.01, lambda: callback_delays.append(event_loop.time() - started)
-    )
-
+    # test-contract: seam observe lock ownership because no public seam exists.
+    monkeypatch.setattr(manager, "_metadata_lock", observed_metadata_lock)
     output = await app._slash_commands.dispatch_async(app, "/model gpt-5.4")
 
     assert output is not None and str(output).startswith("model: gpt-5.4")
-    assert callback_delays and callback_delays[0] < 0.05
-    await asyncio.to_thread(holder.join, 1)
-    assert not holder.is_alive()
+    assert lock_threads
+    assert owner_thread not in lock_threads
     await loop.close()
     opened.store.close()
 

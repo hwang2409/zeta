@@ -70,7 +70,11 @@ class NotificationPresentation:
             notification.get("kind", "agent_completion"), protocol_version
         )
         try:
-            written = await send(event_name, session_id, data=dict(notification))
+            written = await send(
+                event_name,
+                session_id,
+                data=event_contract.notification_payload(notification),
+            )
         except FrameWriteCancelled as cancelled:
             if not cancelled.written and key is not None:
                 self._presented.discard(key)

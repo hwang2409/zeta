@@ -55,6 +55,7 @@ class AgentNotificationMixin:
             store,
             wake_sink=self._on_step_delivery_edge,
             context_assembler=self.context_assembler,
+            causal_episodes=self._background_owner.causal_episodes,
         )
         flow.initialize_resident_edges()
         self._background_owner.conversation_channel.register_delivery_flow(
@@ -132,6 +133,7 @@ class AgentNotificationMixin:
             self.store,
             wake_sink=self._on_step_delivery_edge,
             context_assembler=self.context_assembler,
+            causal_episodes=self._background_owner.causal_episodes,
         )
         await flow.initialize()
         self._background_owner.conversation_channel.register_delivery_flow(
