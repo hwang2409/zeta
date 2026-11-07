@@ -5,7 +5,7 @@ inputs:
   python-version:
     description: Python version used by uv
     required: false
-    default: "3.12"
+    default: ""
 
 runs:
   using: composite
@@ -26,8 +26,8 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/uv
-        key: uv-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('uv.lock') }}
-        restore-keys: uv-${{ runner.os }}-py${{ inputs.python-version }}-
+        key: uv-${{ runner.os }}-${{ inputs.python-version != '' && format('py{0}-', inputs.python-version) || '' }}${{ hashFiles('uv.lock') }}
+        restore-keys: uv-${{ runner.os }}-${{ inputs.python-version != '' && format('py{0}-', inputs.python-version) || '' }}
 
     # --frozen pins the resolution to uv.lock so a transitive bump cannot
     # turn main red without a lockfile change in the diff.
@@ -35,4 +35,4 @@ runs:
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
       shell: bash
-      run: uv run --python "${{ inputs.python-version }}" --frozen pytest -q -n 4 --dist worksteal --durations=25
+      run: uv run ${{ inputs.python-version != '' && format('--python "{0}" ', inputs.python-version) || '' }}--frozen pytest -q -n 4 --dist worksteal --durations=25

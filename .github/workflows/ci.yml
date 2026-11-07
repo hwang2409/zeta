@@ -38,8 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/pytest
+        if: matrix.os == 'ubuntu-latest'
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: ./.github/workflows/pytest
+        if: matrix.os == 'macos-latest'
 
   lint:
     name: ruff
