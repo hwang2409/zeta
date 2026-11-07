@@ -32,7 +32,10 @@ class ContextMarkerMixin:
             if valid:
                 pinned = entry.data.get("pinned_message")
                 pinned_message = None if pinned is None else Message.from_dict(pinned)
-                if pinned_message is not None and "source_seq" not in pinned_message.metadata:
+                if (
+                    pinned_message is not None
+                    and "source_seq" not in pinned_message.metadata
+                ):
                     pinned_seq = ContextMarkerMixin._legacy_pinned_seq(
                         entry, pinned_message, source_entries
                     )
@@ -41,7 +44,10 @@ class ContextMarkerMixin:
                             pinned_message.role,
                             list(pinned_message.content),
                             tool_result=pinned_message.tool_result,
-                            metadata={**pinned_message.metadata, "source_seq": pinned_seq},
+                            metadata={
+                                **pinned_message.metadata,
+                                "source_seq": pinned_seq,
+                            },
                         )
                 messages = ContextMarkerMixin._eviction_view_messages(
                     view,
@@ -88,7 +94,9 @@ class ContextMarkerMixin:
         matches = [
             source.seq
             for source in source_entries
-            if entry.data["source_seq_start"] <= source.seq <= entry.data["source_seq_end"]
+            if entry.data["source_seq_start"]
+            <= source.seq
+            <= entry.data["source_seq_end"]
             and source.type == "message"
             and Message.from_dict(source.data["message"]) == pinned
         ]
@@ -117,7 +125,12 @@ class ContextMarkerMixin:
         pin_index: int | None = None
         for index, item in enumerate(view):
             seq = item["seq"]
-            if pinned is not None and type(pinned_seq) is int and seq >= pinned_seq and pin_index is None:
+            if (
+                pinned is not None
+                and type(pinned_seq) is int
+                and seq >= pinned_seq
+                and pin_index is None
+            ):
                 pin_index = len(messages)
                 messages.append(pinned)
                 if seq == pinned_seq:
@@ -149,7 +162,11 @@ class ContextMarkerMixin:
             pin_index = len(messages)
             if type(pinned_seq) is not int:
                 last_user = max(
-                    (i for i, message in enumerate(messages) if message.role is MessageRole.USER),
+                    (
+                        i
+                        for i, message in enumerate(messages)
+                        if message.role is MessageRole.USER
+                    ),
                     default=-1,
                 )
                 pin_index = last_user + 1
