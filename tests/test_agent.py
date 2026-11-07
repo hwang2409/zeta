@@ -3898,7 +3898,11 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
 
     model_turn = asyncio.create_task(
         state.run_model_turn(
-            child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
+            child_loop,
+            OllamaBackend(stall_seconds=0).complete(
+                [], [], control=completion_control()
+            ),
+            consume_stream,
         )
     )
     await stream_started.wait()
@@ -6480,6 +6484,7 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
         self.child_a_path: Path | None = None
         self.release_child_b = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11643,6 +11648,7 @@ async def test_killed_task_receipt_never_contains_command_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailingBackend(_TaskOwningChildBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             started = any(
                 message.role is MessageRole.TOOL_RESULT
@@ -11655,7 +11661,9 @@ async def test_killed_task_receipt_never_contains_command_secrets(
             )
             if started:
                 raise CodexStreamError("permanent", code="model_not_found")
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 yield event
 
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)

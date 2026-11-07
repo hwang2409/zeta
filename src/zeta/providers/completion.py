@@ -34,6 +34,7 @@ _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
 }
 _TERMINAL_ERROR_CODES = {
+    "account_lock_timeout",
     "auth_error",
     "authentication_error",
     "context_length_exceeded",
@@ -423,6 +424,10 @@ class PrematureCompletionError(RuntimeError):
     code = "stream_error"
 
 
+class CompletionCleanupError(RuntimeError):
+    """Closing a successful provider attempt failed."""
+
+
 class ProviderStallError(RuntimeError):
     retryable = True
     retry_reason = "stream_stall"
@@ -550,6 +555,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     continue
             self._observe(event)
             if self._attempt_completed:
+                await self._finish_attempt()
                 self._closed = True
             return event
 
@@ -758,6 +764,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             else:
                 selected = merge_exception(primary_error, cleanup_error)
                 if selected is cleanup_error:
+                    if primary is None and not is_control_exception(cleanup_error):
+                        raise CompletionCleanupError(str(cleanup_error)) from cleanup_error
                     raise selected
             if not is_control_exception(cleanup_error):
                 asyncio.get_running_loop().call_exception_handler(

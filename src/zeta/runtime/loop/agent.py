@@ -1060,7 +1060,10 @@ class AgentLoop(
                         step_delivery
                     ):
                         yield publication
-                if provider_retry_budget.exhausted:
+                if (
+                    provider_retry_budget is not None
+                    and provider_retry_budget.exhausted
+                ):
                     original = provider_retry_budget.original_error
                     if isinstance(original, ErrorInfo):
                         provider_error = original

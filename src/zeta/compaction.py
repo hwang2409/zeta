@@ -115,6 +115,7 @@ from .protocol.types import (
     flatten_tool_content,
 )
 from .providers.completion import (
+    CompletionCleanupError,
     CompletionControl,
     CompletionRetryBudget,
     ResetPolicy,
@@ -651,7 +652,14 @@ class CompactionPolicy:
                     ):
                         completed = event.message
             except Exception as exc:
-                if isinstance(exc, (SummaryCompletionError, RequestBudgetExceeded)):
+                if isinstance(
+                    exc,
+                    (
+                        CompletionCleanupError,
+                        SummaryCompletionError,
+                        RequestBudgetExceeded,
+                    ),
+                ):
                     raise
                 code = getattr(exc, "code", None)
                 if type(code) is str:
