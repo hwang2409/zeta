@@ -687,19 +687,14 @@ def _recover_nested_children(
                     notification_store.close_child_questions(
                         child_instance_id, reason=reason
                     )
-                existing = _sync_agent_notification(
+                existing = _mirrored_recovery_notification(
+                    store,
                     notification_store,
                     notification_index,
+                    store_notification_index,
                     child_instance_id,
+                    deliveries,
                 )
-                if notification_store is not store:
-                    store_notification = _sync_agent_notification(
-                        store,
-                        store_notification_index,
-                        child_instance_id,
-                    )
-                    if existing is None:
-                        existing = store_notification
                 if existing is None:
                     lifecycle = (
                         child_store.agent_lifecycle()
@@ -776,6 +771,44 @@ def _recover_nested_children(
             store.finish_agent_child(marker_key)
 
 
+def _append_recovery_notification(
+    store: ConversationStore,
+    data: dict[str, object],
+) -> ConversationEntry:
+    report = (
+        {
+            "status": data["report_status"],
+            **{
+                key: data[key]
+                for key in ("summary", "head_sha", "verdict")
+                if key in data
+            },
+        }
+        if "report_status" in data
+        else {}
+    )
+    return store.append_agent_notification_if_absent(
+        str(data["child_instance_id"]),
+        child_session_path=str(data["child_session_path"]),
+        description=str(data["description"]),
+        status=str(data["status"]),
+        text=str(data["text"]),
+        stats=data.get("stats") if isinstance(data.get("stats"), dict) else None,
+        killed_task_ids=(
+            data.get("killed_task_ids")
+            if isinstance(data.get("killed_task_ids"), list)
+            else None
+        ),
+        killed_task_count=(
+            data.get("killed_task_count")
+            if isinstance(data.get("killed_task_count"), int)
+            else None
+        ),
+        killed_task_ids_truncated=data.get("killed_task_ids_truncated") is True,
+        report=report or None,
+    )[0]
+
+
 def _mirrored_recovery_notification(
     owner_store: ConversationStore,
     notification_store: ConversationStore,
@@ -796,16 +829,21 @@ def _mirrored_recovery_notification(
         owner_notification_index,
         child_instance_id,
     )
-    if notification is not None or owner_notification is None:
+    if notification is not None and owner_notification is None:
+        _append_recovery_notification(owner_store, dict(notification.data))
         return notification
-    deliveries.append(
-        NotificationInput(
-            "child_completion",
-            dict(owner_notification.data),
-            dedupe_key=child_instance_id,
+    if notification is None and owner_notification is not None:
+        data = dict(owner_notification.data)
+        data["display_only"] = True
+        deliveries.append(
+            NotificationInput(
+                "child_completion",
+                data,
+                dedupe_key=child_instance_id,
+            )
         )
-    )
-    return owner_notification
+        return owner_notification
+    return notification or owner_notification
 
 
 def recover_agent_children(

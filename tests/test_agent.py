@@ -17090,6 +17090,90 @@ def test_events_after_terminal_state_emit_no_second_receipt(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_nested_completion_recovery_repairs_missing_parent_copy(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    parent = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    parent_call = _run_agent_call("parent-call")
+    child_call = _run_agent_call("child-call")
+    root.register_agent_child(
+        parent_call,
+        child_session_path=str(parent.session_dir),
+        description="parent",
+        background=False,
+        child_instance_id="root:1",
+    )
+    parent.register_agent_child(
+        child_call,
+        child_session_path=str(child.session_dir),
+        description="child",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+    root.append_agent_notification(
+        "root:1:1",
+        child_session_path=str(child.session_dir),
+        description="child",
+        status="completed",
+        text="done",
+        display_only=True,
+    )
+    parent.close()
+    child.close()
+    owner = BackgroundAgentOwner(root)
+    loop = SimpleNamespace(
+        store=root,
+        _background_owner=owner,
+        _existing_tool_result=lambda _call_id: False,
+    )
+    assert parent.agent_children()["root:1:1"]["background"] is True
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(recover_agent_children, loop), timeout=10
+        )
+        recovered_parent = ConversationStore(
+            root.session_dir / "agents", session_id="1"
+        )
+        try:
+            assert len(
+                [
+                    entry
+                    for entry in recovered_parent.agent_notifications(
+                        pending_only=False
+                    )
+                    if entry.data.get("child_instance_id") == "root:1:1"
+                ]
+            ) == 1
+        finally:
+            recovered_parent.close()
+        assert len(
+            [
+                entry
+                for entry in root.agent_notifications(pending_only=False)
+                if entry.data.get("child_instance_id") == "root:1:1"
+            ]
+        ) == 1
+        assert root.agent_children() == {}
+        await asyncio.wait_for(
+            asyncio.to_thread(recover_agent_children, loop), timeout=10
+        )
+        assert len(
+            [
+                entry
+                for entry in root.agent_notifications(pending_only=False)
+                if entry.data.get("child_instance_id") == "root:1:1"
+            ]
+        ) == 1
+    finally:
+        root.close()
+        parent.close()
+        child.close()
+
+
+@pytest.mark.asyncio
 async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     tmp_path: Path,
 ) -> None:
