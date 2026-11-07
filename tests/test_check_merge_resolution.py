@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
-SCRIPT = Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+SCRIPT = Path(
+    os.environ.get(
+        "SCRIPT", Path(__file__).parents[1] / "scripts/check_merge_resolution.py"
+    )
+)
 
 
 def run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -26,6 +31,47 @@ def repo(tmp_path: Path) -> Path:
 def commit(r: Path, message: str) -> None:
     subprocess.run(["git", "add", "."], cwd=r, check=True)
     subprocess.run(["git", "commit", "-qm", message], cwd=r, check=True)
+
+
+def test_dropped_membership_element_flagged(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        '    return event.type in ("CONFIG_CHANGED", "CHILD_MESSAGE_DELIVERED")\n'
+    )
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED", "MAIN"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        'EVENTS = {"CHILD_MESSAGE_DELIVERED"}\n'
+        "def check(event):\n"
+        "    return event.type in EVENTS\n"
+    )
+    commit(r, "bad merge")
+    result = run(r)
+    assert result.returncode == 1
+    assert "CONFIG_CHANGED" in result.stdout
+    assert "check|event.type" in result.stdout
 
 
 def test_dropped_main_function_flagged(tmp_path: Path):
@@ -149,6 +195,130 @@ def test_new_constant_value_flagged(tmp_path: Path):
     assert "WRITER_EPOCH" in run(r).stdout
 
 
+def _set_origin_main(r: Path) -> None:
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "main"], cwd=r, check=True
+    )
+
+
+def test_collection_lookup_is_local_for_correct_two_file_merge(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").unlink()
+    commit(r, "branch deletes z")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z", "C"}\n')
+    commit(r, "main adds a and changes z")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/z.py").unlink()
+    commit(
+        r,
+        "correct merge deletes z\n\nmerge-resolution: src/z.py collection element EVENTS -> intentional",
+    )
+    assert run(r).returncode == 0
+
+
+def test_membership_imports_resolve_and_report_only_missing_element(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/render.py").write_text('EVENTS = {"A", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text('def check(event): return event in ("A", "B")\n')
+    commit(r, "main inlines events")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "bad merge loses b")
+    result = run(r)
+    assert result.returncode == 1
+    assert "element \"'B'\"" in result.stdout
+    assert "element \"'A'\"" not in result.stdout
+
+
+def test_collection_lookup_cannot_hide_two_file_loss(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef check(event): return event in EVENTS\n'
+    )
+    (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/z.py").write_text('EVENTS = {"Z", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds a")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "branch", "--", "src/a.py"], cwd=r, check=True
+    )
+    commit(
+        r,
+        "bad merge\n\nmerge-resolution: src/a.py collection element EVENTS -> intentional",
+    )
+    result = run(r)
+    assert result.returncode == 1
+    assert "src/a.py membership element check|event" in result.stdout
+
+
+def test_renamed_function_owns_no_merge_element_finding(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "rename")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef old(event): return event in EVENTS\n'
+    )
+    commit(r, "main adds b")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        'EVENTS = {"A", "B"}\ndef new(event): return event in EVENTS\n'
+    )
+    commit(r, "clean rename merge")
+    assert run(r).returncode == 0
+
+
 def test_non_merge_is_clean(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -208,133 +378,227 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     assert "main:" not in result.stdout
 
 
-def test_parent_selection_reports_pr_merge(tmp_path: Path):
-    r = repo(tmp_path)
+def _api_repo(r: Path) -> None:
     (r / "src").mkdir()
-    (r / "src/base.py").write_text("x = 1\n")
+    (r / "src/api.py").write_text("def shared(): pass\n")
     commit(r, "base")
-    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/main.py").write_text("x = 2\n")
-    commit(r, "main change")
+
+
+def _merge_loss(
+    r: Path, *, into: str, from_branch: str, message: str = "merge"
+) -> tuple[str, str, str, str]:
+    subprocess.run(["git", "checkout", "-q", into], cwd=r, check=True)
     subprocess.run(
-        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+        ["git", "merge", "--no-ff", "--no-commit", from_branch], cwd=r, check=True
     )
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    (r / "src/branch.py").write_text("x = 3\n")
-    commit(r, "branch change")
-    merge, p1, _p2 = make_merge(r, into="main", from_branch="branch")
-    result = run(r, merge)
-    assert result.returncode == 0
-    assert f"main parent: {p1}" in result.stdout
-    assert "origin/main first-parent ancestry" in result.stdout
+    p1 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    p2 = subprocess.check_output(
+        ["git", "rev-parse", "MERGE_HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "rm", "-qf", "src/main_only.py"], cwd=r, check=True)
+    commit(r, message)
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    return merge, p1, p2, "main_only"
 
 
-def test_parent_selection_reports_main_into_branch(tmp_path: Path):
-    r = repo(tmp_path)
-    (r / "src").mkdir()
-    (r / "src/base.py").write_text("x = 1\n")
-    commit(r, "base")
-    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/main.py").write_text("x = 2\n")
-    commit(r, "main change")
+def _direct_case(
+    r: Path, *, into: str = "main", message: str = "merge"
+) -> tuple[str, str, str, str]:
+    _api_repo(r)
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/branch.py").write_text("def branch_only(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/main_only.py").write_text("def main_only(): pass\n")
+    commit(r, "main")
     main = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
     subprocess.run(
         ["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True
     )
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    (r / "src/branch.py").write_text("x = 3\n")
-    commit(r, "branch change")
-    merge, p1, _p2 = make_merge(r, into="branch", from_branch="main")
-    result = run(r, merge)
-    assert result.returncode == 0
-    assert f"main parent: {main}" in result.stdout
-    assert f"1={p1}" in result.stdout
-
-
-def test_parent_selection_requires_flag_when_ambiguous(tmp_path: Path):
-    r = repo(tmp_path)
-    (r / "src").mkdir()
-    (r / "src/base.py").write_text("x = 1\n")
-    commit(r, "base")
-    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/main.py").write_text("x = 2\n")
-    commit(r, "main change")
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    (r / "src/branch.py").write_text("x = 3\n")
-    commit(r, "branch change")
-    merge, _p1, _p2 = make_merge(r, into="branch", from_branch="main")
-    subprocess.run(
-        ["git", "update-ref", "refs/remotes/origin/main", "HEAD~2"], cwd=r, check=True
+    return _merge_loss(
+        r,
+        into=into,
+        from_branch="branch" if into == "main" else "main",
+        message=message,
     )
-    result = run(r, merge)
-    assert result.returncode == 2
-    assert "pass --main-sha" in result.stderr
 
 
-def test_main_sha_override_and_removed_parent_flag(tmp_path: Path):
-    r = repo(tmp_path)
-    (r / "src").mkdir()
-    (r / "src/a.py").write_text("x = 1\n")
-    commit(r, "base")
-    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/a.py").write_text("x = 2\ndef main_only(): pass\n")
-    commit(r, "main change")
-    main = subprocess.check_output(
+def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str, str]:
+    _api_repo(r)
+    initial = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
+    subprocess.run(["git", "branch", "origin-side", initial], cwd=r, check=True)
+    subprocess.run(["git", "checkout", "-q", "origin-side"], cwd=r, check=True)
+    (r / "src/origin.py").write_text("def origin(): pass\n")
+    commit(r, "origin")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/main.py").write_text("def main(): pass\n")
+    commit(r, "main")
     subprocess.run(
-        ["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True
+        ["git", "merge", "--no-ff", "--no-commit", "origin-side"], cwd=r, check=True
     )
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    (r / "src/b.py").write_text("x = 3\n")
-    commit(r, "branch change")
-    merge, p1, p2 = make_merge(r, into="branch", from_branch="main", restore="src/a.py")
-    default = run(r, merge)
-    assert default.returncode == 1
-    assert f"main parent: {p2}" in default.stdout
-    assert "main_only" in default.stdout
-    wrong_side = run(r, merge, "--main-sha", p1)
-    assert wrong_side.returncode == 2
-    assert "disagrees with the identified main parent" in wrong_side.stderr
-    correct = run(r, merge, "--main-sha", p2)
-    assert correct.returncode == 1
-    assert f"main parent: {p2}" in correct.stdout
-    assert "main_only" in correct.stdout
-    abbreviated = run(r, merge, "--main-sha", p2[:8])
-    assert abbreviated.returncode == 2
-    assert "full 40-hex parent sha" in abbreviated.stderr
-    wrong = run(r, merge, "--main-sha", "HEAD~2")
-    assert wrong.returncode == 2
-    assert "full 40-hex parent sha" in wrong.stderr
-    removed = run(r, merge, "--main-parent", "1")
-    assert removed.returncode == 2
-    assert "unrecognized arguments" in removed.stderr
-    assert p1 != p2
+    commit(r, "origin merge")
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "branch", "train", base], cwd=r, check=True)
+    subprocess.run(["git", "checkout", "-qb", "train-side", base], cwd=r, check=True)
+    (r / "src/main_only.py").write_text("def main_only(): pass\n")
+    (r / "src/train.py").write_text("def train(): pass\n")
+    commit(r, "train change")
+    train_change = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    origin_main = base
+    if newer:
+        (r / "src/newer.py").write_text("def newer(): pass\n")
+        commit(r, "newer main")
+        pr_base = "main"
+        origin_main = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+    else:
+        subprocess.run(
+            ["git", "checkout", "-qb", "pr-side", initial], cwd=r, check=True
+        )
+        (r / "src/pr.py").write_text("def pr(): pass\n")
+        commit(r, "older pr")
+        pr_base = "pr-side"
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", origin_main],
+        cwd=r,
+        check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "train"], cwd=r, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", train_change], cwd=r, check=True
+    )
+    commit(r, "train merge 1")
+    for index in range(1, depth):
+        subprocess.run(
+            ["git", "checkout", "-qb", f"train-side-{index}", "HEAD"], cwd=r, check=True
+        )
+        (r / f"src/train{index}.py").write_text(f"def train{index}(): pass\n")
+        commit(r, f"train change {index + 1}")
+        subprocess.run(["git", "checkout", "-q", "train"], cwd=r, check=True)
+        subprocess.run(
+            ["git", "merge", "--no-ff", "--no-commit", f"train-side-{index}"],
+            cwd=r,
+            check=True,
+        )
+        commit(r, f"train merge {index + 1}")
+    train_merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", pr_base], cwd=r, check=True)
+    if newer:
+        (r / "src/pr.py").write_text("def pr(): pass\n")
+        commit(r, "newer pr")
+    pr_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", "train"], cwd=r, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", pr_head], cwd=r, check=True
+    )
+    subprocess.run(["git", "rm", "-qf", "src/main_only.py"], cwd=r, check=True)
+    commit(r, "train result")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    return merge, train_merge, pr_head, "main_only"
 
 
-def test_both_qualifying_parents_are_rejected(tmp_path: Path):
-    r = repo(tmp_path)
-    (r / "src").mkdir()
-    (r / "src/a.py").write_text("x = 1\n")
-    commit(r, "base")
-    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/a.py").write_text("x = 2\n")
-    commit(r, "main change")
-    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
-    (r / "src/b.py").write_text("x = 3\n")
-    commit(r, "branch change")
-    merge, _p1, _p2 = make_merge(r, into="branch", from_branch="main")
-    subprocess.run(
-        ["git", "checkout", "-qb", "mainline", f"{merge}^1^"], cwd=r, check=True
-    )
-    (r / "src/c.py").write_text("x = 4\n")
-    commit(r, "mainline change")
-    subprocess.run(["git", "merge", "--no-ff", "--no-edit", merge], cwd=r, check=True)
-    subprocess.run(
-        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
-    )
-    result = run(r, merge)
-    assert result.returncode == 2
-    assert "both parents qualify" in result.stderr
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected", "refusal"),
+    [
+        ("pr", 0, False),
+        ("main-into-branch", 1, False),
+        ("train-1", 0, False),
+        ("train-older", 0, False),
+        ("train-newer", 0, False),
+        ("train-newer-wrong", None, True),
+        ("both", None, True),
+        ("neither", None, True),
+        ("wrong", None, True),
+        ("right", 1, False),
+        ("update-branch", 1, False),
+    ],
+)
+def test_parent_selection_table(
+    tmp_path: Path, shape: str, expected: int | None, refusal: bool
+) -> None:
+    if shape.startswith("train"):
+        r = repo(tmp_path)
+        merge, p1, p2, loss = _train_case(
+            r,
+            newer=shape in {"train-newer", "train-newer-wrong"},
+            depth=1 if shape == "train-1" else 2,
+        )
+    else:
+        r = repo(tmp_path)
+        merge, p1, p2, loss = _direct_case(
+            r,
+            into="branch"
+            if shape in {"main-into-branch", "right", "wrong", "update-branch"}
+            else "main",
+            message="Merge branch 'main' into branch"
+            if shape == "update-branch"
+            else "merge",
+        )
+    args: tuple[str, ...] = ()
+    if shape == "both":
+        subprocess.run(
+            ["git", "checkout", "-qb", "later", f"{merge}^1^"], cwd=r, check=True
+        )
+        (r / "later").write_text("later\n")
+        commit(r, "later")
+        subprocess.run(
+            ["git", "merge", "--no-ff", "--no-edit", merge], cwd=r, check=True
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+        )
+    elif shape == "neither":
+        subprocess.run(
+            ["git", "checkout", "-qb", "unrelated", f"{merge}^1^"], cwd=r, check=True
+        )
+        (r / "unrelated").write_text("unrelated\n")
+        commit(r, "unrelated")
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+        )
+    if shape == "train-newer-wrong":
+        args = ("--main-sha", p2)
+    elif shape == "wrong":
+        # guard: this direct-shape refusal already held on 707549ed.
+        args = ("--main-sha", p1)
+        expected = None
+        refusal = True
+    elif shape == "right":
+        args = ("--main-sha", p2)
+    result = run(r, merge, *args)
+    if refusal:
+        assert result.returncode == 2
+        if shape == "wrong":
+            assert f"disagrees with the identified main parent {p2}" in result.stderr
+            assert "main parent:" not in result.stdout
+        elif shape == "train-newer-wrong":
+            assert f"disagrees with the identified main parent {p1}" in result.stderr
+            assert "main parent:" not in result.stdout
+        else:
+            assert "cannot identify exactly one main parent" in result.stderr
+    else:
+        assert result.returncode == 1
+        chosen = (p1, p2)[expected]
+        assert f"main parent: {chosen}" in result.stdout
+        assert loss in result.stdout
