@@ -86,6 +86,7 @@ from ..backend_state import (
     effective_backend_budget,
     prepare_backend_state,
 )
+from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -113,7 +114,7 @@ from .empty_turn import (
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import RuntimePrompt, SkillRefreshMixin
+from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -316,7 +317,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: str | Message | None = None
+        self._plan_mode_prior_prompt: RuntimePrompt | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
