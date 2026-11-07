@@ -1182,9 +1182,7 @@ def test_resume_does_not_sanitize_entire_tool_result_before_bounded_render(
         tool_result=ToolResult("call", "output\n" * 10_000),
     )
 
-    sanitized = checkpoints_module._sanitize_replayed_message(
-        message, include_thoughts=True
-    )
+    sanitized = checkpoints_module._sanitize_replayed_message(message)
 
     assert sanitized.tool_result is message.tool_result
     sanitize.assert_not_called()

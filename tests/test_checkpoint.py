@@ -27,9 +27,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.tui import checkpoints as checkpoints_module
 from zeta.tui.app import TUIApp
-from zeta.tui.cards.base import strip_terminal_controls
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.render import render_event, render_markdown
 from zeta.tui.theme import RICH_THEME
@@ -226,69 +224,6 @@ def test_tui_replay_hides_passive_harness_message(tmp_path: Path) -> None:
     assert "visible prompt" in replay
     assert "visible answer" in replay
     assert "hidden inbox status" not in replay
-
-
-def test_tui_rebuild_does_not_sanitize_hidden_thinking(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    sanitized: list[str] = []
-
-    def record(value: str) -> str:
-        sanitized.append(value)
-        return strip_terminal_controls(value)
-
-    monkeypatch.setattr(checkpoints_module, "strip_terminal_controls", record)
-    hidden = "hidden thought " * 10_000
-    store = ConversationStore(tmp_path)
-    store.append_message(
-        Message(
-            MessageRole.ASSISTANT,
-            [ThinkingContent(hidden), TextContent("visible \x1b]0;title\x07answer")],
-        )
-    )
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="claude",
-        model="offline",
-        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-    )
-    app._active_session = app._make_session()
-
-    app._rebuild_transcript()
-
-    assert hidden not in sanitized
-    assert sum(map(len, sanitized)) < len(hidden)
-    replay = app._transcript.render(120)
-    assert "visible answer" in replay
-    assert "hidden thought" not in replay
-    assert "\x1b]" not in replay
-
-
-def test_replay_sanitizes_shown_thinking(monkeypatch: pytest.MonkeyPatch) -> None:
-    sanitized: list[str] = []
-
-    def record(value: str) -> str:
-        sanitized.append(value)
-        return strip_terminal_controls(value)
-
-    monkeypatch.setattr(checkpoints_module, "strip_terminal_controls", record)
-    thought = "shown \x1b]0;title\x07thought"
-    rendered: list[object] = []
-
-    render_replayed_message(
-        Message(MessageRole.ASSISTANT, [ThinkingContent(thought)]),
-        presenter=object(),
-        print_unit=rendered.append,
-        tool_calls={},
-        include_thoughts=True,
-        provider="claude",
-    )
-
-    assert thought in sanitized
-    output = StringIO()
-    Console(file=output, force_terminal=True, theme=RICH_THEME).print(rendered[0])
-    assert "\x1b]" not in output.getvalue()
-    assert "shown thought" in Text.from_ansi(output.getvalue()).plain
 
 
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
