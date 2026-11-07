@@ -859,6 +859,15 @@ def _active_status_parts(
         if client.protocol_version != "1.0" and loop is not None
         else None
     )
+    project_context_health = (
+        (
+            loop.project_context_health.summary
+            if loop is not None and loop.project_context_health is not None
+            else "healthy"
+        )
+        if client.protocol_version != "1.0"
+        else None
+    )
     status = {
         "session": client._session_snapshot(),
         "state": (
@@ -878,6 +887,11 @@ def _active_status_parts(
         **(
             {"transcript_index_failure": transcript_index_failure}
             if transcript_index_failure is not None
+            else {}
+        ),
+        **(
+            {"project_context_health": project_context_health}
+            if project_context_health is not None
             else {}
         ),
         "store": runtime.opened.store,
