@@ -13098,7 +13098,9 @@ async def _cancel_idle_fixture(
     child.close()
 
 
-@pytest.mark.parametrize("wake_source", ["task", "child", "question"])
+@pytest.mark.parametrize(
+    "wake_source", ["task", "child", "idle_child", "question"]
+)
 @pytest.mark.asyncio
 async def test_idle_with_open_work_does_not_notify_parent(
     tmp_path: Path,
@@ -13109,6 +13111,7 @@ async def test_idle_with_open_work_does_not_notify_parent(
         tmp_path
     )
     owned_child: asyncio.Task[None] | None = None
+    owned_child_store: ConversationStore | None = None
     if wake_source == "task":
         monkeypatch.setattr(
             registry.background_tasks,
@@ -13119,12 +13122,37 @@ async def test_idle_with_open_work_does_not_notify_parent(
                 ),
             ),
         )
-    elif wake_source == "child":
+    elif wake_source in {"child", "idle_child"}:
         owned_child = asyncio.create_task(asyncio.Event().wait())
+        if wake_source == "idle_child":
+            owned_child_store = ConversationStore(tmp_path / "idle-owned-child")
+            child.register_agent_child(
+                _run_agent_call("idle-owned"),
+                child_session_path=str(owned_child_store.session_dir),
+                description="idle owned child",
+                agent_type="worker",
+                background=True,
+                child_instance_id="root:1:1",
+                accepts_follow_ups=True,
+                explicit_finish=True,
+            )
+            owned_child_store.start_agent_lifecycle(
+                handle="root:1:1",
+                started_at="2026-01-01T00:00:00+00:00",
+                depth=2,
+                agent_type="worker",
+                description="idle owned child",
+            )
+            owned_child_store.update_agent_lifecycle(
+                state="idle",
+                current_step="idle, waiting for follow-up",
+                idle_since="2026-01-01T00:01:00+00:00",
+            )
         loop._background_owner.register(
             "root:1:1",
             owned_child.cancel,
             owned_child,
+            active_store=owned_child_store,
             parent_instance_id="root:1",
             description="owned child",
         )
@@ -13152,6 +13180,10 @@ async def test_idle_with_open_work_does_not_notify_parent(
             for entry in parent.agent_notifications(pending_only=False)
         )
         assert wakes == []
+        if owned_child_store is not None:
+            marker = child.agent_children()["root:1:1"]
+            assert marker["explicit_finish"] is True
+            assert owned_child_store.agent_lifecycle()["state"] == "idle"
         lifecycle = child.agent_lifecycle()
         assert lifecycle["state"] == "idle"
         assert lifecycle["current_step"] == "idle, waiting for follow-up"
@@ -13161,6 +13193,9 @@ async def test_idle_with_open_work_does_not_notify_parent(
             await asyncio.wait_for(
                 asyncio.gather(owned_child, return_exceptions=True), 10
             )
+            loop._background_owner.unregister("root:1:1")
+        if owned_child_store is not None:
+            owned_child_store.close()
         await _cancel_idle_fixture(run, registry, parent, child)
 
 

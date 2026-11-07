@@ -539,6 +539,10 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
 
 # Every stream event is owned by scrollback, another TUI component, or is hidden
 # by design. Keep this exhaustive when adding a StreamEventType member.
+BACKGROUND_EVENTS_RENDERED_IMMEDIATELY = frozenset({
+    StreamEventType.AGENT_NOTIFICATION,
+    StreamEventType.CHILD_MESSAGE_DELIVERED,
+})
 STREAM_EVENTS_RENDERED = frozenset({
     StreamEventType.MESSAGE_END,
     StreamEventType.RETRY,

@@ -54,7 +54,7 @@ from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from . import overlay, theme
+from . import overlay, render, theme
 from .agent_card import (
     AgentNavigation,
     AgentRunCommandMixin,
@@ -826,10 +826,7 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
-        if event.type in {
-            StreamEventType.AGENT_NOTIFICATION,
-            StreamEventType.CHILD_MESSAGE_DELIVERED,
-        }:
+        if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()
             return
