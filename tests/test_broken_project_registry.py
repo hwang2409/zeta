@@ -66,6 +66,25 @@ _CORRUPTIONS: tuple[tuple[str, Callable[[Path, Path, Path], None]], ...] = (
 _CASE_IDS = [case for case, _corrupt in _CORRUPTIONS]
 
 
+def _missing_required_key(_home: Path, _linked: Path, record: Path) -> None:
+    value = json.loads(record.read_text(encoding="utf-8"))
+    del value["name"]
+    record.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+
+def _mismatched_project_id(_home: Path, _linked: Path, record: Path) -> None:
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["project_id"] = "p_" + "0" * 32
+    record.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+
+_IDENTITY_CORRUPTIONS = (
+    ("invalid-json", _invalid_json),
+    ("missing-required-key", _missing_required_key),
+    ("mismatched-project-id", _mismatched_project_id),
+)
+
+
 def test_registry_lock_wait_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -167,6 +186,170 @@ async def _serve_hello(home: Path) -> dict[str, object]:
         await server.close()
 
 
+def _healthy_and_malformed_projects(
+    home: Path,
+    repository: Path,
+    malformed_repository: Path,
+    corrupt: Callable[[Path, Path, Path], None],
+) -> tuple[str, str, Path]:
+    registry = ProjectRegistry(home / "projects")
+    healthy = registry.create_project(
+        "healthy", "git", repository, memory_profile="zeta"
+    )
+    malformed = registry.create_project(
+        "malformed", "git", malformed_repository, memory_profile="zeta"
+    )
+    registry._replace_entry_kind(healthy.project_id, "brief", "HEALTHY-A-MEMORY")
+    registry._replace_entry_kind(malformed.project_id, "brief", "DAMAGED-B-MEMORY")
+    record = registry.root / malformed.project_id / "project.json"
+    corrupt(home, malformed_repository, record)
+    return healthy.project_id, malformed.project_id, record
+
+
+async def _serve_new_session_prompt(home: Path, cwd: Path) -> str:
+    class StartedBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__([ScriptedTurn(content=[TextContent("ok")])])
+            self.started = asyncio.Event()
+
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                self.started.set()
+                yield event
+
+    backend = StartedBackend()
+    server = ZetaServer(
+        home=home,
+        cwd=cwd,
+        port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, backend_home: (
+            backend,
+            model or "offline",
+        ),
+    )
+    await server.start()
+    assert server.port is not None
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+
+    async def request(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> dict[str, object]:
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        while True:
+            frame = json.loads(await asyncio.wait_for(reader.readline(), 10))
+            if frame.get("id") == request_id:
+                return frame
+
+    try:
+        hello = await request(
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["session_cwd"]},
+        )
+        created = await request(
+            2, "new_session", {"provider": "codex", "cwd": str(cwd)}
+        )
+        sent = await request(3, "send", {"text": "check context"})
+        assert "result" in hello
+        assert "result" in created
+        assert "result" in sent
+        await asyncio.wait_for(backend.started.wait(), 10)
+        return backend.calls[0][0][0].content[0].text
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+
+
+def _project_context_isolation_case(
+    tmp_path: Path,
+    corrupt: Callable[[Path, Path, Path], None],
+) -> tuple[Path, Path, str, str]:
+    home = tmp_path / "home"
+    repository = tmp_path / "healthy"
+    malformed_repository = tmp_path / "malformed"
+    repository.mkdir()
+    malformed_repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "init", "-q", str(malformed_repository)], check=True)
+    healthy_id, malformed_id, _record = _healthy_and_malformed_projects(
+        home, repository, malformed_repository, corrupt
+    )
+    return home, repository, healthy_id, malformed_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_case", "corrupt"),
+    _IDENTITY_CORRUPTIONS,
+    ids=[case for case, _corrupt in _IDENTITY_CORRUPTIONS],
+)
+async def test_new_tui_keeps_healthy_project_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _case: str,
+    corrupt: Callable[[Path, Path, Path], None],
+) -> None:
+    home, repository, healthy_id, malformed_id = _project_context_isolation_case(
+        tmp_path, corrupt
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
+    try:
+        prompt = app.loop.context_assembler.system_prompt.content[0].text
+        assert "HEALTHY-A-MEMORY" in prompt
+        assert "DAMAGED-B-MEMORY" not in prompt
+        assert "project" in app.loop.tool_registry.registered_names
+        status = app.slash_status()
+        assert status.project_context_health == (
+            f"malformed_project ({malformed_id}/project.json): "
+            "project metadata is malformed"
+        )
+        assert healthy_id in prompt
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("_case", "corrupt"),
+    _IDENTITY_CORRUPTIONS,
+    ids=[case for case, _corrupt in _IDENTITY_CORRUPTIONS],
+)
+async def test_serve_new_session_keeps_healthy_project_context(
+    tmp_path: Path,
+    _case: str,
+    corrupt: Callable[[Path, Path, Path], None],
+) -> None:
+    home, repository, healthy_id, _malformed_id = _project_context_isolation_case(
+        tmp_path, corrupt
+    )
+
+    prompt = await _serve_new_session_prompt(home, repository)
+
+    assert "HEALTHY-A-MEMORY" in prompt
+    assert "DAMAGED-B-MEMORY" not in prompt
+    assert healthy_id in prompt
+
+
 @pytest.mark.parametrize(("_case", "corrupt"), _CORRUPTIONS, ids=_CASE_IDS)
 def test_broken_registry_tui_start_and_resume_without_repair(
     tmp_path: Path,
@@ -200,7 +383,9 @@ def test_broken_registry_tui_start_and_resume_without_repair(
     before = _registry_snapshot(projects)
     state = load_project_registry(projects)
     assert state.registry is not None
-    assert isinstance(state.unavailable, ProjectRegistryUnavailable)
+    assert isinstance(state.unavailable, ProjectRegistryUnavailable) == (
+        _case == "dangling-symlink"
+    )
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(repository)
 
@@ -249,8 +434,8 @@ async def test_broken_registry_serve_hello_without_repair(
     before = _registry_snapshot(projects)
     try:
         hello = await _serve_hello(home)
-        notices = hello["notices"]
-        assert notices == [_REGISTRY_WARNING]
+        notices = hello.get("notices", [])
+        assert notices == ([_REGISTRY_WARNING] if _case == "dangling-symlink" else [])
         assert "projects" in hello["capabilities"].get("features", ())
         assert _registry_snapshot(projects) == before
     finally:
@@ -650,7 +835,7 @@ def test_project_instructions_refuses_unavailable_registry(tmp_path: Path) -> No
     home = tmp_path / "home"
     repository = tmp_path / "repository"
     repository.mkdir()
-    record = _corrupt_registry(home, _invalid_json)
+    record = _corrupt_registry(home, _dangling_symlink)
     state = load_project_registry(home / "projects")
     assert state.unavailable is not None
 
