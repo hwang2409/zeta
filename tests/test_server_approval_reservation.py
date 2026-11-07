@@ -907,6 +907,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "deny": {"request_id": call.id},
             "fork_message": {"session_id": session_id, "message_id": "missing"},
             "rename_session": {"session_id": session_id, "name": "changed"},
+            "revoke_session_grants": {"clear": True},
             "send": {"text": "blocked"},
             "send_images": {"session_id": session_id, "text": "blocked", "images": []},
             "set_compaction": {"session_id": session_id, "mode": "eviction"},
@@ -1789,6 +1790,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         writer.close()
         await writer.wait_closed()
         await _wait_controller_release(server)
+        assert await asyncio.wait_for(reader.read(), TIMEOUT) == b""
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
