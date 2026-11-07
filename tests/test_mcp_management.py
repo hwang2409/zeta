@@ -2,7 +2,7 @@ import asyncio
 import fcntl
 import inspect
 import json
-import multiprocessing
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -30,12 +30,17 @@ def service(tmp_path, mount=None):
     )
 
 
-def _add_mcp_server_in_process(home, project, name, connection):
-    manager = MCPManagementService(home=home, project_dir=project)
-    connection.send("ready")
-    connection.recv()
-    connection.close()
-    asyncio.run(manager.add(name, scope="user", command=sys.executable))
+_ADD_MCP_SERVER_PROCESS = """
+import asyncio
+import sys
+
+from zeta.mcp.management import MCPManagementService
+
+manager = MCPManagementService(home=sys.argv[1], project_dir=sys.argv[2])
+print("ready", flush=True)
+sys.stdin.readline()
+asyncio.run(manager.add(sys.argv[3], scope="user", command=sys.executable))
+"""
 
 
 @pytest.mark.asyncio
@@ -181,36 +186,53 @@ async def test_untrusted_cloned_project_never_creates_subprocess(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_multiprocess_mutations_do_not_lose_writers(tmp_path):
-    context = multiprocessing.get_context("fork")
-    connections = [context.Pipe() for _name in range(2)]
-    processes = [
-        context.Process(
-            target=_add_mcp_server_in_process,
-            args=(tmp_path / "home", tmp_path / "repo", name, child),
+    processes = []
+    for name in ("process-one", "process-two"):
+        process = await asyncio.to_thread(
+            subprocess.Popen,
+            [
+                sys.executable,
+                "-c",
+                _ADD_MCP_SERVER_PROCESS,
+                str(tmp_path / "home"),
+                str(tmp_path / "repo"),
+                name,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        for name, (_parent, child) in zip(
-            ("process-one", "process-two"), connections, strict=True
-        )
-    ]
-    for process in processes:
-        process.start()
-    for parent, child in connections:
-        child.close()
-        assert await asyncio.to_thread(parent.recv) == "ready"
-    for parent, _child in connections:
-        parent.send("start")
-        parent.close()
+        processes.append(process)
+    try:
+        for process in processes:
+            assert process.stdout is not None
+            assert await asyncio.to_thread(process.stdout.readline) == "ready\n"
+        for process in processes:
+            assert process.stdin is not None
+            process.stdin.write("start\n")
+            process.stdin.close()
 
-    exitcodes = []
-    for process in processes:
-        await asyncio.to_thread(process.join, 10)
-        if process.is_alive():
-            process.kill()
-            process.join()
-            pytest.fail("MCP config writer process did not exit")
-        exitcodes.append(process.exitcode)
-        process.close()
-    assert exitcodes == [0, 0]
+        exitcodes = []
+        for process in processes:
+            try:
+                exitcodes.append(await asyncio.to_thread(process.wait, 10))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                await asyncio.to_thread(process.wait)
+                pytest.fail("MCP config writer process did not exit")
+        assert exitcodes == [0, 0], [
+            process.stderr.read() if process.stderr is not None else ""
+            for process in processes
+        ]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                await asyncio.to_thread(process.wait)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
     manager = service(tmp_path)
     await manager.refresh()

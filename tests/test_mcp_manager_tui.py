@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import inspect
 import json
 import sys
@@ -18,6 +19,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
+from zeta.mcp import management as mcp_management
 from zeta.mcp.management import ManagedServer, MCPManagementService
 from zeta.mcp.oauth_store import MCPOAuthToken
 from zeta.runtime.loop import AgentLoop
@@ -221,6 +223,119 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_real_prompt_lock_contention_stays_responsive_and_renders_busy(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    project = tmp_path / "repo"
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=home, project_dir=project)
+    home.mkdir()
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "contended": {
+                        "transport": "stdio",
+                        "command": sys.executable,
+                        "enabled": False,
+                    }
+                }
+            }
+        )
+    )
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        zeta_home=home,
+    )
+    refreshed = asyncio.Event()
+    original_refresh = app._refresh_mcp_manager
+
+    def record_refresh() -> None:
+        original_refresh()
+        refreshed.set()
+
+    app._refresh_mcp_manager = record_refresh
+    lock_path = app._mcp_manager.service.path("user").with_name(".mcp.json.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+")
+    prompt = None
+    try:
+        with (
+            create_pipe_input() as pipe,
+            create_app_session(input=pipe, output=DummyOutput()),
+        ):
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            prompt = asyncio.create_task(session.prompt_async())
+            async with asyncio.timeout(5):
+                while not get_app().is_running:
+                    await asyncio.sleep(0)
+            app.open_mcp_manager()
+            async with asyncio.timeout(10):
+                await refreshed.wait()
+
+            mcp_management.fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            contended = threading.Event()
+            attempted = []
+            original_flock = mcp_management.fcntl.flock
+            loop_thread = threading.get_ident()
+
+            def observe_flock(fd, operation):
+                if operation & fcntl.LOCK_EX:
+                    attempted.append((threading.get_ident(), operation))
+                    contended.set()
+                    if (
+                        threading.get_ident() == loop_thread
+                        or not operation & fcntl.LOCK_NB
+                    ):
+                        raise BlockingIOError
+                return original_flock(fd, operation)
+
+            monkeypatch.setattr(mcp_management.fcntl, "flock", observe_flock)
+            refreshed.clear()
+            pipe.send_text("e")
+            async with asyncio.timeout(5):
+                assert await asyncio.to_thread(contended.wait, 5)
+            assert attempted
+            assert all(thread != loop_thread for thread, _operation in attempted)
+            assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
+
+            responsive = asyncio.Event()
+            asyncio.get_running_loop().call_soon(responsive.set)
+            async with asyncio.timeout(5):
+                await responsive.wait()
+            assert not refreshed.is_set()
+
+            async with asyncio.timeout(10):
+                await refreshed.wait()
+            rendered = "\n".join(
+                "".join(text for _style, text in line)
+                for line in app._status_card._lines
+            )
+            assert (
+                "mcp error: mcp busy: configuration is being updated; retry" in rendered
+            )
+            assert not app._mcp_manager.service.show("contended", scope="user").enabled
+    finally:
+        mcp_management.fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+        if prompt is not None:
+            prompt.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await prompt
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monkeypatch):
     loop = AgentLoop(
         FakeBackend([]),
@@ -350,6 +465,7 @@ async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
     async def wizard():
         raise LookupError("boom")
 
+    # test-contract: seam force the real wizard task's exception callback
     monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
     app._status_action("a")
     await asyncio.sleep(0)
@@ -409,6 +525,7 @@ async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
             cancelled.set()
             raise
 
+    # test-contract: seam keep the real wizard task open through app shutdown
     monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
     app._status_action("a")
     await asyncio.sleep(0)
