@@ -3725,7 +3725,7 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
 
 
 @pytest.mark.asyncio
-async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
+async def test_session_swap_rejects_pending_notification_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3742,58 +3742,90 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             ScriptedTurn([TextContent("parent done")]),
         ]
     )
-    server = ZetaServer(provider="codex",
+    server = ZetaServer(
+        provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer = await _ready(server)
+    reader, writer = await _ready(server, protocol_version="1.1")
     assert server._client is not None
     agent_end_published = asyncio.Event()
+    release_agent_end = asyncio.Event()
+    notification_captured = asyncio.Event()
+    release_notification = asyncio.Event()
     original_notify = server.control._notify
+    original_notification_turn = server.turn_contexts.run_notification_turn
 
     async def notify(event: str, *args: object, **kwargs: object) -> None:
         await original_notify(event, *args, **kwargs)
         if event == "agent_end":
             agent_end_published.set()
+            await release_agent_end.wait()
+
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        notification_captured.set()
+        await release_notification.wait()
+        return await original_notification_turn(*args, **kwargs)
 
     monkeypatch.setattr(server.control, "_notify", notify)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )
     old_session_id = server.runtime.session_id
-    assert server.runtime.opened is not None
-    old_store = server.runtime.opened.store
-    for index in range(300):
-        old_store.append_message(
-            with_message_origin(
-                Message(MessageRole.USER, [TextContent(f"history-{index}")]),
-                MessageOrigin.USER,
-            )
-        )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
         approval = await _event(reader, "approval_request")
         assert approval["delegated"] is True
-        # A child approval and per-provider turn_end do not signal that the
-        # parent agent loop is idle. agent_end is the session-swap handoff.
-        await asyncio.wait_for(agent_end_published.wait(), timeout=30)
+        await asyncio.wait_for(agent_end_published.wait(), timeout=TIMEOUT)
+
+        swap_frames = await _request(
+            reader, writer, 4, "new_session", {"provider": "codex"}
+        )
+        assert swap_frames[-1]["error"]["code"] == -32004
+
+        release_agent_end.set()
         await _event(reader, "agent_end")
-        swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "codex"})
+        await _request(
+            reader,
+            writer,
+            5,
+            "approve",
+            {"request_id": approval["request_id"]},
+        )
+        await asyncio.wait_for(notification_captured.wait(), timeout=TIMEOUT)
+        notification_turn = server.control._turn_task
+        assert notification_turn is not None
+        release_notification.set()
+        await asyncio.wait_for(asyncio.shield(notification_turn), timeout=TIMEOUT)
+
+        swap_frames = await _request(
+            reader, writer, 6, "new_session", {"provider": "codex"}
+        )
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
-        assert all(
-            frame.get("params", {}).get("session_id") == old_session_id
-            for frame in swap_frames
-            if frame.get("params") is not None
-        )
 
-        old_notifications = old_store.agent_notifications()
-        assert old_notifications
-        assert all(
-            entry.data["child_instance_id"].startswith(f"{old_session_id}:")
-            for entry in old_notifications
+        resumed = await _request(
+            reader, writer, 7, "resume", {"session_id": old_session_id}
         )
-        status = await _request(reader, writer, 5, "status")
-        assert status[-1]["result"]["session"]["session_id"] == new_session_id
+        assert resumed[-1]["result"]["session"]["session_id"] == old_session_id
+        history = await _request(
+            reader,
+            writer,
+            8,
+            "session_history",
+            {"session_id": old_session_id},
+        )
+        assert "result" in history[-1], history[-1]
+        assert any(
+            message.get("role") == "assistant"
+            and message.get("content")
+            == [{"type": "text", "text": "parent done"}]
+            for message in history[-1]["result"]["messages"]
+        )
     finally:
+        release_agent_end.set()
+        release_notification.set()
         await _close(server, writer)
 
 
