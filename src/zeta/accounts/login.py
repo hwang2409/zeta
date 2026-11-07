@@ -14,7 +14,7 @@ from ..core.login_flow import (
     run_login,
 )
 from ..core.session import account_home
-from ..providers.login import build_login_provider, pkce_values
+from ..providers.login import LOGIN_PROVIDER_ERRORS, build_login_provider, pkce_values
 from .store import AccountError, AccountId, AccountStore
 
 
@@ -29,7 +29,7 @@ def login_failure_message(exc: Exception) -> str:
         if cause == "a login for this provider is already in progress":
             cause += "; close the other login and retry"
         return prefix + cause
-    if isinstance(exc, LoginError):
+    if isinstance(exc, (LoginError, *LOGIN_PROVIDER_ERRORS)):
         return (
             prefix + "the provider rejected the login or returned an invalid callback; "
             "retry in a new browser window"
