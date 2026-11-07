@@ -66,6 +66,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -81,6 +83,14 @@ jobs:
       # the pull request.
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
+
+      - name: Reject new low-signal test patterns
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
+          git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
 
   browser:
     name: browser
