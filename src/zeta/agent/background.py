@@ -20,6 +20,7 @@ from ..protocol.types import (
     ToolCall,
     ToolResult,
 )
+from . import conversation_channel
 from .conversation_channel import ConversationChannel, recover_orphaned_questions
 from .finish_gate import CausalEpisodeRegistry, FinishGateState
 from .pending_delivery import NotificationInput
@@ -771,44 +772,6 @@ def _recover_nested_children(
             store.finish_agent_child(marker_key)
 
 
-def _append_recovery_notification(
-    store: ConversationStore,
-    data: dict[str, object],
-) -> ConversationEntry:
-    report = (
-        {
-            "status": data["report_status"],
-            **{
-                key: data[key]
-                for key in ("summary", "head_sha", "verdict")
-                if key in data
-            },
-        }
-        if "report_status" in data
-        else {}
-    )
-    return store.append_agent_notification_if_absent(
-        str(data["child_instance_id"]),
-        child_session_path=str(data["child_session_path"]),
-        description=str(data["description"]),
-        status=str(data["status"]),
-        text=str(data["text"]),
-        stats=data.get("stats") if isinstance(data.get("stats"), dict) else None,
-        killed_task_ids=(
-            data.get("killed_task_ids")
-            if isinstance(data.get("killed_task_ids"), list)
-            else None
-        ),
-        killed_task_count=(
-            data.get("killed_task_count")
-            if isinstance(data.get("killed_task_count"), int)
-            else None
-        ),
-        killed_task_ids_truncated=data.get("killed_task_ids_truncated") is True,
-        report=report or None,
-    )[0]
-
-
 def _mirrored_recovery_notification(
     owner_store: ConversationStore,
     notification_store: ConversationStore,
@@ -822,16 +785,14 @@ def _mirrored_recovery_notification(
         notification_index,
         child_instance_id,
     )
-    if notification_store is owner_store:
-        return notification
+    if notification_store is owner_store: return notification
     owner_notification = _sync_agent_notification(
         owner_store,
         owner_notification_index,
         child_instance_id,
     )
     if notification is not None and owner_notification is None:
-        _append_recovery_notification(owner_store, dict(notification.data))
-        return notification
+        conversation_channel._append_recovery_notification(owner_store, dict(notification.data)); return notification
     if notification is None and owner_notification is not None:
         data = dict(owner_notification.data)
         data["display_only"] = True

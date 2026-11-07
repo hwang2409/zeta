@@ -15,6 +15,25 @@ if TYPE_CHECKING:
     from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
 
 
+def _append_recovery_notification(
+    store: ConversationStore, data: dict[str, object]
+) -> ConversationEntry:
+    report = (
+        {"status": data["report_status"]}
+        | {key: data[key] for key in ("summary", "head_sha", "verdict") if key in data}
+    ) if "report_status" in data else None
+    return store.append_agent_notification_if_absent(
+        str(data["child_instance_id"]),
+        child_session_path=str(data["child_session_path"]),
+        description=str(data["description"]),
+        status=str(data["status"]), text=str(data["text"]),
+        stats=data.get("stats") if isinstance(data.get("stats"), dict) else None,
+        killed_task_ids=data.get("killed_task_ids") if isinstance(data.get("killed_task_ids"), list) else None,
+        killed_task_count=data.get("killed_task_count") if isinstance(data.get("killed_task_count"), int) else None,
+        killed_task_ids_truncated=data.get("killed_task_ids_truncated") is True, report=report,
+    )[0]
+
+
 @dataclass(slots=True)
 class _DeliveryTarget:
     loop: asyncio.AbstractEventLoop
