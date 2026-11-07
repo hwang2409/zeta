@@ -47,7 +47,6 @@ from zeta.accounts import (
 )
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens, ProviderLoginRequiredError
@@ -61,6 +60,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.factory import build_backend, credential_store
 from zeta.providers.retry_policy import retryable_provider_error
+from zeta.runtime.loop import AgentLoop
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
