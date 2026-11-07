@@ -2678,11 +2678,13 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period() ->
         assert await wait.timeouts.get() == 3600
     finally:
         supervisor.cancel()
-        await asyncio.gather(supervisor, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
 
 
 @pytest.mark.asyncio
-async def test_task_safety_coalesces_deadlines_within_one_second() -> None:
+async def test_task_safety_delayed_wake_coalesces_all_overdue_deadlines() -> None:
     from zeta.agent.explicit_finish import TaskSafetyLifecycle
 
     now = [0.0]
@@ -2691,9 +2693,44 @@ async def test_task_safety_coalesces_deadlines_within_one_second() -> None:
     registry.tasks.extend(
         [
             SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
-            SimpleNamespace(task_id="task-2", headline="second", running=True, started_at=0.5),
-            SimpleNamespace(task_id="task-3", headline="boundary", running=True, started_at=1.0),
-            SimpleNamespace(task_id="task-4", headline="next cohort", running=True, started_at=1.001),
+            SimpleNamespace(task_id="task-2", headline="second", running=True, started_at=2.0),
+        ]
+    )
+    notices = _TaskSafetyNotices()
+    lifecycle = TaskSafetyLifecycle(3600, clock=lambda: now[0], wait=wait)
+    supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+    try:
+        assert await wait.timeouts.get() == 3601
+        now[0] = 3610
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert len(notices) == 1
+        assert "task task-1 (first)" in notices[0]
+        assert "task task-2 (second)" in notices[0]
+
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3601
+        assert {window.deadline for window in lifecycle._windows.values()} == {7210}
+    finally:
+        supervisor.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_safety_leaves_deadline_beyond_next_second_for_later_notice() -> None:
+    from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+    now = [0.0]
+    wait = _ControlledTaskSafetyWait()
+    registry = _ControlledTaskSafetyRegistry()
+    registry.tasks.extend(
+        [
+            SimpleNamespace(task_id="task-1", headline="first", running=True, started_at=0.0),
+            SimpleNamespace(task_id="task-2", headline="boundary", running=True, started_at=2.0),
+            SimpleNamespace(task_id="task-3", headline="later", running=True, started_at=2.001),
         ]
     )
     notices = _TaskSafetyNotices()
@@ -2703,15 +2740,22 @@ async def test_task_safety_coalesces_deadlines_within_one_second() -> None:
         assert await wait.timeouts.get() == 3601
         now[0] = 3601
         await wait.releases.put(False)
-        assert await wait.timeouts.get() == pytest.approx(1.001)
+        assert await wait.timeouts.get() == pytest.approx(2.001)
         assert len(notices) == 1
         assert "task task-1 (first)" in notices[0]
-        assert "task task-2 (second)" in notices[0]
-        assert "task task-3 (boundary)" in notices[0]
-        assert "task task-4 (next cohort)" not in notices[0]
+        assert "task task-2 (boundary)" in notices[0]
+        assert "task task-3 (later)" not in notices[0]
+
+        now[0] = 3603.001
+        await wait.releases.put(False)
+        assert await wait.timeouts.get() is None
+        assert len(notices) == 2
+        assert "task task-3 (later)" in notices[1]
     finally:
         supervisor.cancel()
-        await asyncio.gather(supervisor, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
 
 
 @pytest.mark.asyncio
@@ -2737,7 +2781,9 @@ async def test_task_safety_rereads_terminal_state_at_deadline() -> None:
         assert registry.kills == []
     finally:
         supervisor.cancel()
-        await asyncio.gather(supervisor, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
 
 
 @pytest.mark.asyncio
@@ -2773,7 +2819,9 @@ async def test_task_completion_turn_rearms_full_safety_window() -> None:
         ]
     finally:
         supervisor.cancel()
-        await asyncio.gather(supervisor, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(supervisor, return_exceptions=True), timeout=10
+        )
 
 
 @pytest.mark.asyncio

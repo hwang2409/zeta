@@ -183,7 +183,12 @@ class _TaskSafetyWindow:
 
 
 class TaskSafetyLifecycle:
-    """Wake a task owner before enforcing one per-task safety window."""
+    """Wake a task owner before enforcing one per-task safety window.
+
+    When a warning fires, one notice includes every live task whose deadline has
+    passed at that moment, plus any live task whose deadline falls within the
+    next second.
+    """
 
     def __init__(
         self,
@@ -267,13 +272,19 @@ class TaskSafetyLifecycle:
         publish_notice: Callable[[str], Awaitable[str]],
         now: float,
     ) -> None:
-        due = [
+        actionable = [
             window
             for window in self._windows.values()
             if window.warning_prompt_id is None and window.deadline <= now
         ]
-        warning_cohort = [window for window in due if not window.warned]
-        if warning_cohort:
+        if any(not window.warned for window in actionable):
+            warning_cohort = [
+                window
+                for window in self._windows.values()
+                if not window.warned
+                and window.warning_prompt_id is None
+                and window.deadline <= now + self._cohort_seconds
+            ]
             text = "\n".join(
                 f"task {window.task.task_id} ({window.task.headline}) has run "
                 f"{_format_duration(_task_age(window.task, now, self._limit))}; "
@@ -285,7 +296,7 @@ class TaskSafetyLifecycle:
                 window.warned = True
                 window.warning_prompt_id = prompt_id
 
-        for window in due:
+        for window in actionable:
             if not window.warned or window.warning_prompt_id is not None:
                 continue
             age = _task_age(window.task, now, self._limit)

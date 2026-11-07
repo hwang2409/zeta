@@ -13134,6 +13134,8 @@ async def test_late_task_gets_its_own_safety_window(
         )
     )
     task_id: str | None = None
+    safety_observed: asyncio.Task[float] | None = None
+    task_exited: asyncio.Task[object] | None = None
     try:
         await asyncio.wait_for(first_idle.wait(), 10)
         await asyncio.sleep(0)
@@ -13168,10 +13170,12 @@ async def test_late_task_gets_its_own_safety_window(
         task_exited = asyncio.create_task(
             loop.tool_registry.background_tasks.wait(task_id)
         )
-        done, pending = await asyncio.wait(
-            (safety_observed, task_exited),
+        done, _ = await asyncio.wait_for(
+            asyncio.wait(
+                (safety_observed, task_exited),
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
             timeout=10,
-            return_when=asyncio.FIRST_COMPLETED,
         )
         assert done
 
@@ -13184,9 +13188,6 @@ async def test_late_task_gets_its_own_safety_window(
         ).running
         assert safety_observed in done
         assert safety_observed.result() == pytest.approx(0.01)
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
 
         now[0] += 0.01
         await safety_wait.releases.put(False)
@@ -13208,8 +13209,21 @@ async def test_late_task_gets_its_own_safety_window(
     finally:
         if task_id is not None:
             await loop.tool_registry.background_tasks.kill(task_id)
+        waiters = tuple(
+            waiter
+            for waiter in (safety_observed, task_exited)
+            if waiter is not None
+        )
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*waiters, return_exceptions=True), timeout=10
+        )
         run.cancel()
-        await asyncio.gather(run, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(run, return_exceptions=True), timeout=10
+        )
         owner.conversation_channel.unregister_loop("root:1")
         await loop.close()
 
