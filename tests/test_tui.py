@@ -1537,7 +1537,6 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
-
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     event = StreamEvent(
@@ -6455,7 +6454,8 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "  fill: [--------------------] 0%\ncompaction_history:\n  none\n"
         "context_files: /repo/AGENTS.md\n"
         "hooks: stop: true\nautomatic_memory_failure: none\n"
-        "transcript_index_failure: none\n\0overlay-rule\0\n"
+        "transcript_index_failure: none\nproject_context_health: healthy\n"
+        "\0overlay-rule\0\n"
         "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
     )
 
@@ -6482,6 +6482,19 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         return "disk full; pending changes will retry"
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
+    app.loop.project_context_health = SimpleNamespace(
+        summary="malformed_memory (p_root/memory/state.md): project memory is malformed"
+    )
+    vars(app.loop._background_owner)["project_context_loops"] = {
+        "child-session": SimpleNamespace(
+            project_context_health=SimpleNamespace(
+                summary=(
+                    "malformed_memory (p_child/memory/brief.md): "
+                    "project memory is malformed"
+                )
+            )
+        )
+    }
     monkeypatch.setattr(
         AgentLoop,
         "connection_setup_counts",
@@ -6498,7 +6511,19 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
             "transcript_index_failure: disk full; pending changes will retry"
             in rendered
         )
+        assert (
+            "project_context_health: malformed_memory "
+            "(p_child/memory/brief.md): project memory is malformed" in rendered
+        )
         assert "completion_client_setups: codex/gpt-test=1" in rendered
+
+        app._agent_navigation.current_path = app._agent_navigation.root_path
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+        assert (
+            "project_context_health: malformed_memory "
+            "(p_root/memory/state.md): project memory is malformed" in rendered
+        )
     finally:
         await app.close()
 
@@ -8508,7 +8533,9 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         replay_completed.append(None)
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    # test-contract: seam Observe transcript rebuild through the application boundary.
     monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
+    # test-contract: seam Observe the production heap-freeze boundary.
     monkeypatch.setattr(
         "zeta.tui.checkpoints.freeze_long_lived_heap",
         lambda: freeze_calls.append(None),
@@ -8919,7 +8946,7 @@ async def test_run_keeps_empty_resumed_transcript_blank(
             else app_session(app, pipe)
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: app._input_loop_active)
         pipe.send_text("\x04")
         await run_task
 
@@ -11639,6 +11666,7 @@ async def test_tui_close_rejects_inflight_transcript_source(
         assert release.wait(5)
         return tree
 
+    # test-contract: seam Hold the transcript source at its production refresh boundary.
     monkeypatch.setattr(agent_sync.AgentTranscriptSource, "__init__", record_init)
     monkeypatch.setattr(agent_sync.AgentTranscriptSource, "refresh", gated_refresh)
     app._agent_navigation.selected_index = 1
@@ -12471,7 +12499,9 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
         return False, False
 
     _patch_draft_publish(monkeypatch, fail_write)
+    # test-contract: seam Run the CLI against the controlled application.
     monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12533,6 +12563,7 @@ def test_new_session_continues_after_failed_draft_save(
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12622,7 +12653,9 @@ def test_failed_active_draft_is_printed_on_every_exit(
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12704,7 +12737,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -12751,7 +12786,9 @@ def test_new_session_with_successful_draft_prints_nothing(
         await app.close()
         return False, False
 
+    # test-contract: seam Run the CLI against controlled session applications.
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
@@ -13020,7 +13057,6 @@ async def test_draft_write_failure_is_reported_once_without_raising(
 async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
     persistence.schedule("line one\nline two")
-    await asyncio.sleep(0.02)
     await persistence.flush_pending()
     assert persistence.load() == "line one\nline two"
 

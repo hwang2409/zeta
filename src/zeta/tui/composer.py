@@ -760,6 +760,10 @@ class SubmissionMixin:
     """Translate composer callbacks into pipeline messages."""
 
     async def slash_mcp(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_mcp_manager()
+            return ""
         return await self.loop.slash_mcp(args)
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
