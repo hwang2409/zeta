@@ -6,8 +6,8 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 
 
-async def _complete(backend: FakeBackend, prompt: str) -> None:
-    messages = [Message(MessageRole.USER, [TextContent(prompt)])]
+async def _complete(backend: FakeBackend, *prompts: str) -> None:
+    messages = [Message(MessageRole.USER, [TextContent(prompt)]) for prompt in prompts]
     _ = [event async for event in backend.complete(messages, [])]
 
 
@@ -37,4 +37,4 @@ async def test_fake_backend_rejects_shared_background_actor_script() -> None:
         AssertionError,
         match="FakeBackend cannot serve multiple actors; use PerActorFakeBackend",
     ):
-        await _complete(backend, "child work")
+        await _complete(backend, "parent work", "child work")

@@ -47,19 +47,21 @@ class FakeBackend(CompletionBackend):
         self.request_bytes: list[bytes] = []
         self._previous_request: bytes | None = None
         self._actor_prompt: str | None = None
-        self._multi_actor_script = any(
-            call.name == "agent" and call.arguments.get("background") is True
+        self._scripted_child_prompts = {
+            prompt
             for turn in turns
             for call in turn.tool_calls
-        )
+            if call.name == "agent" and call.arguments.get("background") is True
+            if isinstance(prompt := call.arguments.get("prompt"), str)
+        }
 
     async def complete(
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
-        if self._multi_actor_script:
-            actor_prompt = _first_public_input(messages)
+        if self._scripted_child_prompts:
+            actor_prompt = _script_actor_prompt(messages, self._scripted_child_prompts)
             if self._actor_prompt is None:
                 self._actor_prompt = actor_prompt
             elif actor_prompt != self._actor_prompt:
@@ -114,13 +116,19 @@ class FakeBackend(CompletionBackend):
                 raise self.close_error
 
 
-def _first_public_input(messages: Sequence[Message]) -> str:
-    for message in messages:
-        if message.role is MessageRole.USER:
-            for block in message.content:
-                if isinstance(block, TextContent):
-                    return block.text
-    raise AssertionError("scripted multi-actor backend call has no public input")
+def _script_actor_prompt(messages: Sequence[Message], child_prompts: set[str]) -> str:
+    public_inputs = [
+        block.text
+        for message in messages
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    if not public_inputs:
+        raise AssertionError("scripted multi-actor backend call has no public input")
+    return next(
+        (text for text in public_inputs if text in child_prompts), public_inputs[0]
+    )
 
 
 def _common_prefix_length(previous: bytes | None, current: bytes) -> int:
