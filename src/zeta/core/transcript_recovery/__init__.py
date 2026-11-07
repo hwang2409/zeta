@@ -13,13 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from ..storage_format import (
+from ...storage_format import (
     CLOSED_VARIANTS,
     RECOVERY_STATE_MEMORY_PAIRS,
     STRICT_PAYLOAD_KEYS,
 )
-from .checkpoints import ConversationEntry, load_session_json
-from .session_files import (
+from ..checkpoints import ConversationEntry, load_session_json
+from ..session_files import (
     child_directory,
     open_session_file,
     session_directory,
@@ -72,6 +72,30 @@ class RepairTarget:
             raise ValueError("invalid root session id")
         if self.child_run_id is not None:
             _child_run_segments(self.root_session_id, self.child_run_id)
+
+
+def repair_target_for_session_dir(
+    session_dir: Path, session_id: str
+) -> RepairTarget:
+    """Recover the public root/child identity from one session directory."""
+    parts = session_dir.parts
+    try:
+        sessions = len(parts) - 1 - parts[::-1].index("sessions")
+    except ValueError:
+        return RepairTarget(session_id)
+    root = parts[sessions + 1] if len(parts) > sessions + 1 else ""
+    relative = parts[sessions + 2 :]
+    if not root or not relative:
+        return RepairTarget(session_id)
+    if (
+        len(relative) % 2
+        or relative[-1] != session_id
+        or any(relative[index] != "agents" for index in range(0, len(relative), 2))
+        or any(not relative[index].isdigit() for index in range(1, len(relative), 2))
+    ):
+        return RepairTarget(session_id)
+    child_run_id = ":".join((root, *relative[1::2]))
+    return RepairTarget(root, child_run_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +216,7 @@ class RepairResult:
     source_digest: str
     repaired_digest: str
     memory_review_required: bool
+    overlapping_memory_versions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +309,7 @@ def repair_target_directory(
         )
         current_run_id = target.root_session_id
         for segment in _child_run_segments(target.root_session_id, target.child_run_id):
-            from .store._child_runs import verify_child_run_directory
+            from ..store._child_runs import verify_child_run_directory
 
             directory_fd = stack.enter_context(child_directory(directory_fd, "agents"))
             directory_fd = stack.enter_context(
@@ -440,6 +465,23 @@ def read_recovery_record(
     except FileNotFoundError:
         return None
     return parse_recovery_record(_mapping(value, "recovery record"))
+
+
+def set_memory_review_required(
+    directory_fd: int, quarantine_id: str, *, required: bool
+) -> RecoveryRecord:
+    """Finalize the memory-review decision after overlap inspection."""
+    record = read_recovery_record(directory_fd, quarantine_id)
+    if record is None or record.state != "committed":
+        raise TranscriptRecoveryError("recovery is not committed")
+    memory_step: MemoryStep = "review_pending" if required else "not_required"
+    if record.memory_step == memory_step:
+        return record
+    if record.memory_step != "review_pending":
+        raise TranscriptRecoveryError("recovery memory decision is already final")
+    updated = replace(record, memory_step=memory_step)
+    write_json_file(directory_fd, _state_name(_record_id(quarantine_id)), updated.to_dict())
+    return updated
 
 
 def resume_memory_review(
@@ -826,7 +868,7 @@ def _child_run_segments(
     if child_run_id is None:
         return ()
     # Import lazily so core recovery does not initialize the store package.
-    from .store._child_runs import child_run_segments
+    from ..store._child_runs import child_run_segments
 
     return child_run_segments(root_session_id, child_run_id)
 

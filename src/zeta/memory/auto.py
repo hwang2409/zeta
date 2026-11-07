@@ -213,8 +213,9 @@ class AutoMemoryReconciler:
         self._transcript_scan_error: str | None = None
         self._transcript_scan_error_seq: int | None = None
         self._recovery_generation = self.state.generation
-        self._recovery_cutoff: int | None = None
-        self._paused_for_recovery = False
+        self._recovery_cutoff = self.state.recovery_cutoff
+        self._paused_for_recovery = self.state.paused_for_recovery
+        self._resume_catch_up = self._recovery_cutoff is not None and not self._paused_for_recovery
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -266,7 +267,11 @@ class AutoMemoryReconciler:
         return queued
 
     async def recovery_committed(
-        self, *, retained_last_sequence: int, memory_review_required: bool
+        self,
+        *,
+        quarantine_id: str,
+        retained_last_sequence: int,
+        memory_review_required: bool,
     ) -> None:
         """Apply a repaired transcript only on this reconciler's owner loop."""
         if self._storage_lease.observed_epoch != WRITER_EPOCH:
@@ -276,6 +281,8 @@ class AutoMemoryReconciler:
             self.state.reset_for_recovery,
             generation=generation,
             retained_last_sequence=retained_last_sequence,
+            quarantine_id=quarantine_id,
+            paused=memory_review_required,
         )
         self._recovery_generation = generation
         self._recovery_cutoff = retained_last_sequence
@@ -313,6 +320,7 @@ class AutoMemoryReconciler:
                 ).cutoff_sequence
 
         retained_last_sequence = await asyncio.to_thread(resume)
+        await asyncio.to_thread(self.state.resume_recovery, quarantine_id)
         self._recovery_cutoff = retained_last_sequence
         self._paused_for_recovery = False
         self._resume_catch_up = True

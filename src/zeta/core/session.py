@@ -13,7 +13,7 @@ import uuid
 import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,7 +25,12 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore, TranscriptLoadError
-from .transcript_recovery import RepairResult, RepairTarget
+from .transcript_recovery import (
+    RepairResult,
+    RepairTarget,
+    recovery_status,
+    set_memory_review_required,
+)
 from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
@@ -351,6 +356,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         if store.cwd != metadata.cwd:
             store.close()
             raise SessionError(f"session {session_id} cwd does not match its metadata")
+        if not _read_only:
+            self._complete_root_recovery(metadata, store)
         if _read_only:
             return OpenedSession(metadata, store)
         metadata._execution_lease = store.execution_lease
@@ -391,9 +398,66 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 raise SessionError(
                     f"session {session_id} transcript does not need repair"
                 )
+            if child_run_id is None:
+                return self._complete_root_recovery(metadata, store, result)
             return result
         finally:
             store.close()
+
+    def _complete_root_recovery(
+        self,
+        metadata: SessionMetadata,
+        store: ConversationStore,
+        result: RepairResult | None = None,
+    ) -> RepairResult | None:
+        """Close memory state before a repaired root store is published."""
+        status = recovery_status(store.directory_fd, RepairTarget(metadata.session_id))
+        record = status.latest_committed
+        if record is None or record.memory_step == "resumed":
+            return result
+
+        overlaps: tuple[str, ...] = ()
+        registry = self.project_registry
+        if metadata.project_id is not None and registry is not None:
+            overlaps = registry.overlapping_automatic_versions(
+                metadata.project_id,
+                session_id=metadata.session_id,
+                retained_last_sequence=record.cutoff_sequence,
+                diagnosed_at=record.diagnosis_timestamp,
+            )
+            from ..memory.reconciliation_state import ReconciliationState
+
+            state = ReconciliationState(
+                store.session_dir / "memory-reconcile.json",
+                project_id=metadata.project_id,
+                session_id=metadata.session_id,
+                diagnostics_path=self.home / "logs" / "memory-reconciliation.jsonl",
+                storage_lease=self._storage_lease,
+            )
+            if state.recovery_quarantine_id != record.quarantine_id:
+                state.reset_for_recovery(
+                    generation=state.generation + 1,
+                    retained_last_sequence=record.cutoff_sequence,
+                    quarantine_id=record.quarantine_id,
+                    paused=bool(overlaps),
+                )
+        set_memory_review_required(
+            store.directory_fd, record.quarantine_id, required=bool(overlaps)
+        )
+        if result is None or result.quarantine_id != record.quarantine_id:
+            result = RepairResult(
+                record.quarantine_id,
+                record.target,
+                record.cutoff_sequence,
+                record.expected_source_digest,
+                record.repaired_digest,
+                bool(overlaps),
+            )
+        return replace(
+            result,
+            memory_review_required=bool(overlaps),
+            overlapping_memory_versions=overlaps,
+        )
 
     def _reconcile_project_link(self, session_id: str) -> None:
         registry = self.project_registry

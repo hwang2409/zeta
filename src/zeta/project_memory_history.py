@@ -1044,7 +1044,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         diagnosed_at: str | None = None,
     ) -> tuple[str, ...]:
         """List automatic versions that refer to rows removed by recovery."""
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> tuple[str, ...]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 records = self._records_locked(directory_fd)
@@ -1055,14 +1055,19 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                         continue
                     if provenance.get("session_id") != session_id:
                         continue
-                    if type(provenance.get("seq_end")) is not int or provenance["seq_end"] <= retained_last_sequence:
+                    seq_end = provenance.get("seq_end")
+                    if type(seq_end) is not int or seq_end <= retained_last_sequence:
                         continue
-                    if diagnosed_at is not None and str(record.get("created_at", "")) > diagnosed_at:
+                    if diagnosed_at is not None and str(
+                        record.get("created_at", "")
+                    ) > diagnosed_at:
                         continue
                     result.append(str(record["version"]))
                 return tuple(result)
             finally:
                 os.close(directory_fd)
+
+        return self._read(read)
 
     def undo_memory(
         self, project_id: str, *, expected_current: str | None = None

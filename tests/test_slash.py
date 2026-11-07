@@ -788,6 +788,80 @@ async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_pat
 
 
 @pytest.mark.asyncio
+async def test_tui_repair_resets_and_pauses_real_automatic_memory_state(
+    tmp_path: Path,
+) -> None:
+    from tests.support.owned import await_or_fail
+    from zeta.core.session import SessionManager
+    from zeta.project_registry import ProjectRegistry
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("recovery", "test")
+    manager = SessionManager(tmp_path)
+    damaged = await await_or_fail(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="offline",
+            cwd=tmp_path,
+            project_id=project.project_id,
+            auto_project=False,
+        ),
+        what="create damaged session",
+    )
+    damaged.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    damaged.store.close()
+    automatic = registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=registry.memory_digest(project.project_id),
+        updates={"state.md": "automatic\n"},
+        provenance={
+            "session_id": damaged.metadata.session_id,
+            "seq_start": 1,
+            "seq_end": 2,
+            "model": "offline",
+        },
+    )
+    transcript = tmp_path / "sessions" / damaged.metadata.session_id / "conversation.jsonl"
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+
+    current = await await_or_fail(
+        asyncio.to_thread(
+            manager.create, provider="codex", model="offline", cwd=tmp_path
+        ),
+        what="create current session",
+    )
+    tui = SimpleNamespace(loop=SimpleNamespace(manager=manager, store=current.store))
+    output = await SlashHandlerMixin.slash_repair_transcript(
+        tui, f"{damaged.metadata.session_id} confirm"
+    )
+    assert "repaired transcript" in output
+
+    memory_state = json.loads(
+        (transcript.parent / "memory-reconcile.json").read_text(encoding="utf-8")
+    )
+    assert memory_state["generation"] == 1
+    assert memory_state["seq"] == 1
+    assert memory_state["transcript_bytes"] == 0
+    assert memory_state["recovery_paused"] is True
+    recovery_files = list(transcript.parent.glob("conversation.recovery.*.json"))
+    assert len(recovery_files) == 1
+    recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
+    assert recovery["memory_step"] == "review_pending"
+    assert registry.overlapping_automatic_versions(
+        project.project_id,
+        session_id=damaged.metadata.session_id,
+        retained_last_sequence=1,
+    ) == (automatic.version,)
+
+
+@pytest.mark.asyncio
 async def test_memory_recovery_pause_resume_uses_shared_command_path() -> None:
     class Registry:
         def memory_format(self, project_id: str) -> int:

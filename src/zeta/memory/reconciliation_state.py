@@ -122,15 +122,39 @@ class ReconciliationState:
     def generation(self) -> int:
         return int(self._value.get("generation", 0))
 
+    @property
+    def recovery_quarantine_id(self) -> str | None:
+        value = self._value.get("recovery_quarantine_id")
+        return value if isinstance(value, str) and value else None
+
+    @property
+    def recovery_cutoff(self) -> int | None:
+        value = self._value.get("recovery_cutoff")
+        return value if type(value) is int and value >= 0 else None
+
+    @property
+    def paused_for_recovery(self) -> bool:
+        return self._value.get("recovery_paused") is True
+
     def reset_for_recovery(
-        self, *, generation: int, retained_last_sequence: int = 0
+        self,
+        *,
+        generation: int,
+        retained_last_sequence: int = 0,
+        quarantine_id: str,
+        paused: bool,
     ) -> None:
         """Forget byte evidence and rescan the repaired transcript from byte zero."""
         if type(generation) is not int or generation < 1:
             raise ValueError("invalid recovery generation")
         if type(retained_last_sequence) is not int or retained_last_sequence < 0:
             raise ValueError("invalid recovery cutoff")
+        if not quarantine_id:
+            raise ValueError("invalid recovery quarantine id")
         self._value["generation"] = generation
+        self._value["recovery_quarantine_id"] = quarantine_id
+        self._value["recovery_cutoff"] = retained_last_sequence
+        self._value["recovery_paused"] = paused
         self._value["seq"] = retained_last_sequence
         self._value["transcript_bytes"] = 0
         self._value["transcript_tokens"] = 0
@@ -143,6 +167,12 @@ class ReconciliationState:
         self._value["last_failure"] = None
         self._value["scanner_failure"] = None
         self._publish("transcript-recovery")
+
+    def resume_recovery(self, quarantine_id: str) -> None:
+        if self.recovery_quarantine_id != quarantine_id:
+            raise ValueError("memory recovery quarantine does not match")
+        self._value["recovery_paused"] = False
+        self._publish("transcript-recovery-resumed")
 
     @property
     def transcript_bytes(self) -> int:
@@ -780,6 +810,9 @@ class ReconciliationState:
             "terminal_receipts": [],
             "last_failure": None,
             "scanner_failure": None,
+            "recovery_quarantine_id": None,
+            "recovery_cutoff": None,
+            "recovery_paused": False,
         }
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))

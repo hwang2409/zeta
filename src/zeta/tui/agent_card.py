@@ -23,6 +23,7 @@ from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
+from ..core.transcript_recovery.runtime import repair_command_for_child_path
 from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
 from .cards.agent import (
@@ -508,24 +509,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def _repair_command(path: Path) -> str:
-    parts = path.parts
-    try:
-        sessions = parts.index("sessions")
-        root = parts[sessions + 1]
-        relative = parts[sessions + 2 :]
-    except (ValueError, IndexError):
-        return ""
-    segments = [
-        relative[index + 1]
-        for index in range(0, len(relative) - 1, 2)
-        if relative[index] == "agents"
-    ]
-    if not root or not segments:
-        return ""
-    return f"/repair-transcript {root} {root}:{':'.join(segments)}"
-
-
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
     """Read one agent's direct transcript, without nested child sessions."""
 
@@ -539,7 +522,7 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
         result.insert(0, bounded.marker)
     if result:
         return result
-    command = _repair_command(path)
+    command = repair_command_for_child_path(path)
     return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 

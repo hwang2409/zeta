@@ -14,6 +14,7 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
+from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -848,8 +849,13 @@ class _Client:
                     "child_run_id must be a string",
                 )
             try:
-                result = await asyncio.to_thread(
-                    runtime.manager.repair_transcript, session_id, child_run_id
+                result = await repair_transcript_for_runtime(
+                    runtime.manager,
+                    session_id,
+                    child_run_id,
+                    parent_store=(
+                        runtime.opened.store if runtime.opened is not None else None
+                    ),
                 )
             except (ValueError, SessionError) as exc:
                 raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
@@ -859,6 +865,9 @@ class _Client:
                 "quarantine_id": result.quarantine_id,
                 "retained_last_sequence": result.retained_last_sequence,
                 "memory_review_required": result.memory_review_required,
+                "overlapping_memory_versions": list(
+                    result.overlapping_memory_versions
+                ),
             }
         if method in {"rename_session", "delete_session"}:
             return await ergonomics.mutate_session(

@@ -53,7 +53,11 @@ from ..session_files import (
     session_root,
 )
 from ..todo import TodoItem, parse_todo_items
-from ..transcript_recovery import RepairResult, RepairTarget
+from ..transcript_recovery import (
+    RepairResult,
+    RepairTarget,
+    repair_target_for_session_dir,
+)
 from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
@@ -164,7 +168,9 @@ class ConversationStore(
             self._read_only = _read_only
             self._must_exist = _must_exist
             self._repair_explicit = _repair_explicit
-            self._repair_target = _repair_target or RepairTarget(self.session_id)
+            self._repair_target = _repair_target or repair_target_for_session_dir(
+                self.session_dir, self.session_id
+            )
             self._last_repair_result: RepairResult | None = None
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False

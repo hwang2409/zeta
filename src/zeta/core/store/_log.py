@@ -33,7 +33,6 @@ from ..checkpoints import (
 )
 from ..session_files import open_session_file
 from ..transcript_recovery import (
-    RepairTarget,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
@@ -950,7 +949,7 @@ class ConversationLogMixin:
         if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
             reconcile_pending(
                 self.directory_fd,
-                RepairTarget(self.session_id),
+                self._repair_target,
                 strict_reopen=self._strict_reopen_repaired_transcript,
             )
         baseline = (len(self._entries), self._entry_prefix_digest)
@@ -982,7 +981,7 @@ class ConversationLogMixin:
                 self._repair_target,
                 error._source_facts,
                 strict_reopen=self._strict_reopen_repaired_transcript,
-                memory_review_required=True,
+                memory_review_required=self._repair_target.child_run_id is None,
             )
             self._repair_explicit = False
             self._load_full()

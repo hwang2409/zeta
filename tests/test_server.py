@@ -10027,7 +10027,8 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
             "child_run_id": None,
             "quarantine_id": quarantine_id,
             "retained_last_sequence": 0,
-            "memory_review_required": True,
+            "memory_review_required": False,
+            "overlapping_memory_versions": [],
         }
         assert (
             path.with_name(
@@ -10051,6 +10052,58 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
         recovery = history[-1]["transcript_recovery"]
         assert recovery["quarantine_id"] == quarantine_id
         assert recovery["session_id"] == session_id
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    assert server.runtime.opened is not None
+    root = server.runtime.opened.store
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("retained")]),
+            MessageOrigin.USER,
+        )
+    )
+    child.close()
+    transcript = root.session_dir / "agents" / "1" / "conversation.jsonl"
+    transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+    try:
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "repair_transcript",
+                {
+                    "session_id": session_id,
+                    "child_run_id": f"{session_id}:1",
+                    "confirm": True,
+                },
+            )
+        )[-1]["result"]
+        assert repaired["child_run_id"] == f"{session_id}:1"
+        assert repaired["memory_review_required"] is False
+
+        reopened = ConversationStore(root.session_dir / "agents", session_id="1")
+        try:
+            reopened.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("usable")]),
+                    MessageOrigin.USER,
+                )
+            )
+            assert [message.content[0].text for message in reopened.messages()] == [
+                "retained",
+                "usable",
+            ]
+        finally:
+            reopened.close()
+        assert len(root.agent_notifications()) == 1
     finally:
         await _close(server, writer)
 

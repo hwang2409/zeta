@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -14,43 +13,7 @@ if TYPE_CHECKING:
 
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationStore, TranscriptLoadError
-from ..core.transcript_recovery import RepairResult, RepairTarget
 from ..protocol.types import ToolResult
-
-
-def transcript_recovery_notification_id(
-    target: RepairTarget, quarantine_id: str
-) -> str:
-    """Return a stable child-instance key for one committed quarantine."""
-    child = target.child_run_id or "root"
-    digest = hashlib.sha256(
-        f"{target.root_session_id}\0{child}\0{quarantine_id}".encode()
-    ).hexdigest()[:32]
-    return f"transcript-unavailable:{digest}"
-
-
-def append_transcript_recovery_notification(
-    parent_store: ConversationStore,
-    result: RepairResult,
-    *,
-    child_session_path: str,
-) -> tuple[object, bool]:
-    """Append one durable parent notice, deduplicated by quarantine identity."""
-    if result.target.child_run_id is None:
-        raise ValueError("child target required")
-    notification_id = transcript_recovery_notification_id(
-        result.target, result.quarantine_id
-    )
-    return parent_store.append_agent_notification_if_absent(
-        notification_id,
-        child_session_path=child_session_path,
-        description="transcript recovery",
-        status="error",
-        text=(
-            f"child transcript repaired; quarantine {result.quarantine_id}; "
-            "reopen the child to continue"
-        ),
-    )
 
 
 class AgentLoopForRecovery(Protocol):
@@ -116,8 +79,6 @@ def acquire_recovery_subtree(
     child_path: Path,
     leases: ExitStack,
     recovery_stores: dict[Path, ConversationStore],
-    *,
-    notification_store: ConversationStore,
 ) -> bool:
     """Lease a complete child subtree before any recovery mutation."""
 
@@ -125,38 +86,8 @@ def acquire_recovery_subtree(
         child_store = open_child_store(parent_store, child_path)
     except SessionOwnedError:
         return False
-    except TranscriptLoadError as error:
-        if error._source_facts is None:
-            return False
-        try:
-            relative = child_path.relative_to(parent_store.session_dir).parts
-            segments = tuple(
-                int(relative[index]) for index in range(1, len(relative), 2)
-            )
-            child_run_id = ":".join(
-                (parent_store.session_id, *(str(segment) for segment in segments))
-            )
-            child_store = ConversationStore(
-                child_path.parent,
-                session_id=child_path.name,
-                cwd=parent_store.cwd,
-                _storage_lease=parent_store._storage_lease,
-                _owner_surface="recovery",
-                _recovery_owner=True,
-                _repair_explicit=True,
-                _repair_target=RepairTarget(parent_store.session_id, child_run_id),
-            )
-            result = child_store.last_repair_result
-            if result is None:
-                child_store.close()
-                return False
-            append_transcript_recovery_notification(
-                notification_store,
-                result,
-                child_session_path=str(child_path),
-            )
-        except (SessionOwnedError, TranscriptLoadError, ValueError):
-            return False
+    except TranscriptLoadError:
+        return False
     if child_store is None:
         return True
     leases.enter_context(child_store)
@@ -169,7 +100,6 @@ def acquire_recovery_subtree(
             Path(marker["child_session_path"]),
             leases,
             recovery_stores,
-            notification_store=notification_store,
         )
         for marker in child_store.agent_children().values()
     )

@@ -27,6 +27,7 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
+from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -278,8 +279,15 @@ class ServerSlashSession:
         if len(parts) not in {2, 3} or parts[-1] != "confirm":
             return "usage: /repair-transcript <session-id> [<child-run-id>] confirm"
         child_run_id = parts[1] if len(parts) == 3 else None
-        result = await asyncio.to_thread(
-            self._runtime.manager.repair_transcript, parts[0], child_run_id
+        result = await repair_transcript_for_runtime(
+            self._runtime.manager,
+            parts[0],
+            child_run_id,
+            parent_store=(
+                self._runtime.opened.store
+                if self._runtime.opened is not None
+                else None
+            ),
         )
         return (
             f"repaired transcript {parts[0]}"
