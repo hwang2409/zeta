@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import inspect
 import os
 from collections import deque
@@ -42,13 +41,12 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .slash_errors import unknown_slash_command
 from .project_context import (
     discover_project_root,
     project_instructions_command,
 )
 from .store import ConversationEntry
-
-
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
     uncached_input_tokens_this_session: int
@@ -118,7 +116,6 @@ class UsageTracker:
                     estimated_cost_usd=_snapshot_cost(self.provider, snapshot),
                 )
             self._accumulate_cost(snapshot)
-
     def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
         if snapshot.model is None:
             return
@@ -785,16 +782,9 @@ class SlashCommandRegistry:
             if custom.kind != "exec":
                 return None
             return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
-        suggestion = difflib.get_close_matches(
-            name,
-            [entry[0] for entry in self.completion_entries],
-            n=1,
-            cutoff=0.6,
+        return unknown_slash_command(
+            name, (entry[0] for entry in self.completion_entries)
         )
-        message = f"unknown command /{name}. type // to send it as text."
-        if suggestion:
-            message += f" did you mean /{suggestion[0]}?"
-        return SlashPromptError(message)
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
