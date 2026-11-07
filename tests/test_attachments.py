@@ -15,6 +15,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import owned_app
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -462,59 +463,63 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         provider="codex",
         model="offline",
     )
-    session = app._make_session()
-    app._active_session = session
-    buffer = session.default_buffer
-    paths = [
-        store.session_dir / f"clipboard-{name}.png"
-        for name in ("first", "second", "third")
-    ]
-    lock = threading.Lock()
-    all_staged = threading.Event()
-    gates = [threading.Event() for _ in paths]
-    returned = [threading.Event() for _ in paths]
-    staged_count = 0
-    # Each paste's staging thread inherits the context of the start() call, so
-    # task i stages paths[i] whatever order the threads run in.
-    paste_index: contextvars.ContextVar[int] = contextvars.ContextVar("paste_index")
+    async with owned_app(app) as owner:
+        session = app._make_session()
+        app._active_session = session
+        buffer = session.default_buffer
+        paths = [
+            store.session_dir / f"clipboard-{name}.png"
+            for name in ("first", "second", "third")
+        ]
+        lock = threading.Lock()
+        all_staged = threading.Event()
+        gates = [threading.Event() for _ in paths]
+        for gate in gates:
+            owner.release_with(gate.set)
+        returned = [threading.Event() for _ in paths]
+        staged_count = 0
+        # Each paste's staging thread inherits the context of the start() call, so
+        # task i stages paths[i] whatever order the threads run in.
+        paste_index: contextvars.ContextVar[int] = contextvars.ContextVar("paste_index")
 
-    def stage(*args: object, **kwargs: object) -> Path:
-        nonlocal staged_count
-        del args, kwargs
-        index = paste_index.get()
-        with lock:
-            staged_count += 1
-            if staged_count == len(paths):
-                all_staged.set()
-        paths[index].write_bytes(PNG)
-        gates[index].wait()
-        returned[index].set()
-        return paths[index]
+        def stage(*args: object, **kwargs: object) -> Path:
+            nonlocal staged_count
+            del args, kwargs
+            index = paste_index.get()
+            with lock:
+                staged_count += 1
+                if staged_count == len(paths):
+                    all_staged.set()
+            paths[index].write_bytes(PNG)
+            gates[index].wait()
+            returned[index].set()
+            return paths[index]
 
-    cleanup_started = asyncio.Event()
-    cleanup_canceled = app._paste_runtime._cleanup_canceled
-    deleted = threading.Event()
-    delete_staged = app._paste_runtime._delete_staged
+        cleanup_started = asyncio.Event()
+        cleanup_canceled = app._paste_runtime._cleanup_canceled
+        deleted = threading.Event()
+        delete_staged = app._paste_runtime._delete_staged
 
-    async def record_cleanup(*args: object) -> None:
-        cleanup_started.set()
-        await cleanup_canceled(*args)  # type: ignore[arg-type]
+        async def record_cleanup(*args: object) -> None:
+            cleanup_started.set()
+            await cleanup_canceled(*args)  # type: ignore[arg-type]
 
-    def record_delete(path: Path, session_dir: Path, directory_fd: int | None) -> None:
-        delete_staged(path, session_dir, directory_fd)
-        if path == paths[1]:
-            deleted.set()
+        def record_delete(path: Path, session_dir: Path, directory_fd: int | None) -> None:
+            delete_staged(path, session_dir, directory_fd)
+            if path == paths[1]:
+                deleted.set()
 
-    monkeypatch.setattr(paste_runtime, "paste_image", stage)
-    # test-contract: seam no public event reports entry into canceled-paste cleanup.
-    monkeypatch.setattr(app._paste_runtime, "_cleanup_canceled", record_cleanup)
-    # test-contract: seam no public event reports completion of staged-file deletion.
-    monkeypatch.setattr(app._paste_runtime, "_delete_staged", record_delete)
-    tasks = []
-    for index in range(3):
-        paste_index.set(index)
-        tasks.append(app._paste_runtime.start(buffer))
-    try:
+        monkeypatch.setattr(paste_runtime, "paste_image", stage)
+        # test-contract: seam no public event reports entry into canceled-paste cleanup.
+        monkeypatch.setattr(app._paste_runtime, "_cleanup_canceled", record_cleanup)
+        # test-contract: seam no public event reports completion of staged-file deletion.
+        monkeypatch.setattr(app._paste_runtime, "_delete_staged", record_delete)
+        tasks = []
+        for index in range(3):
+            paste_index.set(index)
+            task = app._paste_runtime.start(buffer)
+            owner.task(task)
+            tasks.append(task)
         assert await asyncio.to_thread(all_staged.wait, 10)
         # Adverse order: cancel the middle paste and let both later stagings
         # finish while the first paste is still staging.
@@ -535,19 +540,16 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         assert not tasks[1].done()
         assert not tasks[2].done()
         assert buffer.text == ""
-    finally:
-        # Never leave a staging thread blocked, even when an assertion fails.
         for gate in gates:
             gate.set()
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        await app.close()
 
-    assert isinstance(results[1], asyncio.CancelledError)
-    assert buffer.text == "[Image #1][Image #2]"
-    assert list(app._pending_attachment_tokens.values()) == [paths[0], paths[2]]
-    assert paths[0].exists()
-    assert not paths[1].exists()
-    assert paths[2].exists()
+        assert isinstance(results[1], asyncio.CancelledError)
+        assert buffer.text == "[Image #1][Image #2]"
+        assert list(app._pending_attachment_tokens.values()) == [paths[0], paths[2]]
+        assert paths[0].exists()
+        assert not paths[1].exists()
+        assert paths[2].exists()
 
 
 @pytest.mark.asyncio
@@ -755,22 +757,22 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
         provider="codex",
         model="offline",
     )
-    notices: list[str] = []
-    app._print_system = notices.append
-    session = PromptSession(
-        output=DummyOutput(),
-        key_bindings=build_key_bindings(
-            on_history_previous=lambda _buffer: None,
-            on_history_next=lambda _buffer: None,
-            on_interrupt=app.abort_active,
-            on_exit=app.request_exit,
-        ),
-        multiline=True,
-    )
-    # test-contract: seam no public event reports prompt-session readiness for /paste.
-    app._active_session = session
+    async with owned_app(app):
+        notices: list[str] = []
+        app._print_system = notices.append
+        session = PromptSession(
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        # test-contract: seam no public event reports prompt-session readiness for /paste.
+        app._active_session = session
 
-    try:
         await app._handle_prompt_value("/paste")
 
         assert session.app.current_buffer.text == "[Image #1]"
@@ -778,9 +780,7 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
             "[Image #1]": app._pending_attachments[0]
         }
         assert helper_threads and helper_threads != [loop_thread]
-    finally:
-        await app.close()
-    assert notices == []
+        assert notices == []
 
 
 @pytest.mark.asyncio
