@@ -215,9 +215,7 @@ class AgentLoop(
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
-        # Directory of the ROOT session that owns the durable child-link index;
-        # threaded down every loop so nested children publish their lineage
-        # intent into a single flat directory the root can reconcile.
+        # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
             root_session_dir if root_session_dir is not None else store.session_dir
         )
@@ -256,8 +254,7 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
-        # Partial assistant persistence uses these values so provider metadata is
-        # retained even when the stream later fails or is cancelled.
+        # Preserve provider metadata if the partial assistant stream fails.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
@@ -518,11 +515,7 @@ class AgentLoop(
         cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
-        """Close session-owned transports and background processes.
-
-        Returns the ids of background tasks killed by this close so a completing
-        child can report them to its parent.
-        """
+        """Close owned resources and return task ids killed during close."""
 
         self._closed = True
         killed: tuple[str, ...] = ()
@@ -611,8 +604,7 @@ class AgentLoop(
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
         await self._activate_project_inbox()
-        # Frontends can render immediately while trusted, enabled MCP servers
-        # connect in the background. Operations that require MCP await this task.
+        # Render now; MCP-dependent operations await the background connection.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
 

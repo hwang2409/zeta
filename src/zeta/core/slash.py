@@ -982,8 +982,7 @@ def _format_status(status: SlashStatus) -> str:
             + (status.automatic_memory_failure or "none"),
             "transcript_index_failure: "
             + (status.transcript_index_failure or "none"),
-            "project_context_health: "
-            + (status.project_context_health or "healthy"),
+            f"project_context_health: {status.project_context_health or 'healthy'}",
         ]
     )
     if status.todo_counts is not None:
