@@ -307,10 +307,11 @@ def _proposal(prompt: str) -> str:
 
 
 class _IdleClock:
-    def __init__(self) -> None:
+    def __init__(self, *, expiry_delay_ticks: int = 0) -> None:
         self.now = 0.0
         self.waiting = asyncio.Event()
         self.release = asyncio.Event()
+        self.expiry_delay_ticks = expiry_delay_ticks
 
     def __call__(self) -> float:
         return self.now
@@ -321,6 +322,8 @@ class _IdleClock:
         self.release.clear()
         if wake.is_set():
             return
+        for _ in range(self.expiry_delay_ticks):
+            await asyncio.sleep(0)
         raise TimeoutError
 
     async def advance(self, seconds: float) -> None:
@@ -329,9 +332,11 @@ class _IdleClock:
         await asyncio.sleep(0)
 
 
-async def _wait_until(event: asyncio.Event) -> None:
-    while not event.is_set():
-        await asyncio.sleep(0)
+async def _wait_until(event: asyncio.Event, description: str) -> None:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=10)
+    except TimeoutError:
+        pytest.fail(f"timed out waiting for {description}")
     event.clear()
 
 
@@ -682,39 +687,44 @@ async def test_token_growth_position_is_durable_and_ignores_provider_usage(
 
 @pytest.mark.asyncio
 async def test_idle_trigger(tmp_path: Path) -> None:
-    idle_clock = _IdleClock()
+    idle_clock = _IdleClock(expiry_delay_ticks=101)
+    reconciliation_started = asyncio.Event()
+
+    async def invoke(prompt: str) -> str:
+        reconciliation_started.set()
+        return _proposal(prompt)
+
     runner, registry, project_id, _ = _runner(
         tmp_path,
+        invoke,
         idle_seconds=10,
         minimum_interval=0,
         clock=idle_clock,
         idle_wait=idle_clock.wait,
     )
     runner.activity(1)
-    await _wait_until(idle_clock.waiting)
+    await _wait_until(idle_clock.waiting, "idle clock to start waiting")
     runner.activity(4)
     await idle_clock.advance(10)
-    await _wait_until(idle_clock.waiting)
+    await _wait_until(idle_clock.waiting, "idle clock to re-arm")
     assert not registry.memory_log(project_id)
     await idle_clock.advance(10)
-    for _ in range(100):
-        await asyncio.sleep(0)
-        if registry.memory_log(project_id):
-            break
+    await _wait_until(
+        reconciliation_started, "idle-triggered reconciliation to start"
+    )
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 1
 
     # Idle is re-armed by later durable activity after a completed reconciliation.
     _write_transcript(runner.session_dir, 5)
     runner.activity(5)
-    await _wait_until(idle_clock.waiting)
+    await _wait_until(idle_clock.waiting, "idle clock to wait for later activity")
     await idle_clock.advance(10)
-    await _wait_until(idle_clock.waiting)
+    await _wait_until(idle_clock.waiting, "idle clock to re-arm later activity")
     await idle_clock.advance(10)
-    for _ in range(100):
-        await asyncio.sleep(0)
-        if len(registry.memory_log(project_id)) == 2:
-            break
+    await _wait_until(
+        reconciliation_started, "re-armed idle-triggered reconciliation to start"
+    )
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 2
 

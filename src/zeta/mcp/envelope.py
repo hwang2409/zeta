@@ -1,4 +1,4 @@
-"""Bounded accumulation for MCP HTTP responses."""
+"""Bounded accumulation for MCP responses."""
 
 from __future__ import annotations
 
@@ -9,6 +9,15 @@ from dataclasses import dataclass
 from typing import BinaryIO
 
 from ..tools._spill import SpillStore
+
+_SPILL_WRITE_SIZE = 64 * 1024
+_MEBIBYTE = 1024 * 1024
+
+
+def _format_wire_limit(size: int) -> str:
+    if size % _MEBIBYTE == 0:
+        return f"{size // _MEBIBYTE} MiB"
+    return f"{size} bytes"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +53,7 @@ class MCPCallEnvelope:
         self._parts: list[bytes] = []
         self._temporary = None
         self._handle: BinaryIO | None = None
+        self._spill_buffer = bytearray()
         self._reserved = 0
 
     async def append(self, chunk: bytes) -> None:
@@ -61,9 +71,8 @@ class MCPCallEnvelope:
             self._reserved = self.total
             self._temporary = self.spill_store.temporary_file()
             self._handle = await asyncio.to_thread(self._temporary.__enter__)
-            prefix = b"".join(self._parts)
+            self._spill_buffer.extend(b"".join(self._parts))
             self._parts.clear()
-            await asyncio.to_thread(self._handle.write, prefix)
         extra = self.total - self._reserved
         if extra:
             try:
@@ -71,12 +80,22 @@ class MCPCallEnvelope:
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
             self._reserved += extra
+        self._spill_buffer.extend(chunk)
+        if len(self._spill_buffer) >= _SPILL_WRITE_SIZE:
+            await self._flush_spill()
+
+    async def _flush_spill(self) -> None:
+        if self._handle is None or not self._spill_buffer:
+            return
+        chunk = bytes(self._spill_buffer)
+        self._spill_buffer.clear()
         await asyncio.to_thread(self._handle.write, chunk)
 
     async def finish_json(self) -> object:
         try:
             if self._handle is None:
                 return await asyncio.to_thread(json.loads, b"".join(self._parts))
+            await self._flush_spill()
             await asyncio.to_thread(self._handle.seek, 0)
             return await asyncio.to_thread(json.load, self._handle)
         finally:
@@ -89,6 +108,7 @@ class MCPCallEnvelope:
         self._handle = None
         self._reserved = 0
         self._parts.clear()
+        self._spill_buffer.clear()
         try:
             if temporary is not None:
                 await asyncio.to_thread(temporary.__exit__, None, None, None)
@@ -97,4 +117,9 @@ class MCPCallEnvelope:
                 self.spill_store.release_transient(reserved)
 
 
-__all__ = ["MCPCallEnvelope", "MCPCallLimits", "MCPTransientQuotaError", "MCPWireLimitError"]
+__all__ = [
+    "MCPCallEnvelope",
+    "MCPCallLimits",
+    "MCPTransientQuotaError",
+    "MCPWireLimitError",
+]

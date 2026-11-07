@@ -151,6 +151,70 @@ def test_parent_and_child_abort_interfaces_match_protocol() -> None:
     assert inspect.signature(ChildApprovalPolicy.abort_or_winner) == expected
 
 
+class _RecordingServeApprovalControl:
+    def __init__(self) -> None:
+        self.aborts: list[tuple[str, str | None, str]] = []
+        self.cleanups: list[str] = []
+
+    async def request_approval_abort(
+        self,
+        request_id: str,
+        *,
+        child_instance_id: str | None,
+        reason: str,
+    ) -> dict[str, str]:
+        self.aborts.append((request_id, child_instance_id, reason))
+        return {"decision": "abort", "reason": reason}
+
+    def register_delegated(self, *args: object) -> None:
+        pass
+
+    async def cleanup_delegated(self, child_instance_id: str) -> None:
+        self.cleanups.append(child_instance_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [2, 3])
+async def test_nested_child_abort_reaches_serve_with_innermost_identity(
+    tmp_path: Path,
+    depth: int,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    control = _RecordingServeApprovalControl()
+    parent_policy.bind_serve_control(control)
+    policy: ApprovalPolicy | ChildApprovalPolicy = parent_policy
+    child_stores: list[ConversationStore] = []
+    for level in range(1, depth + 1):
+        child_store = ConversationStore(
+            tmp_path / f"child-{level}-sessions", cwd=tmp_path
+        )
+        child_stores.append(child_store)
+        policy = ChildApprovalPolicy(
+            policy,
+            child_store,
+            f"child {level}",
+            f"child-{level}",
+            child_cwd=tmp_path,
+        )
+
+    assert isinstance(policy, ChildApprovalPolicy)
+    assert await policy._resolve_abort_or_winner(
+        "nested-request",
+        execution_token=None,
+        capability=object(),  # type: ignore[arg-type]
+    ) is None
+    await policy.cleanup()
+
+    assert control.aborts == [
+        ("nested-request", f"child-{depth}", "child_cleanup")
+    ]
+    assert control.cleanups == [f"child-{depth}"]
+    for store in reversed(child_stores):
+        store.close()
+    parent_store.close()
+
+
 @pytest.mark.asyncio
 async def test_pre_aborted_child_task_output_fails_closed(
     tmp_path: Path,

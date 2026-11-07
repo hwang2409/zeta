@@ -157,6 +157,9 @@ class ServerSlashSession:
                 if loop.memory_reconciler is not None
                 else None
             ),
+            transcript_index_failure=loop.transcript_index_failure(
+                opened.metadata.session_id
+            ),
         )
 
     async def slash_accounts(self, args: str) -> str:

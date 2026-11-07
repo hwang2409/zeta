@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta import storage_format
 from zeta.core.checkpoints import ConversationIntegrityError
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.store import ConversationStore
@@ -133,6 +134,29 @@ def test_writer_lock_descriptor_is_not_inherited(tmp_path: Path) -> None:
     lease.close()
 
 
+def test_writer_owner_cleanup_can_reenter_registry_lock(tmp_path: Path) -> None:
+    advance(tmp_path, expected_epoch=0)
+    lease = open_writer(tmp_path)
+
+    storage_format._REGISTRY_LOCK.acquire()
+    reentered = storage_format._REGISTRY_LOCK.acquire(blocking=False)
+    try:
+        if reentered:
+            lease.close()
+            storage_format._REGISTRY_LOCK.release()
+    finally:
+        storage_format._REGISTRY_LOCK.release()
+    if not reentered:
+        lease.close()
+    assert reentered, "owner cleanup must re-enter the writer registry lock"
+
+    result: multiprocessing.Queue[str] = multiprocessing.Queue()
+    _try_exclusive_lock(str(tmp_path), result)
+    assert result.get(timeout=1) == "exclusive lock acquired"
+    result.close()
+    result.join_thread()
+
+
 def test_background_registry_releases_its_only_writer_lease(tmp_path: Path) -> None:
     _assert_closed_owner_allows_exclusive_lock(tmp_path, "background")
 
@@ -176,7 +200,9 @@ def test_publish_reads_locked_tree_before_writing(tmp_path: Path) -> None:
     )
 
     def publish(fd: int, name: str, data: bytes) -> None:
-        with open(name, "wb", opener=lambda path, flags: os.open(path, flags, dir_fd=fd)) as handle:
+        with open(
+            name, "wb", opener=lambda path, flags: os.open(path, flags, dir_fd=fd)
+        ) as handle:
             handle.write(data)
 
     try:
