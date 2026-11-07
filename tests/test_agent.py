@@ -4449,6 +4449,7 @@ async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
     profiles = {
         "orchestrator": "tools: [agent, read]\n",
         "lead": "tools: [bash]\n",
+        "policy_denied": "tools: [write]\n",
     }
     for name, settings in profiles.items():
         profile = home / "agents" / f"{name}.md"
@@ -4473,6 +4474,7 @@ async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
                 ]
             ),
             ScriptedTurn([TextContent("lead complete")]),
+            ScriptedTurn(tool_calls=[_agent_call("denied-agent", "policy_denied")]),
             ScriptedTurn([TextContent("orchestrator complete")]),
         ]
     )
@@ -4482,7 +4484,8 @@ async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
         session_store=store,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=catalog,
-        tool_allow=("agent", "bash", "read"),
+        tool_allow=("agent", "bash", "read", "write"),
+        tool_deny=("write",),
     )
     loop = AgentLoop(
         backend,
@@ -4506,7 +4509,15 @@ async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
     )
     assert not bash_result.is_error
     assert "nested-ok" in bash_result.content
+    orchestrator_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    denied_result = next(
+        message.tool_result
+        for message in orchestrator_store.messages()
+        if message.tool_result and message.tool_result.is_error
+    )
+    assert "profile 'policy_denied' requests unavailable tools: write" in denied_result.content
 
+    orchestrator_store.close()
     lead_store.close()
     await loop.close()
 
