@@ -1185,7 +1185,8 @@ async def test_read_after_cross_store_reclaim_reports_artifact_gone_and_repairs_
 async def test_child_spills_share_one_root_byte_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE + 50
+    minimum = 4 * 1024
+    shared_cap = minimum + 50
     monkeypatch.setattr(
         spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
     )
@@ -1212,8 +1213,8 @@ async def test_child_spills_share_one_root_byte_cap(
         )
         first = root.clone_for_session(first_store)
         second = root.clone_for_session(second_store)
-        first.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
-        second.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+        first.spills.max_bytes = minimum
+        second.spills.max_bytes = minimum
         try:
             old_path = first.spills.write_bytes("tool", "duplicate", 0, b"a" * 100)
             sibling_path = second.spills.write_bytes(
