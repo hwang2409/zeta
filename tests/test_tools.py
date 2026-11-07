@@ -1621,7 +1621,7 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
         )
     )
     child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
-    result = await execution
+    result = await asyncio.wait_for(execution, 10)
     await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
     assert result["isError"] is True
