@@ -1,5 +1,4 @@
 """The provider-neutral agent loop."""
-
 from __future__ import annotations
 
 import asyncio
@@ -197,10 +196,7 @@ class AgentLoop(
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
     ) -> None:
-        if (
-            type(max_agent_depth) is not int
-            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
-        ):
+        if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )

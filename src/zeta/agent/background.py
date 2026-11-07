@@ -200,7 +200,9 @@ class BackgroundAgentOwner:
                     changed = True
         return selected
 
-    def cancel_subtree(self, instance_id: str) -> tuple[_CancellationConfirmation, ...]:
+    def cancel_subtree(
+        self, instance_id: str
+    ) -> tuple[_CancellationConfirmation, ...]:
         selected = self._subtree_ids(instance_id)
         confirmations: list[_CancellationConfirmation] = []
         for child in tuple(self._cancellers):
@@ -390,9 +392,7 @@ class BackgroundAgentOwner:
                 self._observed_close_failures.update(
                     task
                     for task in close_tasks
-                    if task.done()
-                    and not task.cancelled()
-                    and task.exception() is not None
+                    if task.done() and not task.cancelled() and task.exception() is not None
                 )
                 raise
             for task in close_tasks:
@@ -556,7 +556,9 @@ def _background_terminal(
             "canceled": "canceled",
         }.get(lifecycle_state, "canceled")
     )
-    text = lifecycle.get("final_result") if lifecycle is not None else None
+    text = (
+        lifecycle.get("final_result") if lifecycle is not None else None
+    )
     if type(text) is not str or not text:
         text = fallback_text
     stats = agent_stats(lifecycle, status=status, turns_used=turns_used)
@@ -624,7 +626,9 @@ def _recovered_completion_input(
         for key in ("summary", "head_sha", "verdict"):
             if key in report:
                 data[key] = report[key]
-    return NotificationInput("child_completion", data, dedupe_key=child_instance_id)
+    return NotificationInput(
+        "child_completion", data, dedupe_key=child_instance_id
+    )
 
 
 def _recover_nested_children(
@@ -983,7 +987,9 @@ def _recover_agent_children(
                 elif recovered_result is not None or existing_result is not None:
                     child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
-    recover_orphaned_questions(loop.store, excluded_child_subtrees=busy_child_subtrees)
+    recover_orphaned_questions(
+        loop.store, excluded_child_subtrees=busy_child_subtrees
+    )
     return tuple(deliveries)
 
 
@@ -1071,16 +1077,15 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        result_structured = (
-            result.get("structuredContent", {}) if isinstance(result, dict) else {}
-        )
+        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
         turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
         if (
             child_loop is not None
             and status != "canceled"
             and explicit_finish_report is None
             and not (
-                finish_gate_state is not None and finish_gate_state.terminal_admitted
+                finish_gate_state is not None
+                and finish_gate_state.terminal_admitted
             )
         ):
             from .finish_gate import await_owned_work
@@ -1110,13 +1115,8 @@ async def finish_background_child(
             "canceled": "canceled",
             "error": "failed",
         }[status]
-        effective_parent_store, effective_parent_id = background_owner.parent_edge(
-            child_instance_id, parent_store, agent_instance_id
-        )
-        terminal_stats = agent_stats(
-            {**(child_store.agent_lifecycle() or {}), "turns_used": turns_used},
-            status=status,
-        )
+        effective_parent_store, effective_parent_id = background_owner.parent_edge(child_instance_id, parent_store, agent_instance_id)
+        terminal_stats = agent_stats({**(child_store.agent_lifecycle() or {}), "turns_used": turns_used}, status=status)
         result_text = notification_text or "background child completed"
         if explicit_finish_report is not None:
             explicit_terminal = _background_terminal(
@@ -1195,9 +1195,7 @@ async def finish_background_child(
                 ),
             )
             for transferred_id in transferred:
-                background_owner.adopt(
-                    transferred_id, effective_parent_store, effective_parent_id
-                )
+                background_owner.adopt(transferred_id, effective_parent_store, effective_parent_id)
             await background_owner.conversation_channel.close_questions(
                 child_instance_id,
                 reason="canceled" if status == "canceled" else "finished",
