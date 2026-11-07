@@ -224,7 +224,9 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
 
     try:
         await asyncio.wait_for(refresh_and_run_turn(), timeout=5)
-        assert loop.tool_registry.skill_catalog.find("live").description == "live description"
+        live_skill = loop.tool_registry.skill_catalog.find("live")
+        assert live_skill is not None
+        assert live_skill.description == "live description"
     finally:
         release.set()
         holder.join(1)
