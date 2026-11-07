@@ -161,11 +161,12 @@ async def create_tool_subprocess_shell(
                 await asyncio.shield(cleanup)
                 raise
             raise
+        proc = transport._proc
         try:
             await waiter
-            await _wait_for_launcher(process=transport._proc)
+            await _wait_for_launcher(process=proc)
         except BaseException:
-            transport._proc.ready.close()
+            proc.ready.close()
             transport.close()
             await transport._wait()
             raise
