@@ -845,7 +845,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         }
                     )
                     return
-                raise cleanup_error
+                raise
             selected = select_completion_outcome(
                 primary_error,
                 producer_error if isinstance(producer_error, BaseException) else None,
