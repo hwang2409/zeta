@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.storage_homes import initialize_storage_home
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp import (
@@ -190,6 +191,7 @@ def _monkey_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 
 def _write_token(name: str, home: Path, **overrides: object) -> MCPOAuthToken:
+    initialize_storage_home(home)
     token = MCPOAuthToken(
         access_token=overrides.get("access_token", "access-token-1"),
         refresh_token=overrides.get("refresh_token", "refresh-token-1"),
@@ -217,6 +219,7 @@ def _write_token(name: str, home: Path, **overrides: object) -> MCPOAuthToken:
 
 
 def _write_legacy_token(name: str, home: Path, *, client_secret: str) -> MCPOAuthToken:
+    initialize_storage_home(home)
     token = MCPOAuthToken(
         access_token="stale-token",
         refresh_token="refresh-token-1",
@@ -2204,7 +2207,7 @@ async def test_call_tool_maps_unsafe_credential_records_without_http(
     reason: str,
     text_fragment: str,
 ) -> None:
-    home = tmp_path / "home"
+    home = initialize_storage_home(tmp_path / "home")
     path = token_store_path("live", home)
     path.parent.mkdir(parents=True)
     if record == "malformed":
