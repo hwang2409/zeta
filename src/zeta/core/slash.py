@@ -721,9 +721,7 @@ class SlashCommandRegistry:
     def prepare_live_config(
         self, catalog: SkillCatalog, _agents: object
     ) -> LiveSkillProjection:
-        return prepare_slash_projection(
-            catalog, self._commands, self._custom_commands
-        )
+        return prepare_slash_projection(catalog, self._commands, self._custom_commands)
 
     def commit_live_config(self, prepared: object) -> None:
         """Commit one worker-prepared slash projection by reference."""
