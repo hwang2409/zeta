@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -31,6 +32,66 @@ async def execute(registry: ToolRegistry) -> dict:
 
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+class _ManualTimeout:
+    def __init__(self, clock: _ManualTimeoutClock, delay: float) -> None:
+        self.clock = clock
+        self.deadline = clock.now + delay
+        self.expired = False
+        self.task: asyncio.Task[object] | None = None
+        self.cancelling = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        assert self.clock.active is None
+        self.task = task
+        self.cancelling = task.cancelling()
+        self.clock.active = self
+
+    async def __aexit__(self, exc_type, _exc, _tb) -> bool:
+        self.clock.active = None
+        if self.expired and exc_type is asyncio.CancelledError:
+            assert self.task is not None
+            if self.task.uncancel() <= self.cancelling:
+                raise TimeoutError
+        return False
+
+
+class _ManualTimeoutClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.active: _ManualTimeout | None = None
+
+    def timeout(self, delay: float) -> _ManualTimeout:
+        return _ManualTimeout(self, delay)
+
+    async def advance(self, seconds: float) -> None:
+        self.now += seconds
+        active = self.active
+        assert active is not None
+        if self.now >= active.deadline and not active.expired:
+            active.expired = True
+            assert active.task is not None
+            active.task.cancel()
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await heartbeat.wait()
+
+
+def _manual_timeout(monkeypatch: pytest.MonkeyPatch) -> _ManualTimeoutClock:
+    clock = _ManualTimeoutClock()
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(
+        codex,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"timeout": clock.timeout})),
+    )
+    assert codex.asyncio is not asyncio
+    assert asyncio.timeout is real_timeout
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 10.0)
+    return clock
 
 
 def install_codex_transport(
@@ -461,16 +522,31 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
             {"type": "response.completed"},
         ),
     )
+    clock = _manual_timeout(monkeypatch)
+    acquisition_started = asyncio.Event()
+    release_acquisition = asyncio.Event()
+    acquisition_finished = asyncio.Event()
 
-    async def slow_access_token(_store, _client):
-        await asyncio.sleep(0.05)
+    async def blocked_access_token(_store, _client):
+        acquisition_started.set()
+        await release_acquisition.wait()
+        acquisition_finished.set()
         return "test-token"
 
-    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
-    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", blocked_access_token)
     calls = install_ddg_result(monkeypatch)
+    search = asyncio.create_task(execute(registry))
 
-    result = await execute(registry)
+    try:
+        await asyncio.wait_for(acquisition_started.wait(), timeout=10)
+        await clock.advance(9.999)
+        assert not search.done()
+        assert calls == []
+        await clock.advance(0.001)
+        result = await asyncio.wait_for(search, timeout=10)
+    finally:
+        release_acquisition.set()
+        await asyncio.wait_for(acquisition_finished.wait(), timeout=10)
 
     assert result["structuredContent"]["backend"] == "duckduckgo"
     assert calls == ["zeta"]
@@ -560,31 +636,41 @@ async def test_inflight_acquisition_cleared_after_completion(monkeypatch, regist
 @pytest.mark.asyncio
 async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registry):
     install_codex_transport(monkeypatch)
+    clock = _manual_timeout(monkeypatch)
     refresh_started = asyncio.Event()
+    allow_refresh_to_finish = asyncio.Event()
     refresh_persisted = asyncio.Event()
     refresh_cancelled = False
 
-    async def slow_access_token(_store, _client):
+    async def blocked_access_token(_store, _client):
         nonlocal refresh_cancelled
         refresh_started.set()
         try:
-            await asyncio.sleep(0.05)
+            await allow_refresh_to_finish.wait()
             refresh_persisted.set()
             return "test-token"
         except asyncio.CancelledError:
             refresh_cancelled = True
             raise
 
-    monkeypatch.setattr(codex.AccountCredentials, "access_token", slow_access_token)
-    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
+    monkeypatch.setattr(codex.AccountCredentials, "access_token", blocked_access_token)
     install_ddg_result(monkeypatch)
+    search = asyncio.create_task(execute(registry))
 
-    result = await execute(registry)
+    try:
+        await asyncio.wait_for(refresh_started.wait(), timeout=10)
+        await clock.advance(9.999)
+        assert not search.done()
+        assert not refresh_cancelled
+        await clock.advance(0.001)
+        result = await asyncio.wait_for(search, timeout=10)
 
-    assert result["structuredContent"]["backend"] == "duckduckgo"
-    assert "timed out" in result["structuredContent"]["codex_failure"]
-    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
-    await asyncio.wait_for(refresh_persisted.wait(), timeout=0.2)
+        assert result["structuredContent"]["backend"] == "duckduckgo"
+        assert "timed out" in result["structuredContent"]["codex_failure"]
+        assert not refresh_cancelled
+    finally:
+        allow_refresh_to_finish.set()
+        await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
     assert not refresh_cancelled
 
 
@@ -614,13 +700,13 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
     task = asyncio.create_task(
         websearch._websearch(registry, {"query": "zeta"}, AbortSignal())
     )
-    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+    await asyncio.wait_for(refresh_started.wait(), timeout=10)
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     allow_refresh_to_finish.set()
-    await asyncio.wait_for(refresh_persisted.wait(), timeout=0.2)
+    await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
 
     assert calls == []
     assert not refresh_cancelled
@@ -628,19 +714,32 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
 
 @pytest.mark.asyncio
 async def test_codex_overall_deadline_falls_back(monkeypatch, registry):
-    class SlowStream(httpx.AsyncByteStream):
+    stream_started = asyncio.Event()
+    release_stream = asyncio.Event()
+
+    class BlockedStream(httpx.AsyncByteStream):
         async def __aiter__(self):
-            await asyncio.sleep(0.05)
+            stream_started.set()
+            await release_stream.wait()
             yield sse(
                 {"type": "response.output_text.delta", "delta": "answer"},
                 {"type": "response.completed"},
             )
 
-    install_codex_transport(monkeypatch, stream=SlowStream())
-    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001, raising=False)
+    install_codex_transport(monkeypatch, stream=BlockedStream())
+    clock = _manual_timeout(monkeypatch)
     calls = install_ddg_result(monkeypatch)
+    search = asyncio.create_task(execute(registry))
 
-    result = await execute(registry)
+    try:
+        await asyncio.wait_for(stream_started.wait(), timeout=10)
+        await clock.advance(9.999)
+        assert not search.done()
+        assert calls == []
+        await clock.advance(0.001)
+        result = await asyncio.wait_for(search, timeout=10)
+    finally:
+        release_stream.set()
 
     assert result["structuredContent"]["backend"] == "duckduckgo"
     assert calls == ["zeta"]

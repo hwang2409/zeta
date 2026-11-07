@@ -89,6 +89,7 @@ class AsyncDurableWritesMixin:
             _must_exist=True,
             _collect_persisted_appends=True,
             _validated_log_state=None if prepared is None else prepared[1],
+            _storage_lease=self._storage_lease,
         )
 
     def _run_durable_write(
@@ -139,6 +140,7 @@ class AsyncDurableWritesMixin:
             self.root_dir,
             session_id=self.session_id,
             _must_exist=True,
+            _storage_lease=self._storage_lease,
         )
         try:
             return reader._detach_log_state()
@@ -153,6 +155,7 @@ class AsyncDurableWritesMixin:
             self.root_dir,
             session_id=self.session_id,
             _must_exist=True,
+            _storage_lease=self._storage_lease,
         )
         try:
             return _DetachedConversationState(

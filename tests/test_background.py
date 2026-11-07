@@ -215,6 +215,71 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
 
 
 @pytest.mark.asyncio
+async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    archive_entered = asyncio.Event()
+    monitor_cancelled = asyncio.Event()
+    release_archive = asyncio.Event()
+    original_archive_record = registry._archive_record
+
+    async def gated_archive_record(record, log_handle) -> None:
+        archive_entered.set()
+        try:
+            await release_archive.wait()
+        except asyncio.CancelledError:
+            monitor_cancelled.set()
+            await release_archive.wait()
+            await original_archive_record(record, log_handle)
+            raise
+        await original_archive_record(record, log_handle)
+
+    # test-contract: seam force the archive-pending monitor cancellation order
+    monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
+    monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
+    waiter = asyncio.create_task(registry.wait(task_id))
+    killer = asyncio.create_task(registry.kill(task_id))
+    try:
+        await archive_entered.wait()
+        await monitor_cancelled.wait()
+        release_archive.set()
+
+        status = await waiter
+        assert status["running"] is False
+        await killer
+    finally:
+        release_archive.set()
+        await asyncio.gather(waiter, killer, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
+    tmp_path: Path,
+) -> None:
+    registry = BackgroundTaskRegistry()
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    wait_started = asyncio.Event()
+
+    async def wait_for_task() -> None:
+        wait_started.set()
+        await registry.wait(task_id)
+
+    waiter = asyncio.create_task(wait_for_task())
+    try:
+        await wait_started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert registry.snapshot()[0].running is True
+    finally:
+        await registry.kill(task_id)
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_canceled_monitor_propagates_when_record_already_stopped() -> None:
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -885,11 +950,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         child_stores.append(child_store), track_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    for _ in range(100):
-        if not owner._stores:
-            break
-        await asyncio.sleep(0.01)
-    await owner.wait_for_store_closes()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
@@ -1763,16 +1824,18 @@ def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
 import asyncio, json, os, resource, sys
 from pathlib import Path
 from zeta.core.store import ConversationStore
+from zeta.storage_format import advance, open_writer
 from zeta.tools._shared.process import BackgroundTaskRegistry
 
-async def main(root: Path) -> None:
+async def main(root: Path, lease) -> None:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
-    with ConversationStore(root / "sessions", session_id="fd-bound") as store:
+    with ConversationStore(root / "sessions", session_id="fd-bound", _storage_lease=lease) as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             output_limit=4,
+            storage_lease=lease,
         )
         baseline = len(os.listdir("/dev/fd"))
         task_ids = []
@@ -1790,7 +1853,13 @@ async def main(root: Path) -> None:
         assert final <= baseline + 2
         await tasks.close()
 
-asyncio.run(main(Path(sys.argv[1])))
+root = Path(sys.argv[1])
+advance(root, expected_epoch=0)
+lease = open_writer(root)
+try:
+    asyncio.run(main(root, lease))
+finally:
+    lease.close()
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)],
