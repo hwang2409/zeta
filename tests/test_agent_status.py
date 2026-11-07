@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools.agent as agent_tools
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from zeta.agent.receipt import encode_json
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
@@ -68,39 +68,35 @@ async def _status(
 @pytest.mark.asyncio
 async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    release_background = asyncio.Event()
-
-    class GatedBackend(FakeBackend):
-        async def complete(self, messages, tool_schemas):
-            if len(self.calls) == 3:
-                await release_background.wait()
-            async for event in super().complete(messages, tool_schemas):
-                yield event
-
     foreground_call = ToolCall(
         "foreground-agent",
         "agent",
-        {"prompt": "inspect", "description": "foreground"},
+        {"prompt": "inspect foreground", "description": "foreground"},
     )
-    backend = GatedBackend(
+    backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[foreground_call]),
-            ScriptedTurn([TextContent("foreground done")]),
             ScriptedTurn(
                 tool_calls=[
                     ToolCall(
                         "background-agent",
                         "agent",
                         {
-                            "prompt": "inspect",
+                            "prompt": "inspect background",
                             "description": "background",
                             "background": True,
                         },
                     )
                 ]
             ),
-            ScriptedTurn([TextContent("background done")]),
-        ]
+        ],
+        {
+            "inspect foreground": [ScriptedTurn([TextContent("foreground done")])],
+            "inspect background": [ScriptedTurn([TextContent("background done")])],
+        },
+        parent_prompt={"start foreground", "start background"},
+        gated_child_prompts={"inspect background"},
+        parent_waits_for_children=False,
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
@@ -163,8 +159,8 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
         in live_list_status["content"][0]["text"]
     )
 
-    release_background.set()
-    await loop._background_owner.wait()
+    backend.release_children.set()
+    await asyncio.wait_for(loop._background_owner.wait(), 10)
     all_status = await _status(loop)
     children = all_status["structuredContent"]["children"]
     assert children == []

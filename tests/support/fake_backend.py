@@ -139,10 +139,14 @@ class PerActorFakeBackend:
         parent_turns: list[ScriptedTurn],
         child_turns: dict[str, list[ScriptedTurn]],
         *,
-        parent_prompt: str,
+        parent_prompt: str | Collection[str],
         gated_child_call: int = 1,
+        gated_child_prompts: Collection[str] | None = None,
+        parent_waits_for_children: bool = True,
     ) -> None:
-        self.parent_prompt = parent_prompt
+        self.parent_prompts = (
+            {parent_prompt} if isinstance(parent_prompt, str) else set(parent_prompt)
+        )
         self.parent = FakeBackend(parent_turns)
         self.children = {
             prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
@@ -151,10 +155,16 @@ class PerActorFakeBackend:
         self.child_calls = dict.fromkeys(self.children, 0)
         self.release_children = asyncio.Event()
         self.gated_child_call = gated_child_call
+        self.parent_waits_for_children = parent_waits_for_children
+        self.gated_child_prompts = (
+            set(self.children)
+            if gated_child_prompts is None
+            else set(gated_child_prompts)
+        )
 
     async def complete(self, messages, tool_schemas):
         actor_prompt = _public_input_prompt(
-            messages, {self.parent_prompt, *self.children}
+            messages, {*self.parent_prompts, *self.children}
         )
         child_prompt = actor_prompt if actor_prompt in self.children else None
         backend = (
@@ -163,7 +173,7 @@ class PerActorFakeBackend:
         if child_prompt is not None:
             self.child_calls[child_prompt] += 1
         if (
-            child_prompt is not None
+            child_prompt in self.gated_child_prompts
             and self.child_calls[child_prompt] == self.gated_child_call
         ):
             self.child_started[child_prompt].set()
@@ -172,7 +182,11 @@ class PerActorFakeBackend:
             except TimeoutError as error:
                 raise AssertionError("children were not released") from error
         stream = backend.complete(messages, tool_schemas)
-        if child_prompt is None and self.parent.calls:
+        if (
+            child_prompt is None
+            and self.parent.calls
+            and self.parent_waits_for_children
+        ):
             try:
                 try:
                     await asyncio.wait_for(
