@@ -167,6 +167,7 @@ def _wait_pid_exited_sync(pid: int, timeout: float) -> None:
             state = _pid_state(pid)
             if state is None or state.startswith("Z"):
                 return
+            # test-contract: latency compatibility fallback must rate-limit ps polling
             time.sleep(0.05)
 
     state = _pid_state(pid)
