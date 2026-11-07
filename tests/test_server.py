@@ -10690,10 +10690,17 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         await asyncio.wait_for(duplicate_finish_started.wait(), timeout=10)
         release_settlement.set()
         await asyncio.wait_for(write_started.wait(), timeout=10)
-        tool_wait = asyncio.create_task(tool_end_started.wait())
-        cleanup.callback(tool_wait.cancel)
-        done, _ = await asyncio.wait({tool_wait}, timeout=10)
-        assert done, "tool_end waited for the approval_end transport write"
+        async def await_or_fail(event: asyncio.Event, message: str) -> None:
+            try:
+                async with asyncio.timeout(10):
+                    await event.wait()
+            except TimeoutError:
+                raise AssertionError(message) from None
+
+        await await_or_fail(
+            tool_end_started,
+            f"child tool_end {call.id} did not reach admission while approval_end write was held",
+        )
         release_write.set()
 
         def owner_position(kind: str, identifier: str | int) -> int | None:
