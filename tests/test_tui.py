@@ -6353,6 +6353,39 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     assert rendered.count("\n  plan") == 1
 
 
+@pytest.mark.asyncio
+async def test_status_card_renders_viewed_session_transcript_index_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    viewed = app._agent_navigation.root_path / "child-session"
+    app._agent_navigation.current_path = viewed
+    requested: list[str] = []
+
+    def failure(session_id: str) -> str:
+        requested.append(session_id)
+        return "disk full; pending changes will retry"
+
+    monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
+
+    lines = tui_app_module._status_card_lines(app.slash_status())
+    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+
+    assert requested == ["child-session"]
+    assert (
+        "transcript_index_failure: disk full; pending changes will retry" in rendered
+    )
+    await app.close()
+
+
 @pytest.mark.parametrize(
     "state", ["streaming", "tool-running", "idle", "interrupted", "compacting"]
 )

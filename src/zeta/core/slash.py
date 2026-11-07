@@ -528,6 +528,7 @@ class SlashStatus:
     model_window: int | None = None
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     automatic_memory_failure: str | None = None
+    transcript_index_failure: str | None = None
     explicit_finish: bool = False
 
 
@@ -967,6 +968,8 @@ def _format_status(status: SlashStatus) -> str:
             "hooks: " + (", ".join(status.hooks) or "none"),
             "automatic_memory_failure: "
             + (status.automatic_memory_failure or "none"),
+            "transcript_index_failure: "
+            + (status.transcript_index_failure or "none"),
         ]
     )
     if status.todo_counts is not None:
