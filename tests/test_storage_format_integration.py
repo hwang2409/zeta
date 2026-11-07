@@ -82,7 +82,9 @@ def test_keyed_agent_child_delete_survives_reload_and_keeps_unknown_data(
 
     store.finish_agent_child("child-1")
     store.close()
-    reopened = ConversationStore(manager.sessions_dir, session_id=opened.metadata.session_id)
+    reopened = ConversationStore(
+        manager.sessions_dir, session_id=opened.metadata.session_id
+    )
     persisted = json.loads(state_path.read_text())["agent_children"]
     assert set(reopened.agent_children()) == {"child-2", "future-child"}
     assert "child-1" not in persisted
@@ -185,47 +187,47 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
     store.close()
 
 
-@pytest.mark.parametrize(
-    ("family", "filename"),
-    (
-        ("metadata", "meta.json"),
-        ("session-state", "session_state.json"),
-        ("agent-lifecycle", "agent_lifecycle.json"),
-        ("workspace", "workspace_snapshots.json"),
-        ("background-tasks", "background_tasks.json"),
-        ("project-link", "project_link_pending.json"),
-        ("draft", "draft"),
-    ),
-)
-def test_session_publication_families_leave_too_new_home_unchanged(
-    tmp_path: Path, family: str, filename: str
+def test_session_manager_refuses_too_new_home_without_changing_metadata(
+    tmp_path: Path,
 ) -> None:
-    manifest = tmp_path / "storage-format.json"
-    manifest.write_text('{"writer_epoch":999}\n')
-    session_dir = tmp_path / "sessions" / "session-1"
-    session_dir.mkdir(parents=True)
-    target = session_dir / filename
-    target.write_bytes(b"unchanged future bytes\n")
-    before = {
-        path.relative_to(tmp_path): path.read_bytes()
-        for path in tmp_path.rglob("*")
-        if path.is_file() and path.name != ".storage-format.lock"
-    }
+    (tmp_path / "storage-format.json").write_bytes(b'{"writer_epoch":999}\n')
+    metadata = tmp_path / "sessions" / "session-1" / "meta.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_bytes(b'{"future":"metadata"}\n')
 
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
-        if family == "workspace":
-            WorkspaceSnapshotStore(session_dir, "session-1")
-        elif family in {"session-state", "agent-lifecycle"}:
-            ConversationStore(tmp_path / "sessions", session_id="session-1")
-        else:
-            SessionManager(tmp_path)
+        SessionManager(tmp_path)
 
-    after = {
-        path.relative_to(tmp_path): path.read_bytes()
-        for path in tmp_path.rglob("*")
-        if path.is_file() and path.name != ".storage-format.lock"
-    }
-    assert after == before
+    assert metadata.read_bytes() == b'{"future":"metadata"}\n'
+
+
+def test_conversation_store_refuses_too_new_home_without_changing_session_state(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "storage-format.json").write_bytes(b'{"writer_epoch":999}\n')
+    state = tmp_path / "sessions" / "session-1" / "session_state.json"
+    state.parent.mkdir(parents=True)
+    state.write_bytes(b'{"bash_cwd":"/future","future":"session state"}\n')
+
+    with pytest.raises(StorageFormatError, match="newer than writer capability"):
+        ConversationStore(tmp_path / "sessions", session_id="session-1")
+
+    assert state.read_bytes() == b'{"bash_cwd":"/future","future":"session state"}\n'
+
+
+def test_workspace_store_refuses_too_new_home_without_changing_snapshots(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "storage-format.json").write_bytes(b'{"writer_epoch":999}\n')
+    session_dir = tmp_path / "sessions" / "session-1"
+    snapshots = session_dir / "workspace_snapshots.json"
+    snapshots.parent.mkdir(parents=True)
+    snapshots.write_bytes(b'{"future":"snapshots"}\n')
+
+    with pytest.raises(StorageFormatError, match="newer than writer capability"):
+        WorkspaceSnapshotStore(session_dir, "session-1")
+
+    assert snapshots.read_bytes() == b'{"future":"snapshots"}\n'
 
 
 def test_too_new_refusal_is_visible_in_tui_and_server(

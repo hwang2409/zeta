@@ -91,13 +91,19 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         decoder = json.JSONDecoder()
         text = raw.decode()
         value, end = decoder.raw_decode(text)
-        if text[end:].strip() or type(value) is not dict or set(value) != {"writer_epoch"}:
+        if (
+            text[end:].strip()
+            or type(value) is not dict
+            or set(value) != {"writer_epoch"}
+        ):
             raise ValueError
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError
     except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise StorageFormatError(f"stored-format manifest is invalid at {home}") from exc
+        raise StorageFormatError(
+            f"stored-format manifest is invalid at {home}"
+        ) from exc
     return epoch
 
 
@@ -210,7 +216,9 @@ def verify(home: str | Path, *, capability: int = WRITER_EPOCH) -> VerificationR
     return VerificationReport(writer_epoch=epoch)
 
 
-def _mapping_at(root: dict[str, Any], path: tuple[str, ...], *, create: bool) -> tuple[dict[str, Any], str]:
+def _mapping_at(
+    root: dict[str, Any], path: tuple[str, ...], *, create: bool
+) -> tuple[dict[str, Any], str]:
     if not path:
         raise StorageFormatError("a mutation path cannot be empty")
     parent = root
@@ -220,7 +228,9 @@ def _mapping_at(root: dict[str, Any], path: tuple[str, ...], *, create: bool) ->
             child = {}
             parent[key] = child
         if type(child) is not dict:
-            raise StorageFormatError(f"stored JSON path is not an object: {'.'.join(path)}")
+            raise StorageFormatError(
+                f"stored JSON path is not an object: {'.'.join(path)}"
+            )
         parent = child
     return parent, path[-1]
 
@@ -243,7 +253,9 @@ def apply_mutations(raw: object, mutations: Iterable[Mutation]) -> dict[str, Any
         raise StorageFormatError("stored JSON root must be an object")
     output = copy.deepcopy(raw)
     for mutation in mutations:
-        parent, key = _mapping_at(output, mutation.path, create=not isinstance(mutation, DeleteValue))
+        parent, key = _mapping_at(
+            output, mutation.path, create=not isinstance(mutation, DeleteValue)
+        )
         if isinstance(mutation, DeleteValue):
             parent.pop(key, None)
         elif isinstance(mutation, ReplaceSubtree):
@@ -273,6 +285,49 @@ def mapping_mutations(
         )
         mutations.append(mutation_type((key,), item))
     return tuple(mutations)
+
+
+def _require_record_id(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+    return value
+
+
+def _apply_record_mutations(
+    raw: object,
+    upserts: Iterable[Mapping[str, Any]],
+    *,
+    identity: str,
+    delete_ids: Iterable[str],
+    name: str,
+) -> list[dict[str, Any]]:
+    if type(raw) is not list or any(type(item) is not dict for item in raw):
+        raise StorageFormatError(f"stored JSON record collection is invalid: {name}")
+
+    output = copy.deepcopy(raw)
+    positions: dict[str, int] = {}
+    for index, record in enumerate(output):
+        record_id = _require_record_id(record.get(identity), name)
+        if record_id in positions:
+            raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+        positions[record_id] = index
+
+    deleted = {_require_record_id(record_id, name) for record_id in delete_ids}
+    seen: set[str] = set()
+    for record in upserts:
+        record_id = _require_record_id(record.get(identity), name)
+        if record_id in seen or record_id in deleted:
+            raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+        seen.add(record_id)
+        if record_id in positions:
+            _merge_mapping(output[positions[record_id]], record)
+        else:
+            positions[record_id] = len(output)
+            current: dict[str, Any] = {}
+            _merge_mapping(current, record)
+            output.append(current)
+
+    return [record for record in output if record[identity] not in deleted]
 
 
 class WriterLease:
@@ -314,7 +369,9 @@ class WriterLease:
             except (OSError, ValueError) as exc:
                 raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
         output = apply_mutations(raw, mutations)
-        encoded = (json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n").encode()
+        encoded = (
+            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode()
         publish(directory_fd, name, encoded)
         return output
 
@@ -342,45 +399,16 @@ class WriterLease:
                     raw = json.load(stream)
             except (OSError, ValueError) as exc:
                 raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-        if type(raw) is not list or any(type(item) is not dict for item in raw):
-            raise StorageFormatError(f"stored JSON record collection is invalid: {name}")
-
-        output = copy.deepcopy(raw)
-        positions: dict[str, int] = {}
-        for index, record in enumerate(output):
-            record_id = record.get(identity)
-            if type(record_id) is not str or not record_id or record_id in positions:
-                raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
-            positions[record_id] = index
-
-        requested_deletes = tuple(delete_ids)
-        if any(
-            type(record_id) is not str or not record_id
-            for record_id in requested_deletes
-        ):
-            raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
-        deleted = set(requested_deletes)
-        output = [record for record in output if record[identity] not in deleted]
-        positions = {record[identity]: index for index, record in enumerate(output)}
-        seen: set[str] = set()
-        for record in upserts:
-            record_id = record.get(identity)
-            if (
-                type(record_id) is not str
-                or not record_id
-                or record_id in seen
-                or record_id in deleted
-            ):
-                raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
-            seen.add(record_id)
-            if record_id in positions:
-                _merge_mapping(output[positions[record_id]], record)
-            else:
-                positions[record_id] = len(output)
-                current: dict[str, Any] = {}
-                _merge_mapping(current, record)
-                output.append(current)
-        encoded = (json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n").encode()
+        output = _apply_record_mutations(
+            raw,
+            upserts,
+            identity=identity,
+            delete_ids=delete_ids,
+            name=name,
+        )
+        encoded = (
+            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode()
         publish(directory_fd, name, encoded)
         return output
 
