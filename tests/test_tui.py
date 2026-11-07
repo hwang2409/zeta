@@ -6336,6 +6336,7 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "completion_client_setups: none\n"
         "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
         "retained_tail: 6\ntokens_used_this_session: 150\n"
         "tokens_in_current_context: 120\ncompaction_marker_count: 1\n"
