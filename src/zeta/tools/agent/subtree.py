@@ -46,25 +46,28 @@ def _path_for(root_path: Path, root_id: str, handle: object) -> Path | None:
     return path
 
 
+def _agent_call(block: object) -> ToolCall | None:
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return None
+    raw = block.get("tool_call")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        call = ToolCall.from_dict(raw)
+    except ValueError:
+        return None
+    return call if call.name.casefold() == "agent" else None
+
+
 def _active_agent_calls(entries: list[ConversationEntry]) -> dict[str, ToolCall]:
     calls: dict[str, ToolCall] = {}
     for entry in entries:
-        if entry.type != "message":
-            continue
-        message = entry.data.get("message")
+        message = entry.data.get("message") if entry.type == "message" else None
         if not isinstance(message, dict):
             continue
         for block in message.get("content", []):
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            raw = block.get("tool_call")
-            if not isinstance(raw, dict):
-                continue
-            try:
-                call = ToolCall.from_dict(raw)
-            except ValueError:
-                continue
-            if call.name.casefold() == "agent":
+            call = _agent_call(block)
+            if call is not None:
                 calls[call.id] = call
     return calls
 

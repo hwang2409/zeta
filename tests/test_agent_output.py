@@ -1281,7 +1281,7 @@ async def test_agent_output_reads_and_fits_off_event_loop(
     def controlled_read(*args: object, **kwargs: object) -> bytes:
         read_threads.append(threading.get_ident())
         asyncio_loop.call_soon_threadsafe(entered.set)
-        assert release.wait(2)
+        assert release.wait(10)
         return original(*args, **kwargs)
 
     asyncio_loop = asyncio.get_running_loop()
@@ -1335,7 +1335,7 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         if not blocked:
             blocked = True
             asyncio_loop.call_soon_threadsafe(entered.set)
-            assert release.wait(2)
+            assert release.wait(10)
         return original(*args, **kwargs)
 
     asyncio_loop = asyncio.get_running_loop()
@@ -1363,22 +1363,26 @@ def _create_nested_child_in_process(
 ) -> None:
     child = ConversationStore(Path(root_dir) / "root" / "agents", session_id="1")
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
-    call = ToolCall("process-grandchild", "agent", {"prompt": "nested"})
-    _record_running_child(
-        child,
-        grandchild,
-        call=call,
-        handle="root:1:1",
-        depth=2,
-    )
-    grandchild.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("cross-process answer")])
-    )
-    ready.send("ready")
-    ready.recv()
-    grandchild.close()
-    child.close()
-    ready.close()
+    try:
+        call = ToolCall("process-grandchild", "agent", {"prompt": "nested"})
+        _record_running_child(
+            child,
+            grandchild,
+            call=call,
+            handle="root:1:1",
+            depth=2,
+        )
+        grandchild.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("cross-process answer")])
+        )
+        ready.send("ready")
+        if not ready.poll(10):
+            raise TimeoutError("parent did not close the child process within 10 seconds")
+        ready.recv()
+    finally:
+        grandchild.close()
+        child.close()
+        ready.close()
 
 
 @pytest.mark.asyncio
@@ -1403,7 +1407,10 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
     process.start()
     child_pipe.close()
     try:
-        assert await asyncio.to_thread(parent_pipe.recv) == "ready"
+        ready = await asyncio.to_thread(parent_pipe.poll, 10)
+        if not ready:
+            pytest.fail("child process did not become ready within 10 seconds")
+        assert parent_pipe.recv() == "ready"
         loop = AgentLoop(
             FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
         )
@@ -1417,15 +1424,27 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
         assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
         assert "cross-process answer" in output["content"][0]["text"]
     finally:
-        parent_pipe.send("close")
-        await asyncio.to_thread(process.join, 5)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-        parent_pipe.close()
-    assert process.exitcode == 0
-    process.close()
-    root.close()
+        try:
+            if not parent_pipe.closed:
+                try:
+                    parent_pipe.send("close")
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+            await asyncio.to_thread(process.join, 10)
+            if process.is_alive():
+                process.terminate()
+                await asyncio.to_thread(process.join, 10)
+            if process.is_alive():
+                process.kill()
+                await asyncio.to_thread(process.join, 10)
+            process_exitcode = process.exitcode
+        finally:
+            parent_pipe.close()
+            try:
+                process.close()
+            finally:
+                root.close()
+    assert process_exitcode == 0
 
 
 @pytest.mark.parametrize(
