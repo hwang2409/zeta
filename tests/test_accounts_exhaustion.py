@@ -598,11 +598,17 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
         event_loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=4)
         rename_futures: list[object] = []
-        writers_ready = threading.Barrier(5)
+        writers_started = threading.Event()
+        writer_count_lock = threading.Lock()
+        writer_count = 0
         writer_manager = SessionManager(context.home)
 
         def rename(index: int) -> object:
-            writers_ready.wait(timeout=10)
+            nonlocal writer_count
+            with writer_count_lock:
+                writer_count += 1
+                if writer_count == 4:
+                    writers_started.set()
             return writer_manager.rename(context.metadata.session_id, f"rename {index}")
 
         def queue_renames() -> None:
@@ -621,7 +627,8 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
             ) as directory_fd:
                 assert directory_fd is None
             event_loop.call_soon_threadsafe(queue_renames)
-            writers_ready.wait(timeout=10)
+            if not writers_started.wait(timeout=10):
+                raise AssertionError("metadata writers did not queue behind the held lock")
             return metadata
 
         SessionAccountContext._commit_locked = commit_then_queue_renames  # type: ignore[method-assign]
