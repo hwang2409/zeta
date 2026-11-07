@@ -21,8 +21,10 @@ from ...protocol.types import (
     ContentBlock,
     ErrorInfo,
     Message,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    ThinkingContent,
     ToolUseContent,
 )
 from ...providers.retry_policy import (
@@ -37,6 +39,20 @@ if TYPE_CHECKING:
     from ...core.store._client_delivery import ClientSteeringBatch
 
 MAX_ERROR_MESSAGE = 400
+
+
+def _sanitize_account_message(message: Message) -> Message:
+    content = [
+        ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
+        for block in message.content
+        if not isinstance(block, RedactedThinkingContent)
+    ]
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=message.metadata,
+    )
 
 
 async def provider_events(
