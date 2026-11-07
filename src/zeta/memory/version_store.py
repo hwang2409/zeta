@@ -133,7 +133,7 @@ def _publish_payloads(
 
 
 def _publish_legacy_json(
-    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = False
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = True
 ) -> None:
     atomic_publish_file(
         directory_fd,
