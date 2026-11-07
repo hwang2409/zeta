@@ -286,6 +286,75 @@ def test_main_sha_override_and_removed_parent_flag(tmp_path: Path):
     assert p1 != p2
 
 
+def test_newer_pr_head_train_parent_is_selected_from_real_merge(tmp_path: Path):
+    """The train parent remains identifiable when its PR head is newer than main."""
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    initial = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "branch", "origin-side", initial], cwd=r, check=True)
+    subprocess.run(["git", "checkout", "-q", "origin-side"], cwd=r, check=True)
+    (r / "src/origin.py").write_text("def origin(): pass\n")
+    commit(r, "origin change")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/mainline.py").write_text("def mainline(): pass\n")
+    commit(r, "mainline change")
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "origin-side"], cwd=r, check=True
+    )
+    commit(r, "origin merge")
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "branch", "train", base], cwd=r, check=True)
+    subprocess.run(["git", "checkout", "-qb", "train-side", base], cwd=r, check=True)
+    (r / "src/train.py").write_text("def train(): pass\n")
+    (r / "src/a.py").write_text("def kept(): pass\ndef main_only(): pass\n")
+    commit(r, "train change")
+    train_change = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/newer.py").write_text("def newer(): pass\n")
+    commit(r, "newer main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", base], cwd=r, check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "train"], cwd=r, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", train_change], cwd=r, check=True
+    )
+    commit(r, "train merge")
+    train_merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/pr.py").write_text("def pr(): pass\n")
+    commit(r, "newer PR head")
+    pr_merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(["git", "checkout", "-q", "train"], cwd=r, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", pr_merge], cwd=r, check=True
+    )
+    subprocess.run(["git", "checkout", pr_merge, "--", "src/a.py"], cwd=r, check=True)
+    commit(r, "train result")
+    result = run(r)
+    assert result.returncode == 1
+    assert f"main parent: {train_merge}" in result.stdout
+    assert "main_only" in result.stdout
+    wrong_parent = subprocess.check_output(
+        ["git", "rev-list", "--parents", "-n", "1", "HEAD"], cwd=r, text=True
+    ).split()[2]
+    wrong = run(r, "HEAD", "--main-sha", wrong_parent)
+    assert wrong.returncode == 2
+    assert "disagrees with the identified main parent" in wrong.stderr
+
+
 def test_both_qualifying_parents_are_rejected(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
