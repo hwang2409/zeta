@@ -7848,6 +7848,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         await _close(server, writer)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/tmp",
+        "/tmp is full",
+        "/Users/henry/x.py is broken",
+        "/this is pasted prose\nsecond line",
+        "//foo",
+    ],
+)
+@pytest.mark.asyncio
+async def test_serve_slash_run_keeps_slash_like_model_text(
+    tmp_path: Path, text: str
+) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "slash-model-text",
+                "slash_run",
+                {"session_id": sid, "text": text},
+            )
+        )[-1]["result"]
+        name = text.split("\n", 1)[0][1:].split(maxsplit=1)[0]
+        assert result == {"kind": "unknown", "name": name}
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_serve_does_not_advertise_or_run_tui_approval_commands(
     tmp_path: Path,
@@ -7869,7 +7901,10 @@ async def test_serve_does_not_advertise_or_run_tui_approval_commands(
             await _request(reader, writer, "list", "slash_list", {"session_id": sid})
         )[-1]["result"]
 
-        assert run_result == {"kind": "unknown", "name": "approve"}
+        assert run_result == {
+            "kind": "error",
+            "text": "unknown command /approve. type // to send it as text.",
+        }
         assert {entry["name"] for entry in list_result["commands"]}.isdisjoint(
             {"approve", "deny"}
         )
@@ -8509,9 +8544,18 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/fork"))["result"]
         assert result == {"kind": "client_only", "name": "fork"}
 
-        # Unknown commands are rejected structurally, never posted to the model.
-        result = (await run("/nosuchcommand"))["result"]
-        assert result == {"kind": "unknown", "name": "nosuchcommand"}
+        # Unknown slash-safe commands return a visible error, never model input.
+        result = (await run("/statu"))["result"]
+        assert result == {
+            "kind": "error",
+            "text": (
+                "unknown command /statu. type // to send it as text. "
+                "did you mean /status?"
+            ),
+        }
+        # Paths remain unhandled by the shared slash dispatcher.
+        result = (await run("/Users/henry/x"))["result"]
+        assert result["kind"] == "unknown"
 
         # Text that does not start with `/` is a shape error, not a passthrough.
         error = (await run("hello"))["error"]
