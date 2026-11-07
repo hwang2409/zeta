@@ -614,9 +614,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._finish_attempt(error)
             if retry:
                 return True
-            if retryable_eof:
-                raise
-            return False
+            raise
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
@@ -723,14 +721,15 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         max(0, self._control.budget.attempts - 1),
                     )
             return False
+        if self._emitted and self._control.reset is ResetPolicy.NO_RESET:
+            self._record_failure_decision(error, will_retry=False)
+            return False
         notice = self._retry_notice(plan, error)
         if self._retry_usage is not None:
             notice.data["usage"] = self._retry_usage
             self._retry_usage = None
         self._pending.append(notice)
         if self._emitted:
-            if self._control.reset is ResetPolicy.NO_RESET:
-                return False
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
         self._pending_retry = plan
@@ -785,13 +784,18 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     "is_stall": True,
                 },
             )
+        retry_text = (
+            f"{retry_error_label(error)}, retry scheduled"
+            if getattr(error, "retry_reason", None) == "stream_error"
+            else (
+                f"{retry_error_label(error)}, retrying in {plan.delay:g}s "
+                f"(attempt {plan.attempt}/{MAX_PROVIDER_ATTEMPTS})"
+            )
+        )
         return StreamEvent(
             StreamEventType.RETRY,
             data={
-                "text": (
-                    f"{retry_error_label(error)}, retrying in {plan.delay:g}s "
-                    f"(attempt {plan.attempt}/{MAX_PROVIDER_ATTEMPTS})"
-                ),
+                "text": retry_text,
                 "kind": "provider_retry",
                 "attempt": plan.attempt,
                 "retry": plan.attempt - 1,
@@ -987,6 +991,8 @@ def retry_error_label(error: BaseException | object) -> str:
         return "429 rate limited"
     if status_code == 529 or reason == "overloaded_error":
         return "529 overloaded"
+    if getattr(error, "retry_reason", None) == "stream_error":
+        return "provider error (stream_error)"
     if status_code is not None:
         return f"{status_code} server error"
     if getattr(error, "retryable", False):

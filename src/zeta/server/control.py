@@ -146,6 +146,7 @@ class ServeControl:
         *,
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
+        allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
         self._turn_task = asyncio.create_task(
@@ -156,6 +157,7 @@ class ServeControl:
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
                 turn_id=uuid.uuid4().hex,
+                allow_assistant_reset=allow_assistant_reset,
             )
         )
 
@@ -476,6 +478,7 @@ class ServeControl:
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
         turn_id: str,
+        allow_assistant_reset: bool = True,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -500,6 +503,7 @@ class ServeControl:
                 host_instruction=""
                 if host_commands is None
                 else host_commands.instruction,
+                allow_assistant_reset=allow_assistant_reset,
             ):
                 if pending_turn_end is not None:
                     if event.type is StreamEventType.AGENT_END:

@@ -739,6 +739,7 @@ class AgentLoop(
         notification_turn: bool = False,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
@@ -934,7 +935,11 @@ class AgentLoop(
                     admitted_request,
                     control=CompletionControl(
                         abort=turn_abort_signal,
-                        reset=ResetPolicy.ALLOW_ASSISTANT_RESET,
+                        reset=(
+                            ResetPolicy.ALLOW_ASSISTANT_RESET
+                            if allow_assistant_reset
+                            else ResetPolicy.NO_RESET
+                        ),
                         budget=provider_retry_budget,
                     ),
                 )
@@ -1146,7 +1151,6 @@ class AgentLoop(
                 approval_requests,
             )
             completion.commit()
-            provider_retry_budget = None
             self._turn_provider_retry_records = []
             error = output_limit_error(
                 assistant_message, stop_reason=self._turn_stop_reason

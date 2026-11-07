@@ -180,6 +180,7 @@ class AgentNotificationMixin:
         abort_signal: ToolAbortSignal | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         return self._run_turn(
             user_text,
@@ -189,6 +190,7 @@ class AgentNotificationMixin:
             abort_signal=abort_signal,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            allow_assistant_reset=allow_assistant_reset,
         )
 
     async def _run_turn(
@@ -205,6 +207,7 @@ class AgentNotificationMixin:
         on_turn_context_persisted: Callable[[], None] | None = None,
         host_environment: Mapping[str, str] | None = None,
         host_instruction: str = "",
+        allow_assistant_reset: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         if turn_context is not None:
             if system_message is not None:
@@ -223,6 +226,7 @@ class AgentNotificationMixin:
             notification_turn=notification_turn,
             host_environment=host_environment,
             host_instruction=host_instruction,
+            allow_assistant_reset=allow_assistant_reset,
         )
         try:
             async for event in stream:

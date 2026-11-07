@@ -33,7 +33,7 @@ from tests.support.agent_lifecycle import (
     watch_delegated_registrations,
 )
 from tests.support.completion import completion_control
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
@@ -5359,8 +5359,8 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
         if explicit_finish_enabled
         else ScriptedTurn([TextContent("finished")])
     )
-    backend = FakeBackend(
-        [
+    backend = PerActorFakeBackend(
+        parent_turns=[
             ScriptedTurn(
                 tool_calls=[
                     ToolCall(
@@ -5374,9 +5374,10 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
                         },
                     )
                 ]
-            ),
-            child_turn,
-        ]
+            )
+        ],
+        child_turns={"inspect the task": [child_turn]},
+        parent_prompt="start",
     )
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     registry = ToolRegistry(
@@ -5399,7 +5400,9 @@ async def test_restricted_profile_keeps_eligible_child_runtime_tools(
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
 
-    child_tools = {schema["name"] for schema in backend.calls[1][1]}
+    child_tools = {
+        schema["name"] for schema in backend.children["inspect the task"].calls[0][1]
+    }
     assert "ask_parent" in child_tools
     if explicit_finish_enabled:
         assert {"finish", "agent_handoff"} <= child_tools
@@ -7514,7 +7517,11 @@ async def test_failed_background_receipt_matches_error_flag(
     call = _background_agent_call()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
-        FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn()]),
+        PerActorFakeBackend(
+            parent_turns=[ScriptedTurn(tool_calls=[call]), ScriptedTurn()],
+            child_turns={"inspect the task": [ScriptedTurn()]},
+            parent_prompt="start",
+        ),
         store,
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
@@ -8682,7 +8689,7 @@ class RetryBeforeProviderBackend(CompletionBackend):
         del messages, tool_schemas
         yield StreamEvent(StreamEventType.RETRY, data={"text": "retrying"})
         self.retry_sent.set()
-        await self.release.wait()
+        await await_or_fail(self.release.wait(), what="retry release")
 
 
 class CapturePromptBackend(CompletionBackend):
