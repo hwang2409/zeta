@@ -148,7 +148,7 @@ async def test_nested_recovery_refreshes_both_notification_stores_per_child(
     assert [
         (entry.data["child_instance_id"], entry.data["status"])
         for entry in nested_store.agent_notifications(pending_only=False)
-    ] == [("nested:2", "completed")]
+    ] == [("nested:1", "canceled"), ("nested:2", "completed")]
 
 
 @pytest.mark.asyncio
@@ -295,7 +295,7 @@ def test_completion_notification_query_returns_detached_first_match(
     assert replayed_message.metadata["nested"]["value"] == "original"
 
 
-def test_recovery_scans_notification_store_once_for_many_children(
+def test_recovery_uses_point_notification_queries_for_many_children(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="recovery-scan")
@@ -315,14 +315,22 @@ def test_recovery_scans_notification_store_once_for_many_children(
         store=store,
         _background_owner=SimpleNamespace(notification_store=store),
     )
-    with patch.object(
-        store,
-        "agent_completion_notifications_by_child",
-        wraps=store.agent_completion_notifications_by_child,
-    ) as notification_index:
+    with (
+        patch.object(
+            store,
+            "agent_completion_notifications_by_child",
+            wraps=store.agent_completion_notifications_by_child,
+        ) as full_scan,
+        patch.object(
+            store,
+            "sync_agent_completion_notification",
+            wraps=store.sync_agent_completion_notification,
+        ) as point_query,
+    ):
         recover_agent_children(loop)
 
-    assert notification_index.call_count == 1
+    assert full_scan.call_count == 0
+    assert point_query.call_count == 8
     assert store.agent_children() == {}
 
 
