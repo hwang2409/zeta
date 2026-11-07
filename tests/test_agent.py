@@ -3056,7 +3056,8 @@ async def test_post_cap_question_answer_completion_uses_three_causal_turns(
             store,
             child_handle,
             "queued follow-up",
-            channel=loop._background_owner.conversation_channel,
+            owner=loop._background_owner,
+channel=loop._background_owner.conversation_channel,
         )
         is None
     )
@@ -3201,7 +3202,8 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
                 store,
                 child_handle,
                 "follow-up while waiting",
-                channel=channel,
+                owner=loop._background_owner,
+channel=channel,
             )
             is None
         )
@@ -3259,7 +3261,8 @@ async def test_follow_up_after_finish_gate_queue_check_is_delivered(
                 store,
                 child_handle,
                 "follow-up after queue check",
-                channel=channel,
+                owner=loop._background_owner,
+channel=channel,
             )
             is None
         )
@@ -3313,7 +3316,8 @@ async def test_follow_up_between_gate_turns_is_delivered_once(
                 store,
                 child_handle,
                 "follow-up between gate turns",
-                channel=channel,
+                owner=loop._background_owner,
+channel=channel,
             )
             is None
         )
@@ -3376,7 +3380,8 @@ async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
                 store,
                 child_handle,
                 "follow-up before bound",
-                channel=channel,
+                owner=owner,
+channel=channel,
             )
             is None
         )
@@ -3614,7 +3619,8 @@ async def _run_post_cap_tool_cycle(
                 store,
                 child_handle,
                 "fresh external prompt",
-                channel=owner.conversation_channel,
+                owner=owner,
+channel=owner.conversation_channel,
             )
             is None
         )
@@ -9224,7 +9230,8 @@ async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
             parent,
             handle,
             "follow up",
-            channel=owner.conversation_channel,
+            owner=owner,
+channel=owner.conversation_channel,
         )
         is None
     )
@@ -10040,7 +10047,8 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     monkeypatch.setattr(ConversationStore, "_append_row_unlocked", gate_prompt_append)
     send = asyncio.create_task(
         pending_delivery_module.send_to_run(
-            parent, handle, "commit first", channel=owner.conversation_channel
+            parent, handle, "commit first", owner=owner,
+channel=owner.conversation_channel
         )
     )
     assert await asyncio.to_thread(entered.wait, 2)
@@ -10077,7 +10085,8 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     assert await asyncio.to_thread(entered.wait, 2)
     send = asyncio.create_task(
         pending_delivery_module.send_to_run(
-            parent, handle, "close first", channel=owner.conversation_channel
+            parent, handle, "close first", owner=owner,
+channel=owner.conversation_channel
         )
     )
     release.set()
@@ -10447,7 +10456,8 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
         store,
         handle,
         "too late",
-        channel=loop._background_owner.conversation_channel,
+        owner=loop._background_owner,
+channel=loop._background_owner.conversation_channel,
     )
     assert error is not None and "no live run" in error
 
@@ -10518,7 +10528,8 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
             store,
             handle,
             "also check the tests",
-            channel=loop._background_owner.conversation_channel,
+            owner=loop._background_owner,
+channel=loop._background_owner.conversation_channel,
         )
         is None
     )
@@ -10560,7 +10571,8 @@ async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> 
             store,
             handle,
             "also check the tests",
-            channel=loop._background_owner.conversation_channel,
+            owner=loop._background_owner,
+channel=loop._background_owner.conversation_channel,
         )
         is None
     )
@@ -10598,13 +10610,16 @@ async def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> 
     store = ConversationStore(tmp_path)
 
     channel = BackgroundAgentOwner(store).conversation_channel
-    error = await send_to_run(store, "run-1", "hello", channel=channel)
+    error = await send_to_run(store, "run-1", "hello", owner=owner,
+channel=channel)
     assert error is not None and "no live run" in error
 
-    assert await send_to_run(store, "", "hello", channel=channel) == (
+    assert await send_to_run(store, "", "hello", owner=owner,
+channel=channel) == (
         "child_instance_id must be a nonempty string"
     )
-    error = await send_to_run(store, "run-1", "  ", channel=channel)
+    error = await send_to_run(store, "run-1", "  ", owner=owner,
+channel=channel)
     assert error == "message must be a nonempty string"
 
 
@@ -10631,7 +10646,8 @@ async def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
         store,
         "sess:1",
         "hello",
-        channel=BackgroundAgentOwner(store).conversation_channel,
+        owner=owner,
+channel=BackgroundAgentOwner(store).conversation_channel,
     )
     assert error is not None
     assert "explore" in error and "agent_send" in error
@@ -13366,7 +13382,8 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
             store,
             handle,
             "also check the tests",
-            channel=loop._background_owner.conversation_channel,
+            owner=loop._background_owner,
+channel=loop._background_owner.conversation_channel,
         )
         is None
     )
@@ -14216,7 +14233,8 @@ async def test_idle_child_is_running_during_wake_turn(
             parent_store,
             "parent:1",
             "continue",
-            channel=owner.conversation_channel,
+            owner=owner,
+channel=owner.conversation_channel,
         )
         is None
     )
@@ -16048,7 +16066,8 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
             parent,
             "root:1",
             "approved",
-            channel=owner.conversation_channel,
+            owner=owner,
+channel=owner.conversation_channel,
         )
         is None
     )
