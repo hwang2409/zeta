@@ -7758,8 +7758,7 @@ async def test_model_selection_respects_unknown_account_fence(
     from tests.support.credentials import named_account_credentials
     from tests.support.server_backend import ServerFakeBackend
     from zeta.accounts import AccountError
-    from zeta.mcp.oauth_store import token_store_path
-from zeta.oauth import OAuthTokens
+    from zeta.oauth import OAuthTokens
     from zeta.server import model_selection
 
     token = OAuthTokens("access", "refresh", 9_999_999_999.0)
@@ -7818,8 +7817,7 @@ async def test_serve_model_selection_uses_account_transition(
 ) -> None:
     from tests.support.credentials import named_account_credentials
     from tests.support.server_backend import ServerFakeBackend
-    from zeta.mcp.oauth_store import token_store_path
-from zeta.oauth import OAuthTokens
+    from zeta.oauth import OAuthTokens
 
     token = OAuthTokens("access", "refresh", 9_999_999_999.0)
     await asyncio.to_thread(named_account_credentials(tmp_path, "codex").save, token)
@@ -7872,8 +7870,7 @@ async def test_serve_cross_provider_model_change_updates_account_context(
     from tests.support.credentials import named_account_credentials
     from tests.support.server_backend import ServerFakeBackend
     from zeta.accounts import AccountId
-    from zeta.mcp.oauth_store import token_store_path
-from zeta.oauth import OAuthTokens
+    from zeta.oauth import OAuthTokens
     from zeta.protocol.types import Message, MessageRole, TextContent, ThinkingContent
     from zeta.server import model_selection
 
