@@ -46,6 +46,81 @@ class CloseOutcome:
     failures: tuple[CloseFailure, ...]
 
 
+def _exception_type_name(error: BaseException) -> str:
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
+def _primary_outcome(primary_exception: BaseException | None) -> str:
+    if isinstance(primary_exception, asyncio.CancelledError):
+        return "cancelled"
+    return "error" if primary_exception is not None else "success"
+
+
+def _cleanup_failure_context(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None = None,
+) -> dict[str, object]:
+    return {
+        "exception_type": _exception_type_name(error),
+        "stage": stage,
+        "index": index,
+        "primary_outcome": _primary_outcome(primary_exception),
+    }
+
+
+def _report_loop_cleanup_failure(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None = None,
+) -> None:
+    asyncio.get_running_loop().call_exception_handler(
+        _cleanup_failure_context(
+            error,
+            stage=stage,
+            index=index,
+            primary_exception=primary_exception,
+        )
+    )
+
+
+async def _report_cleanup_failure(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None = None,
+    diagnostics_path: Path | None = None,
+    provider: str = "provider",
+) -> None:
+    if diagnostics_path is None:
+        _report_loop_cleanup_failure(
+            error,
+            stage=stage,
+            index=index,
+            primary_exception=primary_exception,
+        )
+        return
+    context = _cleanup_failure_context(
+        error,
+        stage=stage,
+        index=index,
+        primary_exception=primary_exception,
+    )
+    await StreamDiagnostics.record_cleanup_failure(
+        diagnostics_path,
+        provider=provider,
+        stage=stage,
+        index=index,
+        exception_type=str(context["exception_type"]),
+        primary_outcome=str(context["primary_outcome"]),
+    )
+
+
 def _release_background_close(
     task: asyncio.Task[object],
     index: int,
@@ -57,13 +132,13 @@ def _release_background_close(
     except BaseException as exc:
         if is_control_exception(exc):
             return
-        if report_failure is not None:
+        if report_failure is None:
+            _report_loop_cleanup_failure(
+                exc, stage="background_close", index=index
+            )
+        else:
             with contextlib.suppress(BaseException):
                 report_failure(index, exc)
-            return
-        task.get_loop().call_exception_handler(
-            {"message": "provider cleanup failed", "exception": exc}
-        )
 
 
 def _retain_background_closes(
@@ -77,6 +152,28 @@ def _retain_background_closes(
                 done, index, report_failure
             )
         )
+
+
+def _schedule_cleanup_failure(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None,
+    diagnostics_path: Path | None,
+    provider: str,
+) -> None:
+    task = asyncio.create_task(
+        _report_cleanup_failure(
+            error,
+            stage=stage,
+            index=index,
+            primary_exception=primary_exception,
+            diagnostics_path=diagnostics_path,
+            provider=provider,
+        )
+    )
+    _retain_background_closes((task,), None)
 
 
 def retry_after_seconds(headers: Mapping[str, str] | None) -> float | None:
@@ -184,11 +281,37 @@ class HTTPClientLease:
     async def refresh(
         self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
     ) -> str:
+        primary_exception: BaseException | None = None
+        token = ""
         try:
-            return await refresh_token(self.client)
-        finally:
-            if self.owned:
-                await close_resource(self.client)
+            token = await refresh_token(self.client)
+        except BaseException as exc:
+            primary_exception = exc
+        if self.owned:
+            try:
+                outcome = await close_transport_resources(self.client.aclose())
+            except asyncio.CancelledError as exc:
+                primary_exception = merge_exception(primary_exception, exc)
+            else:
+                for failure in outcome.failures:
+                    if is_control_exception(failure.error):
+                        primary_exception = merge_exception(
+                            primary_exception, failure.error
+                        )
+                    else:
+                        await _report_cleanup_failure(
+                            failure.error,
+                            stage="refresh_client",
+                            index=failure.index,
+                            primary_exception=primary_exception,
+                        )
+        if task_is_cancelling():
+            primary_exception = merge_exception(
+                primary_exception, asyncio.CancelledError()
+            )
+        if primary_exception is not None:
+            raise primary_exception
+        return token
 
 
 async def build_response_error[ErrorT: RuntimeError](
@@ -496,17 +619,16 @@ async def stall_watchdog[T](
     finally:
         close = getattr(iterator, "aclose", None)
         if close is not None:
+            primary_exception = sys.exception()
             outcome = await close_transport_resources(close())
             for failure in outcome.failures:
                 if is_control_exception(failure.error):
                     raise failure.error
-                asyncio.get_running_loop().call_exception_handler(
-                    {
-                        "message": "provider cleanup failed",
-                        "exception": failure.error,
-                        "resource": "stream_iterator",
-                        "primary_exception": sys.exception(),
-                    }
+                await _report_cleanup_failure(
+                    failure.error,
+                    stage="stream_iterator",
+                    index=failure.index,
+                    primary_exception=primary_exception,
                 )
 
 
@@ -640,33 +762,24 @@ async def cleanup_transport[ErrorT: RuntimeError](
         closes.append(client.aclose())  # type: ignore[attr-defined]
         resources.append("client")
 
-    def report_failure(index: int, error: BaseException) -> None:
+    def schedule_failure(index: int, error: BaseException) -> None:
         diagnostic_error = (
             request_error(error, http_error_type)
             if isinstance(error, httpx.HTTPError)
             else error
         )
-        if diagnostics_path is not None:
-            StreamDiagnostics.record_cleanup_failure(
-                diagnostics_path,
-                diagnostic_error,
-                provider=provider,
-                resource=resources[index],
-                primary_exception=primary_exception,
-            )
-            return
-        asyncio.get_running_loop().call_exception_handler(
-            {
-                "message": "provider cleanup failed",
-                "exception": diagnostic_error,
-                "provider": provider,
-                "resource": resources[index],
-            }
+        _schedule_cleanup_failure(
+            diagnostic_error,
+            stage=resources[index],
+            index=index,
+            primary_exception=primary_exception,
+            diagnostics_path=diagnostics_path,
+            provider=provider,
         )
 
     try:
         outcome = await close_transport_resources(
-            *closes, report_failure=report_failure
+            *closes, report_failure=schedule_failure
         )
     except asyncio.CancelledError as exc:
         raise merge_exception(primary_exception, exc)
@@ -674,7 +787,19 @@ async def cleanup_transport[ErrorT: RuntimeError](
         if is_control_exception(failure.error):
             primary_exception = merge_exception(primary_exception, failure.error)
         else:
-            report_failure(failure.index, failure.error)
+            diagnostic_error = (
+                request_error(failure.error, http_error_type)
+                if isinstance(failure.error, httpx.HTTPError)
+                else failure.error
+            )
+            await _report_cleanup_failure(
+                diagnostic_error,
+                stage=resources[failure.index],
+                index=failure.index,
+                primary_exception=primary_exception,
+                diagnostics_path=diagnostics_path,
+                provider=provider,
+            )
     if task_is_cancelling():
         primary_exception = merge_exception(primary_exception, asyncio.CancelledError())
     if isinstance(primary_exception, asyncio.CancelledError):

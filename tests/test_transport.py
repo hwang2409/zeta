@@ -1,12 +1,17 @@
 import asyncio
 import gc
+import json
+import threading
 import weakref
 from collections.abc import AsyncIterator
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 import zeta.providers.retry_policy as retry_policy_module
+import zeta.providers.stream_diagnostics as stream_diagnostics_module
 from zeta.protocol.types import (
     ErrorInfo,
     Message,
@@ -22,11 +27,15 @@ from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
 from zeta.providers.ollama import OllamaError
 from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import (
+    HTTPClientLease,
     build_response_error,
+    cleanup_transport,
     close_transport_resources,
     retry_provider_completion,
     stall_watchdog,
 )
+from zeta.tui import loop_errors as loop_errors_module
+from zeta.tui.loop_errors import run_prompt_toolkit
 
 
 class _PartialErrorBody(httpx.AsyncByteStream):
@@ -163,8 +172,12 @@ async def test_detached_close_failure_reaches_loop_diagnostics() -> None:
         loop.set_exception_handler(previous_handler)
 
     assert len(contexts) == 1
-    assert contexts[0]["message"] == "provider cleanup failed"
-    assert isinstance(contexts[0]["exception"], RuntimeError)
+    assert contexts[0] == {
+        "exception_type": "builtins.RuntimeError",
+        "stage": "background_close",
+        "index": 0,
+        "primary_outcome": "success",
+    }
 
 
 class _FailingCloseIterator:
@@ -198,8 +211,134 @@ async def test_stream_iterator_close_failure_keeps_success_and_reaches_diagnosti
 
     assert values == []
     assert len(contexts) == 1
-    assert contexts[0]["resource"] == "stream_iterator"
-    assert isinstance(contexts[0]["exception"], RuntimeError)
+    assert contexts[0] == {
+        "exception_type": "builtins.RuntimeError",
+        "stage": "stream_iterator",
+        "index": 0,
+        "primary_outcome": "success",
+    }
+
+
+class _FailingCloseClient:
+    async def aclose(self) -> None:
+        raise RuntimeError("cleanup-secret-canary")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_error", [False, True])
+async def test_refresh_cleanup_failure_keeps_primary_outcome(
+    primary_error: bool,
+) -> None:
+    lease = HTTPClientLease.__new__(HTTPClientLease)
+    lease.client = _FailingCloseClient()
+    lease.owned = True
+    contexts: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    async def refresh(_client: object) -> str:
+        if primary_error:
+            raise ValueError("primary-provider-secret-canary")
+        return "fresh-token"
+
+    try:
+        if primary_error:
+            with pytest.raises(ValueError, match="primary-provider-secret-canary"):
+                await lease.refresh(refresh)
+        else:
+            assert await lease.refresh(refresh) == "fresh-token"
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert contexts == [
+        {
+            "exception_type": "builtins.RuntimeError",
+            "stage": "refresh_client",
+            "index": 0,
+            "primary_outcome": "error" if primary_error else "success",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_is_secret_safe_through_real_tui_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostics: list[dict[str, object]] = []
+    printed: list[object] = []
+    monkeypatch.setattr(
+        loop_errors_module,
+        "_schedule_diagnostic",
+        lambda _path, record: diagnostics.append(record),
+    )
+
+    class PromptApplication:
+        async def run_async(self, *, set_exception_handler: bool) -> None:
+            assert not set_exception_handler
+            async for _value in stall_watchdog(
+                _FailingCloseIterator(),
+                seconds=0,
+                on_stall=lambda _elapsed: RuntimeError("unexpected stall"),
+            ):
+                pass
+
+    session = SimpleNamespace(app=PromptApplication())
+    app = SimpleNamespace(
+        _print_unit=printed.append,
+        _invalidate_prompt=lambda: None,
+    )
+
+    await run_prompt_toolkit(session, app)
+
+    rendered = repr((printed, diagnostics))
+    assert printed and diagnostics
+    assert "iterator close canary" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_cleanup_diagnostic_is_secret_safe_and_written_off_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop_thread = threading.get_ident()
+    write_thread: list[int] = []
+    write_started = threading.Event()
+    real_write = stream_diagnostics_module.write_stream_diagnostic
+
+    def observed_write(path: Path, record: object, **kwargs: object) -> None:
+        write_thread.append(threading.get_ident())
+        write_started.set()
+        real_write(path, record, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        stream_diagnostics_module, "write_stream_diagnostic", observed_write
+    )
+    diagnostics_path = tmp_path / "provider.jsonl"
+    primary = ValueError("primary-provider-secret-canary")
+
+    outcome = await cleanup_transport(
+        stream_context=None,
+        entered=False,
+        client=_FailingCloseClient(),
+        owns_client=True,
+        primary_exception=primary,
+        http_error_type=RuntimeError,
+        diagnostics_path=diagnostics_path,
+        provider="test-provider",
+    )
+
+    assert outcome is primary
+    assert write_started.is_set()
+    assert write_thread and write_thread[0] != loop_thread
+    raw_record = diagnostics_path.read_text()
+    record = json.loads(raw_record)
+    assert "cleanup-secret-canary" not in raw_record
+    assert "primary-provider-secret-canary" not in raw_record
+    assert record["exception_type"] == "builtins.RuntimeError"
+    assert record["stage"] == "client"
+    assert record["index"] == 0
+    assert record["primary_outcome"] == "error"
 
 
 @pytest.mark.parametrize("status_code", [520, 521, 522, 523, 524, 529])

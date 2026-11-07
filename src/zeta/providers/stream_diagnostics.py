@@ -132,33 +132,29 @@ class StreamDiagnostics:
         )
 
     @staticmethod
-    def record_cleanup_failure(
+    async def record_cleanup_failure(
         path: Path,
-        error: BaseException,
         *,
         provider: str,
-        resource: str,
-        primary_exception: BaseException | None,
+        stage: str,
+        index: int,
+        exception_type: str,
+        primary_outcome: str,
     ) -> None:
-        """Record a close failure without replacing the provider outcome."""
+        """Record sanitized close facts without blocking the provider loop."""
 
-        write_stream_diagnostic(
+        await asyncio.to_thread(
+            _write_cleanup_failure,
             path,
             {
-                "timestamp": time.time(),
                 "provider": provider,
                 "type": "provider_cleanup_failed",
-                "resource": resource,
-                "exception": f"{type(error).__module__}.{type(error).__qualname__}",
-                "primary_outcome": (
-                    "cancelled"
-                    if isinstance(primary_exception, asyncio.CancelledError)
-                    else "error"
-                    if primary_exception is not None
-                    else "success"
-                ),
-                "cancelled": isinstance(primary_exception, asyncio.CancelledError),
-                **fd_diagnostics(),
+                "stage": stage,
+                "resource": stage,
+                "index": index,
+                "exception_type": exception_type,
+                "primary_outcome": primary_outcome,
+                "cancelled": primary_outcome == "cancelled",
             },
         )
 
@@ -199,6 +195,13 @@ class StreamDiagnostics:
                 **fd_diagnostics(),
             },
         )
+
+
+def _write_cleanup_failure(path: Path, record: Mapping[str, Any]) -> None:
+    write_stream_diagnostic(
+        path,
+        {"timestamp": time.time(), **record, **fd_diagnostics()},
+    )
 
 
 def write_stream_diagnostic(
