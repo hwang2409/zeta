@@ -17,6 +17,7 @@ from tests.test_server import TIMEOUT, _socket_path
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
+from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
 from zeta.server import server as server_module
 from zeta.server.protocol import EventDescriptor
@@ -173,6 +174,83 @@ async def _ready_connection(
         if state.role == role
     )
     return server, reader, writer, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Transport,
+) -> None:
+    server, _old_reader, old_writer, old_state = await _ready_connection(
+        tmp_path, transport, "controller"
+    )
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    claim_attempted = asyncio.Event()
+    new_writer: asyncio.StreamWriter | None = None
+    original_cancel = accounts_module.cancel_owned_switch
+    original_claim = server.connections._claim
+
+    async def gated_cancel(owner: object) -> None:
+        if owner is old_state.connection:
+            cleanup_entered.set()
+            await asyncio.wait_for(cleanup_release.wait(), 10)
+        await original_cancel(owner)
+
+    def tracked_claim(
+        connection: object,
+        role: str,
+        protocol_version: str,
+        features: frozenset[str],
+    ) -> None:
+        if connection is not old_state.connection:
+            claim_attempted.set()
+        original_claim(connection, role, protocol_version, features)
+
+    # test-contract: seam force a replacement hello while real disconnect cleanup waits
+    monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
+    monkeypatch.setattr(server.connections, "_claim", tracked_claim)
+    hello: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        old_writer.close()
+        await old_writer.wait_closed()
+        await asyncio.wait_for(cleanup_entered.wait(), 10)
+
+        new_reader, new_writer = await _connect(
+            server, transport, "controller", start=False
+        )
+        hello = asyncio.create_task(
+            _rpc(
+                new_reader,
+                new_writer,
+                transport,
+                2,
+                "hello",
+                {"protocol_version": "1.2", "role": "controller"},
+            )
+        )
+        await asyncio.wait_for(claim_attempted.wait(), 10)
+        cleanup_release.set()
+        response = await asyncio.wait_for(hello, 10)
+        assert response["result"]["server"] == "zeta"
+
+        assert await server.connections.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="new-controller"
+        )
+        event = await _read_json(new_reader, transport)
+        assert event["params"]["delta"] == "new-controller"
+    finally:
+        cleanup_release.set()
+        if hello is not None and not hello.done():
+            hello.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(hello, 10)
+        if new_writer is not None:
+            new_writer.close()
+            await new_writer.wait_closed()
+        await asyncio.wait_for(server.close(), 10)
 
 
 @pytest.mark.asyncio
