@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -78,7 +79,7 @@ async def test_serve_mounts_already_authorized_oauth_server(
         redirect_uri="http://127.0.0.1:8000/callback",
         resource="https://mcp.test/rpc",
     )
-    save_token("mail", token, home=home)
+    await asyncio.to_thread(save_token, "mail", token, home=home)
     mounted: list[StreamableHTTPMCPClient] = []
 
     async def connect_and_list(client: StreamableHTTPMCPClient) -> list:

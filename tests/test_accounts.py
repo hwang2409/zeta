@@ -652,7 +652,7 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
             lambda args, count: args[1] == "default" and count == 6,
         )
     elif step == "credential_file":
-        original = wrap("_atomic_publish", lambda args, count: args[1] == "oauth.json")
+        original = wrap("atomic_publish", lambda args, count: args[1] == "oauth.json")
     elif step == "credential_directory_sync":
         original = wrap(
             "_stage_account_tokens", lambda args, count: True, owner=AccountStore
@@ -661,7 +661,7 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
         original = wrap("_read_tokens", lambda args, count: count == 2)
     elif step == "registry_file":
         original = wrap(
-            "_atomic_publish", lambda args, count: args[1] == "accounts.json"
+            "atomic_publish", lambda args, count: args[1] == "accounts.json"
         )
     elif step == "registry_directory_sync":
         original = wrap("_write_registry", lambda args, count: True, AccountStore)
@@ -678,10 +678,10 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
             "accounts_directory": "_mkdir_child_durable",
             "provider_directory": "_mkdir_child_durable",
             "account_directory": "_mkdir_child_durable",
-            "credential_file": "_atomic_publish",
+            "credential_file": "atomic_publish",
             "credential_directory_sync": "_stage_account_tokens",
             "credential_verification": "_read_tokens",
-            "registry_file": "_atomic_publish",
+            "registry_file": "atomic_publish",
             "registry_directory_sync": "_write_registry",
             "legacy_unlink": "_unlink_legacy_file",
             "legacy_directory_sync": "_unlink_legacy",

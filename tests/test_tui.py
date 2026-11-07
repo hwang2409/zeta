@@ -13667,7 +13667,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         "last_attempt_at": "2020-01-01T00:00:00Z",
         "last_error": "rate limited; retry later",
     }
-    store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
+    await asyncio.to_thread(
+        store._write_usage_bytes, account, (json.dumps(usage) + "\n").encode()
+    )
     manager = SessionManager(home)
     opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
     context = await asyncio.to_thread(

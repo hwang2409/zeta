@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from collections.abc import Callable, Mapping
@@ -131,6 +132,17 @@ def _publish_payloads(
     return digests
 
 
+def _publish_legacy_json(
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = False
+) -> None:
+    atomic_publish_file(
+        directory_fd,
+        name,
+        json.dumps(json.loads(data), sort_keys=True).encode(),
+        sync_directory=sync_directory,
+    )
+
+
 def publish_version[T](
     directory_fd: int,
     *,
@@ -184,7 +196,7 @@ def publish_version[T](
                 versions_fd,
                 f"{version}.json",
                 mapping_mutations(manifest),
-                atomic_publish_file,
+                _publish_legacy_json,
             )
             transaction_step("manifest")
             lease.publish_json(
@@ -194,7 +206,7 @@ def publish_version[T](
                     *mapping_mutations({"current": version}),
                     ReplaceSubtree(("history",), retained),
                 ),
-                lambda fd, name, data: atomic_publish_file(
+                lambda fd, name, data: _publish_legacy_json(
                     fd, name, data, sync_directory=True
                 ),
             )

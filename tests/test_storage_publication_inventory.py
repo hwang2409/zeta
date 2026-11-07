@@ -16,7 +16,7 @@ _ALLOWED_DIRECT_PUBLICATION = {
         "atomic_publish_file",
     ),
     ("memory/version_store.py", "_publish_payloads", "atomic_publish_file"),
-    ("memory/version_store.py", "publish_version", "atomic_publish_file"),
+    ("memory/version_store.py", "_publish_legacy_json", "atomic_publish_file"),
     ("remote_sync/project_publish.py", "publish_version", "atomic_publish_file"),
     ("remote_sync/project_publish.py", "_publish_payloads", "atomic_publish_file"),
     ("remote_sync/project_publish.py", "_publish_side_files", "atomic_publish_file"),

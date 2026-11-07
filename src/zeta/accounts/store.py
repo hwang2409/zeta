@@ -11,8 +11,7 @@ import re
 import stat
 import threading
 import time
-import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import (
     AbstractContextManager,
     ExitStack,
@@ -40,6 +39,19 @@ from ..oauth import (
     credential_file_lock,
 )
 from ..storage_format import DeleteValue, SetValue, open_writer, require_closed_variant
+from .files import (
+    exists as _exists,
+)
+from .files import (
+    file_mtime_ns as _file_mtime_ns,
+)
+from .files import (
+    read_optional as _read_optional,
+)
+from .files import (
+    read_optional_bytes as _read_optional_bytes,
+)
+from .publication import atomic_publish, publish_mapping
 
 _PROVIDERS = {"anthropic", "codex"}
 _MAX_SWEEP_WARNING_PATHS = 5
@@ -218,7 +230,9 @@ class AccountStore:
             self._home() as home_fd,
             _account_directory(home_fd, account) as account_fd,
         ):
-            self._publish_mapping(account_fd, "usage.json", json.loads(data))
+            publish_mapping(
+                self.home, account_fd, "usage.json", json.loads(data), atomic_publish
+            )
             _fsync_directory(account_fd)
 
     @contextmanager
@@ -708,36 +722,21 @@ class AccountStore:
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise AccountError("accounts.json is invalid; use /accounts") from exc
 
-    def _publish_mapping(
-        self,
-        directory_fd: int,
-        name: str,
-        value: Mapping[str, Any],
-        *,
-        delete: Iterable[str] = (),
-    ) -> None:
-        with open_writer(self.home) as lease:
-            lease.publish_json(
-                directory_fd,
-                name,
-                (
-                    *(DeleteValue((key,)) for key in delete),
-                    *(SetValue((key,), item) for key, item in value.items()),
-                ),
-                _atomic_publish,
-            )
-
     def _stage_account_tokens(
         self, account_fd: int, account: AccountId, tokens: OAuthTokens
     ) -> None:
-        self._publish_mapping(account_fd, "oauth.json", tokens.to_dict())
+        publish_mapping(
+            self.home, account_fd, "oauth.json", tokens.to_dict(), atomic_publish
+        )
         credential = _read_optional_bytes(account_fd, "oauth.json")
         if credential is None:
             raise AccountError("OAuth credentials are invalid; login required")
-        self._publish_mapping(
+        publish_mapping(
+            self.home,
             account_fd,
             "publish-pending.json",
             _publication_record(account, credential),
+            atomic_publish,
         )
         _fsync_directory(account_fd)
         _verify_tokens(account_fd, tokens)
@@ -768,7 +767,7 @@ class AccountStore:
                 home_fd,
                 "accounts.json",
                 mutations,
-                _atomic_publish,
+                atomic_publish,
             )
         _fsync_directory(home_fd)
 
@@ -955,7 +954,13 @@ class AccountCredentials:
 
     def _write(self, home_fd: int, tokens: OAuthTokens) -> None:
         with _account_directory(home_fd, self.account) as account_fd:
-            self.store._publish_mapping(account_fd, "oauth.json", tokens.to_dict())
+            publish_mapping(
+                self.store.home,
+                account_fd,
+                "oauth.json",
+                tokens.to_dict(),
+                atomic_publish,
+            )
             _fsync_directory(account_fd)
             _verify_tokens(account_fd, tokens)
 
@@ -1145,33 +1150,6 @@ def _mkdir_child_durable(parent_fd: int, name: str) -> int:
     return fd
 
 
-def _atomic_publish(directory_fd: int, name: str, data: bytes) -> None:
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    fd = open_session_file(
-        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    )
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        published = open_session_file(directory_fd, name, os.O_RDONLY)
-        try:
-            os.fchmod(published, 0o600)
-        finally:
-            os.close(published)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(temporary, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-
-
 def _token_bytes(tokens: OAuthTokens) -> bytes:
     return (json.dumps(tokens.to_dict(), separators=(",", ":")) + "\n").encode()
 
@@ -1259,40 +1237,6 @@ def _tokens_from_bytes(credential: bytes) -> OAuthTokens:
         raise AccountError("OAuth credentials are invalid; login required") from None
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         raise AccountError("OAuth credentials are invalid; login required") from exc
-
-
-def _read_optional_bytes(directory_fd: int, name: str) -> bytes | None:
-    try:
-        fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd, "rb") as handle:
-        return handle.read()
-
-
-def _read_optional(directory_fd: int, name: str) -> str | None:
-    try:
-        fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd) as handle:
-        return handle.read()
-
-
-def _exists(directory_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _file_mtime_ns(directory_fd: int, name: str) -> int:
-    fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    try:
-        return os.fstat(fd).st_mtime_ns
-    finally:
-        os.close(fd)
 
 
 def _exists_regular(directory_fd: int, name: str) -> bool:
