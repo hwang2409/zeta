@@ -25,7 +25,8 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore, TranscriptLoadError
-from .transcript_recovery import RepairResult
+from .transcript_recovery import RepairResult, RepairTarget
+from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
     OwnerSurface,
@@ -363,27 +364,32 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             raise
         return OpenedSession(metadata, store)
 
-    def repair_transcript(self, session_id: str) -> RepairResult:
-        """Repair one diagnosed root transcript while holding its execution owner."""
+    def repair_transcript(
+        self, session_id: str, child_run_id: str | None = None
+    ) -> RepairResult:
+        """Repair one diagnosed root or child transcript."""
         metadata = self.read_metadata(session_id)
+        target = RepairTarget(session_id, child_run_id)
+        segments = child_run_segments(session_id, child_run_id)
+        session_dir = self.sessions_dir / session_id
+        for segment in segments:
+            session_dir = session_dir / "agents" / str(segment)
         store = ConversationStore(
-            self.sessions_dir,
-            session_id=session_id,
+            session_dir.parent,
+            session_id=session_dir.name,
+            cwd=metadata.cwd,
             _must_exist=True,
             _storage_lease=self._storage_lease,
             _owner_surface="recovery",
             _recovery_owner=True,
             _repair_explicit=True,
+            _repair_target=target,
         )
         try:
-            if store.cwd != metadata.cwd:
-                raise SessionError(
-                    f"session {session_id} cwd does not match its metadata"
-                )
             result = store.last_repair_result
             if result is None:
                 raise SessionError(
-                    f"session {session_id} does not need transcript repair"
+                    f"session {session_id} transcript does not need repair"
                 )
             return result
         finally:

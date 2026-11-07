@@ -33,7 +33,6 @@ from ..checkpoints import (
 )
 from ..session_files import open_session_file
 from ..transcript_recovery import (
-    RepairTarget,
     TranscriptSourceFacts,
     ValidatedPrefix,
     repair_transcript,
@@ -972,7 +971,7 @@ class ConversationLogMixin:
                 raise
             self._last_repair_result = repair_transcript(
                 self.directory_fd,
-                RepairTarget(self.session_id),
+                self._repair_target,
                 error._source_facts,
                 strict_reopen=self._strict_reopen_repaired_transcript,
                 memory_review_required=True,
@@ -1007,7 +1006,7 @@ class ConversationLogMixin:
             )
             self._last_repair_result = repair_transcript(
                 self.directory_fd,
-                RepairTarget(self.session_id),
+                self._repair_target,
                 source,
                 strict_reopen=self._strict_reopen_repaired_transcript,
                 memory_review_required=False,
