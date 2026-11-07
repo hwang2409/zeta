@@ -1032,9 +1032,9 @@ async def test_background_task_owner_state_table(
 
         if row == "4-exit-evidence-precedes-not-running":
             from tests.test_agent import (
-                _TaskFinishGateBackend,
                 _completion_after_publication,
                 _start_task_gate,
+                _TaskFinishGateBackend,
             )
 
             backend = _TaskFinishGateBackend(
