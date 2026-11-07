@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -10488,13 +10489,26 @@ class _TaskFinishGateBackend(CompletionBackend):
         )
 
 
+async def _cancel_and_drain_test_task(task: asyncio.Task[object]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+
+
+async def _close_test_agent_loop(loop: AgentLoop) -> None:
+    await asyncio.wait_for(loop.close(), 10)
+
+
 async def _start_task_gate(
     tmp_path: Path,
     backend: CompletionBackend,
     *,
     owner: BackgroundAgentOwner | None = None,
+    stack: contextlib.AsyncExitStack | None = None,
 ) -> tuple[ConversationStore, AgentLoop, asyncio.Task[list[StreamEvent]], asyncio.Event]:
     store = ConversationStore(tmp_path)
+    if stack is not None:
+        stack.callback(store.close)
     loop = AgentLoop(
         backend,
         store,
@@ -10502,10 +10516,14 @@ async def _start_task_gate(
         background_owner=owner,
         skill_catalog=SkillCatalog.empty(),
     )
+    if stack is not None:
+        stack.push_async_callback(_close_test_agent_loop, loop)
     completion_published = _record_completion_publication(loop)
     run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
+    if stack is not None:
+        stack.push_async_callback(_cancel_and_drain_test_task, run)
     return store, loop, run, completion_published
 
 
@@ -10700,13 +10718,15 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(tmp_path: Path)
         ),
     ],
 )
-async def test_child_finish_gate_task_handoff_kills_task_without_command_secrets(
+async def test_killed_task_receipt_never_contains_command_secrets(
     tmp_path: Path, command: str, secret: str
 ) -> None:
-    backend = _TaskFinishGateBackend(command, action="handoff")
-    store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
+    async with contextlib.AsyncExitStack() as stack:
+        backend = _TaskFinishGateBackend(command, action="handoff")
+        store, loop, run, completion_published = await _start_task_gate(
+            tmp_path, backend, stack=stack
+        )
 
-    try:
         await asyncio.wait_for(run, timeout=5)
         notification = await _completion_after_publication(store, completion_published)
         notifications = store.agent_notifications(pending_only=False)
@@ -10730,8 +10750,6 @@ async def test_child_finish_gate_task_handoff_kills_task_without_command_secrets
         )
         assert "command unavailable" not in text
         assert notification.data["killed_task_count"] == 1
-    finally:
-        await loop.close()
 
 
 @pytest.mark.asyncio

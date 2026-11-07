@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import pty
@@ -2721,6 +2722,98 @@ class _TaskSafetyNotices(list[str]):
     async def publish(self, text: str) -> str:
         self.append(text)
         return f"warning-{len(self)}"
+
+
+async def _close_test_background_registry(
+    registry: BackgroundTaskRegistry | ToolRegistry,
+) -> None:
+    await asyncio.wait_for(registry.close(), 10)
+
+
+async def _cancel_and_drain_background_task(task: asyncio.Task[object]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_task_safety_second_window_records_cause_for_every_task(
+    tmp_path: Path,
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        from zeta.agent.explicit_finish import TaskSafetyLifecycle
+
+        store = ConversationStore(tmp_path / "session")
+        stack.callback(store.close)
+        wake = asyncio.Event()
+        flow = pending_delivery_module.StepDeliveryFlow(
+            store, wake_sink=lambda _source: wake.set()
+        )
+        tools = ToolRegistry(
+            tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+        )
+        stack.push_async_callback(_close_test_background_registry, tools)
+        registry = tools.background_tasks
+        registry.set_notification_sink(
+            lambda item: flow.produce(_task_notification(item))
+        )
+        task_ids = [
+            (
+                await asyncio.wait_for(
+                    registry.start(
+                        _python("import time; time.sleep(60)"), tmp_path
+                    ),
+                    10,
+                )
+            )[0]
+            for _ in range(3)
+        ]
+        started_at = [task.started_at for task in registry.snapshot()]
+        assert all(value is not None for value in started_at)
+        now = [min(value for value in started_at if value is not None)]
+        wait = _ControlledTaskSafetyWait()
+        notices = _TaskSafetyNotices()
+        lifecycle = TaskSafetyLifecycle(7, clock=lambda: now[0], wait=wait)
+        supervisor = asyncio.create_task(lifecycle.run(registry, notices.publish))
+        stack.push_async_callback(_cancel_and_drain_background_task, supervisor)
+
+        await asyncio.wait_for(wait.timeouts.get(), 10)
+        now[0] = max(value for value in started_at if value is not None) + 7
+        await asyncio.wait_for(wait.releases.put(False), 10)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+        assert len(notices) == 1
+
+        lifecycle.delivery_completed(set())
+        await asyncio.wait_for(wait.releases.put(True), 10)
+        await asyncio.wait_for(wait.timeouts.get(), 10)
+        now[0] += 7
+        await asyncio.wait_for(wait.releases.put(False), 10)
+        assert await asyncio.wait_for(wait.timeouts.get(), 10) is None
+
+        rows = json.loads(
+            (store.session_dir / "background_tasks.json").read_text()
+        )
+        receipts = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        causes = {
+            task_id: (
+                "explicit-finish task safety limit expired at task age "
+                f"{now[0] - started:g} seconds after no owner turn for 7 seconds"
+            )
+            for task_id, started in zip(task_ids, started_at, strict=True)
+            if started is not None
+        }
+        assert {row["task_id"] for row in rows} == set(task_ids)
+        assert {receipt.data["task_id"] for receipt in receipts} == set(task_ids)
+        for row in rows:
+            assert row["terminal_phase"] == "task_kill"
+            assert row["note"] == causes[row["task_id"]]
+        for receipt in receipts:
+            assert receipt.data["background_phase"] == "task_kill"
+            assert receipt.data["note"] == causes[receipt.data["task_id"]]
 
 
 @pytest.mark.asyncio
