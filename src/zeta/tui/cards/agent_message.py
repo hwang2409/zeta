@@ -268,14 +268,17 @@ def _render_agent_status(
     event: StreamEvent,
     running: bool,
     identities: AgentIdentityIndex,
-) -> Panel:
+) -> Panel | None:
+    call = event.tool_call
     result = event.tool_result
     structured = result.structured_content if result is not None else None
     children = structured.get("children") if isinstance(structured, dict) else None
+    if call is not None and call.arguments and not isinstance(children, list):
+        return None
     if running or not isinstance(children, list):
         state = "error" if result is not None and result.is_error else "running"
         return render_agent_message(
-            Text(f"agent status · {state}", style=_state_style(state)),
+            Text(f"agent_status · {state}", style=_state_style(state)),
             result=result.content if result is not None and result.is_error else None,
             state=state,
         )
@@ -297,7 +300,7 @@ def _render_agent_status(
                 fields.append(value)
         rows.append(" · ".join(fields))
     noun = "child" if len(rows) == 1 else "children"
-    header = Text(f"agent status · {len(rows)} {noun}", style=theme.AGENT_MAIN)
+    header = Text(f"agent_status · {len(rows)} {noun}", style=theme.AGENT_MAIN)
     return render_agent_message(header, body="\n".join(rows) or "no children")
 
 

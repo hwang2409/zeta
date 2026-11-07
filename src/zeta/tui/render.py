@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from ..agent.receipt import terminal_state
 from ..protocol.types import (
     ErrorInfo,
     RedactedThinkingContent,
@@ -80,6 +81,10 @@ from .cards.tool import TOOL_CARD_REGISTRY
 
 MAX_RESULT = 180
 MAX_ERROR_REASON = 400
+MAX_AGENT_NOTIFICATION_NAME = 64
+MAX_AGENT_NOTIFICATION_REASON = 80
+MAX_AGENT_NOTIFICATION_LINE = 78
+_NOTIFICATION_SGR_RE = re.compile(r"\x1b\[[0-?]*[ -/]*m")
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
@@ -475,6 +480,63 @@ def _duration(data: dict[str, Any]) -> float | None:
     return None
 
 
+def _compact_notification_text(value: str, limit: int) -> str:
+    """Return one bounded, terminal-safe notification fragment."""
+
+    single_line = " ".join(
+        _NOTIFICATION_SGR_RE.sub("", _strip_terminal_controls(value)).split()
+    )
+    if limit <= 0:
+        return ""
+    if cell_len(single_line) <= limit:
+        return single_line
+    if limit <= 3:
+        return "." * limit
+    bounded = Text(single_line)
+    bounded.truncate(limit - 3, overflow="crop")
+    return bounded.plain + "..."
+
+
+def _notification_state(data: dict[str, Any]) -> tuple[str, bool]:
+    status = data["status"]
+    state = terminal_state(status=status)
+    stats = data.get("stats")
+    if type(stats) is not dict or not ({"error", "canceled"} & stats.keys()):
+        return state, False
+
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    conflict = (
+        type(error) is not bool
+        or type(canceled) is not bool
+        or (error and canceled)
+        or error != (state == "failed")
+        or canceled != (state == "canceled")
+    )
+    return ("failed" if conflict else state), conflict
+
+
+def _notification_stats(data: dict[str, Any]) -> list[str]:
+    stats = data.get("stats")
+    if type(stats) is not dict:
+        return []
+    parts: list[str] = []
+    elapsed = stats.get("elapsed")
+    if type(elapsed) in {int, float} and elapsed >= 0:
+        seconds = round(float(elapsed), 1)
+        if seconds >= 3600:
+            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
+        elif seconds >= 60:
+            minutes, remainder = divmod(int(seconds), 60)
+            parts.append(f"{minutes}m{remainder:02d}s")
+        else:
+            parts.append(f"{seconds:.1f}s")
+    turns = stats.get("turns_used")
+    if type(turns) is int and turns >= 0:
+        parts.append(f"{turns} turns")
+    return parts
+
+
 # Every stream event is owned by scrollback, another TUI component, or is hidden
 # by design. Keep this exhaustive when adding a StreamEventType member.
 STREAM_EVENTS_RENDERED = frozenset({
@@ -534,10 +596,54 @@ def render_agent_notification(
         style = theme.RECEIPT if code == 0 else theme.ERROR
         message = f"⏺ task {task_id} exited ({code}) · {headline}"
         return Text(message, style=style, overflow="ellipsis", no_wrap=True)
-    rendered = render_agent_notification_message(event, identity_index)
-    if rendered is not None:
-        return rendered
-    return Text("background agent notification unavailable", style=theme.ERROR)
+    if kind in {"child_question", "child_idle", "child_question_withdrawn"}:
+        rendered = render_agent_notification_message(event, identity_index)
+        if rendered is not None:
+            return rendered
+        return Text("background agent notification unavailable", style=theme.ERROR)
+    description = event.data.get("description")
+    status = event.data.get("status")
+    if type(description) is not str or type(status) is not str or not description:
+        return Text("background agent notification unavailable", style=theme.ERROR)
+    try:
+        state, state_conflict = _notification_state(event.data)
+    except ValueError:
+        return Text("background agent notification unavailable", style=theme.ERROR)
+
+    stats_parts = _notification_stats(event.data)
+    status_parts = [state, *stats_parts]
+    fixed_suffix = " · ".join(status_parts)
+    name_limit = min(
+        MAX_AGENT_NOTIFICATION_NAME,
+        MAX_AGENT_NOTIFICATION_LINE
+        - cell_len("⏺ ")
+        - cell_len(" · ")
+        - cell_len(fixed_suffix),
+    )
+    parts = [
+        f"⏺ {_compact_notification_text(description, name_limit)}",
+        *status_parts,
+    ]
+    if state in {"failed", "canceled"}:
+        text = (
+            "conflicting completion state" if state_conflict else event.data.get("text")
+        )
+        if type(text) is str and text:
+            reason_limit = min(
+                MAX_AGENT_NOTIFICATION_REASON,
+                MAX_AGENT_NOTIFICATION_LINE
+                - cell_len(" · ".join(parts))
+                - cell_len(" · reason: "),
+            )
+            if reason_limit > 0:
+                reason = _compact_notification_text(text, reason_limit)
+                parts.append(f"reason: {reason}")
+    return Text(
+        " · ".join(parts),
+        style=theme.ERROR if state != "completed" else theme.RECEIPT,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
 
 
 def render_event(

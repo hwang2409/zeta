@@ -5133,7 +5133,7 @@ def test_typed_agent_cards_and_receipts_show_type() -> None:
     )
     progress = AgentCard.render_progress(call, "turn 1: thinking")
     assert progress is not None
-    assert "task research · explore · running" in renderable_plain(progress)
+    assert "explore · task research" in renderable_plain(progress)
 
     receipt = AgentCard.render_receipt(
         StreamEvent(
@@ -5151,7 +5151,7 @@ def test_typed_agent_cards_and_receipts_show_type() -> None:
         )
     )
     assert receipt is not None
-    assert "task research · explore · completed" in receipt.plain
+    assert "explore · task research" in receipt.plain
 
 
 def test_nested_agent_card_shows_depth_and_reaches_grandchild_tail(
@@ -5375,7 +5375,7 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
     app._rebuild_transcript()
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "task research · plan · completed" in rendered
+    assert "plan · task research" in rendered
 
 
 def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:

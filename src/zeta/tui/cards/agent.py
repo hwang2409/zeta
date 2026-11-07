@@ -17,9 +17,11 @@ from rich.text import Text
 
 from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_usage
+from ...agent.presets import GENERAL_PRESET, get_agent_preset
 from ...agent.receipt import (
     agent_stats,
     ensure_agent_receipt_text,
+    has_agent_receipt_suffix,
     terminal_state,
 )
 from ...core.agent_progress import live_agent_lifecycle
@@ -109,20 +111,10 @@ class AgentCard:
 
     @classmethod
     def _agent_type(cls, call: ToolCall) -> str:
-        value = call.arguments.get("agent_type")
-        return value if isinstance(value, str) and value else ""
-
-    @classmethod
-    def _model(cls, call: ToolCall) -> str:
-        value = call.arguments.get("model")
-        return value if isinstance(value, str) and value else ""
-
-    @staticmethod
-    def _short_handle(handle: object) -> str:
-        if not isinstance(handle, str):
+        preset = get_agent_preset(call.arguments.get("agent_type"))
+        if preset is None or preset.name == GENERAL_PRESET.name:
             return ""
-        separator = handle.find(":")
-        return handle[separator:] if separator >= 0 else handle
+        return preset.name
 
     @classmethod
     def _turns_from_content(cls, content: str) -> int:
@@ -152,13 +144,11 @@ class AgentCard:
         turns_used: int,
         depth: int = 1,
     ) -> Text:
-        fields = [cls._description(call)]
-        fields.extend(value for value in (cls._agent_type(call), cls._model(call)) if value)
-        fields.extend(
-            ("running", f"{elapsed_seconds:.1f}s", f"{turns_used} turns", f"depth {depth}")
-        )
+        agent_type = cls._agent_type(call)
+        prefix = f"{agent_type} · " if agent_type else ""
         return Text(
-            " · ".join(fields),
+            f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
+            f"{turns_used} turns · depth {depth}",
             style=theme.COMMAND,
             no_wrap=True,
             overflow="ellipsis",
@@ -405,6 +395,15 @@ class AgentCard:
                 else None
             ),
         )
+        status = (
+            structured_status
+            if structured_status in {"completed", "error", "canceled"}
+            else "canceled"
+            if receipt_status == "canceled"
+            else "fail"
+            if receipt_status == "failed"
+            else "ok"
+        )
         stats = agent_stats(
             lifecycle,
             status=receipt_status,
@@ -415,28 +414,19 @@ class AgentCard:
             receipt_status,
             stats,
         )
-        description = structured.get("description", cls._description(call))
-        fields = [str(description)]
-        handle = cls._short_handle(structured.get("child_instance_id"))
-        if handle:
-            fields[-1] += f" {handle}"
-        for value in (
-            structured.get("agent_type", cls._agent_type(call)),
-            structured.get("model", cls._model(call)),
-        ):
-            if isinstance(value, str) and value:
-                fields.append(value)
-        fields.extend(
-            (
-                receipt_status,
-                f"{turns} turns",
-                f"{max(0.0, elapsed or 0.0):.1f}s",
-                f"depth {display_depth}",
+        if has_agent_receipt_suffix(result.content):
+            return Text(
                 receipt_text,
+                style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
+                no_wrap=True,
+                overflow="ellipsis",
             )
-        )
+        agent_type = cls._agent_type(call)
+        prefix = f"{agent_type} · " if agent_type else ""
         return Text(
-            " · ".join(fields),
+            f"{prefix}{cls._description(call)} · {turns} turns · "
+            f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
+            f"depth {display_depth} · {receipt_text}",
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
