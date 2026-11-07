@@ -6,7 +6,6 @@ import fcntl
 import hashlib
 import inspect
 import json
-import multiprocessing
 import os
 import subprocess
 import threading
@@ -2688,7 +2687,6 @@ skill_catalog=SkillCatalog.empty(),
 async def test_cancel_honors_approval_won_by_other_writer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root = tmp_path / "zeta-home" / "sessions"
     opened = await asyncio.to_thread(
         SessionManager(tmp_path / "zeta-home").create,
         provider="codex", model="offline", cwd=tmp_path
