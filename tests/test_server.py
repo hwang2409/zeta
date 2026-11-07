@@ -8314,7 +8314,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
             for _ in range(1_000)
         )
-        store.append_compaction_marker("summary", sources[0].seq, sources[-1].seq)
+        store.append_compaction_marker(
+            "summary", sources[0].seq, sources[-1].seq
+        )
         original_counter = server.runtime.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
@@ -8344,9 +8346,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                         probe_frames.append(json.loads(stream.readline()))
                         probe_ready.set()
                         if not entered.wait(10):
-                            raise AssertionError(
-                                "status transcript worker did not start"
-                            )
+                            raise AssertionError("status transcript worker did not start")
                         stream.write(
                             b'{"jsonrpc":"2.0","id":"live","method":"status",'
                             b'"params":{}}\n'
@@ -8424,9 +8424,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             or frame.get("params", {}).get("event") is not None
             for frame in frames
         )
-        assert (await _request(observer_reader, observer_writer, "after", "ping"))[-1][
-            "id"
-        ] == "after"
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
+            -1
+        ]["id"] == "after"
     finally:
         release.set()
         if request_task is not None and not request_task.done():
