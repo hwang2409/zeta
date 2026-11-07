@@ -257,6 +257,7 @@ def _run_bash_completion(script: Path, line: bytes, tmp_path: Path) -> bytes:
             master,
             (
                 f"source {script}; "
+                # test-contract: wrap real completion to emit candidates and done.
                 "_zeta_definition=$(declare -f _zeta_completions); "
                 'eval "${_zeta_definition/_zeta_completions/'
                 '_zeta_test_completions}"; '

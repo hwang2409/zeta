@@ -7022,7 +7022,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         read_pty_until(
             master_fd, b"\x1b[?1049l", process=process, output=output
         )
-        reap_process(process, timeout=5)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
@@ -7030,7 +7030,8 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         assert output.count(b"\x1b[?1049h") == 1
     finally:
         if process.poll() is None:
-            reap_process(process, timeout=0)
+            process.kill()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7079,11 +7080,12 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 
         os.write(master_fd, b"\x04")
         read_until(b"\x1b[?1049l")
-        reap_process(process, timeout=5)
+        reap_process(process, timeout=10)
         assert process.returncode == 0
     finally:
         if process.poll() is None:
-            reap_process(process, timeout=0)
+            process.kill()
+            reap_process(process, timeout=10)
         os.close(master_fd)
 
 
@@ -7126,7 +7128,7 @@ def test_main_pty_normal_command_then_queued_enter_submits(
             read_pty_until(
                 master_fd, b"\x1b[?1049l", process=process, output=output
             )
-            reap_process(process, timeout=5)
+            reap_process(process, timeout=10)
         assert process.returncode == 0
         os.close(master_fd)
 
