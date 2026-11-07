@@ -1,6 +1,9 @@
 import asyncio
 import base64
 import json
+import threading
+import time
+import traceback
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -966,6 +969,8 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
     call = ToolCall("burst-1", "stream", {})
     chunks = [f"chunk-{index}\n" for index in range(200)]
     final_text = "".join(chunks)
+    loop_thread_id = threading.get_ident()
+    original_sleep = time.sleep
     nonblocking_updates = 0
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     original_put_nowait = asyncio.Queue.put_nowait
@@ -997,6 +1002,17 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
 
     monkeypatch.setattr(asyncio.Queue, "put", guard_stream_put)
 
+    def guard_loop_thread_sleep(seconds: float) -> None:
+        if threading.get_ident() == loop_thread_id:
+            caller = "".join(traceback.format_stack(limit=8))
+            raise AssertionError(
+                "stream turn called time.sleep on the event loop thread; "
+                f"seconds={seconds!r}\n{caller}"
+            )
+        original_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", guard_loop_thread_sleep)
+
     async def stream(
         arguments: dict[str, object],
         abort_signal: object,
@@ -1018,6 +1034,7 @@ skill_catalog=SkillCatalog.empty(),
     async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            # test-contract: latency preserve the consumer pacing that exercises queue retention
             await asyncio.sleep(0.001)
 
     updates = [
