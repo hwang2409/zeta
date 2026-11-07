@@ -373,6 +373,7 @@ class AgentLoop(
             self.step_delivery.capacity_changed()
         if isinstance(self.backend, ContextWindowBackend):
             self.backend.set_token_budget(token_budget)
+
     def abort(
         self,
         *,
@@ -385,6 +386,7 @@ class AgentLoop(
             self._background_owner.cancel_all()
             if steering_drop_reason is not None:
                 self.store.drop_client_steering(steering_drop_reason)
+
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
         The running ``_run_turn`` drains this queue before the next provider
@@ -392,27 +394,33 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
+
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
+
     def clear_pending_steering(
         self,
         reason: Literal["clear", "turn_end"] = "clear",
     ) -> int:
         return self.store.drop_client_steering(reason)
+
     def drop_pending_steering(
         self,
         reason: Literal["abort", "disconnect", "turn_end", "failed"],
     ) -> int:
         return self.store.drop_client_steering(reason)
+
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
         self._background_event_sink = sink
+
     @property
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
+
     def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
             self._background_event_sink(event)
@@ -444,6 +452,7 @@ class AgentLoop(
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
+
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
         state = self.store.approval_states().get(request_id)
@@ -701,51 +710,6 @@ class AgentLoop(
             recovery_state=recovery_state,
             error=error,
         )
-    @staticmethod
-    def _record_recovery_event(state: EmptyTurnRecoveryState, event: StreamEvent) -> None:
-        if event.type is StreamEventType.TOOL_EXECUTION_END:
-            state.record_tool_result(event.tool_call, event.tool_result)
-    async def _handle_toolless_turn(
-        self,
-        step_delivery: StepDeliveryFlow,
-        assistant_message: Message,
-        *,
-        iteration_consuming_notifications: bool,
-        notification_turn: bool,
-        recovery_state: EmptyTurnRecoveryState,
-        turn_number: int,
-    ) -> tuple[_ToollessTransition, tuple[StreamEvent, ...], bool]:
-        transition = await self._toolless_transition(
-            step_delivery,
-            assistant_message,
-            iteration_consuming_notifications=iteration_consuming_notifications,
-            notification_turn=notification_turn,
-            recovery_state=recovery_state,
-        )
-        if transition.error is not None:
-            if self.agent_instance_id is None:
-                await step_delivery.admit_terminal("foreground_end")
-            return transition, (
-                StreamEvent(StreamEventType.ERROR, error=transition.error),
-                StreamEvent(StreamEventType.AGENT_END),
-            ), True
-        if transition.continue_turn:
-            return transition, (
-                StreamEvent(
-                    StreamEventType.TURN_END,
-                    message=assistant_message,
-                    data={"turn": turn_number, "tool_calls": 0},
-                ),
-            ), False
-        self._schedule_transcript_index()
-        return transition, (
-            StreamEvent(
-                StreamEventType.TURN_END,
-                message=assistant_message,
-                data={"turn": turn_number, "tool_calls": 0},
-            ),
-            StreamEvent(StreamEventType.AGENT_END),
-        ), True
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -1210,7 +1174,7 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             if not calls:
-                transition, events, done = await self._handle_toolless_turn(
+                transition = await self._toolless_transition(
                     step_delivery,
                     assistant_message,
                     iteration_consuming_notifications=(
@@ -1218,16 +1182,26 @@ class AgentLoop(
                     ),
                     notification_turn=notification_turn,
                     recovery_state=recovery_state,
-                    turn_number=turn_number,
                 )
                 recovery_state = transition.recovery_state
                 nudge_turn_pending = transition.nudge_turn_pending
-                for event in events:
-                    yield event
-                consuming_notifications = transition.consuming_notifications
-                if done:
+                if transition.error is not None:
+                    yield StreamEvent(StreamEventType.ERROR, error=transition.error)
+                    if self.agent_instance_id is None:
+                        await step_delivery.admit_terminal("foreground_end")
+                    yield StreamEvent(StreamEventType.AGENT_END)
                     return
-                continue
+                yield StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": 0},
+                )
+                consuming_notifications = transition.consuming_notifications
+                if transition.continue_turn:
+                    continue
+                self._schedule_transcript_index()
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
@@ -1237,7 +1211,10 @@ class AgentLoop(
             )
             try:
                 async for event in dispatch:
-                    self._record_recovery_event(recovery_state, event)
+                    if event.type is StreamEventType.TOOL_EXECUTION_END:
+                        recovery_state.record_tool_result(
+                            event.tool_call, event.tool_result
+                        )
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is durable before dispatch starts. If
