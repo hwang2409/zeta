@@ -317,6 +317,7 @@ class Client:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self.reader, self.writer, self.ident = reader, writer, 0
+        self.retries = 0
 
     async def request(
         self, method: str, params: dict[str, Any]
@@ -348,12 +349,27 @@ FEATURES = [
 
 
 async def connect(socket: Path) -> Client:
-    reader, writer = await asyncio.open_unix_connection(
-        str(socket), limit=8 * 1024 * 1024
-    )
-    client = Client(reader, writer)
-    await client.request("hello", {"protocol_version": "1.2", "features": FEATURES})
-    return client
+    """Connect and say hello. A controller that just disconnected can still be
+    registered for a moment; retry that refusal (counted in Client.retries)."""
+    retries = 0
+    while True:
+        reader, writer = await asyncio.open_unix_connection(
+            str(socket), limit=8 * 1024 * 1024
+        )
+        client = Client(reader, writer)
+        try:
+            await client.request(
+                "hello", {"protocol_version": "1.2", "features": FEATURES}
+            )
+        except RuntimeError as exc:
+            writer.close()
+            if "already connected" not in str(exc) or retries >= 500:
+                raise
+            retries += 1
+            await asyncio.sleep(0.01)
+            continue
+        client.retries = retries
+        return client
 
 
 async def serve_session(socket: Path, sid: str, n: int) -> dict[str, Any]:
@@ -436,6 +452,7 @@ async def serve_session(socket: Path, sid: str, n: int) -> dict[str, Any]:
             (time.perf_counter_ns() - started) / 1e6,
             size,
             cursor=cursor,
+            hello_retries_last=again.retries,
         )
         again.writer.close()
         await again.writer.wait_closed()

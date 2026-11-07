@@ -403,6 +403,21 @@ def make_home(name: str, fraction: float = 1.0) -> tuple[Path, str]:
         conversation.write_bytes(b"".join(lines[:keep]))
         for path in target.glob("*.sqlite*"):
             path.unlink()
+        # Child receipts store absolute paths under the real home; point them
+        # at the copy so agent_status/agent_output resolve the copied children.
+        for path in (conversation, target / "session_state.json"):
+            if path.exists():
+                path.write_bytes(
+                    path.read_bytes().replace(
+                        str(source).encode(), str(target).encode()
+                    )
+                )
+        # The copy has no credentials. Drop the recorded account selection so
+        # `zeta serve` resume does not ask for a login; no provider is called.
+        meta_path = target / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["selected_accounts"] = {}
+        meta_path.write_text(json.dumps(meta))
         ready.write_text(sid)
     os.environ["ZETA_HOME"] = str(home)
     os.environ["ZETA_ACCOUNT_HOME"] = str(home)
