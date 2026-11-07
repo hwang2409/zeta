@@ -3,17 +3,51 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, Protocol
 
 from prompt_toolkit.buffer import Buffer
 
 _RANK_BATCH_SIZE = 16
 
 
+class FinderRuntimeTarget(Protocol):
+    """Finder operations used by the shared runtime."""
+
+    @property
+    def finder_active(self) -> bool: ...
+
+    async def build_finder_candidate_batches(
+        self, request: Any
+    ) -> AsyncIterator[tuple[Any, bool]]: ...
+
+    def finder_publish_candidate_batch(
+        self, request: Any, candidates: Any, *, complete: bool
+    ) -> bool: ...
+
+    def finder_set_query(self, query: str) -> int | None: ...
+
+    def finder_needs_ranking(self) -> bool: ...
+
+    def finder_rank(self, *, candidate_limit: int | None = None) -> Any: ...
+
+    def finder_publish(self, result: Any) -> bool: ...
+
+    def finder_state(self) -> Any: ...
+
+    def finder_move(self, delta: int) -> None: ...
+
+    def finder_toggle_preview(self) -> None: ...
+
+    def finder_accept(self) -> bool: ...
+
+    def finder_cancel(self) -> None: ...
+
+
 class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
 
-    def _finder_target(self) -> Any:
+    def _finder_target(self) -> FinderRuntimeTarget:
         finder = getattr(self, "_active_finder", None)
         return finder if finder is not None else self._viewed_transcript()
 
@@ -36,23 +70,16 @@ class FinderRuntimeMixin:
         )
         self._invalidate_prompt()
 
-    async def _prepare_finder_candidates(self, finder: Any, request: Any) -> None:
+    async def _prepare_finder_candidates(
+        self, finder: FinderRuntimeTarget, request: Any
+    ) -> None:
         """Extract bounded candidates without blocking the UI loop."""
 
         task = asyncio.current_task()
         try:
-            progressive = getattr(finder, "build_finder_candidate_batches", None)
-            if progressive is None:
-                candidates = await finder.build_finder_candidates(request)
-                if finder is self._finder_target() and finder.finder_publish_candidates(
-                    request, candidates
-                ):
-                    self._invalidate_prompt()
-                    state = finder.finder_state()
-                    if state is not None and not state.complete:
-                        self._start_finder_ranking()
-                return
-            async for candidates, complete in progressive(request):
+            async for candidates, complete in finder.build_finder_candidate_batches(
+                request
+            ):
                 if finder is not self._finder_target():
                     return
                 if not finder.finder_publish_candidate_batch(
@@ -99,9 +126,7 @@ class FinderRuntimeMixin:
             if self._finder_rank_task is task:
                 self._finder_rank_task = None
                 finder = self._finder_target()
-                if finder.finder_active and getattr(
-                    finder, "finder_needs_ranking", lambda: False
-                )():
+                if finder.finder_active and finder.finder_needs_ranking():
                     self._start_finder_ranking()
 
     def _cancel_finder_workers(self) -> None:
@@ -156,4 +181,4 @@ class FinderRuntimeMixin:
         self._invalidate_prompt()
 
 
-__all__ = ["FinderRuntimeMixin"]
+__all__ = ["FinderRuntimeMixin", "FinderRuntimeTarget"]

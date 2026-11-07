@@ -8,7 +8,22 @@ from prompt_toolkit.document import Document
 
 from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.transcript import FinderControl
+from zeta.tui.transcript.finder_runtime import FinderRuntimeTarget
+from zeta.tui.transcript.transcript_finder import TranscriptFinderMixin
 from zeta.tui.transcript.history_finder import HistoryFinder, build_history_candidates
+
+
+def test_finders_implement_the_runtime_interface() -> None:
+    required = {
+        name
+        for name in vars(FinderRuntimeTarget)
+        if not name.startswith("_")
+    }
+    for finder in (HistoryFinder, TranscriptFinderMixin):
+        assert required <= set(dir(finder)), (
+            finder.__name__,
+            required - set(dir(finder)),
+        )
 
 
 def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> HistoryFinder:
