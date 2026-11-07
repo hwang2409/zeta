@@ -5615,6 +5615,7 @@ async def test_idle_status_resolves_config_off_event_loop_once_per_request(
         config_threads.append(threading.get_ident())
         return original_config(*args, **kwargs)
 
+    # test-contract: seam verify the settings resolver leaves the serve event loop
     monkeypatch.setattr(server.runtime, "_config", tracked_config)
     reader, writer = await _connect(server)
     observer_reader, observer_writer = await asyncio.open_connection(
