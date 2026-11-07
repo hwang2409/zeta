@@ -130,7 +130,7 @@ async def test_management_close_propagates_outer_cancellation(
     manager._transaction_task = transaction
     closing = asyncio.create_task(manager.aclose())
     try:
-        assert await asyncio.to_thread(manager._closed.wait, 10)
+        assert await asyncio.to_thread(manager._closed.wait, timeout=10)
         closing.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(closing, 10)
