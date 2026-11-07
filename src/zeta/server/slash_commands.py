@@ -18,10 +18,7 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
-from ..core.project_context import (
-    discover_repo_root,
-    initialize_project_for_directory,
-)
+from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -291,59 +288,31 @@ class ServerSlashSession:
             return "project registry unavailable: no active session"
         if registry is None:
             return "project registry unavailable"
-        project = None
-        if args.strip() == "init":
-            try:
-                project = await asyncio.to_thread(
-                    initialize_project_for_directory,
-                    registry,
-                    opened.store.cwd,
-                )
-                await persist_metadata_change(
-                    runtime.manager,
-                    runtime.metadata,
-                    lambda candidate: runtime.manager.associate_project(
-                        candidate, project.project_id
-                    ),
-                )
-                if runtime.loop is not None:
-                    runtime.loop._set_runtime_project(runtime.metadata)
-            except (ProjectRegistryError, OSError, SessionError) as exc:
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                opened.store.cwd,
+                runtime.metadata.project_id,
+                initialize=initialize,
+            )
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
                 return f"could not initialize project: {exc}"
-        else:
-            if runtime.metadata.project_id:
-                try:
-                    project = await asyncio.to_thread(
-                        registry.show_project, runtime.metadata.project_id
-                    )
-                except ProjectRegistryError:
-                    project = None
-            if project is None:
-                project = await asyncio.to_thread(
-                    registry.find_for_directory, opened.store.cwd
-                )
-        if project is None:
-            return "unassociated (run /project init to associate this directory)"
-        if await asyncio.to_thread(registry.memory_format, project.project_id) == 2:
-            memory = (
-                ", ".join(
-                    await asyncio.to_thread(
-                        registry._entry_memory_mirrors, project.project_id
-                    )
-                )
-                or "none"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                runtime.manager,
+                runtime.metadata,
+                lambda candidate: runtime.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
             )
-        else:
-            memory = (
-                ", ".join(
-                    name
-                    for name, _ in await asyncio.to_thread(
-                        registry.load_memory, project.project_id
-                    )
-                )
-                or "none"
-            )
-        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+            if runtime.loop is not None:
+                runtime.loop._set_runtime_project(runtime.metadata)
+        return view.text
 
     async def slash_memory(self, args: str) -> str:
         runtime = self._runtime

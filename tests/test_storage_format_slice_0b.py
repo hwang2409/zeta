@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import inspect
@@ -14,6 +15,7 @@ import pytest
 
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.core.session_files import atomic_publish_file
+from zeta.core.slash import create_slash_registry
 from zeta.mcp.management import ManagedServer
 from zeta.mcp.oauth_store import (
     MCPOAuthToken,
@@ -31,6 +33,7 @@ from zeta.project_inbox import (
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
 from zeta.storage_format import CLOSED_VARIANTS, SetValue, open_writer
 from zeta.tui.cards.mcp_manager import MCPManager
 from zeta.tui.slash_handlers import SlashHandlerMixin
@@ -631,6 +634,51 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
 
     assert len(calls) == 3
     assert all(thread_id != loop_thread for thread_id in calls)
+
+
+@pytest.mark.asyncio
+async def test_tui_project_dispatch_reads_storage_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    project = await asyncio.to_thread(
+        registry.create_project, project_root.name, "git", project_root
+    )
+    loop_thread = threading.get_ident()
+    read_threads: list[int] = []
+    original_read = registry._read
+
+    def recording_read(operation: object) -> object:
+        read_threads.append(threading.get_ident())
+        return original_read(operation)  # type: ignore[arg-type]
+
+    # test-contract: seam records real registry transactions across TUI dispatch
+    monkeypatch.setattr(registry, "_read", recording_read)
+
+    class Tui(SlashHandlerMixin):
+        pass
+
+    tui = Tui()
+    tui.loop = SimpleNamespace(  # type: ignore[assignment]
+        project_registry=registry,
+        store=SimpleNamespace(cwd=project_root),
+        session_metadata=SimpleNamespace(project_id=project.project_id),
+    )
+    commands = create_slash_registry(
+        zeta_home=tmp_path / "home",
+        project_dir=project_root,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    output = await commands.dispatch_async(tui, "/project")
+
+    assert output is not None
+    assert output.startswith(f"project: {project.name} ({project.project_id})\n")
+    assert f"root: {project_root}\n" in output
+    assert len(read_threads) >= 3
+    assert all(thread_id != loop_thread for thread_id in read_threads)
 
 
 @pytest.mark.asyncio

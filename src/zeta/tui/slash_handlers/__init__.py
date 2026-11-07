@@ -22,7 +22,7 @@ from ...accounts import (
 from ...accounts.login import login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
-from ...core.project_context import initialize_project_for_directory
+from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
     env_home,
@@ -764,46 +764,30 @@ class SlashHandlerMixin:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
-        project = None
-        if args.strip() == "init":
-            try:
-                project = await asyncio.to_thread(
-                    initialize_project_for_directory,
-                    registry,
-                    self.loop.store.cwd,
-                )
-                await persist_metadata_change(
-                    self.loop.manager,
-                    self.loop.session_metadata,
-                    lambda candidate: self.loop.manager.associate_project(
-                        candidate, project.project_id
-                    ),
-                )
-                self.loop._set_runtime_project(self.loop.session_metadata)
-            except (ProjectRegistryError, OSError, SessionError) as exc:
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                self.loop.store.cwd,
+                self.loop.session_metadata.project_id,
+                initialize=initialize,
+            )
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
                 return f"could not initialize project: {exc}"
-        else:
-            if self.loop.session_metadata.project_id:
-                try:
-                    project = registry.show_project(
-                        self.loop.session_metadata.project_id
-                    )
-                except ProjectRegistryError:
-                    project = None
-            if project is None:
-                project = registry.find_for_directory(self.loop.store.cwd)
-        if project is None:
-            return "unassociated (run /project init to associate this directory)"
-        if registry.memory_format(project.project_id) == 2:
-            memory = (
-                ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                self.loop.manager,
+                self.loop.session_metadata,
+                lambda candidate: self.loop.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
             )
-        else:
-            memory = (
-                ", ".join(name for name, _ in registry.load_memory(project.project_id))
-                or "none"
-            )
-        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+            self.loop._set_runtime_project(self.loop.session_metadata)
+        return view.text
 
     async def slash_memory(self, args: str) -> str:
         """Show, retry, or undo versioned automatic project-memory changes."""
