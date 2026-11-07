@@ -12,9 +12,9 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _event,
     _frames_until_event,
@@ -23,9 +23,6 @@ from tests.test_server import (
     _socket_path,
 )
 from tests.test_server_observers import _observer
-from tests.test_server_websocket import (
-    _close as _close_websocket,
-)
 from tests.test_server_websocket import (
     _connect as _connect_websocket,
 )
@@ -246,7 +243,7 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
         await _request(reader, writer, 7, "deny", {"request_id": "call-2"})
         await _frames_until_event(reader, "turn_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -341,7 +338,7 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         )
         assert revoked[-1]["result"]["grants"]["session_grants"] == []
     finally:
-        await _close_websocket(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -497,10 +494,14 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
         )
         await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await asyncio.wait_for(observer_writer.wait_closed(), TIMEOUT)
-        await asyncio.wait_for(_close(server, writer), TIMEOUT)
+        await asyncio.wait_for(
+            close_serve(
+                server,
+                writer,
+                *([observer_writer] if observer_writer is not None else []),
+            ),
+            TIMEOUT,
+        )
 
 
 @pytest.mark.asyncio
@@ -540,7 +541,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         async def block_observer(payload: bytes) -> bool:
             if b"session_grants_changed" in payload:
                 observer_blocked.set()
-                await release_observer.wait()
+                await asyncio.wait_for(release_observer.wait(), 10)
             return await original_write(payload)
 
         # test-contract: seam gate the real observer transport write
@@ -554,7 +555,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 {"request_id": "call-1", "scope": "always_tool"},
             )
         )
-        await observer_blocked.wait()
+        await asyncio.wait_for(observer_blocked.wait(), 10)
         approve_frames = await _assert_completes_in_ready_turns(approve)
         assert approve_frames[-1]["result"] == {
             "accepted": True,
@@ -579,7 +580,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 {"grant": "bash"},
             )
         )
-        await observer_blocked.wait()
+        await asyncio.wait_for(observer_blocked.wait(), 10)
         revoke_frames = await _assert_completes_in_ready_turns(revoke)
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
@@ -616,13 +617,15 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         assert snapshot["session_grants"] == []
     finally:
         release_observer.set()
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        if replacement_writer is not None:
-            replacement_writer.close()
-            await replacement_writer.wait_closed()
-        await _close(server, writer)
+        await close_serve(
+            server,
+            writer,
+            *[
+                candidate
+                for candidate in (observer_writer, replacement_writer)
+                if candidate is not None
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -680,15 +683,16 @@ async def test_observer_write_failure_does_not_block_approved_tool_resume(
             "request_id": "call-1",
             "scope": "always_tool",
         }
-        await write_failed.wait()
+        await asyncio.wait_for(write_failed.wait(), 10)
         await _frames_until_event(reader, "turn_end")
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot["session_grants"] == ["bash"]
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        await _close(server, writer)
+        await close_serve(
+            server,
+            writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
@@ -752,15 +756,16 @@ async def test_observer_write_failure_does_not_turn_revoke_into_error(
         revoked = revoke_response["result"]
         assert revoked["removed"] == ["bash"]
         assert revoked["grants"]["session_grants"] == []
-        await write_failed.wait()
+        await asyncio.wait_for(write_failed.wait(), 10)
         assert (await _request(reader, writer, 6, "session_grants"))[-1]["result"] == (
             revoked["grants"]
         )
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        await _close(server, writer)
+        await close_serve(
+            server,
+            writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
@@ -800,7 +805,7 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
             "message": "session grants require the negotiated session_grants feature",
         }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     server = ZetaServer(
         home=home,
@@ -885,7 +890,7 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
         assert sentinel["id"] == 8
         assert sentinel["result"]["session_grants"] == []
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -942,7 +947,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         )
         await _frames_until_event(reader, "turn_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1017,7 @@ async def test_duplicate_grant_emits_no_event_before_positive_fifo_sentinel(
         assert sentinel["result"]["session_grants"] == ["bash"]
         await _frames_until_event(reader, "turn_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1060,7 +1065,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         monkeypatch.setattr(server.connections, "release", release)
         writer.close()
         await writer.wait_closed()
-        await released.wait()
+        await asyncio.wait_for(released.wait(), 10)
 
         replacement_reader, replacement_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -1093,7 +1098,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         assert snapshot_response["id"] == 11
         assert snapshot_response["result"]["session_grants"] == ["bash"]
     finally:
-        if replacement_writer is not None:
-            replacement_writer.close()
-            await replacement_writer.wait_closed()
-        await server.close()
+        await close_serve(
+            server,
+            *([replacement_writer] if replacement_writer is not None else []),
+        )
