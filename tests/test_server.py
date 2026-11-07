@@ -799,17 +799,27 @@ class BlockingThenCaptureBackend:
         )
 
 
-def _public_input_prompt(messages, prompts: Collection[str]) -> str | None:
-    return next(
-        (
-            block.text
-            for message in messages
-            if message.role is MessageRole.USER
-            for block in message.content
-            if isinstance(block, TextContent) and block.text in prompts
-        ),
-        None,
-    )
+def _public_input_prompt(messages, prompts: Collection[str]) -> str:
+    public_inputs = [
+        block.text
+        for message in messages
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    prompt = next((text for text in public_inputs if text in prompts), None)
+    if prompt is None:
+        raise AssertionError(f"no scripted backend for actor prompt {public_inputs!r}")
+    return prompt
+
+
+def test_public_input_prompt_rejects_unknown_actor() -> None:
+    messages = [Message(MessageRole.USER, [TextContent("unknown-child")])]
+
+    with pytest.raises(
+        AssertionError, match="no scripted backend for actor prompt.*unknown-child"
+    ):
+        _public_input_prompt(messages, {"parent", "known-child"})
 
 
 class PerActorFakeBackend:
@@ -818,8 +828,10 @@ class PerActorFakeBackend:
         parent_turns: list[ScriptedTurn],
         child_turns: dict[str, list[ScriptedTurn]],
         *,
+        parent_prompt: str,
         gated_child_call: int = 1,
     ) -> None:
+        self.parent_prompt = parent_prompt
         self.parent = FakeBackend(parent_turns)
         self.children = {
             prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
@@ -830,8 +842,13 @@ class PerActorFakeBackend:
         self.gated_child_call = gated_child_call
 
     async def complete(self, messages, tool_schemas):
-        child_prompt = _public_input_prompt(messages, self.children)
-        backend = self.children.get(child_prompt, self.parent)
+        actor_prompt = _public_input_prompt(
+            messages, {self.parent_prompt, *self.children}
+        )
+        child_prompt = actor_prompt if actor_prompt in self.children else None
+        backend = (
+            self.children[child_prompt] if child_prompt is not None else self.parent
+        )
         if child_prompt is not None:
             self.child_calls[child_prompt] += 1
         if (
@@ -1730,6 +1747,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
                 ScriptedTurn([TextContent("child done")]),
             ]
         },
+        parent_prompt="both",
         gated_child_call=2,
     )
     server = ZetaServer(provider="codex",
@@ -3766,12 +3784,12 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         {"prompt": "wait", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
-    backend = PerActorFakeBackend(
+    backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn(tool_calls=[child_call]),
             ScriptedTurn([TextContent("parent done")]),
-        ],
-        {"wait": [ScriptedTurn(tool_calls=[child_call])]},
+        ]
     )
     server = ZetaServer(provider="codex",
         home=tmp_path,
@@ -3922,6 +3940,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             ]
             for prompt in ("read one", "read two")
         },
+        parent_prompt="delegate",
     )
     server = ZetaServer(provider="codex",
         home=tmp_path,
