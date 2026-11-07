@@ -6117,11 +6117,18 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     )
     baseline = set(asyncio.all_tasks())
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await started.wait()
-    loop.abort()
-
-    await task
-    await loop.close()
+    try:
+        try:
+            await asyncio.wait_for(started.wait(), 10)
+        except TimeoutError:
+            pytest.fail("child turn never started")
+        loop.abort()
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await loop.close()
 
     assert not [
         child_task
