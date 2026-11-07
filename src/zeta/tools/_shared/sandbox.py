@@ -51,6 +51,21 @@ def expand_user_path(raw_path: str) -> str:
     return expanded
 
 
+def resolve_shell_cwd(
+    persisted_cwd: str | os.PathLike[str], cwd: object
+) -> str:
+    """Resolve a shell cwd override from the persisted shell cwd."""
+
+    if cwd is None:
+        return os.fspath(persisted_cwd)
+    if type(cwd) is not str or not cwd:
+        raise ValueError("cwd must be a nonempty string or null")
+    candidate = Path(expand_user_path(cwd))
+    if not candidate.is_absolute():
+        candidate = Path(persisted_cwd) / candidate
+    return os.path.abspath(candidate)
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedPath:
     """A file-tool path resolved by the shared sandbox policy."""

@@ -21,8 +21,13 @@ OBSERVER_REQUESTS = frozenset({
     "model_catalog", "session_settings", "ping", "delivery_status",
 })
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
-_CONTROLLER_BUFFER_LIMIT = 4 * 1024 * 1024
-_CONTROLLER_BUFFER_FRAMES = 256
+OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+OUTPUT_MAX_FRAMES = 256
+OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
+
+
+async def _overflow_deadline_wait() -> None:
+    await asyncio.sleep(OUTPUT_OVERFLOW_CLOSE_DEADLINE)
 
 
 @dataclass(frozen=True)
@@ -36,7 +41,6 @@ class ControllerMetadata:
 class _OutputFrame:
     payload: bytes
     future: asyncio.Future[bool] | None = None
-    buffered_controller_event: bool = False
 
 
 @dataclass
@@ -52,12 +56,11 @@ class _OutputState:
     ready: asyncio.Future[bool] | None = None
     callers_settled: asyncio.Event = field(default_factory=asyncio.Event)
     pending_callers: int = 0
-    overflow_done: asyncio.Future[bool] | None = None
-    queued_bytes: int = 0
-    pending_controller_bytes: int = 0
-    pending_controller_frames: int = 0
+    retained_bytes: int = 0
+    retained_frames: int = 0
+    overflow_frame: bytes | None = None
+    overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
-    overflowed_before_flush: bool = False
     released: bool = False
 
 
@@ -147,6 +150,8 @@ class ConnectionRegistry:
                 raise RuntimeError("observer limit reached")
             self._observers.append(state)
         state.role = role
+        assert state.output is not None
+        state.output.overflow_frame = self._overflow_frame(role)
         state.protocol_version = protocol_version
         state.features = features
 
@@ -183,27 +188,17 @@ class ConnectionRegistry:
         frame = state.connection.codec.notification(event, session_id, **fields)
         output = state.output
         assert output is not None
+        if output.phase not in {"claimed_buffering", "flushing", "ready"}:
+            return False
+        if not self._admit(state, frame):
+            return False
         if output.phase in {"claimed_buffering", "flushing"}:
-            if output.phase == "flushing" and output.overflowed:
-                # Honest rejection with -32011 belongs to phase B.
-                return True
-            if (
-                output.pending_controller_bytes + len(frame) > _CONTROLLER_BUFFER_LIMIT
-                or output.pending_controller_frames >= _CONTROLLER_BUFFER_FRAMES
-            ):
-                output.overflowed = True
-                self._clear_output(output)
-                return False
-            output.pending_controller_bytes += len(frame)
-            output.pending_controller_frames += 1
             self._enqueue(
                 output,
-                _OutputFrame(frame, buffered_controller_event=True),
+                _OutputFrame(frame),
                 wake=output.phase == "flushing",
             )
             return True
-        if output.phase != "ready":
-            return False
         return await self._send_frame(output, frame)
 
     def release(self, connection: Any) -> None:
@@ -224,22 +219,28 @@ class ConnectionRegistry:
             return False
         output = state.output
         if output.phase == "claimed_buffering":
-            return await self._send_hello(output, frame)
-        if output.phase != "ready":
+            return await self._send_hello(state, frame)
+        if output.phase != "ready" or not self._admit(state, frame):
             return False
-        if state.role == "observer" and (
-            output.queued_bytes + len(frame) > 4 * 1024 * 1024
-            or len(output.queue) >= 256
-        ):
-            return await self._overflow(state)
         return await self._send_frame(output, frame)
 
-    async def _send_hello(self, output: _OutputState, frame: bytes) -> bool:
+    async def _send_hello(self, state: _Connection, frame: bytes) -> bool:
+        output = state.output
+        assert output is not None
+        if (
+            output.overflow_frame is not None
+            and not output.overflowed
+            and not self._fits(output, frame)
+        ):
+            self._begin_overflow(state, enqueue_control=False)
         hello = _OutputFrame(frame)
         output.queue.appendleft(hello)
-        output.queued_bytes += len(frame)
-        output.overflowed_before_flush = output.overflowed
-        output.phase = "flushing"
+        self._charge(output, hello)
+        if output.overflowed:
+            output.phase = "overflowing"
+            self._enqueue_overflow_control(output)
+        else:
+            output.phase = "flushing"
         output.wake.set()
         assert output.ready is not None
         self._begin_caller(output)
@@ -297,7 +298,7 @@ class ConnectionRegistry:
         self, output: _OutputState, frame: _OutputFrame, *, wake: bool = True
     ) -> None:
         output.queue.append(frame)
-        output.queued_bytes += len(frame.payload)
+        self._charge(output, frame)
         if wake:
             output.wake.set()
 
@@ -328,11 +329,11 @@ class ConnectionRegistry:
             self._finish_frame_accounting(output, item)
             if not output.released:
                 self._finish_future(item.future, False)
-            if output.phase == "overflowing":
-                return
             if asyncio.current_task().cancelling():
                 self._finish_future(output.ready, False)
                 raise
+            if output.phase == "overflowing":
+                return
             if output.phase == "flushing":
                 self._reset_flush(output, False)
             return
@@ -356,20 +357,18 @@ class ConnectionRegistry:
         if output.released:
             return True
         if output.phase == "flushing":
-            if output.overflowed_before_flush:
-                output.phase = "overflowing"
-                self._enqueue(
-                    output, _OutputFrame(self._overflow_frame("controller"))
-                )
-                return False
             output.phase = "ready"
+            output.overflowed = False
+            self._assert_retained_accounting(output)
+            assert output.retained_bytes == 0
+            assert output.retained_frames == 0
             self._finish_future(output.ready, True)
             return False
         if output.phase != "overflowing":
             return False
+        self._cancel_overflow_deadline(output)
         await state.connection.close()
         self._finish_future(output.ready, False)
-        self._finish_future(output.overflow_done, False)
         return True
 
     def _reset_flush(
@@ -384,18 +383,67 @@ class ConnectionRegistry:
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
 
-    async def _overflow(self, state: _Connection) -> bool:
+    def _fits(self, output: _OutputState, frame: bytes) -> bool:
+        control = output.overflow_frame
+        assert control is not None
+        return (
+            output.retained_bytes + len(frame) + len(control) <= OUTPUT_MAX_BYTES
+            and output.retained_frames + 2 <= OUTPUT_MAX_FRAMES
+        )
+
+    def _admit(self, state: _Connection, frame: bytes) -> bool:
         output = state.output
         assert output is not None
-        if state.connection not in self._connections:
+        if output.overflowed:
             return False
-        output.phase = "overflowing"
+        if self._fits(output, frame):
+            return True
+        self._begin_overflow(
+            state, enqueue_control=output.phase != "claimed_buffering"
+        )
+        return False
+
+    def _begin_overflow(
+        self, state: _Connection, *, enqueue_control: bool
+    ) -> None:
+        output = state.output
+        assert output is not None
+        if output.overflowed:
+            return
+        output.overflowed = True
+        self._clear_output(output, result=False)
+        if enqueue_control:
+            output.phase = "overflowing"
+            self._enqueue_overflow_control(output)
+        output.overflow_deadline_task = asyncio.create_task(
+            self._close_after_overflow_deadline(state)
+        )
+
+    def _enqueue_overflow_control(self, output: _OutputState) -> None:
+        control = output.overflow_frame
+        assert control is not None
+        self._enqueue(output, _OutputFrame(control))
+        self._assert_retained_accounting(output)
+        assert output.retained_bytes <= OUTPUT_MAX_BYTES
+        assert output.retained_frames <= OUTPUT_MAX_FRAMES
+
+    async def _close_after_overflow_deadline(self, state: _Connection) -> None:
+        await _overflow_deadline_wait()
+        output = state.output
+        if output is None or output.phase != "overflowing":
+            return
+        await self._close_overflow(state)
+
+    async def _close_overflow(self, state: _Connection) -> None:
+        output = state.output
+        assert output is not None
         self._clear_output(output)
-        if output.current_write is not None:
-            output.current_write.cancel()
-        output.overflow_done = self.loop.create_future()
-        self._enqueue(output, _OutputFrame(self._overflow_frame("observer")))
-        return await output.overflow_done
+        writer = output.writer_task
+        if writer is not None:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+        await state.connection.close()
+        self._finish_future(output.ready, False)
 
     @staticmethod
     def _overflow_frame(role: str) -> bytes:
@@ -428,13 +476,26 @@ class ConnectionRegistry:
             future.set_result(result)
 
     @staticmethod
+    def _charge(output: _OutputState, item: _OutputFrame) -> None:
+        output.retained_bytes += len(item.payload)
+        output.retained_frames += 1
+
+    @staticmethod
     def _finish_frame_accounting(
         output: _OutputState, item: _OutputFrame
     ) -> None:
-        output.queued_bytes -= len(item.payload)
-        if item.buffered_controller_event:
-            output.pending_controller_bytes -= len(item.payload)
-            output.pending_controller_frames -= 1
+        output.retained_bytes -= len(item.payload)
+        output.retained_frames -= 1
+        assert output.retained_bytes >= 0
+        assert output.retained_frames >= 0
+
+    @staticmethod
+    def _assert_retained_accounting(output: _OutputState) -> None:
+        frames = list(output.queue)
+        if output.current_frame is not None:
+            frames.append(output.current_frame)
+        assert output.retained_bytes == sum(len(item.payload) for item in frames)
+        assert output.retained_frames == len(frames)
 
     @staticmethod
     async def _cancel_frame(
@@ -460,6 +521,7 @@ class ConnectionRegistry:
 
     def _release_output(self, output: _OutputState, role: str | None) -> None:
         output.released = True
+        self._cancel_overflow_deadline(output)
         if role == "observer":
             self._clear_output(output)
             if output.writer_task is not None:
@@ -479,16 +541,27 @@ class ConnectionRegistry:
             self._finish_future(item.future, False)
         if output.writer_task is not None:
             output.writer_task.cancel()
+        self._cancel_overflow_deadline(output)
         self._finish_future(output.ready, False)
-        self._finish_future(output.overflow_done, False)
 
     @staticmethod
-    def _clear_output(output: _OutputState) -> None:
+    def _cancel_overflow_deadline(output: _OutputState) -> None:
+        task = output.overflow_deadline_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        output.overflow_deadline_task = None
+
+    @staticmethod
+    def _clear_output(output: _OutputState, *, result: bool | None = None) -> None:
         while output.queue:
             item = output.queue.popleft()
             ConnectionRegistry._finish_frame_accounting(output, item)
-            if item.future is not None and not item.future.done():
+            if item.future is None or item.future.done():
+                continue
+            if result is None:
                 item.future.cancel()
+            else:
+                item.future.set_result(result)
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""
