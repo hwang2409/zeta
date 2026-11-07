@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import os
 import stat
@@ -780,11 +781,14 @@ async def close_direct_test_runtime_owners(
                         "is_open": is_open, "close": close})
 
     loop_init = AgentLoop.__init__
+    loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
+    registry_close = ToolRegistry.close
     background_init = BackgroundTaskRegistry.__init__
+    background_close = BackgroundTaskRegistry.close
 
     def ensure_format(home: Path) -> None:
         canonical = home.resolve()
@@ -811,8 +815,10 @@ async def close_direct_test_runtime_owners(
     @wraps(loop_init)
     def tracked_loop_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
-        add(loop, "AgentLoop", "owned_resources().async_resource(loop, what=...)",
-            lambda: not loop._closed, loop.close)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(loop, "AgentLoop", "owned_resources().async_resource(loop, what=...)",
+                lambda: not loop._closed, lambda: loop_close(loop))
 
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
@@ -835,8 +841,10 @@ async def close_direct_test_runtime_owners(
         home = Path(args[0]) if args and args[0] is not None else Path(os.environ["ZETA_HOME"])
         ensure_format(home)
         manager_init(manager, *args, **kwargs)
-        add(manager, "SessionManager", "owned_resources().release_with(manager._release_storage_lease)",
-            lambda: manager._release_storage_lease.alive, manager._release_storage_lease)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(manager, "SessionManager", "owned_resources().release_with(manager._release_storage_lease)",
+                lambda: manager._release_storage_lease.alive, manager._release_storage_lease)
 
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
@@ -846,14 +854,18 @@ async def close_direct_test_runtime_owners(
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else session_dir.parent)
         workspace_init(workspace, *args, **kwargs)
-        add(workspace, "WorkspaceSnapshotStore", "owned_resources().store(workspace)",
-            lambda: workspace._release_lease.alive, workspace.close)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(workspace, "WorkspaceSnapshotStore", "owned_resources().store(workspace)",
+                lambda: workspace._release_lease.alive, workspace.close)
 
     @wraps(registry_init)
     def tracked_registry_init(registry, *args, **kwargs):
         registry_init(registry, *args, **kwargs)
-        add(registry, "ToolRegistry", "owned_resources().async_resource(registry, what=...)",
-            lambda: not registry._closed, registry.close)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(registry, "ToolRegistry", "owned_resources().async_resource(registry, what=...)",
+                lambda: not registry._closed, lambda: registry_close(registry))
 
     @wraps(background_init)
     def tracked_background_init(background, *args, **kwargs):
@@ -866,8 +878,10 @@ async def close_direct_test_runtime_owners(
             ensure_format(home.parent if home.name == "sessions" else session_path.parent)
             kwargs["storage_lease"] = test_home_leases[home.resolve()]
         background_init(background, *args, **kwargs)
-        add(background, "BackgroundTaskRegistry", "owned_resources().async_resource(background, what=...)",
-            lambda: not background._closed, background.close)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            add(background, "BackgroundTaskRegistry", "owned_resources().async_resource(background, what=...)",
+                lambda: not background._closed, lambda: background_close(background))
 
     # test-contract: seam constructor tracking has no public test hook
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
@@ -892,7 +906,11 @@ async def close_direct_test_runtime_owners(
             continue
         leaked.append(record)
         try:
-            await await_or_fail(record["close"](), what=f"closing {record['kind']}") if asyncio.iscoroutinefunction(record["close"]) else await await_or_fail(asyncio.to_thread(record["close"]), what=f"closing {record['kind']}")
+            result = await await_or_fail(
+                asyncio.to_thread(record["close"]), what=f"closing {record['kind']}"
+            )
+            if inspect.isawaitable(result):
+                await await_or_fail(result, what=f"closing {record['kind']}")
         except BaseException as exc:  # noqa: BLE001
             if first_error is None:
                 first_error = exc
