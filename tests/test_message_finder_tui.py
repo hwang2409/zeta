@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.styles import Style
 from rich.text import Text
 
@@ -16,6 +17,7 @@ from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
+from zeta.tui.transcript.history_finder import HistoryFinder
 from zeta.tui.transcript.message_finder import Role
 
 
@@ -93,6 +95,30 @@ class _ThreadRecordingRenderable:
         if self._release is not None:
             assert self._release.wait(timeout=5)
         yield Text("older rendered candidate")
+
+
+@pytest.mark.asyncio
+async def test_history_finder_ranks_multiple_batches_without_ui_error() -> None:
+    history = tuple(f"history entry {index}" for index in range(32)) + ("target exact",)
+    app = _app_for_finder(TranscriptWidget())
+    app._history_finder = HistoryFinder(lambda: None, lambda: history)
+    buffer = Buffer()
+
+    app._history_finder_open(buffer)
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+    await asyncio.gather(prepare_task, return_exceptions=True)
+    assert prepare_task.exception() is None, f"ui_error: {prepare_task.exception()}"
+    app._finder_input("target")
+    rank_task = app._finder_rank_task
+    assert rank_task is not None
+    await asyncio.gather(rank_task, return_exceptions=True)
+    assert rank_task.exception() is None, f"ui_error: {rank_task.exception()}"
+
+    state = app._history_finder.finder_state()
+    assert state is not None
+    assert state.complete
+    assert state.rows[0].candidate.text == "target exact"
 
 
 @pytest.mark.asyncio
