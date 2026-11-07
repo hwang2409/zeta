@@ -259,6 +259,7 @@ def _register(registry: ToolRegistry, actions: dict[str, ToolAction]) -> None:
     registry.register_session_tool(
         "inbox",
         _inbox,
+        binding="shared",
         actions=actions,
         description="Project inbox actions: " + ", ".join(actions),
         parameters={
