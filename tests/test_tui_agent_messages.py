@@ -735,13 +735,19 @@ def test_recursive_agent_send_is_bounded_after_wrapping(
         "agent_send",
         {"child_instance_id": f"{HANDLE}:1", "message": message},
     )
+    latest_message = "LATEST MESSAGE MUST STAY VISIBLE"
+    latest = ToolCall(
+        "send-worker-latest",
+        "agent_send",
+        {"child_instance_id": f"{HANDLE}:1", "message": latest_message},
+    )
     snapshot = AgentTranscriptTreeSnapshot(
         root,
         (
             (
                 root,
                 AgentTranscriptSnapshot(
-                    ("send", "send-result"),
+                    ("send", "send-result", "latest", "latest-result"),
                     (
                         (
                             "send",
@@ -759,6 +765,29 @@ def test_recursive_agent_send_is_bounded_after_wrapping(
                                 "content": [{"type": "text", "text": "queued"}],
                                 "tool_result": {
                                     "tool_call_id": send.id,
+                                    "content": "queued a follow-up",
+                                    "structured_content": {
+                                        "child_instance_id": f"{HANDLE}:1"
+                                    },
+                                },
+                            },
+                        ),
+                        (
+                            "latest",
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "tool_use", "tool_call": latest.to_dict()}
+                                ],
+                            },
+                        ),
+                        (
+                            "latest-result",
+                            {
+                                "role": "tool_result",
+                                "content": [{"type": "text", "text": "queued"}],
+                                "tool_result": {
+                                    "tool_call_id": latest.id,
                                     "content": "queued a follow-up",
                                     "structured_content": {
                                         "child_instance_id": f"{HANDLE}:1"
@@ -790,7 +819,8 @@ def test_recursive_agent_send_is_bounded_after_wrapping(
 
     # Two panel borders and one card header sit outside the tail budget.
     assert len(rendered_lines) <= MAX_TAIL_LINES + 3
-    assert "… +" in output.getvalue()
+    assert latest_message in output.getvalue()
+    assert "… +" in rendered_lines[2]
 
 
 def test_unknown_identity_snapshot_is_cached_until_observed() -> None:

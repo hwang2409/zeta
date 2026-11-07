@@ -72,8 +72,8 @@ class _BoundedTail:
         )
         if omitted:
             projected = [
-                *projected[: MAX_TAIL_LINES - 1],
                 f"… +{omitted} lines",
+                *projected[-(MAX_TAIL_LINES - 1) :],
             ]
         for line in projected:
             yield Text(line, style=theme.BODY, overflow="ellipsis", no_wrap=True)
