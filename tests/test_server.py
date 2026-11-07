@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import inspect
 import json
 import multiprocessing
@@ -3059,6 +3060,18 @@ async def test_invalid_utf8_tail_preserves_request_id(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
+async def _unix_hello(server: ZetaServer, request_id: str) -> None:
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        reply = await _request(
+            reader, writer, request_id, "hello", {"protocol_version": "1.0"}
+        )
+        assert reply[-1]["result"]["server"] == "zeta"
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     tmp_path: Path,
@@ -3074,72 +3087,111 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     stale.bind(str(socket_path))
     stale.close()
     await server.start()
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
     try:
         assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        await _unix_hello(server, "stale-replaced")
+        with pytest.raises(RuntimeError, match="already listening"):
+            await contender.start()
+        await _unix_hello(server, "live-server-preserved")
     finally:
+        await contender.close()
         await server.close()
     assert not socket_path.exists()
 
 
 @pytest.mark.asyncio
-async def test_server_start_preserves_socket_replaced_after_stale_probe(
+async def test_old_server_close_preserves_replacement_protocol_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     socket_path = _socket_path(tmp_path)
-    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(str(socket_path))
-    stale.close()
-    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="codex")
-    owned_path = server.socket_path
-    real_unlink = Path.unlink
-    replacement_bound = False
+    old_server = ZetaServer(
+        home=tmp_path / "old", socket_path=socket_path, provider="codex"
+    )
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
 
-    def replace_after_unlink(path: Path, *args: object, **kwargs: object) -> None:
-        nonlocal replacement_bound
-        real_unlink(path, *args, **kwargs)
-        if path == owned_path and not replacement_bound:
-            replacement.bind(str(owned_path))
-            replacement.listen()
-            replacement_bound = True
-
-    monkeypatch.setattr(Path, "unlink", replace_after_unlink)
+    with monkeypatch.context() as patch:
+        patch.setattr(fcntl, "flock", lambda *_args: None)
+        await old_server.start()
+    socket_path.unlink()
+    await replacement.start()
     try:
-        with pytest.raises(OSError, match="Address already in use"):
-            await server.start()
-
-        assert socket_path.exists()
-        probe.connect(str(socket_path))
+        await _unix_hello(replacement, "replacement-before-close")
+        await old_server.close()
+        await _unix_hello(replacement, "replacement-after-close")
     finally:
-        probe.close()
-        replacement.close()
-        await server.close()
-        real_unlink(socket_path, missing_ok=True)
+        await old_server.close()
+        await replacement.close()
 
 
 @pytest.mark.asyncio
-async def test_server_close_preserves_replacement_unix_socket(tmp_path: Path) -> None:
+async def test_socket_lock_prevents_replacement_during_owner_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     socket_path = _socket_path(tmp_path)
-    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="codex")
-    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    await server.start()
+    owner = ZetaServer(
+        home=tmp_path / "owner", socket_path=socket_path, provider="codex"
+    )
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
+    socket_path = owner.socket_path
+    await owner.start()
+    await _unix_hello(owner, "owner")
+
+    real_unlink = os.unlink
+    attempted = False
+    contender_error: Exception | None = None
+    path_after_attempt: bool | None = None
+
+    def interleaved_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal attempted, contender_error, path_after_attempt
+        if Path(os.fsdecode(path)) != socket_path or attempted:
+            real_unlink(path, *args, **kwargs)
+            return
+        attempted = True
+        real_unlink(path)
+
+        def run_contender() -> None:
+            nonlocal contender_error
+            try:
+                asyncio.run(contender.start())
+            except RuntimeError as exc:
+                contender_error = exc
+
+        thread = threading.Thread(target=run_contender)
+        thread.start()
+        thread.join()
+        path_after_attempt = socket_path.exists()
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", interleaved_unlink)
+    await owner.close()
+
+    assert attempted
+    assert isinstance(contender_error, RuntimeError)
+    assert "already listening" in str(contender_error)
+    assert path_after_attempt is False
+
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
+    await replacement.start()
     try:
-        socket_path.unlink()
-        replacement.bind(str(socket_path))
-        replacement.listen()
-
-        await server.close()
-
-        assert socket_path.exists()
-        probe.connect(str(socket_path))
+        await _unix_hello(replacement, "replacement-after-owner-close")
     finally:
-        probe.close()
-        replacement.close()
-        await server.close()
-        socket_path.unlink(missing_ok=True)
+        await replacement.close()
+    assert not socket_path.exists()
 
 
 @pytest.mark.asyncio

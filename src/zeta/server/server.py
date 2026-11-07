@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import fcntl
 import os
 import socket
 import stat
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +63,107 @@ LOADED_SESSION_MUTATIONS = frozenset(
     }
 )
 _DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
+
+
+class _UnixSocketListener:
+    def __init__(
+        self,
+        path: Path,
+        server: asyncio.AbstractServer,
+        lock_fd: int,
+        identity: tuple[int, int],
+    ) -> None:
+        self.path = path
+        self.server = server
+        self._lock_fd = lock_fd
+        self._identity = identity
+
+    @classmethod
+    async def start(
+        cls,
+        path: Path,
+        accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
+    ) -> _UnixSocketListener:
+        cls._prepare_parent(path)
+        lock_fd = os.open(
+            f"{path}.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"a server is already listening on {path}") from exc
+            cls._prepare_path(path)
+            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            identity: tuple[int, int] | None = None
+            try:
+                unix_socket.bind(str(path))
+                socket_stat = path.lstat()
+                identity = (socket_stat.st_dev, socket_stat.st_ino)
+                server = await asyncio.start_unix_server(
+                    accept, sock=unix_socket, limit=MAX_FRAME_BYTES + 1
+                )
+                os.chmod(path, 0o600)
+                return cls(path, server, lock_fd, identity)
+            except BaseException:
+                unix_socket.close()
+                if identity is not None:
+                    cls._unlink_if_owned(path, identity)
+                raise
+        except BaseException:
+            os.close(lock_fd)
+            raise
+
+    async def close(self) -> None:
+        try:
+            self.server.close()
+            await self.server.wait_closed()
+            self._unlink_if_owned(self.path, self._identity)
+        finally:
+            os.close(self._lock_fd)
+
+    @staticmethod
+    def _prepare_parent(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            parent_stat = path.parent.stat()
+            if parent_stat.st_uid == os.getuid():
+                os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+
+    @classmethod
+    def _prepare_path(cls, path: Path) -> None:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(path_stat.st_mode):
+            raise RuntimeError(f"refusing to replace non-socket path: {path}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(str(path))
+        except OSError as exc:
+            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+                raise RuntimeError(f"could not inspect socket: {path}") from exc
+        else:
+            raise RuntimeError(f"a server is already listening on {path}")
+        finally:
+            probe.close()
+        cls._unlink_if_owned(path, (path_stat.st_dev, path_stat.st_ino))
+
+    @staticmethod
+    def _unlink_if_owned(path: Path, identity: tuple[int, int]) -> None:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if (path_stat.st_dev, path_stat.st_ino) == identity:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 class ZetaServer:
@@ -130,7 +233,7 @@ class ZetaServer:
         self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
-        self._socket_identity: tuple[int, int] | None = None
+        self._unix_listener: _UnixSocketListener | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -150,22 +253,10 @@ class ZetaServer:
         self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
-            self._prepare_socket_path()
-            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                unix_socket.bind(str(self.socket_path))
-                socket_stat = self.socket_path.lstat()
-                self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
-                self._server = await asyncio.start_unix_server(
-                    self._accept, sock=unix_socket, limit=MAX_FRAME_BYTES + 1
-                )
-            except BaseException:
-                unix_socket.close()
-                if self._socket_identity is not None:
-                    self._unlink_socket_if_owned(self._socket_identity)
-                    self._socket_identity = None
-                raise
-            os.chmod(self.socket_path, 0o600)
+            self._unix_listener = await _UnixSocketListener.start(
+                self.socket_path, self._accept
+            )
+            self._server = self._unix_listener.server
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1
@@ -207,53 +298,14 @@ class ZetaServer:
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
-                    if self._server is not None:
+                    if self._unix_listener is not None:
+                        await self._unix_listener.close()
+                    elif self._server is not None:
                         self._server.close()
                         await self._server.wait_closed()
                 finally:
                     self._server = None
-                    if self.port is None and self._socket_identity is not None:
-                        self._unlink_socket_if_owned(self._socket_identity)
-                        self._socket_identity = None
-
-    def _prepare_socket_path(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            parent_stat = self.socket_path.parent.stat()
-            if parent_stat.st_uid == os.getuid():
-                os.chmod(self.socket_path.parent, 0o700)
-        except OSError:
-            pass
-        try:
-            path_stat = self.socket_path.lstat()
-        except FileNotFoundError:
-            return
-        if not stat.S_ISSOCK(path_stat.st_mode):
-            raise RuntimeError(
-                f"refusing to replace non-socket path: {self.socket_path}"
-            )
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.settimeout(0.2)
-            probe.connect(str(self.socket_path))
-        except OSError as exc:
-            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
-                raise RuntimeError(
-                    f"could not inspect socket: {self.socket_path}"
-                ) from exc
-        else:
-            raise RuntimeError(f"a server is already listening on {self.socket_path}")
-        finally:
-            probe.close()
-        self._unlink_socket_if_owned((path_stat.st_dev, path_stat.st_ino))
-
-    def _unlink_socket_if_owned(self, identity: tuple[int, int]) -> None:
-        try:
-            path_stat = self.socket_path.lstat()
-        except FileNotFoundError:
-            return
-        if (path_stat.st_dev, path_stat.st_ino) == identity:
-            self.socket_path.unlink()
+                    self._unix_listener = None
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
