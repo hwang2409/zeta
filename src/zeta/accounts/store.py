@@ -286,14 +286,13 @@ class AccountStore:
         catalog = self.list_catalog()
         with self._home() as home_fd:
             for item in catalog:
-                tokens = self._available_tokens(home_fd, item.account)
+                tokens = _read_account_tokens(home_fd, item.account)
                 details = (
                     tuple(filter(None, (tokens.email, tokens.workspace)))
                     if tokens
                     else ()
                 )
                 from .usage import read_usage
-
                 result.append(
                     AccountDisplay(
                         item.account,
@@ -306,17 +305,8 @@ class AccountStore:
         return result
 
     def require_available(self, account: AccountId) -> None:
-        """Refuse a registered account that has no readable credentials."""
-
-        with self.credential_guard(
-            account, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS
-        ) as home_fd:
-            if self._available_tokens(home_fd, account) is not None:
-                return
-        command = f"zeta accounts login {account.provider} {account.name} --replace"
-        raise AccountError(
-            f"account {account} is unavailable: credentials missing; run '{command}'"
-        )
+        if not any(item.account == account and item.available for item in self.list_display()):
+            raise AccountError(f"account {account} is unavailable: credentials missing; run 'zeta accounts login {account.provider} {account.name} --replace'")
 
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
@@ -510,10 +500,6 @@ class AccountStore:
             self._lifecycle_guard(home_fd, account, wait=wait),
         ):
             yield home_fd
-
-    @staticmethod
-    def _available_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None:
-        return _read_account_tokens(home_fd, account)
 
     def _recover_account(self, home_fd: int, account: AccountId) -> OAuthTokens | None:
         value = self._read_registry(home_fd)

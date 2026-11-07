@@ -188,7 +188,10 @@ class SessionAccountContext:
         return selected
 
     def require_active_available(self, provider: str) -> None:
-        selected = self.resolve(provider)
+        canonical = account_provider(provider)
+        if canonical is None:
+            return
+        selected = self.resolve(canonical)
         if self.store.contains(selected):
             self.store.require_available(selected)
 
