@@ -318,7 +318,13 @@ class DecisionsMixin:
             try:
                 replies = AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self))
                 await asyncio.to_thread(replies.stage, record.id, decision)
-                if len(self._decisions_panel.items) <= 1:
+                staged = await asyncio.to_thread(replies.recover)
+                item_ids = {
+                    item.record.id
+                    for item in self._decisions_panel.items
+                    if item.session_id == record.session_id
+                }
+                if item_ids <= {item_id for item_id, _reply in staged.staged}:
                     await asyncio.to_thread(replies.flush, self.loop.store.session_id)
                 self._schedule_background_wake()
             except (OSError, ValueError) as exc:
