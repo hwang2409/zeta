@@ -9,7 +9,6 @@ import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -599,22 +598,18 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
         event_loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=4)
         rename_futures: list[object] = []
-        writers_ready = threading.Barrier(5)
+        writers_started = threading.Event()
+        writer_count_lock = threading.Lock()
+        writer_count = 0
         writer_manager = SessionManager(context.home)
-        metadata_lock = writer_manager._metadata_lock
-
-        @contextmanager
-        def observed_metadata_lock(*args: object, **kwargs: object):
-            writers_ready.wait(timeout=10)
-            with metadata_lock(*args, **kwargs) as directory_fd:
-                yield directory_fd
-
-        writer_manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
 
         def rename(index: int) -> object:
-            return writer_manager.rename(
-                context.metadata.session_id, f"rename {index}"
-            )
+            nonlocal writer_count
+            with writer_count_lock:
+                writer_count += 1
+                if writer_count == 4:
+                    writers_started.set()
+            return writer_manager.rename(context.metadata.session_id, f"rename {index}")
 
         def queue_renames() -> None:
             event_loop.set_default_executor(executor)
@@ -632,7 +627,8 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
             ) as directory_fd:
                 assert directory_fd is None
             event_loop.call_soon_threadsafe(queue_renames)
-            writers_ready.wait(timeout=10)
+            if not writers_started.wait(timeout=10):
+                raise AssertionError("metadata writers did not queue behind the held lock")
             return metadata
 
         SessionAccountContext._commit_locked = commit_then_queue_renames  # type: ignore[method-assign]

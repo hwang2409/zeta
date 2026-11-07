@@ -31,6 +31,7 @@ from ...protocol.types import (
     require_new_message_origin,
 )
 from ...storage_format import WriterLease, open_writer
+from .. import session_execution
 from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -57,8 +58,8 @@ from ._async_writes import AsyncDurableWritesMixin
 from ._child_runs import ChildRunStoreMixin, validate_child_run_started_data
 from ._client_delivery import ClientDeliveryMixin, validate_client_delivery_data
 from ._incremental_validation import (
-    APPROVAL_RESOLUTION_REASONS,
     IncrementalValidationMixin,
+    validate_approval_reason,
 )
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
@@ -83,20 +84,6 @@ from ._validation import (
     validate_notification_data,
     validate_terminal_transition_data,
 )
-from .runtime_lease import (
-    SessionRuntimeLease,
-    StoreRuntimeLeaseMixin,
-    close_store_leases,
-)
-
-
-def _validate_approval_reason(decision: str, reason: str | None) -> None:
-    if reason is not None and (
-        type(reason) is not str
-        or decision != "abort"
-        or reason not in APPROVAL_RESOLUTION_REASONS
-    ):
-        raise ValueError("invalid approval resolution reason")
 
 
 class ConversationStore(
@@ -108,7 +95,7 @@ class ConversationStore(
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
-    StoreRuntimeLeaseMixin,
+    session_execution.StoreRuntimeLeaseMixin,
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
@@ -130,6 +117,9 @@ class ConversationStore(
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
         _storage_lease: WriterLease | None = None,
+        _execution_lease: session_execution.SessionExecutionLease | None = None,
+        _owner_surface: session_execution.OwnerSurface = "tui",
+        _recovery_owner: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -151,14 +141,16 @@ class ConversationStore(
             )
         with ExitStack() as storage_ownership:
             self._storage_lease = storage_ownership.enter_context(
-                _storage_lease.retain() if _storage_lease is not None else open_writer(home)
+                _storage_lease.retain()
+                if _storage_lease is not None
+                else open_writer(home)
             )
             self.on_persisted_activity: Callable[[int], None] | None = None
             self._initialize_entries_installed()
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
-            self._runtime_lease: SessionRuntimeLease | None = None
+            self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
             self._owner_thread_id: int | None = None
@@ -214,17 +206,23 @@ class ConversationStore(
                     self._load()
                     self._load_session_state()
                 else:
+                    self._runtime_lease = self._open_execution_lease(
+                        self.directory_fd,
+                        self.session_id,
+                        _execution_lease,
+                        _owner_surface,
+                        _recovery_owner,
+                    )
+                    lease.callback(self._runtime_lease.close)
                     if _validated_log_state is not None:
                         self._install_log_state(_validated_log_state)
                         self._strict_snapshot_sync = True
                     with self._append_lock(deadline=_lock_deadline):
                         self._load_session_state()
                     self._strict_snapshot_sync = False
-                if not _read_only:
-                    self._runtime_lease = SessionRuntimeLease(self.directory_fd)
                 self._release_lease = weakref.finalize(
                     self,
-                    close_store_leases,
+                    session_execution.close_store_leases,
                     self._runtime_lease,
                     lease.pop_all(),
                     self._storage_lease,
@@ -232,7 +230,6 @@ class ConversationStore(
             storage_ownership.pop_all()
 
     def bind_owner_thread(self) -> None:
-        """Bind resident state publication and mutation to the event-loop thread."""
         self._owner_thread_id = threading.get_ident()
 
     def _assert_owner_thread(self) -> None:
@@ -549,7 +546,7 @@ class ConversationStore(
                     raise ValueError("approval resolution id must be a nonempty string")
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
-                _validate_approval_reason(decision, entry.data.get("reason"))
+                validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "approval_history":
                 validate_approval_history_data(entry.data)
             elif entry.type == "turn_end":
@@ -593,11 +590,17 @@ class ConversationStore(
 
     @contextmanager
     def _append_lock(
-        self, *, deadline: float | None = None, wait: bool = True
+        self,
+        *,
+        deadline: float | None = None,
+        wait: bool = True,
+        observer: bool = False,
     ) -> Iterator[bool]:
         """Lock and synchronize the log before exposing resident state."""
         if self._closed:
             raise ValueError("session store is closed")
+        if not observer:
+            self.assert_execution_owner()
         with os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:
@@ -645,7 +648,9 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         with self._append_lock():
-            return self._snapshot_entry(self._append_row_unlocked(entry_type, data, parent_id))
+            return self._snapshot_entry(
+                self._append_row_unlocked(entry_type, data, parent_id)
+            )
 
     def append_many(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
@@ -907,6 +912,7 @@ class ConversationStore(
             data["telemetry"] = dict(telemetry)
         if fact_floor is not None:
             from ...context_eviction._fact_floor import validate_fact_floor
+
             if not validate_fact_floor(fact_floor):
                 raise ValueError("invalid eviction fact floor")
             data["fact_floor"] = dict(fact_floor)
@@ -1050,7 +1056,7 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
-        _validate_approval_reason(decision, reason)
+        validate_approval_reason(decision, reason)
         with self._append_lock():
             entry = self._resolve_approval_unlocked(
                 request_id,
@@ -1076,9 +1082,12 @@ class ConversationStore(
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
-        _validate_approval_reason(decision, reason)
+        validate_approval_reason(decision, reason)
         with self._append_lock():
-            return self._resolve_approval_unlocked(request_id, decision, reason=reason) is not None
+            return (
+                self._resolve_approval_unlocked(request_id, decision, reason=reason)
+                is not None
+            )
 
     def _resolve_approval_unlocked(
         self,
