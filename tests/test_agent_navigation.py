@@ -497,7 +497,7 @@ async def test_child_todo_refresh_coalesces_pending_requests(
     finally:
         release.set()
         if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
     assert task is not None
     await task
