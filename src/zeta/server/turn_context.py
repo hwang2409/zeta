@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 from ..protocol.types import StreamEvent, StreamEventType
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
     from ..runtime.loop.agent import AgentLoop
@@ -49,7 +49,7 @@ class PendingTurnContexts:
         """Validate negotiation and set context for the active session."""
         if "turn_context" not in features:
             raise ProtocolError(
-                -32601, "set_turn_context requires negotiated turn_context feature"
+                ErrorDescriptor.METHOD_NOT_FOUND, "set_turn_context requires negotiated turn_context feature"
             )
         session_id = runtime.session_id if runtime.opened is not None else None
         return self.set(session_id, params)
@@ -86,15 +86,15 @@ class PendingTurnContexts:
 
     def set(self, session_id: str | None, params: dict[str, Any]) -> dict[str, object]:
         if session_id is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         if "text" not in params or (
             params["text"] is not None and not isinstance(params["text"], str)
         ):
-            raise ProtocolError(-32602, "text must be a string or null")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must be a string or null")
         text = params["text"]
         if text is not None and len(text.encode("utf-8")) > MAX_BYTES:
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_PARAMS,
                 f"text must not exceed {MAX_BYTES} UTF-8 bytes",
             )
         if text is None:

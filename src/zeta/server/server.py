@@ -32,6 +32,7 @@ from .project_requests import (
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
+    ErrorDescriptor,
     FrameCodec,
     ProtocolError,
     finish_frame_write,
@@ -64,7 +65,7 @@ _DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
 
 
 class ZetaServer:
-    """Serve one local client over a Unix socket or localhost TCP."""
+    """Serve one controller and negotiated observers over local transports."""
 
     def __init__(
         self,
@@ -302,7 +303,7 @@ class _Client:
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
-                            exc.request_id, exc.code, exc.message, exc.data
+                            exc.request_id, exc.descriptor, exc.message, exc.data
                         )
                     )
                     if not self.handshaken:
@@ -319,36 +320,36 @@ class _Client:
                             exc.request_id
                             if exc.request_id is not None
                             else request_id,
-                            exc.code,
+                            exc.descriptor,
                             exc.message,
                             exc.data,
                         )
                     )
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
-                    code, message, data = project_request_error(exc)
+                    descriptor, message, data = project_request_error(exc)
                     await self._write(
-                        self.codec.error_response(request_id, code, message, data)
+                        self.codec.error_response(request_id, descriptor, message, data)
                     )
                 except ProjectRegistryBusyError as exc:
                     await self._write(
                         self.codec.error_response(
                             request_id,
-                            -32000,
+                            ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
-                            {"code": exc.code, "retryable": exc.retryable},
+                            {"retryable": exc.retryable},
                         )
                     )
                 except ConversationIntegrityError as exc:
                     await self._write(
-                        self.codec.error_response(request_id, -32000, str(exc))
+                        self.codec.error_response(request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc))
                     )
                 except (SessionError, ValueError) as exc:
                     await self._write(
-                        self.codec.error_response(request_id, -32602, str(exc))
+                        self.codec.error_response(request_id, ErrorDescriptor.INVALID_PARAMS, str(exc))
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
                     await self._write(
-                        self.codec.error_response(request_id, -32000, str(exc))
+                        self.codec.error_response(request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc))
                     )
                 else:
                     written = await self._write(self.codec.response(request_id, result))
@@ -434,7 +435,7 @@ class _Client:
                     await self.server.control.controller_ready()
             return True, result
         if not self.handshaken:
-            raise ProtocolError(-32002, "hello must be the first request")
+            raise ProtocolError(ErrorDescriptor.PROTOCOL_MISMATCH, "hello must be the first request")
         assert self.server.connections is not None
         return await self.server.connections.route_request(
             self, request_id, method, params
@@ -450,15 +451,15 @@ class _Client:
             self.server.control._reject_if_unhealthy()
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
-                raise ProtocolError(-32601, "login is unavailable on this server")
+                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "login is unavailable on this server")
             return await self.logins.request(method, params)
         if method in ergonomics.EXTENSION_REQUESTS:
             if self.protocol_version == "1.0":
-                raise ProtocolError(-32601, "request requires protocol 1.1")
+                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "request requires protocol 1.1")
             return await self._ergonomics(method, params)
         if method == "ping":
             if "ping" not in self.features:
-                raise ProtocolError(-32601, "ping requires the negotiated ping feature")
+                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "ping requires the negotiated ping feature")
             return {"pong": True}
         if method == "set_turn_context":
             contexts = self.server.turn_contexts
@@ -466,7 +467,7 @@ class _Client:
         if method in PROJECT_REQUESTS:
             if "projects" not in self.features:
                 raise ProtocolError(
-                    -32601, f"{method} requires the negotiated projects feature"
+                    ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires the negotiated projects feature"
                 )
             assert self.projects is not None
             return await asyncio.to_thread(
@@ -537,22 +538,22 @@ class _Client:
                         await self.server.runtime.resume_session(session_id, force=True)
                     except SessionNotFoundError as exc:
                         raise ProtocolError(
-                            -32602,
+                            ErrorDescriptor.SESSION_NOT_FOUND,
                             str(exc),
-                            {"code": "session_not_found", "session_id": session_id},
+                            {"session_id": session_id},
                         ) from exc
                     except Exception as exc:
                         raise ProtocolError(
-                            -32000, "approval persistence failed"
+                            ErrorDescriptor.INTERNAL_ERROR, "approval persistence failed"
                         ) from exc
                 else:
                     try:
                         await self.server.runtime.resume_session(session_id)
                     except SessionNotFoundError as exc:
                         raise ProtocolError(
-                            -32602,
+                            ErrorDescriptor.SESSION_NOT_FOUND,
                             str(exc),
-                            {"code": "session_not_found", "session_id": session_id},
+                            {"session_id": session_id},
                         ) from exc
                 self.server.control._active_host_commands = candidate
                 self.server.control._host_binding_required = (
@@ -580,9 +581,9 @@ class _Client:
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(-32602, "scope must be 'once' or 'always_tool'")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope must be 'once' or 'always_tool'")
             if scope == "always_tool" and method != "approve":
-                raise ProtocolError(-32602, "scope 'always_tool' requires approve")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' requires approve")
             return await self.server.control.resolve_approval(
                 method, _required_string(params, "request_id"), scope
             )
@@ -600,11 +601,11 @@ class _Client:
             return await self.server.connections.read_status(
                 self, await self._status(), session_id
             )
-        raise ProtocolError(-32601, f"method not found: {method}")
+        raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}")
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
-            raise ProtocolError(-32600, "hello may only be sent once")
+            raise ProtocolError(ErrorDescriptor.INVALID_REQUEST, "hello may only be sent once")
         version = params.get("protocol_version")
         client_version = params.get("client_version")
         self.protocol_version = negotiate_protocol_version(version, client_version)
@@ -613,7 +614,7 @@ class _Client:
             not isinstance(requested, list)
             or not all(isinstance(item, str) for item in requested)
         ):
-            raise ProtocolError(-32602, "features must be an array of strings")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "features must be an array of strings")
         extended = self.protocol_version != "1.0"
         accepted = (
             [item for item in FEATURES if item in (requested or ())] if extended else []
@@ -685,7 +686,7 @@ class _Client:
     def _require_feature(self, feature: str, param: str) -> None:
         if feature not in self.features:
             raise ProtocolError(
-                -32602, f"{param} requires the negotiated {feature} feature"
+                ErrorDescriptor.INVALID_PARAMS, f"{param} requires the negotiated {feature} feature"
             )
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
@@ -704,7 +705,7 @@ class _Client:
         if method == "content_read":
             if "content_read" not in self.features:
                 raise ProtocolError(
-                    -32601, "content_read requires the negotiated content_read feature"
+                    ErrorDescriptor.METHOD_NOT_FOUND, "content_read requires the negotiated content_read feature"
                 )
             assert self.server.connections is not None
             return await self.server.connections.read_session(self, method, params)
@@ -740,7 +741,7 @@ class _Client:
         if method == "set_compaction":
             _required_string(params, "mode")
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_PARAMS,
                 "compaction mode selection was removed; eviction is always used",
             )
         if method == "fork_message":
@@ -879,7 +880,7 @@ def _home() -> Path:
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string")
     return value
 
 
@@ -890,24 +891,24 @@ def _integer(
         return default
     value = params[name]
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-        raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be an integer of at least {minimum}")
     return value
 
 
 def _directory(params: dict[str, Any], name: str) -> Path:
     value = params.get(name)
     if not isinstance(value, str) or not value or not os.path.isabs(value):
-        raise ProtocolError(-32602, f"{name} must be an absolute directory path")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be an absolute directory path")
     path = Path(value).resolve()
     if not path.is_dir():
-        raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} is not an existing directory: {value}")
     return path
 
 
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
     value = params.get(name)
     if value is not None and (not isinstance(value, str) or not value):
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string")
     return value
 
 

@@ -24,7 +24,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -51,7 +51,7 @@ class DeliveryRequests:
         control = self._control
         runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
@@ -59,7 +59,7 @@ class DeliveryRequests:
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
         value = control._model_inputs.resolve(
             runtime.session_id,
             params,
@@ -123,14 +123,14 @@ class DeliveryRequests:
         control = self._control
         runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(
             params, features, feature="send_images_delivery_id"
         )
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
         ergonomics.require_mutable(runtime, control.has_pending_approvals())
         worker = asyncio.create_task(
             asyncio.to_thread(ergonomics.prepare_image_delivery, runtime, params)
@@ -218,14 +218,14 @@ class DeliveryRequests:
         runtime = control.server.runtime
         loop = runtime.loop
         if loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         requested_delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(requested_delivery_id)
         if duplicate is not None:
             return duplicate
         control._reject_if_unhealthy()
         if not control.turn_busy():
-            raise ProtocolError(-32005, "no turn is running")
+            raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running")
         text = _required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
@@ -334,7 +334,7 @@ class DeliveryRequests:
         delivery_id = _required_delivery_id(params)
         runtime = control.server.runtime
         if runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
@@ -375,7 +375,7 @@ class DeliveryRequests:
                 and delivery.payload_digest != payload_digest
             ):
                 raise ProtocolError(
-                    -32010,
+                    ErrorDescriptor.DELIVERY_ID_EVICTED,
                     "delivery id already used for a different payload",
                     {"outcome": delivery.status},
                 )
@@ -385,7 +385,7 @@ class DeliveryRequests:
         outcome = store.client_delivery_outcome(delivery_id)
         if outcome is not None:
             raise ProtocolError(
-                -32010,
+                ErrorDescriptor.DELIVERY_ID_EVICTED,
                 "delivery id already used",
                 {"outcome": outcome},
             )
@@ -456,13 +456,13 @@ def _require_feature(
     features: frozenset[str], feature: str, param: str
 ) -> None:
     if feature not in features:
-        raise ProtocolError(-32602, f"{param} requires negotiated feature '{feature}'")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{param} requires negotiated feature '{feature}'")
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string")
     return value
 
 
@@ -470,7 +470,7 @@ def _required_delivery_id(params: dict[str, Any]) -> str:
     value = params.get("delivery_id")
     if not valid_client_delivery_id(value):
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "delivery_id must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'",
         )
     return value

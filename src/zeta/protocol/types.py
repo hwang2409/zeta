@@ -55,27 +55,6 @@ class MessageOrigin(StrEnum):
     UNKNOWN = "unknown"
 
 
-# Normative meanings for every JSON-RPC error that zeta serve can emit.
-PROTOCOL_ERROR_CODES = {
-    -32700: "invalid JSON or invalid UTF-8 frame",
-    -32600: "invalid JSON-RPC request or duplicate handshake",
-    -32601: "method or negotiated feature is not supported",
-    -32602: "params have the wrong shape, value, or negotiated capability",
-    -32000: "unexpected server or storage failure",
-    -32001: "requested controller or observer connection role is at capacity",
-    -32002: "handshake is missing or the protocol version does not match",
-    -32003: "no active session, or the active session requires a host binding",
-    -32004: "operation is blocked by active turn, tool, or background-agent work",
-    -32005: "requested turn or account state is unavailable",
-    -32006: "approval request is missing, resolved, or reserved",
-    -32007: "outbound frame exceeds the size limit",
-    -32008: "request is not allowed for this connection or account state",
-    -32009: "session history snapshot is stale",
-    -32010: "delivery ID details were evicted",
-    -32011: "connection output queue overflowed",
-    -32012: "content handle was not found",
-}
-
 FAILED_TURN_MARKER = "turn_failed"
 FAILED_TURN_ERROR = "turn_error"
 ASSISTANT_RESPONSE_STATE = "response_state"

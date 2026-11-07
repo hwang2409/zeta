@@ -14,7 +14,7 @@ from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import event_contract
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 
 Publish = Callable[..., Awaitable[bool]]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
@@ -71,7 +71,7 @@ class Register:
 class Start:
     stream_event: StreamEvent
     session_id: str | None
-    wire_event: str
+    wire_event: EventDescriptor
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,31 +637,31 @@ class ApprovalLifecycle:
     ) -> tuple[dict[str, object], ApprovalKey]:
         policy = self._policy()
         if policy is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         self.reject_if_unhealthy()
         core_key = self.core_key(request_id)
         record = await self._record_for_decision(core_key, policy)
         if record is None or record.phase != "pending" or record.request is None:
             raise ProtocolError(
-                -32006, f"approval request not found or already resolved: {request_id}"
+                ErrorDescriptor.APPROVAL_UNAVAILABLE, f"approval request not found or already resolved: {request_id}"
             )
         pending = record.request
         if scope == "always_tool" and pending.child_instance_id is not None:
             raise ProtocolError(
-                -32602, "scope 'always_tool' is unavailable for delegated approvals"
+                ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' is unavailable for delegated approvals"
             )
         if scope == "always_tool":
             try:
                 pending.always_allow_rule()
             except ValueError as exc:
                 raise ProtocolError(
-                    -32602, f"cannot always allow approval request: {exc}"
+                    ErrorDescriptor.INVALID_PARAMS, f"cannot always allow approval request: {exc}"
                 ) from exc
         decision = "allow" if method == "approve" else "deny"
         record = self._reserve(record, decision)
         if record is None:
             raise ProtocolError(
-                -32006, f"approval request not found or already resolved: {request_id}"
+                ErrorDescriptor.APPROVAL_UNAVAILABLE, f"approval request not found or already resolved: {request_id}"
             )
         settlement = asyncio.create_task(
             self._settle_record(
@@ -674,7 +674,7 @@ class ApprovalLifecycle:
         try:
             resolution = await settlement
         except OSError as exc:
-            raise ProtocolError(-32000, f"approval persistence failed: {exc}") from exc
+            raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, f"approval persistence failed: {exc}") from exc
         confirmed = resolution["decision"]
         result: dict[str, object] = {
             "accepted": True,
@@ -691,9 +691,8 @@ class ApprovalLifecycle:
         health = self._state.health
         if health is not None:
             raise ProtocolError(
-                -32000,
+                ErrorDescriptor.APPROVAL_PERSISTENCE_FAILED,
                 "approval persistence failed",
-                {"code": health.code},
             )
 
     async def _record_for_decision(
@@ -905,7 +904,7 @@ class ApprovalLifecycle:
                 self._remove(record.target.key)
 
     async def _start_approval(
-        self, event: StreamEvent, session_id: str | None, wire_event: str
+        self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
         raw_request_id = event.tool_call.id if event.tool_call else ""
         child_id = event.data.get("agent_instance_id")
@@ -955,7 +954,7 @@ class ApprovalLifecycle:
         token: int,
         generation: int,
         session_id: str | None,
-        wire_event: str,
+        wire_event: EventDescriptor,
     ) -> None:
         target = record.target
         if durable_state is None:

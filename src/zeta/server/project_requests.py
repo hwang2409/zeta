@@ -18,7 +18,7 @@ from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .entry_project_views import EntryProjectViews
-from .protocol import FrameCodec
+from .protocol import ErrorDescriptor, FrameCodec
 
 if TYPE_CHECKING:
     from .runtime import ServerRuntime
@@ -583,21 +583,21 @@ def _message_strings(
 
 def project_request_error(
     error: Exception,
-) -> tuple[int, str, dict[str, str] | None]:
+) -> tuple[ErrorDescriptor, str, dict[str, object] | None]:
     """Map project request and storage errors to safe protocol fields."""
     if isinstance(error, ProjectNotFound):
         return (
-            -32602,
+            ErrorDescriptor.PROJECT_NOT_FOUND,
             str(error),
-            {"code": "project_not_found", "project_id": error.project_id},
+            {"project_id": error.project_id},
         )
     if isinstance(error, RequestValidationError):
-        return -32602, str(error), None
+        return ErrorDescriptor.INVALID_PARAMS, str(error), None
     if isinstance(error, ProjectRegistryBusyError):
-        return -32000, str(error), {"code": error.code, "retryable": error.retryable}
+        return ErrorDescriptor.PROJECT_REGISTRY_BUSY, str(error), {"retryable": error.retryable}
     if isinstance(error, UnsupportedMemoryFormatError):
-        return -32000, str(error), None
-    return -32000, "project storage is invalid or unavailable", None
+        return ErrorDescriptor.INTERNAL_ERROR, str(error), None
+    return ErrorDescriptor.INTERNAL_ERROR, "project storage is invalid or unavailable", None
 
 
 def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:

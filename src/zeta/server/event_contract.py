@@ -6,6 +6,7 @@ from enum import Enum, auto
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
+from .protocol_registry import EventDescriptor
 
 
 def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
@@ -68,18 +69,18 @@ def project_tool_value(value: object) -> tuple[object, bool]:
         return result, truncated
     return value, False
 
-LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
+LEGACY_NOTIFICATION_WIRE_EVENT = EventDescriptor.SUB_AGENT_RECEIPT
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
-    "child_idle": "child_idle",
-    "task_exited": "task_exit_notification",
-    "project_inbox": "project_inbox_notification",
-    "child_question": "child_question",
-    "child_question_withdrawn": "child_question_withdrawn",
+    "child_idle": EventDescriptor.CHILD_IDLE,
+    "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
+    "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
+    "child_question": EventDescriptor.CHILD_QUESTION,
+    "child_question_withdrawn": EventDescriptor.CHILD_QUESTION_WITHDRAWN,
 }
 
 
-def notification_wire_event(kind: object, protocol_version: str) -> str:
+def notification_wire_event(kind: object, protocol_version: str) -> EventDescriptor:
     """Preserve the legacy notification event until protocol 1.2."""
 
     if protocol_version != "1.2":
@@ -96,11 +97,11 @@ class AuxiliaryEvent(Enum):
 
 
 AUXILIARY_WIRE_EVENTS = {
-    AuxiliaryEvent.DELIVERY_STATUS: "delivery_status",
-    AuxiliaryEvent.MEMORY_UPDATED: "memory_updated",
-    AuxiliaryEvent.TURN_ABORTED: "turn_aborted",
-    AuxiliaryEvent.USAGE: "usage",
-    AuxiliaryEvent.USER_MESSAGE: "user_message",
+    AuxiliaryEvent.DELIVERY_STATUS: EventDescriptor.DELIVERY_STATUS,
+    AuxiliaryEvent.MEMORY_UPDATED: EventDescriptor.MEMORY_UPDATED,
+    AuxiliaryEvent.TURN_ABORTED: EventDescriptor.TURN_ABORTED,
+    AuxiliaryEvent.USAGE: EventDescriptor.USAGE,
+    AuxiliaryEvent.USER_MESSAGE: EventDescriptor.USER_MESSAGE,
 }
 
 # Custom projections in server.py use this exhaustive contract.
@@ -194,32 +195,27 @@ def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]
 
 
 STREAM_EVENT_WIRE_EVENTS = {
-    StreamEventType.AGENT_START: "agent_start",
-    StreamEventType.TURN_START: "turn_start",
-    StreamEventType.COMPACTION_START: "compaction_start",
-    StreamEventType.COMPACTION_END: "compaction_end",
-    StreamEventType.MESSAGE_START: "message_start",
-    StreamEventType.MESSAGE_UPDATE: "assistant_delta",
-    StreamEventType.MESSAGE_END: "assistant_message",
-    StreamEventType.RETRY: "retry",
-    StreamEventType.ASSISTANT_RESET: "assistant_reset",
-    StreamEventType.TOOL_APPROVAL_START: "approval_request",
-    StreamEventType.TOOL_APPROVAL_END: "approval_end",
-    StreamEventType.TOOL_EXECUTION_START: "tool_start",
-    StreamEventType.TOOL_EXECUTION_UPDATE: "tool_output",
-    StreamEventType.TOOL_EXECUTION_END: "tool_end",
-    StreamEventType.AGENT_NOTIFICATION: "notification_by_kind",
-    StreamEventType.CHILD_MESSAGE_DELIVERED: "child_message_delivered",
-    StreamEventType.ACCOUNT_LIMIT: "account_limit",
-    StreamEventType.ACCOUNT_STATE_UNKNOWN: "account_state_unknown",
-    StreamEventType.TURN_END: "turn_end",
-    StreamEventType.AGENT_END: "agent_end",
-    StreamEventType.ERROR: "error",
+    StreamEventType.AGENT_START: EventDescriptor.AGENT_START,
+    StreamEventType.TURN_START: EventDescriptor.TURN_START,
+    StreamEventType.COMPACTION_START: EventDescriptor.COMPACTION_START,
+    StreamEventType.COMPACTION_END: EventDescriptor.COMPACTION_END,
+    StreamEventType.MESSAGE_START: EventDescriptor.MESSAGE_START,
+    StreamEventType.MESSAGE_UPDATE: EventDescriptor.ASSISTANT_DELTA,
+    StreamEventType.MESSAGE_END: EventDescriptor.ASSISTANT_MESSAGE,
+    StreamEventType.RETRY: EventDescriptor.RETRY,
+    StreamEventType.ASSISTANT_RESET: EventDescriptor.ASSISTANT_RESET,
+    StreamEventType.TOOL_APPROVAL_START: EventDescriptor.APPROVAL_REQUEST,
+    StreamEventType.TOOL_APPROVAL_END: EventDescriptor.APPROVAL_END,
+    StreamEventType.TOOL_EXECUTION_START: EventDescriptor.TOOL_START,
+    StreamEventType.TOOL_EXECUTION_UPDATE: EventDescriptor.TOOL_OUTPUT,
+    StreamEventType.TOOL_EXECUTION_END: EventDescriptor.TOOL_END,
+    StreamEventType.AGENT_NOTIFICATION: EventDescriptor.SUB_AGENT_RECEIPT,
+    StreamEventType.CHILD_MESSAGE_DELIVERED: EventDescriptor.CHILD_MESSAGE_DELIVERED,
+    StreamEventType.ACCOUNT_LIMIT: EventDescriptor.ACCOUNT_LIMIT,
+    StreamEventType.ACCOUNT_STATE_UNKNOWN: EventDescriptor.ACCOUNT_STATE_UNKNOWN,
+    StreamEventType.TURN_END: EventDescriptor.TURN_END,
+    StreamEventType.AGENT_END: EventDescriptor.AGENT_END,
+    StreamEventType.ERROR: EventDescriptor.ERROR,
 }
 
-# Derived from every runtime-to-wire map so adding an event also requires docs.
-WIRE_EVENT_NAMES = frozenset(
-    (set(STREAM_EVENT_WIRE_EVENTS.values()) - {"notification_by_kind"})
-    | set(AUXILIARY_WIRE_EVENTS.values())
-    | set(NOTIFICATION_WIRE_EVENTS.values())
-)
+WIRE_EVENT_NAMES = frozenset(event.value for event in EventDescriptor)

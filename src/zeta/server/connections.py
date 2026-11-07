@@ -7,14 +7,19 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import content, ergonomics, event_contract
-from .protocol import FrameCodec, FrameWriteCancelled, ProtocolError
+from . import content, ergonomics
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameCodec,
+    FrameWriteCancelled,
+    ProtocolError,
+)
 
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history", "content_read",
     "model_catalog", "session_settings", "ping", "delivery_status",
 })
-OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 _CONTROLLER_BUFFER_LIMIT = 4 * 1024 * 1024
 _CONTROLLER_BUFFER_FRAMES = 256
@@ -104,22 +109,22 @@ class ConnectionRegistry:
         max_role: str = "controller",
     ) -> str:
         if requested_role not in {"controller", "observer"}:
-            raise ProtocolError(-32602, "role must be 'controller' or 'observer'")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "role must be 'controller' or 'observer'")
         role = str(requested_role)
         if max_role == "observer" and role == "controller":
-            raise ProtocolError(-32602, "credential permits observer role only")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "credential permits observer role only")
         if role == "observer" and (
             protocol_version == "1.0" or "serve_observers" not in features
         ):
             raise ProtocolError(
-                -32602, "observer requires protocol 1.1 and serve_observers"
+                ErrorDescriptor.INVALID_PARAMS, "observer requires protocol 1.1 and serve_observers"
             )
         try:
             self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
-                raise ProtocolError(-32001, "observer limit reached") from exc
-            raise ProtocolError(-32001, "another client is already connected") from exc
+                raise ProtocolError(ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached") from exc
+            raise ProtocolError(ErrorDescriptor.CONNECTION_CAPACITY, "another client is already connected") from exc
         connection.role = role
         if role == "controller":
             connection.server.runtime.set_post_stream_provider_retry(
@@ -157,17 +162,12 @@ class ConnectionRegistry:
 
     async def publish_controller(
         self,
-        event: str,
+        event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
         **fields: object,
     ) -> bool:
-        if event not in event_contract.WIRE_EVENT_NAMES:
-            raise ValueError(
-                f"undocumented serve event {event!r}; add it to event_contract "
-                "and docs/serve-protocol.md"
-            )
         state = self._controller
         if state is None or (
             required_feature is not None and required_feature not in state.features
@@ -400,7 +400,7 @@ class ConnectionRegistry:
     @staticmethod
     def _overflow_frame(role: str) -> bytes:
         return FrameCodec().error_response(
-            None, -32011, f"{role} output overflow"
+            None, ErrorDescriptor.OUTPUT_OVERFLOW, f"{role} output overflow"
         )
 
     @staticmethod
@@ -514,7 +514,7 @@ class ConnectionRegistry:
             session_id is not None
             and connection.server.runtime.session_id != session_id
         ):
-            raise ProtocolError(-32003, "session is not active")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return result
 
     async def read_session(
@@ -596,9 +596,9 @@ class ConnectionRegistry:
             method == "list_sessions" and "project_id" in params
         ):
             raise ProtocolError(
-                -32008,
+                ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",
-                {"code": OBSERVER_READ_ONLY_CODE, "method": method},
+                {"method": method},
             )
         if method not in {
             "list_sessions",
@@ -613,7 +613,7 @@ class ConnectionRegistry:
             return True, await self.read_session(connection, method, params)
         if method == "content_read":
             if "content_read" not in state.features:
-                raise ProtocolError(-32601, "content_read requires the negotiated content_read feature")
+                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "content_read requires the negotiated content_read feature")
             target = capture_read(connection, method, params)
             return True, await self.run_read(connection, lambda: perform_read(method, target, params), session_id=target[0])
         if method == "list_sessions":
@@ -653,12 +653,11 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
     if method == "content_read":
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_CONTENT_READ,
                 "invalid content read",
-                {"code": "invalid_content_read"},
             )
         if runtime.opened is None:
-            raise ProtocolError(-32003, "session is not active")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return runtime.session_id, runtime.opened.store
     if method in {"session_tree", "session_history"}:
         store = ergonomics.active(runtime, params)
@@ -691,7 +690,7 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
         return None, ergonomics.catalog(runtime)
     if method == "session_settings":
         return runtime.session_id, ergonomics.settings(runtime)
-    raise ProtocolError(-32601, "method not found")
+    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
 def project_status(target: object) -> dict[str, Any]:
@@ -733,4 +732,4 @@ def perform_read(
         )
     if method == "content_read":
         return content.read(store, params.get("handle"), offset=params.get("offset", 0), limit=params.get("limit", content.MAX_CONTENT_READ))
-    raise ProtocolError(-32601, "method not found")
+    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")

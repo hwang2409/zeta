@@ -12,11 +12,11 @@ from zeta.server.event_contract import (
     tool_output,
     tool_start,
 )
-from zeta.server.protocol import FrameCodec
+from zeta.server.protocol import EventDescriptor, FrameCodec
 
 
 def _params(event: str, fields: dict[str, object]) -> bytes:
-    return FrameCodec().notification(event, "session", **fields)
+    return FrameCodec().notification(EventDescriptor(event), "session", **fields)
 
 
 def test_live_projection_golden_params_are_byte_exact() -> None:

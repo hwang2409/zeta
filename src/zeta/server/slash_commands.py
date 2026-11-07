@@ -36,7 +36,7 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
 # Composed once at the model layer so the wire text is not literal in the frontend client.
@@ -114,7 +114,7 @@ class ServerSlashSession:
         loop = runtime.loop
         opened = runtime.opened
         if loop is None or opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         assembler = loop.context_assembler
         child_usage = assembler.descendant_usage
         pending = self._approval_control.pending_approval_labels() if self._approval_control is not None else ()
@@ -357,10 +357,10 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
 
     opened = runtime.opened
     if opened is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     loop = runtime.loop
     if loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     catalog = loop.tool_registry.skill_catalog
     project_dir = discover_repo_root(Path(opened.metadata.cwd or runtime.cwd))
     return create_slash_registry(
@@ -415,11 +415,11 @@ async def run_command(
     """Dispatch one slash invocation through the shared registry."""
 
     if not text.startswith("/") or text.startswith("//"):
-        raise ProtocolError(-32602, "text must start with '/'")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)
     if not parts or not parts[0]:
-        raise ProtocolError(-32602, "text must name a command")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
     if (
@@ -445,7 +445,7 @@ async def run_command(
     registry = await asyncio.to_thread(build_registry, runtime)
     if name == "mcp" and tail.strip() == "status":
         if runtime.loop is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         return {"kind": "text", "text": await runtime.loop.slash_mcp("status")}
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}
@@ -468,7 +468,7 @@ async def run_command(
         return _model_input_result(result, register_model_input)
     if isinstance(result, str):
         return {"kind": "output", "text": result}
-    raise ProtocolError(-32000, "unexpected slash result type")
+    raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
 
 
 def _model_input_result(

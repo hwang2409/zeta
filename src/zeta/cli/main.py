@@ -339,7 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
         if action == "login":
             sub.add_argument("--no-browser", action="store_true")
     serve_parser = commands.add_parser(
-        "serve", help="serve zeta to one local frontend client"
+        "serve", help="serve zeta to a local controller and observers"
     )
     serve_parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     serve_parser.add_argument(

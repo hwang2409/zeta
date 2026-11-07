@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from ..protocol.types import PROTOCOL_ERROR_CODES
+from .protocol_registry import ErrorDescriptor, EventDescriptor
 
 PROTOCOL_VERSION = "1.2"
 SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
@@ -136,30 +136,22 @@ def _observe_write(task: asyncio.Future[bool]) -> None:
         task.exception()
 
 
-def _check_error_code(code: int) -> None:
-    if code not in PROTOCOL_ERROR_CODES:
-        raise ValueError(
-            f"undocumented serve error code {code}; add it to "
-            "PROTOCOL_ERROR_CODES and docs/serve-protocol.md"
-        )
-
-
 class ProtocolError(Exception):
     """A JSON-RPC error that can be returned to the client."""
 
     def __init__(
         self,
-        code: int,
+        descriptor: ErrorDescriptor,
         message: str,
-        data: object | None = None,
+        data: dict[str, object] | None = None,
         *,
         request_id: str | int | None = None,
     ) -> None:
-        _check_error_code(code)
         super().__init__(message)
-        self.code = code
+        self.descriptor = descriptor
+        self.code = descriptor.code
         self.message = message
-        self.data = data
+        self.data = descriptor.data(data)
         self.request_id = _safe_request_id(request_id)
 
 
@@ -168,7 +160,7 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
 
     if requested not in SUPPORTED_PROTOCOL_VERSIONS:
         raise ProtocolError(
-            -32002,
+            ErrorDescriptor.PROTOCOL_MISMATCH,
             "unsupported protocol version",
             {"requested": requested, "supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
         )
@@ -184,7 +176,7 @@ class FrameCodec:
         request_id = _request_id_hint(line[:MAX_FRAME_BYTES])
         if len(line) > MAX_FRAME_BYTES:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"request frame exceeds {MAX_FRAME_BYTES} bytes",
                 request_id=request_id,
             )
@@ -201,13 +193,13 @@ class FrameCodec:
             ValueError,
         ) as exc:
             raise ProtocolError(
-                -32700,
+                ErrorDescriptor.PARSE_ERROR,
                 "invalid JSON frame",
                 request_id=request_id,
             ) from exc
         if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request must be a JSON-RPC 2.0 object",
                 request_id=request_id,
             )
@@ -216,19 +208,19 @@ class FrameCodec:
         request_id = _safe_request_id(raw_request_id)
         if isinstance(raw_request_id, _OversizedInteger):
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"numeric request id exceeds {MAX_NUMERIC_ID_DIGITS} digits",
                 request_id=request_id,
             )
         if type(raw_request_id) is not str and type(raw_request_id) is not int:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request id must be a string or integer",
                 request_id=request_id,
             )
         if isinstance(raw_request_id, str) and request_id is None:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 f"request id exceeds {MAX_REQUEST_ID_BYTES} UTF-8 bytes",
                 request_id=request_id,
             )
@@ -236,14 +228,14 @@ class FrameCodec:
         method = value.get("method")
         if not isinstance(method, str) or not method:
             raise ProtocolError(
-                -32600,
+                ErrorDescriptor.INVALID_REQUEST,
                 "request method must be a nonempty string",
                 request_id=request_id,
             )
         params = value.get("params", {})
         if not isinstance(params, dict):
             raise ProtocolError(
-                -32602,
+                ErrorDescriptor.INVALID_PARAMS,
                 "request params must be an object",
                 request_id=request_id,
             )
@@ -279,21 +271,21 @@ class FrameCodec:
     def error_response(
         self,
         request_id: str | int | None,
-        code: int,
+        descriptor: ErrorDescriptor,
         message: str,
-        data: object | None = None,
+        data: dict[str, object] | None = None,
     ) -> bytes:
-        _check_error_code(code)
-        error: dict[str, Any] = {"code": code, "message": message}
-        if data is not None:
-            error["data"] = data
+        error: dict[str, Any] = {"code": descriptor.code, "message": message}
+        wire_data = descriptor.data(data)
+        if wire_data is not None:
+            error["data"] = wire_data
         value = {"jsonrpc": "2.0", "id": request_id, "error": error}
         return self._bounded_json(value, request_id=request_id)
 
     def notification(
-        self, event: str, session_id: str | None, **fields: object
+        self, event: EventDescriptor, session_id: str | None, **fields: object
     ) -> bytes:
-        params: dict[str, object] = {"event": event}
+        params: dict[str, object] = {"event": event.value}
         if session_id is not None:
             params["session_id"] = session_id
         params.update(fields)
@@ -316,7 +308,7 @@ class FrameCodec:
         if len(payload) > MAX_FRAME_BYTES:
             payload = self.error_response(
                 None,
-                -32007,
+                ErrorDescriptor.FRAME_TOO_LARGE,
                 f"outbound frame exceeds {MAX_FRAME_BYTES} bytes",
             )
         try:
@@ -334,14 +326,14 @@ class FrameCodec:
         except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
             return self._minimal_error(
                 request_id,
-                -32000,
+                ErrorDescriptor.INTERNAL_ERROR,
                 "response could not be serialized",
             )
         if len(payload) <= MAX_FRAME_BYTES:
             return payload
         return self._minimal_error(
             request_id,
-            -32007,
+            ErrorDescriptor.FRAME_TOO_LARGE,
             f"outbound frame exceeds {MAX_FRAME_BYTES} bytes",
         )
 
@@ -358,14 +350,13 @@ class FrameCodec:
         ).encode("utf-8")
 
     def _minimal_error(
-        self, request_id: str | int | None, code: int, message: str
+        self, request_id: str | int | None, descriptor: ErrorDescriptor, message: str
     ) -> bytes:
-        _check_error_code(code)
         safe_id = _safe_request_id(request_id)
         value = {
             "jsonrpc": "2.0",
             "id": safe_id,
-            "error": {"code": code, "message": message},
+            "error": {"code": descriptor.code, "message": message},
         }
         payload = self._json_bytes(value)
         if len(payload) <= MAX_FRAME_BYTES:
@@ -374,12 +365,12 @@ class FrameCodec:
         return self._json_bytes(value)
 
     def _error_notification(
-        self, session_id: str | None, event: str, message: str
+        self, session_id: str | None, event: EventDescriptor, message: str
     ) -> bytes:
         params: dict[str, object] = {
-            "event": "error",
+            "event": EventDescriptor.ERROR.value,
             "error": {"code": "frame_too_large", "message": message},
-            "data": {"event": event},
+            "data": {"event": event.value},
         }
         if session_id is not None:
             params["session_id"] = session_id

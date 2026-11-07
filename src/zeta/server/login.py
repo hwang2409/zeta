@@ -18,7 +18,7 @@ from ..core.login_flow import (
 from ..core.session import account_home
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 
 REQUESTS = ["login_start", "login_status", "login_cancel", "login_providers"]
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
@@ -80,11 +80,11 @@ class Logins:
             return await asyncio.to_thread(self.providers)
         provider = params.get("provider")
         if provider not in ("claude", "codex"):
-            raise ProtocolError(-32602, "unsupported login provider")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "unsupported login provider")
         task = self.tasks.get(provider)
         if method == "login_start":
             if task is not None and not task.done():
-                raise ProtocolError(-32005, "login is already pending", {"code": "login_in_progress"})
+                raise ProtocolError(ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending")
             url = asyncio.get_running_loop().create_future()
             operation = _LoginOperation()
             task = asyncio.create_task(self._run(provider, url, operation))

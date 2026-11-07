@@ -84,7 +84,12 @@ from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
 )
-from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
+from zeta.server.protocol import (
+    MAX_FRAME_BYTES,
+    MAX_REQUEST_ID_BYTES,
+    EventDescriptor,
+    FrameCodec,
+)
 from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
@@ -96,7 +101,7 @@ TIMEOUT = 30
 
 
 def _client_notifier(client: _Client):
-    async def notify(event: str, session_id: str | None = None, **fields: object) -> bool:
+    async def notify(event: EventDescriptor, session_id: str | None = None, **fields: object) -> bool:
         return await client._write(client.codec.notification(event, session_id, **fields))
 
     return notify
@@ -3013,7 +3018,10 @@ def test_protocol_schema_documents_all_reviewed_event_contracts() -> None:
         encoding="utf-8"
     )
     rows = protocol.splitlines()
-    assert "| `-32007` | outbound frame exceeds the size limit |" in rows
+    assert (
+        "| `frame_too_large` | `-32007` | none | "
+        "outbound frame exceeds the size limit |"
+    ) in rows
     assert (
         "| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, "
         "`turn_aborted`, `compaction_start`, `compaction_end` | `event` | "

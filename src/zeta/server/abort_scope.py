@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Literal
 
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
     from ..runtime.loop.agent import AgentLoop
@@ -21,11 +21,11 @@ def clear_pending_steering(
 
     if "abort_scope" not in features:
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "clear_steering requires the negotiated abort_scope feature",
         )
     if loop is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     return {"cleared": loop.clear_pending_steering()}
 
 
@@ -34,9 +34,9 @@ def parse_abort_scope(params: dict[str, object], features: set[str]) -> AbortSco
 
     scope = params.get("scope", "session")
     if "scope" in params and "abort_scope" not in features:
-        raise ProtocolError(-32602, "scope requires the negotiated abort_scope feature")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope requires the negotiated abort_scope feature")
     if not isinstance(scope, str) or scope not in {"session", "foreground"}:
-        raise ProtocolError(-32602, "scope must be 'session' or 'foreground'")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "scope must be 'session' or 'foreground'")
     return scope
 
 

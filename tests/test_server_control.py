@@ -37,7 +37,7 @@ from zeta.protocol.types import (
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
-from zeta.server.protocol import FrameCodec
+from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
 
 
@@ -157,9 +157,9 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    await registry.publish_controller("assistant_delta", "session", delta="x")
+    await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="x")
     assert await registry.send(connection, b"hello\n")
-    assert json.loads(connection.frames[1])["params"]["event"] == "assistant_delta"
+    assert json.loads(connection.frames[1])["params"]["event"] == EventDescriptor.ASSISTANT_DELTA
     registry.release(connection)
 
 
@@ -170,7 +170,7 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for value in ("a", "b", "c"):
-        await registry.publish_controller("assistant_delta", "session", delta=value)
+        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta=value)
     assert await registry.send(connection, b"hello\n")
     assert [json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]] == [
         "a",
@@ -200,11 +200,11 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
     connection._write_physical = gated_write  # type: ignore[method-assign]
     first = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="first")
+        registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="first")
     )
     await first_started.wait()
     second = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="second")
+        registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="second")
     )
     await asyncio.sleep(0)
     assert connection.frames == []
@@ -257,7 +257,7 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     first = _ControllerConnection()
     registry.register(first)
     registry.negotiate_role(first, "controller", "1.2", frozenset())
-    await registry.publish_controller("assistant_delta", "session", delta="old")
+    await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="old")
     registry.release(first)
     second = _ControllerConnection()
     registry.register(second)
@@ -274,7 +274,7 @@ async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> Non
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for _ in range(257):
-        await registry.publish_controller("assistant_delta", "session", delta="x")
+        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="x")
     assert not await registry.send(connection, b"hello\n")
     assert json.loads(connection.frames[1])["error"]["code"] == -32011
     registry.release(connection)
@@ -308,13 +308,13 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
     connection._write_physical = write_then_cancel  # type: ignore[method-assign]
     publisher = asyncio.create_task(
-        registry.publish_controller("assistant_delta", "session", delta="once")
+        registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="once")
     )
     try:
         delivered = await publisher
     except asyncio.CancelledError:
         delivered = await registry.publish_controller(
-            "assistant_delta", "session", delta="once"
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="once"
         )
 
     assert delivered
@@ -440,9 +440,9 @@ async def test_pre_hello_flush_overflow_drops_tail_keeps_connection() -> None:
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    seed = connection.codec.notification("assistant_delta", "session", delta="seed")
+    seed = connection.codec.notification(EventDescriptor.ASSISTANT_DELTA, "session", delta="seed")
     assert await registry.publish_controller(
-        "assistant_delta", "session", delta="seed"
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="seed"
     )
     seed_started = asyncio.Event()
     release_seed = asyncio.Event()
@@ -464,7 +464,7 @@ async def test_pre_hello_flush_overflow_drops_tail_keeps_connection() -> None:
     hello = asyncio.create_task(_send_hello_and_flush(registry, connection))
     await seed_started.wait()
     for _ in range(256):
-        await registry.publish_controller("assistant_delta", "session", delta="tail")
+        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="tail")
     release_seed.set()
 
     await asyncio.gather(hello, return_exceptions=True)
@@ -479,9 +479,9 @@ async def test_pre_hello_flush_drops_publications_after_overflow_like_base() -> 
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    seed = connection.codec.notification("assistant_delta", "session", delta="seed")
+    seed = connection.codec.notification(EventDescriptor.ASSISTANT_DELTA, "session", delta="seed")
     assert await registry.publish_controller(
-        "assistant_delta", "session", delta="seed"
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="seed"
     )
     seed_started = asyncio.Event()
     release_seed = asyncio.Event()
@@ -503,9 +503,9 @@ async def test_pre_hello_flush_drops_publications_after_overflow_like_base() -> 
     hello = asyncio.create_task(_send_hello_and_flush(registry, connection))
     await seed_started.wait()
     for _ in range(256):
-        await registry.publish_controller("assistant_delta", "session", delta="tail")
+        await registry.publish_controller(EventDescriptor.ASSISTANT_DELTA, "session", delta="tail")
     assert await registry.publish_controller(
-        "assistant_delta", "session", delta="post-overflow"
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="post-overflow"
     )
     release_seed.set()
 

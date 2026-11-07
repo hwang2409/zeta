@@ -831,27 +831,39 @@ failures, then returns to `idle`.
 
 ## errors
 
-Error responses use standard JSON-RPC codes where applicable:
+Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
 
-| code | meaning |
-| ---: | --- |
-| `-32700` | invalid JSON or invalid UTF-8 frame |
-| `-32600` | invalid JSON-RPC request or duplicate handshake |
-| `-32601` | method or negotiated feature is not supported |
-| `-32602` | params have the wrong shape, value, or negotiated capability |
-| `-32000` | unexpected server or storage failure |
-| `-32001` | requested controller or observer connection role is at capacity |
-| `-32002` | handshake is missing or the protocol version does not match |
-| `-32003` | no active session, or the active session requires a host binding |
-| `-32004` | operation is blocked by active turn, tool, or background-agent work |
-| `-32005` | requested turn or account state is unavailable |
-| `-32006` | approval request is missing, resolved, or reserved |
-| `-32007` | outbound frame exceeds the size limit |
-| `-32008` | request is not allowed for this connection or account state |
-| `-32009` | session history snapshot is stale |
-| `-32010` | delivery ID details were evicted |
-| `-32011` | connection output queue overflowed |
-| `-32012` | content handle was not found |
+Error descriptors are:
+
+| name | code | data.code | meaning |
+| --- | ---: | --- | --- |
+| `parse_error` | `-32700` | none | invalid JSON or invalid UTF-8 frame |
+| `invalid_request` | `-32600` | none | invalid JSON-RPC request or duplicate handshake |
+| `method_not_found` | `-32601` | none | method or negotiated feature is not supported |
+| `invalid_params` | `-32602` | none | params have the wrong shape, value, or negotiated capability |
+| `internal_error` | `-32000` | none | unexpected server or storage failure |
+| `connection_capacity` | `-32001` | none | requested controller or observer connection role is at capacity |
+| `protocol_mismatch` | `-32002` | none | handshake is missing or the protocol version does not match |
+| `no_active_session` | `-32003` | none | no active session, or the active session requires a host binding |
+| `operation_busy` | `-32004` | none | operation is blocked by active turn, tool, or background-agent work |
+| `state_unavailable` | `-32005` | none | requested turn or account state is unavailable |
+| `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
+| `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
+| `request_forbidden` | `-32008` | none | request is not allowed for this connection or account state |
+| `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
+| `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
+| `output_overflow` | `-32011` | none | connection output queue overflowed |
+| `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
+| `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
+| `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
+| `host_binding_required` | `-32003` | `host_binding_required` | the session requires a host binding |
+| `invalid_content_read` | `-32602` | `invalid_content_read` | content_read parameters are invalid |
+| `login_in_progress` | `-32005` | `login_in_progress` | a login is already pending |
+| `observer_read_only` | `-32008` | `observer_read_only` | a read-only observer requested a write method |
+| `project_not_found` | `-32602` | `project_not_found` | the requested project does not exist |
+| `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
+| `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that

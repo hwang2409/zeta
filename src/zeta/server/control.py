@@ -33,7 +33,13 @@ from .approval_lifecycle import (
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
-from .protocol import FrameWriteCancelled, ProtocolError, bounded
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameWriteCancelled,
+    ProtocolError,
+    bounded,
+)
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -143,9 +149,8 @@ class ServeControl:
     def reject_client_turn_if_detached(self) -> None:
         if self._host_binding_required and self._active_host_commands is None:
             raise ProtocolError(
-                -32003,
+                ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
-                {"code": "host_binding_required"},
             )
 
     def request_turn_failure(self) -> None:
@@ -165,7 +170,7 @@ class ServeControl:
 
     async def require_idle(self) -> None:
         if self.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
 
     def model_input_registrar(self, features: frozenset[str]):
         return self._model_inputs.registrar(
@@ -329,7 +334,7 @@ class ServeControl:
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
         if loop is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
@@ -754,7 +759,7 @@ class ServeControl:
         await self._notify(wire_event, session_id, data=dict(event.data))
 
     async def _start_approval(
-        self, event: StreamEvent, session_id: str | None, wire_event: str
+        self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
         await self._approvals.transition(Start(event, session_id, wire_event))
 
@@ -795,7 +800,7 @@ class ServeControl:
             )
 
     async def _notify(
-        self, event: str, session_id: str | None = None, **fields: object
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id

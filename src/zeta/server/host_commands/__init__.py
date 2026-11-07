@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from ..protocol import ProtocolError
+from ..protocol import ErrorDescriptor, ProtocolError
 
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -32,7 +32,7 @@ class SessionHostCommands:
             value = []
         if not isinstance(value, list) or len(value) > 4:
             raise ProtocolError(
-                -32602, "host_commands must be an array of at most 4 items"
+                ErrorDescriptor.INVALID_PARAMS, "host_commands must be an array of at most 4 items"
             )
         out = []
         env = {}
@@ -46,12 +46,12 @@ class SessionHostCommands:
                 "summary",
                 "environment",
             }:
-                raise ProtocolError(-32602, f"{p} is invalid")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p} is invalid")
             n, e, s, m = (
                 item[k] for k in ("name", "executable", "summary", "environment")
             )
             if not isinstance(n, str) or not _NAME.fullmatch(n) or n in names:
-                raise ProtocolError(-32602, f"{p}.name is invalid")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.name is invalid")
             if (
                 not isinstance(e, str)
                 or not e.startswith("/")
@@ -60,11 +60,11 @@ class SessionHostCommands:
                 or "\n" in e
                 or len(e.encode()) > 4096
             ):
-                raise ProtocolError(-32602, f"{p}.executable is invalid")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.executable is invalid")
             if not isinstance(s, str) or not s or "\n" in s or len(s.encode()) > 256:
-                raise ProtocolError(-32602, f"{p}.summary is invalid")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.summary is invalid")
             if not isinstance(m, dict):
-                raise ProtocolError(-32602, f"{p}.environment is invalid")
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.environment is invalid")
             names.add(n)
             out.append(HostCommand(n, e, s))
             for k, v in m.items():
@@ -84,13 +84,13 @@ class SessionHostCommands:
                     }
                     or k.startswith(("LD_", "DYLD_"))
                 ):
-                    raise ProtocolError(-32602, f"{p}.environment key is invalid")
+                    raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.environment key is invalid")
                 if not isinstance(v, str) or "\x00" in v or len(v.encode()) > 4096:
-                    raise ProtocolError(-32602, f"{p}.environment value is invalid")
+                    raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"{p}.environment value is invalid")
                 env[k] = v
                 total += len(k.encode()) + len(v.encode())
         if len(env) > 16 or total > 16384:
-            raise ProtocolError(-32602, "host_commands.environment exceeds its limit")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "host_commands.environment exceeds its limit")
         ins = ""
         if out:
             ins = (

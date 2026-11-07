@@ -41,6 +41,7 @@ from . import event_contract
 from .protocol import (
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
+    ErrorDescriptor,
     FrameCodec,
     ProtocolError,
     bounded,
@@ -93,14 +94,13 @@ async def mutate_session(
         await require_idle()
         if runtime.opened is not None and session_id == runtime.session_id:
             raise ProtocolError(
-                -32005,
+                ErrorDescriptor.ACTIVE_SESSION,
                 "select another session before deleting this session",
-                {"code": "active_session"},
             )
         await asyncio.to_thread(runtime.manager.delete, session_id)
         return {"session_id": session_id}
     if not isinstance(name, str):
-        raise ProtocolError(-32602, "name must be a string")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "name must be a string")
     metadata = await asyncio.to_thread(runtime.manager.rename, session_id, name)
     if runtime.opened is not None and session_id == runtime.session_id:
         runtime.manager._copy_metadata(runtime.metadata, metadata)
@@ -110,9 +110,9 @@ async def mutate_session(
 def active(runtime: ServerRuntime, params: dict):
     session_id = params.get("session_id")
     if not isinstance(session_id, str) or not session_id:
-        raise ProtocolError(-32602, "session_id must be a nonempty string")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string")
     if runtime.opened is None or session_id != runtime.session_id:
-        raise ProtocolError(-32003, "session is not active")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
     return runtime.opened.store
 
 
@@ -123,7 +123,7 @@ def require_mutable(runtime: ServerRuntime, has_pending_approvals: bool = False)
         or loop.store.has_outstanding_tool_calls(loop.store.replay())
         or has_pending_approvals
     ):
-        raise ProtocolError(-32004, "finish pending tools and background agents first")
+        raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "finish pending tools and background agents first")
 
 
 def tree(runtime: ServerRuntime) -> dict:
@@ -738,12 +738,11 @@ def _backward_page_history(
         or validator.get("entry_id") != _history_endpoint(projection, stable_end)
     ):
         raise ProtocolError(
-            -32009,
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
             "session history changed; restart from the newest page",
-            {"code": "stale_history_snapshot"},
         )
     if before < 0 or before > stable_end + int(first_page):
-        raise ProtocolError(-32602, "before must not exceed history end")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "before must not exceed history end")
     rows, selected, response_groups, expanded = _fit_history_groups(
         projection, range(before - 1, -1, -1), end=end,
         include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read, backward=True,
@@ -856,13 +855,13 @@ def _forward_history_request(
 
 def _validate_history_params(params: dict) -> None:
     if set(params) - {"session_id", "before", "history_validator"}:
-        raise ProtocolError(-32602, "invalid backward session history parameters")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid backward session history parameters")
     before = params["before"]
     if before is not None and (type(before) is not int or before < 0):
-        raise ProtocolError(-32602, "before must be null or a nonnegative integer")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "before must be null or a nonnegative integer")
     validator = params.get("history_validator")
     if before is None and "history_validator" in params:
-        raise ProtocolError(-32602, "history_validator is only valid for continuations")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "history_validator is only valid for continuations")
     if before is not None and (
         not isinstance(validator, dict)
         or set(validator) != {"end", "entry_id"}
@@ -870,7 +869,7 @@ def _validate_history_params(params: dict) -> None:
         or validator.get("end") < 0
         or (validator.get("entry_id") is not None and not isinstance(validator.get("entry_id"), str))
     ):
-        raise ProtocolError(-32602, "history_validator is invalid")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid")
 
 
 def history(
@@ -879,15 +878,15 @@ def history(
 ) -> dict:
     backward_keys = {"before", "history_validator"}
     if backward_keys.intersection(params) and not backward_enabled:
-        raise ProtocolError(-32602, "backward session history requires negotiation")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "backward session history requires negotiation")
     if "before" in params:
         _validate_history_params(params)
         return _backward_history_request(runtime, params, include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read)
     if backward_keys.intersection(params):
-        raise ProtocolError(-32602, "invalid session history parameters")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid session history parameters")
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
-        raise ProtocolError(-32602, "offset must be a nonnegative integer")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "offset must be a nonnegative integer")
     return _forward_history_request(runtime, params, include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read)
 
 def settings(runtime: ServerRuntime) -> dict:
@@ -915,12 +914,12 @@ def _validated_image_payload(
         or not isinstance(images, list)
         or not 1 <= len(images) <= 4
     ):
-        raise ProtocolError(-32602, "send_images needs text and 1 to 4 images")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "send_images needs text and 1 to 4 images")
     decoded = []
     total = 0
     for item in images:
         if not isinstance(item, dict):
-            raise ProtocolError(-32602, "image must be an object")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "image must be an object")
         name, mime, data = item.get("name"), item.get("mime_type"), item.get("data")
         if (
             not isinstance(name, str)
@@ -932,28 +931,28 @@ def _validated_image_payload(
             or any(unicodedata.category(c) == "Cc" or c in DIRECTION_CONTROLS for c in name)
         ):
             raise ProtocolError(
-                -32602, "image name must be a filename of at most 128 characters"
+                ErrorDescriptor.INVALID_PARAMS, "image name must be a filename of at most 128 characters"
             )
         if (
             not isinstance(mime, str)
             or mime not in IMAGE_EXTENSIONS
             or not isinstance(data, str)
         ):
-            raise ProtocolError(-32602, "unsupported image type or data")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "unsupported image type or data")
         compact_data = "".join(data.split())
         if len(compact_data) > (MAX_IMAGE_BYTES + 2) // 3 * 4:
-            raise ProtocolError(-32602, "images exceed 512 KiB")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "images exceed 512 KiB")
         try:
             raw = base64.b64decode(compact_data, validate=True)
         except (ValueError, binascii.Error) as exc:
-            raise ProtocolError(-32602, "invalid image base64") from exc
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid image base64") from exc
         total += len(raw)
         if total > MAX_IMAGE_BYTES:
-            raise ProtocolError(-32602, "images exceed 512 KiB")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "images exceed 512 KiB")
         if not raw or not image_signature_matches(mime, raw):
-            raise ProtocolError(-32602, "image signature does not match its type")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "image signature does not match its type")
         if Path(name).suffix.lower() not in IMAGE_EXTENSIONS[mime]:
-            raise ProtocolError(-32602, "image extension does not match its type")
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "image extension does not match its type")
         decoded.append((name, mime, base64.b64encode(raw).decode(), raw))
     return text, decoded
 
@@ -977,7 +976,7 @@ def prepare_image_delivery(
     )
     provider = runtime.provider
     if provider is None:
-        raise ProtocolError(-32003, "no active provider")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active provider")
     policy = image_policy_for_provider(provider)
     blocks = [TextContent(text)]
     store = runtime.opened.store
@@ -989,7 +988,7 @@ def prepare_image_delivery(
                 try:
                     prepared = asyncio.run(normalize_image_bytes(raw, policy))
                 except ValueError as exc:
-                    raise ProtocolError(-32602, f"image cannot be prepared: {exc}") from exc
+                    raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, f"image cannot be prepared: {exc}") from exc
                 raw = prepared.data or b""
                 mime = prepared.media_type
                 data = base64.b64encode(raw).decode("ascii")

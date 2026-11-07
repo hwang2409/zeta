@@ -11,7 +11,7 @@ from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
 from ..accounts.usage import UsageState, usage_json
 from ..core.session import account_home
 from ..providers.factory import build_backend
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
 REQUEST_METHODS = {"account_list", "account_logout", "account_refresh", "account_switch"}
@@ -44,7 +44,7 @@ async def list_accounts(
 ) -> dict[str, object]:
     context = getattr(runtime.loop, "account_context", None)
     if context is None:
-        raise ProtocolError(-32005, "accounts unavailable for this session")
+        raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "accounts unavailable for this session")
     snapshot = await context.list_snapshot()
     return {
         "accounts": [
@@ -76,7 +76,7 @@ async def request(
         return await refresh_accounts(runtime)
     raw = params.get("account")
     if not isinstance(raw, str) or ":" not in raw:
-        raise ProtocolError(-32602, "account must be provider:name")
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "account must be provider:name")
     account = AccountId(*raw.split(":", 1))
     loop = runtime.loop
     if method == "account_logout":
@@ -87,7 +87,7 @@ async def request(
                 sessions_root=runtime.home / "sessions",
             )
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ProtocolError(-32005, str(exc)) from exc
+            raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, str(exc)) from exc
         return {"account": str(account), "message": message}
     context = loop.account_context
     provider = runtime.metadata.provider
