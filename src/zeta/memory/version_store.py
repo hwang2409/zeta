@@ -153,7 +153,7 @@ def publish_version[T](
     version_handles: Callable[[int, bool], tuple[int, int, int]],
     manifest_reader: Callable[[int, str], dict[str, object]],
     transaction_step: Callable[[str], None],
-    prune_versions: Callable[[int, int, set[str]], None],
+    prune_versions: Callable[[int, int, set[str], set[str]], None],
     home: os.PathLike[str] | str,
 ) -> PublishedVersion[T]:
     """Publish one immutable version through the format-independent protocol."""
@@ -211,7 +211,7 @@ def publish_version[T](
                 ),
             )
         transaction_step("publish")
-        prune_versions(blobs_fd, versions_fd, set(retained))
+        prune_versions(blobs_fd, versions_fd, set(retained), set(dropped))
         return PublishedVersion(prepared.value, snapshot, version)
     finally:
         os.close(versions_fd)

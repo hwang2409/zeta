@@ -951,14 +951,14 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
                     memory_reconciler=None,
                 )
             )
-            SlashHandlerMixin.slash_memory(tui, action)
+            await SlashHandlerMixin.slash_memory(tui, action)
         else:
             runtime = SimpleNamespace(
                 metadata=SimpleNamespace(project_id=project_id),
                 manager=SimpleNamespace(project_registry=registry),
                 loop=None,
             )
-            ServerSlashSession(runtime).slash_memory(action)
+            await ServerSlashSession(runtime).slash_memory(action)
     elif entry_point == "serve-project-request":
         runtime = SimpleNamespace(
             manager=SimpleNamespace(list_sessions_read_only=list)

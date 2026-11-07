@@ -20,7 +20,7 @@ from contextlib import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import httpx
 
@@ -38,7 +38,13 @@ from ..oauth import (
     classify_oauth_refresh_failure,
     credential_file_lock,
 )
-from ..storage_format import DeleteValue, SetValue, open_writer, require_closed_variant
+from ..storage_format import (
+    CLOSED_VARIANTS,
+    DeleteValue,
+    SetValue,
+    open_writer,
+    require_closed_variant,
+)
 from .files import (
     exists as _exists,
 )
@@ -53,7 +59,7 @@ from .files import (
 )
 from .publication import atomic_publish, publish_mapping
 
-_PROVIDERS = {"anthropic", "codex"}
+_PROVIDERS = cast(frozenset[str], CLOSED_VARIANTS["account.provider"])
 _MAX_SWEEP_WARNING_PATHS = 5
 _SLUG = re.compile(r"^[a-z0-9_-]{1,32}$")
 
@@ -76,12 +82,14 @@ def _registry_reference_index(
     for key, metadata in accounts.items():
         if not isinstance(key, str) or not isinstance(metadata, Mapping):
             raise TypeError
-        account = AccountId(*key.split(":", 1))
+        provider, name = key.split(":", 1)
+        require_closed_variant("account.provider", provider)
+        account = AccountId(provider, name)
         if key != str(account) or any(
             metadata.get(field) != expected
             for field, expected in {
-            "provider": account.provider,
-            "name": account.name,
+                "provider": account.provider,
+                "name": account.name,
             }.items()
         ):
             raise ValueError
@@ -710,13 +718,10 @@ class AccountStore:
             }
             _registry_reference_index(normalized)
             for provider, key in defaults.items():
-                if (
-                    not isinstance(provider, str)
-                    or not isinstance(key, str)
-                    or provider not in _PROVIDERS
-                    or key not in accounts
-                    or not key.startswith(f"{provider}:")
-                ):
+                if not isinstance(provider, str) or not isinstance(key, str):
+                    raise TypeError
+                require_closed_variant("account.provider", provider)
+                if key not in accounts or not key.startswith(f"{provider}:"):
                     raise ValueError
             return normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1171,7 +1176,8 @@ def _read_publication_pending(directory_fd: int) -> dict[str, str] | None:
         if (
             not isinstance(value, Mapping)
             or set(value) != {"provider", "name", "sha256"}
-            or value["provider"] not in _PROVIDERS
+            or require_closed_variant("account.provider", value["provider"])
+            != value["provider"]
             or not isinstance(value["name"], str)
             or not _SLUG.fullmatch(value["name"])
             or not isinstance(value["sha256"], str)

@@ -70,7 +70,7 @@ class ProjectInboxNotificationMixin:
             await asyncio.sleep(2)
             await self._check_project_inbox(periodic=True)
 
-    def _record_sent_statuses(self, messages: tuple[dict[str, Any], ...]) -> None:
+    async def _record_sent_statuses(self, messages: tuple[dict[str, Any], ...]) -> None:
         pending: dict[tuple[str, str], dict[str, Any]] = getattr(
             self, "_pending_sent_statuses", {}
         )
@@ -88,7 +88,9 @@ class ProjectInboxNotificationMixin:
             reported = record.get("reported", [])
             if status == "done" and record.get("reply_id") is not None:
                 if self._inbox_scanner is not None:
-                    self._inbox_scanner.mark_reported(iter((key,)))
+                    await asyncio.to_thread(
+                        self._inbox_scanner.mark_reported, iter((key,))
+                    )
                 continue
             if isinstance(reported, list) and status not in reported:
                 pending[key] = record
@@ -159,7 +161,7 @@ class ProjectInboxNotificationMixin:
         except (InboxError, OSError, ProjectRegistryError):
             return
         if sent is not None:
-            ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
+            await ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
         if message_ids is None or not message_ids:
             return
         text = (
@@ -180,9 +182,7 @@ class ProjectInboxNotificationMixin:
                     "text": text,
                 },
                 dedupe_key=project_id,
-                after_commit=lambda: scanner.inbox.claim_wake(
-                    project_id, message_ids
-                ),
+                after_commit=lambda: scanner.inbox.claim_wake(project_id, message_ids),
             )
         )
 

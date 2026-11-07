@@ -6396,7 +6396,8 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
-def test_memory_command_parity_tui_and_serve() -> None:
+@pytest.mark.asyncio
+async def test_memory_command_parity_tui_and_serve() -> None:
     from types import SimpleNamespace
 
     from zeta.tui.slash_handlers import SlashHandlerMixin
@@ -6435,8 +6436,14 @@ def test_memory_command_parity_tui_and_serve() -> None:
         metadata=SimpleNamespace(project_id="p"),
         manager=SimpleNamespace(project_registry=Registry()),
     )
-    tui_outputs = [SlashHandlerMixin.slash_memory(tui, command) for command in ("log", "undo", "accept state.md")]
-    serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
+    tui_outputs = [
+        await SlashHandlerMixin.slash_memory(tui, command)
+        for command in ("log", "undo", "accept state.md")
+    ]
+    serve_outputs = [
+        await ServerSlashSession(runtime).slash_memory(command)
+        for command in ("log", "undo", "accept state.md")
+    ]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
 

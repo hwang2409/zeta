@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
@@ -24,6 +26,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
     "conversation.entry_type": frozenset(
         {
@@ -45,9 +48,15 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
             "terminal_transition",
         }
     ),
+    "inbox.kind": frozenset(
+        {"bug_report", "change_request", "question", "info", "reply"}
+    ),
     "inbox.schema_version": frozenset({1}),
     "memory.format": frozenset({1, 2}),
+    "project.repo_agents": frozenset({"include", "ignore"}),
     "project.schema_version": frozenset({1}),
+    "project.session_role": frozenset({"session", "orchestrator", "worker"}),
+    "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1}),
 }
 _MANIFEST = "storage-format.json"
@@ -116,6 +125,25 @@ class _RegistryEntry:
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
 _REGISTRY_LOCK = threading.RLock()
+
+
+@contextmanager
+def _shape_lock(home: Path, directory_fd: int, name: str) -> Iterator[None]:
+    info = os.fstat(directory_fd)
+    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).digest()
+    offset = int.from_bytes(digest[:8]) & ((1 << 63) - 1)
+    fd = os.open(
+        home / ".storage-format-shapes.lock",
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        os.set_inheritable(fd, False)
+        fcntl.lockf(fd, fcntl.LOCK_EX, 1, offset)
+        yield
+    finally:
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, offset)
+        os.close(fd)
 
 
 def _canonical_home(home: str | Path) -> Path:
@@ -436,22 +464,23 @@ class WriterLease:
     ) -> dict[str, Any]:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        except FileNotFoundError:
-            raw = {} if initial is None else initial
-        else:
+        with _shape_lock(self.home, directory_fd, name):
             try:
-                with os.fdopen(fd, "rb") as stream:
-                    raw = json.load(stream)
-            except (OSError, ValueError) as exc:
-                raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-        output = apply_mutations(raw, mutations)
-        encoded = (
-            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode()
-        publish(directory_fd, name, encoded)
-        return output
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            except FileNotFoundError:
+                raw = {} if initial is None else initial
+            else:
+                try:
+                    with os.fdopen(fd, "rb") as stream:
+                        raw = json.load(stream)
+                except (OSError, ValueError) as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            output = apply_mutations(raw, mutations)
+            encoded = (
+                json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode()
+            publish(directory_fd, name, encoded)
+            return output
 
     def publish_records(
         self,
@@ -469,37 +498,51 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        except FileNotFoundError:
-            raw: object = ([] if not path else {}) if initial is None else initial
-        else:
+        with _shape_lock(self.home, directory_fd, name):
             try:
-                with os.fdopen(fd, "rb") as stream:
-                    raw = json.load(stream)
-            except (OSError, ValueError) as exc:
-                raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-        records = raw
-        if path:
-            if type(raw) is not dict:
-                raise StorageFormatError("stored JSON root must be an object")
-            parent, key = _mapping_at(raw, path, create=True)
-            records = parent.get(key, [])
-        output = _apply_record_mutations(
-            records,
-            upserts,
-            identity=identity,
-            delete_ids=delete_ids,
-            name=name,
-        )
-        published: object = output
-        if path:
-            published = apply_mutations(raw, (ReplaceSubtree(path, output),))
-        encoded = (
-            json.dumps(published, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode()
-        publish(directory_fd, name, encoded)
-        return output
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            except FileNotFoundError:
+                raw: object = ([] if not path else {}) if initial is None else initial
+            else:
+                try:
+                    with os.fdopen(fd, "rb") as stream:
+                        raw = json.load(stream)
+                except (OSError, ValueError) as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            records = raw
+            if path:
+                if type(raw) is not dict:
+                    raise StorageFormatError("stored JSON root must be an object")
+                parent, key = _mapping_at(raw, path, create=True)
+                records = parent.get(key, [])
+            output = _apply_record_mutations(
+                records,
+                upserts,
+                identity=identity,
+                delete_ids=delete_ids,
+                name=name,
+            )
+            published: object = output
+            if path:
+                published = apply_mutations(raw, (ReplaceSubtree(path, output),))
+            encoded = (
+                json.dumps(published, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode()
+            publish(directory_fd, name, encoded)
+            return output
+
+    def publish_append(
+        self,
+        shape: str,
+        variants: Iterable[object],
+        publish: Callable[[], None],
+    ) -> None:
+        """Validate closed variants before an authoritative append."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        for variant in variants:
+            require_closed_variant(shape, variant)
+        publish()
 
     def close(self) -> None:
         if self._closed:

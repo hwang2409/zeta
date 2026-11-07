@@ -30,7 +30,12 @@ from .core.session_files import (
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
-from .storage_format import mapping_mutations, open_writer, require_closed_variant
+from .storage_format import (
+    CLOSED_VARIANTS,
+    mapping_mutations,
+    open_writer,
+    require_closed_variant,
+)
 
 SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
@@ -39,7 +44,7 @@ SENT_HISTORY_LIMIT = 512
 SENT_PAGE_LIMIT = 100
 _SENT_TRACKING_FILE = "project-inbox-sent.json"
 SENT_STATUS_EVENT = "project_inbox_sent_status"
-KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
+KINDS = frozenset(str(value) for value in CLOSED_VARIANTS["inbox.kind"])
 LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -257,13 +262,15 @@ class SentMessageTracker:
             or not target
             or not isinstance(created_at, str)
             or not isinstance(reported, list)
-            or any(
-                not isinstance(item, str) or item not in {"claimed", "done"}
-                for item in reported
-            )
+            or any(not isinstance(item, str) for item in reported)
             or len(set(reported)) != len(reported)
         ):
             raise InboxError("invalid sent-message tracking record")
+        try:
+            for status in reported:
+                require_closed_variant("sent_message_ledger.reported_status", status)
+        except ValueError as exc:
+            raise InboxError("invalid sent-message tracking record") from exc
         return {
             "id": message_id,
             "target_project": target,
@@ -401,8 +408,10 @@ class ProjectInbox:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
         session = _id(from_session, "session id")
-        if kind not in KINDS:
-            raise InboxError(f"unknown message kind: {kind}")
+        try:
+            require_closed_variant("inbox.kind", kind)
+        except ValueError as exc:
+            raise InboxError(f"unknown message kind: {kind}") from exc
         title = _text(title, "title")
         body = _text(body, "body", empty=True)
         if in_reply_to is not None:
@@ -992,8 +1001,10 @@ class ProjectInbox:
         _text(sender.get("project"), "sender project")
         _id(sender.get("session"), "sender session")
         _text(value.get("to_project"), "target project")
-        if value.get("kind") not in KINDS:
-            raise InboxError("invalid message kind")
+        try:
+            require_closed_variant("inbox.kind", value.get("kind"))
+        except ValueError as exc:
+            raise InboxError("invalid message kind") from exc
         _text(value.get("title"), "title")
         _text(value.get("created_at"), "created_at")
         if "claimer_session" in value:

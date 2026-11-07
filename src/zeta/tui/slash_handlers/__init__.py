@@ -230,7 +230,9 @@ class SlashHandlerMixin:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
-            return "accounts unavailable: cannot switch while a turn or approval is active"
+            return (
+                "accounts unavailable: cannot switch while a turn or approval is active"
+            )
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
@@ -804,13 +806,14 @@ class SlashHandlerMixin:
             )
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_memory(self, args: str) -> str:
         """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(
+        return await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,

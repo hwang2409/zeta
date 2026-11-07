@@ -712,17 +712,29 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         return published.version
 
     def _prune_versions(
-        self, blobs_fd: int, versions_fd: int, retained: set[str]
+        self,
+        blobs_fd: int,
+        versions_fd: int,
+        retained: set[str],
+        dropped: set[str],
     ) -> None:
-        plan = reachable_version_pruning_plan(
+        retained_plan = reachable_version_pruning_plan(
             retained, lambda version: self._manifest(versions_fd, version)
         )
-        for name in os.listdir(versions_fd):
-            if name.endswith(".json") and name[:-5] not in plan.versions:
-                os.unlink(name, dir_fd=versions_fd)
-        for name in os.listdir(blobs_fd):
-            if name not in plan.blobs:
-                os.unlink(name, dir_fd=blobs_fd)
+        dropped_blobs: set[str] = set()
+        for version in dropped:
+            manifest = self._manifest(versions_fd, version)
+            for key in ("snapshot", "before_snapshot"):
+                payloads = manifest.get(key)
+                if isinstance(payloads, dict):
+                    dropped_blobs.update(
+                        value for value in payloads.values() if isinstance(value, str)
+                    )
+                elif isinstance(payloads, str):
+                    dropped_blobs.add(payloads)
+            os.unlink(f"{version}.json", dir_fd=versions_fd)
+        for digest in dropped_blobs - retained_plan.blobs:
+            os.unlink(digest, dir_fd=blobs_fd)
         os.fsync(versions_fd)
         os.fsync(blobs_fd)
 

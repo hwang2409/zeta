@@ -7,6 +7,7 @@ import stat
 import sys
 import threading
 import uuid
+import weakref
 from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -714,7 +715,7 @@ async def close_direct_test_runtime_owners(
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     loops: list[AgentLoop] = []
-    stores: list[ConversationStore] = []
+    stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     memory_runners: list[AutoMemoryReconciler] = []
     managers: list[SessionManager] = []
     workspaces: list[WorkspaceSnapshotStore] = []
@@ -800,7 +801,7 @@ async def close_direct_test_runtime_owners(
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        stores.append(store)
+        stores.add(store)
 
     @wraps(memory_runner_init)
     def tracked_memory_runner_init(runner, *args, **kwargs):
@@ -873,7 +874,7 @@ async def close_direct_test_runtime_owners(
             await runner.close()
         except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
             pass
-    for store in reversed(stores):
+    for store in reversed(tuple(stores)):
         if not store._closed:
             try:
                 store_close(store)
