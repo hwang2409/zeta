@@ -856,13 +856,16 @@ def main() -> None:
                     )
                     scaled_rows, scaled_bytes = conversation_stats(scaled)
                     store = store_probe(scaled_home, sid, f"{name}-{fraction}")
-                    # Replay time is linear in bytes; ms/MB makes sizes comparable.
+                    # Report both per-MB and per-row cost: bytes per row differ between sessions.
                     curves[str(fraction)] = {
                         "rows_in_file": scaled_rows,
                         "bytes": scaled_bytes,
                         "rows_replayed": store["rows_replayed"],
                         "replay_ms_per_mb": round(
                             store["replay"]["p50_ms"] / (scaled_bytes / 1e6), 3
+                        ),
+                        "replay_us_per_row": round(
+                            store["replay"]["p50_ms"] * 1000 / scaled_rows, 2
                         ),
                         "store": store,
                     }
