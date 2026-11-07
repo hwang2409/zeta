@@ -10,6 +10,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.tui_render import render_full_screen
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
 from zeta.cli.main import build_parser
 from zeta.config.tool_policy import ToolPolicy
@@ -22,6 +23,7 @@ from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolAction
+from zeta.tui import theme
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
 
@@ -617,12 +619,24 @@ async def test_implement_exits_and_submits_the_explicit_request() -> None:
 # --- surfaces --------------------------------------------------------------
 
 
-def test_status_bar_shows_and_styles_the_plan_segment() -> None:
-    rendered = format_status(
-        "claude", "claude-sonnet-4-6", "idle", None, None, plan_state="PLAN"
-    )
-    assert rendered.plain.startswith("PLAN")
-    assert any(span.style for span in rendered.spans)
+async def test_status_bar_shows_and_styles_the_plan_segment(tmp_path: Path) -> None:
+    app = build_app(tmp_path, [])
+    app.loop.set_plan_mode(True)
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+
+    screen = render_full_screen(session, 80)
+    footer = "".join(screen.data_buffer[23][column].char for column in range(80))
+    plan_start = footer.index("PLAN")
+    plan_cells = [
+        screen.data_buffer[23][column]
+        for column in range(plan_start, plan_start + len("PLAN"))
+    ]
+
+    assert "".join(cell.char for cell in plan_cells) == "PLAN"
+    assert all(theme.PLAN_STATE in cell.style for cell in plan_cells)
+    await app.close()
 
 
 def test_status_bar_omits_the_plan_segment_when_off() -> None:
