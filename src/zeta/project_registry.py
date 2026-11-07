@@ -832,16 +832,12 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             "recorded_at": recorded,
         }
 
-    @classmethod
-    def _read_session_records(
-        cls, directory_fd: int, *, repair_torn_final: bool
-    ) -> list[dict[str, object]]:
-        """Read the bounded JSONL reference file from one pinned regular fd.
-
-        This is intentionally the one reader used by listing and append.  It
-        never opens a FIFO/block device, never performs an unbounded read while
-        holding the registry lock, and can discard only a torn final line.
-        """
+    @staticmethod
+    @contextmanager
+    def _open_session_records(
+        directory_fd: int, *, repair_torn_final: bool
+    ) -> Iterator[int | None]:
+        """Open and validate the bounded JSONL reference file."""
         maximum = MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
         try:
             fd = os.open(
@@ -852,7 +848,8 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 dir_fd=directory_fd,
             )
         except FileNotFoundError:
-            return []
+            yield None
+            return
         except OSError as exc:
             # O_NOFOLLOW turns a symlinked reference into ELOOP; keep the
             # public contract that unsafe references raise a registry error
@@ -872,65 +869,80 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 raise ProjectRegistryError(
                     "project session references exceed the limit"
                 )
-            # Parse incrementally.  In particular, never materialize the
-            # complete file and a split-lines copy (the old implementation
-            # briefly used roughly 2x the configured maximum).
-            records: list[dict[str, object]] = []
-            pending = bytearray()
-            total = 0
-            line_count = 0
-
-            def consume(line: bytes) -> None:
-                nonlocal line_count
-                if len(line) > MAX_SESSION_REFERENCE_SIZE:
-                    raise ProjectRegistryError("project session reference is too large")
-                try:
-                    value = cls._decode_session_link(json.loads(line.decode("utf-8")))
-                except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
-                    raise ProjectRegistryError(
-                        "malformed project session reference"
-                    ) from exc
-                line_count += 1
-                if line_count > MAX_SESSION_REFERENCES:
-                    raise ProjectRegistryError(
-                        "project session references exceed the limit"
-                    )
-                records.append(value)
-
-            while total <= maximum:
-                data = os.read(fd, min(64 * 1024, maximum + 1 - total))
-                if not data:
-                    break
-                total += len(data)
-                pending.extend(data)
-                while True:
-                    try:
-                        position = pending.index(10)
-                    except ValueError:
-                        if len(pending) > MAX_SESSION_REFERENCE_SIZE:
-                            raise ProjectRegistryError(
-                                "project session reference is too large"
-                            )
-                        break
-                    consume(bytes(pending[:position]))
-                    del pending[: position + 1]
-            if total > maximum:
-                raise ProjectRegistryError(
-                    "project session references exceed the limit"
-                )
-            if pending and repair_torn_final:
-                # A crash can leave one unterminated final record. Readers must
-                # ignore that bounded tail without requiring a later append;
-                # writers may additionally repair it while holding the lock.
-                complete = total - len(pending)
-                os.ftruncate(fd, complete)
-            return records
+            yield fd
         except OSError as exc:
             raise ProjectRegistryError(
                 "project session references are unreadable"
             ) from exc
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _read_session_record_bytes(fd: int, *, repair_torn_final: bool) -> bytes:
+        """Read complete bounded JSONL records and optionally remove a torn tail."""
+        maximum = MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
+        data = bytearray()
+        last_newline = 0
+        while len(data) <= maximum:
+            chunk = os.read(fd, min(64 * 1024, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            newline = data.rfind(b"\n", last_newline)
+            if newline >= 0:
+                last_newline = newline + 1
+            if len(data) - last_newline > MAX_SESSION_REFERENCE_SIZE:
+                raise ProjectRegistryError("project session reference is too large")
+        if len(data) > maximum:
+            raise ProjectRegistryError("project session references exceed the limit")
+        if last_newline != len(data):
+            if repair_torn_final:
+                os.ftruncate(fd, last_newline)
+            del data[last_newline:]
+        return bytes(data)
+
+    @classmethod
+    def _decode_session_record_line(cls, line: bytes) -> dict[str, object]:
+        if len(line) > MAX_SESSION_REFERENCE_SIZE:
+            raise ProjectRegistryError("project session reference is too large")
+        try:
+            return cls._decode_session_link(json.loads(line.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+            raise ProjectRegistryError("malformed project session reference") from exc
+
+    @classmethod
+    def _decode_session_records(cls, data: bytes) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        start = 0
+        while start < len(data):
+            end = data.index(b"\n", start)
+            records.append(cls._decode_session_record_line(data[start:end]))
+            if len(records) > MAX_SESSION_REFERENCES:
+                raise ProjectRegistryError(
+                    "project session references exceed the limit"
+                )
+            start = end + 1
+        return records
+
+    @classmethod
+    def _read_session_records(
+        cls, directory_fd: int, *, repair_torn_final: bool
+    ) -> list[dict[str, object]]:
+        """Read the bounded JSONL reference file from one pinned regular fd."""
+        with cls._open_session_records(
+            directory_fd, repair_torn_final=repair_torn_final
+        ) as fd:
+            if fd is None:
+                return []
+            try:
+                data = cls._read_session_record_bytes(
+                    fd, repair_torn_final=repair_torn_final
+                )
+                return cls._decode_session_records(data)
+            except OSError as exc:
+                raise ProjectRegistryError(
+                    "project session references are unreadable"
+                ) from exc
 
     def list_session_links(
         self, project_id: str, *, limit: int = 100
@@ -984,9 +996,30 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
                 if len(payload) > MAX_SESSION_REFERENCE_SIZE:
                     raise ProjectRegistryError("project session reference is too large")
-                existing = self._read_session_records(
+                with self._open_session_records(
                     directory_fd, repair_torn_final=True
+                ) as fd:
+                    data = (
+                        b""
+                        if fd is None
+                        else self._read_session_record_bytes(fd, repair_torn_final=True)
+                    )
+                session_id_field = b'"session_id": ' + json.dumps(session_id).encode(
+                    "utf-8"
                 )
+                start = 0
+                while (end := data.find(b"\n", start)) >= 0:
+                    line = data[start:end]
+                    if session_id_field in line:
+                        try:
+                            candidate = self._decode_session_record_line(line)
+                        except ProjectRegistryError:
+                            pass
+                        else:
+                            if candidate["session_id"] == session_id:
+                                return
+                    start = end + 1
+                existing = self._decode_session_records(data)
                 if any(item["session_id"] == session_id for item in existing):
                     return
                 if len(existing) >= MAX_SESSION_REFERENCES:

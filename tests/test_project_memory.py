@@ -97,6 +97,93 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
     session.store.close()
 
 
+def _linked_session_fixture(tmp_path: Path):
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+    opened = SessionManager(home).create(provider="codex", model="fake", cwd=repository)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    links_path = home / "projects" / project.project_id / "sessions.jsonl"
+    return home, project, session_id, links_path
+
+
+def test_linked_session_reopen_decodes_only_matching_registry_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    target = json.loads(links_path.read_text(encoding="utf-8"))
+    records = [
+        {
+            **target,
+            "session_id": f"decoy-{index}",
+            "transcript_path": f"/decoy/{index}",
+        }
+        for index in range(500)
+    ]
+    records.append(target)
+    links_path.write_text(
+        "".join(f"{json.dumps(record, sort_keys=True)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    decoded = 0
+    real_decode = ProjectRegistry._decode_session_link
+
+    def count_decode(value: object) -> dict[str, object]:
+        nonlocal decoded
+        decoded += 1
+        return real_decode(value)
+
+    monkeypatch.setattr(
+        ProjectRegistry, "_decode_session_link", staticmethod(count_decode)
+    )
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert decoded <= 1
+
+
+def test_linked_session_reopen_ignores_unrelated_malformed_registry_row(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    original = links_path.read_bytes()
+    malformed = b"{not valid json}\n" + original
+    links_path.write_bytes(malformed)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+
+    assert links_path.read_bytes() == malformed
+
+
+def test_new_session_link_preserves_registry_validation_and_append(
+    tmp_path: Path,
+) -> None:
+    home, _, session_id, links_path = _linked_session_fixture(tmp_path)
+    malformed = b"{not valid json}\n"
+    links_path.write_bytes(malformed)
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    assert links_path.read_bytes() == malformed
+
+    links_path.write_bytes(b"")
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    first_append = links_path.read_bytes()
+    records = [json.loads(line) for line in first_append.splitlines()]
+    assert [record["session_id"] for record in records] == [session_id]
+
+    reopened = SessionManager(home).open(session_id)
+    reopened.store.close()
+    assert links_path.read_bytes() == first_append
+
+
 def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
