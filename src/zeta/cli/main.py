@@ -28,11 +28,11 @@ from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, account_home, env_home
-from ..core.session_files import TerminalRenderError
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
 from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
+from ..tui.errors import TerminalRenderError
 
 
 def _tool_patterns_arg(value: str) -> str:
