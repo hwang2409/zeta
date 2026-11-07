@@ -39,6 +39,7 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..providers.factory import build_backend, credential_store
+from ..runtime.offload import await_joined_offload
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -57,7 +58,7 @@ from .presets import (
     compose_system_prompt,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
+from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 
@@ -242,6 +243,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if gate_result.outcome == "task_safety_expired":
+                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
@@ -471,6 +474,7 @@ async def _build_child_loop(
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
             project_registry=loop.project_registry,
+            child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
@@ -488,7 +492,7 @@ async def _build_child_loop(
         return child_loop, child_policy
     except asyncio.CancelledError:
         if child_registry is not None:
-            cleanup = asyncio.create_task(child_registry.close())
+            cleanup = asyncio.create_task(child_registry.close(background_task_cause="child spawn setup canceled"))
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
@@ -496,7 +500,7 @@ async def _build_child_loop(
         raise
     except BaseException:
         if child_registry is not None:
-            await child_registry.close()
+            await child_registry.close(background_task_cause="child spawn setup failed")
         raise
 
 
@@ -681,7 +685,7 @@ async def run_agent_tool(
             background=background,
         ),
     )
-    if loop.root_project_id is not None and loop.project_registry is not None:
+    if loop._child_lineage_publisher is not None:
         link = {
             "project_id": loop.root_project_id,
             "session_id": child_instance_id,
@@ -690,26 +694,7 @@ async def run_agent_tool(
             "transcript_path": child_path,
         }
         try:
-            from ..core.session_links import (
-                persist_pending_child_link,
-                remove_pending_child_link,
-            )
-
-            # Record the durable lineage intent in the ROOT session's pending
-            # index (directory-fsynced) BEFORE the registry append, so the root's
-            # reconciliation can recover this child link after a crash or a
-            # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(
-                loop.root_session_dir, link, loop.store._storage_lease
-            )
-            loop.project_registry.record_session(
-                loop.root_project_id,
-                session_id=child_instance_id,
-                transcript_path=child_path,
-                role="worker",
-                parent_session_id=parent_identity,
-            )
-            remove_pending_child_link(loop.root_session_dir, child_instance_id)
+            await await_joined_offload(loop._child_lineage_publisher.publish, link)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
@@ -1063,8 +1048,8 @@ async def run_agent_tool(
             loop._background_owner.mark_store_finished(child_store)
             loop._background_owner.release_unused_stores()
 
-        async def close_background_child() -> tuple[str, ...]:
-            return tuple(await child_loop.close(cancel_background=False))
+        async def close_background_child(cause: str) -> tuple[str, ...]:
+            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
 
         async def finish_background() -> None:
             await finish_background_child(
@@ -1154,8 +1139,7 @@ async def run_agent_tool(
             (child_task, abort_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # A completed child wins a same-turn abort race so its descendants can
-        # be adopted by receipt processing rather than canceled as unreachable.
+        # A completed child wins an abort race so descendants can be adopted by receipt processing.
         if child_task in done:
             result = child_task.result()
             if follow_up_loop:
@@ -1184,8 +1168,7 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(cancel_background=False)
-
+        await child_loop.close(cancel_background=False, background_task_cause=child_cleanup_details("foreground", child_task.cancelled())[0])
 
 def _child_base_system_prompt(
     loop: AgentLoop,

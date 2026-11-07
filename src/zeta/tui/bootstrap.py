@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import threading
-import time
 from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
@@ -15,10 +14,6 @@ from typing import TYPE_CHECKING, Any
 from rich.text import Text
 
 from ..accounts import AccountId, AccountStore, account_provider
-from ..agent.pending_delivery import (
-    SHUTDOWN_DELIVERY_TIMEOUT_SECONDS,
-    NotificationInput,
-)
 from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
@@ -152,48 +147,15 @@ def background_notice(
         # this decision independent of user-controlled command text.
         message = None
     elif isinstance(notice, BackgroundTaskShutdownNotice) and notice.tasks:
-        # Macro shutdowns retain their durable canceled receipt. Ordinary
-        # run_background tasks have no shutdown notification, so keep the
-        # immediate shutdown notice for those task ids.
-        task_ids = [
-            task_id
-            for task_id, owner in notice.tasks
-            if owner == "run_background"
-        ]
-        message = (
-            "background tasks killed on session exit: " + ", ".join(task_ids)
-            if task_ids
-            else None
-        )
+        # Shutdown task exits and macro cancellations have durable receipts.
+        message = None
     else:
         message = notice.message if not isinstance(notice, str) else notice
-    output_failed = False
     if message is not None:
         try:
             app._print(Text(message, style=_theme.DIM))
         except (ValueError, BrokenPipeError, OSError):
-            output_failed = True
-    if output_failed and isinstance(notice, BackgroundTaskShutdownNotice):
-        for task_id, owner in notice.tasks:
-            if owner != "run_background":
-                continue
-            app.loop._create_task(
-                app.loop.step_delivery.produce(
-                    NotificationInput(
-                        "task_exit",
-                        {
-                            "task_id": task_id,
-                            "headline": "canceled on session exit",
-                            "exit_code": None,
-                            "output_tail": "",
-                            "background_owner": "run_background",
-                            "background_phase": "session_shutdown",
-                        },
-                        dedupe_key=task_id,
-                        deadline=time.monotonic() + SHUTDOWN_DELIVERY_TIMEOUT_SECONDS,
-                    )
-                )
-            )
+            pass
     try:
         app._invalidate_prompt()
     except (ValueError, BrokenPipeError, OSError):

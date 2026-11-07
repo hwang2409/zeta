@@ -95,6 +95,7 @@ from zeta.server.server import _Client
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.tui.render import render_event
 
 # A hang guard for waits on real frames, not a speed limit: a loaded CI
 # runner can take more than a few seconds between frames.
@@ -872,13 +873,22 @@ class PerActorFakeBackend:
             and self.child_calls[child_prompt] == self.gated_child_call
         ):
             self.child_started[child_prompt].set()
-            await self.release_children.wait()
+            try:
+                await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
+            except TimeoutError as error:
+                raise AssertionError("children were not released") from error
         stream = backend.complete(messages, tool_schemas)
         if child_prompt is None and self.parent.calls:
-            await asyncio.gather(
-                *(started.wait() for started in self.child_started.values())
-            )
             try:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(started.wait() for started in self.child_started.values())
+                        ),
+                        TIMEOUT,
+                    )
+                except TimeoutError as error:
+                    raise AssertionError("child did not start") from error
                 yield await anext(stream)
             finally:
                 self.release_children.set()
@@ -3803,12 +3813,13 @@ async def test_session_swap_rejects_pending_notification_handoff(
         {"prompt": "wait", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend(
+    backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[parent_call]),
-            ScriptedTurn(tool_calls=[child_call]),
             ScriptedTurn([TextContent("parent done")]),
-        ]
+        ],
+        {"wait": [ScriptedTurn(tool_calls=[child_call])]},
+        parent_prompt="start",
     )
     server = ZetaServer(
         provider="codex",
@@ -4800,7 +4811,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         written = await original_write(target, payload)
         if b'"sub_agent_receipt"' in payload and not published.is_set():
             published.set()
-            await release_publication.wait()
+            await asyncio.wait_for(release_publication.wait(), TIMEOUT)
         return written
 
     monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
@@ -4818,7 +4829,9 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
-        await asyncio.gather(first_turn, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(first_turn, return_exceptions=True), 10
+        )
         assert [
             entry.id for entry in server.runtime.opened.store.agent_notifications()
         ] == [notification.id]
@@ -4860,8 +4873,14 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+        task_id="task-1",
+        command="printf hi",
+        exit_code=0,
+        output_tail="hi",
+        note=task_cause,
+        background_metadata=("run_background", "task_kill"),
     )
     store._append_row(
         "notification",
@@ -4893,10 +4912,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
-        assert (
-            "background task task-1 exited"
-            in by_kind["task_exited"]["content"][0]["text"]
-        )
+        assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
     finally:
@@ -4904,8 +4920,15 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 
 @pytest.mark.asyncio
-async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
-    # Protocol 1.2 gives known notification kinds explicit events.
+@pytest.mark.parametrize(
+    "task_cause",
+    ["foreground child completion cleanup", "tool registry closed"],
+    ids=["child-cleanup", "registry-close"],
+)
+async def test_close_kill_cause_reaches_live_serve_event(
+    tmp_path: Path, task_cause: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
@@ -4913,38 +4936,125 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         provider="codex",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
-    store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
-    )
-    store.append_agent_notification(
-        "child-1",
-        child_session_path="/tmp/child-1",
-        description="child",
-        status="completed",
-        text="child done",
+    reader, writer, session_id = await _ready_extensions(server)
+    writer.close()
+    await asyncio.wait_for(writer.wait_closed(), TIMEOUT)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
     )
     try:
-        writer.close()
-        await writer.wait_closed()
-        await asyncio.sleep(0.05)
-        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        frames = await _request(
+        hello_frames = await _request(
             reader, writer, 4, "hello", {"protocol_version": "1.2"}
         )
-        frames += await _frames_until_event(reader, "turn_end")
+        store = server.runtime.opened.store
+        store.append_agent_notification(
+            "child-1",
+            child_session_path="/tmp/child-1",
+            description="child",
+            status="completed",
+            text="child done",
+        )
+        registry = server.runtime.loop.tool_registry.background_tasks
+        task_id, _pid = await registry.start("sleep 30", tmp_path)
+        admission_started = threading.Event()
+        admission_held_past_old_deadline = threading.Event()
+        release_admission = threading.Event()
+        hold_observer: threading.Thread | None = None
+        if task_cause == "tool registry closed":
+            flow = await server.runtime.loop._ensure_step_delivery()
+            original_produce = flow.produce
+
+            async def gated_produce(item):
+                if getattr(item, "kind", None) == "task_exit":
+                    admission_started.set()
+                    assert await asyncio.wait_for(
+                        asyncio.to_thread(release_admission.wait, 10), 10
+                    ), "task-exit admission was not released"
+                return await original_produce(item)
+
+            monkeypatch.setattr(flow, "produce", gated_produce)
+
+            def observe_old_deadline() -> None:
+                if admission_started.wait(10) and not release_admission.wait(1.1):
+                    admission_held_past_old_deadline.set()
+
+            hold_observer = threading.Thread(target=observe_old_deadline)
+            hold_observer.start()
+        registry.begin_shutdown(task_cause)
+        close_task = asyncio.create_task(registry.close())
+        try:
+            if hold_observer is not None:
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(admission_held_past_old_deadline.wait, 10), 10
+                )
+                release_admission.set()
+            close_result = await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
+            assert close_result == [(task_id,)]
+        finally:
+            release_admission.set()
+            if not close_task.done():
+                close_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
+            if hold_observer is not None:
+                await asyncio.wait_for(asyncio.to_thread(hold_observer.join, 10), 10)
+
+        history_frames = await _request(
+            reader,
+            writer,
+            6,
+            "session_history",
+            {"session_id": session_id},
+        )
+        history = history_frames[-1]["result"]["messages"]
+        task_rows = [
+            row
+            for row in history
+            if row.get("notification", {}).get("kind") == "task_exited"
+        ]
+        assert len(task_rows) == 1
+        assert task_cause in task_rows[0]["content"][0]["text"]
+        notification = next(
+            entry
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == "task_exited"
+        )
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": notification.id,
+                    **notification.data,
+                    "tui_presented": store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
+                },
+            )
+        )
+        assert rendered is not None
+        assert task_cause in rendered.plain
+
+        task_frames = history_frames
+        if not any(
+            frame.get("params", {}).get("event") == "turn_end"
+            for frame in task_frames
+        ):
+            task_frames += await _frames_until_event(reader, "turn_end")
         events = [
             frame["params"]
-            for frame in frames
+            for frame in task_frames + hello_frames
             if frame.get("params", {}).get("event")
             in {"task_exit_notification", "sub_agent_receipt"}
         ]
         task_events = [e for e in events if e["event"] == "task_exit_notification"]
         receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
         assert len(task_events) == 1
-        assert task_events[0]["data"]["task_id"] == "task-1"
+        assert task_events[0]["data"]["task_id"] == task_id
         assert task_events[0]["data"]["kind"] == "task_exited"
+        assert task_events[0]["data"]["note"] == task_cause
         assert {
             e["data"].get("kind", "agent_completion") for e in receipt_events
         } == {"agent_completion"}
@@ -6959,7 +7069,8 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
-def test_memory_command_parity_tui_and_serve() -> None:
+@pytest.mark.asyncio
+async def test_memory_command_parity_tui_and_serve() -> None:
     from types import SimpleNamespace
 
     from zeta.tui.slash_handlers import SlashHandlerMixin
@@ -6998,8 +7109,14 @@ def test_memory_command_parity_tui_and_serve() -> None:
         metadata=SimpleNamespace(project_id="p"),
         manager=SimpleNamespace(project_registry=Registry()),
     )
-    tui_outputs = [SlashHandlerMixin.slash_memory(tui, command) for command in ("log", "undo", "accept state.md")]
-    serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
+    tui_outputs = [
+        await SlashHandlerMixin.slash_memory(tui, command)
+        for command in ("log", "undo", "accept state.md")
+    ]
+    serve_outputs = [
+        await ServerSlashSession(runtime).slash_memory(command)
+        for command in ("log", "undo", "accept state.md")
+    ]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
@@ -7056,6 +7173,58 @@ async def test_slash_status_maps_compaction_with_or_without_fact_floor(
         assert result["kind"] == "output"
         assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
         assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
+
+
+async def test_serve_project_init_runs_discovery_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    # test-contract: seam observe the real Git subprocess seam through socket RPC
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=workspace,
+        port=0,
+        provider="codex",
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    discovery_threads.clear()
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "project-init",
+                "slash_run",
+                {"session_id": sid, "text": "/project init"},
+            )
+        )[-1]
+
+        project_id = server.runtime.metadata.project_id
+        assert project_id is not None
+        assert response["result"] == {
+            "kind": "output",
+            "text": (
+                f"project: workspace ({project_id})\n"
+                f"root: {workspace.resolve()}\n"
+                "memory: brief, decisions, state, backlog, changelog"
+            ),
+        }
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
     finally:
         await _close(server, writer)
 
@@ -7554,6 +7723,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # `/project init` mutates the session association — must reject.
+        assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
             "kind": "output",
@@ -8689,6 +8860,9 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
 def _serve_switch_rename_race(home_value: str, results: object) -> None:
     home = Path(home_value)
+    from zeta.storage_format import advance
+
+    advance(home, expected_epoch=0)
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
@@ -8696,9 +8870,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999)
         )
     AccountStore(home).set_default(first)
-    from zeta.storage_format import advance
-
-    advance(home, expected_epoch=0)
     server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
 
     async def run() -> None:
@@ -9278,4 +9449,270 @@ async def test_slash_run_mcp_credential_evidence_recovery(
         assert logged_out == {"kind": "output", "text": "logged out live."}
         assert (await MCPCredentialStore(home=home).load("live")).token is None
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("gated-call", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    persisted = asyncio.Event()
+    runtime_end = asyncio.Event()
+    runtime_end_handled = asyncio.Event()
+    release = asyncio.Event()
+    original = ConversationStore._to_thread_durable
+    approvals = server.control._approvals
+    original_end = approvals._end_approval
+
+    async def gated_durable(self, function, *args, **kwargs):
+        result = await original(self, function, *args, **kwargs)
+        if function.__name__ == "resolve_approval" and args[0] == "gated-call":
+            persisted.set()
+            await asyncio.wait_for(release.wait(), timeout=10)
+        return result
+
+    async def record_runtime_end(*args, **kwargs):
+        runtime_end.set()
+        await original_end(*args, **kwargs)
+        runtime_end_handled.set()
+
+    # test-contract: seam no public hook exists between durable approval commit and settlement
+    monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
+    # test-contract: seam forces the runtime end event before settlement resumes
+    monkeypatch.setattr(approvals, "_end_approval", record_runtime_end)
+    reader, writer = await _ready(server)
+    frames: list[dict[str, Any]] = []
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "deny",
+                        "params": {"request_id": approval["request_id"]},
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(persisted.wait(), timeout=10)
+        await asyncio.wait_for(runtime_end.wait(), timeout=10)
+        await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
+        release.set()
+        while not _named_events(frames, "turn_end"):
+            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        assert len(_named_events(frames, "approval_end")) == 1
+        assert (
+            names.index("approval_end")
+            < names.index("tool_end")
+            < names.index("turn_end")
+        )
+    finally:
+        release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["oserror", "cancelled"])
+async def test_delegated_history_failure_still_publishes_approval_end_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("history-failure-call", "read", {"path": str(target)})
+    backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    history_write_started = asyncio.Event()
+    history_release = asyncio.Event()
+    original_append = ConversationStore.append_approval_history_async
+
+    async def fail_terminal_history(self, payload):
+        if payload.get("event") == "approval_end":
+            history_write_started.set()
+            if failure == "oserror":
+                raise OSError("forced delegated history failure")
+            await asyncio.wait_for(history_release.wait(), timeout=10)
+        return await original_append(self, payload)
+
+    # test-contract: seam the durable store has no deterministic failure hook
+    monkeypatch.setattr(
+        ConversationStore, "append_approval_history_async", fail_terminal_history
+    )
+    reader, writer = await _ready(server)
+    frames: list[dict[str, Any]] = []
+    try:
+        async with asyncio.timeout(10):
+            await _request(reader, writer, 3, "send", {"text": "delegate"})
+            while not _named_events(frames, "approval_request"):
+                frames.append(await _read(reader))
+            approval = _named_events(frames, "approval_request")[0]
+            assert approval["delegated"] is True
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 4,
+                            "method": "deny",
+                            "params": {"request_id": approval["request_id"]},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            await history_write_started.wait()
+            settlement = None
+            if failure == "cancelled":
+                record = server.control._approvals.state.records[
+                    (approval["agent_instance_id"], child_call.id)
+                ]
+                settlement = record.settlement
+                assert settlement is not None
+                settlement.cancel()
+            while not _named_events(frames, "approval_end"):
+                frames.append(await _read(reader))
+            names = [frame.get("params", {}).get("event") for frame in frames]
+            child_start = max(
+                index for index, name in enumerate(names) if name == "turn_start"
+            )
+            approval_end = names.index("approval_end")
+            assert len(_named_events(frames, "approval_end")) == 1
+            assert child_start < approval_end
+            key = (approval["agent_instance_id"], child_call.id)
+            if settlement is not None:
+                with pytest.raises(asyncio.CancelledError):
+                    await settlement
+            else:
+                while not _named_events(frames, "error"):
+                    frames.append(await _read(reader))
+                error = _named_events(frames, "error")[0]
+                names = [frame.get("params", {}).get("event") for frame in frames]
+                assert approval_end < names.index("error")
+                assert error["error"] == {
+                    "code": "server_error",
+                    "message": "approval history could not be persisted",
+                }
+                assert error["data"] == {"request_id": approval["request_id"]}
+                status_frames = await _request(reader, writer, 5, "status")
+                frames.extend(status_frames)
+                assert status_frames[-1]["result"]["state"] == "idle"
+                health = server.control._approvals.state.health
+                assert health is not None
+                assert health.code == "approval_persistence_failed"
+            names = [frame.get("params", {}).get("event") for frame in frames]
+            child_terminals = [
+                index
+                for index, name in enumerate(names)
+                if index > child_start and name in {"tool_end", "turn_end"}
+            ]
+            assert all(approval_end < index for index in child_terminals)
+            assert key not in server.control._approvals.state.records
+    finally:
+        history_release.set()
+        await asyncio.wait_for(_close(server, writer), timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("backpressured-call", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    controller = server.connections.controller_metadata()
+    assert controller is not None
+    connection = controller.connection
+    original_write = connection._write_physical
+    original_notify = server.control._notify
+    tool_end_started = asyncio.Event()
+
+    async def gated_write(payload: bytes) -> bool:
+        frame = json.loads(payload)
+        if frame.get("params", {}).get("event") == "approval_end":
+            write_started.set()
+            await asyncio.wait_for(release_write.wait(), timeout=10)
+        return await original_write(payload)
+
+    async def record_tool_end(event, *args, **kwargs):
+        if event == "tool_end":
+            tool_end_started.set()
+        return await original_notify(event, *args, **kwargs)
+
+    # test-contract: seam the transport has no public physical-write backpressure hook
+    monkeypatch.setattr(connection, "_write_physical", gated_write)
+    # test-contract: seam wire output cannot expose an admitted frame behind backpressure
+    monkeypatch.setattr(server.control, "_notify", record_tool_end)
+    frames: list[dict[str, Any]] = []
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "deny",
+                        "params": {"request_id": approval["request_id"]},
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        async with asyncio.timeout(10):
+            await write_started.wait()
+            await tool_end_started.wait()
+            release_write.set()
+            while not _named_events(frames, "turn_end"):
+                frames.append(await _read(reader))
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        assert len(_named_events(frames, "approval_end")) == 1
+        assert (
+            names.index("approval_end")
+            < names.index("tool_end")
+            < names.index("turn_end")
+        )
+    finally:
+        release_write.set()
         await _close(server, writer)
