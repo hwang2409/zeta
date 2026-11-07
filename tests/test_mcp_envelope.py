@@ -31,7 +31,7 @@ from zeta.tui.app import TUIApp
 _REAL_ASYNC_HTTP = httpx.AsyncHTTPTransport.handle_async_request
 
 LIMIT = 512
-LIMIT_ERROR = f"MCP tool local__echo exceeded the {LIMIT} response limit"
+LIMIT_ERROR = f"MCP tool local__echo exceeded the {LIMIT} bytes response limit"
 
 
 def _limits(*, spill_after: int = 64) -> SimpleNamespace:
@@ -273,7 +273,7 @@ async def test_notification_get_event_overflow_degrades_once(
             await asyncio.sleep(0.001)
         assert mount.statuses["local"].state == "degraded"
         assert failures == [
-            f"MCP HTTP notification event exceeded the {LIMIT} response limit"
+            f"MCP HTTP notification event exceeded the {LIMIT} bytes response limit"
         ]
         assert get_requests == 1
         assert mount._actors["local"]._requests == {}

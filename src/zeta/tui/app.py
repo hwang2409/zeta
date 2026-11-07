@@ -90,7 +90,6 @@ from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .paste_runtime import PasteRuntime
 from .render import (
-    render_event,
     render_markdown,
     render_thought,
     render_thought_live_delta,
@@ -362,6 +361,7 @@ class TUIApp(
             self.console,
             lambda: app._full_screen_active(),
             lambda renderable: app._print(renderable),
+            self.loop.store.agent_children,
         )
         self.loop.set_background_event_sink(
             lambda event: app._handle_background_event(event)
@@ -825,7 +825,7 @@ class TUIApp(
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
         if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
-            self._print_unit(render_event(event))
+            self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()
             return
         if event.type in {

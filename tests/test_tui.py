@@ -8540,16 +8540,37 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
             FakeBackend([]),
             ConversationStore(tmp_path / "sessions"),
             skip_mcp_mount=True,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
     )
 
+    startup_ready = asyncio.Event()
+    rebuild_finished = asyncio.Event()
+    notice_emitted = asyncio.Event()
+    rebuild_transcript = app._rebuild_transcript_async
+    finish_startup_replay = app._finish_startup_replay
+
+    async def tracked_rebuild(*, batch_size: int = 1) -> bool:
+        try:
+            return await rebuild_transcript(batch_size=batch_size)
+        finally:
+            rebuild_finished.set()
+
     async def ensure_mcp_servers() -> None:
+        await asyncio.wait_for(rebuild_finished.wait(), timeout=5)
         assert app.loop._mcp_notice_sink is not None
         app.loop._mcp_notice_sink("mcp · prompts unavailable")
+        notice_emitted.set()
 
+    def tracked_finish_startup_replay(*, completed: bool) -> None:
+        finish_startup_replay(completed=completed)
+        if completed and rebuild_finished.is_set() and notice_emitted.is_set():
+            startup_ready.set()
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", tracked_rebuild)
+    monkeypatch.setattr(app, "_finish_startup_replay", tracked_finish_startup_replay)
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -8564,13 +8585,11 @@ skill_catalog=SkillCatalog.empty(),
             multiline=True,
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(startup_ready.wait(), timeout=5)
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, timeout=5)
 
-    assert "prompts unavailable" in Text.from_ansi(
-        app._transcript.render(120)
-    ).plain
+    assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
