@@ -616,7 +616,12 @@ class ContextAssembler(ContextMarkerMixin):
             committed_tokens = self._count(committed_messages)
         pinned_user = (
             items[latest_user]
-            if latest_user is not None and latest_user < boundary
+            if latest_user is not None
+            and latest_user < boundary
+            and not any(
+                self._is_completed_assistant(item)
+                for item in items[latest_user + 1 : boundary]
+            )
             else None
         )
         prefix_has_uncompacted_items = any(
@@ -848,6 +853,17 @@ class ContextAssembler(ContextMarkerMixin):
                 else _EvictionPlan("none-fallback")
             )
         view = eviction_view(records, result)
+        pinned_message = None
+        if latest_user_item is not None:
+            pinned_message = Message(
+                latest_user_item.message.role,
+                list(latest_user_item.message.content),
+                tool_result=latest_user_item.message.tool_result,
+                metadata={
+                    **latest_user_item.message.metadata,
+                    "source_seq": latest_user_item.entry.seq,
+                },
+            )
         view_messages = self._eviction_view_messages(view)
         proposed = floor_plan.proposed_messages(
             system_messages,
@@ -874,7 +890,7 @@ class ContextAssembler(ContextMarkerMixin):
             source_start,
             source_end,
             replaces,
-            None if latest_user_item is None else latest_user_item.message,
+            pinned_message,
             tuple(view),
             telemetry,
             floor_plan.floor,
@@ -974,6 +990,22 @@ class ContextAssembler(ContextMarkerMixin):
             item.message.tool_result is None
             or call_indexes.get(item.message.tool_result.tool_call_id, -1) >= boundary
             for item in items[boundary:]
+        )
+
+    @staticmethod
+    def _is_completed_assistant(item: _ContextItem) -> bool:
+        return (
+            item.entry is not None
+            and item.entry.type == "message"
+            and item.message.role is MessageRole.ASSISTANT
+            and (
+                item.message.metadata.get(ASSISTANT_RESPONSE_STATE)
+                == ASSISTANT_RESPONSE_COMPLETED
+                or (
+                    ASSISTANT_RESPONSE_STATE not in item.message.metadata
+                    and not item.message.metadata.get(FAILED_TURN_MARKER)
+                )
+            )
         )
 
     @staticmethod

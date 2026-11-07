@@ -28,10 +28,33 @@ class ContextMarkerMixin:
             view = entry.data["view"]
             valid = valid_eviction_view(entry, active_source_seqs)
             if valid:
-                messages = ContextMarkerMixin._eviction_view_messages(view)
-                messages.extend(
-                    _fact_floor.projected_fact_floor(entry.data.get("fact_floor"))
+                pinned = entry.data.get("pinned_message")
+                messages = ContextMarkerMixin._eviction_view_messages(
+                    view,
+                    None if pinned is None else Message.from_dict(pinned),
                 )
+                floor = _fact_floor.projected_fact_floor(entry.data.get("fact_floor"))
+                pinned_rendered = None
+                if pinned is not None:
+                    pinned_value = Message.from_dict(pinned)
+                    pinned_rendered = Message(
+                        pinned_value.role,
+                        list(pinned_value.content),
+                        tool_result=pinned_value.tool_result,
+                        metadata={
+                            key: value
+                            for key, value in pinned_value.metadata.items()
+                            if key != "source_seq"
+                        },
+                    )
+                if (
+                    pinned_rendered is not None
+                    and messages
+                    and messages[-1] == pinned_rendered
+                ):
+                    messages[-1:] = [*floor, messages[-1]]
+                else:
+                    messages.extend(floor)
             else:
                 messages = [
                     normalize_evicted_tool_result(
@@ -57,19 +80,77 @@ class ContextMarkerMixin:
                 entry.data["summary"],
             )
             items = [_ContextItem(entry, message, fixed=True) for message in messages]
-        pinned = entry.data.get("pinned_message")
-        if pinned is not None:
-            items.append(_ContextItem(entry, Message.from_dict(pinned)))
+        if entry.data.get("kind") != EVICTION_KIND:
+            pinned = entry.data.get("pinned_message")
+            if pinned is not None:
+                items.append(_ContextItem(entry, Message.from_dict(pinned)))
         return items
 
     @staticmethod
-    def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
+    def _eviction_view_messages(
+        view: Sequence[Mapping[str, Any]], pinned: Message | None = None
+    ) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
         messages: list[Message] = []
+        pinned_seq = None if pinned is None else pinned.metadata.get("source_seq")
+        projected_pinned = pinned
+        if pinned is not None and "source_seq" in pinned.metadata:
+            projected_pinned = Message(
+                pinned.role,
+                list(pinned.content),
+                tool_result=pinned.tool_result,
+                metadata={
+                    key: value
+                    for key, value in pinned.metadata.items()
+                    if key != "source_seq"
+                },
+            )
+        inserted = False
         for index, item in enumerate(view):
-            messages.append(ContextMarkerMixin._eviction_view_message(item))
+            seq = item["seq"]
+            if pinned is not None and type(pinned_seq) is int and seq == pinned_seq:
+                messages.append(projected_pinned)
+                inserted = True
+            elif pinned is not None and not inserted and (
+                type(pinned_seq) is int and seq > pinned_seq
+            ):
+                messages.extend(
+                    (projected_pinned, ContextMarkerMixin._eviction_view_message(item))
+                )
+                inserted = True
+            else:
+                messages.append(ContextMarkerMixin._eviction_view_message(item))
             if index % 4 == 3:
                 cooperative_pause()
+        if pinned is not None and not inserted:
+            if type(pinned_seq) is not int and any(
+                message.role is projected_pinned.role
+                and message.content == projected_pinned.content
+                and message.tool_result == projected_pinned.tool_result
+                and {
+                    key: value
+                    for key, value in message.metadata.items()
+                    if key != "source_seq"
+                }
+                == projected_pinned.metadata
+                for message in messages
+            ):
+                inserted = True
+            elif type(pinned_seq) is not int:
+                # Legacy markers did not persist the request sequence. Their
+                # view retains user turns, so place the request after the last
+                # retained user turn and before later assistant updates.
+                last_user = max(
+                    (
+                        i
+                        for i, message in enumerate(messages)
+                        if message.role is MessageRole.USER
+                    ),
+                    default=-1,
+                )
+                messages.insert(last_user + 1, projected_pinned)
+            else:
+                messages.append(projected_pinned)
         return messages
 
     @staticmethod
