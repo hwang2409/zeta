@@ -918,6 +918,7 @@ async def test_cancelled_mutation_releases_lock_and_refresh_adopts_commit(
             finished.set()
 
     loop_thread = threading.get_ident()
+    # test-contract: durability force cancellation after the durable write starts
     monkeypatch.setattr(manager, "_atomic_json", gated_write)
     task = asyncio.create_task(
         manager.add("committed", scope="user", command=sys.executable)
