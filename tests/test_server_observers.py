@@ -12,8 +12,9 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
-from tests.test_server import TIMEOUT, _close, _connect, _read, _request
+from tests.test_server import TIMEOUT, _connect, _read, _request
 from zeta.protocol.types import (
     Message,
     MessageOrigin,

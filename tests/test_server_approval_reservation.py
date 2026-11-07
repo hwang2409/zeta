@@ -17,10 +17,10 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _frames_until_event,
     _read_raw,
@@ -1364,7 +1364,6 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy = server.runtime.policy
     assert policy is not None
-    closed = False
     late: ConversationStore | None = None
     try:
         policy.register_delegated(request, child, child_instance_id="child")
@@ -1375,7 +1374,6 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
             await cleanup
 
         await close_serve(server, writer)
-        closed = True
         late = ConversationStore(tmp_path / "late-child")
         late_call = ToolCall("late-call", "read", {"path": "late"})
         late.append_message_with_approval_requests(
@@ -1391,8 +1389,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
-        if not closed:
-            await close_serve(server, writer)
+        await close_serve(server, writer)
         if late is not None:
             late.close()
         child.close()
