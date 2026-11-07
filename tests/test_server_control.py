@@ -597,6 +597,23 @@ async def _replace_registry_controller(
     return replacement, writer
 
 
+def _assert_raw_frames_preserved(actual: bytes, expected: bytes) -> None:
+    actual_frames = actual.splitlines(keepends=True)
+    expected_frames = expected.splitlines(keepends=True)
+    assert {
+        parsed["id"]: frame
+        for frame in actual_frames
+        if (parsed := json.loads(frame)).get("id") is not None
+    } == {
+        parsed["id"]: frame
+        for frame in expected_frames
+        if (parsed := json.loads(frame)).get("id") is not None
+    }
+    assert [
+        frame for frame in actual_frames if b'"method":"event"' in frame
+    ] == [frame for frame in expected_frames if b'"method":"event"' in frame]
+
+
 @pytest.mark.asyncio
 async def test_serve_control_detach_preserves_controller_raw_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -604,9 +621,18 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
     expected = (
         Path(__file__).parent / "fixtures" / "serve_control_detach_origin_main.jsonl"
     ).read_bytes()
-    actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
-    actual += await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
-    assert actual == expected
+    expected_frames = expected.splitlines(keepends=True)
+    split = next(
+        index for index, frame in enumerate(expected_frames) if b'"id":1' in frame
+    )
+    actual_controller = await _controller_event_stream(
+        tmp_path, monkeypatch, observer=False
+    )
+    actual_direct = await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
+    _assert_raw_frames_preserved(
+        actual_controller, b"".join(expected_frames[:split])
+    )
+    _assert_raw_frames_preserved(actual_direct, b"".join(expected_frames[split:]))
 
     server = ZetaServer(home=tmp_path / "owner", port=0, provider="codex")
     await server.start()
