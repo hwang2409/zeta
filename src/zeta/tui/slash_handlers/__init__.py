@@ -112,6 +112,16 @@ class SlashHandlerMixin:
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
+        viewed_path = self._viewed_session_path()
+        if viewed_path == self.loop.store.session_dir:
+            viewed_health = self.loop.project_context_health
+        else:
+            viewed_loop = self.loop._background_owner.project_context_loops.get(
+                viewed_path.name
+            )
+            viewed_health = (
+                viewed_loop.project_context_health if viewed_loop is not None else None
+            )
         return build_slash_status(
             capture_slash_status(
                 self.loop,
@@ -122,7 +132,10 @@ class SlashHandlerMixin:
                 vim_mode=self.vim_mode,
                 pending_approvals=pending,
                 usage_tracker=self._usage_tracker,
-                transcript_session_id=self._viewed_session_path().name,
+                project_context_health=(
+                    viewed_health.summary if viewed_health is not None else None
+                ),
+                transcript_session_id=viewed_path.name,
             )
         )
 
