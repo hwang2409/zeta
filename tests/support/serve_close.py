@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-
 _CLOSE_TIMEOUT = 10
 
 
@@ -17,13 +16,13 @@ async def close_serve(server: Any, *writers: Any) -> None:
             writer.close()
             try:
                 await asyncio.wait_for(writer.wait_closed(), _CLOSE_TIMEOUT)
-            except Exception as error:
+            except BaseException as error:  # noqa: BLE001
                 if first_error is None:
                     first_error = error
     finally:
         try:
             await asyncio.wait_for(asyncio.shield(server_task), _CLOSE_TIMEOUT)
-        except Exception as error:
+        except BaseException as error:  # noqa: BLE001
             if first_error is None:
                 first_error = error
     if first_error is not None:

@@ -77,7 +77,7 @@ async def test_close_serve_cleanup_outcomes(
     outcome: BaseException | None = None
     try:
         await close_serve(server, *writers)
-    except BaseException as error:
+    except RuntimeError as error:
         outcome = error
 
     assert server.closed
