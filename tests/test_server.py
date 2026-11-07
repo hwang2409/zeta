@@ -3835,11 +3835,11 @@ async def test_session_swap_rejects_pending_notification_handoff(
         await original_notify(event, *args, **kwargs)
         if event == "agent_end":
             agent_end_published.set()
-            await release_agent_end.wait()
+            await asyncio.wait_for(release_agent_end.wait(), TIMEOUT)
 
     async def gated_notification_turn(*args: object, **kwargs: object):
         notification_captured.set()
-        await release_notification.wait()
+        await asyncio.wait_for(release_notification.wait(), TIMEOUT)
         return await original_notification_turn(*args, **kwargs)
 
     # test-contract: seam serve has no public agent-end publication gate
@@ -3847,6 +3847,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
     )  # test-contract: seam serve has no public notification-turn start gate
+    notification_turn: asyncio.Task[None] | None = None
     try:
         await asyncio.wait_for(
             client.request("hello", "hello", {"protocol_version": "1.1"}), TIMEOUT
@@ -3911,6 +3912,11 @@ async def test_session_swap_rejects_pending_notification_handoff(
     finally:
         release_agent_end.set()
         release_notification.set()
+        if notification_turn is not None:
+            if not notification_turn.done():
+                notification_turn.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(notification_turn, TIMEOUT)
         await client.close()
         await server.close()
 
@@ -3942,6 +3948,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
     original_notification_turn = server.turn_contexts.run_notification_turn
     setup_calls = 0
     termination_calls = 0
+    watcher: asyncio.Task[None] | None = None
     wake_task: asyncio.Task[None] | None = None
     swap: asyncio.Task[list[dict[str, Any]]] | None = None
 
@@ -3957,7 +3964,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
         termination_calls += 1
         if termination_calls == 1:
             setup_entered.set()
-            await release_setup.wait()
+            await asyncio.wait_for(release_setup.wait(), TIMEOUT)
         await original_terminate_approvals(*args, **kwargs)
 
     def observe_schedule_wake(session_id: str) -> None:
@@ -3969,7 +3976,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
 
     async def gated_notification_turn(*args: object, **kwargs: object):
         notification_captured.set()
-        await release_notification.wait()
+        await asyncio.wait_for(release_notification.wait(), TIMEOUT)
         return await original_notification_turn(*args, **kwargs)
 
     # test-contract: seam serve has no public session-setup gate
@@ -4011,7 +4018,9 @@ async def test_session_swap_reserves_child_completion_during_setup(
         assert new_session_id != old_session_id
         release_notification.set()
         if wake_task is not None:
-            result = await asyncio.gather(wake_task, return_exceptions=True)
+            result = await asyncio.wait_for(
+                asyncio.gather(wake_task, return_exceptions=True), TIMEOUT
+            )
             assert result == [None], result
 
         failed = await _request(
@@ -4045,11 +4054,21 @@ async def test_session_swap_reserves_child_completion_during_setup(
         backend.release_child.set()
         release_setup.set()
         release_notification.set()
+        if wake_task is not None:
+            if not wake_task.done():
+                wake_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(wake_task, TIMEOUT)
         if swap is not None:
             if not swap.done():
                 swap.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(swap, TIMEOUT)
+        if watcher is not None:
+            if not watcher.done():
+                watcher.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(watcher, TIMEOUT)
         await _close(server, writer)
 
 
