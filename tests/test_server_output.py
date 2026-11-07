@@ -462,6 +462,7 @@ async def test_active_flush_overflow_sends_control_then_closes(
             await release_hello.wait()
         return await original_write(client, payload)
 
+    # test-contract: seam stalls the real transport during the hello flush
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     try:
         await _send_json(
@@ -540,6 +541,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         await release_deadline.wait()
         deadline_fired.set()
 
+    # test-contract: seam fires the production deadline without a wall clock
     monkeypatch.setattr(
         connections_module,
         "_overflow_deadline_wait",
@@ -562,6 +564,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
             await release_head.wait()
         return await original_write(client, payload)
 
+    # test-contract: seam stalls the real transport until the deadline fires
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     tasks: list[asyncio.Task[bool]] = []
     try:
