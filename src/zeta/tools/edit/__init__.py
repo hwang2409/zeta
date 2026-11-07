@@ -8,6 +8,12 @@ from itertools import pairwise
 from typing import NotRequired, TypedDict
 
 from ...protocol.types import StructuredToolResult
+from .._atomic_replace import (
+    ConcurrentFileChangeError,
+    PublicationGuard,
+    atomic_replace,
+    run_file_worker,
+)
 from .._shared.sandbox import _path_from_fd, open_target
 from ..registry import (
     AbortSignal,
@@ -47,10 +53,99 @@ def _count_overlapping(content: str, old_string: str) -> int:
     return count
 
 
+def _edit_target(
+    registry: ToolRegistry,
+    raw_path: str,
+    replacements: list[tuple[str, str]],
+    *,
+    batch: bool,
+    abort_signal: AbortSignal,
+    execution_context: ToolExecutionContext,
+    publication: PublicationGuard,
+) -> StructuredToolResult:
+    try:
+        for old_string, new_string in replacements:
+            old_string.encode("utf-8")
+            new_string.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("old_string and new_string must be valid UTF-8") from exc
+
+    with open_target(
+        registry,
+        raw_path,
+        flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        execution_context=execution_context,
+    ) as (file_descriptor, _resolved_path):
+        path = _path_from_fd(file_descriptor)
+        with os.fdopen(file_descriptor, "rb", closefd=False) as handle:
+            content_bytes = handle.read()
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"file is not valid UTF-8: {path}") from exc
+
+        matches: list[tuple[int, int, str, int]] = []
+        for index, (old_string, new_string) in enumerate(replacements):
+            label = f"edits {index + 1}: " if batch else ""
+            match_count = _count_overlapping(content, old_string)
+            if match_count == 0:
+                return _error_result(f"{label}old_string not found in {raw_path}")
+            if match_count > 1:
+                return _error_result(
+                    f"{label}old_string found {match_count} times in "
+                    f"{raw_path}; must be unique"
+                )
+            start = content.find(old_string)
+            matches.append((start, start + len(old_string), new_string, index))
+
+        matches.sort(key=lambda match: match[0])
+        for previous, current in pairwise(matches):
+            if current[0] < previous[1]:
+                return _error_result(
+                    f"edits {previous[3] + 1} and {current[3] + 1} overlap "
+                    f"in {raw_path}"
+                )
+
+        parts: list[str] = []
+        position = 0
+        for start, end, new_string, _index in matches:
+            parts.extend((content[position:start], new_string))
+            position = end
+        parts.append(content[position:])
+        updated_bytes = "".join(parts).encode("utf-8")
+        try:
+            atomic_replace(
+                file_descriptor,
+                path,
+                updated_bytes,
+                abort_signal,
+                publication,
+                expected_digest=hashlib.sha256(content_bytes).digest(),
+            )
+        except ConcurrentFileChangeError as exc:
+            raise ValueError(
+                f"target changed while edit was in progress: {path}"
+            ) from exc
+
+    structured_content: EditStructuredContent = {
+        "path": path,
+        "bytes_before": len(content_bytes),
+        "bytes_after": len(updated_bytes),
+        "sha256_after": hashlib.sha256(updated_bytes).hexdigest(),
+    }
+    message = f"edited {path}: {len(content_bytes)} bytes → {len(updated_bytes)} bytes"
+    if batch:
+        message += f" ({len(replacements)} replacements)"
+    return _success_result(
+        text_block(message),
+        structured_content=structured_content,
+    )
+
+
 async def _edit(
     registry: ToolRegistry,
     arguments: EditArguments,
-    _abort_signal: AbortSignal,
+    abort_signal: AbortSignal,
     *,
     execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
@@ -70,78 +165,15 @@ async def _edit(
             )
         replacements = [(edit["old_string"], edit["new_string"]) for edit in batch]
 
-    try:
-        for old_string, new_string in replacements:
-            old_string.encode("utf-8")
-            new_string.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError("old_string and new_string must be valid UTF-8") from exc
-
-    with open_target(
+    return await run_file_worker(
+        _edit_target,
         registry,
         arguments["path"],
-        flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        replacements,
+        batch=batch is not None,
+        abort_signal=abort_signal,
         execution_context=execution_context,
-    ) as (file_descriptor, _resolved_path):
-        path = _path_from_fd(file_descriptor)
-        with os.fdopen(file_descriptor, "r+b", closefd=False) as handle:
-            content_bytes = handle.read()
-            try:
-                content = content_bytes.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"file is not valid UTF-8: {path}") from exc
-
-            matches: list[tuple[int, int, str, int]] = []
-            for index, (old_string, new_string) in enumerate(replacements):
-                label = f"edits {index + 1}: " if batch is not None else ""
-                match_count = _count_overlapping(content, old_string)
-                if match_count == 0:
-                    return _error_result(
-                        f"{label}old_string not found in {arguments['path']}"
-                    )
-                if match_count > 1:
-                    return _error_result(
-                        f"{label}old_string found {match_count} times in "
-                        f"{arguments['path']}; must be unique"
-                    )
-                start = content.find(old_string)
-                matches.append((start, start + len(old_string), new_string, index))
-
-            matches.sort(key=lambda match: match[0])
-            for previous, current in pairwise(matches):
-                if current[0] < previous[1]:
-                    return _error_result(
-                        f"edits {previous[3] + 1} and {current[3] + 1} overlap "
-                        f"in {arguments['path']}"
-                    )
-
-            parts: list[str] = []
-            position = 0
-            for start, end, new_string, _index in matches:
-                parts.extend((content[position:start], new_string))
-                position = end
-            parts.append(content[position:])
-            updated_content = "".join(parts)
-            updated_bytes = updated_content.encode("utf-8")
-            try:
-                handle.seek(0)
-                handle.truncate()
-                handle.write(updated_bytes)
-                handle.flush()
-            except OSError as exc:
-                raise ValueError(f"could not write file: {path}: {exc}") from exc
-    structured_content: EditStructuredContent = {
-        "path": path,
-        "bytes_before": len(content_bytes),
-        "bytes_after": len(updated_bytes),
-        "sha256_after": hashlib.sha256(updated_bytes).hexdigest(),
-    }
-    message = f"edited {path}: {len(content_bytes)} bytes → {len(updated_bytes)} bytes"
-    if batch is not None:
-        message += f" ({len(replacements)} replacements)"
-    return _success_result(
-        text_block(message),
-        structured_content=structured_content,
+        signal=abort_signal,
     )
 
 

@@ -7,6 +7,7 @@ import stat
 import sys
 import threading
 import uuid
+import weakref
 from collections import Counter
 from collections.abc import Generator
 from contextlib import ExitStack
@@ -711,6 +712,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
     loops: list[AgentLoop] = []
     stores: list[ConversationStore] = []
+    composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
@@ -766,7 +768,11 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        stores.append(store)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            stores.append(store)
+        else:
+            composed_stores.add(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
@@ -832,7 +838,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
                 await registry_close(registry)
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for store in reversed(stores):
+    for store in reversed((*stores, *composed_stores)):
         if not store._closed:
             try:
                 store_close(store)

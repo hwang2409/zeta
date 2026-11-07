@@ -31,12 +31,7 @@ from ...protocol.types import (
     require_new_message_origin,
 )
 from ...storage_format import WriterLease, open_writer
-from ..agent_state import (
-    AgentStateMixin,
-    _apply_agent_state,
-    _parse_agent_state,
-    _session_state_mutations,
-)
+from ..agent_state import AgentStateMixin, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
@@ -50,7 +45,6 @@ from ..session_files import (
     read_session_file,
     session_directory,
     session_root,
-    write_session_file,
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import (
@@ -76,6 +70,7 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
+from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._turn_history import TurnHistoryMixin, validate_turn_end_data
@@ -120,6 +115,7 @@ class ConversationStore(
     TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
+    SessionStatePersistenceMixin,
 ):
     def __init__(
         self,
@@ -365,32 +361,6 @@ class ConversationStore(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
                 )
             self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
-
-    def _write_session_state(
-        self, bash_cwd: str, todo_items: Iterable[TodoItem],
-        *,
-        deleted_agent_children: Iterable[str] = (),
-    ) -> None:
-        state: dict[str, Any] = {"bash_cwd": bash_cwd}
-        normalized_items = [dict(item) for item in todo_items]
-        if normalized_items:
-            state["todo_items"] = normalized_items
-        if self._todo_dismissed:
-            state["todo_dismissed"] = True
-        _apply_agent_state(
-            state,
-            agent_counter=self._agent_counter,
-            agent_children=self._agent_children,
-            agent_parent=self._agent_parent,
-            agent_canceled=self._agent_canceled,
-        )
-        mutations = _session_state_mutations(state, tuple(deleted_agent_children))
-        self._storage_lease.publish_json(
-            self.directory_fd,
-            "session_state.json",
-            mutations,
-            write_session_file,
-        )
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
