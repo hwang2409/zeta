@@ -24,10 +24,11 @@ CONTRACT_ERROR = (
     "'# test-contract: complexity <reason>', 'durability <reason>', or "
     "'seam <reason>' on this line or the line above"
 )
-CONTRACT_KINDS = {"complexity", "durability", "latency", "seam"}
+CONTRACT_KINDS = {"bootstrap", "complexity", "durability", "latency", "seam"}
 GLOBAL_BOOTSTRAP_ERROR = (
     "global test bootstrap {name} hides production startup; use a local fixture "
-    "and a real subprocess test"
+    "and a real subprocess test; use '# test-contract: bootstrap <reason>' on "
+    "this line or the line above for an intended session-wide harness setting"
 )
 MIN_HANG_GUARD_SECONDS = 10
 GLOBAL_BOOTSTRAP_ALLOWLIST = {
@@ -400,61 +401,72 @@ def _env_receiver(node: ast.AST, receivers: set[str]) -> str | None:
     return receiver if receiver in receivers else None
 
 
+def _literal_key_names(node: ast.Dict, source: str) -> list[str]:
+    return [
+        name
+        for key in node.keys
+        if key is not None
+        for name in [_env_name(key, source)]
+        if name
+    ]
+
+
 def _assignment_bootstrap_names(
     node: ast.Assign | ast.AugAssign, source: str, receivers: set[str]
 ) -> list[str]:
     if isinstance(node, ast.AugAssign):
-        if _env_receiver(node.target, receivers) is None or not isinstance(
-            node.value, ast.Dict
-        ):
-            return []
-        return [
-            name
-            for key in node.value.keys
-            if key is not None
-            for name in [_env_name(key, source)]
-            if name
-        ]
-    targets = node.targets
-    if len(targets) != 1 or not isinstance(targets[0], ast.Subscript):
+        return (
+            _literal_key_names(node.value, source)
+            if _env_receiver(node.target, receivers) is not None
+            and isinstance(node.value, ast.Dict)
+            else []
+        )
+    if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Subscript):
         return []
-    target = targets[0]
+    target = node.targets[0]
     if _env_receiver(target.value, receivers) is None:
         return []
     name = _env_name(target.slice, source)
     return [name] if name else []
 
 
+def _direct_environment_call_names(node: ast.Call, source: str) -> list[str]:
+    if _name(node.func) != "os.putenv" or not node.args:
+        return []
+    name = _env_name(node.args[0], source)
+    return [name] if name else []
+
+
+def _monkeypatch_call_names(node: ast.Call, source: str) -> list[str]:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "setenv":
+        return []
+    receiver = node.func.value
+    if _name(receiver) != "monkeypatch" and not (
+        isinstance(receiver, ast.Call) and _name(receiver.func) == "MonkeyPatch"
+    ):
+        return []
+    if not node.args:
+        return []
+    name = _env_name(node.args[0], source)
+    return [name] if name else []
+
+
 def _call_bootstrap_names(
     node: ast.Call, source: str, receivers: set[str]
 ) -> list[str]:
-    function = _name(node.func)
-    if function == "os.putenv" and node.args:
+    if direct := _direct_environment_call_names(node, source):
+        return direct
+    if monkeypatch := _monkeypatch_call_names(node, source):
+        return monkeypatch
+    if not isinstance(node.func, ast.Attribute) or not node.args:
+        return []
+    if _env_receiver(node.func.value, receivers) is None:
+        return []
+    if node.func.attr == "update" and isinstance(node.args[0], ast.Dict):
+        return _literal_key_names(node.args[0], source)
+    if node.func.attr == "setdefault":
         name = _env_name(node.args[0], source)
         return [name] if name else []
-    if isinstance(node.func, ast.Attribute) and node.args:
-        receiver = _env_receiver(node.func.value, receivers)
-        if receiver is not None and node.func.attr in {"setdefault", "update"}:
-            update = node.args[0]
-            if node.func.attr == "update" and isinstance(update, ast.Dict):
-                return [
-                    name
-                    for key in update.keys
-                    if key is not None
-                    for name in [_env_name(key, source)]
-                    if name
-                ]
-            name = _env_name(update, source)
-            return [name] if name else []
-        if node.func.attr == "setenv" and (
-            _name(node.func.value) == "monkeypatch"
-            or (
-                isinstance(node.func.value, ast.Call)
-                and _name(node.func.value.func) == "MonkeyPatch"
-            )
-        ):
-            name = _env_name(node.args[0], source)
-            return [name] if name else []
     return []
 
 
@@ -490,6 +502,7 @@ def _global_bootstrap_findings(
     module_scope = path.name in {"conftest.py", "sitecustomize.py"}
     findings: list[Finding] = []
     receivers = _environment_receivers(tree)
+    lines = source.splitlines()
 
     def visit(node: ast.AST, global_scope: bool = module_scope) -> None:
         child_scope = global_scope
@@ -505,7 +518,9 @@ def _global_bootstrap_findings(
             and _touches_added_line(node, added)
         ):
             for name in _global_bootstrap_names(node, source, receivers):
-                if name in GLOBAL_BOOTSTRAP_ALLOWLIST:
+                if name in GLOBAL_BOOTSTRAP_ALLOWLIST or _has_marker(
+                    lines, node.lineno, {"bootstrap"}
+                ):
                     continue
                 findings.append(
                     Finding(

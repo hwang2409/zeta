@@ -231,15 +231,37 @@ os.environ[\"ZETA_TEST_SCRIPTED_PROVIDER\"] = \"1\"
     ]
 
 
+def test_tq005_reasoned_bootstrap_marker_suppresses_finding(tmp_path: Path) -> None:
+    source = """import os
+# test-contract: bootstrap session-wide isolated home is required by the harness
+os.environ["ZETA_HOME"] = "/tmp/home"
+"""
+
+    assert _lint(tmp_path, source, path="tests/conftest.py") == []
+
+
+def test_tq005_bare_or_wrong_marker_does_not_suppress(tmp_path: Path) -> None:
+    for index, marker in enumerate(
+        ("# test-contract: bootstrap", "# test-contract: latency unrelated")
+    ):
+        source = f"""import os
+{marker}
+os.environ["ZETA_HOME"] = "/tmp/home"
+"""
+        case = tmp_path / f"case{index}"
+        case.mkdir()
+        findings = _lint(case, source, path="tests/conftest.py")
+        assert [finding.code for finding in findings] == ["TQ005"]
+
+
 def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> None:
     source = 'import os\nos.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"\n'
 
     findings = _lint(tmp_path, source, path="tests/conftest.py")
 
     assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 2)]
-    assert findings[0].message == (
-        "global test bootstrap ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT hides production "
-        "startup; use a local fixture and a real subprocess test"
+    assert findings[0].message == quality.GLOBAL_BOOTSTRAP_ERROR.format(
+        name="ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"
     )
 
 
@@ -323,17 +345,17 @@ MonkeyPatch().setenv(\"ZETA_PATCH\", \"1\")
         (
             "TQ005",
             3,
-            "global test bootstrap name hides production startup; use a local fixture and a real subprocess test",
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="name"),
         ),
         (
             "TQ005",
             4,
-            "global test bootstrap ZETA_ONE hides production startup; use a local fixture and a real subprocess test",
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="ZETA_ONE"),
         ),
         (
             "TQ005",
             5,
-            "global test bootstrap ZETA_PATCH hides production startup; use a local fixture and a real subprocess test",
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="ZETA_PATCH"),
         ),
     ]
 
