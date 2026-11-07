@@ -691,9 +691,6 @@ async def test_stdio_large_tools_list_line_mounts(
 async def test_mcp_stdio_oversized_line_spills_not_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     description = "x" * 4096
     source = _stdio_source().replace(
@@ -720,9 +717,6 @@ async def test_mcp_stdio_oversized_line_spills_not_errors(
 async def test_mcp_stdio_malformed_oversized_line_does_not_wedge_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '    elif method == "tools/list":\n        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}\n',
@@ -780,10 +774,7 @@ async def test_mcp_stdio_oversized_line_memory_is_bounded(
 ) -> None:
     import tracemalloc
 
-    import zeta.mcp.stdio as stdio_module
-
     payload_size = 4 * 1024 * 1024
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 64 * 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '"name": "echo", "description": "echo text",',
@@ -816,9 +807,6 @@ async def test_mcp_stdio_oversized_line_memory_is_bounded(
 async def test_stdio_write_after_server_exit_preserves_protocol_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
     client = StdioMCPClient(
@@ -833,7 +821,6 @@ async def test_stdio_write_after_server_exit_preserves_protocol_error(
         source,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        limit=stdio_module.MCP_STDIO_LINE_LIMIT,
     )
     client._process = process
     reader_task = asyncio.create_task(client._read_stdout())
@@ -2457,6 +2444,10 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
     )
+    now = 100.0
+    monkeypatch.setattr(
+        server_actor_module, "time", SimpleNamespace(monotonic=lambda: now)
+    )
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
     )
@@ -2464,14 +2455,11 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     await asyncio.sleep(0)
     actor = mount._actors["retry"]
     actor._failure_count = 1024
-    before = mount_module.time.monotonic()
 
     result = await registry.execute(ToolCall("retry", "retry__echo", {}))
 
     assert result["isError"] is True
-    retry_at = mount.statuses["retry"].next_retry_at
-    assert retry_at is not None
-    assert retry_at - before <= 30.1
+    assert mount.statuses["retry"].next_retry_at == now + 30.0
     await mount.close()
 
 

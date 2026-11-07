@@ -12,15 +12,51 @@ from typing import Any
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
+from ..storage_format import (
+    DeleteValue,
+    Mutation,
+    SetValue,
+    mapping_mutations,
+)
 from .agent_progress import (
     live_agent_lifecycle,
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
 from .checkpoints import ConversationIntegrityError, _now
-from .session_files import child_directory, write_session_json
+from .session_files import child_directory, write_session_file
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+
+
+def _session_state_mutations(
+    state: dict[str, Any], deleted_children: tuple[str, ...]
+) -> tuple[Mutation, ...]:
+    children = state.pop("agent_children", {})
+    mutations = list(
+        mapping_mutations(
+            state,
+            delete=(
+                key
+                for key in (
+                    "todo_items",
+                    "todo_dismissed",
+                    "agent_counter",
+                    "agent_parent",
+                    "agent_canceled",
+                )
+                if key not in state
+            ),
+        )
+    )
+    mutations.extend(
+        SetValue(("agent_children", child_id), marker)
+        for child_id, marker in children.items()
+    )
+    mutations.extend(
+        DeleteValue(("agent_children", child_id)) for child_id in deleted_children
+    )
+    return tuple(mutations)
 
 
 def _validate_lifecycle_start(
@@ -309,7 +345,11 @@ class AgentStateMixin:
         if marker_key not in self._agent_children:
             return False
         self._agent_children.pop(marker_key)
-        self._write_session_state(self.bash_cwd, self._todo_items)
+        self._write_session_state(
+            self.bash_cwd,
+            self._todo_items,
+            deleted_agent_children=(marker_key,),
+        )
         return True
 
     def finish_agent_child(self, marker_key: str) -> None:
@@ -509,6 +549,7 @@ class AgentStateMixin:
         killed_task_ids: list[str] | None = None,
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool | None = None,
+        canonical_receipt: bool = False,
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
@@ -551,6 +592,8 @@ class AgentStateMixin:
             self._agent_lifecycle["state"] = state
             self._agent_lifecycle["finished_at"] = resolved_finished_at
             self._agent_lifecycle["final_result"] = final_result
+            if canonical_receipt:
+                self._agent_lifecycle["final_result_is_receipt"] = True
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
             if killed_task_ids is not None:
@@ -623,6 +666,63 @@ class AgentStateMixin:
                 self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
             self._write_agent_lifecycle()
 
+    async def finalize_background_agent(
+        self,
+        *,
+        parent_store: Any,
+        terminal_state: str,
+        final_result: str,
+        turns_used: int,
+        killed_task_ids: list[str] | None,
+        killed_task_count: int | None,
+        killed_task_ids_truncated: bool,
+        canceled_tool_call_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Transfer direct markers and durably publish one terminal lifecycle."""
+
+        transferred: list[str] = []
+        if canceled_tool_call_id is not None:
+            await self._to_thread_agent_state(
+                self.mark_agent_canceled, canceled_tool_call_id
+            )
+        else:
+            for marker_key, marker in self.agent_children().items():
+                tool_call = ToolCall.from_dict(marker["tool_call"])
+                await parent_store._to_thread_agent_state(
+                    parent_store.register_agent_child,
+                    tool_call,
+                    child_session_path=marker["child_session_path"],
+                    description=marker["description"],
+                    agent_type=marker.get("agent_type"),
+                    background=marker.get("background", False),
+                    child_instance_id=marker.get("child_instance_id"),
+                    accepts_follow_ups=marker.get("accepts_follow_ups", False) is True,
+                    explicit_finish=marker.get("explicit_finish", False) is True,
+                    turns_used=(
+                        marker.get("turns_used", 0)
+                        if type(marker.get("turns_used", 0)) is int
+                        else 0
+                    ),
+                )
+                await self._to_thread_agent_state(
+                    self.finish_agent_child, marker_key
+                )
+                child_instance_id = marker.get("child_instance_id")
+                if type(child_instance_id) is str:
+                    transferred.append(child_instance_id)
+            await self._to_thread_agent_state(self.finish_agent_parent)
+        await self._to_thread_agent_state(
+            self.finish_agent_lifecycle,
+            terminal_state,
+            final_result=final_result,
+            turns_used=turns_used,
+            killed_task_ids=killed_task_ids,
+            killed_task_count=killed_task_count,
+            killed_task_ids_truncated=killed_task_ids_truncated,
+            canonical_receipt=True,
+        )
+        return tuple(transferred)
+
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
@@ -632,6 +732,10 @@ class AgentStateMixin:
             and type(self._agent_lifecycle["final_result_is_receipt"]) is not bool
         ):
             raise ValueError("agent lifecycle receipt marker must be boolean")
-        write_session_json(
-            self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle
+        value = self._agent_lifecycle or {}
+        self._storage_lease.publish_json(
+            self.directory_fd,
+            "agent_lifecycle.json",
+            mapping_mutations(value),
+            write_session_file,
         )

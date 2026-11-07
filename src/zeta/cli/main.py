@@ -31,6 +31,7 @@ from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
+from ..storage_format import StorageFormatError, advance
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
 
@@ -118,9 +119,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 def _provider_name(value: str) -> str:
     if value == "fake":
-        raise argparse.ArgumentTypeError(
-            REMOVED_PROVIDER_ERROR
-        )
+        raise argparse.ArgumentTypeError(REMOVED_PROVIDER_ERROR)
     if value not in PROVIDERS:
         raise argparse.ArgumentTypeError(
             f"invalid provider {value!r}; choose claude, codex or ollama"
@@ -294,7 +293,9 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("new_label", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
-    accounts_parser.add_argument("--refresh", dest="status_refresh", action="store_true")
+    accounts_parser.add_argument(
+        "--refresh", dest="status_refresh", action="store_true"
+    )
     accounts_parser.add_argument("--replace", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
@@ -408,6 +409,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
+    storage_format_parser = commands.add_parser(
+        "storage-format", help="manage the home stored-format gate"
+    )
+    storage_format_commands = storage_format_parser.add_subparsers(
+        dest="storage_format_action", required=True
+    )
+    storage_format_advance = storage_format_commands.add_parser("advance")
+    storage_format_advance.add_argument("--expected-epoch", type=int, required=True)
+    storage_format_advance.add_argument("--target-epoch", type=int, default=1)
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -478,10 +488,12 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
         return
     lines: list[str] = []
     for item in accounts:
-        marker = "  ★ default" if store.default(item.account.provider) == item.account else ""
-        lines.append(
-            str(item) + (f"  {item.detail}" if item.detail else "") + marker
+        marker = (
+            "  ★ default"
+            if store.default(item.account.provider) == item.account
+            else ""
         )
+        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -656,7 +668,9 @@ async def _account_statuses(
     return statuses, all_ok
 
 
-def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool) -> None:
+def _print_account_statuses(
+    statuses: list[dict[str, object]], *, as_json: bool
+) -> None:
     if as_json:
         print(json.dumps(statuses))
         return
@@ -671,7 +685,11 @@ def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool)
         line = f"{status['provider']}:{status['account']}  {state}  expires {expiry}{default}"
         refresh = status.get("refresh")
         if isinstance(refresh, dict):
-            line += "  refresh ok" if refresh["ok"] else f"  refresh failed ({refresh['code']})"
+            line += (
+                "  refresh ok"
+                if refresh["ok"]
+                else f"  refresh failed ({refresh['code']})"
+            )
         lines.append(line)
     print("\n".join(lines))
 
@@ -779,14 +797,16 @@ def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> No
 
 
 def _retain_active_draft(
-    app: object | None, retained_drafts: list[_UnsavedDraft],
+    app: object | None,
+    retained_drafts: list[_UnsavedDraft],
 ) -> None:
     if app is not None and (draft := _unsaved_draft(app)) is not None:
         retained_drafts.append(draft)
 
 
 def _create_tui_app(
-    args: argparse.Namespace, parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
 ) -> object | None:
     try:
         if args.continue_session or args.resume is not None:
@@ -801,7 +821,8 @@ def _create_tui_app(
 
 
 def _run_tui_lifecycle(
-    args: argparse.Namespace, parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
     retained_drafts: list[_UnsavedDraft] = []
     current_session_id = ""
@@ -931,6 +952,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService
+        from ..mcp.oauth_store import (
+            MCPCredentialStoreError,
+            public_credential_store_error,
+        )
 
         service = MCPManagementService(project_dir=discover_repo_root(os.getcwd()))
         try:
@@ -952,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(result.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
+                asyncio.run(service.refresh_credentials())
                 values = [item.as_json() for item in service.list(scope=args.scope)]
                 output = (
                     json.dumps(values, sort_keys=True)
@@ -964,6 +990,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action == "show":
+                asyncio.run(service.refresh_credentials())
                 value = service.show(args.name, scope=args.scope).as_json()
                 output = (
                     json.dumps(value, indent=2, sort_keys=True)
@@ -989,16 +1016,26 @@ def main(argv: list[str] | None = None) -> int:
                 service.untrust(args.name)
                 return 0
             if args.mcp_action == "logout":
-                service.logout(args.name, scope=args.scope)
+                asyncio.run(service.logout(args.name, scope=args.scope))
+                print(f"logged out {args.name}.")
                 return 0
             result = (
                 asyncio.run(service.test(args.name, scope=args.scope))
                 if args.mcp_action == "test"
-                else asyncio.run(service.login(args.name, scope=args.scope, no_browser=getattr(args, "no_browser", False)))
+                else asyncio.run(
+                    service.login(
+                        args.name,
+                        scope=args.scope,
+                        no_browser=getattr(args, "no_browser", False),
+                    )
+                )
             )
             if result is not None:
                 print(json.dumps(result, sort_keys=True))
             return 0
+        except MCPCredentialStoreError as exc:
+            print(public_credential_store_error(exc)["text"], file=sys.stderr)
+            return 2
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2
@@ -1053,6 +1090,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         except KeyboardInterrupt:
             return 130
+        return 0
+    if args.command == "storage-format":
+        try:
+            advance(
+                env_home(),
+                expected_epoch=args.expected_epoch,
+                target_epoch=args.target_epoch,
+            )
+        except StorageFormatError as exc:
+            print(f"zeta storage-format: {exc}", file=sys.stderr)
+            return 2
+        print(f"stored format advanced to epoch {args.target_epoch}")
         return 0
     if args.command == "completion":
         print(completion_script(args.shell), end="")

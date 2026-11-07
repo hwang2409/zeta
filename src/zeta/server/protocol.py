@@ -33,6 +33,7 @@ FEATURES = (
     "session_history_backward",
     "session_host_commands",
     "session_history_fidelity",
+    "served_turn_end",
     "content_read",
     "session_grants",
 )

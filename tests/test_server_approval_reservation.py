@@ -748,6 +748,7 @@ async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
             "session",
             "state",
             "explicit_finish",
+            "max_agent_depth",
             "pending_approvals",
             "usage",
             "compaction_markers",
