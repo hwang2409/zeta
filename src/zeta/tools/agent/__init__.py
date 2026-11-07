@@ -63,7 +63,8 @@ from .approval import ChildApprovalPolicy  # noqa: F401
 
 _TRUNCATION_NOTE = "\n[truncated]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_VALID_AGENT_STATES = frozenset({"running", "idle", *_TERMINAL_AGENT_STATES})
+_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+_VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
 _STATUS_ROW_STRING_FIELDS = (
@@ -420,7 +421,7 @@ def _project_agent_status(
         raise ValueError("invalid child metadata state")
     if state in _TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
-    if state in {"running", "idle"} and finished_at is not None:
+    if state in _NONTERMINAL_AGENT_STATES and finished_at is not None:
         raise ValueError("non-terminal state has finished_at")
 
     elapsed = _agent_status_elapsed(
