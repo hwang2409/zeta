@@ -1023,9 +1023,11 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
         )
         tasks.append(task)
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
     release_owner.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True), 10
+    )
     await loop.close()
     opened.store.close()
 
@@ -1120,16 +1122,18 @@ async def test_real_child_spawns_repeat_after_generation_changes(
             loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
         )
         tasks.append(task)
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
     last = asyncio.create_task(
         loop._run_agent_tool(
             calls[256], calls[256].arguments, signals.new_generation(), None
         )
     )
     tasks.append(last)
-    await asyncio.gather(last, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
     release_first_batch.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True), 10
+    )
     await loop.close()
     opened.store.close()
     assert all(isinstance(result, RuntimeError) for result in results)
@@ -1176,7 +1180,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         child_loops.append(child_loop)
         if len(child_loops) == 2:
             children_ready.set()
-        await release_children.wait()
+        await asyncio.wait_for(release_children.wait(), 10)
         return kwargs["child_result"]("done", state="completed")
 
     monkeypatch.setattr(agent_runner, "consume_child", hold_children)
@@ -1202,7 +1206,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         )
         for item in root_calls
     ]
-    await children_ready.wait()
+    await asyncio.wait_for(children_ready.wait(), 10)
 
     async def stop_after_publication(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -1269,8 +1273,11 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
     )
     grand_tasks.append(second)
     second_owner_wait = asyncio.create_task(second_owner_entered.wait())
-    done, _ = await asyncio.wait(
-        {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
+    done, _ = await asyncio.wait_for(
+        asyncio.wait(
+            {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
+        ),
+        10,
     )
     grand_tasks.extend(
         asyncio.create_task(
@@ -1283,14 +1290,20 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         )
         for index in range(2, 4)
     )
-    await asyncio.gather(*grand_tasks[2:], return_exceptions=True)
+    await asyncio.wait_for(
+        asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
+    )
     release_batches.set()
-    results = await asyncio.gather(*grand_tasks, return_exceptions=True)
+    results = await asyncio.wait_for(
+        asyncio.gather(*grand_tasks, return_exceptions=True), 10
+    )
     if second_owner_wait not in done:
         second_owner_wait.cancel()
-        await asyncio.gather(second_owner_wait, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(second_owner_wait, return_exceptions=True), 10
+        )
     release_children.set()
-    await asyncio.gather(*root_tasks)
+    await asyncio.wait_for(asyncio.gather(*root_tasks), 10)
     await loop.close()
     opened.store.close()
 
@@ -1377,14 +1390,14 @@ async def test_cancelled_child_publication_joins_before_loop_close(
         close_task = asyncio.create_task(loop.close())
         cancellation_observed = asyncio.Event()
         asyncio.get_running_loop().call_soon(cancellation_observed.set)
-        await cancellation_observed.wait()
+        await asyncio.wait_for(cancellation_observed.wait(), 10)
         assert not task.done()
         assert not close_task.done()
         release_worker.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
     if close_task is not None:
-        await close_task
+        await asyncio.wait_for(close_task, 10)
     else:
         await loop.close()
 
@@ -1541,6 +1554,7 @@ def test_quarantine_handles_max_length_filename(
     invalid_name = "x" * 255
     (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
 
+    # test-contract: seam force an overlong directory entry through the scanner seam
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
@@ -1587,6 +1601,7 @@ def test_transient_read_error_keeps_intent_and_retries(
 
     # Fix the scan order so the test proves that the transient failure stops the
     # pass before a later, otherwise valid intent can be published.
+    # test-contract: seam fix scan order to prove transient failure stops the pass
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
