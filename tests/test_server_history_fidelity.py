@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -10,12 +12,16 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.server_client import event, request
 from zeta.protocol.types import (
+    CompletionBackend,
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
+    ToolSchema,
     ToolUseContent,
     with_message_origin,
 )
@@ -24,7 +30,7 @@ from zeta.server import ZetaServer
 
 async def _open(
     tmp_path: Path,
-    backend: FakeBackend | None = None,
+    backend: CompletionBackend | None = None,
     *,
     features: list[str] | None = None,
 ):
@@ -51,9 +57,9 @@ async def _open(
             "features": features or ["session_history_fidelity"],
         },
     )
-    session_id = (await request(
-        reader, writer, 2, "new_session", {"provider": "codex"}
-    ))[-1]["result"]["session"]["session_id"]
+    session_id = (
+        await request(reader, writer, 2, "new_session", {"provider": "codex"})
+    )[-1]["result"]["session"]["session_id"]
     return server, reader, writer, session_id
 
 
@@ -64,9 +70,37 @@ async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
 
 
 async def _history(reader, writer, session_id: str):
-    return (await request(
-        reader, writer, 90, "session_history", {"session_id": session_id}
-    ))[-1]["result"]["messages"]
+    return (
+        await request(reader, writer, 90, "session_history", {"session_id": session_id})
+    )[-1]["result"]["messages"]
+
+
+class _BlockingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.started.set()
+        await asyncio.Event().wait()
+        if False:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+
+
+class _FailingBackend(CompletionBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        raise RuntimeError("provider failed")
+        if False:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
 
 
 @pytest.mark.asyncio
@@ -237,15 +271,15 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
         live = await event(reader, "delivery_status")
         assert live["status"] == "dropped"
         assert live["reason"] == "abort"
-        assert live["content"] == [
-            {"type": "text", "text": "also inspect tests"}
-        ]
+        assert live["content"] == [{"type": "text", "text": "also inspect tests"}]
         status = (await request(reader, writer, 6, "status"))[-1]["result"]
         assert status["state"] == "idle"
 
         rows = await _history(reader, writer, session_id)
         replayed = next(row for row in rows if row.get("event") == "delivery_status")
-        assert {key: value for key, value in live.items() if key != "session_id"} == replayed
+        assert {
+            key: value for key, value in live.items() if key != "session_id"
+        } == replayed
     finally:
         await _close(server, writer)
 
@@ -305,6 +339,223 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         rows = await _history(reader, writer, session_id)
         assert not any(row.get("event") == "served_turn_end" for row in rows)
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.parametrize(
+    ("reason", "terminal"),
+    [
+        ("completed", "agent_end"),
+        ("user_stop", "turn_aborted"),
+        ("error", "error"),
+        ("disconnect", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_real_served_turn_finalizers_persist_closed_outcomes(
+    tmp_path: Path,
+    reason: str,
+    terminal: str | None,
+) -> None:
+    backend: CompletionBackend
+    if reason in {"user_stop", "disconnect"}:
+        backend = _BlockingBackend()
+    elif reason == "error":
+        backend = _FailingBackend()
+    else:
+        backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, session_id = await _open(
+        tmp_path, backend, features=["served_turn_end"]
+    )
+    finalized = asyncio.Event()
+    original_finalize = server.control.deliveries.finalize_turn
+
+    async def track_finalize(*args, **kwargs) -> None:
+        await original_finalize(*args, **kwargs)
+        finalized.set()
+
+    server.control.deliveries.finalize_turn = track_finalize
+    try:
+        writer.close()
+        await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await request(
+            reader,
+            writer,
+            10,
+            "hello",
+            {"protocol_version": "1.2", "features": ["served_turn_end"]},
+        )
+        assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
+        await request(reader, writer, 11, "send", {"text": "finish"})
+        if isinstance(backend, _BlockingBackend):
+            await backend.started.wait()
+        if reason == "user_stop":
+            await request(reader, writer, 12, "abort")
+        elif reason == "disconnect":
+            writer.close()
+            await writer.wait_closed()
+        if terminal is not None:
+            await event(reader, terminal)
+        await finalized.wait()
+
+        if reason == "disconnect":
+            reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+            await request(
+                reader,
+                writer,
+                13,
+                "hello",
+                {"protocol_version": "1.2", "features": ["served_turn_end"]},
+            )
+        rows = await _history(reader, writer, session_id)
+        assert [
+            row["data"]["reason"]
+            for row in rows
+            if row.get("event") == "served_turn_end"
+        ] == [reason]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.parametrize("finalizer", ["notification", "resumed_tool"])
+@pytest.mark.asyncio
+async def test_background_finalizers_persist_served_turn_end(
+    tmp_path: Path, finalizer: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notification handled")])])
+    server, reader, writer, session_id = await _open(
+        tmp_path, backend, features=["served_turn_end"]
+    )
+    finalized = asyncio.Event()
+    original_finalize = server.control.deliveries.finalize_turn
+
+    async def track_finalize(*args, **kwargs) -> None:
+        await original_finalize(*args, **kwargs)
+        finalized.set()
+
+    server.control.deliveries.finalize_turn = track_finalize
+    try:
+        writer.close()
+        await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await request(
+            reader,
+            writer,
+            10,
+            "hello",
+            {"protocol_version": "1.2", "features": ["served_turn_end"]},
+        )
+        assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
+        store = server.runtime.opened.store
+        if finalizer == "notification":
+            store.append_agent_notification(
+                "child",
+                child_session_path="/tmp/child",
+                description="child",
+                status="completed",
+                text="done",
+            )
+            server.control._schedule_background_wake(session_id)
+        else:
+            target = tmp_path / "resumed-tool.txt"
+            target.write_text("ready")
+            call = ToolCall("resumed-read", "read", {"path": str(target)})
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            await request(
+                reader,
+                writer,
+                11,
+                "approve",
+                {"request_id": call.id, "scope": "once"},
+            )
+        await finalized.wait()
+
+        rows = await _history(reader, writer, session_id)
+        assert [
+            row["data"]["reason"]
+            for row in rows
+            if row.get("event") == "served_turn_end"
+        ] == ["completed"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_turn_end_commit_precedes_cleanup_and_agent_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, session_id = await _open(
+        tmp_path, backend, features=["served_turn_end"]
+    )
+    store = server.runtime.opened.store
+    original_durable_write = type(store)._run_durable_write
+    committed = threading.Event()
+    release = threading.Event()
+
+    def gate_after_commit(self, method_name, args, kwargs):
+        result = original_durable_write(self, method_name, args, kwargs)
+        if method_name == "_append_row" and args == (
+            "turn_end",
+            {"reason": "completed"},
+        ):
+            committed.set()
+            assert release.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(type(store), "_run_durable_write", gate_after_commit)
+    announcement: asyncio.Task[dict] | None = None
+    try:
+        writer.close()
+        await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await request(
+            reader,
+            writer,
+            10,
+            "hello",
+            {"protocol_version": "1.2", "features": ["served_turn_end"]},
+        )
+        assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
+        await request(reader, writer, 11, "send", {"text": "finish"})
+        announcement = asyncio.create_task(event(reader, "agent_end"))
+        assert await asyncio.to_thread(committed.wait, 5)
+
+        def reopened_rows():
+            from zeta.core.store import ConversationStore
+
+            reopened = ConversationStore(
+                store.root_dir, session_id=session_id, _must_exist=True
+            )
+            try:
+                return reopened.replay()
+            finally:
+                reopened.close()
+
+        durable_rows = await asyncio.to_thread(reopened_rows)
+        assert any(
+            row.type == "turn_end" and row.data == {"reason": "completed"}
+            for row in durable_rows
+        )
+        assert server.runtime.state.status == "running"
+        assert not announcement.done()
+
+        release.set()
+        await announcement
+        rows = await _history(reader, writer, session_id)
+        assert [
+            row["data"]["reason"]
+            for row in rows
+            if row.get("event") == "served_turn_end"
+        ] == ["completed"]
+    finally:
+        release.set()
+        if announcement is not None and not announcement.done():
+            announcement.cancel()
         await _close(server, writer)
 
 
