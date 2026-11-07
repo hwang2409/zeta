@@ -8986,7 +8986,7 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
         result = await original(self, function, *args, **kwargs)
         if function.__name__ == "resolve_approval" and args[0] == "gated-call":
             persisted.set()
-            await release.wait()
+            await asyncio.wait_for(release.wait(), timeout=10)
         return result
 
     async def record_runtime_end(*args, **kwargs):
@@ -9064,7 +9064,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             history_write_started.set()
             if failure == "oserror":
                 raise OSError("forced delegated history failure")
-            await history_release.wait()
+            await asyncio.wait_for(history_release.wait(), timeout=10)
         return await original_append(self, payload)
 
     # test-contract: seam the durable store has no deterministic failure hook
@@ -9176,7 +9176,7 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         frame = json.loads(payload)
         if frame.get("params", {}).get("event") == "approval_end":
             write_started.set()
-            await release_write.wait()
+            await asyncio.wait_for(release_write.wait(), timeout=10)
         return await original_write(payload)
 
     async def record_tool_end(event, *args, **kwargs):
