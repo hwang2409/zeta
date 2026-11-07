@@ -118,7 +118,9 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "sessions"
-    reader = ConversationStore(root, session_id="shared")
+    with ConversationStore(root, session_id="shared"):
+        pass
+    reader = ConversationStore(root, session_id="shared", _read_only=True)
     context = multiprocessing.get_context("fork")
     ready = context.Event()
     release = context.Event()

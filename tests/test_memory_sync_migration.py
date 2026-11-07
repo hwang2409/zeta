@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli import project as project_cli
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
@@ -56,7 +57,18 @@ from zeta.server.project_requests import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tui.slash_handlers import SlashHandlerMixin
+
+
+@pytest.fixture
+def retained_test_writers(tmp_path: Path):
+    leases = [open_writer(tmp_path / name) for name in ("home", "second", "remote")]
+    try:
+        yield
+    finally:
+        for lease in reversed(leases):
+            lease.close()
 
 
 def _source(seq: int = 1) -> tuple[MemorySource, ...]:
@@ -140,7 +152,10 @@ def test_entry_sync_conflicts_concurrent_same_id_edits(tmp_path: Path) -> None:
     push_project_memory(first, LocalTransport(second), project_id=project_id)
     remote_registry = ProjectRegistry(second / "projects")
 
-    for owner, text, seq in ((registry, "local edit", 2), (remote_registry, "remote edit", 3)):
+    for owner, text, seq in (
+        (registry, "local edit", 2),
+        (remote_registry, "remote edit", 3),
+    ):
         before = owner._entry_memory_state(project_id)
         owner._compare_and_swap_entries(
             project_id,
@@ -261,7 +276,10 @@ def test_imported_entry_can_be_undone(tmp_path: Path) -> None:
 
     assert result.changed
     assert imported_id not in result.state.entries
-    assert registry._entry_memory_log(project_id, entry_id=imported_id)[-1]["kind"] == "entry-undo"
+    assert (
+        registry._entry_memory_log(project_id, entry_id=imported_id)[-1]["kind"]
+        == "entry-undo"
+    )
 
 
 def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> None:
@@ -282,7 +300,9 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
         reconciliation_key=None,
     )
     push_project_memory(first, LocalTransport(second), project_id=project_id)
-    remote_entry = remote_registry._entry_memory_state(project_id).state.entries[entry_id]
+    remote_entry = remote_registry._entry_memory_state(project_id).state.entries[
+        entry_id
+    ]
     assert isinstance(remote_entry, MemoryEntry)
     assert remote_entry.status == "resolved"
 
@@ -314,7 +334,9 @@ def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> None:
+async def test_public_migration_end_to_end_with_real_content(
+    tmp_path: Path, retained_test_writers: None
+) -> None:
     first = tmp_path / "home"
     second = tmp_path / "second"
     workspace = tmp_path / "workspace"
@@ -330,11 +352,14 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
     monkey_home = os.environ.get("ZETA_HOME")
     os.environ["ZETA_HOME"] = str(first)
     try:
-        assert project_cli.run(
-            _cli_args(project_id, remote="migrate"),
-            stdout=io.StringIO(),
-            stderr=io.StringIO(),
-        ) == 0
+        assert (
+            project_cli.run(
+                _cli_args(project_id, remote="migrate"),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+            )
+            == 0
+        )
     finally:
         if monkey_home is None:
             os.environ.pop("ZETA_HOME", None)
@@ -356,7 +381,8 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
                     }
                 },
             }
-        ) + "\n"
+        )
+        + "\n"
     )
 
     async def invoke(_prompt: str) -> str:
@@ -400,12 +426,15 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
     )
     assert "PR 5 is ready." in resumed
     assert entry_id in run_memory_command(registry, project_id, "log")
-    assert run_memory_command(
-        registry,
-        project_id,
-        f"accept {entry_id}",
-        authorization=MemoryMutationAuthorization.direct_slash(),
-    ) == f"memory accepted: {entry_id}"
+    assert (
+        run_memory_command(
+            registry,
+            project_id,
+            f"accept {entry_id}",
+            authorization=MemoryMutationAuthorization.direct_slash(),
+        )
+        == f"memory accepted: {entry_id}"
+    )
     assert "undo complete" in run_memory_command(
         registry,
         project_id,
@@ -425,9 +454,13 @@ async def test_public_migration_end_to_end_with_real_content(tmp_path: Path) -> 
         features=frozenset({"projects-memory-v2"}),
     )
     assert shown["memory"]["profile"] == "zeta"
-    assert push_project_memory(
-        first, LocalTransport(second), project_id=project_id
-    ).conflicts == ()
+    pushed = await asyncio.to_thread(
+        push_project_memory,
+        first,
+        LocalTransport(second),
+        project_id=project_id,
+    )
+    assert pushed.conflicts == ()
     assert ProjectRegistry(second / "projects").memory_format(project_id) == 2
 
     registry.rollback_memory_migration(project_id)
@@ -488,9 +521,13 @@ def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) ->
     push_project_memory(home, LocalTransport(remote), project_id=project_id)
 
     class RacingTransport(LocalTransport):
-        def publish_project(self, project_id: str, snapshot: Path, *, expected_digest: str) -> None:
+        def publish_project(
+            self, project_id: str, snapshot: Path, *, expected_digest: str
+        ) -> None:
             _add(ProjectRegistry(self.home / "projects"), project_id, "raced", 4)
-            super().publish_project(project_id, snapshot, expected_digest=expected_digest)
+            super().publish_project(
+                project_id, snapshot, expected_digest=expected_digest
+            )
 
     _add(registry, project_id, "source", 3)
     with pytest.raises(RemoteSyncError, match="changed"):
@@ -504,7 +541,7 @@ def test_entry_sync_uses_python_only_ssh_transport(
     bin_dir.mkdir()
     shim = bin_dir / "ssh"
     shim.write_text(
-        "#!/bin/sh\n[ \"$1\" = -- ] && shift\nshift\nexec /bin/sh -c \"$1\"\n",
+        '#!/bin/sh\n[ "$1" = -- ] && shift\nshift\nexec /bin/sh -c "$1"\n',
         encoding="utf-8",
     )
     shim.chmod(0o755)
@@ -512,6 +549,7 @@ def test_entry_sync_uses_python_only_ssh_transport(
     first = tmp_path / "first"
     second = tmp_path / "second"
     second.mkdir()
+    initialize_storage_home(second)
     registry, project_id = _fixture(first, tmp_path / "workspace")
     _add(registry, project_id, "through ssh", 1)
 
@@ -568,7 +606,7 @@ def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str
 
 @pytest.mark.asyncio
 async def test_inflight_format_one_reconciliation_during_migration(
-    tmp_path: Path,
+    tmp_path: Path, retained_test_writers: None
 ) -> None:
     registry, project_id, _ = _legacy_fixture(tmp_path)
     home = tmp_path / "home"
@@ -587,7 +625,8 @@ async def test_inflight_format_one_reconciliation_during_migration(
                     }
                 },
             }
-        ) + "\n"
+        )
+        + "\n"
     )
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
@@ -680,13 +719,16 @@ def test_legacy_five_file_migration_round_trips_exactly(tmp_path: Path) -> None:
     )
     assert plan.rendered_mirrors == contents
     assert reverse_migration(plan) == contents
-    assert migrate_format_one(
-        project_id=project_id,
-        contents=source.contents,
-        source_digest=source.digest,
-        source_version=registry.memory_state(project_id).version,
-        migrated_at="2026-10-08T12:00:00Z",
-    ) == plan
+    assert (
+        migrate_format_one(
+            project_id=project_id,
+            contents=source.contents,
+            source_digest=source.digest,
+            source_version=registry.memory_state(project_id).version,
+            migrated_at="2026-10-08T12:00:00Z",
+        )
+        == plan
+    )
 
 
 @pytest.mark.parametrize(
@@ -755,6 +797,7 @@ def test_migration_references_survive_bounded_local_and_remote_history(
     first = tmp_path / "home"
     second = tmp_path / "second"
     second.mkdir()
+    initialize_storage_home(second)
     registry, project_id, contents = _legacy_fixture(tmp_path)
     registry.migrate_memory(project_id, migrated_at="2026-10-09T00:00:00Z")
     transport = LocalTransport(second)
@@ -802,9 +845,12 @@ def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:
     )
     assert registry.memory_format(project_id) == 2
     assert migrated.source_version == before_version
-    assert registry._migrate_memory_for_test(
-        project_id, migrated_at="2026-10-09T12:00:00Z"
-    ) == migrated
+    assert (
+        registry._migrate_memory_for_test(
+            project_id, migrated_at="2026-10-09T12:00:00Z"
+        )
+        == migrated
+    )
     pointer_path = registry.root / project_id / "memory-current.json"
     pointer = json.loads(pointer_path.read_text())
     pointer["history"] = [pointer["current"]]
@@ -887,6 +933,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     entry_point: str,
+    retained_test_writers: None,
 ) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -918,16 +965,12 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
                 updates={"state.md": "# Current state\n\nautomatic\n"},
                 provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
             )
-            args = _cli_args(
-                "accept", remote="state.md", directory=str(workspace)
-            )
+            args = _cli_args("accept", remote="state.md", directory=str(workspace))
             monkeypatch.chdir(workspace)
-        with patch.object(
-            MemoryMutationAuthorization, "authorize", return_value=None
-        ):
-            assert project_cli.run(
-                args, stdout=io.StringIO(), stderr=io.StringIO()
-            ) == 0
+        with patch.object(MemoryMutationAuthorization, "authorize", return_value=None):
+            assert (
+                project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+            )
     elif entry_point.startswith(("tui-", "serve-")):
         action = entry_point.split("-", 1)[1]
         if action == "undo":
@@ -951,31 +994,42 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
                     memory_reconciler=None,
                 )
             )
-            SlashHandlerMixin.slash_memory(tui, action)
+            await SlashHandlerMixin.slash_memory(tui, action)
         else:
             runtime = SimpleNamespace(
                 metadata=SimpleNamespace(project_id=project_id),
                 manager=SimpleNamespace(project_registry=registry),
                 loop=None,
             )
-            ServerSlashSession(runtime).slash_memory(action)
+            await ServerSlashSession(runtime).slash_memory(action)
     elif entry_point == "serve-project-request":
-        runtime = SimpleNamespace(
-            manager=SimpleNamespace(list_sessions_read_only=list)
-        )
+        runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
         ProjectRequests(
             home=home, runtime=runtime, codec=FrameCodec(), registry=registry
-        ).dispatch(
-            1, "project_show", {"project_id": project_id}
-        )
+        ).dispatch(1, "project_show", {"project_id": project_id})
     elif entry_point == "sync-push":
-        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            push_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
     elif entry_point == "sync-pull":
-        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            push_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
         ProjectRegistry(remote / "projects").update_memory(
             project_id, {"state.md": "# Current state\n\nremote\n"}
         )
-        pull_project_memory(home, LocalTransport(remote), project_id=project_id)
+        await asyncio.to_thread(
+            pull_project_memory,
+            home,
+            LocalTransport(remote),
+            project_id=project_id,
+        )
     elif entry_point == "project-create":
         args = _cli_args(
             "unused",
@@ -984,9 +1038,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             scope="scope",
             canonical_integration_root=str(tmp_path / "created"),
         )
-        assert project_cli.run(
-            args, stdout=io.StringIO(), stderr=io.StringIO()
-        ) == 0
+        assert project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
     elif entry_point == "project-init":
         new_workspace = tmp_path / "initialized"
         new_workspace.mkdir()
@@ -997,9 +1049,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             name="initialized",
             scope="scope",
         )
-        assert project_cli.run(
-            args, stdout=io.StringIO(), stderr=io.StringIO()
-        ) == 0
+        assert project_cli.run(args, stdout=io.StringIO(), stderr=io.StringIO()) == 0
     else:
         session_dir = home / "sessions" / ("a" * 32)
         session_dir.mkdir(parents=True)
@@ -1461,7 +1511,9 @@ def test_memory_sync_does_not_replace_project_directory(tmp_path: Path) -> None:
         def publish_project(
             self, project_id: str, snapshot: Path, *, expected_digest: str
         ) -> None:
-            super().publish_project(project_id, snapshot, expected_digest=expected_digest)
+            super().publish_project(
+                project_id, snapshot, expected_digest=expected_digest
+            )
             concurrent.parent.mkdir()
             concurrent.write_text('{"kept": true}\n', encoding="utf-8")
 
@@ -1492,13 +1544,20 @@ def test_interrupted_sync_leaves_no_orphan_artifacts(tmp_path: Path) -> None:
         referenced: set[str] = set()
         for version in pointer["history"]:
             manifest = json.loads(
-                (project / "memory-versions" / "versions" / f"{version}.json").read_text()
+                (
+                    project / "memory-versions" / "versions" / f"{version}.json"
+                ).read_text()
             )
             for field in ("snapshot", "before_snapshot"):
                 value = manifest[field]
-                referenced.update(value.values() if isinstance(value, dict) else (value,))
-        blobs = {path.name for path in (project / "memory-versions" / "blobs").iterdir()}
+                referenced.update(
+                    value.values() if isinstance(value, dict) else (value,)
+                )
+        blobs = {
+            path.name for path in (project / "memory-versions" / "blobs").iterdir()
+        }
         assert blobs <= referenced
+
 
 def test_sync_state_size_bounded_over_add_sync_compact_cycles(tmp_path: Path) -> None:
     first, second = tmp_path / "first", tmp_path / "second"

@@ -11,11 +11,13 @@ import threading
 import uuid
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -23,7 +25,6 @@ from tests.test_server import (
     _frames_until_event,
     _read_raw,
     _request,
-    _socket_path,
 )
 from zeta.core.approval import ApprovalRequest
 from zeta.core.store import ConversationStore
@@ -41,6 +42,8 @@ from zeta.server.protocol import ProtocolError
 from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> None:
@@ -167,9 +170,7 @@ class _StoreGate:
         return self.bound_original(*args, **kwargs)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def gated(
-            store: ConversationStore, *args: object, **kwargs: object
-        ) -> object:
+        def gated(store: ConversationStore, *args: object, **kwargs: object) -> object:
             if store.session_dir != self.session_dir:
                 return self.original(store, *args, **kwargs)
             self.thread_ids.append(threading.get_ident())
@@ -714,7 +715,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
 
 
 @pytest.mark.asyncio
-async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
+async def test_observer_status_surfaces_viewed_session_health_when_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _controller_reader, controller_writer, call = await _approval_server(
@@ -742,6 +743,11 @@ async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
             "transcript_index_failure",
             lambda _session_id: "disk full; pending changes will retry",
         )
+        server.runtime.loop.project_context_health = SimpleNamespace(
+            summary=(
+                "malformed_memory (p_test/memory/state.md): project memory is malformed"
+            )
+        )
         response = (await _request(observer_reader, observer_writer, 11, "status"))[-1]
         result = response["result"]
         assert set(result) == {
@@ -753,10 +759,14 @@ async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
             "usage",
             "compaction_markers",
             "transcript_index_failure",
+            "project_context_health",
         }
         assert result["state"] == "idle"
         assert result["transcript_index_failure"] == (
             "disk full; pending changes will retry"
+        )
+        assert result["project_context_health"] == (
+            "malformed_memory (p_test/memory/state.md): project memory is malformed"
         )
         mutation = (
             await _request(
@@ -907,6 +917,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "deny": {"request_id": call.id},
             "fork_message": {"session_id": session_id, "message_id": "missing"},
             "rename_session": {"session_id": session_id, "name": "changed"},
+            "revoke_session_grants": {"clear": True},
             "send": {"text": "blocked"},
             "send_images": {"session_id": session_id, "text": "blocked", "images": []},
             "set_compaction": {"session_id": session_id, "mode": "eviction"},
@@ -926,7 +937,9 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
         old_entries = tuple(server.runtime.opened.store.entries)
         for request_id, method in enumerate(LOADED_SESSION_MUTATIONS, 20):
             response = (
-                await _request(reader, writer, request_id, method, params_by_method[method])
+                await _request(
+                    reader, writer, request_id, method, params_by_method[method]
+                )
             )[-1]
             assert "error" in response, (method, response)
             assert response["error"]["code"] == -32000, method
@@ -1099,7 +1112,9 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
                 target = os.path.realpath(f"{fd_directory}/{name}")
             except OSError:
                 continue
-            if target == str(session_dir) or target.startswith(f"{session_dir}{os.sep}"):
+            if target == str(session_dir) or target.startswith(
+                f"{session_dir}{os.sep}"
+            ):
                 leaked_targets.append(target)
         assert leaked_targets == []
     finally:
@@ -1743,9 +1758,13 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
         await _close(server, writer)
         child.close()
 
+
 async def _wait_controller_release(server: ZetaServer) -> None:
     for _ in range(100):
-        if server.connections is not None and server.connections.controller_metadata() is None:
+        if (
+            server.connections is not None
+            and server.connections.controller_metadata() is None
+        ):
             return
         await asyncio.sleep(0)
     raise AssertionError("controller was not released")
@@ -1782,13 +1801,12 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        request = (await _frames_until_event(reader, "approval_request"))[-1][
-            "params"
-        ]
+        request = (await _frames_until_event(reader, "approval_request"))[-1]["params"]
         assert request["request_id"] == call.id
         writer.close()
         await writer.wait_closed()
         await _wait_controller_release(server)
+        assert await asyncio.wait_for(reader.read(), TIMEOUT) == b""
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -1800,9 +1818,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
             "hello",
             {"protocol_version": "1.2", "features": ["approval_reconnect"]},
         )
-        assert hello[-1]["result"]["capabilities"]["features"] == [
-            "approval_reconnect"
-        ]
+        assert hello[-1]["result"]["capabilities"]["features"] == ["approval_reconnect"]
         replay = json.loads(await _read_raw(replay_reader))["params"]
         assert replay["event"] == "approval_request"
         assert replay["request_id"] == call.id
@@ -1818,9 +1834,10 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         )
         assert approved[-1]["result"]["request_id"] == call.id
         await _frames_until_event(replay_reader, "agent_end")
-        assert server.runtime.opened.store.approval_resolution_data(call.id)[
-            "decision"
-        ] == "allow"
+        assert (
+            server.runtime.opened.store.approval_resolution_data(call.id)["decision"]
+            == "allow"
+        )
         assert len(backend.calls) == 2
     finally:
         if replay_writer is not None:
@@ -1891,9 +1908,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace.cancel()
         await asyncio.gather(grace, return_exceptions=True)
         server.approval_reconnect_grace = 0
-        monkeypatch.setattr(
-            server.runtime.opened.store, gate.method, gate.call
-        )
+        monkeypatch.setattr(server.runtime.opened.store, gate.method, gate.call)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
         await _wait_thread_gate(gate)
 
@@ -1988,7 +2003,9 @@ async def test_approval_reconnect_status_during_reserved_write(
         store = server.runtime.opened.store
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
-        decision = asyncio.create_task(server.control.resolve_approval("approve", call.id))
+        decision = asyncio.create_task(
+            server.control.resolve_approval("approve", call.id)
+        )
         await _wait_thread_gate(gate)
         status = server.control.pending_approvals_now(reconnect=True)
         assert status == [

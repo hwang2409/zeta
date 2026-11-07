@@ -16,7 +16,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
-from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
 from zeta.project_registry import (
@@ -26,8 +25,17 @@ from zeta.project_registry import (
     ProjectRegistryError,
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools import ToolRegistry
+
+
+async def _cancel_and_drain(tasks: list[asyncio.Task[object]]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
 
 
 def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
@@ -87,7 +95,9 @@ def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -
     assert "shipping the first version" in context.system_prompt
     assert any(path.name == "state.md" for path in context.files)
 
-    session = SessionManager(home).create(provider="codex", model="fake", cwd=repository)
+    session = SessionManager(home).create(
+        provider="codex", model="fake", cwd=repository
+    )
     assert session.metadata.project_id == project.project_id
     assert session.metadata.parent_session_id is None
     references = (home / "projects" / project.project_id / "sessions.jsonl").read_text()
@@ -204,8 +214,11 @@ def test_project_record_publish_rejects_oversized_data_without_replacing(
     monkeypatch.setattr(registry_module, "MAX_RECORD_SIZE", len(original) - 1)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(ProjectRegistryError, match="too large"):
-            registry._publish(directory_fd, "project.json", registry._encode(project))
+        with (
+            pytest.raises(ProjectRegistryError, match="too large"),
+            open_writer(tmp_path) as lease,
+        ):
+            registry._publish(lease, directory_fd, "project.json", registry._encode(project))
     finally:
         os.close(directory_fd)
 
@@ -220,7 +233,8 @@ def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) 
     value["scope"] = "legacy" + chr(0xD800)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        registry._publish(directory_fd, "project.json", value)
+        with open_writer(tmp_path) as lease:
+            registry._publish(lease, directory_fd, "project.json", value)
     finally:
         os.close(directory_fd)
 
@@ -253,9 +267,7 @@ def test_project_record_loads_boolean_schema_version(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("field", ("name", "scope"))
-def test_project_record_loads_legacy_surrogate_text(
-    tmp_path: Path, field: str
-) -> None:
+def test_project_record_loads_legacy_surrogate_text(tmp_path: Path, field: str) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     project = registry.create_project("demo", "scope")
     record = registry.root / project.project_id / "project.json"
@@ -491,8 +503,12 @@ def _nested_spawn_turns() -> list[ScriptedTurn]:
     ]
 
 
-async def _run_root_with_child_and_grandchild(manager: SessionManager, repository: Path):
-    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=repository))
+async def _run_root_with_child_and_grandchild(
+    manager: SessionManager, repository: Path
+):
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="fake", cwd=repository)
+    )
     loop = AgentLoop(
         FakeBackend(_nested_spawn_turns()),
         opened.store,
@@ -516,8 +532,11 @@ async def test_child_lineage_two_roots_each_with_child_and_grandchild(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
@@ -547,12 +566,17 @@ async def test_child_lineage_reconciled_after_registry_failure(
     home = tmp_path / ".zeta"
     repository = tmp_path / "repo"
     repository.mkdir()
-    project = ProjectRegistry(home / "projects").create_project(
-        "demo", "scope", repository
+    project = await asyncio.to_thread(
+        ProjectRegistry(home / "projects").create_project,
+        "demo",
+        "scope",
+        repository,
     )
 
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=repository))
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="fake", cwd=repository)
+    )
     root_id = opened.metadata.session_id
 
     # Inject a registry-append failure for the child lineage records: the
@@ -614,7 +638,14 @@ def _write_sessions_file(path: Path, data: bytes) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["torn_final", "malformed_middle", "oversized_final", "fifo", "symlink", "hardlink"],
+    [
+        "torn_final",
+        "malformed_middle",
+        "oversized_final",
+        "fifo",
+        "symlink",
+        "hardlink",
+    ],
 )
 def test_list_session_links_file_safety(tmp_path: Path, case: str) -> None:
     root = tmp_path / "projects"
@@ -627,7 +658,9 @@ def test_list_session_links_file_safety(tmp_path: Path, case: str) -> None:
     if case == "torn_final":
         # A crash can leave one unterminated final record; the reader tolerates
         # that bounded tail and returns only the completed records.
-        _write_sessions_file(sessions, first + b"\n" + (_VALID_LINK % ("b" * 32)).encode())
+        _write_sessions_file(
+            sessions, first + b"\n" + (_VALID_LINK % ("b" * 32)).encode()
+        )
         links = registry.list_session_links(project.project_id)
         assert [link["session_id"] for link in links] == ["a" * 32]
         return
@@ -803,9 +836,7 @@ def test_child_reconciliation_makes_progress_across_budgeted_passes(
     total = 6
     ids = [f"{root_id}:{i}" for i in range(1, total + 1)]
     for sid in ids:
-        _write_child_intent(
-            manager, root_id, project.project_id, sid, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, sid, root_id)
     # A tight per-pass bound truncates each pass, but because published entries
     # leave the index every pass makes forward progress.
     monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
@@ -839,9 +870,7 @@ def test_child_reconciliation_does_not_walk_agents_tree(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     ids = [f"{root_id}:{i}" for i in range(1, 4)]
     for sid in ids:
-        _write_child_intent(
-            manager, root_id, project.project_id, sid, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, sid, root_id)
     # Plant an agents subtree that would trip any traversal: if reconciliation
     # ever opened it the spy below would record the visit.
     with session_directory(manager.sessions_dir, root_id) as (_, root_fd):
@@ -879,9 +908,7 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     ids = [f"{root_id}:{i}" for i in range(1, 4)]
     for sid in ids:
-        _write_child_intent(
-            manager, root_id, project.project_id, sid, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, sid, root_id)
     registry = manager.project_registry
 
     def boom(*args: object, **kwargs: object) -> None:
@@ -1011,23 +1038,38 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
         )
         for index in range(257)
     ]
-    first = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[0], calls[0].arguments, signals.new_generation(), None
+    tasks: list[asyncio.Task[object]] = []
+    try:
+        first = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[0], calls[0].arguments, signals.new_generation(), None
+            )
         )
-    )
-    await asyncio.to_thread(owner_before_collection.wait)
-    tasks = [first]
-    for call in calls[1:]:
-        task = asyncio.create_task(
-            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
+        tasks.append(first)
+        assert await asyncio.to_thread(owner_before_collection.wait, 10), (
+            "owner_before_collection not reached"
         )
-        tasks.append(task)
-        await asyncio.gather(task, return_exceptions=True)
-    release_owner.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    await loop.close()
-    opened.store.close()
+        for call in calls[1:]:
+            task = asyncio.create_task(
+                loop._run_agent_tool(
+                    call, call.arguments, signals.new_generation(), None
+                )
+            )
+            tasks.append(task)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        release_owner.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
+    finally:
+        release_owner.set()
+        try:
+            await _cancel_and_drain(tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
 
     assert all(isinstance(result, RuntimeError) for result in results)
     assert registry_reads == 2
@@ -1108,30 +1150,45 @@ async def test_real_child_spawns_repeat_after_generation_changes(
         )
         for index in range(257)
     ]
-    first = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[0], calls[0].arguments, signals.new_generation(), None
+    tasks: list[asyncio.Task[object]] = []
+    try:
+        first = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[0], calls[0].arguments, signals.new_generation(), None
+            )
         )
-    )
-    await asyncio.to_thread(first_batch_ready.wait)
-    tasks = [first]
-    for call in calls[1:256]:
-        task = asyncio.create_task(
-            loop._run_agent_tool(call, call.arguments, signals.new_generation(), None)
+        tasks.append(first)
+        assert await asyncio.to_thread(first_batch_ready.wait, 10), (
+            "first_batch_ready not reached"
         )
-        tasks.append(task)
-        await asyncio.gather(task, return_exceptions=True)
-    last = asyncio.create_task(
-        loop._run_agent_tool(
-            calls[256], calls[256].arguments, signals.new_generation(), None
+        for call in calls[1:256]:
+            task = asyncio.create_task(
+                loop._run_agent_tool(
+                    call, call.arguments, signals.new_generation(), None
+                )
+            )
+            tasks.append(task)
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        last = asyncio.create_task(
+            loop._run_agent_tool(
+                calls[256], calls[256].arguments, signals.new_generation(), None
+            )
         )
-    )
-    tasks.append(last)
-    await asyncio.gather(last, return_exceptions=True)
-    release_first_batch.set()
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    await loop.close()
-    opened.store.close()
+        tasks.append(last)
+        await asyncio.wait_for(asyncio.gather(last, return_exceptions=True), 10)
+        release_first_batch.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
+    finally:
+        release_first_batch.set()
+        try:
+            await _cancel_and_drain(tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
     assert all(isinstance(result, RuntimeError) for result in results)
 
     # The first ready set is already collected when publication blocks. The
@@ -1176,7 +1233,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         child_loops.append(child_loop)
         if len(child_loops) == 2:
             children_ready.set()
-        await release_children.wait()
+        await asyncio.wait_for(release_children.wait(), 10)
         return kwargs["child_result"]("done", state="completed")
 
     monkeypatch.setattr(agent_runner, "consume_child", hold_children)
@@ -1193,106 +1250,135 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
             },
         )
 
-    root_calls = [call("child-a"), call("child-b")]
-    root_tasks = [
-        asyncio.create_task(
-            loop._run_agent_tool(
-                item, item.arguments, signals.new_generation(), None
-            )
-        )
-        for item in root_calls
-    ]
-    await children_ready.wait()
-
-    async def stop_after_publication(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("stop after lineage publication")
-
-    for child_loop in child_loops:
-        monkeypatch.setattr(
-            child_loop.store, "append_child_run_started_async", stop_after_publication
-        )
-
-    first_batch_ready = threading.Event()
-    second_owner_entered = asyncio.Event()
-    event_loop = asyncio.get_running_loop()
     release_batches = threading.Event()
-    record_lock = threading.Lock()
-    active_records = 0
-    max_active_records = 0
-    record_calls = 0
-    registry_reads = 0
-    real_record_sessions = registry.record_sessions
-    real_read = registry._read_session_records
+    root_tasks: list[asyncio.Task[object]] = []
+    grand_tasks: list[asyncio.Task[object]] = []
+    second_owner_wait: asyncio.Task[object] | None = None
+    try:
+        root_calls = [call("child-a"), call("child-b")]
+        root_tasks = [
+            asyncio.create_task(
+                loop._run_agent_tool(
+                    item, item.arguments, signals.new_generation(), None
+                )
+            )
+            for item in root_calls
+        ]
+        await asyncio.wait_for(children_ready.wait(), 10)
 
-    def gate_batches(*args: object, **kwargs: object) -> None:
-        nonlocal active_records, max_active_records, record_calls
-        with record_lock:
-            record_calls += 1
-            active_records += 1
-            max_active_records = max(max_active_records, active_records)
-            if record_calls == 1:
-                first_batch_ready.set()
-            elif record_calls == 2:
-                event_loop.call_soon_threadsafe(second_owner_entered.set)
-        release_batches.wait()
-        try:
-            real_record_sessions(*args, **kwargs)
-        finally:
+        async def stop_after_publication(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("stop after lineage publication")
+
+        for child_loop in child_loops:
+            monkeypatch.setattr(
+                child_loop.store,
+                "append_child_run_started_async",
+                stop_after_publication,
+            )
+
+        first_batch_ready = threading.Event()
+        second_owner_entered = asyncio.Event()
+        event_loop = asyncio.get_running_loop()
+        record_lock = threading.Lock()
+        active_records = 0
+        max_active_records = 0
+        record_calls = 0
+        registry_reads = 0
+        real_record_sessions = registry.record_sessions
+        real_read = registry._read_session_records
+
+        def gate_batches(*args: object, **kwargs: object) -> None:
+            nonlocal active_records, max_active_records, record_calls
             with record_lock:
-                active_records -= 1
+                record_calls += 1
+                active_records += 1
+                max_active_records = max(max_active_records, active_records)
+                if record_calls == 1:
+                    first_batch_ready.set()
+                elif record_calls == 2:
+                    event_loop.call_soon_threadsafe(second_owner_entered.set)
+            if not release_batches.wait(10):
+                raise TimeoutError("release_batches not reached")
+            try:
+                real_record_sessions(*args, **kwargs)
+            finally:
+                with record_lock:
+                    active_records -= 1
 
-    def count_registry_read(*args: object, **kwargs: object):
-        nonlocal registry_reads
-        registry_reads += 1
-        return real_read(*args, **kwargs)
+        def count_registry_read(*args: object, **kwargs: object):
+            nonlocal registry_reads
+            registry_reads += 1
+            return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "record_sessions", gate_batches)
-    # test-contract: seam count registry scans behind real nested spawn calls
-    monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
-    grand_calls = [call(f"grandchild-{index}") for index in range(4)]
-    grand_tasks = [
-        asyncio.create_task(
-            child_loops[0]._run_agent_tool(
-                grand_calls[0],
-                grand_calls[0].arguments,
-                signals.new_generation(),
-                None,
+        monkeypatch.setattr(registry, "record_sessions", gate_batches)
+        # test-contract: seam count registry scans behind real nested spawn calls
+        monkeypatch.setattr(registry, "_read_session_records", count_registry_read)
+        grand_calls = [call(f"grandchild-{index}") for index in range(4)]
+        grand_tasks = [
+            asyncio.create_task(
+                child_loops[0]._run_agent_tool(
+                    grand_calls[0],
+                    grand_calls[0].arguments,
+                    signals.new_generation(),
+                    None,
+                )
+            )
+        ]
+        assert await asyncio.to_thread(first_batch_ready.wait, 10), (
+            "first_batch_ready not reached"
+        )
+        second = asyncio.create_task(
+            child_loops[1]._run_agent_tool(
+                grand_calls[1], grand_calls[1].arguments, signals.new_generation(), None
             )
         )
-    ]
-    await asyncio.to_thread(first_batch_ready.wait)
-    second = asyncio.create_task(
-        child_loops[1]._run_agent_tool(
-            grand_calls[1], grand_calls[1].arguments, signals.new_generation(), None
+        grand_tasks.append(second)
+        second_owner_wait = asyncio.create_task(second_owner_entered.wait())
+        done, _ = await asyncio.wait_for(
+            asyncio.wait(
+                {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
+            ),
+            10,
         )
-    )
-    grand_tasks.append(second)
-    second_owner_wait = asyncio.create_task(second_owner_entered.wait())
-    done, _ = await asyncio.wait(
-        {second, second_owner_wait}, return_when=asyncio.FIRST_COMPLETED
-    )
-    grand_tasks.extend(
-        asyncio.create_task(
-            child_loops[index % 2]._run_agent_tool(
-                grand_calls[index],
-                grand_calls[index].arguments,
-                signals.new_generation(),
-                None,
+        grand_tasks.extend(
+            asyncio.create_task(
+                child_loops[index % 2]._run_agent_tool(
+                    grand_calls[index],
+                    grand_calls[index].arguments,
+                    signals.new_generation(),
+                    None,
+                )
             )
+            for index in range(2, 4)
         )
-        for index in range(2, 4)
-    )
-    await asyncio.gather(*grand_tasks[2:], return_exceptions=True)
-    release_batches.set()
-    results = await asyncio.gather(*grand_tasks, return_exceptions=True)
-    if second_owner_wait not in done:
-        second_owner_wait.cancel()
-        await asyncio.gather(second_owner_wait, return_exceptions=True)
-    release_children.set()
-    await asyncio.gather(*root_tasks)
-    await loop.close()
-    opened.store.close()
+        await asyncio.wait_for(
+            asyncio.gather(*grand_tasks[2:], return_exceptions=True), 10
+        )
+        release_batches.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(*grand_tasks, return_exceptions=True), 10
+        )
+        if second_owner_wait not in done:
+            second_owner_wait.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(second_owner_wait, return_exceptions=True), 10
+            )
+        release_children.set()
+        await asyncio.wait_for(asyncio.gather(*root_tasks), 10)
+    finally:
+        release_batches.set()
+        release_children.set()
+        cleanup_tasks = [*grand_tasks, *root_tasks]
+        if second_owner_wait is not None:
+            cleanup_tasks.append(second_owner_wait)
+        try:
+            await _cancel_and_drain(cleanup_tasks)
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
 
     assert all(isinstance(result, RuntimeError) for result in results)
     assert max_active_records == 1
@@ -1368,31 +1454,43 @@ async def test_cancelled_child_publication_joins_before_loop_close(
             None,
         )
     )
-    asyncio.get_running_loop().call_soon(lambda: order.append("heartbeat"))
-    await asyncio.to_thread(first_phase.wait)
-
     close_task: asyncio.Task[tuple[str, ...]] | None = None
-    if worker_entered.is_set():
-        task.cancel()
-        close_task = asyncio.create_task(loop.close())
-        cancellation_observed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(cancellation_observed.set)
-        await cancellation_observed.wait()
-        assert not task.done()
-        assert not close_task.done()
+    try:
+        asyncio.get_running_loop().call_soon(lambda: order.append("heartbeat"))
+        assert await asyncio.to_thread(first_phase.wait, 10), "first_phase not reached"
+
+        if worker_entered.is_set():
+            task.cancel()
+            close_task = asyncio.create_task(loop.close())
+            cancellation_observed = asyncio.Event()
+            asyncio.get_running_loop().call_soon(cancellation_observed.set)
+            await asyncio.wait_for(cancellation_observed.wait(), 10)
+            assert not task.done()
+            assert not close_task.done()
+            release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        if close_task is not None:
+            await asyncio.wait_for(close_task, 10)
+        else:
+            await asyncio.wait_for(loop.close(), 10)
+    finally:
         release_worker.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    if close_task is not None:
-        await close_task
-    else:
-        await loop.close()
+        try:
+            await _cancel_and_drain([task])
+        finally:
+            try:
+                if close_task is not None:
+                    await asyncio.wait_for(close_task, 10)
+                else:
+                    await asyncio.wait_for(loop.close(), 10)
+            finally:
+                opened.store.close()
 
     assert order.index("heartbeat") < order.index("storage_return")
     child_id = f"{opened.metadata.session_id}:1"
     records = registry.list_session_links(project.project_id)
     assert [record["session_id"] for record in records].count(child_id) == 1
-    opened.store.close()
 
 
 def test_pending_index_fsyncs_root_dir_before_record_session(
@@ -1468,16 +1566,20 @@ def test_invalid_entries_are_quarantined_not_deleted(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_ids = [f"{root_id}:{i}" for i in range(1, 4)]
     # Seed one valid intent first so the durable index directory exists.
-    _write_child_intent(
-        manager, root_id, project.project_id, valid_ids[0], root_id
-    )
+    _write_child_intent(manager, root_id, project.project_id, valid_ids[0], root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
 
     # Permanently unpublishable entries planted ahead of the valid intents:
     # malformed JSON, schema-invalid JSON, an oversized blob, an empty object,
     # and a symlink.  None can ever be published; all must be unlinked so they
     # never occupy the first page forever.
-    invalid_names = ["malformed", "wrong_schema", "oversized", "empty_json", "symlinked"]
+    invalid_names = [
+        "malformed",
+        "wrong_schema",
+        "oversized",
+        "empty_json",
+        "symlinked",
+    ]
     (pending_dir / "malformed").write_text("{ not json", encoding="utf-8")
     (pending_dir / "wrong_schema").write_text(
         json.dumps({"foo": "bar"}), encoding="utf-8"
@@ -1488,9 +1590,7 @@ def test_invalid_entries_are_quarantined_not_deleted(
 
     # Seed the remaining valid intents behind the invalid ones.
     for sid in valid_ids[1:]:
-        _write_child_intent(
-            manager, root_id, project.project_id, sid, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, sid, root_id)
 
     reordered_pending_scandir(pending_dir)
     monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
@@ -1498,7 +1598,9 @@ def test_invalid_entries_are_quarantined_not_deleted(
 
     for _ in range(30):  # generous upper bound on passes
         reconcile_child_links(registry, manager.sessions_dir, root_id)
-        all_published = _child_link_ids(registry, project.project_id) == sorted(valid_ids)
+        all_published = _child_link_ids(registry, project.project_id) == sorted(
+            valid_ids
+        )
         all_invalid_quarantined = all(
             not os.path.lexists(pending_dir / name) for name in invalid_names
         )
@@ -1512,12 +1614,14 @@ def test_invalid_entries_are_quarantined_not_deleted(
     for name in invalid_names:
         assert not os.path.lexists(pending_dir / name)
         assert os.path.lexists(_quarantined_path(quarantine_dir, name))
-    assert _quarantined_path(quarantine_dir, "malformed").read_text(
-        encoding="utf-8"
-    ) == "{ not json"
-    assert _quarantined_path(quarantine_dir, "oversized").read_text(
-        encoding="utf-8"
-    ) == "x" * 9000
+    assert (
+        _quarantined_path(quarantine_dir, "malformed").read_text(encoding="utf-8")
+        == "{ not json"
+    )
+    assert (
+        _quarantined_path(quarantine_dir, "oversized").read_text(encoding="utf-8")
+        == "x" * 9000
+    )
     remaining = [n for n in os.listdir(pending_dir) if not n.startswith(".")]
     assert remaining == []
 
@@ -1533,14 +1637,13 @@ def test_quarantine_handles_max_length_filename(
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_id = f"{root_id}:later-valid"
-    _write_child_intent(
-        manager, root_id, project.project_id, valid_id, root_id
-    )
+    _write_child_intent(manager, root_id, project.project_id, valid_id, root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     valid_name = session_links._encode_link_name(valid_id)
     invalid_name = "x" * 255
     (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
 
+    # test-contract: seam force an overlong directory entry through the scanner seam
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
@@ -1577,9 +1680,7 @@ def test_transient_read_error_keeps_intent_and_retries(
     blocked_id = f"{root_id}:blocked"
     later_id = f"{root_id}:later"
     for child_id in (blocked_id, later_id):
-        _write_child_intent(
-            manager, root_id, project.project_id, child_id, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, child_id, root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     blocked_name = session_links._encode_link_name(blocked_id)
     later_name = session_links._encode_link_name(later_id)
@@ -1587,6 +1688,7 @@ def test_transient_read_error_keeps_intent_and_retries(
 
     # Fix the scan order so the test proves that the transient failure stops the
     # pass before a later, otherwise valid intent can be published.
+    # test-contract: seam fix scan order to prove transient failure stops the pass
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
@@ -1641,9 +1743,7 @@ def test_directory_entries_do_not_stall_reconciliation(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_ids = [f"{root_id}:valid-{i}" for i in range(2)]
     for child_id in valid_ids:
-        _write_child_intent(
-            manager, root_id, project.project_id, child_id, root_id
-        )
+        _write_child_intent(manager, root_id, project.project_id, child_id, root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     directory_names = [f"invalid-directory-{i}" for i in range(5)]
     for name in directory_names:
@@ -1665,7 +1765,9 @@ def test_directory_entries_do_not_stall_reconciliation(
         if all_published and all_directories_quarantined:
             break
 
-    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(valid_ids)
+    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(
+        valid_ids
+    )
     quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
     for name in directory_names:
         assert not (pending_dir / name).exists()
@@ -1683,9 +1785,7 @@ def test_hardlinked_entry_is_quarantined(tmp_path: Path) -> None:
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     child_id = f"{root_id}:hardlinked"
-    _write_child_intent(
-        manager, root_id, project.project_id, child_id, root_id
-    )
+    _write_child_intent(manager, root_id, project.project_id, child_id, root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     name = session_links._encode_link_name(child_id)
     original_content = (pending_dir / name).read_bytes()
@@ -1722,7 +1822,9 @@ def test_temp_files_count_toward_pass_budget(
     for name in list(os.listdir(pending_dir)):
         os.unlink(pending_dir / name)
     for i in range(5):
-        (pending_dir / f".seed{i}.{i:032x}.tmp").write_text("in-flight", encoding="utf-8")
+        (pending_dir / f".seed{i}.{i:032x}.tmp").write_text(
+            "in-flight", encoding="utf-8"
+        )
 
     monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
     with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
@@ -1740,9 +1842,7 @@ def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
     )
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
-    _write_child_intent(
-        manager, root_id, project.project_id, f"{root_id}:1", root_id
-    )
+    _write_child_intent(manager, root_id, project.project_id, f"{root_id}:1", root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
 
     stale = pending_dir / (".stale." + "a" * 32 + ".tmp")
@@ -1763,9 +1863,10 @@ def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
     assert fresh.read_text(encoding="utf-8") == "in-flight"
     quarantine = pending_dir.parent / "pending_child_links.invalid"
     assert not nonmatching.exists()
-    assert _quarantined_path(quarantine, nonmatching.name).read_text(
-        encoding="utf-8"
-    ) == "not json"
+    assert (
+        _quarantined_path(quarantine, nonmatching.name).read_text(encoding="utf-8")
+        == "not json"
+    )
     # The valid intent was still published.
     assert _child_link_ids(manager.project_registry, project.project_id) == [
         f"{root_id}:1"
@@ -1793,10 +1894,13 @@ def test_quarantine_never_clobbers_existing_entry(tmp_path: Path) -> None:
 
     reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
-    assert (quarantine_dir / invalid_name).read_text(encoding="utf-8") == "existing payload"
-    assert _quarantined_path(quarantine_dir, invalid_name).read_text(
+    assert (quarantine_dir / invalid_name).read_text(
         encoding="utf-8"
-    ) == "new invalid payload"
+    ) == "existing payload"
+    assert (
+        _quarantined_path(quarantine_dir, invalid_name).read_text(encoding="utf-8")
+        == "new invalid payload"
+    )
 
 
 def test_quarantine_is_unbounded_and_never_deletes(tmp_path: Path) -> None:
@@ -1822,12 +1926,15 @@ def test_quarantine_is_unbounded_and_never_deletes(tmp_path: Path) -> None:
     reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
     assert not (pending_dir / invalid_name).exists()
-    assert _quarantined_path(quarantine_dir, invalid_name).read_text(
-        encoding="utf-8"
-    ) == "not json"
+    assert (
+        _quarantined_path(quarantine_dir, invalid_name).read_text(encoding="utf-8")
+        == "not json"
+    )
     assert len(list(quarantine_dir.iterdir())) == 257
     for i in range(256):
-        assert (quarantine_dir / f"existing-{i:03d}").read_text(encoding="utf-8") == str(i)
+        assert (quarantine_dir / f"existing-{i:03d}").read_text(
+            encoding="utf-8"
+        ) == str(i)
 
 
 def test_invalid_entries_never_starve_valid_intents_across_passes(
@@ -1841,9 +1948,7 @@ def test_invalid_entries_never_starve_valid_intents_across_passes(
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     valid_id = f"{root_id}:valid"
-    _write_child_intent(
-        manager, root_id, project.project_id, valid_id, root_id
-    )
+    _write_child_intent(manager, root_id, project.project_id, valid_id, root_id)
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     valid_name = session_links._encode_link_name(valid_id)
     for i in range(2 * session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS):
@@ -1852,7 +1957,9 @@ def test_invalid_entries_never_starve_valid_intents_across_passes(
     def invalids_first(
         pending_fd: int,
     ) -> tuple[list[str], list[str], bool, bool]:
-        names = sorted(os.listdir(pending_fd), key=lambda name: (name == valid_name, name))
+        names = sorted(
+            os.listdir(pending_fd), key=lambda name: (name == valid_name, name)
+        )
         bound = session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS
         return names[:bound], [], False, len(names) > bound
 
@@ -1878,9 +1985,7 @@ def test_reconciliation_reads_pending_intent_until_eof(
     manager, project, root_id = _reconcile_fixture(tmp_path)
     child_id = f"{root_id}:short-read"
     _write_child_intent(manager, root_id, project.project_id, child_id, root_id)
-    pending_path = (
-        manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
-    )
+    pending_path = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     intent_path = next(pending_path.iterdir())
     intent_stat = intent_path.stat()
     real_read = os.read
@@ -1936,11 +2041,17 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     root_repository.mkdir()
     child_repository.mkdir()
     registry = ProjectRegistry(home / "projects")
-    root_project = registry.create_project("root", "root scope", root_repository)
-    child_project = registry.create_project("child", "child scope", child_repository)
+    root_project = await asyncio.to_thread(
+        registry.create_project, "root", "root scope", root_repository
+    )
+    child_project = await asyncio.to_thread(
+        registry.create_project, "child", "child scope", child_repository
+    )
 
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(lambda: manager.create(provider="codex", model="fake", cwd=root_repository))
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="fake", cwd=root_repository)
+    )
     root_id = opened.metadata.session_id
     turns = [
         ScriptedTurn(

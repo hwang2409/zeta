@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import build_parser
 from zeta.config.settings import load_settings
 from zeta.core.project_context import associate_project_discovery, discover_project
@@ -53,13 +55,17 @@ def manager(tmp_path: Path) -> SessionManager:
 def test_new_session_auto_creates_and_links_project(tmp_path: Path) -> None:
     root = repo(tmp_path)
     opened = manager(tmp_path).create(provider="codex", model="test", cwd=root)
-    project = ProjectRegistry(tmp_path / "zeta" / "projects").show_project(opened.metadata.project_id)
+    project = ProjectRegistry(tmp_path / "zeta" / "projects").show_project(
+        opened.metadata.project_id
+    )
     assert opened.metadata.project_id == project.project_id
     assert project.name == root.name
     assert project.canonical_integration_root == str(root.resolve())
 
 
-def test_subdirectory_and_inside_outside_worktrees_share_one_project(tmp_path: Path) -> None:
+def test_subdirectory_and_inside_outside_worktrees_share_one_project(
+    tmp_path: Path,
+) -> None:
     root = repo(tmp_path)
     inside = root / ".worktrees" / "x"
     inside.parent.mkdir()
@@ -68,18 +74,25 @@ def test_subdirectory_and_inside_outside_worktrees_share_one_project(tmp_path: P
     git(root, "worktree", "add", str(outside), "-b", "outside")
     (root / "sub").mkdir()
     m = manager(tmp_path)
-    ids = [m.create(provider="codex", model="test", cwd=where).metadata.project_id
-           for where in (root / "sub", inside, outside)]
+    ids = [
+        m.create(provider="codex", model="test", cwd=where).metadata.project_id
+        for where in (root / "sub", inside, outside)
+    ]
     assert len(set(ids)) == 1
     assert len(ProjectRegistry(tmp_path / "zeta" / "projects").list_projects()) == 1
 
 
 @pytest.mark.parametrize("location", ["plain", "home", "root"])
-def test_non_git_home_and_filesystem_root_are_unassociated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str) -> None:
+def test_non_git_home_and_filesystem_root_are_unassociated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
     if location == "plain":
-        cwd = tmp_path / "plain"; cwd.mkdir()
+        cwd = tmp_path / "plain"
+        cwd.mkdir()
     elif location == "home":
-        cwd = tmp_path / "home"; cwd.mkdir(); monkeypatch.setenv("HOME", str(cwd))
+        cwd = tmp_path / "home"
+        cwd.mkdir()
+        monkeypatch.setenv("HOME", str(cwd))
     else:
         cwd = Path("/")
     opened = manager(tmp_path).create(provider="codex", model="test", cwd=cwd)
@@ -89,7 +102,9 @@ def test_non_git_home_and_filesystem_root_are_unassociated(tmp_path: Path, monke
 
 def test_auto_project_can_be_disabled(tmp_path: Path) -> None:
     root = repo(tmp_path)
-    opened = manager(tmp_path).create(provider="codex", model="test", cwd=root, auto_project=False)
+    opened = manager(tmp_path).create(
+        provider="codex", model="test", cwd=root, auto_project=False
+    )
     assert opened.metadata.project_id is None
 
 
@@ -97,16 +112,24 @@ def test_concurrent_session_creation_is_unique(tmp_path: Path) -> None:
     root = repo(tmp_path)
     m = manager(tmp_path)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        sessions = list(pool.map(lambda _: m.create(provider="codex", model="test", cwd=root), range(8)))
+        sessions = list(
+            pool.map(
+                lambda _: m.create(provider="codex", model="test", cwd=root), range(8)
+            )
+        )
     assert len({s.metadata.project_id for s in sessions}) == 1
     assert len(m.project_registry.list_projects()) == 1
 
 
-def test_registry_failure_is_nonfatal_and_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+def test_registry_failure_is_nonfatal_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     root = repo(tmp_path)
     m = manager(tmp_path)
+
     def fail(*args: object, **kwargs: object) -> object:
         raise OSError("registry down")
+
     monkeypatch.setattr(m.project_registry, "find_for_directory", fail)
     with caplog.at_level(logging.WARNING):
         opened = m.create(provider="codex", model="test", cwd=root)
@@ -115,52 +138,84 @@ def test_registry_failure_is_nonfatal_and_warns(tmp_path: Path, monkeypatch: pyt
 
 
 def test_resumed_session_keeps_association_and_child_inherits(tmp_path: Path) -> None:
-    root = repo(tmp_path); m = manager(tmp_path)
+    root = repo(tmp_path)
+    m = manager(tmp_path)
     parent = m.create(provider="codex", model="test", cwd=root)
     resumed = m.open(parent.metadata.session_id)
-    child = m.create(provider="codex", model="test", cwd=tmp_path, project_id=parent.metadata.project_id, parent_session_id=parent.metadata.session_id, project_role="worker")
+    child = m.create(
+        provider="codex",
+        model="test",
+        cwd=tmp_path,
+        project_id=parent.metadata.project_id,
+        parent_session_id=parent.metadata.session_id,
+        project_role="worker",
+    )
     assert resumed.metadata.project_id == parent.metadata.project_id
     assert child.metadata.project_id == parent.metadata.project_id
     assert len(m.project_registry.list_projects()) == 1
 
 
 def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
-    root = repo(tmp_path); m = manager(tmp_path)
+    root = repo(tmp_path)
+    m = manager(tmp_path)
     opened = m.create(provider="codex", model="test", cwd=root)
-    tools = ToolRegistry(cwd=str(root), project_id=opened.metadata.project_id, project_registry=m.project_registry, skill_catalog=SkillCatalog.empty())
+    tools = ToolRegistry(
+        cwd=str(root),
+        project_id=opened.metadata.project_id,
+        project_registry=m.project_registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
+
     result = asyncio.run(_inspect_project(tools, {"action": "inspect"}))
     assert result["isError"] is False
-    assert result["structuredContent"]["project"]["project_id"] == opened.metadata.project_id
+    assert (
+        result["structuredContent"]["project"]["project_id"]
+        == opened.metadata.project_id
+    )
 
 
 async def test_project_slash_show_and_init(tmp_path: Path) -> None:
-    root = repo(tmp_path); m = manager(tmp_path)
+    root = repo(tmp_path)
+    m = manager(tmp_path)
     opened = await asyncio.to_thread(
         lambda: m.create(provider="codex", model="test", cwd=root)
     )
+
     class Loop:
         project_registry = m.project_registry
         manager = m
         session_metadata = opened.metadata
-        class Store: cwd = str(root)
+
+        class Store:
+            cwd = str(root)
+
         store = Store()
+
         def _set_runtime_project(self, metadata: object) -> None:
             self.session_metadata = metadata
+
     class Session:
         loop = Loop()
-        def slash_project(self, args: str) -> str: return ""
+
+        def slash_project(self, args: str) -> str:
+            return ""
+
     # Exercise the production slash handler through the session mixin implementation.
     from zeta.tui.slash_handlers import SlashHandlerMixin
-    handler = object.__new__(SlashHandlerMixin); handler.loop = Loop()
+
+    handler = object.__new__(SlashHandlerMixin)
+    handler.loop = Loop()
     output = await handler.slash_project("")
     assert "project: repo" in output
-    plain = tmp_path / "plain"; plain.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
     opened2 = await asyncio.to_thread(
         lambda: m.create(provider="codex", model="test", cwd=plain, auto_project=False)
     )
-    handler.loop.session_metadata = opened2.metadata; handler.loop.store.cwd = str(plain)
+    handler.loop.session_metadata = opened2.metadata
+    handler.loop.store.cwd = str(plain)
     assert "unassociated" in await handler.slash_project("")
     assert "project: plain" in await handler.slash_project("init")
 
@@ -193,7 +248,9 @@ def test_registered_home_project_does_not_capture_nested_repo(
 
     assert opened.metadata.project_id != home_project.project_id
     assert opened.metadata.project_id is not None
-    assert registry.show_project(opened.metadata.project_id).canonical_integration_root == str(nested.resolve())
+    assert registry.show_project(
+        opened.metadata.project_id
+    ).canonical_integration_root == str(nested.resolve())
     opened.store.close()
 
 
@@ -247,7 +304,9 @@ def test_git_repo_at_home_does_not_create_project_for_descendant(
     opened.store.close()
 
 
-def test_same_basename_repositories_get_distinct_stable_projects(tmp_path: Path) -> None:
+def test_same_basename_repositories_get_distinct_stable_projects(
+    tmp_path: Path,
+) -> None:
     roots = []
     for parent_name in ("alpha", "beta"):
         root = tmp_path / parent_name / "repo"
@@ -262,11 +321,16 @@ def test_same_basename_repositories_get_distinct_stable_projects(tmp_path: Path)
     first_ids = [opened.metadata.project_id for opened in first]
     assert len(set(first_ids)) == 2
     assert [opened.metadata.project_id for opened in reopened] == first_ids
-    projects = {project.project_id: project for project in m.project_registry.list_projects()}
-    assert [projects[project_id].name for project_id in first_ids] == ["repo", "repo-beta"]
-    assert [projects[project_id].canonical_integration_root for project_id in first_ids] == [
-        str(root.resolve()) for root in roots
+    projects = {
+        project.project_id: project for project in m.project_registry.list_projects()
+    }
+    assert [projects[project_id].name for project_id in first_ids] == [
+        "repo",
+        "repo-beta",
     ]
+    assert [
+        projects[project_id].canonical_integration_root for project_id in first_ids
+    ] == [str(root.resolve()) for root in roots]
     for opened in [*first, *reopened]:
         opened.store.close()
 
@@ -348,7 +412,9 @@ def test_git_discovery_does_not_invoke_fsmonitor(
     opened.store.close()
 
 
-def test_separate_git_dir_and_linked_worktree_share_primary_project(tmp_path: Path) -> None:
+def test_separate_git_dir_and_linked_worktree_share_primary_project(
+    tmp_path: Path,
+) -> None:
     primary = tmp_path / "primary"
     git_dir = tmp_path / "git-data"
     primary.mkdir()
@@ -402,7 +468,10 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     session_id = app.loop.store.session_id
     try:
-        assert "memory from primary" in app.loop.context_assembler.system_prompt.content[0].text
+        assert (
+            "memory from primary"
+            in app.loop.context_assembler.system_prompt.content[0].text
+        )
     finally:
         asyncio.run(app.close())
 
@@ -410,7 +479,10 @@ def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
         build_parser().parse_args(["--provider", "codex", "--resume", session_id])
     )
     try:
-        assert "memory from primary" in resumed.loop.context_assembler.system_prompt.content[0].text
+        assert (
+            "memory from primary"
+            in resumed.loop.context_assembler.system_prompt.content[0].text
+        )
     finally:
         asyncio.run(resumed.close())
 
@@ -516,7 +588,10 @@ def test_hanging_git_registered_project_one_warning_one_deadline(
         # test-contract: latency one registered-project timeout emits one warning
         assert len(warnings) == 1
         assert app.loop.session_metadata.project_id is None
-        assert "PRIVATE-MUST-NOT-LOAD" not in app.loop.context_assembler.system_prompt.content[0].text
+        assert (
+            "PRIVATE-MUST-NOT-LOAD"
+            not in app.loop.context_assembler.system_prompt.content[0].text
+        )
     finally:
         asyncio.run(app.close())
 
@@ -584,7 +659,9 @@ async def test_registered_home_and_injected_filesystem_root_projects_do_not_auto
     monkeypatch.setattr(
         m.project_registry, "find_for_directory", fail_ineligible_lookup
     )
-    assert associate_project_discovery(root_discovery, m.project_registry).project is None
+    assert (
+        associate_project_discovery(root_discovery, m.project_registry).project is None
+    )
     assert root_project.project_id is not None
 
     from zeta.tui.app import create_app
@@ -648,8 +725,19 @@ def test_first_auto_created_session_refreshes_project_memory_on_resume(
 async def test_project_init_rebinds_runtime_child_and_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.core import project_context
     from zeta.tui.app import create_app
 
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    # test-contract: seam observe the real Git subprocess seam through TUI dispatch
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
     plain = tmp_path / "plain"
     plain.mkdir()
     home = tmp_path / "zeta-home"
@@ -658,10 +746,16 @@ async def test_project_init_rebinds_runtime_child_and_approval(
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(plain)
-    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app = await asyncio.to_thread(
+        create_app, build_parser().parse_args(["--provider", "codex"])
+    )
     try:
         assert app.loop.root_project_id is None
-        assert "project: plain" in await app.slash_project("init")
+        discovery_threads.clear()
+        output = await app._slash_commands.dispatch_async(app, "/project init")
+        assert "project: plain" in output
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
         project_id = app.loop.session_metadata.project_id
         assert project_id is not None
         assert app.loop.root_project_id == project_id
@@ -739,11 +833,13 @@ def test_project_init_uses_durable_pending_link_on_registry_failure(
 
 def test_concurrent_session_creation_across_processes_is_unique(tmp_path: Path) -> None:
     root = repo(tmp_path)
-    home = tmp_path / "zeta"
+    home = initialize_storage_home(tmp_path / "zeta")
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
     processes = [
-        context.Process(target=_create_session_process, args=(str(home), str(root), queue))
+        context.Process(
+            target=_create_session_process, args=(str(home), str(root), queue)
+        )
         for _ in range(6)
     ]
     for process in processes:
@@ -886,7 +982,9 @@ def test_explicit_resume_discovers_only_the_stored_session_cwd(
     )
     try:
         prompt = app.loop.context_assembler.system_prompt.content[0].text
-        skill_names = {skill.name for skill in app.loop.tool_registry.skill_catalog.skills}
+        skill_names = {
+            skill.name for skill in app.loop.tool_registry.skill_catalog.skills
+        }
         assert app.loop.session_metadata.project_id == project_id
         assert "SESSION REPOSITORY CONTEXT" in prompt
         assert "INVOCATION REPOSITORY CONTEXT" not in prompt

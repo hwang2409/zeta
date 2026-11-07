@@ -11,9 +11,9 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.fork_session import (

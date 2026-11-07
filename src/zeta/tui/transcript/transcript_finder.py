@@ -111,16 +111,6 @@ class TranscriptFinderMixin:
         if not metadata:
             yield (), True
 
-    async def build_finder_candidates(
-        self, request: FinderCandidateRequest
-    ) -> tuple[Candidate, ...]:
-        """Build the complete snapshot for tests and non-progressive callers."""
-
-        batches = [
-            batch async for batch, _complete in self.build_finder_candidate_batches(request)
-        ]
-        return tuple(sorted((item for batch in batches for item in batch), key=lambda item: item.index))
-
     async def _prepare_finder_candidate(
         self, index: int, unit: Any, role: Role, marker: str
     ) -> Candidate | None:
@@ -168,18 +158,6 @@ class TranscriptFinderMixin:
         if self._finder is None or self._finder_generation != request.generation:
             return False
         self._finder.extend_candidates(candidates, complete=complete)
-        return True
-
-    def finder_publish_candidates(
-        self,
-        request: FinderCandidateRequest,
-        candidates: tuple[Candidate, ...],
-    ) -> bool:
-        """Load candidates only if their finder overlay is still active."""
-
-        if self._finder is None or self._finder_generation != request.generation:
-            return False
-        self._finder.load_candidates(candidates)
         return True
 
     def finder_set_query(self, query: str) -> int | None:

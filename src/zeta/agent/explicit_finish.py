@@ -176,6 +176,10 @@ async def kill_tasks_after_deadline(
 
     await asyncio.sleep(timeout)
     task_ids = tuple(task.task_id for task in registry.snapshot() if task.running)
+    cause = (
+        "explicit-finish child task safety deadline expired after "
+        f"{timeout:g} seconds"
+    )
     for task_id in task_ids:
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause=cause)
     return task_ids
