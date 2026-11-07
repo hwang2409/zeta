@@ -41,20 +41,6 @@ if TYPE_CHECKING:
 MAX_ERROR_MESSAGE = 400
 
 
-def _sanitize_account_message(message: Message) -> Message:
-    content = [
-        ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
-        for block in message.content
-        if not isinstance(block, RedactedThinkingContent)
-    ]
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=message.metadata,
-    )
-
-
 async def provider_events(
     completion: AsyncIterator[StreamEvent],
     on_started: Callable[[], Awaitable[None]] | None = None,
@@ -172,6 +158,20 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
         message,
         status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
+    )
+
+
+def _sanitize_account_message(message: Message) -> Message:
+    content = [
+        ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
+        for block in message.content
+        if not isinstance(block, RedactedThinkingContent)
+    ]
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=message.metadata,
     )
 
 
