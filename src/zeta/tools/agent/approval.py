@@ -26,6 +26,7 @@ from ...protocol.types import (
     ToolCall,
     ToolUseContent,
 )
+from .._shared.sandbox import resolve_shell_cwd
 from ..registry import AbortSignal
 
 
@@ -149,18 +150,14 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     def _effective_cwd(
         self, tool_name: str, arguments: Mapping[str, object]
     ) -> Path:
-        effective_cwd = self.child_cwd
-        cwd_argument = arguments.get("cwd")
-        if tool_name == "bash" and cwd_argument is None:
-            effective_cwd = Path(self.child_store.bash_cwd)
-        elif tool_name in {"bash", "run_background"} and isinstance(
-            cwd_argument, str
-        ):
-            candidate = Path(cwd_argument).expanduser()
-            effective_cwd = (
-                candidate if candidate.is_absolute() else self.child_cwd / candidate
+        if tool_name in {"bash", "run_background"}:
+            return Path(
+                resolve_shell_cwd(
+                    self.child_store.bash_cwd,
+                    arguments.get("cwd"),
+                )
             )
-        return Path(os.path.abspath(effective_cwd))
+        return Path(os.path.abspath(self.child_cwd))
 
     def _capture_pending_binding(
         self,

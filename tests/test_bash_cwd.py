@@ -1,12 +1,15 @@
+import asyncio
 import shlex
 from pathlib import Path
 
 import pytest
 
+from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools.agent.approval import ChildApprovalPolicy
 
 
 @pytest.mark.asyncio
@@ -92,6 +95,75 @@ async def test_run_background_relative_cwd_uses_persisted_bash_cwd(
 
         assert changed["structuredContent"]["cwd_after"] == str(persisted_cwd)
         assert result["structuredContent"]["output"].strip() == str(
+            persisted_cwd / "child"
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["bash", "run_background"])
+async def test_delegated_shell_approval_uses_persisted_bash_cwd(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    initial_cwd = tmp_path / "initial"
+    persisted_cwd = tmp_path / "persisted"
+    (initial_cwd / "child").mkdir(parents=True)
+    (persisted_cwd / "child").mkdir(parents=True)
+    parent_store = ConversationStore(tmp_path / "parent", cwd=initial_cwd)
+    child_store = ConversationStore(tmp_path / "child", cwd=initial_cwd)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    child_policy = ChildApprovalPolicy(
+        parent_policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=initial_cwd,
+        child_cwd=initial_cwd,
+    )
+    registry = ToolRegistry(
+        initial_cwd,
+        session_store=child_store,
+        skill_catalog=SkillCatalog.empty(),
+        approval_policy=child_policy,
+    )
+
+    try:
+        changed = await registry.execute(
+            ToolCall(
+                "change-cwd",
+                "bash",
+                {"command": f"cd {shlex.quote(str(persisted_cwd))}"},
+            ),
+            _skip_approval=True,
+        )
+        call = ToolCall(
+            "relative-cwd",
+            tool_name,
+            {"command": "pwd", "cwd": "child"},
+        )
+        execution = asyncio.create_task(registry.execute(call))
+        while not parent_policy.pending_requests():
+            await asyncio.sleep(0)
+
+        request = parent_policy.pending_requests()[0]
+        assert parent_policy.approve(request.key)
+        result = await execution
+        if tool_name == "run_background":
+            task_id = result["structuredContent"]["task_id"]
+            await registry.background_tasks.wait(task_id)
+            result = await registry.execute(
+                ToolCall("background-output", "task_output", {"task_id": task_id})
+            )
+            actual_cwd = result["structuredContent"]["output"].strip()
+        else:
+            actual_cwd = result["structuredContent"]["stdout"].strip()
+
+        assert changed["structuredContent"]["cwd_after"] == str(persisted_cwd)
+        assert actual_cwd == str(persisted_cwd / "child")
+        assert request.effective_cwd == str(persisted_cwd / "child")
+        assert request.audit_display()["effective_cwd"] == str(
             persisted_cwd / "child"
         )
     finally:

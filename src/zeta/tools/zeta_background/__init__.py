@@ -7,7 +7,7 @@ from typing import Any, TypedDict
 
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
-from ..bash import _start_cwd
+from .._shared.sandbox import resolve_shell_cwd
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
@@ -26,7 +26,9 @@ async def _run_background(
     *,
     execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
-    start_cwd = Path(_start_cwd(registry, arguments))
+    start_cwd = Path(
+        resolve_shell_cwd(registry.bash_cwd, arguments.get("cwd"))
+    )
     approved_execution = (
         execution_context.approved_execution
         if execution_context is not None
