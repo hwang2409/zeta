@@ -572,10 +572,6 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
     archived_rows = json.loads(
         (store.session_dir / "background_tasks.json").read_text()
     )
-    assert archived_rows[0]["receipt_pending"] is True
-    assert archived_rows[0]["note"] == cause
-    assert archived_rows[0]["terminal_phase"] == "task_kill"
-    assert archived_rows[0]["tui_presented"] is True
 
     resumed_store = ConversationStore(
         tmp_path / "session", session_id=store.session_id
@@ -594,6 +590,10 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
             if entry.data.get("kind") == "task_exited"
         ]
         assert len(receipts) == 1
+        assert archived_rows[0]["receipt_pending"] is True
+        assert archived_rows[0]["note"] == cause
+        assert archived_rows[0]["terminal_phase"] == "task_kill"
+        assert archived_rows[0]["tui_presented"] is True
         assert receipts[0].data["task_id"] == task_id
         assert receipts[0].data["note"] == cause
         assert receipts[0].data["background_phase"] == "task_kill"
