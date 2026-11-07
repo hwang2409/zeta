@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import socket
 import stat
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,7 @@ from zeta.mcp import (
 from zeta.mcp.client import MCPHTTPError, MCPResource, MCPResourceContent
 from zeta.mcp.commands import parse_add_command
 from zeta.mcp.http import MAX_RESPONSE_BYTES
+from zeta.mcp.management import MCPManagementService
 from zeta.mcp.oauth import (
     AuthServerMetadata,
     MCPOAuthError,
@@ -38,11 +42,9 @@ from zeta.mcp.oauth import (
     refresh_access_token,
 )
 from zeta.mcp.oauth_store import (
+    MCPCredentialStore,
     MCPOAuthToken,
-    delete_token,
-    load_token,
     redact_token,
-    save_token,
     token_is_expired,
     token_state,
     token_store_path,
@@ -70,9 +72,7 @@ async def _fire_redirect(url: str) -> None:
         path = f"{path}?{parsed.query}"
     reader, writer = await asyncio.open_connection(host, port)
     request = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        f"Connection: close\r\n\r\n"
+        f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
     ).encode("ascii")
     writer.write(request)
     await writer.drain()
@@ -160,7 +160,9 @@ class _FakeAuthServer:
                 )
             access = self.next_access_token
             self.issued_access_tokens.append(access)
-            self.next_access_token = f"access-token-{len(self.issued_access_tokens) + 1}"
+            self.next_access_token = (
+                f"access-token-{len(self.issued_access_tokens) + 1}"
+            )
             return httpx.Response(
                 200,
                 json={
@@ -200,13 +202,16 @@ def _write_token(name: str, home: Path, **overrides: object) -> MCPOAuthToken:
         resource=overrides.get("resource", "https://mcp.test/resource"),
         refresh_error=overrides.get("refresh_error"),
     )
-    save_token(name, token, home=str(home))
+    path = token_store_path(name, home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = asdict(token)
+    values.pop("client_secret", None)
+    path.write_text(json.dumps(values))
+    path.chmod(0o600)
     return token
 
 
-def _write_legacy_token(
-    name: str, home: Path, *, client_secret: str
-) -> MCPOAuthToken:
+def _write_legacy_token(name: str, home: Path, *, client_secret: str) -> MCPOAuthToken:
     token = MCPOAuthToken(
         access_token="stale-token",
         refresh_token="refresh-token-1",
@@ -236,34 +241,41 @@ def test_pkce_generates_verifier_and_challenge() -> None:
     assert challenge != other_challenge
 
 
-def test_token_store_round_trips_with_secure_permissions(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_token_store_round_trips_with_secure_permissions(tmp_path: Path) -> None:
     home = tmp_path / "home"
     token = _write_token("srv", home)
-    loaded = load_token("srv", home=str(home))
-    assert loaded is not None
-    assert loaded.access_token == token.access_token
+    store = MCPCredentialStore(home=home)
+    saved = await store.save_login("srv", token)
+    loaded = await store.load("srv")
+    assert loaded == saved
     file_mode = token_store_path("srv", str(home)).stat().st_mode
     assert stat.S_IMODE(file_mode) == 0o600
 
 
-def test_new_token_bundle_does_not_persist_client_secret(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_new_token_bundle_does_not_persist_client_secret(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    _write_token("srv", home, client_secret="configured-secret")
+    token = _write_token("srv", home, client_secret="configured-secret")
+    store = MCPCredentialStore(home=home)
+    await store.save_login("srv", token)
 
     payload = json.loads(token_store_path("srv", str(home)).read_text())
+    assert "client_secret" not in payload["token"]
+    loaded = await store.load("srv")
+    assert loaded.token is not None
+    assert loaded.token.client_secret is None
 
-    assert "client_secret" not in payload
-    loaded = load_token("srv", home=str(home))
-    assert loaded is not None
-    assert loaded.client_secret is None
 
-
-def test_delete_token_removes_the_file(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_delete_token_commits_tombstone(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_token("srv", home)
-    assert load_token("srv", home=str(home)) is not None
-    delete_token("srv", home=str(home))
-    assert load_token("srv", home=str(home)) is None
+    store = MCPCredentialStore(home=home)
+    deleted = await store.delete("srv")
+    assert await store.load("srv") == deleted
+    assert deleted.generation == 1
+    assert deleted.token is None
 
 
 def test_token_state_reflects_expiry_and_refresh_failure(tmp_path: Path) -> None:
@@ -307,13 +319,16 @@ async def test_full_browser_flow_round_trip(
         auth.last_code_challenge = params["code_challenge"][0]
         await _fire_redirect(f"{redirect_uri}?code=auth-code&state={state}")
 
+    loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
+
     def open_browser(url: str) -> None:
-        asyncio.create_task(_do_redirect(url))
+        assert threading.get_ident() != loop_thread_id
+        asyncio.run_coroutine_threadsafe(_do_redirect(url), loop)
 
     token = await authorize(
         server_name="live",
         server_url=auth.server_url,
-        home=str(home),
         http_client=http_client,
         browser_opener=open_browser,
     )
@@ -329,15 +344,15 @@ async def test_full_browser_flow_round_trip(
 
     assert token.access_token == "access-token-1"
     assert token.refresh_token == "refresh-token-1"
-    stored = load_token("live", home=str(home))
-    assert stored is not None
-    assert stored.access_token == token.access_token
+    assert not token_store_path("live", home).exists()
     assert auth.registrations, "dynamic registration should have fired"
     token_form = auth.token_requests[0]
     assert token_form["grant_type"] == "authorization_code"
     assert token_form["code"] == "auth-code"
     assert token_form["resource"] == auth.resource
-    assert token_form["code_verifier"], "PKCE verifier must be present in the token request"
+    assert token_form["code_verifier"], (
+        "PKCE verifier must be present in the token request"
+    )
     assert auth.token_requests[1]["grant_type"] == "refresh_token"
     assert auth.token_requests[1]["resource"] == auth.resource
 
@@ -346,7 +361,7 @@ async def test_full_browser_flow_round_trip(
 async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = _monkey_home(monkeypatch, tmp_path)
+    _monkey_home(monkeypatch, tmp_path)
     auth = _FakeAuthServer()
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(auth.handle))
     with socket.socket() as available:
@@ -365,13 +380,14 @@ async def test_preregistered_client_uses_fixed_callback_scopes_and_extra_params(
             f"{redirect_uri}?code=registered-code&state={params['state'][0]}"
         )
 
+    loop = asyncio.get_running_loop()
+
     def open_browser(url: str) -> None:
-        asyncio.create_task(redirect(url))
+        asyncio.run_coroutine_threadsafe(redirect(url), loop)
 
     token = await authorize(
         server_name="live",
         server_url=auth.server_url,
-        home=str(home),
         client_id="registered-client",
         client_secret="configured-secret",
         callback_port=callback_port,
@@ -437,8 +453,7 @@ def test_config_rejects_reserved_authorization_params(
 
     assert "bad" in config.malformed_servers
     assert config.malformed_servers["bad"].malformed_reason == (
-        "auth.authorization_params must not override reserved parameters: "
-        f"{reserved}"
+        f"auth.authorization_params must not override reserved parameters: {reserved}"
     )
 
 
@@ -477,9 +492,7 @@ async def test_discovery_overrides_replace_default_probes() -> None:
         resource_metadata_url="https://metadata.test/protected",
         http_client=client,
     )
-    metadata = await discover_auth_server(
-        "https://login.test", http_client=client
-    )
+    metadata = await discover_auth_server("https://login.test", http_client=client)
     await client.aclose()
 
     assert resource.authorization_server == "https://login.test"
@@ -628,7 +641,9 @@ async def test_protected_resource_path_probe_falls_back_to_root(
         return httpx.Response(200, json={"resource": "https://host"}, request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        metadata = await discover_protected_resource("https://host/mcp", http_client=client)
+        metadata = await discover_protected_resource(
+            "https://host/mcp", http_client=client
+        )
 
     assert metadata.resource == "https://host"
     assert requests == [
@@ -638,7 +653,9 @@ async def test_protected_resource_path_probe_falls_back_to_root(
 
 
 @pytest.mark.asyncio
-async def test_protected_resource_root_redirect_is_unavailable_and_not_followed() -> None:
+async def test_protected_resource_root_redirect_is_unavailable_and_not_followed() -> (
+    None
+):
     requests: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -652,7 +669,9 @@ async def test_protected_resource_root_redirect_is_unavailable_and_not_followed(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), follow_redirects=True
     ) as client:
-        metadata = await discover_protected_resource("https://host/mcp", http_client=client)
+        metadata = await discover_protected_resource(
+            "https://host/mcp", http_client=client
+        )
 
     assert metadata == ProtectedResourceMetadata("https://host/mcp", None)
     assert requests == [
@@ -703,7 +722,9 @@ async def test_configured_resource_metadata_url_remains_strict(
 
 
 @pytest.mark.asyncio
-async def test_default_protected_resource_probe_keeps_invalid_response_fallback() -> None:
+async def test_default_protected_resource_probe_keeps_invalid_response_fallback() -> (
+    None
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="not JSON", request=request)
 
@@ -737,9 +758,7 @@ async def test_discovery_rejects_inconsistent_override_metadata(
                 request=request,
             )
         issuer = (
-            "https://other.test"
-            if inconsistency == "issuer"
-            else "https://login.test"
+            "https://other.test" if inconsistency == "issuer" else "https://login.test"
         )
         endpoint = (
             "http://remote.test/token"
@@ -766,7 +785,11 @@ async def test_discovery_rejects_inconsistent_override_metadata(
                     http_client=client,
                 )
         else:
-            expected = "issuer does not match" if inconsistency == "issuer" else "must use https"
+            expected = (
+                "issuer does not match"
+                if inconsistency == "issuer"
+                else "must use https"
+            )
             with pytest.raises(MCPOAuthError, match=expected):
                 await discover_auth_server("https://login.test", http_client=client)
     finally:
@@ -976,18 +999,19 @@ async def test_authorize_rejects_mismatched_state(
         redirect_uri = params["redirect_uri"][0]
         await _fire_redirect(f"{redirect_uri}?code=auth-code&state=WRONG")
 
+    loop = asyncio.get_running_loop()
+
     def open_browser(url: str) -> None:
-        asyncio.create_task(_do_redirect(url))
+        asyncio.run_coroutine_threadsafe(_do_redirect(url), loop)
 
     with pytest.raises(MCPOAuthStateError):
         await authorize(
             server_name="live",
             server_url=auth.server_url,
-            home=str(home),
             http_client=http_client,
             browser_opener=open_browser,
         )
-    assert load_token("live", home=str(home)) is None
+    assert not token_store_path("live", home).exists()
     await http_client.aclose()
 
 
@@ -995,7 +1019,7 @@ async def test_authorize_rejects_mismatched_state(
 async def test_authorize_surfaces_error_from_redirect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home = _monkey_home(monkeypatch, tmp_path)
+    _monkey_home(monkeypatch, tmp_path)
     auth = _FakeAuthServer()
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(auth.handle))
 
@@ -1006,14 +1030,15 @@ async def test_authorize_surfaces_error_from_redirect(
         state = params["state"][0]
         await _fire_redirect(f"{redirect_uri}?error=access_denied&state={state}")
 
+    loop = asyncio.get_running_loop()
+
     def open_browser(url: str) -> None:
-        asyncio.create_task(_do_redirect(url))
+        asyncio.run_coroutine_threadsafe(_do_redirect(url), loop)
 
     with pytest.raises(MCPOAuthError, match="access_denied"):
         await authorize(
             server_name="live",
             server_url=auth.server_url,
-            home=str(home),
             http_client=http_client,
             browser_opener=open_browser,
         )
@@ -1040,7 +1065,7 @@ async def test_headless_callback_validation(
 ) -> None:
     from zeta.mcp import oauth as oauth_module
 
-    home = _monkey_home(monkeypatch, tmp_path)
+    _monkey_home(monkeypatch, tmp_path)
     auth = _FakeAuthServer()
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(auth.handle))
     authorization_url = ""
@@ -1077,21 +1102,17 @@ async def test_headless_callback_validation(
         token = await authorize(
             server_name="live",
             server_url=auth.server_url,
-            home=str(home),
             client_id="registered-client",
             no_browser=True,
             http_client=http_client,
         )
         assert token.access_token == "access-token-1"
-        assert [request["code"] for request in auth.token_requests] == [
-            "headless-code"
-        ]
+        assert [request["code"] for request in auth.token_requests] == ["headless-code"]
     else:
         with pytest.raises(error_type, match=message):
             await authorize(
                 server_name="live",
                 server_url=auth.server_url,
-                home=str(home),
                 client_id="registered-client",
                 no_browser=True,
                 http_client=http_client,
@@ -1208,7 +1229,7 @@ async def test_http_client_refreshes_on_401_and_retries(
     result = await client.call_tool("echo", {}, AbortSignal())
     assert result["content"][0]["text"] == "ok"
     assert call_count == 2
-    persisted = load_token("live", home=str(home))
+    persisted = (await MCPCredentialStore(home=home).load("live")).token
     assert persisted is not None and persisted.access_token == "fresh-token"
     assert persisted.refresh_token == "refresh-token-2"
     assert persisted.refresh_error is None
@@ -1260,13 +1281,14 @@ async def test_refresh_uses_client_secret_resolved_from_environment(
 
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
-    current = client._current_token
-    assert current is not None
+    current = await MCPCredentialStore(home=home).load("live")
+    assert current.token is not None
     assert await client._refresh_token_once(MCPHTTPError(401, "expired"), current)
 
     assert requests[0]["client_secret"] == ["environment-secret"]
-    assert "client_secret" not in json.loads(
-        token_store_path("live", str(home)).read_text()
+    assert (
+        "client_secret"
+        not in json.loads(token_store_path("live", str(home)).read_text())["token"]
     )
     await client.close()
 
@@ -1276,9 +1298,7 @@ async def test_legacy_stored_secret_refreshes_and_rewrite_removes_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = _monkey_home(monkeypatch, tmp_path)
-    token = _write_legacy_token(
-        "live", home, client_secret="legacy-stored-secret"
-    )
+    token = _write_legacy_token("live", home, client_secret="legacy-stored-secret")
     requests: list[dict[str, list[str]]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1297,13 +1317,14 @@ async def test_legacy_stored_secret_refreshes_and_rewrite_removes_it(
     )
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
-    current = client._current_token
-    assert current == token
+    current = await MCPCredentialStore(home=home).load("live")
+    assert current.token == token
     assert await client._refresh_token_once(MCPHTTPError(401, "expired"), current)
 
     assert requests[0]["client_secret"] == ["legacy-stored-secret"]
-    assert "client_secret" not in json.loads(
-        token_store_path("live", str(home)).read_text()
+    assert (
+        "client_secret"
+        not in json.loads(token_store_path("live", str(home)).read_text())["token"]
     )
     await client.close()
 
@@ -1318,9 +1339,7 @@ async def test_http_client_reports_refresh_failure_shape(
     async def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url.endswith("/token"):
-            return httpx.Response(
-                400, json={"error": "invalid_grant"}, request=request
-            )
+            return httpx.Response(400, json={"error": "invalid_grant"}, request=request)
         body = json.loads(request.content)
         if "id" not in body:
             return httpx.Response(202, request=request)
@@ -1350,9 +1369,9 @@ async def test_http_client_reports_refresh_failure_shape(
     text = result["content"][0]["text"]
     assert "MCP OAuth token refresh failed" in text
     assert "run /mcp auth live" in text
-    persisted = load_token("live", home=str(home))
+    persisted = (await MCPCredentialStore(home=home).load("live")).token
     assert persisted is not None
-    assert persisted.refresh_error is not None
+    assert persisted.refresh_error is None
     await client.close()
 
 
@@ -1412,10 +1431,7 @@ async def test_config_rejects_oauth_on_stdio(tmp_path: Path) -> None:
     )
     config = load_mcp_config(path)
     assert "bad" in config.malformed_servers
-    assert (
-        "streamable-http"
-        in config.malformed_servers["bad"].malformed_reason
-    )
+    assert "streamable-http" in config.malformed_servers["bad"].malformed_reason
 
 
 @pytest.mark.asyncio
@@ -1471,7 +1487,9 @@ async def test_resources_list_and_attach_round_trip(
         return _ResourceClient(config)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
+    )
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add live --http https://mcp.example")
 
@@ -1632,16 +1650,19 @@ async def test_tokens_do_not_appear_in_conversation_store(
     project.mkdir()
     store = ConversationStore(project)
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
-    loop = AgentLoop(backend, store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("please answer", origin=MessageOrigin.USER)]
+    loop = AgentLoop(
+        backend, store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()
+    )
+    events = [
+        event
+        async for event in loop.run_turn("please answer", origin=MessageOrigin.USER)
+    ]
     await loop.close()
 
     haystack = ""
     for session_file in store.session_dir.rglob("*.jsonl"):
         haystack += session_file.read_text()
-    haystack += json.dumps(
-        [event.type.value for event in events]
-    )
+    haystack += json.dumps([event.type.value for event in events])
     assert token.access_token not in haystack
     assert token.refresh_token not in haystack
 
@@ -1661,7 +1682,9 @@ async def test_slash_mcp_status_shows_oauth_state(
         return []
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
+    )
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.slash_mcp("add live --http https://mcp.example --oauth")
@@ -1678,8 +1701,8 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    from zeta.mcp import commands as commands_module
     from zeta.mcp import mount as mount_module
+    from zeta.mcp import oauth as oauth_module
 
     async def fake_connect_and_list(client: Any) -> list:
         return []
@@ -1692,15 +1715,10 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
 
         async def __call__(self, **kwargs: object) -> MCPOAuthToken:
             self.calls.append(kwargs)
-            token = _write_token(
-                str(kwargs["server_name"]),
-                Path(str(kwargs["home"])) if kwargs.get("home") else home,
-                expires_at=1e12,
-            )
-            return token
+            return _write_token(str(kwargs["server_name"]), home, expires_at=1e12)
 
     recorder = _RecordingAuthorize()
-    monkeypatch.setattr(commands_module, "authorize", recorder)
+    monkeypatch.setattr(oauth_module, "authorize", recorder)
     (home / "mcp.json").write_text(
         json.dumps(
             {
@@ -1733,7 +1751,6 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
     assert recorder.calls[0] == {
         "server_name": "live",
         "server_url": "https://mcp.example",
-        "home": str(home),
         "client_id": None,
         "client_secret": None,
         "callback_port": 0,
@@ -1741,6 +1758,7 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
         "authorization_server_url": "https://login.example",
         "resource_metadata_url": "https://mcp.example/metadata",
         "authorization_params": {"access_type": "offline"},
+        "no_browser": False,
     }
     await loop.close()
 
@@ -1753,8 +1771,8 @@ async def test_slash_mcp_auth_reports_flow_failure(
     project = tmp_path / "proj"
     project.mkdir()
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    from zeta.mcp import commands as commands_module
     from zeta.mcp import mount as mount_module
+    from zeta.mcp import oauth as oauth_module
 
     async def fake_connect_and_list(client: Any) -> list:
         return []
@@ -1764,8 +1782,10 @@ async def test_slash_mcp_auth_reports_flow_failure(
     async def boom(**kwargs: object) -> MCPOAuthToken:
         raise MCPOAuthError("consent denied")
 
-    monkeypatch.setattr(commands_module, "authorize", boom)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
+    monkeypatch.setattr(oauth_module, "authorize", boom)
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
+    )
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add live --http https://mcp.example --oauth")
 
@@ -1793,10 +1813,15 @@ async def test_slash_mcp_auth_rejects_stdio_server(
         async def connect(self) -> None: ...
         async def list_tools(self) -> list:
             return []
+
         async def close(self) -> None: ...
 
-    monkeypatch.setattr(mount_module, "_build_client", lambda config: _NoopClient(config))
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
+    monkeypatch.setattr(
+        mount_module, "_build_client", lambda config: _NoopClient(config)
+    )
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty()
+    )
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add local --stdio command")
 
@@ -2044,3 +2069,332 @@ async def test_http_notification_refreshes_on_401(
     assert refresh_count == 1
     assert notification_calls == ["Bearer stale-token", "Bearer fresh-token"]
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_credential_reads_run_off_loop_through_call_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="ordered-token")
+    loop_thread_id = threading.get_ident()
+    credential_path = token_store_path("live", home)
+    observed_threads: list[int] = []
+    original_open = os.open
+
+    def checked_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == str(credential_path):
+            observed_threads.append(threading.get_ident())
+            assert threading.get_ident() != loop_thread_id
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("zeta.mcp.oauth_store.os.open", checked_open)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+            },
+            request=request,
+        )
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test", auth_type="oauth"
+        ),
+        client=transport,
+        home=str(home),
+    )
+    result = await client.call_tool("echo", {}, AbortSignal())
+    assert result["content"][0]["text"] == "ok"
+    assert observed_threads
+    await client.close()
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record", "reason", "text_fragment"),
+    [
+        ("malformed", "malformed", "is malformed"),
+        ("oversized", "oversized", "is too large"),
+        ("symlink", "unsafe_file", "is unsafe"),
+    ],
+)
+async def test_call_tool_maps_unsafe_credential_records_without_http(
+    tmp_path: Path,
+    record: str,
+    reason: str,
+    text_fragment: str,
+) -> None:
+    home = tmp_path / "home"
+    path = token_store_path("live", home)
+    path.parent.mkdir(parents=True)
+    if record == "malformed":
+        path.write_text("{broken")
+    elif record == "oversized":
+        path.write_text(json.dumps({"access_token": "x" * (70 * 1024)}))
+    else:
+        target = tmp_path / "other-token"
+        target.write_text("{}")
+        path.symlink_to(target)
+    attempts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(str(request.url))
+        return httpx.Response(500, request=request)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test", auth_type="oauth"
+        ),
+        client=transport,
+        home=str(home),
+    )
+    result = await client.call_tool("echo", {}, AbortSignal())
+    error = result["structuredContent"]["credential_store_error"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == error["text"]
+    assert error == {
+        "code": "mcp_credential_store",
+        "reason": reason,
+        "server": "live",
+        "credential_file": str(path.absolute()),
+        "operation": "load",
+        "recovery": "move_aside_then_auth",
+        "text": error["text"],
+    }
+    assert text_fragment in error["text"]
+    assert attempts == []
+    await client.close()
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_client_does_not_send_token_after_public_logout(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    token = _write_token("live", home, access_token="deleted-token")
+    manager = MCPManagementService(home=home, project_dir=project)
+    manager.add("live", scope="user", url="https://mcp.test", oauth=True)
+    attempts: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("authorization"))
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"content": [{"type": "text", "text": "unexpected"}]},
+            },
+            request=request,
+        )
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test", auth_type="oauth"
+        ),
+        client=transport,
+        home=str(home),
+    )
+    outcome = manager.logout("live", scope="user")
+    if inspect.isawaitable(outcome):
+        await outcome
+    result = await client.call_tool("echo", {}, AbortSignal())
+    assert result["isError"] is True
+    assert token.access_token not in result["content"][0]["text"]
+    assert attempts == []
+    await client.close()
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_connect_rereads_credentials_for_notification_post_and_get(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="first-token")
+    requests: list[tuple[str, str | None]] = []
+    get_seen = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        requests.append((request.method, auth))
+        if request.method == "GET":
+            get_seen.set()
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"",
+                request=request,
+            )
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            _write_token("live", home, access_token="second-token")
+            return httpx.Response(
+                200,
+                headers={"mcp-session-id": "session"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                },
+                request=request,
+            )
+        _write_token("live", home, access_token="third-token")
+        return httpx.Response(202, request=request)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test", auth_type="oauth"
+        ),
+        client=transport,
+        home=str(home),
+    )
+    await client.connect()
+    await asyncio.wait_for(get_seen.wait(), timeout=2)
+    assert requests[:3] == [
+        ("POST", "Bearer first-token"),
+        ("POST", "Bearer second-token"),
+        ("GET", "Bearer third-token"),
+    ]
+    await client.close()
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_clients_refresh_with_generation_cas_and_fresh_retry(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="stale-token")
+    exchange_count = 0
+    both_exchanges = asyncio.Event()
+    first_retry = asyncio.Event()
+    tool_headers: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal exchange_count
+        if request.url.path == "/token":
+            exchange_count += 1
+            index = exchange_count
+            if index == 1:
+                await asyncio.wait_for(both_exchanges.wait(), timeout=2)
+                access = "winner-token"
+            else:
+                both_exchanges.set()
+                await asyncio.wait_for(first_retry.wait(), timeout=2)
+                access = "loser-token"
+            return httpx.Response(
+                200,
+                json={"access_token": access, "token_type": "Bearer"},
+                request=request,
+            )
+        auth = request.headers.get("authorization")
+        tool_headers.append(auth)
+        if auth == "Bearer stale-token":
+            return httpx.Response(401, text="expired", request=request)
+        if auth == "Bearer winner-token":
+            first_retry.set()
+            body = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"content": [{"type": "text", "text": "ok"}]},
+                },
+                request=request,
+            )
+        return httpx.Response(500, request=request)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    config = MCPServerConfig(
+        "live", "streamable-http", url="https://mcp.test/rpc", auth_type="oauth"
+    )
+    clients = [
+        StreamableHTTPMCPClient(config, client=transport, home=str(home))
+        for _ in range(2)
+    ]
+    results = await asyncio.gather(
+        *(client.call_tool("echo", {}, AbortSignal()) for client in clients)
+    )
+    assert [result["content"][0]["text"] for result in results] == ["ok", "ok"]
+    assert tool_headers.count("Bearer winner-token") == 2
+    assert "Bearer loser-token" not in tool_headers
+    stored = await MCPCredentialStore(home=home).load("live")
+    assert stored.generation == 1
+    assert stored.token is not None and stored.token.access_token == "winner-token"
+    for client in clients:
+        await client.close()
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [("candidate_oversized", "candidate_oversized"), ("durability", "durability")],
+)
+async def test_refresh_commit_failure_never_sends_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    reason: str,
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="stale-token")
+    candidate = (
+        "x" * (70 * 1024) if failure == "candidate_oversized" else "candidate-token"
+    )
+    candidate_requests: list[str] = []
+    original_fsync = os.fsync
+
+    if failure == "durability":
+
+        def fail_directory_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("injected directory fsync failure")
+            original_fsync(fd)
+
+        monkeypatch.setattr("zeta.mcp.oauth_store.os.fsync", fail_directory_fsync)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return httpx.Response(
+                200,
+                json={"access_token": candidate, "token_type": "Bearer"},
+                request=request,
+            )
+        auth = request.headers.get("authorization")
+        if auth == f"Bearer {candidate}":
+            candidate_requests.append(auth)
+        return httpx.Response(401, text="expired", request=request)
+
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            "live", "streamable-http", url="https://mcp.test/rpc", auth_type="oauth"
+        ),
+        client=transport,
+        home=str(home),
+    )
+    result = await client.call_tool("echo", {}, AbortSignal())
+    error = result["structuredContent"]["credential_store_error"]
+    assert error["reason"] == reason
+    assert error["operation"] == "save_if_current"
+    assert candidate_requests == []
+    await client.close()
+    await transport.aclose()

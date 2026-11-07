@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import hashlib
@@ -23,7 +24,13 @@ from .config import (
     project_config_path,
     read_mcp_config_file,
 )
-from .oauth_store import load_token, token_state
+from .oauth_store import (
+    MCPCredentialStore,
+    MCPCredentialStoreError,
+    PublicCredentialStoreError,
+    public_credential_store_error,
+    token_state,
+)
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolRegistry
@@ -88,9 +95,14 @@ class MCPManagementService:
     ) -> None:
         self.home = Path(home).expanduser() if home is not None else None
         self.project_dir = (
-            Path(project_dir).expanduser().resolve() if project_dir is not None else None
+            Path(project_dir).expanduser().resolve()
+            if project_dir is not None
+            else None
         )
         self.mount = mount
+        self._credential_store = MCPCredentialStore(home=self.home)
+        self._credential_status: dict[str, str] = {}
+        self.credential_store_error: PublicCredentialStoreError | None = None
 
     def path(self, scope: Literal["user", "project"]) -> Path:
         if scope == "project":
@@ -142,11 +154,20 @@ class MCPManagementService:
                 return value
             if lowered == "url":
                 return cls._redacted_url(value)
-            if lowered in {"token", "client_secret", "authorization", "proxy-authorization"}:
+            if lowered in {
+                "token",
+                "client_secret",
+                "authorization",
+                "proxy-authorization",
+            }:
                 return "<redacted>"
             if key is not None and value.startswith("${") and value.endswith("}"):
                 return value
-            if lowered not in {"transport", "command", "args", "type", "client_id", "scopes"} and key is not None:
+            if (
+                lowered
+                not in {"transport", "command", "args", "type", "client_id", "scopes"}
+                and key is not None
+            ):
                 return "<redacted>"
         return value
 
@@ -168,7 +189,14 @@ class MCPManagementService:
         security = {
             key: raw.get(key)
             for key in (
-                "transport", "command", "args", "env", "url", "headers", "auth", "client"
+                "transport",
+                "command",
+                "args",
+                "env",
+                "url",
+                "headers",
+                "auth",
+                "client",
             )
         }
         payload = json.dumps(security, sort_keys=True, separators=(",", ":"))
@@ -220,7 +248,9 @@ class MCPManagementService:
     @staticmethod
     def _atomic_json(path: Path, data: object, *, mode: int | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".mcp-management.", dir=str(path.parent))
+        fd, temporary = tempfile.mkstemp(
+            prefix=".mcp-management.", dir=str(path.parent)
+        )
         try:
             if mode is not None:
                 os.fchmod(fd, mode)
@@ -248,7 +278,9 @@ class MCPManagementService:
             document = self._read_object(path)
             raw_servers = document.get("servers", {})
             if type(raw_servers) is not dict:
-                raise MCPManagementError(f"MCP config servers must be an object: {path}")
+                raise MCPManagementError(
+                    f"MCP config servers must be an object: {path}"
+                )
             servers = copy.deepcopy(raw_servers)
             change(servers)  # type: ignore[arg-type]
             document["servers"] = servers
@@ -342,7 +374,11 @@ class MCPManagementService:
         auth = raw.get("auth")
         if isinstance(auth, dict):
             auth_type = str(auth.get("type", "none"))
-        auth_status = token_state(load_token(name, home=self.home)) if auth_type == "oauth" else auth_type
+        auth_status = (
+            self._credential_status.get(name, "unauthorized")
+            if auth_type == "oauth"
+            else auth_type
+        )
         runtime_status, tool_count = self._runtime_status(name)
         if not enabled:
             status = "disabled"
@@ -351,7 +387,14 @@ class MCPManagementService:
         else:
             status = runtime_status
         return ManagedServer(
-            name, scope, self.redact(raw), enabled, trusted, status, auth_status, tool_count
+            name,
+            scope,
+            self.redact(raw),
+            enabled,
+            trusted,
+            status,
+            auth_status,
+            tool_count,
         )
 
     def list(self, *, scope: Scope = "effective") -> list[ManagedServer]:
@@ -368,20 +411,43 @@ class MCPManagementService:
                     }
                 )
             return list(result.values())
-        return [self._managed(name, scope, raw) for name, raw in self._raw(scope).items()]
+        return [
+            self._managed(name, scope, raw) for name, raw in self._raw(scope).items()
+        ]
 
     def show(self, name: str, *, scope: Scope = "effective") -> ManagedServer:
-        item = next((entry for entry in self.list(scope=scope) if entry.name == name), None)
+        item = next(
+            (entry for entry in self.list(scope=scope) if entry.name == name), None
+        )
         if item is None:
             raise MCPManagementError(f"unknown MCP server: {name}")
         return item
+
+    async def refresh_credentials(self) -> list[ManagedServer]:
+        """Refresh non-secret credential display state off the event loop."""
+
+        entries = await asyncio.to_thread(self.list)
+        self.credential_store_error = None
+        for item in entries:
+            auth = item.config.get("auth")
+            if not isinstance(auth, dict) or auth.get("type") != "oauth":
+                continue
+            try:
+                snapshot = await self._credential_store.load(item.name)
+            except MCPCredentialStoreError as exc:
+                self.credential_store_error = public_credential_store_error(exc)
+                raise
+            self._credential_status[item.name] = token_state(snapshot.token)
+        return await asyncio.to_thread(self.list)
 
     def runtime_config(self) -> MCPConfig:
         """Return effective config with disabled and untrusted project stdio removed."""
         config = load_mcp_config_overlay(home=self.home, project_dir=self.project_dir)
         allowed_names: set[str] = set()
         sources: dict[str, Path] = {}
-        project_path = self.path("project").resolve() if self.project_dir is not None else None
+        project_path = (
+            self.path("project").resolve() if self.project_dir is not None else None
+        )
         project_raw = self._raw("project") if self.project_dir is not None else {}
         user_raw = self._raw("user")
         for name, server in config.configured_servers.items():
@@ -391,13 +457,19 @@ class MCPManagementService:
             if type(raw) is not dict:
                 continue
             enabled = raw.get("enabled", server.enabled) is not False
-            if not enabled or (is_project and not self.is_trusted(name, raw, "project")):
+            if not enabled or (
+                is_project and not self.is_trusted(name, raw, "project")
+            ):
                 continue
             allowed_names.add(name)
             sources[name] = source
         return replace(
             config,
-            servers={name: value for name, value in config.servers.items() if name in allowed_names},
+            servers={
+                name: value
+                for name, value in config.servers.items()
+                if name in allowed_names
+            },
             skipped_servers={
                 name: value
                 for name, value in config.skipped_servers.items()
@@ -473,21 +545,29 @@ class MCPManagementService:
         finally:
             await client.close()
 
-    async def login(self, name: str, *, scope: Scope = "effective", no_browser: bool = False) -> None:
+    async def login(
+        self, name: str, *, scope: Scope = "effective", no_browser: bool = False
+    ) -> None:
         from .oauth import authorize
 
-        item = self.show(name, scope=scope)
+        item = await asyncio.to_thread(self.show, name, scope=scope)
         if not self._server_allowed(name):
             raise MCPManagementError(f"{name}: skipped by tool policy")
         if item.config.get("transport") != "streamable-http":
-            raise MCPManagementError("OAuth requires HTTP")
-        config = load_mcp_config(self.path(item.scope)).configured_servers.get(name)
+            raise MCPManagementError(
+                "OAuth requires an HTTP MCP server "
+                f"(got transport {item.config.get('transport')})"
+            )
+        config = (
+            await asyncio.to_thread(load_mcp_config, self.path(item.scope))
+        ).configured_servers.get(name)
         if config is None:
             raise MCPManagementError(f"server cannot be used for OAuth: {name}")
-        await authorize(
+        # Keep unsafe credential evidence intact and fail before browser consent.
+        await self._credential_store.load(name)
+        candidate = await authorize(
             server_name=name,
             server_url=config.url or "",
-            home=str(self.home) if self.home else None,
             client_id=config.client_id,
             client_secret=config.client_secret,
             callback_port=config.callback_port,
@@ -497,14 +577,17 @@ class MCPManagementService:
             authorization_params=config.authorization_params,
             no_browser=no_browser,
         )
+        snapshot = await self._credential_store.save_login(name, candidate)
+        self._credential_status[name] = token_state(snapshot.token)
+        self.credential_store_error = None
 
-    def logout(self, name: str, *, scope: Scope = "effective") -> None:
-        from .oauth_store import delete_token
-
+    async def logout(self, name: str, *, scope: Scope = "effective") -> None:
         # OAuth tokens are name-global, but the requested definition must exist
         # in the selected scope before its token is removed.
-        self.show(name, scope=scope)
-        delete_token(name, home=self.home)
+        await asyncio.to_thread(self.show, name, scope=scope)
+        await self._credential_store.delete(name)
+        self._credential_status[name] = "unauthorized"
+        self.credential_store_error = None
 
 
 __all__ = ["MCPManagementError", "MCPManagementService", "ManagedServer", "Scope"]

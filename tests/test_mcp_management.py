@@ -27,7 +27,9 @@ def service(tmp_path, mount=None):
 
 def test_add_scopes_precedence_redaction_and_env_reference(tmp_path):
     manager = service(tmp_path)
-    manager.add("shared", scope="user", url="https://example.test", env={"TOKEN": "${TOKEN}"})
+    manager.add(
+        "shared", scope="user", url="https://example.test", env={"TOKEN": "${TOKEN}"}
+    )
     manager.add("shared", scope="project", command=sys.executable, args=("-c", "pass"))
     assert manager.show("shared").scope == "project"
     assert manager.show("shared", scope="user").config["env"]["TOKEN"] == "${TOKEN}"
@@ -107,8 +109,12 @@ def test_project_http_does_not_require_trust_but_stdio_does(tmp_path):
 
 
 def test_clone_path_has_independent_trust_and_pending_stdio_is_filtered(tmp_path):
-    first = MCPManagementService(home=tmp_path / "home", project_dir=tmp_path / "clone-a")
-    second = MCPManagementService(home=tmp_path / "home", project_dir=tmp_path / "clone-b")
+    first = MCPManagementService(
+        home=tmp_path / "home", project_dir=tmp_path / "clone-a"
+    )
+    second = MCPManagementService(
+        home=tmp_path / "home", project_dir=tmp_path / "clone-b"
+    )
     first.add("local", scope="project", command=sys.executable)
     second.path("project").parent.mkdir(parents=True)
     second.path("project").write_text(first.path("project").read_text())
@@ -133,7 +139,9 @@ async def test_untrusted_cloned_project_never_creates_subprocess(tmp_path, monke
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
     (tmp_path / "registry").mkdir()
     registry = ToolRegistry(
-        tmp_path / "registry", register_builtin=False, skill_catalog=SkillCatalog.empty()
+        tmp_path / "registry",
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
     )
     mount = await mount_mcp_servers(registry, manager.runtime_config())
     assert spawned == []
@@ -165,10 +173,19 @@ def test_old_config_defaults_enabled_and_headers_round_trip(tmp_path, monkeypatc
     monkeypatch.setenv("API_KEY", "resolved")
     manager = service(tmp_path)
     manager.path("user").parent.mkdir(parents=True)
-    manager.path("user").write_text(json.dumps({"servers": {"old": {
-        "transport": "streamable-http", "url": "https://example.test",
-        "headers": {"X-Key": "${API_KEY}"},
-    }}}))
+    manager.path("user").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "old": {
+                        "transport": "streamable-http",
+                        "url": "https://example.test",
+                        "headers": {"X-Key": "${API_KEY}"},
+                    }
+                }
+            }
+        )
+    )
     config = load_mcp_config_overlay(home=tmp_path / "home")
     assert config.configured_servers["old"].enabled
     raw = json.loads(manager.path("user").read_text())
@@ -180,13 +197,22 @@ async def test_missing_connect_time_header_is_named_without_leaking_values(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "mcp.json"
-    path.write_text(json.dumps({"servers": {"http": {
-        "transport": "streamable-http", "url": "https://example.test",
-        "headers": {
-            "Authorization": "Bearer ${PRESENT_SECRET}",
-            "X-Missing": "${MISSING_SECRET}",
-        },
-    }}}))
+    path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "http": {
+                        "transport": "streamable-http",
+                        "url": "https://example.test",
+                        "headers": {
+                            "Authorization": "Bearer ${PRESENT_SECRET}",
+                            "X-Missing": "${MISSING_SECRET}",
+                        },
+                    }
+                }
+            }
+        )
+    )
     monkeypatch.setenv("PRESENT_SECRET", "must-not-leak")
     monkeypatch.delenv("MISSING_SECRET", raising=False)
     config = load_mcp_config_overlay(home=tmp_path, project_dir=None).servers["http"]
@@ -205,10 +231,19 @@ async def test_missing_connect_time_header_is_named_without_leaking_values(
 @pytest.mark.asyncio
 async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
     path = tmp_path / "mcp.json"
-    path.write_text(json.dumps({"servers": {"http": {
-        "transport": "streamable-http", "url": "https://example.test",
-        "headers": {"X-Key": "${API_KEY}"},
-    }}}))
+    path.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "http": {
+                        "transport": "streamable-http",
+                        "url": "https://example.test",
+                        "headers": {"X-Key": "${API_KEY}"},
+                    }
+                }
+            }
+        )
+    )
     monkeypatch.setenv("API_KEY", "before")
     config = load_mcp_config_overlay(home=tmp_path, project_dir=None).servers["http"]
     assert config.headers == {"X-Key": "${API_KEY}"}
@@ -225,9 +260,15 @@ async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
             if body["method"] == "initialize"
             else {"tools": []}
         )
-        return httpx.Response(200, request=request, json={
-            "jsonrpc": "2.0", "id": body["id"], "result": result,
-        })
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": result,
+            },
+        )
 
     client = StreamableHTTPMCPClient(
         config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -275,9 +316,12 @@ def test_malformed_url_rejected_and_redaction_total(tmp_path):
 def test_redacts_env_headers_auth_and_url_credentials(tmp_path):
     manager = service(tmp_path)
     manager.add(
-        "x", scope="user", url="https://user:pass@example.test/path?token=secret",
+        "x",
+        scope="user",
+        url="https://user:pass@example.test/path?token=secret",
         env={"TOKEN": "literal", "REF": "${SAFE_REF}"},
-        headers={"Authorization": "Bearer literal"}, oauth=True,
+        headers={"Authorization": "Bearer literal"},
+        oauth=True,
     )
     text = json.dumps(manager.show("x", scope="user").as_json())
     assert "literal" not in text
@@ -309,8 +353,18 @@ def test_mcp_add_after_global_options_parses_command_tail():
 
     parsed = parser.parse_args(
         [
-            "--model", "m", "mcp", "add", "n", "--scope", "user", "--",
-            "npx", "-y", "pkg", "--flag",
+            "--model",
+            "m",
+            "mcp",
+            "add",
+            "n",
+            "--scope",
+            "user",
+            "--",
+            "npx",
+            "-y",
+            "pkg",
+            "--flag",
         ]
     )
 
@@ -338,7 +392,18 @@ def test_cli_parser_accepts_stdio_separator_and_all_management_commands():
         ]
     )
     assert option_like.server_command == ["npx", "-y", "@x/server", "--flag"]
-    for action in ("list", "show", "remove", "enable", "disable", "test", "login", "logout", "trust", "untrust"):
+    for action in (
+        "list",
+        "show",
+        "remove",
+        "enable",
+        "disable",
+        "test",
+        "login",
+        "logout",
+        "trust",
+        "untrust",
+    ):
         args = ["mcp", action]
         if action != "list":
             args.append("server")
@@ -392,14 +457,20 @@ for line in sys.stdin:
 """
     home = tmp_path / "home"
     home.mkdir()
-    (home / "mcp.json").write_text(json.dumps({"servers": {
-        "broken": "must-not-leak",
-        "working": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": ["-c", source],
-        },
-    }}))
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "broken": "must-not-leak",
+                    "working": {
+                        "transport": "stdio",
+                        "command": sys.executable,
+                        "args": ["-c", source],
+                    },
+                }
+            }
+        )
+    )
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     loop = AgentLoop(
         FakeBackend([ScriptedTurn([TextContent("done")])]),
@@ -408,7 +479,9 @@ for line in sys.stdin:
     )
     loop.set_mcp_scope(home=home)
 
-    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
+    events = [
+        event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
+    ]
 
     assert events[-1].type.value == "agent_end"
     assert loop._mcp_mount is not None
@@ -420,7 +493,20 @@ for line in sys.stdin:
 def test_cli_json_shapes_redaction_and_error_exit(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ZETA_MCP_CONFIG", str(tmp_path / "user.json"))
-    assert main(["mcp", "add", "remote", "--url", "https://u:p@example.test?q=secret", "--header", "Authorization=secret"]) == 0
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "remote",
+                "--url",
+                "https://u:p@example.test?q=secret",
+                "--header",
+                "Authorization=secret",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert main(["mcp", "list", "--json"]) == 0
     listing = json.loads(capsys.readouterr().out)
@@ -445,7 +531,9 @@ for line in sys.stdin:
 """
     (tmp_path / "registry").mkdir()
     registry = ToolRegistry(
-        tmp_path / "registry", register_builtin=False, skill_catalog=SkillCatalog.empty()
+        tmp_path / "registry",
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
     )
     mount = MCPMount(registry, {}, {}, home=str(tmp_path / "home"))
     manager = service(tmp_path, mount)
@@ -472,7 +560,9 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_path, monkeypatch):
+async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(
+    tmp_path, monkeypatch
+):
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -484,7 +574,8 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_
 
     monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", slow_mount)
     loop = AgentLoop(
-        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        FakeBackend([]),
+        ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
     await loop.activate()
@@ -501,9 +592,7 @@ async def test_login_uses_the_explicit_scope_when_project_shadows_user(
     tmp_path, monkeypatch
 ):
     manager = service(tmp_path)
-    manager.add(
-        "oauth", scope="user", url="https://user.example.test", oauth=True
-    )
+    manager.add("oauth", scope="user", url="https://user.example.test", oauth=True)
     manager.add(
         "oauth", scope="project", url="https://project.example.test", oauth=True
     )
@@ -520,9 +609,7 @@ async def test_login_uses_the_explicit_scope_when_project_shadows_user(
 
 
 @pytest.mark.asyncio
-async def test_login_skips_oauth_flow_blocked_by_session_policy(
-    tmp_path, monkeypatch
-):
+async def test_login_skips_oauth_flow_blocked_by_session_policy(tmp_path, monkeypatch):
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
@@ -545,23 +632,19 @@ async def test_login_skips_oauth_flow_blocked_by_session_policy(
         await registry.close()
 
 
-def test_logout_validates_explicit_scope_without_removing_definition(
-    tmp_path, monkeypatch
-):
+@pytest.mark.asyncio
+async def test_logout_validates_explicit_scope_without_removing_definition(tmp_path):
     manager = service(tmp_path)
-    manager.add("oauth", scope="project", url="https://project.example.test", oauth=True)
-    deleted = []
-    monkeypatch.setattr(
-        "zeta.mcp.oauth_store.delete_token",
-        lambda name, *, home: deleted.append((name, home)),
+    manager.add(
+        "oauth", scope="project", url="https://project.example.test", oauth=True
     )
 
     with pytest.raises(MCPManagementError, match="unknown MCP server"):
-        manager.logout("oauth", scope="user")
-    assert deleted == []
+        await manager.logout("oauth", scope="user")
 
-    manager.logout("oauth", scope="project")
-    assert deleted == [("oauth", manager.home)]
+    await manager.logout("oauth", scope="project")
+    token_file = manager.home / "mcp-tokens" / "oauth.json"
+    assert json.loads(token_file.read_text()) == {"generation": 1, "token": None}
     assert manager.show("oauth", scope="project").name == "oauth"
 
 
@@ -597,16 +680,21 @@ async def test_management_test_skips_server_blocked_by_session_policy(tmp_path):
         await registry.close()
 
 
-@pytest.mark.parametrize(
-    ("scope", "enabled"), (("user", False), ("project", True))
-)
+@pytest.mark.parametrize(("scope", "enabled"), (("user", False), ("project", True)))
 def test_stdio_test_only_lists_tools_without_changing_definition_state(
     tmp_path, scope, enabled
 ):
-    source = "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method')\n if m=='tools/call': raise RuntimeError('test must not call tools')\n result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[{'name':'z-last','description':'z description','inputSchema':{}},{'name':'a-first','description':'" + ("x" * 200) + "','inputSchema':{}}]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
+    source = (
+        "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method')\n if m=='tools/call': raise RuntimeError('test must not call tools')\n result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[{'name':'z-last','description':'z description','inputSchema':{}},{'name':'a-first','description':'"
+        + ("x" * 200)
+        + "','inputSchema':{}}]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
+    )
     manager = service(tmp_path)
     manager.add(
-        "x", scope=scope, command=sys.executable, args=("-c", source),
+        "x",
+        scope=scope,
+        command=sys.executable,
+        args=("-c", source),
         enabled=enabled,
     )
     path = manager.path(scope)
@@ -641,7 +729,10 @@ def test_untrusted_project_stdio_server_is_not_spawned_by_test(tmp_path):
     source = f"open({str(marker)!r}, 'w').close()"
     manager = service(tmp_path)
     manager.add(
-        "untrusted", scope="project", command=sys.executable, args=("-c", source),
+        "untrusted",
+        scope="project",
+        command=sys.executable,
+        args=("-c", source),
         enabled=True,
     )
     assert manager.show("untrusted", scope="project").trusted is False

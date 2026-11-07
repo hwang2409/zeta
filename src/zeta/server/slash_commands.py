@@ -103,7 +103,11 @@ class ServerSlashSession:
     so the shared dispatcher never leaks half-executed state.
     """
 
-    def __init__(self, runtime: ServerRuntime, approval_control: _ApprovalProjection | None = None) -> None:
+    def __init__(
+        self,
+        runtime: ServerRuntime,
+        approval_control: _ApprovalProjection | None = None,
+    ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
 
@@ -117,7 +121,11 @@ class ServerSlashSession:
             raise ProtocolError(-32003, "no active session")
         assembler = loop.context_assembler
         child_usage = assembler.descendant_usage
-        pending = self._approval_control.pending_approval_labels() if self._approval_control is not None else ()
+        pending = (
+            self._approval_control.pending_approval_labels()
+            if self._approval_control is not None
+            else ()
+        )
         items = loop.store.todo_items()
         return SlashStatus(
             session_id=opened.metadata.session_id,
@@ -134,7 +142,9 @@ class ServerSlashSession:
             uncached_input_tokens=assembler.uncached_input_tokens_this_session,
             output_tokens_this_session=assembler.output_tokens_this_session,
             child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage["cache_creation_input_tokens"],
+            child_cache_creation_input_tokens=child_usage[
+                "cache_creation_input_tokens"
+            ],
             child_uncached_input_tokens=child_usage["input_tokens"],
             child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=tuple(opened.metadata.context_files),
@@ -341,9 +351,7 @@ class ServerSlashSession:
         del args
         return self._client_only("mcp")
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str:
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         del name, arguments
         raise RuntimeError(_UNAVAILABLE_NOTICE)
 
@@ -369,7 +377,11 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         extra_commands=(
-            SlashCommand("accounts", lambda session, args: session.slash_accounts(args), "list or label accounts"),
+            SlashCommand(
+                "accounts",
+                lambda session, args: session.slash_accounts(args),
+                "list or label accounts",
+            ),
         ),
     )
 
@@ -433,7 +445,10 @@ async def run_command(
         # the store or settings while background children are still running
         # or an approval is outstanding. Read-only calls (`/status`,
         # `/help`, argless `/model`) stay guard-free.
-        ergonomics.require_mutable(runtime, approval_control is not None and approval_control.has_pending_approvals())
+        ergonomics.require_mutable(
+            runtime,
+            approval_control is not None and approval_control.has_pending_approvals(),
+        )
     if name == "model" and not tail.strip():
         # Argless `/model` opens the client's picker surface (Settings on
         # the frontend client) rather than returning a bare text notice — the doc
@@ -446,7 +461,12 @@ async def run_command(
     if name == "mcp" and tail.strip() == "status":
         if runtime.loop is None:
             raise ProtocolError(-32003, "no active session")
-        return {"kind": "text", "text": await runtime.loop.slash_mcp("status")}
+        result = await runtime.loop.slash_mcp("status")
+        response: dict[str, object] = {"kind": "text", "text": result}
+        credential_error = getattr(result, "credential_store_error", None)
+        if credential_error is not None:
+            response["credential_store_error"] = credential_error
+        return response
     if name in CLIENT_ONLY_BUILTINS:
         return {"kind": "client_only", "name": name}
     # Prompt macros expand to user input rather than dispatch through a handler.
@@ -467,7 +487,11 @@ async def run_command(
     if isinstance(result, ModelInputEnvelope):
         return _model_input_result(result, register_model_input)
     if isinstance(result, str):
-        return {"kind": "output", "text": result}
+        response = {"kind": "output", "text": result}
+        credential_error = getattr(result, "credential_store_error", None)
+        if credential_error is not None:
+            response["credential_store_error"] = credential_error
+        return response
     raise ProtocolError(-32000, "unexpected slash result type")
 
 
@@ -519,9 +543,7 @@ def _entries_from_registry(
                 # drive over the RPC surface; list them so the menu shows them
                 # and let the frontend client decide how to surface the limitation.
                 client_only=command.kind == "exec",
-                unavailable=(
-                    "" if command.kind == "prompt" else _UNAVAILABLE_NOTICE
-                ),
+                unavailable=("" if command.kind == "prompt" else _UNAVAILABLE_NOTICE),
             )
         )
     for skill in registry.skill_entries:
