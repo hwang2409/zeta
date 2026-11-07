@@ -555,6 +555,17 @@ class MCPManagementService:
         self._ensure_open()
         task = asyncio.create_task(asyncio.to_thread(self._transaction, mutation))
         self._transaction_task = task
+
+        def consume_closed_outcome(completed: asyncio.Task[_ManagementCandidate]) -> None:
+            if completed.cancelled():
+                return
+            exception = completed.exception()
+            if exception is not None and not isinstance(
+                exception, MCPManagementClosedError
+            ):
+                raise exception
+
+        task.add_done_callback(consume_closed_outcome)
         try:
             candidate = await asyncio.shield(task)
         except asyncio.CancelledError:
