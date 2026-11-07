@@ -302,7 +302,7 @@ class AgentLoop(
             self.tool_registry.set_approval_policy(approval_policy)
         if self.tool_registry.approval_policy is not None:
             self.tool_registry.bind_approval_store(store)
-        self.tool_schemas = list(
+        self.tool_schemas = tuple(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
