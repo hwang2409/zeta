@@ -575,23 +575,11 @@ class AgentLoop(
             self.hooks.session_start()
 
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
-        data: dict[str, object] = {
-            "task_id": item.task_id,
-            "headline": item.command,
-            "exit_code": item.exit_code,
-            "output_tail": item.output_tail,
-            "background_owner": item.owner,
-            "background_phase": item.phase,
-        }
-        if item.log_path is not None:
-            data["log_path"] = item.log_path
-        if item.note is not None:
-            data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
             NotificationInput(
                 "task_exit",
-                data,
+                item.notification_data(),
                 dedupe_key=item.task_id,
                 tui_presented=item.tui_presented,
             )

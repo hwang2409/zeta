@@ -44,6 +44,21 @@ class TaskExitInput:
     phase: str = "natural_exit"
     tui_presented: bool = False
 
+    def notification_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "task_id": self.task_id,
+            "headline": self.command,
+            "exit_code": self.exit_code,
+            "output_tail": self.output_tail,
+            "background_owner": self.owner,
+            "background_phase": self.phase,
+        }
+        if self.log_path is not None:
+            data["log_path"] = self.log_path
+        if self.note is not None:
+            data["note"] = self.note
+        return data
+
 
 @dataclass(frozen=True, slots=True)
 class BackgroundTaskInfo:
