@@ -231,9 +231,7 @@ class _FailingCloseClient:
 async def test_refresh_reuses_lease_client_and_keeps_primary_outcome(
     primary_error: bool,
 ) -> None:
-    lease = HTTPClientLease.__new__(HTTPClientLease)
-    lease.client = _FailingCloseClient()
-    lease.owned = True
+    lease = HTTPClientLease(_FailingCloseClient())
     contexts: list[dict[str, object]] = []
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()

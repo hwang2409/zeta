@@ -443,30 +443,28 @@ class SessionAccountContext:
                 pins,
             )
         )
-        try:
-            result, applied, retired = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled.set()
+        caller_cancellation: asyncio.CancelledError | None = None
+        while not worker.done():
             try:
-                _, _, retired = await asyncio.shield(worker)
-            except BaseException:  # noqa: BLE001 - caller cancellation wins
-                retired = discard_backend
-            if retired is not None:
-                try:
-                    await loop.close_backend(retired, stage="replacement")
-                except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
-                    pass
-            self._mark_unknown(build_backend)
-            raise
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                caller_cancellation = caller_cancellation or exc
+                cancelled.set()
+        try:
+            result, applied, retired = worker.result()
         except BaseException:
             if discard_backend is not None:
                 await loop.close_backend(discard_backend, stage="replacement_failure")
             self._mark_unknown(build_backend)
+            if caller_cancellation is not None:
+                raise caller_cancellation
             raise
-        if not applied:
+        if not applied or caller_cancellation is not None:
             self._mark_unknown(build_backend)
         if retired is not None:
             await loop.close_backend(retired, stage="replacement")
+        if caller_cancellation is not None:
+            raise caller_cancellation
         return result
 
     def _locked_apply_worker(

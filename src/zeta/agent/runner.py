@@ -489,10 +489,15 @@ async def _build_child_loop(
         return child_loop, child_policy
     except asyncio.CancelledError:
         cleanup = asyncio.create_task(close_construction())
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise
         raise
     except BaseException:
         await close_construction()

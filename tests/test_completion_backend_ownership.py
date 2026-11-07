@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -18,7 +19,6 @@ from zeta.protocol.types import Message, StreamEvent, ToolSchema
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import CloseOutcome, close_transport_resources
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.loop import backend_owners as backend_owner_module
 from zeta.skills import SkillCatalog
 
 
@@ -62,43 +62,6 @@ class _RecordingClient:
         self.close_count += 1
         if self.close_error is not None:
             raise self.close_error
-
-
-class _GatedResponse(_Response):
-    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
-        self.started = started
-        self.release = release
-
-    async def aiter_bytes(self) -> AsyncIterator[bytes]:
-        self.started.set()
-        await _within(self.release.wait())
-        yield b'{"message":{"content":"ok"},"done":true}\n'
-
-
-class _GatedClient(_RecordingClient):
-    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
-        super().__init__()
-        self.started = started
-        self.release = release
-        self.closed = asyncio.Event()
-
-    def stream(self, *_args: object, **_kwargs: object) -> _Stream:
-        self.request_count += 1
-        return _Stream(_GatedResponse(self.started, self.release))
-
-    async def aclose(self) -> None:
-        await _within(super().aclose())
-        self.closed.set()
-
-
-class _ObservedOllamaBackend(OllamaBackend):
-    def __init__(self, close_entered: asyncio.Event) -> None:
-        self.close_entered = close_entered
-        super().__init__()
-
-    async def aclose(self, *, report_failure=None) -> CloseOutcome:
-        self.close_entered.set()
-        return await _within(super().aclose(report_failure=report_failure))
 
 
 class _RecordingBackend:
@@ -213,43 +176,103 @@ async def test_owned_backend_reuses_one_client_and_runtime_closes_once(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_replacement_close_still_closes_after_active_borrow(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_replaced_backend_reference_rejects_completion_before_transport(
+    tmp_path: Path,
 ) -> None:
-    started = asyncio.Event()
-    release = asyncio.Event()
-    close_entered = asyncio.Event()
-    client = _GatedClient(started, release)
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
-    old = _ObservedOllamaBackend(close_entered)
+    retired_client = _RecordingClient()
+    retired = OllamaBackend(client=retired_client)
     replacement = _RecordingBackend()
     loop = AgentLoop(
-        old,
+        retired,
         ConversationStore(tmp_path),
         skill_catalog=SkillCatalog.empty(),
     )
-    completion = asyncio.create_task(_consume(old))
     try:
-        await _within(started.wait())
-        retired = loop.apply_backend_state(loop.prepare_backend_state(replacement))
-        assert retired is old
-        closing = asyncio.create_task(loop.close_backend(old, stage="replacement"))
-        await _within(close_entered.wait())
-        closing.cancel()
-        release.set()
-        await _within(completion)
-        with pytest.raises(asyncio.CancelledError):
-            await _within(closing)
-        await _within(client.closed.wait())
-        assert client.close_count == 1
-        await _within(loop.close())
-        assert replacement.client.close_count == 1
+        loop.apply_backend_state(loop.prepare_backend_state(replacement))
+
+        with pytest.raises(RuntimeError, match="^completion backend is retired$"):
+            await _within(_consume(retired))
+        assert retired_client.request_count == 0
     finally:
-        release.set()
-        completion.cancel()
-        await _within(asyncio.gather(completion, return_exceptions=True))
         await _within(loop.close())
         loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_double_cancelled_account_replacement_closes_only_retired_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    await _within(
+        asyncio.to_thread(
+            named_account_credentials(home, "codex", "work").save,
+            OAuthTokens("access", "refresh", 9_999_999_999),
+        )
+    )
+    manager = SessionManager(home)
+    opened = await _within(
+        asyncio.to_thread(
+            manager.create,
+            provider="codex",
+            model="gpt-5.6-sol",
+            cwd=tmp_path,
+            compaction_budget=8_192,
+        )
+    )
+    old = _RecordingBackend()
+    replacement = _RecordingBackend()
+    loop = AgentLoop(old, opened.store, skill_catalog=SkillCatalog.empty())
+    context = await _within(
+        asyncio.to_thread(
+            SessionAccountContext.load, home, manager, opened.metadata
+        )
+    )
+    replacement_installed = threading.Event()
+    release_worker = threading.Event()
+    original_apply_on_loop = context._apply_on_loop
+
+    def hold_worker_after_apply(*args):
+        result = original_apply_on_loop(*args)
+        replacement_installed.set()
+        if not release_worker.wait(10):
+            raise TimeoutError("account replacement worker was not released")
+        return result
+
+    # test-contract: seam hold the worker after the real event-loop apply callback
+    monkeypatch.setattr(
+        SessionAccountContext, "_apply_on_loop", staticmethod(hold_worker_after_apply)
+    )
+    switch = asyncio.create_task(
+        context.switch_active(
+            loop,
+            AccountId("codex", "work"),
+            boundary=0,
+            provider="codex",
+            build_backend=lambda _account: replacement,
+        )
+    )
+    try:
+        assert await _within(asyncio.to_thread(replacement_installed.wait, 10))
+        assert loop.backend is replacement
+        switch.cancel()
+        first_cancellation_processed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(first_cancellation_processed.set)
+        await _within(first_cancellation_processed.wait())
+        switch.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await _within(switch)
+
+        assert old.client.close_count == 1
+        assert replacement.client.close_count == 0
+        assert loop.backend is replacement
+    finally:
+        release_worker.set()
+        if not switch.done():
+            switch.cancel()
+        await _within(asyncio.gather(switch, return_exceptions=True))
+        await _within(loop.close())
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -308,6 +331,8 @@ async def test_child_registry_clone_gets_its_own_backend_owner(
 async def test_runtime_reports_backend_close_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.runtime.loop import backend_owners as backend_owner_module
+
     failure = RuntimeError("close failed")
     backend = _RecordingBackend()
     backend.client.close_error = failure

@@ -322,11 +322,6 @@ class HTTPClientLease:
 
     @contextlib.asynccontextmanager
     async def borrow(self) -> AsyncIterator[httpx.AsyncClient]:
-        if not hasattr(self, "_retired"):
-            self._active_borrows = 0
-            self._drained = asyncio.Event()
-            self._drained.set()
-            self._retired = False
         if self._retired:
             raise RuntimeError("completion backend is retired")
         self._active_borrows += 1
