@@ -53,6 +53,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
     {
         "accounts",
         "compact",
+        "decisions",
         "help",
         "inbox",
         "init",
@@ -110,6 +111,48 @@ class ServerSlashSession:
         self._approval_control = approval_control
 
     # --- runnable server-side ---
+
+    async def slash_decisions(self, args: str) -> str:
+        from ..attention_decisions import open_decisions
+        from ..attention_forks import deliver_attention_decision
+        from ..attention_records import AttentionStore
+
+        loop = self._runtime.loop
+        opened = self._runtime.opened
+        if loop is None or opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        parts = args.split(maxsplit=2)
+        items = await asyncio.to_thread(
+            open_decisions, self._runtime.home, opened.metadata.session_id
+        )
+        if parts and parts[0] in {"dismiss", "reply"}:
+            if len(parts) < 2:
+                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+            item = next((item for item in items if item.record.id == parts[1]), None)
+            if item is None:
+                return "attention item not found"
+            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
+            if parts[0] == "dismiss":
+                await asyncio.to_thread(
+                    store.dismiss, item.record.id, session_id=item.session_id
+                )
+                return f"dismissed {item.record.id}"
+            if len(parts) < 3:
+                return "reply text must be nonempty"
+            await asyncio.to_thread(
+                deliver_attention_decision,
+                self._runtime.home,
+                item.record,
+                parts[2],
+                from_session=opened.metadata.session_id,
+            )
+            return f"replied to {item.record.id}"
+        if not items:
+            return "no open attention items"
+        return "open attention items:\n" + "\n".join(
+            f"  {item.record.id} [{item.record.kind}] {item.record.title}"
+            for item in items
+        )
 
     def slash_status(self) -> SlashStatus:
         runtime = self._runtime

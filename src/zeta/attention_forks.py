@@ -115,7 +115,7 @@ def validate_attention_fork(
 
 
 def attention_decision_message_id(attention_id: str) -> str:
-    """Return the stable inbox identity for one attention decision."""
+    """Return the stable inbox identity for one attention reply."""
     return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
         :32
     ]
@@ -129,7 +129,7 @@ def deliver_attention_decision(
     from_session: str,
     registry_state: ProjectRegistryState | None = None,
 ) -> tuple[str, AttentionRecord, bool]:
-    """Deliver and resolve one decision through the shared resolution seam."""
+    """Deliver and resolve one attention reply through the shared resolution seam."""
     decision = decision.strip()
     if not decision:
         raise ValueError("decision must be nonempty")
@@ -144,10 +144,11 @@ def deliver_attention_decision(
     def send(current: AttentionRecord) -> None:
         if current.project_id is None:
             raise ValueError("attention record has no project")
+        label = "Decision" if current.kind == "decision" else "Reply"
         body = (
-            f"User decision relayed from session {from_session}. "
+            f"User {label.lower()} relayed from session {from_session}. "
             f"The question was asked at {current.created_at}; check whether the "
-            f"situation has changed before acting.\n\nDecision: {decision}"
+            f"situation has changed before acting.\n\n{label}: {decision}"
         )
         inbox.send(
             from_project=current.project_id,
@@ -155,7 +156,7 @@ def deliver_attention_decision(
             to_project=current.project_id,
             to_session=current.session_id,
             kind="reply",
-            title=f"Decision: {current.title}",
+            title=f"{'Decision' if current.kind == 'decision' else 'Reply'}: {current.title}",
             body=body,
             message_id=message_id,
         )
@@ -199,7 +200,6 @@ def release_discussion_fork(
     ):
         store.replace(replace(record, fork_session_id=None))
     return fork.forked_from_session
-
 
 
 @contextmanager
@@ -378,9 +378,13 @@ def create_discussion_fork(
         with _fork_allocation_lock(attention_store):
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:
-                raise ValueError("attention record does not belong to the source session")
+                raise ValueError(
+                    "attention record does not belong to the source session"
+                )
             if record.project_id != source.metadata.project_id:
-                raise ValueError("attention record does not belong to the source project")
+                raise ValueError(
+                    "attention record does not belong to the source project"
+                )
             if record.fork_session_id:
                 return record.fork_session_id
             branch = source.store.replay()

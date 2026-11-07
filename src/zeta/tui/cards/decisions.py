@@ -55,7 +55,12 @@ def _labelled_text(label: str, text: str, width: int, style: str) -> list[Fragme
 def _option_lines(index: int, text: str, width: int) -> list[FragmentLine]:
     prefix = f"{index}. "
     return [
-        [overlay.value(prefix if line_index == 0 else " " * len(prefix), theme.ACCENT), overlay.value(line)]
+        [
+            overlay.value(
+                prefix if line_index == 0 else " " * len(prefix), theme.ACCENT
+            ),
+            overlay.value(line),
+        ]
         for line_index, line in enumerate(wrap_by_cells(text, width - len(prefix)))
     ]
 
@@ -88,7 +93,6 @@ class DecisionsPanel:
     @property
     def mode(self) -> str:
         return self._mode
-
 
     @property
     def selected(self) -> DecisionItem | None:
@@ -135,11 +139,11 @@ class DecisionsPanel:
 
     def render_lines(self) -> list[FragmentLine]:
         lines: list[FragmentLine] = [
-            overlay.title("Decisions"),
+            overlay.title("Attention"),
             overlay.rule(),
         ]
         if not self._items:
-            lines.append([overlay.value("No open decisions.", theme.DIM)])
+            lines.append([overlay.value("No open attention items.", theme.DIM)])
             lines.append(overlay.rule())
             lines.append(overlay.hint("esc close"))
             return lines
@@ -149,6 +153,8 @@ class DecisionsPanel:
         selection = self.selected
         if selection is not None:
             lines.extend(self._detail(selection))
+        if selection is not None and selection.record.kind != "decision":
+            lines.append(overlay.hint("d dismiss"))
         if self._mode == "answer":
             lines.append(self._answer_line())
             lines.append(overlay.hint("enter send · esc cancel"))
@@ -156,7 +162,7 @@ class DecisionsPanel:
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:
         selected = item.record.id == self._selected_id
-        label = f"{item.project_name} · {item.session_id[:8]}"
+        label = f"{item.record.kind} · {item.project_name} · {item.session_id[:8]}"
         title = item.record.title
         available = CONTENT_WIDTH - len(label) - 4
         if _cells(title) > available:
@@ -172,14 +178,30 @@ class DecisionsPanel:
     def _detail(self, item: DecisionItem) -> list[FragmentLine]:
         width = CONTENT_WIDTH - 2
         lines: list[FragmentLine] = [overlay.blank()]
-        lines.extend(_labelled_text("Question", item.record.title, width, theme.ACCENT))
+        lines.extend(
+            _labelled_text(
+                "Kind",
+                item.record.kind,
+                width,
+                theme.ACCENT if item.record.kind == "decision" else theme.DIM,
+            )
+        )
+        lines.extend(
+            _labelled_text(
+                "Question" if item.record.kind == "decision" else "Topic",
+                item.record.title,
+                width,
+                theme.ACCENT,
+            )
+        )
         lines.append(overlay.blank())
         lines.extend(_labelled_text("Why", item.record.why, width, theme.DIM))
-        lines.append(overlay.blank())
-        lines.append([overlay.value("Options", theme.ACCENT)])
-        for index, option in enumerate(item.record.options, start=1):
-            lines.extend(_option_lines(index, option, width))
-        if item.record.recommendation:
+        if item.record.kind == "decision":
+            lines.append(overlay.blank())
+            lines.append([overlay.value("Options", theme.ACCENT)])
+            for index, option in enumerate(item.record.options, start=1):
+                lines.extend(_option_lines(index, option, width))
+        if item.record.kind == "decision" and item.record.recommendation:
             lines.append(overlay.blank())
             lines.extend(
                 _labelled_text(

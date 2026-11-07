@@ -70,9 +70,9 @@ def _request(opened, project_id, title, why, **kw):
 
 def test_status_bar_shows_decisions_only_when_present() -> None:
     with_count = format_status("codex", "fake", "idle", decisions_count=2).plain
-    assert "● 2 decisions" in with_count
+    assert "● 2 attention items" in with_count
     singular = format_status("codex", "fake", "idle", decisions_count=1).plain
-    assert "● 1 decision" in singular
+    assert "● 1 attention item" in singular
     none = format_status("codex", "fake", "idle", decisions_count=0).plain
     assert "decision" not in none
 
