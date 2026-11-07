@@ -13130,43 +13130,64 @@ async def _idle_notice_fixture(
     pending_delivery_module.StepDeliveryFlow,
     list[str],
 ]:
-    parent = ConversationStore(tmp_path / "parent")
-    child = ConversationStore(tmp_path / "child")
-    registry_path = tmp_path / "registry"
-    registry_path.mkdir()
-    registry = ToolRegistry(registry_path, skill_catalog=SkillCatalog.empty())
-    registry.bind_session_store(child)
-    owner = BackgroundAgentOwner(parent)
-    loop = _ExplicitFinishLoop(registry, owner)
-    parent.register_agent_child(
-        _run_agent_call(),
-        child_session_path=str(child.session_dir),
-        description="work",
-        agent_type="worker",
-        background=True,
-        child_instance_id="root:1",
-        accepts_follow_ups=True,
-        explicit_finish=True,
-    )
-    child.start_agent_lifecycle(
-        handle="root:1",
-        started_at="2026-01-01T00:00:00+00:00",
-        depth=1,
-        agent_type="worker",
-        description="work",
-    )
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        child,
-        owned_work=lambda: loop.background_work_descriptions,
-        delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
-    )
-    owner.conversation_channel.register_loop("root:1")
-    wakes: list[str] = []
-    parent_flow = pending_delivery_module.StepDeliveryFlow(
-        parent, wake_sink=lambda source: wakes.append(source)
-    )
-    owner.conversation_channel.register_delivery_flow(None, parent_flow)
-    await loop._ensure_step_delivery()
+    parent: ConversationStore | None = None
+    child: ConversationStore | None = None
+    registry: ToolRegistry | None = None
+    owner: BackgroundAgentOwner | None = None
+    try:
+        parent = ConversationStore(tmp_path / "parent")
+        child = ConversationStore(tmp_path / "child")
+        registry_path = tmp_path / "registry"
+        registry_path.mkdir()
+        registry = ToolRegistry(registry_path, skill_catalog=SkillCatalog.empty())
+        registry.bind_session_store(child)
+        owner = BackgroundAgentOwner(parent)
+        loop = _ExplicitFinishLoop(registry, owner)
+        parent.register_agent_child(
+            _run_agent_call(),
+            child_session_path=str(child.session_dir),
+            description="work",
+            agent_type="worker",
+            background=True,
+            child_instance_id="root:1",
+            accepts_follow_ups=True,
+            explicit_finish=True,
+        )
+        child.start_agent_lifecycle(
+            handle="root:1",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="worker",
+            description="work",
+        )
+        loop._terminal_transition_fence = TerminalTransitionFence(
+            child,
+            owned_work=lambda: loop.background_work_descriptions,
+            delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
+        )
+        owner.conversation_channel.register_loop("root:1")
+        wakes: list[str] = []
+        parent_flow = pending_delivery_module.StepDeliveryFlow(
+            parent, wake_sink=lambda source: wakes.append(source)
+        )
+        owner.conversation_channel.register_delivery_flow(None, parent_flow)
+        await loop._ensure_step_delivery()
+    except BaseException:
+        try:
+            if owner is not None:
+                await asyncio.wait_for(owner.wait(), 10)
+        finally:
+            try:
+                if registry is not None:
+                    await asyncio.wait_for(registry.close(), 10)
+            finally:
+                try:
+                    if parent is not None:
+                        parent.close()
+                finally:
+                    if child is not None:
+                        child.close()
+        raise
     return parent, child, registry, loop, parent_flow, wakes
 
 
@@ -13217,8 +13238,12 @@ async def _run_until_idle_wait(
             idle_wait=wait_idle,
         )
     )
-    if wait_for_idle:
-        await asyncio.wait_for(idle_waiting.wait(), 10)
+    try:
+        if wait_for_idle:
+            await asyncio.wait_for(idle_waiting.wait(), 10)
+    except BaseException:
+        await _cancel_and_drain(run)
+        raise
     return run, idle_waiting, prompts
 
 
@@ -13230,17 +13255,18 @@ async def _cancel_and_drain(task: asyncio.Task[object]) -> None:
 
 
 async def _cancel_idle_fixture(
-    run: asyncio.Task[dict[str, object]],
+    run: asyncio.Task[dict[str, object]] | None,
     registry: ToolRegistry,
     parent: ConversationStore,
     child: ConversationStore,
 ) -> None:
     try:
-        try:
-            run.cancel()
-        finally:
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(run, 10)
+        if run is not None:
+            try:
+                run.cancel()
+            finally:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(run, 10)
     finally:
         try:
             await asyncio.wait_for(registry.close(), 10)
@@ -13263,68 +13289,69 @@ async def test_idle_with_open_work_does_not_notify_parent(
     parent, child, registry, loop, parent_flow, wakes = await _idle_notice_fixture(
         tmp_path
     )
+    run: asyncio.Task[dict[str, object]] | None = None
     owned_child: asyncio.Task[None] | None = None
     owned_child_store: ConversationStore | None = None
-    if wake_source == "task":
-        monkeypatch.setattr(
-            registry.background_tasks,
-            "snapshot",
-            lambda: (
-                SimpleNamespace(
-                    running=True, task_id="task-owned", headline="owned task"
-                ),
-            ),
-        )
-    elif wake_source in {"child", "idle_child"}:
-        owned_child = asyncio.create_task(
-            asyncio.wait_for(asyncio.Event().wait(), 10)
-        )
-        if wake_source == "idle_child":
-            owned_child_store = ConversationStore(tmp_path / "idle-owned-child")
-            child.register_agent_child(
-                _run_agent_call("idle-owned"),
-                child_session_path=str(owned_child_store.session_dir),
-                description="idle owned child",
-                agent_type="worker",
-                background=True,
-                child_instance_id="root:1:1",
-                accepts_follow_ups=True,
-                explicit_finish=True,
-            )
-            owned_child_store.start_agent_lifecycle(
-                handle="root:1:1",
-                started_at="2026-01-01T00:00:00+00:00",
-                depth=2,
-                agent_type="worker",
-                description="idle owned child",
-            )
-            owned_child_store.update_agent_lifecycle(
-                state="idle",
-                current_step="idle, waiting for follow-up",
-                idle_since="2026-01-01T00:01:00+00:00",
-            )
-        loop._background_owner.register(
-            "root:1:1",
-            owned_child.cancel,
-            owned_child,
-            active_store=owned_child_store,
-            parent_instance_id="root:1",
-            description="owned child",
-        )
-    else:
-        await loop._background_owner.conversation_channel.publish_question(
-            child_instance_id="root:1",
-            question_id="q-pending",
-            question="approve?",
-            options=None,
-        )
-        prepared = await parent_flow.prepare_request("idle_start", [], None)
-        assert prepared.notification_ids
-        await parent_flow.acknowledge_active()
-        wakes.clear()
-
-    run, _idle_waiting, prompts = await _run_until_idle_wait(loop, child, monkeypatch)
     try:
+        if wake_source == "task":
+            monkeypatch.setattr(
+                registry.background_tasks,
+                "snapshot",
+                lambda: (
+                    SimpleNamespace(
+                        running=True, task_id="task-owned", headline="owned task"
+                    ),
+                ),
+            )
+        elif wake_source in {"child", "idle_child"}:
+            owned_child = asyncio.create_task(
+                asyncio.wait_for(asyncio.Event().wait(), 10)
+            )
+            if wake_source == "idle_child":
+                owned_child_store = ConversationStore(tmp_path / "idle-owned-child")
+                child.register_agent_child(
+                    _run_agent_call("idle-owned"),
+                    child_session_path=str(owned_child_store.session_dir),
+                    description="idle owned child",
+                    agent_type="worker",
+                    background=True,
+                    child_instance_id="root:1:1",
+                    accepts_follow_ups=True,
+                    explicit_finish=True,
+                )
+                owned_child_store.start_agent_lifecycle(
+                    handle="root:1:1",
+                    started_at="2026-01-01T00:00:00+00:00",
+                    depth=2,
+                    agent_type="worker",
+                    description="idle owned child",
+                )
+                owned_child_store.update_agent_lifecycle(
+                    state="idle",
+                    current_step="idle, waiting for follow-up",
+                    idle_since="2026-01-01T00:01:00+00:00",
+                )
+            loop._background_owner.register(
+                "root:1:1",
+                owned_child.cancel,
+                owned_child,
+                active_store=owned_child_store,
+                parent_instance_id="root:1",
+                description="owned child",
+            )
+        else:
+            await loop._background_owner.conversation_channel.publish_question(
+                child_instance_id="root:1",
+                question_id="q-pending",
+                question="approve?",
+                options=None,
+            )
+            prepared = await parent_flow.prepare_request("idle_start", [], None)
+            assert prepared.notification_ids
+            await parent_flow.acknowledge_active()
+            wakes.clear()
+
+        run, _idle_waiting, prompts = await _run_until_idle_wait(loop, child, monkeypatch)
         assert prompts == (
             ["work", run_consumer_module._IMMEDIATE_FINISH_REMINDER]
             if wake_source == "question"
