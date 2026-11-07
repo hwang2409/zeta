@@ -12,11 +12,18 @@ from typing import Protocol
 
 from zeta.core.session_files import atomic_publish_file
 from zeta.project_errors import ProjectRegistryError, UnsupportedMemoryFormatError
+from zeta.storage_format import (
+    ReplaceSubtree,
+    mapping_mutations,
+    open_writer,
+    require_closed_variant,
+)
 
 CURRENT_POINTER = "memory-current.json"
 UNSUPPORTED_FORMAT_2 = (
     "project memory uses format 2; this operation requires the entry-memory interface"
 )
+
 
 @dataclass(frozen=True, slots=True)
 class PublicationContext:
@@ -76,6 +83,10 @@ def stored_memory_format(
     value = manifest.get("format", 1)
     if type(value) is not int or value < 1:
         raise ProjectRegistryError("project memory format is malformed")
+    try:
+        require_closed_variant("memory.format", value)
+    except ValueError as exc:
+        raise ProjectRegistryError("project memory format is unsupported") from exc
     return value
 
 
@@ -121,6 +132,17 @@ def _publish_payloads(
     return digests
 
 
+def _publish_legacy_json(
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = True
+) -> None:
+    atomic_publish_file(
+        directory_fd,
+        name,
+        json.dumps(json.loads(data), sort_keys=True).encode(),
+        sync_directory=sync_directory,
+    )
+
+
 def publish_version[T](
     directory_fd: int,
     *,
@@ -131,7 +153,8 @@ def publish_version[T](
     version_handles: Callable[[int, bool], tuple[int, int, int]],
     manifest_reader: Callable[[int, str], dict[str, object]],
     transaction_step: Callable[[str], None],
-    prune_versions: Callable[[int, int, set[str]], None],
+    prune_versions: Callable[[int, int, set[str], set[str]], None],
+    home: os.PathLike[str] | str,
 ) -> PublishedVersion[T]:
     """Publish one immutable version through the format-independent protocol."""
     root_fd, blobs_fd, versions_fd = version_handles(directory_fd, True)
@@ -168,22 +191,27 @@ def publish_version[T](
             "snapshot": snapshot,
             "before_snapshot": before_snapshot,
         }
-        atomic_publish_file(
-            versions_fd,
-            f"{version}.json",
-            json.dumps(manifest, sort_keys=True).encode(),
-        )
-        transaction_step("manifest")
-        atomic_publish_file(
-            directory_fd,
-            CURRENT_POINTER,
-            json.dumps(
-                {"current": version, "history": retained}, sort_keys=True
-            ).encode(),
-            sync_directory=True,
-        )
+        with open_writer(home) as lease:
+            lease.publish_json(
+                versions_fd,
+                f"{version}.json",
+                mapping_mutations(manifest),
+                _publish_legacy_json,
+            )
+            transaction_step("manifest")
+            lease.publish_json(
+                directory_fd,
+                CURRENT_POINTER,
+                (
+                    *mapping_mutations({"current": version}),
+                    ReplaceSubtree(("history",), retained),
+                ),
+                lambda fd, name, data: _publish_legacy_json(
+                    fd, name, data, sync_directory=True
+                ),
+            )
         transaction_step("publish")
-        prune_versions(blobs_fd, versions_fd, set(retained))
+        prune_versions(blobs_fd, versions_fd, set(retained), set(dropped))
         return PublishedVersion(prepared.value, snapshot, version)
     finally:
         os.close(versions_fd)

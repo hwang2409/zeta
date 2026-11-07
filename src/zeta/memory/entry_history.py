@@ -196,7 +196,10 @@ class _MigrationPayloadAdapter:
     def prepare(self, context: PublicationContext) -> PreparedVersion[EntryMemoryState]:
         return PreparedVersion(
             {"state": self.plan.canonical_state},
-            {name: content.encode() for name, content in self.plan.source_contents.items()},
+            {
+                name: content.encode()
+                for name, content in self.plan.source_contents.items()
+            },
             {
                 "format": 2,
                 "kind": "migrate",
@@ -229,7 +232,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         try:
             fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=blobs_fd)
         except OSError as exc:
-            raise ProjectRegistryError("format-2 memory snapshot is incomplete") from exc
+            raise ProjectRegistryError(
+                "format-2 memory snapshot is incomplete"
+            ) from exc
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_STATE_BYTES:
@@ -239,7 +244,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 raise ProjectRegistryError("format-2 memory snapshot is corrupt")
             return state_from_bytes(payload), digest
         except OSError as exc:
-            raise ProjectRegistryError("format-2 memory snapshot is unreadable") from exc
+            raise ProjectRegistryError(
+                "format-2 memory snapshot is unreadable"
+            ) from exc
         finally:
             os.close(fd)
 
@@ -328,6 +335,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             manifest_reader=self._manifest,
             transaction_step=self._memory_transaction_step,
             prune_versions=self._prune_versions,
+            home=self.root.parent,
         )
         if not isinstance(published.snapshot, str):
             raise TypeError("format-2 publication returned a non-scalar snapshot")
@@ -341,9 +349,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         )
         return snapshot
 
-
     def _export_entry_memory(self, project_id: str) -> EntryMemoryExport:
         """Export one format-2 fixture without exposing storage layout."""
+
         def read(root_fd: int) -> EntryMemoryExport:
             return self._export_entry_memory_locked(root_fd, project_id)
 
@@ -561,12 +569,18 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 target_keys = {kind.key for kind in selected.kinds}
                 source_keys = {kind.key for kind in source_state.schema.kinds}
                 if set(mappings) - source_keys or set(resolve_kinds) - source_keys:
-                    raise ProjectRegistryError("profile change names an unknown source kind")
+                    raise ProjectRegistryError(
+                        "profile change names an unknown source kind"
+                    )
                 if any(target not in target_keys for target in mappings.values()):
-                    raise ProjectRegistryError("profile mapping targets an unknown kind")
+                    raise ProjectRegistryError(
+                        "profile mapping targets an unknown kind"
+                    )
                 removed = source_keys - target_keys
                 if (set(mappings) | set(resolve_kinds)) - removed:
-                    raise ProjectRegistryError("profile mapping applies only to removed kinds")
+                    raise ProjectRegistryError(
+                        "profile mapping applies only to removed kinds"
+                    )
                 populated = {
                     entry.kind
                     for entry in source_state.entries.values()
@@ -657,12 +671,14 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     os.close(versions_fd)
                     os.close(blobs_fd)
                     os.close(root)
-                if any(record.get("kind") == "migration-finalize" for record in records):
+                if any(
+                    record.get("kind") == "migration-finalize" for record in records
+                ):
                     raise ProjectRegistryError("memory migration is already finalized")
                 current_manifest = records[-1]
-                if not any(record.get("kind") == "migrate" for record in records) and not isinstance(
-                    current_manifest.get("migration_version"), str
-                ):
+                if not any(
+                    record.get("kind") == "migrate" for record in records
+                ) and not isinstance(current_manifest.get("migration_version"), str):
                     raise ProjectRegistryError("memory migration is not initialized")
                 return self._publish_entry_version(
                     directory_fd,
@@ -704,7 +720,8 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                                 source_digest=str(current_manifest["source_digest"]),
                                 source_version=(
                                     str(current_manifest["source_version"])
-                                    if current_manifest.get("source_version") is not None
+                                    if current_manifest.get("source_version")
+                                    is not None
                                     else None
                                 ),
                                 migrated_at=str(current_manifest["created_at"]),
@@ -741,6 +758,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                     manifest_reader=self._manifest,
                     transaction_step=self._memory_transaction_step,
                     prune_versions=self._prune_versions,
+                    home=self.root.parent,
                 )
                 if published.value != plan.state:
                     raise AssertionError("migration publication changed its state")
@@ -779,7 +797,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                         if isinstance(migration_version, str):
                             migration = self._manifest(versions_fd, migration_version)
                     if migration is None:
-                        raise ProjectRegistryError("memory is not a reversible migration")
+                        raise ProjectRegistryError(
+                            "memory is not a reversible migration"
+                        )
                     source_version = migration.get("source_version")
                     if source_version is None:
                         source_contents = self._contents_from_manifest(
@@ -798,7 +818,9 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                             else [source_version]
                         )
                     else:
-                        raise ProjectRegistryError("memory is not a reversible migration")
+                        raise ProjectRegistryError(
+                            "memory is not a reversible migration"
+                        )
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
