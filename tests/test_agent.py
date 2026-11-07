@@ -10923,6 +10923,85 @@ async def test_subagent_empty_after_tools_stops_at_recovery_cap(
 
 
 @pytest.mark.asyncio
+async def test_subagent_pending_delivery_wins_at_recovery_cap(
+    tmp_path: Path,
+) -> None:
+    class Backend(FakeBackend):
+        def __init__(self, turns: Sequence[ScriptedTurn]) -> None:
+            super().__init__(turns)
+            self.loop: AgentLoop | None = None
+
+        async def complete(self, messages, tool_schemas):
+            if len(self.calls) == 7:
+                assert self.loop is not None
+                flow = await self.loop._ensure_step_delivery()
+                await flow.produce(
+                    pending_delivery_module.NotificationInput(
+                        "task_exit",
+                        {
+                            "origin": "notification",
+                            "kind": "task_exited",
+                            "task_id": "task",
+                            "headline": "work",
+                            "exit_code": 0,
+                            "output_tail": "",
+                            "background_owner": "run_background",
+                            "background_phase": "natural_exit",
+                        },
+                        dedupe_key="task",
+                    )
+                )
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+
+    backend = Backend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child-call")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-2", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-3", "sig-3")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-4", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-5", "sig-5")]),
+            ScriptedTurn(tool_calls=[ToolCall("ping-6", "ping", {})]),
+            ScriptedTurn([ThinkingContent("empty-7", "sig-7")]),
+            ScriptedTurn([TextContent("notification consumed")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register(
+        "ping",
+        lambda *_args, **_kwargs: "pong",
+        description="ping",
+        requires_approval=False,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    backend.loop = loop
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    assert len(backend.calls) == 9
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in backend.calls[-1][0]
+    )
+    assert not any(
+        event.type is StreamEventType.ERROR
+        and event.error is not None
+        and event.error.code == "empty_turn"
+        for event in events
+    )
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in store.messages()
+    )
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_subagent_tool_recovery_works_after_earlier_empty_nudge(
     tmp_path: Path,
 ) -> None:

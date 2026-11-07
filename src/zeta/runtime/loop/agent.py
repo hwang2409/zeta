@@ -133,6 +133,8 @@ def _sanitize_account_message(message: Message) -> Message:
         metadata=message.metadata,
     )
 TaskResult = TypeVar("TaskResult")
+
+
 @dataclass(frozen=True, slots=True)
 class _ToollessTransition:
     continue_turn: bool
@@ -140,6 +142,8 @@ class _ToollessTransition:
     nudge_turn_pending: bool
     recovery_state: EmptyTurnRecoveryState
     error: ErrorInfo | None = None
+
+
 class AgentLoop(
     BackendOwnerMixin,
     TurnPersistenceMixin,
@@ -667,7 +671,8 @@ class AgentLoop(
         return self._finalize_tool_results([tool_call], [None])[0]
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
-    async def _toolless_transition(        self,
+    async def _toolless_transition(
+        self,
         step_delivery: StepDeliveryFlow,
         assistant_message: Message,
         *,
@@ -688,10 +693,11 @@ class AgentLoop(
                 nudge_count=recovery_state.nudge_count,
             )
         )
+        consume_pending = step_delivery.has_pending_edge and not notification_turn
         error = empty_turn_recovery_error(
             assistant_message,
             notification_turn=notification_turn,
-            consuming_notifications=iteration_consuming_notifications,
+            consuming_notifications=consume_pending,
             should_nudge=should_nudge,
             recovery_state=recovery_state,
         )
@@ -700,7 +706,6 @@ class AgentLoop(
             await self._append_turn_message(build_nudge_message())
         elif not step_delivery.has_pending_edge and self.agent_instance_id is None:
             await step_delivery.admit_terminal("foreground_end")
-        consume_pending = step_delivery.has_pending_edge and not notification_turn
         if should_nudge:
             recovery_state.nudge_count += 1
             recovery_state.nudge_episode = recovery_state.tool_result_episode
