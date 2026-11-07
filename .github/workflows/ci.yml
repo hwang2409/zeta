@@ -112,9 +112,16 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -u
+          body_file=""
+          cleanup() { [ -z "$body_file" ] || rm -f "$body_file"; }
+          trap cleanup EXIT
           if [ "$EVENT_NAME" = pull_request ]; then
+            body_file=$(mktemp)
+            printf '%s' "$PR_BODY" > "$body_file"
             base="$BASE_SHA"
             head="$HEAD_SHA"
             commits=$(git rev-list --merges "$base..$head")
@@ -123,13 +130,24 @@ jobs:
             fi
           else
             commits="$(git rev-parse HEAD)"
+            subject=$(git log -1 --format=%s)
+            pr_number=$(printf '%s\n' "$subject" | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p')
+            if [ -n "$pr_number" ] && body_file=$(mktemp) && gh pr view "$pr_number" --json body -q .body > "$body_file"; then
+              :
+            else
+              [ -z "$body_file" ] || rm -f "$body_file"
+              body_file=""
+              echo "::notice title=merge resolution::PR explanations were not loaded"
+            fi
           fi
           commits=$(printf '%s\n' "$commits" | sed '/^$/d' | sort -u)
           failed=0
           for commit in $commits; do
             echo "checking merge resolution: $commit"
+            args=("$commit")
+            [ -z "$body_file" ] || args+=(--pr-body-file "$body_file")
             set +e
-            output=$(python scripts/check_merge_resolution.py "$commit" 2>&1)
+            output=$(python scripts/check_merge_resolution.py "${args[@]}" 2>&1)
             status=$?
             set -e
             printf '%s\n' "$output"

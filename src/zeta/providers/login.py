@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 from ..accounts import AccountId
 from ..core.login_flow import LoginProvider
+from ..oauth import OAuthTokens, build_pkce_parameters
 from .anthropic import (
     DEFAULT_REDIRECT_URI as ANTHROPIC_REDIRECT_URI,
 )
@@ -15,7 +16,6 @@ from .anthropic import (
     exchange_authorization_code as exchange_anthropic_authorization_code,
 )
 from .anthropic_errors import AnthropicAuthError, AnthropicHTTPError
-from .auth import OAuthTokens, build_pkce_parameters
 from .codex import (
     DEFAULT_CODEX_REDIRECT_URI,
     CodexAuthError,

@@ -181,6 +181,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "edit",
         _edit,
+        binding="shared",
         approval_subject="path",
         description=(
             "Replace one unique UTF-8 string, or several non-overlapping unique "

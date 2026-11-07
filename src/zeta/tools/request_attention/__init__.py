@@ -48,6 +48,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "request_attention",
         _request_attention,
+        binding="shared",
         description=(
             "Use once per topic to put important user attention in the inbox, then continue work. "
             "Set kind to decision only when the user must choose; include options and a recommendation when useful. "

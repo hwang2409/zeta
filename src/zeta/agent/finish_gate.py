@@ -17,7 +17,7 @@ from ..protocol.types import (
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
-FinishGateOutcome = Literal["completed", "handed_off"]
+FinishGateOutcome = Literal["completed", "handed_off", "task_safety_expired"]
 POST_CAP_CAUSAL_TURNS = 3
 ConsumeEvents = Callable[
     [AsyncIterator[StreamEvent], "FinishGateControl | None"], Awaitable[None]
@@ -175,6 +175,7 @@ class FinishGateState:
     """Own finish-gate deadlines and turn control for one complete child run."""
 
     child_deadline: float | None = None
+    task_deadline: float | None = None
     control: FinishGateControl | None = None
     task_outlived_child_bound: bool = False
     turns_exhausted_with_task: bool = False
@@ -187,6 +188,7 @@ class FinishGateState:
         owner = child_loop._background_owner
         started = asyncio.get_running_loop().time()
         self.child_deadline = started + owner.finish_gate_timeout
+        self.task_deadline = started + owner.finish_gate_task_timeout
         self.control = FinishGateControl(owner.finish_gate_max_turns)
 
     def owned_children(self, child_loop: AgentLoop) -> tuple[tuple[str, str], ...]:
@@ -216,6 +218,10 @@ class FinishGateState:
         task_running_at_entry = bool(self.owned_tasks(child_loop))
         task_start_generation = task_registry.task_start_generation
         deadline = loop.time() + owner.finish_gate_timeout
+        if self.task_outlived_child_bound:
+            deadline = self._task_deadline()
+        elif task_running_at_entry:
+            deadline = min(deadline, self._task_deadline())
         registry = owner.causal_episodes
         token = registry.enter(episode)
         try:
@@ -236,7 +242,10 @@ class FinishGateState:
                 task_running_at_entry
                 or task_registry.task_start_generation != task_start_generation
             )
-            return self._model_timeout_result(task_existed=task_existed)
+            return self._model_timeout_result(
+                task_existed=task_existed,
+                task_running=task_registry.running_count > 0,
+            )
         finally:
             registry.leave(token)
         task_existed = (
@@ -245,7 +254,11 @@ class FinishGateState:
         )
         return self._model_turn_result(task_existed=task_existed)
 
-    def _model_timeout_result(self, *, task_existed: bool) -> FinishGateResult | None:
+    def _model_timeout_result(
+        self, *, task_existed: bool, task_running: bool
+    ) -> FinishGateResult | None:
+        if task_running and asyncio.get_running_loop().time() >= self._task_deadline():
+            return _task_safety_expired()
         if task_existed:
             return None
         self.automatic_turns_exhausted = True
@@ -263,51 +276,22 @@ class FinishGateState:
         return None
 
     async def wait_transition(
-        self,
-        child_loop: AgentLoop,
-        *,
-        tasks_running: bool,
-        task_generation: int | None = None,
+        self, child_loop: AgentLoop, *, tasks_running: bool
     ) -> FinishGateResult | None:
         loop = asyncio.get_running_loop()
-        deadline = None if tasks_running else self._child_deadline()
-        if deadline is not None and loop.time() >= deadline:
+        deadline = self._task_deadline() if tasks_running else self._child_deadline()
+        if loop.time() >= deadline:
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
                 await flow.admit_terminal("finish_gate_timeout")
             ).pending:
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
-        async def wait_change() -> None:
-            conversation = asyncio.create_task(
-                child_loop._background_owner.conversation_channel.wait(
+        try:
+            async with asyncio.timeout_at(deadline):
+                await child_loop._background_owner.conversation_channel.wait(
                     child_loop.agent_instance_id or ""
                 )
-            )
-            if task_generation is None:
-                await conversation
-                return
-            task_change = asyncio.create_task(
-                child_loop.tool_registry.background_tasks.task_changes.wait(
-                    task_generation
-                )
-            )
-            try:
-                await asyncio.wait(
-                    (conversation, task_change), return_when=asyncio.FIRST_COMPLETED
-                )
-            finally:
-                for wait in (conversation, task_change):
-                    if not wait.done():
-                        wait.cancel()
-                await asyncio.gather(conversation, task_change, return_exceptions=True)
-
-        try:
-            if deadline is None:
-                await wait_change()
-            else:
-                async with asyncio.timeout_at(deadline):
-                    await wait_change()
         except TimeoutError:
             flow = getattr(child_loop, "step_delivery", None)
             if flow is not None and (
@@ -322,6 +306,8 @@ class FinishGateState:
     def _wait_timeout_result(
         self, child_loop: AgentLoop, *, tasks_running: bool
     ) -> FinishGateResult:
+        if tasks_running and self.owned_tasks(child_loop):
+            return _task_safety_expired()
         return FinishGateResult("completed")
 
     def should_wait_without_model(self, tasks_running: bool) -> bool:
@@ -345,6 +331,10 @@ class FinishGateState:
         assert self.child_deadline is not None
         return self.child_deadline
 
+    def _task_deadline(self) -> float:
+        assert self.task_deadline is not None
+        return self.task_deadline
+
 
 async def await_owned_work(
     child_loop: AgentLoop, state: FinishGateState | None = None
@@ -354,16 +344,11 @@ async def await_owned_work(
     gate = state or FinishGateState()
     gate.start(child_loop)
     while True:
-        task_changes = child_loop.tool_registry.background_tasks.task_changes
-        task_generation = task_changes.generation
         children = gate.owned_children(child_loop)
         tasks = gate.owned_tasks(child_loop)
         if not children and not tasks:
             return
-        if tasks:
-            await task_changes.wait(task_generation)
-            continue
-        deadline = gate._child_deadline()
+        deadline = gate._task_deadline() if tasks else gate._child_deadline()
         if asyncio.get_running_loop().time() >= deadline:
             return
         try:
@@ -437,22 +422,9 @@ async def _wait_for_finish(
     consume_events: ConsumeEvents,
     failed: Callable[[], bool],
 ) -> FinishGateResult:
-    waited_task_generation: int | None = None
     while not failed():
-        task_generation = (
-            child_loop.tool_registry.background_tasks.task_changes.generation
-        )
         children = state.owned_children(child_loop)
         tasks = state.owned_tasks(child_loop)
-        if tasks and waited_task_generation is None:
-            waited_task_generation = task_generation
-        elif not tasks and waited_task_generation == task_generation:
-            await child_loop.tool_registry.background_tasks.task_changes.wait(
-                task_generation
-            )
-            continue
-        elif not tasks:
-            waited_task_generation = None
         state.note_task_outlived_child_bound(bool(tasks))
         state.begin_post_task_turns(bool(tasks))
         pending_notification = child_loop.notification_system_message() is not None
@@ -470,9 +442,7 @@ async def _wait_for_finish(
         if terminal is not None:
             return terminal
         if state.should_wait_without_model(bool(tasks)):
-            result = await state.wait_transition(
-                child_loop, tasks_running=True, task_generation=task_generation
-            )
+            result = await state.wait_transition(child_loop, tasks_running=True)
         elif pending_notification or delivery_pending:
             result = await _handle_pending_notification(
                 state,
@@ -483,9 +453,7 @@ async def _wait_for_finish(
             )
         else:
             result = await state.wait_transition(
-                child_loop,
-                tasks_running=bool(tasks),
-                task_generation=task_generation if tasks else None,
+                child_loop, tasks_running=bool(tasks)
             )
         if result is not None:
             return result
@@ -540,6 +508,7 @@ def _register_handoff(
     child_loop.tool_registry.register(
         "agent_handoff",
         handoff,
+        binding="loop",
         description=(
             "Hand off running background work to the parent. Sub-agents "
             "continue and report to the parent. Background tasks cannot be "
@@ -556,4 +525,10 @@ def _register_handoff(
             "additionalProperties": False,
         },
         requires_approval=False,
+    )
+
+
+def _task_safety_expired() -> FinishGateResult:
+    return FinishGateResult(
+        "task_safety_expired", "finish-gate task safety bound expired"
     )

@@ -5,7 +5,7 @@ from urllib.parse import quote
 import pytest
 
 import zeta.oauth as oauth_module
-from zeta.providers.auth import _redact_multipart, error_body_excerpt
+from zeta.oauth import _redact_multipart, error_body_excerpt
 
 SENSITIVE_NAMES = (
     "authorization",
