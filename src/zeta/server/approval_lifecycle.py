@@ -1043,16 +1043,14 @@ class ApprovalLifecycle:
                     if terminal is not None:
                         record = self._change(record, terminal_result=terminal_result, terminal=None)
                 else:
-                    await self._publish(
+                    admission = self._admit(
                         event_contract.STREAM_EVENT_WIRE_EVENTS[
                             StreamEventType.TOOL_APPROVAL_END
                         ],
-                        self._session_id(),
+                        session_id=self._session_id(),
                         **payload,
                     )
-                    record = self._change(
-                        record, live_end=Admission("admitted")
-                    )
+                    record = self._change(record, live_end=admission)
                     self._release_gate(record, resolution=resolution)
             elif isinstance(record.target.key, tuple):
                 self._release_terminal(record)
