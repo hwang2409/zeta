@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -11,9 +10,8 @@ from ..core.checkpoints import _now
 from ..core.store import ConversationStore
 from ..protocol.types import MessageOrigin
 from ..tools.agent import agent_stats
-from .explicit_finish import IdleNudgeLifecycle, TaskSafetyLifecycle
+from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
-from .pending_delivery import PromptInput
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -135,20 +133,6 @@ async def consume_run(
         wait=kwargs.pop("idle_wait", None),
         nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
     )
-    task_safety = TaskSafetyLifecycle(
-        child_loop._background_owner.finish_gate_task_timeout,
-        clock=kwargs.pop("task_safety_clock", None) or time.monotonic,
-        wait=kwargs.pop("task_safety_wait", None) or None,
-    )
-
-    async def publish_task_safety_notice(text: str) -> None:
-        instance_id = child_loop.agent_instance_id
-        if instance_id is None:
-            return
-        await child_loop._background_owner.conversation_channel.produce_to(
-            instance_id,
-            PromptInput(text, MessageOrigin.AGENT_PROMPT, None),
-        )
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):
@@ -169,17 +153,11 @@ async def consume_run(
     delivered_follow_up = False
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
-    kwargs["finish_gate_state"] = FinishGateState(
-        owner_acted=task_safety.owner_acted
-    )
+    kwargs.setdefault("finish_gate_state", FinishGateState())
 
+    safety_started: float | None = None
     idle_published = False
-    safety_task = asyncio.create_task(
-        task_safety.run(
-            child_loop.tool_registry.background_tasks,
-            publish_task_safety_notice,
-        )
-    )
+    safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
         result = await consume_child(
             child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
@@ -191,7 +169,8 @@ async def consume_run(
                 and isinstance(structured, dict)
                 and structured.get("status") == "running"
             )
-            task_safety.owner_acted()
+            if idle and safety_started is None:
+                safety_started = asyncio.get_running_loop().time()
             flow = await child_loop._ensure_step_delivery()
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
@@ -249,6 +228,21 @@ async def consume_run(
                             text=text,
                         )
                     idle_published = True
+                running_tasks = any(
+                    task.running
+                    for task in child_loop.tool_registry.background_tasks.snapshot()
+                )
+                if running_tasks and safety_task is None:
+                    elapsed = asyncio.get_running_loop().time() - safety_started
+                    timeout = max(
+                        0.0,
+                        child_loop._background_owner.finish_gate_task_timeout - elapsed,
+                    )
+                    safety_task = asyncio.create_task(
+                        kill_tasks_after_deadline(
+                            child_loop.tool_registry.background_tasks, timeout
+                        )
+                    )
                 action = await idle_lifecycle.wait_for_idle_action(
                     lambda: child_loop._background_owner.conversation_channel.wait(
                         child_loop.agent_instance_id
@@ -294,9 +288,10 @@ async def consume_run(
         )
         return terminal_result
     finally:
-        if not safety_task.done():
+        if safety_task is not None and not safety_task.done():
             safety_task.cancel()
-        await asyncio.gather(safety_task, return_exceptions=True)
+        if safety_task is not None:
+            await asyncio.gather(safety_task, return_exceptions=True)
         if terminal_result is not None and callable(final_finish_lifecycle):
             content = terminal_result.get("content")
             text = (

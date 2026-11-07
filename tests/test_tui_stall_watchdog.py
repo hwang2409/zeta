@@ -57,10 +57,11 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     loop_blocked = threading.Event()
     release_loop: queue.SimpleQueue[None] = queue.SimpleQueue()
     record_written = threading.Event()
+    clock_values = iter((0.0, 0.05, 0.05))
 
     def before_probe() -> None:
         probe_ready.set()
-        if not release_probe.wait(timeout=5):
+        if not release_probe.wait(timeout=10):
             raise TimeoutError("probe release was not signaled")
 
     def after_sample() -> None:
@@ -72,7 +73,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         # frame; stack trimming keeps only Zeta, stdlib and innermost frames.
         loop_blocked.set()
         try:
-            release_loop.get(timeout=5)
+            release_loop.get(timeout=10)
         except queue.Empty:
             raise TimeoutError("loop release was not signaled") from None
 
@@ -82,6 +83,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         probe_interval=0.01,
         stall_threshold=0.05,
         sample_interval=0.02,
+        clock=lambda: next(clock_values),
         utc_now=lambda: datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
         before_probe=before_probe,
         after_sample=after_sample,
@@ -92,22 +94,24 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
         append(record)
         record_written.set()
 
+    # test-contract: seam no public watchdog-record publication event exists
     watchdog._append_record = append_and_signal  # type: ignore[method-assign]
     watchdog.start(asyncio.get_running_loop())
     try:
-        assert await asyncio.to_thread(probe_ready.wait, 5)
+        assert await asyncio.to_thread(probe_ready.wait, 10)
         asyncio.get_running_loop().call_soon(block_loop)
         release_probe.set()
-        assert await asyncio.to_thread(record_written.wait, 5)
+        assert await asyncio.to_thread(record_written.wait, 10)
     finally:
         release_probe.set()
         release_loop.put(None)
         await watchdog.close()
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
+    # test-contract: durability one stall episode emits one diagnostic record
     assert len(records) == 1
     assert records[0]["start_time"] == "2026-01-02T03:04:05Z"
-    assert records[0]["duration_ms"] >= 50
+    assert records[0]["duration_ms"] == 50
     assert records[0]["session_id"] == "session-123"
     assert any(
         frame["function"] == "block_loop"

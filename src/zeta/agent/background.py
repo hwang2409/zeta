@@ -20,8 +20,8 @@ from ..protocol.types import (
     ToolCall,
     ToolResult,
 )
-from .adoption import adopt_agent_children
 from .conversation_channel import ConversationChannel, recover_orphaned_questions
+from .finish_gate import CausalEpisodeRegistry, FinishGateState
 from .pending_delivery import NotificationInput
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
@@ -115,6 +115,7 @@ class BackgroundAgentOwner:
         self._parent_ids: dict[str, str | None] = {}
         self._original_parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
+        self.causal_episodes = CausalEpisodeRegistry()
         self.conversation_channel = ConversationChannel(self, notification_store)
 
     def _notify_frontend(self) -> None:
@@ -238,6 +239,9 @@ class BackgroundAgentOwner:
     def original_parent_instance_id(self, instance_id: str) -> str | None:
         return self._original_parent_ids.get(instance_id)
 
+    def description(self, instance_id: str) -> str:
+        return self._descriptions.get(instance_id, "background task")
+
     def conversation_stores(self) -> tuple[ConversationStore, ...]:
         stores = [self.notification_store, *self._stores, *self._parent_stores.values()]
         return tuple(dict.fromkeys(stores))
@@ -320,6 +324,7 @@ class BackgroundAgentOwner:
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
         self._cancel_confirmations.pop(instance_id, None)
+        self.causal_episodes.release_member(instance_id)
 
     def adopt(
         self,
@@ -1004,26 +1009,26 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], Awaitable[None] | None],
-    close_child: Callable[[str], Awaitable[tuple[str, ...]]],
+    close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     background_owner: BackgroundAgentOwner,
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     max_receipt_bytes: int | None = None,
     explicit_finish: bool = False,
+    child_loop: Any | None = None,
+    finish_gate_state: FinishGateState | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
-
     status = "completed"
     notification_text = ""
+    result: object = None
     explicit_finish_report = (
         await TerminalTransitionFence(child_store).recover()
         if explicit_finish
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
-    result: dict[str, object] = {}
-    close_cause = "background child completion cleanup"
     try:
         try:
             result = await child_task
@@ -1071,14 +1076,23 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        # Closing the child after its final turn terminates any task it still
-        # owns and returns task ids for the parent receipt.
-        close_cause = (
-            "background child cancellation cleanup"
-            if status == "canceled"
-            else "background child completion cleanup"
-        )
-        killed_tasks = list(await close_child(close_cause) or ())
+        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
+        if (
+            child_loop is not None
+            and status != "canceled"
+            and explicit_finish_report is None
+            and not (
+                finish_gate_state is not None
+                and finish_gate_state.terminal_admitted
+            )
+        ):
+            from .finish_gate import await_owned_work
+
+            await await_owned_work(child_loop, finish_gate_state)
+        # Admission has ended. Closing now can only kill tasks whose safety
+        # deadline expired; direct children remain live for durable transfer.
+        killed_tasks = list(await close_child() or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
@@ -1086,11 +1100,8 @@ async def finish_background_child(
         killed_task_ids_truncated = len(killed_tasks) > len(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
-        close_event = (
-            "child cancellation" if status == "canceled" else "child completion"
-        )
         killed_task_notice = (
-            f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
+            "\nbackground tasks killed on child completion: "
             + ", ".join(
                 f"{task_id} (background command; archive: {child_path}/background-output.archive)"
                 for task_id in killed_tasks
@@ -1103,37 +1114,14 @@ async def finish_background_child(
             "canceled": "canceled",
             "error": "failed",
         }[status]
-        if lifecycle_state == "canceled":
-            child_store.mark_agent_canceled(tool_call.id)
-        effective_parent_store, effective_parent_id = background_owner.parent_edge(
-            child_instance_id, parent_store, agent_instance_id
-        )
-        await background_owner.conversation_channel.close_questions(
-            child_instance_id,
-            reason="canceled" if status == "canceled" else "finished",
-        )
-        if status != "canceled":
-            adopt_agent_children(
-                child_store,
-                effective_parent_store,
-                background_owner=background_owner,
-                parent_instance_id=effective_parent_id,
-            )
-            await background_owner.conversation_channel.reroute_questions_from(
-                child_store
-            )
-            child_store.finish_agent_parent()
-        terminal_stats = agent_stats(
-            child_store.agent_lifecycle(),
-            status=status,
-            turns_used=child_turns(),
-        )
+        effective_parent_store, effective_parent_id = background_owner.parent_edge(child_instance_id, parent_store, agent_instance_id)
+        terminal_stats = agent_stats({**(child_store.agent_lifecycle() or {}), "turns_used": turns_used}, status=status)
         result_text = notification_text or "background child completed"
         if explicit_finish_report is not None:
             explicit_terminal = _background_terminal(
                 lifecycle=child_store.agent_lifecycle(),
                 report=explicit_finish_report,
-                turns_used=child_turns(),
+                turns_used=turns_used,
                 tool_call_id=tool_call.id,
                 fallback_text=result_text,
                 structured_content=explicit_finish_content,
@@ -1191,38 +1179,55 @@ async def finish_background_child(
             for key in ("head_sha", "verdict"):
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
-        # Always replace the raw lifecycle result with the same bounded final
-        # receipt delivered to notification/recovery consumers. The store
-        # preserves the already-recorded terminal status and timestamp.
-        child_store.finish_agent_lifecycle(
-            lifecycle_state,
-            final_result=notification_text,
-            turns_used=child_turns(),
-            killed_task_ids=killed_task_metadata or None,
-            killed_task_count=killed_task_count or None,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-        )
-        child_store.update_agent_lifecycle_result(
-            notification_text,
-            turns_used=child_turns(),
-            killed_task_ids=killed_task_metadata or None,
-            killed_task_count=killed_task_count or None,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            canonical_receipt=True,
-        )
-        notification = await background_owner.conversation_channel.publish_completion(
-            child_instance_id=child_instance_id,
-            marker_key=marker_key or tool_call.id,
-            child_session_path=child_path,
-            description=description,
-            status=status,
-            text=notification_text,
-            stats=terminal_stats,
-            killed_task_ids=killed_task_metadata or None,
-            killed_task_count=killed_task_count or None,
-            killed_task_ids_truncated=killed_task_ids_truncated,
-            report=notification_report,
-        )
+
+        async def commit_adopt_publish() -> ConversationEntry:
+            transferred = await child_store.finalize_background_agent(
+                parent_store=effective_parent_store,
+                terminal_state=lifecycle_state,
+                final_result=notification_text,
+                turns_used=turns_used,
+                killed_task_ids=killed_task_metadata or None,
+                killed_task_count=killed_task_count or None,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+                canceled_tool_call_id=(
+                    tool_call.id if lifecycle_state == "canceled" else None
+                ),
+            )
+            for transferred_id in transferred:
+                background_owner.adopt(transferred_id, effective_parent_store, effective_parent_id)
+            await background_owner.conversation_channel.close_questions(
+                child_instance_id,
+                reason="canceled" if status == "canceled" else "finished",
+            )
+            if status != "canceled":
+                await background_owner.conversation_channel.reroute_questions_from(
+                    child_store
+                )
+            return await background_owner.conversation_channel.publish_completion(
+                child_instance_id=child_instance_id,
+                marker_key=marker_key or tool_call.id,
+                child_session_path=child_path,
+                description=description,
+                status=status,
+                text=notification_text,
+                stats=terminal_stats,
+                killed_task_ids=killed_task_metadata or None,
+                killed_task_count=killed_task_count or None,
+                killed_task_ids_truncated=killed_task_ids_truncated,
+                report=notification_report,
+            )
+
+        transition = asyncio.create_task(commit_adopt_publish())
+        deferred_cancel = False
+        while not transition.done():
+            try:
+                await asyncio.shield(transition)
+            except asyncio.CancelledError:
+                deferred_cancel = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        notification = transition.result()
         event_data: dict[str, object] = {"notification_id": notification.id}
         if agent_instance_id is not None:
             event_data["agent_instance_id"] = agent_instance_id
@@ -1234,9 +1239,11 @@ async def finish_background_child(
                 data=event_data,
             )
         )
+        if deferred_cancel:
+            raise asyncio.CancelledError
     finally:
         try:
-            await close_child(close_cause)
+            await close_child()
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.
             await asyncio.sleep(0)
