@@ -2008,11 +2008,22 @@ async def test_status_surfaces_transcript_index_failure(
             return "disk full; pending changes will retry"
 
         monkeypatch.setattr(loop, "transcript_index_failure", failure, raising=False)
-        status = (await _request(reader, writer, 3, "status"))[-1]["result"]
+        status = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "status",
+                {"include_connection_setup_counts": True},
+            )
+        )[-1]["result"]
 
         assert requested == [server.runtime.session_id]
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
+        )
+        assert status["connection_setup_counts"] == list(
+            loop.connection_setup_counts()
         )
         assert status["max_agent_depth"] == 3
     finally:

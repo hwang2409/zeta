@@ -146,7 +146,8 @@ async def test_provider_runtime_state_stays_in_zeta_home(
     ollama, _ = await asyncio.to_thread(build_backend, "ollama", None)
     claude, _ = await asyncio.to_thread(build_backend, "claude", None)
     codex, _ = await asyncio.to_thread(build_backend, "codex", None)
-    claude.client, codex.client = clients
+    claude._lease.client, codex._lease.client = clients
+    claude._lease.owned = codex._lease.owned = False
 
     assert ollama.base_url == "http://runtime.example"
     assert claude.token_store.path.is_relative_to(account_home)

@@ -3806,7 +3806,7 @@ def _finish_gate_with_running_task(
 
 @pytest.mark.asyncio
 @_finish_gate_hang_guard
-async def test_finish_gate_ollama_close_obeys_task_deadline(
+async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
@@ -3879,8 +3879,8 @@ async def test_finish_gate_ollama_close_obeys_task_deadline(
     assert result is not None
     assert result.outcome == "task_safety_expired"
     assert clients and clients[0].stream_context.close_cancelled.is_set()
-    assert clients[0].close_started.is_set()
-    assert clients[0].close_cancelled.is_set()
+    assert not clients[0].close_started.is_set()
+    assert not clients[0].close_cancelled.is_set()
     store.close()
 
 

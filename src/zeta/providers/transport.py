@@ -294,48 +294,77 @@ class SSEEventAccumulator[ErrorT: RuntimeError]:
 
 
 class HTTPClientLease:
-    """Provide one configured-or-owned client and close owned refresh clients."""
+    """Own one completion client and drain active borrows before closing it."""
 
-    __slots__ = ("client", "owned")
+    __slots__ = (
+        "_active_borrows",
+        "_background_reporter_registered",
+        "_close_task",
+        "_drained",
+        "_retired",
+        "client",
+        "connection_setup_count",
+        "owned",
+    )
 
-    def __init__(self, configured: httpx.AsyncClient | None) -> None:
+    def __init__(
+        self, configured: httpx.AsyncClient | None, *, timeout: object = None
+    ) -> None:
         self.owned = configured is None
-        self.client = configured or httpx.AsyncClient(timeout=None)
+        self.client = configured or httpx.AsyncClient(timeout=timeout)
+        self.connection_setup_count = int(self.owned)
+        self._active_borrows = 0
+        self._background_reporter_registered = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._retired = False
+
+    @contextlib.asynccontextmanager
+    async def borrow(self) -> AsyncIterator[httpx.AsyncClient]:
+        if self._retired:
+            raise RuntimeError("completion backend is retired")
+        self._active_borrows += 1
+        self._drained.clear()
+        try:
+            yield self.client
+        finally:
+            self._active_borrows -= 1
+            if self._active_borrows == 0:
+                self._drained.set()
+
+    def retire(self) -> None:
+        self._retired = True
+
+    async def _close_owned(self) -> None:
+        await self._drained.wait()
+        if self.owned:
+            await self.client.aclose()
+
+    def start_close(self) -> None:
+        self.retire()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_owned())
+
+    async def aclose(
+        self, report_failure: CloseFailureReporter | None = None
+    ) -> None:
+        self.start_close()
+        assert self._close_task is not None
+        task = self._close_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if report_failure is not None and not self._background_reporter_registered:
+                self._background_reporter_registered = True
+                _retain_background_closes((task,), report_failure)
+            raise
 
     async def refresh(
         self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
     ) -> str:
-        primary_exception: BaseException | None = None
-        token = ""
-        try:
-            token = await refresh_token(self.client)
-        except BaseException as exc:
-            primary_exception = exc
-        if self.owned:
-            try:
-                outcome = await close_transport_resources(self.client.aclose())
-            except asyncio.CancelledError as exc:
-                primary_exception = merge_exception(primary_exception, exc)
-            else:
-                for failure in outcome.failures:
-                    if is_control_exception(failure.error):
-                        primary_exception = merge_exception(
-                            primary_exception, failure.error
-                        )
-                    else:
-                        await _report_cleanup_failure(
-                            failure.error,
-                            stage="refresh_client",
-                            index=failure.index,
-                            primary_exception=primary_exception,
-                        )
-        if task_is_cancelling():
-            primary_exception = merge_exception(
-                primary_exception, asyncio.CancelledError()
-            )
-        if primary_exception is not None:
-            raise primary_exception
-        return token
+        async with self.borrow() as client:
+            return await refresh_token(client)
 
 
 async def build_response_error[ErrorT: RuntimeError](

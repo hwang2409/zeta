@@ -153,6 +153,7 @@ class ServerSlashSession:
             ),
             mcp_summary=loop.mcp_summary,
             explicit_finish=loop.explicit_finish,
+            connection_setup_counts=loop.connection_setup_counts(),
             max_agent_depth=loop.max_agent_depth,
             automatic_memory_failure=(
                 loop.memory_reconciler.automatic_memory_status

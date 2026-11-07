@@ -57,8 +57,17 @@ async def _captured_num_ctx(backend: OllamaBackend) -> int:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        backend.client = client
-        [event async for event in backend.complete([], [])]
+        probe = OllamaBackend(
+            model=backend.model,
+            base_url=backend.base_url,
+            client=client,
+            stall_seconds=backend.stall_seconds,
+            stall_retries=backend.stall_retries,
+            diagnostics_path=backend.diagnostics_path,
+            token_budget=backend.token_budget,
+            model_context_window=backend.model_context_window,
+        )
+        [event async for event in probe.complete([], [])]
     return payloads[0]["options"]["num_ctx"]
 
 
@@ -809,10 +818,13 @@ async def test_ollama_retries_connect_error_and_closes_owned_client(
     clients: list[OwnedClient] = []
     monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", OwnedClient)
     monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    backend = OllamaBackend(stall_retries=1)
     with pytest.raises(OllamaError):
-        [event async for event in OllamaBackend(stall_retries=1).complete([], [])]
-    assert len(clients) == 5  # four ordinary transport retries plus the first attempt
-    assert all(client.closed for client in clients)
+        [event async for event in backend.complete([], [])]
+    assert clients == []
+    await backend.aclose()
+    assert len(clients) == 1
+    assert clients[0].closed
 
 
 @pytest.mark.asyncio
@@ -1444,7 +1456,10 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
             except asyncio.CancelledError:
                 pass
             await asyncio.sleep(0)
-        assert clients and clients[0].response.exited and clients[0].closed
+        assert clients and clients[0].response.exited
+        assert not clients[0].closed
+        await backend.aclose()
+        assert clients[0].closed
     finally:
         ollama.httpx.AsyncClient = original
 
@@ -1534,11 +1549,15 @@ async def test_ollama_cancelled_real_transport_does_not_leak_fds(
     try:
         for _ in range(100):
             first_event = asyncio.Event()
+            backend = OllamaBackend(
+                base_url=f"http://127.0.0.1:{port}", stall_seconds=0
+            )
 
-            async def consume(event: asyncio.Event = first_event) -> None:
-                async for _event in OllamaBackend(
-                    base_url=f"http://127.0.0.1:{port}", stall_seconds=0
-                ).complete([], []):
+            async def consume(
+                event: asyncio.Event = first_event,
+                completion_backend: OllamaBackend = backend,
+            ) -> None:
+                async for _event in completion_backend.complete([], []):
                     event.set()
 
             turn = asyncio.create_task(consume())
@@ -1546,6 +1565,7 @@ async def test_ollama_cancelled_real_transport_does_not_leak_fds(
             turn.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await turn
+            await backend.aclose()
         await asyncio.wait_for(all_closed.wait(), timeout=_CLIENT_DEADLINE_SECONDS)
         await asyncio.sleep(0)
         assert not handlers

@@ -3170,7 +3170,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
     tmp_path: Path,
 ) -> None:
     close_started = asyncio.Event()
-    never = asyncio.Event()
+    release = asyncio.Event()
 
     class Response:
         status_code = 200
@@ -3179,7 +3179,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
             for line in SSE.splitlines():
                 yield line
 
-    class Stream:
+    class StreamContext:
         async def __aenter__(self):
             return Response()
 
@@ -3188,23 +3188,37 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
 
     class Client:
         def stream(self, method, url, *, headers, content):
-            return Stream()
+            return StreamContext()
 
         async def aclose(self):
             close_started.set()
-            await never.wait()
+            await asyncio.wait_for(release.wait(), 10)
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    async def consume() -> list[object]:
-        return [event async for event in AnthropicBackend(token_store=store).complete([], [])]
-
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
-        task = asyncio.create_task(consume())
-        await close_started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        backend = AnthropicBackend(token_store=store)
+        closing = None
+        outcome = None
+        close_error = None
+        try:
+            [event async for event in backend.complete([], [])]
+            closing = asyncio.create_task(backend.aclose())
+            await asyncio.wait_for(close_started.wait(), 10)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+        finally:
+            release.set()
+            if closing is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(closing, return_exceptions=True), 10
+                )
+            try:
+                outcome = await asyncio.wait_for(backend.aclose(), 10)
+            except asyncio.CancelledError as error:
+                close_error = error
+        assert close_error is None and outcome is not None and outcome.failures == ()
 
 
 @pytest.mark.asyncio
@@ -3276,16 +3290,16 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
     await cleanup_started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
-        await task
+        await asyncio.wait_for(task, 10)
     assert isinstance(raised.value.__cause__, AnthropicStreamError)
 
 
 @pytest.mark.asyncio
-async def test_client_cleanup_cancellation_wins_over_stream_error(
+async def test_owned_client_close_cancellation_is_separate_from_stream_error(
     tmp_path: Path,
 ) -> None:
     cleanup_started = asyncio.Event()
-    never = asyncio.Event()
+    release = asyncio.Event()
 
     class Response:
         status_code = 200
@@ -3294,7 +3308,7 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
             yield 'data: {"type":"message_delta","delta":"bad"}'
             yield ""
 
-    class Stream:
+    class StreamContext:
         async def __aenter__(self):
             return Response()
 
@@ -3303,23 +3317,38 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
 
     class Client:
         def stream(self, method, url, *, headers, content):
-            return Stream()
+            return StreamContext()
 
         async def aclose(self):
             cleanup_started.set()
-            await never.wait()
+            await asyncio.wait_for(release.wait(), 10)
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
-        task = asyncio.create_task(
-            anext(AnthropicBackend(token_store=store).complete([], []))
-        )
-        await cleanup_started.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError) as raised:
-            await task
-    assert isinstance(raised.value.__cause__, AnthropicStreamError)
+        backend = AnthropicBackend(token_store=store)
+        closing = None
+        outcome = None
+        close_error = None
+        try:
+            with pytest.raises(AnthropicStreamError):
+                [event async for event in backend.complete([], [])]
+            closing = asyncio.create_task(backend.aclose())
+            await asyncio.wait_for(cleanup_started.wait(), 10)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+        finally:
+            release.set()
+            if closing is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(closing, return_exceptions=True), 10
+                )
+            try:
+                outcome = await asyncio.wait_for(backend.aclose(), 10)
+            except asyncio.CancelledError as error:
+                close_error = error
+        assert close_error is None and outcome is not None and outcome.failures == ()
 
 
 @pytest.mark.asyncio
@@ -3360,7 +3389,7 @@ async def test_response_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_client_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -> None:
+async def test_owned_client_close_failure_is_returned(tmp_path: Path) -> None:
     class Response:
         status_code = 200
 
@@ -3368,7 +3397,7 @@ async def test_client_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -> 
             for line in SSE.splitlines():
                 yield line
 
-    class Stream:
+    class StreamContext:
         async def __aenter__(self):
             return Response()
 
@@ -3377,25 +3406,20 @@ async def test_client_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -> 
 
     class Client:
         def stream(self, method, url, *, headers, content):
-            return Stream()
+            return StreamContext()
 
         async def aclose(self):
             raise httpx.TimeoutException("client cleanup secret")
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    diagnostics_path = tmp_path / "diagnostics.jsonl"
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
-        events = [
-            event
-            async for event in AnthropicBackend(
-                token_store=store, diagnostics_path=diagnostics_path
-            ).complete([], [])
-        ]
+        backend = AnthropicBackend(token_store=store)
+        events = [event async for event in backend.complete([], [])]
+        outcome = await backend.aclose()
     assert events[-1].type is StreamEventType.MESSAGE_END
-    contents = diagnostics_path.read_text()
-    assert "client cleanup secret" not in contents
-    assert json.loads(contents)["exception"].endswith("AnthropicHTTPError")
+    assert len(outcome.failures) == 1
+    assert isinstance(outcome.failures[0].error, httpx.TimeoutException)
 
 
 @pytest.mark.asyncio

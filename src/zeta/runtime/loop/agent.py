@@ -84,12 +84,7 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ..backend_state import (
-    PreparedBackendState,
-    apply_backend_state,
-    effective_backend_budget,
-    prepare_backend_state,
-)
+from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
@@ -107,6 +102,7 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
+from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
@@ -149,6 +145,7 @@ class _ToollessTransition:
 
 
 class AgentLoop(
+    BackendOwnerMixin,
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
@@ -204,6 +201,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -376,15 +374,6 @@ class AgentLoop(
             for message in messages
         ]
 
-    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
-        return prepare_backend_state(self, backend)
-
-    def current_backend_state(self) -> PreparedBackendState:
-        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
-
-    def apply_backend_state(self, state: PreparedBackendState) -> None:
-        apply_backend_state(self, state)
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
         token_budget = effective_backend_budget(self.backend, token_budget)
@@ -555,6 +544,7 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
+            await self.close_backend_owners(stage="runtime_close")
             killed = await self._close_delivery_resources()
         return killed
 
