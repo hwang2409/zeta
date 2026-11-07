@@ -145,17 +145,21 @@ def _production_limits() -> dict[str, int]:
     }
 
 
-def _floor_metrics(normalized: list[dict[str, Any]], limits: dict[str, int]) -> list[dict[str, int]]:
+def _floor_metrics(rows: list[dict[str, Any]], limits: dict[str, int], source: str, violations: list[str] | None = None) -> list[dict[str, int]]:
     from zeta.context_accounting import message_token_count
     from zeta.context_eviction._fact_floor import render_fact_floor, validate_fact_floor
 
     metrics: list[dict[str, int]] = []
-    for row in normalized:
+    for row in rows:
         floor = row.get("data", {}).get("fact_floor")
         if floor is None:
             continue
         if not validate_fact_floor(floor):
-            raise RuntimeError("retained-floor bound check failed: invalid floor")
+            detail = f"seq={row.get('seq')} invalid"
+            if violations is not None:
+                violations.append(detail)
+                continue
+            raise RuntimeError(f"retained-floor bound check failed ({source}): {detail}")
         assert isinstance(floor, dict)
         oldest = floor["oldest"]
         newest = floor["newest"]
@@ -164,16 +168,27 @@ def _floor_metrics(normalized: list[dict[str, Any]], limits: dict[str, int]) -> 
         tokens = message_token_count(rendered) if rendered else 0
         metric = {"oldest": len(oldest), "newest": len(newest), "chars": chars, "tokens": tokens}
         if any(metric[key] > limits[key] for key in metric):
-            raise RuntimeError(
-                "retained-floor bound check failed: "
-                f"oldest={metric['oldest']} newest={metric['newest']} "
-                f"chars={metric['chars']} tokens={metric['tokens']}"
-            )
+            detail = (f"seq={row.get('seq')} oldest={metric['oldest']} newest={metric['newest']} "
+                      f"chars={metric['chars']} tokens={metric['tokens']}")
+            if violations is not None:
+                violations.append(detail)
+            else:
+                raise RuntimeError(f"retained-floor bound check failed ({source}): {detail}")
         metrics.append(metric)
     return metrics
 
 
-async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int, provider: str) -> list[dict[str, Any]]:
+def _install_summary_guard(assembler: Any) -> None:
+    async def forbidden(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("eviction replay reached model-summary fallback")
+    assembler.compaction_policy.summarize_chunked = forbidden  # type: ignore[method-assign]
+
+
+def _collect_artifacts(context: Any, readback: Any, normalized: list[dict[str, Any]], trace: dict[str, Any], provider: str) -> dict[str, Any]:
+    return {"context.json": [message.to_dict() for message in context.messages], "wire.json": _wire(list(context.messages), provider), "appends.json": normalized, "readback.json": [message.to_dict() for message in readback.messages], "scalar.json": trace}
+
+
+async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int, provider: str, limits: dict[str, int] | None = None) -> list[dict[str, Any]]:
     from zeta.core.context import ContextAssembler
     from zeta.core.store import ConversationStore
     store = await asyncio.to_thread(ConversationStore, session_dir.parent, session_id=session_dir.name, _collect_persisted_appends=True)
@@ -181,14 +196,12 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
         meta = json.loads((session_dir / "meta.json").read_text()) if (session_dir / "meta.json").exists() else {}
         assembler = ContextAssembler(store, token_budget=budget, retained_tail=tail, system_prompt=meta.get("system_prompt", ""), backend=None)
         assert assembler.backend is None
-        # A deterministic gate must fail loudly if production reaches model summary.
-        async def forbidden(*args: Any, **kwargs: Any) -> str:
-            raise RuntimeError("eviction replay reached model-summary fallback")
-        assembler.compaction_policy.summarize_chunked = forbidden  # type: ignore[method-assign]
-        limits = _production_limits()
+        _install_summary_guard(assembler)
+        limits = limits or _production_limits()
         records: list[dict[str, Any]] = []
         previous_count = len(store.replay())
         stable = 0
+        previous_context_digest: str | None = None
         normalized_ids: dict[str, str] = {}
         next_normalized_id = [0]
         for invocation in range(1, 9):
@@ -203,26 +216,32 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
             readback_store = await asyncio.to_thread(ConversationStore, session_dir.parent, session_id=store.session_id, _read_only=True, _must_exist=True)
             try:
                 readback_assembler = ContextAssembler(readback_store, token_budget=budget, retained_tail=tail, system_prompt=meta.get("system_prompt", ""), backend=None)
+                _install_summary_guard(readback_assembler)
                 readback = await readback_assembler.assemble_context(backend=None)
             finally:
                 readback_store.close()
-            context_data = [message.to_dict() for message in context.messages]
-            readback_data = [message.to_dict() for message in readback.messages]
-            floor_metrics = _floor_metrics(normalized, limits)
-            trace = {"invocation": invocation, "appended": len(normalized), "token_count": context.token_count, "compacted": context.compacted, "marker_count": store.compaction_marker_count(), "retained_floor": (assembler.last_compaction_telemetry or {}).get("retained_floor"), "floor_metrics": floor_metrics}
-            artifacts = {"context.json": context_data, "wire.json": _wire(list(context.messages), provider), "appends.json": normalized, "readback.json": readback_data, "scalar.json": trace}
+            stored_floor_violations: list[str] = []
+            persisted_rows = [entry.to_dict() for entry in after_entries]
+            floor_metrics = _floor_metrics(persisted_rows, limits, "persisted", stored_floor_violations)
+            appended_floor_metrics = _floor_metrics(normalized, limits, "appended")
+            trace = {"invocation": invocation, "appended": len(normalized), "token_count": context.token_count, "compacted": context.compacted, "marker_count": store.compaction_marker_count(), "retained_floor": (assembler.last_compaction_telemetry or {}).get("retained_floor"), "floor_metrics": floor_metrics, "appended_floor_metrics": appended_floor_metrics, "stored_floor_violations": stored_floor_violations}
+            artifacts = _collect_artifacts(context, readback, normalized, trace, provider)
             invocation_dir = artifact_dir / str(invocation)
             invocation_dir.mkdir(parents=True)
             for name, value in artifacts.items():
                 (invocation_dir / name).write_bytes(_json(value))
             records.append({"invocation": invocation, "appended": len(normalized), "digests": {name: _digest(value) for name, value in artifacts.items()}, "trace": trace})
-            if not appended and len(after_entries) == previous_count:
+            context_digest = _digest(artifacts["context.json"])
+            if not appended and len(after_entries) == previous_count and context_digest == previous_context_digest:
                 stable += 1
             else:
                 stable = 0
+            previous_context_digest = context_digest
             previous_count = len(after_entries)
             if stable >= 2:
                 break
+        if stable < 2:
+            raise RuntimeError("eviction replay did not stabilize within 8 invocations")
         return records
     finally:
         store.close()
@@ -248,7 +267,7 @@ def run(args: argparse.Namespace) -> int:
     artifact_dir = Path(args.artifact_dir or tempfile.mkdtemp(prefix="eviction-artifacts-"))
     started = time.monotonic()
     try:
-        records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider), 600))
+        records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), 600))
         import zeta
         record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "limits": _production_limits(), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3), "artifact_dir": str(artifact_dir)}
         print(json.dumps(record, sort_keys=True, separators=(",", ":")))
@@ -257,13 +276,15 @@ def run(args: argparse.Namespace) -> int:
         temporary.cleanup()
 
 
-def _run_side(session: str, label: str, worktree: str, fixture: bool) -> dict[str, Any] | None:
+def _run_side(session: str, label: str, worktree: str, fixture: bool, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
     artifact_dir = Path(tempfile.mkdtemp(prefix=f"eviction-{label}-"))
     runner = Path(worktree) / "scripts/eviction_replay_gate.py"
     if not runner.exists():
         runner = Path(__file__).resolve()
     command = [sys.executable, str(runner), "run", "--artifact-dir", str(artifact_dir)]
     environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
+    if limits is not None:
+        command.extend(["--limits-json", json.dumps(limits, sort_keys=True)])
     if fixture:
         command.append("--fixture")
     else:
@@ -305,7 +326,7 @@ def compare(args: argparse.Namespace) -> int:
     sessions = ["fixture"] if args.fixture else args.session
     for session in sessions:
         base = _run_side(session, "base", args.base, args.fixture)
-        head = _run_side(session, "head", args.head, args.fixture)
+        head = _run_side(session, "head", args.head, args.fixture, base["record"]["limits"] if base else None)
         if base is None or head is None:
             return 1
         failure = _compare_artifacts(session, base, head)
@@ -326,6 +347,7 @@ def main() -> int:
     run_parser.add_argument("--session")
     run_parser.add_argument("--fixture", action="store_true")
     run_parser.add_argument("--artifact-dir")
+    run_parser.add_argument("--limits-json")
     run_parser.set_defaults(func=run)
     compare_parser = sub.add_parser("compare")
     compare_parser.add_argument("--base", required=True)

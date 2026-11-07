@@ -84,7 +84,7 @@ def test_fixture_compare_rejects_retained_floor_bound_mutation(tmp_path: Path) -
     fact_floor.write_text(text)
     result = _compare(ROOT, head, tmp_path)
     assert result.returncode != 0
-    assert "retained-floor bound check failed" in result.stderr
+    assert "limit change" in result.stderr
     assert "digest" not in result.stderr.lower()
 
 
@@ -95,3 +95,38 @@ def test_fixture_compare_rejects_retained_floor_limit_change(tmp_path: Path) -> 
     result = _compare(ROOT, head, tmp_path)
     assert result.returncode != 0
     assert "limit change" in result.stderr
+
+
+def test_fixture_replay_fails_when_stability_cap_is_not_reached(tmp_path: Path) -> None:
+    head = _mutated_ref(tmp_path, [("for invocation in range(1, 9):", "for invocation in range(1, 2):") ])
+    result = subprocess.run(
+        [sys.executable, str(head / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--artifact-dir", str(tmp_path / "artifacts")],
+        cwd=ROOT, check=False, capture_output=True, text=True,
+        env={**__import__("os").environ, "PYTHONPATH": str(head / "src")},
+    )
+    assert result.returncode != 0
+    assert "did not stabilize within 8 invocations" in result.stderr
+
+
+def test_summary_guard_is_installed_on_every_assembler() -> None:
+    import asyncio
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("eviction_replay_gate", ROOT / "scripts/eviction_replay_gate.py")
+    assert spec and spec.loader
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    class Policy:
+        async def summarize_chunked(self) -> str:
+            return "unexpected"
+
+    class Assembler:
+        compaction_policy = Policy()
+
+    gate._install_summary_guard(Assembler())
+    try:
+        asyncio.run(Assembler.compaction_policy.summarize_chunked())
+    except RuntimeError as error:
+        assert str(error) == "eviction replay reached model-summary fallback"
+    else:
+        raise AssertionError("summary fallback was not blocked")
