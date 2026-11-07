@@ -17953,6 +17953,7 @@ async def test_adoption_moves_live_mutation_control_to_current_owner(tmp_path: P
         child_instance_id="root:1:1",
     )
     owner = BackgroundAgentOwner(root)
+    # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     owner.register("root:1:1", lambda: None, watcher, parent_store=child)
     reopened_child = ConversationStore(root.session_dir / "agents", session_id="1")
