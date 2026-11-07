@@ -1351,8 +1351,10 @@ implementation for the frontend client. Two RPCs cover the surface.
     its authorship stay server-side.
   - `client_only`: the command exists but must run in the client (name is
     echoed back for the client's dispatch table).
-  - `unknown`: no command matched the leading token.
-  - `error`: the shared dispatcher reported a bounded failure `text`.
+  - `unknown`: no command matched a non-slash-safe leading token.
+  - `error`: the shared dispatcher reported a bounded failure `text`, such as
+    an unknown slash-safe command. The text tells users to type `//` to send
+    the command as model input and may include a close-match suggestion.
 
 Structured slash error codes are:
 

@@ -12892,6 +12892,37 @@ async def test_undo_restores_next_image_token_after_deleted_token(
 
 
 @pytest.mark.asyncio
+async def test_unknown_slash_command_is_rendered_without_model_request(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit("/statu", steer=False)
+        for _ in range(100):
+            if not app._submissions.active:
+                break
+            await asyncio.sleep(0.01)
+
+        assert backend.calls == []
+        assert "unknown command /statu" in output.getvalue()
+        assert "did you mean" in output.getvalue()
+        assert "/status?" in output.getvalue()
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_background_wake_and_submission_share_one_provider_consumer(
     tmp_path: Path,
 ) -> None:

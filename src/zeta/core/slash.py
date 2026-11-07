@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import inspect
 import os
 from collections import deque
@@ -780,9 +781,20 @@ class SlashCommandRegistry:
                 parts[1] if len(parts) == 2 else "",
                 display_text=value,
             )
-        if custom is None or custom.kind != "exec":
-            return None
-        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        if custom is not None:
+            if custom.kind != "exec":
+                return None
+            return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
+        suggestion = difflib.get_close_matches(
+            name,
+            [entry[0] for entry in self.completion_entries],
+            n=1,
+            cutoff=0.6,
+        )
+        message = f"unknown command /{name}. type // to send it as text."
+        if suggestion:
+            message += f" did you mean /{suggestion[0]}?"
+        return SlashPromptError(message)
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
