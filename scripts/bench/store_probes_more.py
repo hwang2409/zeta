@@ -15,8 +15,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import store_probes
+from sandbox import STUB_MODEL, STUB_PROVIDER, load1
 from store_probes import (
-    BASE,
     OPS,
     RESULTS,
     WORKTREE,
@@ -26,6 +27,7 @@ from store_probes import (
     load,
     make_home,
     profile,
+    reset_home,
     sample,
     scale,
     summary,
@@ -51,12 +53,38 @@ def _assembler(opened: Any) -> Any:
     )
 
 
-def _reset(name: str, fraction: float = 1.0) -> None:
-    """Mark a grown copy stale so the next probe re-clones it."""
-    (BASE / f"{name}-{round(fraction * 100)}" / ".probe-ready").unlink(missing_ok=True)
-
-
 # --------------------------------------------------------- 3. eviction events
+
+
+async def _evict_event(store: Any, assembler: Any, event: int) -> dict[str, Any]:
+    """One counted eviction event and what it wrote."""
+    seq_before = store.active_branch_head_sequence()
+    size_before = store.path.stat().st_size
+    markers_before = store.compaction_marker_count()
+    with OPS.measure() as ops:
+        started = time.perf_counter_ns()
+        context = await assembler.assemble_context(
+            force=True, bypass_eviction_hysteresis=True
+        )
+        elapsed = (time.perf_counter_ns() - started) / 1e6
+    marker = next((e for e in reversed(store._entries) if e.type == "compaction"), None)
+    data = marker.data if marker is not None else {}
+    floor, view = data.get("fact_floor"), data.get("view")
+    return {
+        "event": event + 1,
+        "ms_while_counting": round(elapsed, 3),
+        "load": load(),
+        "rows_written": store.active_branch_head_sequence() - seq_before,
+        "bytes_written": store.path.stat().st_size - size_before,
+        "new_marker": store.compaction_marker_count() > markers_before,
+        "marker_bytes": len(json.dumps(marker.to_dict())) if marker is not None else 0,
+        "fact_floor_bytes": len(json.dumps(floor)) if floor is not None else 0,
+        "view_items": len(view) if isinstance(view, list) else None,
+        "context_messages": len(context.messages),
+        "context_tokens": context.token_count,
+        "log_rows": len(store._entries),
+        "ops": ops,
+    }
 
 
 def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
@@ -84,43 +112,7 @@ def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
                         user_message(f"evict probe {event}.{index} {filler}")
                     )
                     store.append_message(_assistant(f"reply {event}.{index} {filler}"))
-                seq_before = store.active_branch_head_sequence()
-                size_before = store.path.stat().st_size
-                markers_before = store.compaction_marker_count()
-                with OPS.measure() as ops:
-                    started = time.perf_counter_ns()
-                    context = await assembler.assemble_context(
-                        force=True, bypass_eviction_hysteresis=True
-                    )
-                    elapsed = (time.perf_counter_ns() - started) / 1e6
-                marker = next(
-                    (e for e in reversed(store._entries) if e.type == "compaction"),
-                    None,
-                )
-                floor = marker.data.get("fact_floor") if marker is not None else None
-                view = marker.data.get("view") if marker is not None else None
-                events.append(
-                    {
-                        "event": event + 1,
-                        "ms_while_counting": round(elapsed, 3),
-                        "load": load(),
-                        "rows_written": store.active_branch_head_sequence()
-                        - seq_before,
-                        "bytes_written": store.path.stat().st_size - size_before,
-                        "new_marker": store.compaction_marker_count() > markers_before,
-                        "marker_bytes": len(json.dumps(marker.to_dict()))
-                        if marker is not None
-                        else 0,
-                        "fact_floor_bytes": len(json.dumps(floor))
-                        if floor is not None
-                        else 0,
-                        "view_items": len(view) if isinstance(view, list) else None,
-                        "context_messages": len(context.messages),
-                        "context_tokens": context.token_count,
-                        "log_rows": len(store._entries),
-                        "ops": ops,
-                    }
-                )
+                events.append(await _evict_event(store, assembler, event))
             times = []
             for event in range(args.n):
                 for index in range(4):
@@ -134,7 +126,7 @@ def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
                 await assembler.assemble_context(
                     force=True, bypass_eviction_hysteresis=True
                 )
-                times.append((time.perf_counter_ns() - started) / 1e6)
+                times.append(((time.perf_counter_ns() - started) / 1e6, load1()))
             events.append({"timed_events_uninstrumented": summary(times)})
 
         asyncio.run(run())
@@ -154,7 +146,7 @@ def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
         )
     finally:
         store.close()
-        _reset(args.session)
+        reset_home(args.session)
     return {
         "function": "ContextAssembler.assemble_context(force=True, bypass_eviction_hysteresis=True)",
         "events": events,
@@ -225,7 +217,7 @@ def _context_row(args: argparse.Namespace, fraction: float) -> dict[str, Any]:
             )
     finally:
         store.close()
-        _reset(args.session, fraction)
+        reset_home(args.session, fraction)
     return row
 
 
@@ -305,11 +297,14 @@ def probe_children(args: argparse.Namespace) -> dict[str, Any]:
         out["session_state_bytes_after"] = state.stat().st_size
     finally:
         store.close()
-        _reset(args.session)
+        reset_home(args.session)
     return out
 
 
 # ------------------------------------------------------------- 6. zeta serve
+
+
+FRAME_TIMEOUT = 120  # seconds to wait for one serve frame
 
 
 class Client:
@@ -329,7 +324,8 @@ class Client:
         self.writer.write((json.dumps(frame_out) + "\n").encode())
         await self.writer.drain()
         while True:
-            line = await self.reader.readline()
+            # A stalled serve fails the probe instead of hanging it.
+            line = await asyncio.wait_for(self.reader.readline(), FRAME_TIMEOUT)
             if not line:
                 raise RuntimeError("serve closed the connection")
             frame = json.loads(line)
@@ -377,7 +373,7 @@ async def serve_session(socket: Path, sid: str, n: int) -> dict[str, Any]:
 
     def record(name: str, elapsed: float, size: int, **extra: Any) -> None:
         item = out.setdefault(name, {"times": [], "frames": []})
-        item["times"].append(elapsed)
+        item["times"].append((elapsed, load1()))
         item["frames"].append(size)
         item.update(extra)
 
@@ -468,16 +464,14 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
     ZetaServer over the same socket protocol for op counts per request."""
     home, sid = make_home(args.session, 1.0)
     out: dict[str, Any] = {"scale": scale(home, sid)}
-    socket = Path("/tmp") / f"zsp-{os.getpid()}.sock"
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(WORKTREE / "src"),
-        "ZETA_HOME": str(home),
-        "ZETA_ACCOUNT_HOME": str(home),
-    }
+    box = store_probes.BOX
+    assert box is not None and box.stub is not None
+    socket = box.root / "serve.sock"
+    env = box.env(home, PYTHONPATH=f"{box.site}{os.pathsep}{WORKTREE / 'src'}")
+    seen = len(box.stub.requests)
     RESULTS.mkdir(parents=True, exist_ok=True)
     with open(RESULTS / f"serve-stderr-{args.session}.log", "w") as stderr:
-        process = subprocess.Popen(
+        process = box.spawn(
             [
                 sys.executable,
                 "-c",
@@ -487,7 +481,9 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
                 "--socket",
                 str(socket),
                 "--provider",
-                "codex",
+                STUB_PROVIDER,
+                "--model",
+                STUB_MODEL,
                 "--no-auto-memory",
                 "--approval-reconnect-grace",
                 "0",
@@ -506,9 +502,12 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
             out["subprocess"] = asyncio.run(serve_session(socket, sid, args.n))
             out["subprocess_env"] = "PYTHONPATH=" + env["PYTHONPATH"]
         finally:
-            process.terminate()
-            process.wait(timeout=60)
-            socket.unlink(missing_ok=True)
+            try:
+                box.stop(process)
+            finally:
+                socket.unlink(missing_ok=True)
+    # Requests a resume-started wake turn sent to the stub (never a real provider).
+    out["subprocess_stub_requests"] = len(box.stub.requests) - seen
 
     from zeta.server import ZetaServer, ergonomics
 
@@ -517,14 +516,15 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
             lambda: ZetaServer(
                 home=home,
                 socket_path=socket,
-                provider="codex",
+                provider=STUB_PROVIDER,
+                model=STUB_MODEL,
                 auto_memory=False,
                 approval_reconnect_grace=0,
             )
         )
-        await server.start()
         result: dict[str, Any] = {}
         try:
+            await server.start()
             client = await connect(socket)
             with OPS.measure() as ops:
                 await client.request("resume", {"session_id": sid})
@@ -560,12 +560,14 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             )
         finally:
-            await server.close()
-            socket.unlink(missing_ok=True)
+            try:
+                await server.close()
+            finally:
+                socket.unlink(missing_ok=True)
         return result
 
     out["in_process_ops"] = asyncio.run(in_process())
-    _reset(args.session)
+    reset_home(args.session)
     return out
 
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exploratory production benchmark for copied zeta sessions.
 
-Not a CI benchmark. It records operation scale and load averages beside noisy
-timings. Copies are removed unless --keep is used. Every zeta process and the
-in-process probes import the tree named by --tree (default: this checkout).
+Not a CI benchmark. It records operation scale and a load reading beside every
+timed sample. All copies live in one per-run sandbox (see sandbox.py) that is
+removed on exit unless --keep is used. Every copied session is pinned to the
+local provider stub and a network guard refuses non-local hosts. Every zeta
+process and the in-process probes import the tree named by --tree.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ import argparse
 import asyncio
 import cProfile
 import fcntl
-import http.server
 import io
 import json
 import os
@@ -25,9 +26,7 @@ import statistics
 import struct
 import subprocess
 import sys
-import tempfile
 import termios
-import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -46,7 +45,7 @@ ANSI = re.compile(
 )
 KEY_CHARS = b"zxqjkvwy"
 ROWS, COLS = 50, 200
-# Loaded through PYTHONPATH as sitecustomize in each TUI process. SIGUSR1 starts a
+# Appended to the sandbox guard in each child's sitecustomize. SIGUSR1 starts a
 # cProfile, SIGUSR2 stops it and writes "<prefix>.<n>.prof". With
 # ZETA_BENCH_PROFILE_AT_START=1 the first profile starts before zeta is imported.
 SITECUSTOMIZE = """
@@ -89,6 +88,17 @@ if os.environ.get("ZETA_BENCH_TREE") != str(TREE_SRC):
     env = {**os.environ, "ZETA_BENCH_TREE": str(TREE_SRC), "PYTHONPATH": str(TREE_SRC)}
     os.execve(sys.executable, [sys.executable, *sys.argv], env)
 
+from sandbox import (
+    STUB_MODEL,
+    STUB_PROVIDER,
+    Sandbox,
+    StubOllama,
+    load1,
+    pin_stub_provider,
+    summary,
+    timed,
+)
+
 import zeta
 from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
@@ -100,25 +110,6 @@ assert Path(zeta.__file__).resolve().is_relative_to(TREE_SRC), zeta.__file__
 
 def load() -> tuple[float, float, float]:
     return os.getloadavg()
-
-
-def timed(fn: Callable[[], Any]) -> tuple[Any, float]:
-    started = time.perf_counter_ns()
-    value = fn()
-    return value, (time.perf_counter_ns() - started) / 1e6
-
-
-def summary(values: list[float]) -> dict[str, Any]:
-    if not values:
-        return {"p50_ms": None, "p95_ms": None, "n": 0, "load_average": load()}
-    ordered = sorted(values)
-    return {
-        "p50_ms": round(statistics.median(ordered), 3),
-        "p95_ms": round(ordered[max(0, -(-len(ordered) * 95 // 100) - 1)], 3),
-        "max_ms": round(ordered[-1], 3),
-        "n": len(ordered),
-        "load_average": load(),
-    }
 
 
 def top_cumulative(path: Path, count: int = 15) -> list[str]:
@@ -153,7 +144,7 @@ def clone(source: Path, destination: Path) -> Path:
 
 
 def make_home(path: Path, sessions: list[Path]) -> Path:
-    """Build a throwaway home with the same identity, skills, and project memory."""
+    """Build a sandbox home with the same identity, skills, and project memory."""
     (path / "sessions").mkdir(parents=True)
     advance(path, expected_epoch=0)
     for name in ("AGENTS.md", "skills", "agents"):
@@ -166,12 +157,8 @@ def make_home(path: Path, sessions: list[Path]) -> Path:
         'theme = "gruvbox-dark"\ntoken_budget = 400000\n\n[agents]\nexplicit_finish = true\n'
     )
     for source in sessions:
-        meta_path = clone(source, path / "sessions") / "meta.json"
-        # The throwaway home has no accounts; the copy must not pin the user's.
-        meta = json.loads(meta_path.read_text())
-        meta["selected_accounts"] = {}
-        meta_path.write_text(json.dumps(meta))
-        project = json.loads((source / "meta.json").read_text()).get("project_id")
+        # Metadata comes from the copy, never the live source.
+        project = pin_stub_provider(clone(source, path / "sessions")).get("project_id")
         if project and not (path / "projects" / project).exists():
             clone(SOURCE_HOME / "projects" / project, path / "projects")
     return path
@@ -189,11 +176,11 @@ def truncate(source: Path, destination: Path, fraction: float) -> Path:
 
 
 def store_probe(home: Path, sid: str, name: str, repeats: int = 10) -> dict[str, Any]:
-    open_times: list[float] = []
+    open_times: list[tuple[float, float]] = []
     for _ in range(repeats):
-        opened, elapsed = timed(lambda: SessionManager(home).open(sid, _read_only=True))
+        opened, sample = timed(lambda: SessionManager(home).open(sid, _read_only=True))
         opened.store.close()
-        open_times.append(elapsed)
+        open_times.append(sample)
     opened = SessionManager(home).open(sid, _read_only=True)
     store = opened.store
     try:
@@ -234,10 +221,13 @@ def context_probe(home: Path, sid: str) -> dict[str, Any]:
 
 
 async def serve_one(
-    home: Path, sid: str, stub_url: str, repeats: int
+    home: Path, sid: str, stub: StubOllama, repeats: int
 ) -> dict[str, Any]:
-    """One `zeta serve` process lifetime: hello, one resume, then history/status."""
-    os.environ["ZETA_OLLAMA_BASE_URL"] = stub_url
+    """One `zeta serve` process lifetime: hello, one resume, then history/status.
+
+    The copied session is pinned to the stub, so a wake turn started by resume
+    reaches only the local stub; `stub_requests` counts those requests.
+    """
     socket = home / "bench.sock"
     server = await asyncio.to_thread(
         lambda: ZetaServer(
@@ -250,13 +240,25 @@ async def serve_one(
         )
     )
     await server.start()
+    try:
+        return await _serve_session(socket, sid, stub, repeats)
+    finally:
+        try:
+            await server.close()
+        finally:
+            socket.unlink(missing_ok=True)
+
+
+async def _serve_session(
+    socket: Path, sid: str, stub: StubOllama, repeats: int
+) -> dict[str, Any]:
     # Frames (resume, notifications) exceed StreamReader's 64 KiB default line limit.
     reader, writer = await asyncio.open_unix_connection(str(socket), limit=1 << 26)
     ident = 0
 
     async def request(
         method: str, params: dict[str, Any]
-    ) -> tuple[float, dict[str, Any]]:
+    ) -> tuple[tuple[float, float], dict[str, Any]]:
         nonlocal ident
         ident += 1
         line = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
@@ -264,12 +266,16 @@ async def serve_one(
         writer.write((json.dumps(line) + "\n").encode())
         await writer.drain()
         while True:
-            frame = json.loads(await asyncio.wait_for(reader.readline(), 120))
+            raw = await asyncio.wait_for(reader.readline(), 120)
+            if not raw:
+                raise RuntimeError(f"{method}: serve closed the connection")
+            frame = json.loads(raw)
             if frame.get("id") == ident:
                 if "error" in frame:
                     raise RuntimeError(f"{method}: {frame['error']}")
-                return (time.perf_counter_ns() - started) / 1e6, frame
+                return ((time.perf_counter_ns() - started) / 1e6, load1()), frame
 
+    seen = len(stub.requests)
     try:
         await request(
             "hello",
@@ -288,99 +294,29 @@ async def serve_one(
             for _ in range(repeats)
         ]
         status = [(await request("status", {}))[0] for _ in range(repeats)]
-        return {"resume": resume, "history": history, "status": status}
+        return {
+            "resume": resume,
+            "history": history,
+            "status": status,
+            "stub_requests": len(stub.requests) - seen,
+        }
     finally:
         writer.close()
         await writer.wait_closed()
-        await server.close()
 
 
-def serve_probe(home: Path, sid: str, stub_url: str) -> dict[str, Any]:
+def serve_probe(home: Path, sid: str, stub: StubOllama) -> dict[str, Any]:
     # A resume can start a wake turn, so a second resume on one server is refused;
     # each resume sample gets its own server.
     runs = [
-        asyncio.run(serve_one(home, sid, stub_url, 10 if i == 0 else 0))
-        for i in range(5)
+        asyncio.run(serve_one(home, sid, stub, 10 if i == 0 else 0)) for i in range(5)
     ]
     return {
         "resume": summary([r["resume"] for r in runs]),
         "history": summary(runs[0]["history"]),
         "status": summary(runs[0]["status"]),
+        "stub_requests_per_server": [r["stub_requests"] for r in runs],
     }
-
-
-class StubOllama:
-    """A local Ollama-compatible server, so the production client streams over HTTP."""
-
-    def __init__(self) -> None:
-        self.requests: list[int] = []  # perf_counter_ns at request-line arrival
-        self.stream_seconds: list[float] = []  # per-request stream length; default 0
-        self.finished = threading.Event()
-        self.on_request: Callable[[], None] | None = None
-        stub = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args: Any) -> None:
-                pass
-
-            def do_POST(self) -> None:
-                arrived = time.perf_counter_ns()
-                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                if self.path == "/api/show":
-                    reply = json.dumps(
-                        {"model_info": {"stub.context_length": 400000}}
-                    ).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Length", str(len(reply)))
-                    self.end_headers()
-                    self.wfile.write(reply)
-                    return
-                del body
-                stub.requests.append(arrived)
-                if stub.on_request is not None:
-                    stub.on_request()
-                seconds = stub.stream_seconds.pop(0) if stub.stream_seconds else 0.0
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-ndjson")
-                self.end_headers()
-                deadline = time.monotonic() + seconds
-                while True:
-                    # Dots only, so typed letters stay distinguishable in the render.
-                    self.wfile.write(
-                        json.dumps(
-                            {
-                                "message": {"role": "assistant", "content": ". "},
-                                "done": False,
-                            }
-                        ).encode()
-                        + b"\n"
-                    )
-                    self.wfile.flush()
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.05)
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "message": {"role": "assistant", "content": ""},
-                            "done": True,
-                            "done_reason": "stop",
-                            "prompt_eval_count": 1,
-                            "eval_count": 1,
-                        }
-                    ).encode()
-                    + b"\n"
-                )
-                self.wfile.flush()
-                stub.finished.set()
-
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
 
 
 class Tui:
@@ -388,25 +324,27 @@ class Tui:
 
     def __init__(
         self,
+        box: Sandbox,
         home: Path,
         sid: str | None,
-        stub: StubOllama,
         cwd: Path,
         profile: str | None = None,
         profile_at_start: bool = False,
     ) -> None:
+        self.box = box
         self.output = bytearray()
         self.chunks: list[tuple[int, int]] = []
         self.exit_code: int | None = None
-        site_dir = home.parent / "bench-site"
-        site_dir.mkdir(exist_ok=True)
-        (site_dir / "sitecustomize.py").write_text(SITECUSTOMIZE)
         env = {
             k: v
-            for k, v in os.environ.items()
+            for k, v in box.env(
+                home,
+                TERM="xterm-256color",
+                COLORTERM="truecolor",
+                PYTHONPATH=f"{box.site}{os.pathsep}{TREE_SRC}",
+            ).items()
             if k
             not in {
-                "COLORTERM",
                 "NO_COLOR",
                 "FORCE_COLOR",
                 "CLICOLOR",
@@ -414,19 +352,11 @@ class Tui:
                 "ZETA_BENCH_TREE",
             }
         }
-        env.update(
-            ZETA_HOME=str(home),
-            ZETA_ACCOUNT_HOME=str(home),
-            TERM="xterm-256color",
-            COLORTERM="truecolor",
-            PYTHONPATH=f"{site_dir}{os.pathsep}{TREE_SRC}",
-            ZETA_OLLAMA_BASE_URL=stub.url,
-        )
         if profile:
             env["ZETA_BENCH_PROFILE"] = profile
             if profile_at_start:
                 env["ZETA_BENCH_PROFILE_AT_START"] = "1"
-        # zeta has no __main__, so run the console-script entry point. Popen's setsid plus
+        # zeta has no __main__, so run the console-script entry point. spawn's setsid plus
         # TIOCSCTTY makes the pty the controlling tty; macOS does not do that on open.
         launcher = "import fcntl, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); from zeta.cli.main import main; sys.exit(main())"
         argv = [
@@ -444,14 +374,8 @@ class Tui:
         self.master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         self.started = time.perf_counter_ns()
-        self.process = subprocess.Popen(
-            argv,
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            env=env,
-            cwd=cwd,
-            start_new_session=True,
+        self.process = box.spawn(
+            argv, stdin=slave, stdout=slave, stderr=slave, env=env, cwd=cwd
         )
         os.close(slave)
         self.selector = selectors.DefaultSelector()
@@ -529,7 +453,7 @@ class Tui:
         return {
             **result,
             "bytes": len(self.output),
-            "load_average": load(),
+            "load": load1(),
             **self.failure(),
         }
 
@@ -550,19 +474,20 @@ class Tui:
         char = next(
             (bytes((c,)) for c in KEY_CHARS if bytes((c,)) not in recent), KEY_CHARS[:1]
         )
-        start = len(self.output)
+        offset, start = len(self.output), len(self.chunks)
         sent = time.perf_counter_ns()
         os.write(self.master, char)
-        first = self.wait_for(lambda: len(self.output) > start, timeout)
+        # One bounded loop; the first post-key chunk carries its own timestamp.
         shown = self.wait_for(
-            lambda: char in ANSI.sub(b"", bytes(self.output[start:])), timeout
+            lambda: char in ANSI.sub(b"", bytes(self.output[offset:])), timeout
         )
-        if shown is None:
-            return None
+        if shown is None or len(self.chunks) == start:
+            return None  # a failed sample, counted against `attempted`
         return {
-            "first_byte_ms": (first - sent) / 1e6,
+            "first_byte_ms": (self.chunks[start][0] - sent) / 1e6,
             "render_ms": (shown - sent) / 1e6,
-            "bytes": len(self.output) - start,
+            "bytes": len(self.output) - offset,
+            "load": load1(),
         }
 
     def keys(self, count: int, gap: float = 0.05) -> dict[str, Any]:
@@ -573,8 +498,8 @@ class Tui:
                 samples.append(sample)
             self.quiet(gap, timeout=gap * 20)
         return {
-            "render": summary([s["render_ms"] for s in samples]),
-            "first_byte": summary([s["first_byte_ms"] for s in samples]),
+            "render": summary([(s["render_ms"], s["load"]) for s in samples]),
+            "first_byte": summary([(s["first_byte_ms"], s["load"]) for s in samples]),
             "bytes_per_key_p50": statistics.median([s["bytes"] for s in samples])
             if samples
             else None,
@@ -590,16 +515,11 @@ class Tui:
         os.kill(self.process.pid, sig)
 
     def close(self) -> None:
-        self.selector.close()
         try:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            self.process.wait(timeout=5)
-        except ProcessLookupError:
-            pass
-        except subprocess.TimeoutExpired:
-            os.killpg(self.process.pid, signal.SIGKILL)
-            self.process.wait()
-        os.close(self.master)
+            self.selector.close()
+            self.box.stop(self.process)
+        finally:
+            os.close(self.master)
 
 
 def ps_sample(pid: int) -> tuple[float, int, float]:
@@ -620,7 +540,7 @@ def idle_probe(tui: Tui, seconds: int, profile_prefix: str) -> dict[str, Any]:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         tui.read(1.0)
-        samples.append(ps_sample(tui.process.pid))
+        samples.append((*ps_sample(tui.process.pid), load1()))
     after = samples[-1][2]
     # A separate 10 s profiled window counts loop iterations and the callbacks that fire.
     tui.signal(signal.SIGUSR1)
@@ -650,7 +570,7 @@ def idle_probe(tui: Tui, seconds: int, profile_prefix: str) -> dict[str, Any]:
         "output_bytes": len(tui.output) - start_bytes,
         "profile_10s": str(path),
         "calls_10s": dict(sorted(counts.items(), key=lambda kv: -kv[1])[:25]),
-        "load_average": load(),
+        "load_range": [min(s[3] for s in samples), max(s[3] for s in samples)],
         **tui.failure(),
     }
 
@@ -661,7 +581,7 @@ def submit(
     text: bytes,
     stream_seconds: float,
     before_enter: Callable[[], None] | None = None,
-) -> float | None:
+) -> tuple[float, float] | None:
     """Type text, then time Enter until the stub provider receives the request."""
     stub.stream_seconds.append(stream_seconds)
     stub.finished.clear()
@@ -677,7 +597,7 @@ def submit(
         and len(stub.requests) == seen
     ):
         return None
-    return (stub.requests[seen] - sent) / 1e6
+    return (stub.requests[seen] - sent) / 1e6, load1()
 
 
 def finish_turn(tui: Tui, stub: StubOllama) -> None:
@@ -685,82 +605,97 @@ def finish_turn(tui: Tui, stub: StubOllama) -> None:
     tui.quiet(0.5)
 
 
-def tui_probe(
-    home: Path,
-    sid: str | None,
-    name: str,
-    cwd: Path,
-    stub: StubOllama,
-    idle_seconds: int,
+def _startup_phase(
+    box: Sandbox, home: Path, sid: str | None, cwd: Path
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"startups": []}
+    startups = []
     for _ in range(5):
-        tui = Tui(home, sid, stub, cwd)
+        tui = Tui(box, home, sid, cwd)
         try:
-            result["startups"].append(tui.startup(stub))
+            startups.append(tui.startup(box.stub))
         finally:
             tui.close()
-    ok = [s for s in result["startups"] if s["ready_ms"] is not None]
-    result["startup_prompt"] = summary([s["prompt_ms"] for s in ok])
-    result["startup_ready"] = summary([s["ready_ms"] for s in ok])
-    if not ok:
-        return result
+    ok = [s for s in startups if s["ready_ms"] is not None]
+    return {
+        "startups": startups,
+        "startup_ok": len(ok),
+        "startup_prompt": summary([(s["prompt_ms"], s["load"]) for s in ok]),
+        "startup_ready": summary([(s["ready_ms"], s["load"]) for s in ok]),
+    }
 
-    prefix = str(PROFILE_DIR / f"tui-{name}")
-    tui = Tui(home, sid, stub, cwd, profile=f"{prefix}-idle")
+
+def _scroll_page_up(tui: Tui) -> dict[str, Any]:
+    scroll = []
+    for _ in range(10):
+        start = len(tui.output)
+        sent = time.perf_counter_ns()
+        os.write(tui.master, b"\x1b[5~")  # PageUp
+        first = tui.wait_for(lambda start=start: len(tui.output) > start, 5)
+        last = tui.quiet(0.15, timeout=10)
+        if first and last:
+            scroll.append(
+                {
+                    "first_byte_ms": (first - sent) / 1e6,
+                    "last_byte_ms": (last - sent) / 1e6,
+                    "bytes": len(tui.output) - start,
+                    "load": load1(),
+                }
+            )
+    os.write(tui.master, b"\x1b[F")  # End: back to the live tail
+    tui.quiet(0.3)
+    return {
+        "first_byte": summary([(s["first_byte_ms"], s["load"]) for s in scroll]),
+        "last_byte": summary([(s["last_byte_ms"], s["load"]) for s in scroll]),
+        "first_sample": scroll[0] if scroll else None,
+        "bytes_p50": statistics.median(s["bytes"] for s in scroll) if scroll else None,
+    }
+
+
+def _turns(tui: Tui, stub: StubOllama) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    turn_start = []
+    for index in range(10):
+        sample = submit(tui, stub, b"bench turn %d" % index, 0)
+        if sample is None:
+            result["turn_error"] = tui.failure() or {
+                "tail": ANSI.sub(b"", bytes(tui.output[-4096:])).decode(
+                    "utf-8", "replace"
+                )
+            }
+            break
+        turn_start.append(sample)
+        finish_turn(tui, stub)
+    result["turn_start_first_ms"] = turn_start[0][0] if turn_start else None
+    result["turn_start"] = summary(turn_start)
+    if turn_start and submit(tui, stub, b"bench stream", 10) is not None:
+        result["key_streaming"] = tui.keys(30, gap=0.1)
+        finish_turn(tui, stub)
+    return result
+
+
+def _interaction_phase(
+    box: Sandbox, home: Path, sid: str | None, cwd: Path, prefix: str, idle_seconds: int
+) -> dict[str, Any]:
+    tui = Tui(box, home, sid, cwd, profile=f"{prefix}-idle")
     try:
-        tui.startup(stub)
-        result["idle"] = idle_probe(tui, idle_seconds, f"{prefix}-idle")
+        tui.startup(box.stub)
+        result = {"idle": idle_probe(tui, idle_seconds, f"{prefix}-idle")}
         result["key_idle"] = tui.keys(30)
         tui.clear_composer()
-        scroll = []
-        for _ in range(10):
-            start = len(tui.output)
-            sent = time.perf_counter_ns()
-            os.write(tui.master, b"\x1b[5~")  # PageUp
-            first = tui.wait_for(lambda start=start: len(tui.output) > start, 5)
-            last = tui.quiet(0.15, timeout=10)
-            if first and last:
-                scroll.append(
-                    {
-                        "first_byte_ms": (first - sent) / 1e6,
-                        "last_byte_ms": (last - sent) / 1e6,
-                        "bytes": len(tui.output) - start,
-                    }
-                )
-        os.write(tui.master, b"\x1b[F")  # End: back to the live tail
-        tui.quiet(0.3)
-        result["scroll_page_up"] = {
-            "first_byte": summary([s["first_byte_ms"] for s in scroll]),
-            "last_byte": summary([s["last_byte_ms"] for s in scroll]),
-            "first_sample": scroll[0] if scroll else None,
-            "bytes_p50": statistics.median(s["bytes"] for s in scroll)
-            if scroll
-            else None,
-        }
-        turn_start = []
-        for index in range(10):
-            elapsed = submit(tui, stub, b"bench turn %d" % index, 0)
-            if elapsed is None:
-                result["turn_error"] = tui.failure() or {
-                    "tail": ANSI.sub(b"", bytes(tui.output[-4096:])).decode(
-                        "utf-8", "replace"
-                    )
-                }
-                break
-            turn_start.append(elapsed)
-            finish_turn(tui, stub)
-        result["turn_start_first_ms"] = turn_start[0] if turn_start else None
-        result["turn_start"] = summary(turn_start)
-        if turn_start and submit(tui, stub, b"bench stream", 10) is not None:
-            result["key_streaming"] = tui.keys(30, gap=0.1)
-            finish_turn(tui, stub)
+        result["scroll_page_up"] = _scroll_page_up(tui)
+        result.update(_turns(tui, box.stub))
         result.update(tui.failure())
+        return result
     finally:
         tui.close()
 
-    # Profiles run in their own process so profiler overhead never enters a timing above.
-    tui = Tui(home, sid, stub, cwd, profile=f"{prefix}-span", profile_at_start=True)
+
+def _profile_phase(
+    box: Sandbox, home: Path, sid: str | None, cwd: Path, prefix: str
+) -> dict[str, Any]:
+    """Profiles run in their own process so profiler overhead never enters a timing."""
+    stub = box.stub
+    tui = Tui(box, home, sid, cwd, profile=f"{prefix}-span", profile_at_start=True)
     try:
         # profile 0: process start to the first request; profile 1: one later turn's Enter to its request.
         stub.on_request = lambda: tui.signal(signal.SIGUSR2)
@@ -775,6 +710,7 @@ def tui_probe(
             finish_turn(tui, stub)
         stub.on_request = None
         time.sleep(1)
+        result = {}
         for key, index in (("startup_profile", 0), ("turn_profile", 1)):
             path = Path(f"{prefix}-span.{index}.prof")
             result[key] = (
@@ -782,113 +718,125 @@ def tui_probe(
                 if path.exists()
                 else None
             )
+        return result
     finally:
         stub.on_request = None
         tui.close()
+
+
+def tui_probe(
+    box: Sandbox, home: Path, sid: str | None, name: str, cwd: Path, idle_seconds: int
+) -> dict[str, Any]:
+    result = _startup_phase(box, home, sid, cwd)
+    if not result["startup_ok"]:
+        return result
+    prefix = str(PROFILE_DIR / f"tui-{name}")
+    result.update(_interaction_phase(box, home, sid, cwd, prefix, idle_seconds))
+    result.update(_profile_phase(box, home, sid, cwd, prefix))
     return result
+
+
+def scaling_probe(box: Sandbox, home: Path, sid: str, name: str) -> dict[str, Any]:
+    curves = {}
+    for fraction in (0.1, 0.5, 1.0):
+        scaled_home = box.root / f"scaled-{name}-{fraction}"
+        (scaled_home / "sessions").mkdir(parents=True)
+        try:
+            advance(scaled_home, expected_epoch=0)
+            # Cut the sandbox copy, never the live source.
+            scaled = truncate(
+                home / "sessions" / sid, scaled_home / "sessions", fraction
+            )
+            scaled_rows, scaled_bytes = conversation_stats(scaled)
+            store = store_probe(scaled_home, sid, f"{name}-{fraction}")
+        finally:
+            shutil.rmtree(scaled_home, ignore_errors=True)
+        # Report both per-MB and per-row cost: bytes per row differ between sessions.
+        curves[str(fraction)] = {
+            "rows_in_file": scaled_rows,
+            "bytes": scaled_bytes,
+            "rows_replayed": store["rows_replayed"],
+            "replay_ms_per_mb": round(
+                store["replay"]["p50_ms"] / (scaled_bytes / 1e6), 3
+            ),
+            "replay_us_per_row": round(
+                store["replay"]["p50_ms"] * 1000 / scaled_rows, 2
+            ),
+            "store": store,
+        }
+    return curves
+
+
+# Run order and handler per --probe value: (box, home, sid, name, cwd) -> result.
+PROBES: dict[str, Callable[..., dict[str, Any]]] = {
+    "store": lambda box, home, sid, name, cwd: store_probe(home, sid, name),
+    "context": lambda box, home, sid, name, cwd: context_probe(home, sid),
+    "serve": lambda box, home, sid, name, cwd: serve_probe(home, sid, box.stub),
+    "tui": lambda box, home, sid, name, cwd: tui_probe(
+        box, home, sid, name, cwd, ARGS.idle_seconds
+    ),
+    "scaling": lambda box, home, sid, name, cwd: scaling_probe(box, home, sid, name),
+}
+
+
+def sandbox_sessions(box: Sandbox, names: list[str]) -> tuple[Path, dict[str, Any]]:
+    """Copy the named sessions (and create `fresh`) in the sandbox; return sid and cwd."""
+    home = make_home(box.root / "home", [DEFAULTS[n] for n in names if n != "fresh"])
+    sessions: dict[str, tuple[str, Path]] = {}
+    for name in names:
+        if name == "fresh":
+            opened = SessionManager(home).create(
+                provider=STUB_PROVIDER, model=STUB_MODEL, cwd=HERE, auto_project=False
+            )
+            sessions[name] = (opened.metadata.session_id, HERE)
+            opened.store.close()
+        else:
+            sid = DEFAULTS[name].name
+            meta = json.loads((home / "sessions" / sid / "meta.json").read_text())
+            sessions[name] = (sid, Path(meta["cwd"]))
+    return home, sessions
 
 
 def main() -> None:
     names = ARGS.session or ["fresh", "phoebe", "orchestrator"]
-    probes = set(ARGS.probe or ["store", "scaling", "context", "serve", "tui"])
-    child_zeta = subprocess.run(
-        [sys.executable, "-c", "import zeta; print(zeta.__file__)"],
-        env={**os.environ, "PYTHONPATH": str(TREE_SRC)},
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    selected = set(ARGS.probe or PROBES)
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    base = Path(
-        tempfile.mkdtemp(prefix="zeta-perf-", dir=Path.home() / ".zeta/scratch/perf")
-    )
-    results: dict[str, Any] = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "load_average": load(),
-        "profiles": str(PROFILE_DIR),
-        "zeta_file": zeta.__file__,
-        "child_zeta_file": child_zeta,
-    }
-    print(f"zeta: {zeta.__file__}; child: {child_zeta}", file=sys.stderr)
-    stub = StubOllama()
-    try:
-        home = make_home(base / "home", [DEFAULTS[n] for n in names if n != "fresh"])
-        for name in names:
-            if name == "fresh":
-                opened = SessionManager(home).create(
-                    provider="ollama", model="bench-stub", cwd=HERE, auto_project=False
-                )
-                sid = opened.metadata.session_id
-                opened.store.close()
-                cwd = HERE
-            else:
-                sid = DEFAULTS[name].name
-                cwd = Path(
-                    json.loads((DEFAULTS[name] / "meta.json").read_text())["cwd"]
-                )
-            source = home / "sessions" / sid
-            rows, size = conversation_stats(source)
-            children = (
-                len(list((source / "agents").iterdir()))
-                if (source / "agents").is_dir()
-                else 0
-            )
+    with Sandbox("bench", keep=ARGS.keep) as box:
+        box.write_sitecustomize(SITECUSTOMIZE)
+        child_zeta = subprocess.run(
+            [sys.executable, "-c", "import zeta; print(zeta.__file__)"],
+            env=box.env(PYTHONPATH=f"{box.site}{os.pathsep}{TREE_SRC}"),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        results: dict[str, Any] = {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "load_average": load(),
+            "profiles": str(PROFILE_DIR),
+            "zeta_file": zeta.__file__,
+            "child_zeta_file": child_zeta,
+        }
+        print(f"zeta: {zeta.__file__}; child: {child_zeta}", file=sys.stderr)
+        home, sessions = sandbox_sessions(box, names)
+        box.use_home(home)
+        box.check_stubbed(home)
+        for name, (sid, cwd) in sessions.items():
+            rows, size = conversation_stats(home / "sessions" / sid)
+            agents = home / "sessions" / sid / "agents"
+            children = len(list(agents.iterdir())) if agents.is_dir() else 0
             result: dict[str, Any] = {
                 "scale": {"rows": rows, "bytes": size, "children": children},
                 "load_average": load(),
             }
-            if "store" in probes:
-                result["store"] = store_probe(home, sid, name)
-            if "context" in probes:
-                result["context"] = context_probe(home, sid)
-            if "serve" in probes:
-                result["serve"] = serve_probe(home, sid, stub.url)
-            if "tui" in probes:
-                result["tui"] = tui_probe(home, sid, name, cwd, stub, ARGS.idle_seconds)
-            if "scaling" in probes and name != "fresh":
-                curves = {}
-                for fraction in (0.1, 0.5, 1.0):
-                    scaled_home = base / f"scaled-{name}-{fraction}"
-                    (scaled_home / "sessions").mkdir(parents=True)
-                    advance(scaled_home, expected_epoch=0)
-                    scaled = truncate(
-                        DEFAULTS[name], scaled_home / "sessions", fraction
-                    )
-                    scaled_rows, scaled_bytes = conversation_stats(scaled)
-                    store = store_probe(scaled_home, sid, f"{name}-{fraction}")
-                    # Report both per-MB and per-row cost: bytes per row differ between sessions.
-                    curves[str(fraction)] = {
-                        "rows_in_file": scaled_rows,
-                        "bytes": scaled_bytes,
-                        "rows_replayed": store["rows_replayed"],
-                        "replay_ms_per_mb": round(
-                            store["replay"]["p50_ms"] / (scaled_bytes / 1e6), 3
-                        ),
-                        "replay_us_per_row": round(
-                            store["replay"]["p50_ms"] * 1000 / scaled_rows, 2
-                        ),
-                        "store": store,
-                    }
-                    shutil.rmtree(scaled_home, ignore_errors=True)
-                result["scaling"] = curves
+            for probe, run in PROBES.items():
+                if probe in selected and not (probe == "scaling" and name == "fresh"):
+                    result[probe] = run(box, home, sid, name, cwd)
             result["load_average_after"] = load()
             results[name] = result
             print(json.dumps({name: result}, indent=2), flush=True)
-    finally:
-        stub.close()
-        if not ARGS.keep:
-            shutil.rmtree(base, ignore_errors=True)
-        print(
-            json.dumps(
-                {
-                    "meta": {
-                        k: results[k]
-                        for k in ("generated_at", "zeta_file", "child_zeta_file")
-                    }
-                }
-            ),
-            flush=True,
-        )
+        meta = {k: results[k] for k in ("generated_at", "zeta_file", "child_zeta_file")}
+        print(json.dumps({"meta": meta}), flush=True)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,14 @@
 """Store, eviction, context, child-RPC, serve, and search probes on copied sessions.
 
 Exploratory only (not a CI gate). Every probe calls a named production
-function on a clonefile copy of a real session under a throwaway home. Each
-probe runs three separate passes so the numbers do not disturb each other:
+function on a clonefile copy of a real session inside a per-run sandbox
+(sandbox.py): the copy is pinned to a local provider stub, credential sources
+are removed from the environment, a network guard refuses non-local hosts, and
+the sandbox is deleted on exit unless --keep is given. Each probe runs three
+separate passes so the numbers do not disturb each other:
 
-1. a timed pass with no instrumentation (n samples, p50/p95, load average);
+1. a timed pass with no instrumentation (n samples, p50/p95, a load reading
+   per sample);
 2. an operation-count pass with patched os/json/model entry points;
 3. a cProfile pass written to ~/.zeta/scratch/perf/profiles/.
 
@@ -27,7 +31,6 @@ import json
 import os
 import pstats
 import shutil
-import statistics
 import subprocess
 import sys
 import threading
@@ -36,6 +39,16 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+
+from sandbox import (
+    STUB_MODEL,
+    STUB_PROVIDER,
+    Sandbox,
+    load1,
+    pin_stub_provider,
+    summary,
+    timed,
+)
 
 import zeta
 from zeta.core import checkpoints
@@ -54,7 +67,6 @@ SOURCES = {
     "orchestrator": Path.home() / ".zeta/sessions/86e3d775a40b42ceaa76ca571e27ff1b",
 }
 PERF = Path.home() / ".zeta/scratch/perf"
-BASE = PERF / "home-store"
 PROFILE_DIR = PERF / "profiles"
 RESULTS = PERF / "store"
 WORKTREE = Path(__file__).resolve().parents[2]
@@ -67,28 +79,13 @@ def load() -> list[float]:
     return [round(value, 2) for value in os.getloadavg()]
 
 
-def summary(values: list[float]) -> dict[str, Any]:
-    ordered = sorted(values)
-    if not ordered:
-        return {"n": 0}
-    p95 = ordered[min(len(ordered) - 1, max(0, round(len(ordered) * 0.95) - 1))]
-    return {
-        "n": len(ordered),
-        "p50_ms": round(statistics.median(ordered), 3),
-        "p95_ms": round(p95, 3),
-        "min_ms": round(ordered[0], 3),
-        "load": load(),
-    }
-
-
 def sample(fn: Callable[[], Any], n: int) -> tuple[dict[str, Any], Any]:
-    times: list[float] = []
+    samples: list[tuple[float, float]] = []
     value = None
     for _ in range(n):
-        started = time.perf_counter_ns()
-        value = fn()
-        times.append((time.perf_counter_ns() - started) / 1e6)
-    return summary(times), value
+        value, one = timed(fn)
+        samples.append(one)
+    return summary(samples), value
 
 
 def profile(name: str, fn: Callable[[], Any]) -> dict[str, Any]:
@@ -359,69 +356,73 @@ def _meta(session: Path) -> dict[str, Any]:
     return json.loads((session / "meta.json").read_text())
 
 
+BOX: Sandbox | None = None  # the per-run sandbox, set by main()
+
+
+def _home_path(name: str, fraction: float) -> Path:
+    assert BOX is not None, "probes run inside main()'s sandbox"
+    return BOX.root / f"{name}-{round(fraction * 100)}"
+
+
+def reset_home(name: str, fraction: float = 1.0) -> None:
+    """Drop a grown copy so the next probe in this run re-clones it."""
+    shutil.rmtree(_home_path(name, fraction), ignore_errors=True)
+
+
 def make_home(name: str, fraction: float = 1.0) -> tuple[Path, str]:
-    """Return a throwaway home holding a clonefile copy (cut at a row boundary)."""
+    """Return a sandbox home holding a clonefile copy (cut at a row boundary)."""
     from zeta.core.session import SessionManager
 
-    home = BASE / f"{name}-{round(fraction * 100)}"
+    home = _home_path(name, fraction)
     ready = home / ".probe-ready"
-    if name == "fresh":
-        if not ready.exists():
-            shutil.rmtree(home, ignore_errors=True)
-            (home / "sessions").mkdir(parents=True)
-            advance(home, expected_epoch=0)
-            manager = SessionManager(home)
-            opened = manager.create(
-                provider="codex", model="offline", cwd=WORKTREE, auto_project=False
-            )
-            opened.store.close()
-            ready.write_text(opened.metadata.session_id)
-        os.environ["ZETA_HOME"] = str(home)
+    assert BOX is not None
+    BOX.use_home(home)
+    if ready.exists():
         return home, ready.read_text()
-    source = SOURCES[name]
-    sid = source.name
-    if not ready.exists():
-        shutil.rmtree(home, ignore_errors=True)
-        (home / "sessions").mkdir(parents=True)
-        (home / "projects").mkdir(mode=0o700)
-        os.chmod(home, 0o700)
-        advance(home, expected_epoch=0)
-        target = home / "sessions" / sid
-        subprocess.run(["cp", "-cR", str(source), str(target)], check=True)
-        project_id = _meta(source).get("project_id")
-        if project_id:
-            project = Path.home() / ".zeta/projects" / project_id
-            subprocess.run(
-                ["cp", "-cR", str(project), str(home / "projects" / project_id)],
-                check=True,
-            )
-        conversation = target / "conversation.jsonl"
-        raw = conversation.read_bytes()
-        raw = raw[: raw.rfind(b"\n") + 1]  # the live copy may end mid-row
-        lines = raw.splitlines(keepends=True)
-        keep = max(2, int(len(lines) * fraction))
-        conversation.write_bytes(b"".join(lines[:keep]))
-        for path in target.glob("*.sqlite*"):
-            path.unlink()
-        # Child receipts store absolute paths under the real home; point them
-        # at the copy so agent_status/agent_output resolve the copied children.
-        for path in (conversation, target / "session_state.json"):
-            if path.exists():
-                path.write_bytes(
-                    path.read_bytes().replace(
-                        str(source).encode(), str(target).encode()
-                    )
-                )
-        # The copy has no credentials. Drop the recorded account selection so
-        # `zeta serve` resume does not ask for a login; no provider is called.
-        meta_path = target / "meta.json"
-        meta = json.loads(meta_path.read_text())
-        meta["selected_accounts"] = {}
-        meta_path.write_text(json.dumps(meta))
-        ready.write_text(sid)
-    os.environ["ZETA_HOME"] = str(home)
-    os.environ["ZETA_ACCOUNT_HOME"] = str(home)
+    (home / "sessions").mkdir(parents=True)
+    (home / "projects").mkdir(mode=0o700)
+    os.chmod(home, 0o700)
+    advance(home, expected_epoch=0)
+    if name == "fresh":
+        opened = SessionManager(home).create(
+            provider=STUB_PROVIDER, model=STUB_MODEL, cwd=WORKTREE, auto_project=False
+        )
+        opened.store.close()
+        sid = opened.metadata.session_id
+    else:
+        sid = _clone_session(SOURCES[name], home, fraction)
+    BOX.check_stubbed(home)
+    ready.write_text(sid)
     return home, sid
+
+
+def _clone_session(source: Path, home: Path, fraction: float) -> str:
+    target = home / "sessions" / source.name
+    subprocess.run(["cp", "-cR", str(source), str(target)], check=True)
+    # Metadata comes from the copy, never the live source.
+    project_id = pin_stub_provider(target).get("project_id")
+    if project_id:
+        project = Path.home() / ".zeta/projects" / project_id
+        subprocess.run(
+            ["cp", "-cR", str(project), str(home / "projects" / project_id)],
+            check=True,
+        )
+    conversation = target / "conversation.jsonl"
+    raw = conversation.read_bytes()
+    raw = raw[: raw.rfind(b"\n") + 1]  # the live copy may end mid-row
+    lines = raw.splitlines(keepends=True)
+    keep = max(2, int(len(lines) * fraction))
+    conversation.write_bytes(b"".join(lines[:keep]))
+    for path in target.glob("*.sqlite*"):
+        path.unlink()
+    # Child receipts store absolute paths under the real home; point them
+    # at the copy so agent_status/agent_output resolve the copied children.
+    for path in (conversation, target / "session_state.json"):
+        if path.exists():
+            path.write_bytes(
+                path.read_bytes().replace(str(source).encode(), str(target).encode())
+            )
+    return source.name
 
 
 def scale(home: Path, sid: str) -> dict[str, Any]:
@@ -512,10 +513,7 @@ def probe_append(args: argparse.Namespace) -> dict[str, Any]:
         out[str(fraction)] = _append_row(args, fraction)
     # Undo growth so later probes see the original copy.
     for fraction in fractions_for(args):
-        if args.session != "fresh":
-            (BASE / f"{args.session}-{round(fraction * 100)}" / ".probe-ready").unlink(
-                missing_ok=True
-            )
+        reset_home(args.session, fraction)
     return out
 
 
@@ -556,7 +554,7 @@ def _append_row(args: argparse.Namespace, fraction: float) -> dict[str, Any]:
             for index in range(args.n):
                 started = time.perf_counter_ns()
                 await store.append_message_async(user_message(f"probe async {index}"))
-                times.append((time.perf_counter_ns() - started) / 1e6)
+                times.append(((time.perf_counter_ns() - started) / 1e6, load1()))
             with OPS.measure() as steady_ops:
                 await store.append_message_async(user_message("probe async ops"))
             return {
@@ -587,25 +585,33 @@ PROBES: dict[str, Callable[[argparse.Namespace], dict[str, Any]]] = {
 }
 
 
-def main() -> None:
-    sys.modules.setdefault("store_probes", sys.modules[__name__])
-    from store_probes_more import MORE_PROBES
+# Probes that need a copied session's children or project; `fresh` has neither.
+NEEDS_REAL_SESSION = {"children", "search"}
 
-    PROBES.update(MORE_PROBES)
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "probe", choices=[*PROBES, "clean"]
-    )  # filled with MORE_PROBES above
+    parser.add_argument("probe", choices=list(PROBES))
     parser.add_argument("--session", choices=[*SOURCES, "fresh"], default="phoebe")
     parser.add_argument("--fractions", default="0.1,0.5,1.0")
     parser.add_argument("-n", type=int, default=10)
     parser.add_argument("--events", type=int, default=8)
+    parser.add_argument("--keep", action="store_true", help="keep the sandbox copies")
     args = parser.parse_args()
-    if args.probe == "clean":
-        shutil.rmtree(BASE, ignore_errors=True)
-        return
+    if args.session == "fresh" and args.probe in NEEDS_REAL_SESSION:
+        parser.error(f"probe {args.probe!r} needs a copied session, not 'fresh'")
     if args.session == "fresh":
         args.fractions = "1.0"
+    return args
+
+
+def main() -> None:
+    global BOX
+    sys.modules.setdefault("store_probes", sys.modules[__name__])
+    from store_probes_more import MORE_PROBES
+
+    PROBES.update(MORE_PROBES)
+    args = parse_args()
     result = {
         "probe": args.probe,
         "session": args.session,
@@ -613,7 +619,8 @@ def main() -> None:
         "started_load": load(),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    result.update(PROBES[args.probe](args))
+    with Sandbox("store", keep=args.keep) as BOX:
+        result.update(PROBES[args.probe](args))
     result["finished_load"] = load()
     RESULTS.mkdir(parents=True, exist_ok=True)
     path = RESULTS / f"{args.probe}-{args.session}.json"
