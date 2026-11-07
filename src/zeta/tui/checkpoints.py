@@ -40,6 +40,7 @@ from ..protocol.types import (
     ToolUseContent,
     assistant_text,
     is_passive_harness_message,
+    is_visible_harness_notice,
 )
 from .cards.base import strip_terminal_controls
 from .render import (
@@ -692,6 +693,14 @@ class CheckpointTranscriptMixin:
             if message is None:
                 raise RuntimeError("TUI message projection is missing its message")
             if is_passive_harness_message(message):
+                if is_visible_harness_notice(message):
+                    self._print_system(
+                        "\n".join(
+                            block.text
+                            for block in message.content
+                            if isinstance(block, TextContent)
+                        )
+                    )
                 yield
                 continue
             if message.role is MessageRole.USER:
