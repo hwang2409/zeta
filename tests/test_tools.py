@@ -1651,42 +1651,44 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import pathlib,time; time.sleep(1.0); "
-        f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
+        f"import pathlib; pathlib.Path({str(launcher_ready)!r}).touch()\n"
         + tool_spawn_module._LAUNCHER,
     )
-    command_started = tmp_path / "timeout-command-started"
-    command_finished = tmp_path / "timeout-command-finished"
-    command = (
-        "import pathlib,time; "
-        f"pathlib.Path({str(command_started)!r}).write_text('1'); time.sleep(0.1); "
-        f"pathlib.Path({str(command_finished)!r}).touch()"
-    )
-    original_spawn = bash_module.create_tool_subprocess_shell
+    timeout_started = asyncio.Event()
+    release_timeout = asyncio.Event()
+    timeout_started_early = False
+    real_sleep = asyncio.sleep
 
-    async def spawn_after_command_started(*args, **kwargs):
-        process = await original_spawn(*args, **kwargs)
-        assert launcher_ready.exists()
-        await read_pid_file(command_started)
-        return process
+    async def controlled_sleep(delay: float) -> None:
+        nonlocal timeout_started_early
+        if delay == 0.5:
+            timeout_started_early = not launcher_ready.exists()
+            timeout_started.set()
+            await asyncio.wait_for(release_timeout.wait(), 10)
+            return
+        await real_sleep(delay)
 
-    monkeypatch.setattr(
-        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
-    )
+    monkeypatch.setattr(bash_module.asyncio, "sleep", controlled_sleep)
+    command = _python_command("import time; time.sleep(30)")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-
-    result = await registry.execute(
-        ToolCall(
-            "bash-launcher-timeout",
-            "bash",
-            {"command": _python_command(command), "timeout": 0.5},
+    execution = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "bash-launcher-timeout",
+                "bash",
+                {"command": command, "timeout": 0.5},
+            )
         )
     )
 
+    await asyncio.wait_for(timeout_started.wait(), 10)
     assert launcher_ready.exists()
-    assert command_finished.exists()
-    assert result["isError"] is False
-    assert "timed_out" not in result["structuredContent"]
+    assert not timeout_started_early
+    release_timeout.set()
+    result = await asyncio.wait_for(execution, 10)
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["timed_out"] is True
 
 
 @pytest.mark.asyncio
