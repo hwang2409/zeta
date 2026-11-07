@@ -656,7 +656,7 @@ async def test_oauth_refresh_network_wait_is_bounded(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
         raise AssertionError("unreachable")
 
     async with _mock_client(no_refresh_response) as client:
