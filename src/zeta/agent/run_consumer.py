@@ -130,8 +130,9 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
+    idle_clock = kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time
     idle_lifecycle = IdleNudgeLifecycle(
-        clock=kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time,
+        clock=idle_clock,
         wait=kwargs.pop("idle_wait", None),
         nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
     )
