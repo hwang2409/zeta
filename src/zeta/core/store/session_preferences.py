@@ -26,7 +26,10 @@ class SessionPreferenceMixin:
             )
 
         current = self._mutate(
-            metadata.session_id, update, lock_timeout=lock_timeout
+            metadata.session_id,
+            update,
+            lock_timeout=lock_timeout,
+            execution_lease=metadata._execution_lease,
         )
         self._copy_metadata(metadata, current)
 
@@ -131,7 +134,12 @@ class SessionPreferenceMixin:
                 model_fallback=model_fallback,
             )
 
-        self._copy_metadata(metadata, self._mutate(metadata.session_id, update))
+        self._copy_metadata(
+            metadata,
+            self._mutate(
+                metadata.session_id, update, execution_lease=metadata._execution_lease
+            ),
+        )
 
     def record_budget(
         self,
@@ -157,5 +165,7 @@ class SessionPreferenceMixin:
             item.budget_pinned = pinned
             return self._touch(item) if touch else item
 
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(
+            metadata.session_id, update, execution_lease=metadata._execution_lease
+        )
         self._copy_metadata(metadata, current)
