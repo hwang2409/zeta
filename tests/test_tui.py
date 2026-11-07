@@ -7,12 +7,14 @@ import errno
 import fcntl
 import gc
 import json
+import multiprocessing
 import os
 import pty
 import re
 import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -55,23 +57,31 @@ from rich.text import Text
 
 import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
+import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
+from tests.support.account_processes import hold_provider_login_lock
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
     named_account_credentials,
 )
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.tui_render import render_full_screen as _render_full_screen
-from zeta.accounts import AccountId, AccountStore, AccountUsage, SessionAccountContext
+from zeta.accounts import (
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    SessionAccountContext,
+)
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import budget_for_model
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
@@ -13812,6 +13822,126 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     try:
         assert await app.slash_accounts("login codex personal") == "logged in as codex:personal"
         assert logins == [("codex", "personal")]
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+@pytest.mark.parametrize("invalid_response", [False, True])
+async def test_tui_login_provider_failure_has_safe_cause_and_recovery(
+    provider: str,
+    invalid_response: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reject_provider_token_exchange(
+        monkeypatch, provider, invalid_response=invalid_response
+    )
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, f"/accounts login {provider} work"
+        )
+
+        assert result == (
+            "login failed: the provider rejected the login or returned an invalid "
+            "callback; retry in a new browser window"
+        )
+        assert "secret-token-body" not in result
+    finally:
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_login_lock_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_provider_login_lock,
+        args=(str(account_home(home)), "anthropic", ready, release),
+    )
+    holder.start()
+    assert ready.wait(timeout=10)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    account_context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = account_context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        result = await app._slash_commands.dispatch_async(
+            app, "/accounts login anthropic work"
+        )
+
+        assert result == (
+            "login failed: a login for this provider is already in progress; "
+            "close the other login and retry"
+        )
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        await app.close()
+        opened.store.close()
+    assert holder.exitcode == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_login_callback_port_failure_has_safe_cause_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    try:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            monkeypatch.setattr(
+                provider_login_module,
+                "DEFAULT_CODEX_REDIRECT_URI",
+                f"http://localhost:{port}/auth/callback",
+            )
+            result = await app._slash_commands.dispatch_async(
+                app, "/accounts login codex work"
+            )
+
+        assert result == (
+            f"login failed: port {port} is already in use for codex login — close "
+            "any other Codex login and retry"
+        )
     finally:
         await app.close()
         opened.store.close()
