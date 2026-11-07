@@ -300,12 +300,12 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
         store=SimpleNamespace(cwd=str(workspace)),
     )
 
-    assert _child_base_system_prompt(loop, str(workspace)) is parent_prompt
+    assert _child_base_system_prompt(loop, str(workspace))[0] is parent_prompt
     equivalent_cwd = str(workspace / ".." / workspace.name)
-    assert _child_base_system_prompt(loop, equivalent_cwd) is parent_prompt
+    assert _child_base_system_prompt(loop, equivalent_cwd)[0] is parent_prompt
     symlink_cwd = tmp_path / "workspace-link"
     symlink_cwd.symlink_to(workspace, target_is_directory=True)
-    assert _child_base_system_prompt(loop, str(symlink_cwd)) is parent_prompt
+    assert _child_base_system_prompt(loop, str(symlink_cwd))[0] is parent_prompt
     assert "new memory" not in parent_prompt
 
 
@@ -324,9 +324,10 @@ def test_fresh_cwd_child_loads_current_memory(tmp_path: Path, monkeypatch: pytes
         project_registry=registry,
     )
 
-    child_prompt = _child_base_system_prompt(loop, str(workspace))
+    child_prompt, project_dir = _child_base_system_prompt(loop, str(workspace))
     assert isinstance(child_prompt, str)
     assert "current child memory" in child_prompt
+    assert project_dir == workspace
 
 
 @pytest.mark.asyncio

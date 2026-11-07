@@ -1773,6 +1773,10 @@ def test_scrollback_stream_events_render() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
         ),
+        StreamEventType.CONFIG_CHANGED: StreamEvent(
+            StreamEventType.CONFIG_CHANGED,
+            data={"message": "agent profiles changed: added specialist"},
+        ),
         StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
             StreamEventType.CHILD_MESSAGE_DELIVERED,
             data={"child_label": "root:1", "preview": "check the retry"},
@@ -5027,6 +5031,30 @@ def test_child_message_delivered_background_event_renders_parent_receipt(
     )
 
     assert "delivered to worker: check the retry" in output.getvalue()
+
+
+def test_nested_stalled_idle_background_event_renders_last_message(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:1:1",
+                "description": "nested verifier",
+                "status": "child_idle",
+                "text": "nested verifier is waiting for review",
+            },
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "nested verifier" in rendered
+    assert "nested verifier is waiting for review" in rendered
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:

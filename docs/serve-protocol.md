@@ -1091,6 +1091,7 @@ Event fields are:
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `account_limit` | `event`, `data: object` | `session_id` |
 | `account_state_unknown` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
@@ -1466,6 +1467,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
+| `live_config_changed` | live skill and agent-profile reloads emit `config_changed` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |

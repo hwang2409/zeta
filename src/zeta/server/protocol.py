@@ -171,6 +171,7 @@ class EventDescriptor(StrEnum):
     ASSISTANT_MESSAGE = "assistant_message"
     RETRY = "retry"
     ASSISTANT_RESET = "assistant_reset"
+    CONFIG_CHANGED = "config_changed"
     APPROVAL_REQUEST = "approval_request"
     APPROVAL_END = "approval_end"
     TOOL_START = "tool_start"
@@ -209,6 +210,7 @@ FEATURES = (
     "send_images_delivery_id",
     "list_sessions_paging",
     "memory_updated",
+    "live_config_changed",
     "ping",
     "assistant_reset",
     "model_input_ids",
