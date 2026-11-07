@@ -309,10 +309,14 @@ class MethodDescriptor(Enum):
 
     @classmethod
     def advertised(cls, version: str, features: frozenset[str], role: str) -> list[str]:
+        negotiated = tuple(int(part) for part in version.split("."))
         methods = [
             item.wire
             for item in cls
-            if (item.since is None or version != "1.0")
+            if (
+                item.since is None
+                or negotiated >= tuple(int(part) for part in item.since.split("."))
+            )
             and (item.feature is None or item.feature in features)
             and (role != "observer" or item.access is Access.READ)
         ]

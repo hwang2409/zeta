@@ -560,7 +560,9 @@ class _Client:
                 "method is unavailable to read-only observers",
                 {"method": method},
             )
-        if descriptor.since == "1.1" and self.protocol_version == "1.0":
+        if descriptor.since is not None and tuple(
+            int(part) for part in self.protocol_version.split(".")
+        ) < tuple(int(part) for part in descriptor.since.split(".")):
             raise ProtocolError(
                 ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires protocol 1.1"
             )
