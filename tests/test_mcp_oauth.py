@@ -2260,7 +2260,7 @@ async def test_idle_client_does_not_send_token_after_public_logout(
     project.mkdir()
     token = _write_token("live", home, access_token="deleted-token")
     manager = MCPManagementService(home=home, project_dir=project)
-    manager.add("live", scope="user", url="https://mcp.test", oauth=True)
+    await manager.add("live", scope="user", url="https://mcp.test", oauth=True)
     attempts: list[str | None] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -2286,7 +2286,7 @@ async def test_idle_client_does_not_send_token_after_public_logout(
     )
     outcome = manager.logout("live", scope="user")
     if inspect.isawaitable(outcome):
-        await outcome
+        await asyncio.wait_for(outcome, 10)
     result = await client.call_tool("echo", {}, AbortSignal())
     assert result["isError"] is True
     assert token.access_token not in result["content"][0]["text"]
@@ -2545,10 +2545,10 @@ async def _wait_for_thread_gate(store: _CredentialRaceStore) -> None:
     assert entered, "credential race gate was not reached"
 
 
-def _oauth_manager(home: Path, project: Path) -> MCPManagementService:
+async def _oauth_manager(home: Path, project: Path) -> MCPManagementService:
     project.mkdir(exist_ok=True)
     manager = MCPManagementService(home=home, project_dir=project)
-    manager.add("live", scope="user", url="https://mcp.test/rpc", oauth=True)
+    await manager.add("live", scope="user", url="https://mcp.test/rpc", oauth=True)
     return manager
 
 
@@ -2562,7 +2562,7 @@ async def test_logout_wins_every_refresh_result_to_retry_window(
 ) -> None:
     home = tmp_path / "home"
     original = _write_token("live", home, access_token="stale-token")
-    manager = _oauth_manager(home, tmp_path / "project")
+    manager = await _oauth_manager(home, tmp_path / "project")
     race = _CredentialRaceProcess(
         home,
         gate=(
@@ -2610,7 +2610,7 @@ async def test_logout_wins_failed_refresh_reload_windows(
 ) -> None:
     home = tmp_path / "home"
     original = _write_token("live", home, access_token="stale-token")
-    manager = _oauth_manager(home, tmp_path / "project")
+    manager = await _oauth_manager(home, tmp_path / "project")
     race = _CredentialRaceProcess(
         home,
         gate="before_load" if window == "before_failed_reload" else "after_load",
@@ -2679,7 +2679,7 @@ async def test_public_login_and_logout_follow_both_exclusive_lock_orders(
 ) -> None:
     home = tmp_path / "home"
     original = _write_token("live", home, access_token="old-token")
-    manager = _oauth_manager(home, tmp_path / "project")
+    manager = await _oauth_manager(home, tmp_path / "project")
     candidate = replace(original, access_token="new-login-token")
 
     async def fake_authorize(**_kwargs: object) -> MCPOAuthToken:
@@ -2726,7 +2726,7 @@ async def test_colliding_server_names_keep_separate_credentials_and_logout(
     (tmp_path / "project").mkdir()
     names = ("team/server", "team_server")
     for name in names:
-        manager.add(
+        await manager.add(
             name,
             scope="user",
             url=f"https://{name.replace('/', '-')}.test/rpc",
@@ -2797,7 +2797,7 @@ async def test_colliding_server_names_keep_separate_credentials_and_logout(
 
         logout = manager.logout("team/server", scope="user")
         if inspect.isawaitable(logout):
-            await logout
+            await asyncio.wait_for(logout, 10)
         removed = await pairs["team/server"][0].call_tool("echo", {}, AbortSignal())
         retained = await pairs["team_server"][0].call_tool("echo", {}, AbortSignal())
         assert removed["isError"] is True
