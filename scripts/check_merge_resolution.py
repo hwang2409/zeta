@@ -160,6 +160,41 @@ def _train_parent_qualifies(parent: str, first_parent_chain: set[str]) -> bool:
         current = parents[0]
 
 
+def _direct_main_parent(
+    parents: list[str], first_parent_chain: set[str], origin_main: str
+) -> tuple[int | None, str]:
+    matches = [
+        index for index, parent in enumerate(parents) if parent in first_parent_chain
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is on origin/main first-parent ancestry"
+    if len(matches) > 1:
+        return None, ""
+    matches = [
+        index
+        for index, parent in enumerate(parents)
+        if origin_main and _is_ancestor(parent, origin_main)
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is an ancestor of origin/main"
+    return None, ""
+
+
+def _train_chain_parent(
+    parents: list[str], first_parent_chain: set[str], origin_main: str
+) -> tuple[int | None, str]:
+    if not origin_main:
+        return None, ""
+    matches = [
+        index
+        for index, parent in enumerate(parents)
+        if _train_parent_qualifies(parent, first_parent_chain)
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is the train merge chain"
+    return None, ""
+
+
 def _identify_main_parent(
     parents: list[str],
 ) -> tuple[int | None, str, str, str]:
@@ -171,83 +206,26 @@ def _identify_main_parent(
         origin_main = git("rev-parse", "--verify", "origin/main").strip()
     except subprocess.CalledProcessError:
         first_parent_chain, origin_main = set(), ""
-
-    first_parent_matches = [
-        index for index, parent in enumerate(parents) if parent in first_parent_chain
-    ]
-    if len(first_parent_matches) == 1:
+    index, reason = _direct_main_parent(parents, first_parent_chain, origin_main)
+    if index is not None:
         return (
-            first_parent_matches[0],
-            "the selected parent is on origin/main first-parent ancestry",
+            index,
+            reason,
             origin_main,
             "exactly one parent is on origin/main ancestry",
         )
-    if len(first_parent_matches) > 1:
-        train_matches = [
-            index
-            for index, parent in enumerate(parents)
-            if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-        ]
-        if len(train_matches) == 1:
-            return (
-                train_matches[0],
-                "the selected parent is the train merge chain",
-                origin_main,
-                "exactly one parent is the train merge chain",
-            )
-        return None, "", origin_main, "both parents qualify"
-
-    ancestry_matches = [
-        index
-        for index, parent in enumerate(parents)
-        if origin_main and _is_ancestor(parent, origin_main)
+    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    if index is not None:
+        return index, reason, origin_main, "exactly one parent is the train merge chain"
+    train_matches = [
+        parent
+        for parent in parents
+        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
     ]
-    if len(ancestry_matches) == 1:
-        return (
-            ancestry_matches[0],
-            "the selected parent is an ancestor of origin/main",
-            origin_main,
-            "exactly one parent is on origin/main ancestry",
-        )
-    if len(ancestry_matches) > 1:
-        train_matches = [
-            index
-            for index, parent in enumerate(parents)
-            if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-        ]
-        if len(train_matches) == 1:
-            return (
-                train_matches[0],
-                "the selected parent is the train merge chain",
-                origin_main,
-                "exactly one parent is the train merge chain",
-            )
-        return None, "", origin_main, "both parents qualify"
-
-    train_matches = (
-        [
-            index
-            for index, parent in enumerate(parents)
-            if origin_main and _train_parent_qualifies(parent, first_parent_chain)
-        ]
-        if origin_main
-        else []
+    details = (
+        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
     )
-    if len(train_matches) == 1:
-        return (
-            train_matches[0],
-            "the selected parent is the train merge chain",
-            origin_main,
-            "exactly one parent is the train merge chain",
-        )
-    return (
-        None,
-        "",
-        origin_main,
-        "both parents qualify"
-        if len(train_matches) > 1
-        else "neither parent qualifies",
-    )
+    return None, "", origin_main, details
 
 
 def _render_parent_refusal(

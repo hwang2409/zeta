@@ -638,6 +638,7 @@ def test_ci_events_are_supported_by_quality_lint_base_selection(
     workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text())
     events = workflow.get("on", workflow.get(True, {}))
     assert events
+    results = []
     for event in events:
         repo_path = tmp_path / event
         repo_path.mkdir()
@@ -661,7 +662,15 @@ def test_ci_events_are_supported_by_quality_lint_base_selection(
             ["git", "push", "-q", "origin", "main"], cwd=repo_path, check=True
         )
         monkeypatch.chdir(repo_path)
-        quality.select_base(event, "main")
+        try:
+            base = quality.select_base(event, "main")
+        except (ValueError, subprocess.CalledProcessError) as error:
+            base = f"error: {error}"
+        results.append((event, base))
+    failures = [
+        (event, base) for event, base in results if str(base).startswith("error:")
+    ]
+    assert failures == [], results
 
 
 def test_ci_runs_quality_lint_for_pull_requests_and_main_pushes() -> None:
