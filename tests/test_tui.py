@@ -14338,7 +14338,14 @@ async def test_history_finder_does_not_cross_session_boundaries(
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
-    candidates = await second._history_finder.build_finder_candidates(request)
+    batches = [
+        batch
+        async for batch, complete in second._history_finder.build_finder_candidate_batches(
+            request
+        )
+        if complete
+    ]
 
-    assert [candidate.text for candidate in candidates.candidates] == []
+    assert len(batches) == 1
+    assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()
