@@ -18,6 +18,7 @@ from rich.console import Console
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail, owned_app
 from zeta.model_input import ModelInputEnvelope
 from zeta.core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -1247,11 +1248,12 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
             ),
             multiline=True,
         )
-        run_task = asyncio.create_task(app.run(prompt))
-        pipe.send_text("/status\r")
-        await asyncio.wait_for(status_rendered.wait(), 10)
-        pipe.send_text("\x04")
-        await run_task
+        async with owned_app(app) as owner:
+            run_task = owner.task(asyncio.create_task(app.run(prompt)))
+            pipe.send_text("/status\r")
+            await asyncio.wait_for(status_rendered.wait(), 10)
+            pipe.send_text("\x04")
+            await await_or_fail(run_task, what="status tui shutdown")
 
     assert "session_id:" in output.getvalue()
     assert "provider: codex" in output.getvalue()

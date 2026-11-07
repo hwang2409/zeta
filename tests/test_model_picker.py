@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail, owned_app
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import PROVIDER_MODELS
@@ -197,13 +198,10 @@ async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> No
     # test-contract: seam no public active-turn setup interface exists.
     app._active_task = asyncio.create_task(active_turn.wait())
 
-    try:
+    async with owned_app(app):
         output = await create_slash_registry(
             skill_catalog=SkillCatalog.empty()
         ).dispatch_async(app, "/model")
-    finally:
-        app._active_task.cancel()
-        await asyncio.gather(app._active_task, return_exceptions=True)
 
     assert output == (
         "model: offline (cannot change model while a turn or approval is active)"
@@ -428,7 +426,10 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
         assert moves == [1, -1]
 
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="picker prompt cleanup",
+        )
 
 
 def test_slash_completer_offers_model_names_after_model() -> None:

@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
@@ -500,7 +501,7 @@ async def test_child_todo_refresh_coalesces_pending_requests(
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
     assert task is not None
-    await task
+    await await_or_fail(task, what="todo refresh completion")
 
     assert refreshes == 2
     root.close()
@@ -1138,7 +1139,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     async def reject(*args: object, **kwargs: object) -> str:
         del args, kwargs
         started.set()
-        await release.wait()
+        await await_or_fail(release.wait(), what="child send release", timeout=10)
         return "child finished"
 
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
@@ -1185,7 +1186,10 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
 
     async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        await asyncio.to_thread(release.wait, 5)
+        await await_or_fail(
+            asyncio.to_thread(release.wait, 10),
+            what="child send release",
+        )
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
@@ -1324,7 +1328,10 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
 
     async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        await asyncio.to_thread(release.wait, 5)
+        await await_or_fail(
+            asyncio.to_thread(release.wait, 10),
+            what="child send release",
+        )
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
@@ -1364,7 +1371,7 @@ async def test_child_send_double_enter_queues_once(
         nonlocal calls
         calls += 1
         started.set()
-        await release.wait()
+        await await_or_fail(release.wait(), what="child send release", timeout=10)
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
