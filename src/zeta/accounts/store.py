@@ -45,6 +45,7 @@ from ..storage_format import (
     open_writer,
     require_closed_variant,
 )
+from . import availability
 from .files import (
     exists as _exists,
 )
@@ -143,17 +144,6 @@ class AccountId:
 
     def __str__(self) -> str:
         return f"{self.provider}:{self.name}"
-
-
-@dataclass(frozen=True, slots=True)
-class AccountDisplay:
-    account: AccountId
-    label: str
-    detail: str | None = None
-    usage: Any = None
-
-    def __str__(self) -> str:
-        return f"{self.account.provider}:{self.label}"
 
 
 class AccountStore:
@@ -269,39 +259,22 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
-    def list_catalog(self) -> list[AccountDisplay]:
+    def list_catalog(self) -> list[availability.AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
-        return [
-            AccountDisplay(
-                AccountId(*key.split(":", 1)),
-                value["labels"].get(key, key.split(":", 1)[1]),
+        return availability.catalog_display(value)
+
+    def list_display(self) -> list[availability.AccountDisplay]:
+        return availability.list_display(self)
+
+    def require_available(self, account: AccountId) -> None:
+        if not any(
+            item.account == account and item.available for item in self.list_display()
+        ):
+            raise AccountError(
+                f"account {account} is unavailable: credentials missing; "
+                f"run 'zeta accounts login {account.provider} {account.name} --replace'"
             )
-            for key in value["accounts"]
-        ]
-
-    def list_display(self) -> list[AccountDisplay]:
-        result = []
-        catalog = self.list_catalog()
-        with self._home() as home_fd:
-            for item in catalog:
-                tokens = _read_account_tokens(home_fd, item.account)
-                details = (
-                    tuple(filter(None, (tokens.email, tokens.workspace)))
-                    if tokens
-                    else ()
-                )
-                from .usage import read_usage
-
-                result.append(
-                    AccountDisplay(
-                        item.account,
-                        item.label,
-                        " · ".join(details) or None,
-                        read_usage(self, item.account),
-                    )
-                )
-        return result
 
     def default(self, provider: str) -> AccountId | None:
         if provider not in _PROVIDERS:
@@ -665,13 +638,11 @@ class AccountStore:
             legacy_exists = _exists_regular(home_fd, legacy_name)
             staged = self._recover_account(home_fd, account)
             if registered or staged is not None:
-                if staged is None:
-                    raise AccountError("OAuth credentials are invalid; login required")
                 if legacy_exists:
-                    with _open_account_directory(home_fd, account) as account_fd:
-                        if _file_mtime_ns(home_fd, legacy_name) > _file_mtime_ns(
-                            account_fd, "oauth.json"
-                        ):
+                    with _account_directory(home_fd, account) as account_fd:
+                        if staged is None or _file_mtime_ns(
+                            home_fd, legacy_name
+                        ) > _file_mtime_ns(account_fd, "oauth.json"):
                             tokens = _read_tokens(home_fd, legacy_name)
                             self._stage_account_tokens(account_fd, account, tokens)
                             _delete_publication_pending(account_fd)

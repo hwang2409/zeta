@@ -170,6 +170,11 @@ class ServerSlashSession:
             transcript_index_failure=loop.transcript_index_failure(
                 opened.metadata.session_id
             ),
+            unavailable_accounts=(
+                context.unavailable_accounts
+                if (context := getattr(loop, "account_context", None)) is not None
+                else ()
+            ),
         )
 
     async def slash_accounts(self, args: str) -> str:
@@ -180,10 +185,15 @@ class ServerSlashSession:
             return "accounts unavailable for this session"
         if args.split():
             return await asyncio.to_thread(rename_account_command, context.store, args)
-        displays = await asyncio.to_thread(context.store.list_display)
+        displays = (await context.list_snapshot()).displays
         lines: list[str] = []
         for item in displays:
-            lines.append(str(item) + (f"  {item.detail}" if item.detail else ""))
+            availability = (
+                "  unavailable: credentials missing" if not item.available else ""
+            )
+            lines.append(
+                str(item) + (f"  {item.detail}" if item.detail else "") + availability
+            )
             lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
         return "\n".join(lines) or "no accounts"
 

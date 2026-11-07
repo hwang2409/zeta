@@ -8234,6 +8234,12 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
     store = AccountStore(home)
+    missing = AccountId("anthropic", "missing")
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "missing").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    store.credential_path(missing).unlink()
     store._write_usage_bytes(
         account,
         json.dumps(
@@ -8285,10 +8291,12 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
                 {"session_id": sid},
             )
         )[-1]["result"]
-        row = listed["accounts"][0]
-        assert row["account"] == "codex:work"
+        rows = {row["account"]: row for row in listed["accounts"]}
+        row = rows["codex:work"]
+        assert row["available"] is True
         assert row["current"] is True
         assert row["default"] is True
+        assert rows["anthropic:missing"]["available"] is False
         assert row["usage"]["error"] == "internal refresh error; retry or restart zeta"
         assert row["usage"]["snapshot"]["windows"] == [
             {
@@ -8310,7 +8318,18 @@ async def test_serve_account_list_runs_store_off_loop_and_includes_usage(
         )[-1]["result"]
         assert refreshed
         assert refreshed_list == listed
-        assert off_loop_reads == 2
+
+        status = (
+            await _request(
+                reader,
+                writer,
+                "accounts-status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]["text"]
+        assert "unavailable_accounts: anthropic:missing" in status.splitlines()
+        assert off_loop_reads == 3
     finally:
         await _close(server, writer)
 

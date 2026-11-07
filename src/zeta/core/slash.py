@@ -532,6 +532,7 @@ class SlashStatus:
     explicit_finish: bool = False
     connection_setup_counts: tuple[dict[str, object], ...] = ()
     max_agent_depth: int = 3
+    unavailable_accounts: tuple[str, ...] = ()
 
 
 class SlashSession(Protocol):
@@ -940,6 +941,7 @@ def _format_status(status: SlashStatus) -> str:
         f"tokens_in_current_context: {context_tokens}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
+        "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
