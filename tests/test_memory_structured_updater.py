@@ -880,11 +880,13 @@ def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
         projections += 1
         return original_projection(entry)
 
+    # test-contract: seam count cache work through the prepare path
     monkeypatch.setattr(entry_request, "_entry_projection", projection)
 
     first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
     second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
 
+    # test-contract: seam cache invalidation is observed only through prepare output
     assert second.prompt == first.prompt
     first_projections = projections
     assert first_projections > 0
