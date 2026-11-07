@@ -30,6 +30,69 @@ def service(tmp_path, mount=None):
     )
 
 
+async def _close_management_service(manager: MCPManagementService) -> None:
+    close = getattr(manager, "aclose", None)
+    if close is not None:
+        await close()
+
+
+@pytest.mark.parametrize(
+    "scenario", ("no transaction", "during transaction", "after close", "double close")
+)
+@pytest.mark.asyncio
+async def test_management_service_close_owns_transaction_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    manager = service(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_transaction = manager._transaction
+    transaction_calls = 0
+
+    def gated_transaction(mutation=None):
+        nonlocal transaction_calls
+        transaction_calls += 1
+        if scenario == "during transaction":
+            entered.set()
+            closed = getattr(manager, "_closed", None)
+            if closed is not None:
+                if not closed.wait(10):
+                    raise AssertionError("management close did not begin")
+            elif not release.wait(10):
+                raise AssertionError("management transaction gate was not released")
+        return original_transaction(mutation)
+
+    # test-contract: seam transaction worker has no public readiness hook
+    monkeypatch.setattr(manager, "_transaction", gated_transaction)
+    transaction = None
+    try:
+        if scenario == "during transaction":
+            transaction = asyncio.create_task(
+                manager.add("local", scope="project", command=sys.executable)
+            )
+            assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(_close_management_service(manager), 10)
+        if scenario == "double close":
+            await asyncio.wait_for(_close_management_service(manager), 10)
+        calls_after_close = transaction_calls
+        release.set()
+        if transaction is not None:
+            result = await asyncio.gather(transaction, return_exceptions=True)
+            assert type(result[0]).__name__ == "MCPManagementClosedError"
+            assert not manager.path("project").exists()
+        with pytest.raises(MCPManagementError) as exc_info:
+            await manager.add("late", scope="user", command=sys.executable)
+        assert type(exc_info.value).__name__ == "MCPManagementClosedError"
+        assert transaction_calls == calls_after_close
+    finally:
+        release.set()
+        if transaction is not None and not transaction.done():
+            transaction.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
+
+
 def test_resident_mcp_state_has_no_public_read_bypass():
     message = "MCP state reads must use await service.view() or service.resolve()"
     resident_names = {"_view", "_published_candidate", "_durable_candidate"}

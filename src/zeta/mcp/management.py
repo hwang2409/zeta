@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -43,6 +44,10 @@ _LOCK_TIMEOUT_SECONDS = 1.0
 
 class MCPManagementError(RuntimeError):
     """A user-correctable MCP management error."""
+
+
+class MCPManagementClosedError(MCPManagementError):
+    """The MCP management service is closed."""
 
 
 def _freeze(value: object) -> object:
@@ -123,6 +128,7 @@ class MCPManagementService:
         self._published_candidate: _ManagementCandidate | None = None
         self._durable_candidate: _ManagementCandidate | None = None
         self._transaction_task: asyncio.Task[_ManagementCandidate] | None = None
+        self._closed = threading.Event()
         self._runtime: MCPConfig | None = None
         self._home_path: Path | None = None
         self._project_path: Path | None = None
@@ -231,27 +237,45 @@ class MCPManagementService:
             raise MCPManagementError(f"JSON document must be an object: {path}")
         return value
 
-    @staticmethod
-    def _atomic_json(path: Path, data: object, *, mode: int | None = None) -> None:
+    def _ensure_open(self) -> None:
+        if self._closed.is_set():
+            raise MCPManagementClosedError("MCP management service is closed")
+
+    def _atomic_json(
+        self, path: Path, data: object, *, mode: int | None = None
+    ) -> None:
+        self._ensure_open()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_open()
         fd, temporary = tempfile.mkstemp(
             prefix=".mcp-management.", dir=str(path.parent)
         )
         try:
             if mode is not None:
+                self._ensure_open()
                 os.fchmod(fd, mode)
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(data, output, indent=2, sort_keys=True)
-                output.write("\n")
+            payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+            self._ensure_open()
+            output = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with output:
+                output.write(payload)
+                self._ensure_open()
                 output.flush()
+                self._ensure_open()
                 os.fsync(output.fileno())
+            self._ensure_open()
             os.replace(temporary, path)
+            self._ensure_open()
             directory = os.open(path.parent, os.O_RDONLY)
             try:
+                self._ensure_open()
                 os.fsync(directory)
             finally:
                 os.close(directory)
         finally:
+            if fd >= 0:
+                os.close(fd)
             Path(temporary).unlink(missing_ok=True)
 
     def _canonical_paths(self) -> tuple[Path, Path | None, Path]:
@@ -284,20 +308,26 @@ class MCPManagementService:
         deadline = time.monotonic() + self._lock_timeout
         try:
             for path in sorted(set(paths), key=str):
+                self._ensure_open()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 lock_path = path.with_name(f".{path.name}.lock")
+                self._ensure_open()
                 handle = lock_path.open("a+")
-                while True:
-                    try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            handle.close()
-                            raise MCPManagementError(
-                                "mcp busy: configuration is being updated; retry"
-                            ) from None
-                        time.sleep(0.01)
+                try:
+                    while True:
+                        self._ensure_open()
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise MCPManagementError(
+                                    "mcp busy: configuration is being updated; retry"
+                                ) from None
+                            time.sleep(0.01)
+                except BaseException:
+                    handle.close()
+                    raise
                 handles.append(handle)
             return handles
         except BaseException:
@@ -469,6 +499,7 @@ class MCPManagementService:
         self,
         mutation: Callable[[Path, Path | None, Path], None] | None = None,
     ) -> _ManagementCandidate:
+        self._ensure_open()
         home_path, project_path, trust_path = self._canonical_paths()
         paths = tuple(
             path for path in (home_path, project_path, trust_path) if path is not None
@@ -521,6 +552,7 @@ class MCPManagementService:
         mutation: Callable[[Path, Path | None, Path], None] | None = None,
     ) -> _ManagementCandidate:
         assert self._transaction_gate.locked(), "transaction requires transaction gate"
+        self._ensure_open()
         task = asyncio.create_task(asyncio.to_thread(self._transaction, mutation))
         self._transaction_task = task
         try:
@@ -535,6 +567,18 @@ class MCPManagementService:
         if self._transaction_task is task:
             self._transaction_task = None
         return candidate
+
+    async def aclose(self) -> None:
+        """Stop new transactions and join the transaction owned by this service."""
+
+        self._closed.set()
+        task = self._transaction_task
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except MCPManagementClosedError:
+            pass
 
     async def _repair_lag_locked(self) -> None:
         assert self._transaction_gate.locked(), "repair requires transaction gate"
