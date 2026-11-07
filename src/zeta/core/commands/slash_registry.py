@@ -9,13 +9,13 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from ..mcp.client import MCPPrompt
-from ..mcp.prompt_commands import MCPPromptCommands, SlashPromptError, dispatch_prompt
-from ..model_input import ModelInputEnvelope, skill_model_input
-from ..protocol.types import MessageOrigin
-from ..skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
-from ..skills.invocation import dollar_skill_mentions
-from .commands.custom_commands import (
+from ...mcp.client import MCPPrompt
+from ...mcp.prompt_commands import MCPPromptCommands, SlashPromptError, dispatch_prompt
+from ...model_input import ModelInputEnvelope, skill_model_input
+from ...protocol.types import MessageOrigin
+from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
+from ...skills.invocation import dollar_skill_mentions
+from .custom_commands import (
     CustomCommand,
     InlineShellRunner,
     needs_inline_shell_resolution,
@@ -24,7 +24,7 @@ from .commands.custom_commands import (
 )
 
 if TYPE_CHECKING:
-    from .slash import SlashSession
+    from ..slash import SlashSession
 
 type SlashResult = (
     str

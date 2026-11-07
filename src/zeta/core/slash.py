@@ -26,16 +26,16 @@ from .commands.custom_commands import (
     CustomCommand,
     load_custom_commands,
 )
-from .project_context import (
-    discover_project_root,
-    project_instructions_command,
-)
-from .slash_registry import (
+from .commands.slash_registry import (
     ServeSlash,
     SlashCommand,
     SlashCommandRegistry,
     SlashResult,
     SlashSurface,
+)
+from .project_context import (
+    discover_project_root,
+    project_instructions_command,
 )
 from .store import ConversationEntry
 
@@ -896,6 +896,17 @@ def _project_mutates(args: str) -> bool:
     return args.strip() == "init"
 
 
+def _mcp_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {
+        "add",
+        "remove",
+        "enable",
+        "disable",
+        "trust",
+        "untrust",
+    }
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -920,7 +931,12 @@ def create_slash_registry(
     )
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(
-        SlashCommand("mcp", _run_mcp, "show MCP server status", ServeSlash())
+        SlashCommand(
+            "mcp",
+            _run_mcp,
+            "show MCP server status",
+            ServeSlash(mutates=_mcp_mutates),
+        )
     )
     registry.register(
         SlashCommand(

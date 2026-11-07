@@ -17,6 +17,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
+from ..core.commands.slash_registry import SlashSurface
 from ..core.project_context import discover_repo_root, project_command_view
 from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
@@ -25,7 +26,6 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
-from ..core.slash_registry import SlashSurface
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -279,7 +279,18 @@ class ServerSlashSession:
         self, args: str
     ) -> str | ModelInputEnvelope | _ClientOnlySlashResult:
         stripped = args.strip()
-        if stripped.partition(" ")[0] not in {"", "status", "auth", "logout"}:
+        if stripped.partition(" ")[0] not in {
+            "",
+            "status",
+            "auth",
+            "logout",
+            "add",
+            "remove",
+            "enable",
+            "disable",
+            "trust",
+            "untrust",
+        }:
             return _ClientOnlySlashResult("mcp")
         if self._runtime.loop is None:
             raise RuntimeError(_UNAVAILABLE_NOTICE)
