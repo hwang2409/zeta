@@ -36,10 +36,20 @@ class MCPManager:
         self._pending_remove: str | None = None
         self.last_result: object | None = None
         self.credential_store_error: PublicCredentialStoreError | None = None
+        self._entries: tuple[ManagedServer, ...] = ()
+        self._all_entries: tuple[ManagedServer, ...] = ()
+
+    def _set_entries(self, entries: tuple[ManagedServer, ...]) -> None:
+        self._all_entries = entries
+        effective = {item.name: item for item in entries}
+        self._entries = tuple(effective.values())
+
+    async def refresh(self) -> None:
+        self._set_entries((await self.service.view()).entries)
 
     @property
-    def entries(self) -> list[ManagedServer]:
-        return self.service.list()
+    def entries(self) -> tuple[ManagedServer, ...]:
+        return self._entries
 
     def _selected(self) -> ManagedServer | None:
         entries = self.entries
@@ -132,39 +142,45 @@ class MCPManager:
             )
         )
         lines.append(
-            overlay.hint("l login · o logout · d remove · T trust · esc close")
+            overlay.hint("l login · o logout · d remove · T trust/untrust · esc close")
         )
         return lines
 
-    def add(self, draft: MCPAddDraft) -> ManagedServer:
+    async def add(self, draft: MCPAddDraft) -> ManagedServer:
         self.wizard_active = False
         env = {name: f"${{{reference}}}" for name, reference in draft.env_refs.items()}
         headers = {
             name: f"${{{reference}}}" for name, reference in draft.header_refs.items()
         }
         if draft.transport == "stdio":
-            return self.service.add(
+            view = await self.service.add(
                 draft.name,
                 scope=draft.scope,
                 command=draft.command,
                 args=draft.args,
                 env=env,
             )
-        return self.service.add(
-            draft.name,
-            scope=draft.scope,
-            url=draft.url,
-            oauth=draft.oauth,
-            env=env,
-            headers=headers,
+        else:
+            view = await self.service.add(
+                draft.name,
+                scope=draft.scope,
+                url=draft.url,
+                oauth=draft.oauth,
+                env=env,
+                headers=headers,
+            )
+        self._set_entries(view.entries)
+        return next(
+            item
+            for item in view.entries
+            if item.name == draft.name and item.scope == draft.scope
         )
 
     async def finish_add(self, draft: MCPAddDraft) -> ManagedServer:
-        added = self.add(draft)
-        await self.service.sync_runtime()
-        return added
+        return await self.add(draft)
 
     async def dispatch(self, key: str) -> object | None:
+        await self.refresh()
         if key == "a":
             self.wizard_active = True
             return None
@@ -181,13 +197,20 @@ class MCPManager:
             self.details = not self.details
             return None
         if key == "e":
-            self.last_result = self.service.set_enabled(
+            view = await self.service.set_enabled(
                 item.name, scope=item.scope, enabled=not item.enabled
+            )
+            self._set_entries(view.entries)
+            self.last_result = next(
+                value
+                for value in view.entries
+                if value.name == item.name and value.scope == item.scope
             )
         elif key == "d":
             unshadows = item.scope == "project" and any(
                 candidate.name == item.name
-                for candidate in self.service.list(scope="user")
+                for candidate in self._all_entries
+                if candidate.scope == "user"
             )
             if unshadows and self._pending_remove != item.name:
                 self._pending_remove = item.name
@@ -196,7 +219,9 @@ class MCPManager:
                     "press d again to confirm"
                 )
                 return self.last_result
-            self.service.remove(item.name, scope=item.scope)
+            self._set_entries(
+                (await self.service.remove(item.name, scope=item.scope)).entries
+            )
             self._pending_remove = None
             self.last_result = "removed"
         elif key == "t":
@@ -204,18 +229,23 @@ class MCPManager:
         elif key == "l":
             await self.service.login(item.name, scope=item.scope)
             self.credential_store_error = None
-            await self.service.refresh_credentials()
+            self._set_entries((await self.service.refresh_credentials()).entries)
             self.last_result = f"authorized {item.name}."
         elif key == "o":
             await self.service.logout(item.name, scope=item.scope)
+            await self.refresh()
             self.credential_store_error = None
             self.last_result = f"logged out {item.name}."
         elif key == "T":
-            self.last_result = self.service.trust(item.name)
+            view = await self.service.set_trusted(item.name, trusted=not item.trusted)
+            self._set_entries(view.entries)
+            self.last_result = next(
+                value
+                for value in view.entries
+                if value.name == item.name and value.scope == item.scope
+            )
         else:
             raise ValueError(f"unknown MCP manager key: {key}")
-        if key in {"e", "d", "T"}:
-            await self.service.sync_runtime()
         return self.last_result
 
 

@@ -17,7 +17,6 @@ from rich.text import Text
 from tests.support.fake_backend import FakeBackend
 from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.core.store._child_runs import (
     parse_child_run_id,
@@ -33,6 +32,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.server.ergonomics import history
 from zeta.skills import SkillCatalog
 from zeta.transcript_search.index import TranscriptIndex, TranscriptSource

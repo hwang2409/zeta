@@ -80,7 +80,6 @@ from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import SlashStatus, budget_for_model
 from zeta.core.slash import UsageSnapshot as SlashUsageSnapshot
@@ -95,6 +94,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
@@ -153,7 +153,6 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    harness_notice,
     with_message_origin,
 )
 from zeta.tui import theme
@@ -1535,26 +1534,8 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
-@pytest.mark.asyncio
-async def test_task_safety_notice_and_kill_render_through_real_paths(
-    tmp_path: Path,
-) -> None:
-    notice = (
-        "task task-safety (watch ci) has run 1h; "
-        "kill it with task_kill or leave it running"
-    )
-    store = ConversationStore(tmp_path, session_id="child")
-    store.append_message(
-        harness_notice("task safety", notice, event="agent_task_safety")
-    )
-    control = AgentTranscriptControl()
-    await control.load(store.session_dir)
-    assert notice in Text.from_ansi(control.transcript.render(120)).plain
-
-    cause = (
-        "explicit-finish task safety limit expired at task age 7200 seconds "
-        "after no owner turn for 3600 seconds"
-    )
+def test_task_safety_kill_renders_cause() -> None:
+    cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     event = StreamEvent(
         StreamEventType.AGENT_NOTIFICATION,
         data={
@@ -1571,7 +1552,6 @@ async def test_task_safety_notice_and_kill_render_through_real_paths(
 
     assert rendered is not None
     assert cause in renderable_plain(rendered)
-    store.close()
 
 
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
@@ -5681,7 +5661,9 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         store.session_dir / "agents", session_id="1", cwd=store.cwd
     )
     child.mark_agent_parent(call.id)
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved child tail")]))
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("saved child tail")])
+    )
     store.allocate_agent_index()
     store.register_agent_child(
         call,
@@ -5689,17 +5671,21 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         description="task research",
         turns_used=2,
     )
+    child.close()
 
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     await loop.activate()
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
+
     def render_transcript() -> str:
         transcript = TranscriptWidget()
         transcript.start_tool(
@@ -9122,7 +9108,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from tempfile import TemporaryDirectory
 
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
+        from zeta.runtime.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
@@ -14423,7 +14409,14 @@ async def test_history_finder_does_not_cross_session_boundaries(
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
-    candidates = await second._history_finder.build_finder_candidates(request)
+    batches = [
+        batch
+        async for batch, complete in second._history_finder.build_finder_candidate_batches(
+            request
+        )
+        if complete
+    ]
 
-    assert [candidate.text for candidate in candidates.candidates] == []
+    assert len(batches) == 1
+    assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()

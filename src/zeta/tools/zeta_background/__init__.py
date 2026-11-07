@@ -135,6 +135,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "run_background",
         _run_background,
+        binding="shared",
         approval_subject="command",
         description=(
             "Start a shell command as a session-scoped background task. "
@@ -158,6 +159,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "task_output",
         _task_output,
+        binding="shared",
         description=(
             "Read incremental output and status from a background task. Completion "
             "is announced automatically and wakes the agent; task_output only reads "
@@ -179,6 +181,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "task_input",
         _task_input,
+        binding="shared",
         approval_subject="data",
         description=(
             "Write bounded UTF-8 text to a live background task's stdin. "
@@ -200,6 +203,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "task_kill",
         _task_kill,
+        binding="shared",
         description="Terminate a background task process group.",
         parameters={
             "type": "object",

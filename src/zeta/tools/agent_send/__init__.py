@@ -46,6 +46,7 @@ def register_send(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "agent_send",
         _agent_send,
+        binding="shared",
         description=(
             "Send a follow-up to an eligible child you started. A running child "
             "receives it after its current tool call, before its next model call. "
