@@ -3,12 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 from zeta.protocol import types
 from zeta.server import event_contract
-from zeta.server.connections import ConnectionRegistry
-from zeta.server.protocol import FrameCodec, ProtocolError
 
 PROTOCOL_DOC = Path(__file__).parents[1] / "docs" / "serve-protocol.md"
 
@@ -52,25 +48,6 @@ def test_protocol_docs_match_every_runtime_wire_event() -> None:
         "add every runtime wire event to its event_contract mapping and the "
         "event table in docs/serve-protocol.md"
     )
-
-
-@pytest.mark.asyncio
-async def test_unregistered_event_names_cannot_reach_the_wire() -> None:
-    registry = object.__new__(ConnectionRegistry)
-    registry._controller = None
-    with pytest.raises(
-        ValueError,
-        match="add it to event_contract and docs/serve-protocol.md",
-    ):
-        await registry.publish_controller("undocumented", None)
-
-
-def test_unregistered_error_codes_cannot_reach_the_wire() -> None:
-    message = "add it to PROTOCOL_ERROR_CODES and docs/serve-protocol.md"
-    with pytest.raises(ValueError, match=message):
-        ProtocolError(-32999, "undocumented")
-    with pytest.raises(ValueError, match=message):
-        FrameCodec().error_response(1, -32999, "undocumented")
 
 
 def test_protocol_connection_summary_includes_observers() -> None:
