@@ -713,6 +713,11 @@ class SlashCommandRegistry:
             return
         self._custom_commands[command.name] = command
 
+    def register_live_config(
+        self, catalog: SkillCatalog, _agents: object
+    ) -> None:
+        self.register_skills(catalog)
+
     def register_skills(self, catalog: SkillCatalog) -> None:
         """Replace skills after built-ins and custom commands."""
 
