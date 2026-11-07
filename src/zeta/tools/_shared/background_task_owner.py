@@ -356,5 +356,3 @@ class _BackgroundTaskOwner:
         self.defer_receipt_for_close = False
         self._receipt_release.set()
         await self.wait()
-
-
