@@ -201,7 +201,16 @@ class _BackgroundTaskOwner:
             self.terminal_candidate = candidate
             rows = self.registry._persistence_rows(
                 tuple(
-                    candidate if item is self.record else item
+                    candidate
+                    if item is self.record
+                    else (
+                        self.registry._owners[item.task_id].terminal_candidate
+                        if (
+                            self.registry._owners[item.task_id].terminal_durable.is_set()
+                            and self.registry._owners[item.task_id].terminal_candidate is not None
+                        )
+                        else item
+                    )
                     for item in self.registry._records.values()
                 )
             )

@@ -746,8 +746,20 @@ async def test_background_task_owner_state_table(
 
         if row in {"two-task-close-ordering", "two-task-close-cancellation"}:
             events: list[str] = []
+            task_ids: list[str] = []
             original_notice = registry.background_tasks._notice
-            registry.background_tasks._notice = lambda notice: (events.append("aggregate") if hasattr(notice, "tasks") else None, original_notice(notice))[1]
+
+            def record_aggregate(notice):
+                if hasattr(notice, "tasks"):
+                    rows = json.loads(
+                        (store.session_dir / "background_tasks.json").read_text()
+                    )
+                    by_id = {item["task_id"]: item for item in rows}
+                    assert all(by_id[task_id]["running"] is False for task_id in task_ids)
+                    events.append("aggregate")
+                return original_notice(notice)
+
+            registry.background_tasks._notice = record_aggregate
             original_produce = flow.produce
 
             async def record_receipt(item):
@@ -755,8 +767,12 @@ async def test_background_task_owner_state_table(
                 return await original_produce(item)
 
             monkeypatch.setattr(flow, "produce", record_receipt)
-            await start_registered(_python("import time; time.sleep(30)"))
-            await start_registered(_python("import time; time.sleep(30)"))
+            task_ids.extend(
+                [
+                    await start_registered(_python("import time; time.sleep(30)")),
+                    await start_registered(_python("import time; time.sleep(30)")),
+                ]
+            )
             if row.endswith("cancellation"):
                 closing = asyncio.create_task(registry.close())
                 closing.cancel()
