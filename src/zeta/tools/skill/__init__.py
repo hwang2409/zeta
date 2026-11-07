@@ -11,7 +11,7 @@ async def _load(registry: ToolRegistry, arguments: dict[str, str]) -> str:
     try:
         meta = registry.skill_catalog.find(name)
     except ValueError:
-        await registry.refresh_skills(force=True)
+        await registry.refresh_live_config(force=True)
         meta = registry.skill_catalog.find(name)
     return load_skill_prompt(meta)
 
