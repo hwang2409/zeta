@@ -18,7 +18,11 @@ from typing import Any
 import pytest
 
 from zeta.core.session import SessionManager
-from zeta.core.session_execution import OwnerHint, SessionExecutionLease
+from zeta.core.session_execution import (
+    OwnerHint,
+    SessionExecutionLease,
+    session_owner_status,
+)
 
 _WAIT_TIMEOUT_SECONDS = 10.0
 
@@ -237,6 +241,32 @@ def test_execution_acquire_uses_only_nonblocking_flock_and_never_fsyncs(
 
     assert operations == [fcntl.LOCK_EX | fcntl.LOCK_NB]
     assert fsync_calls == []
+
+
+def test_runtime_lease_record_survives_short_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = os.write
+
+    def short_write(fd: int, payload: bytes) -> int:
+        return real_write(fd, payload[:1])
+
+    monkeypatch.setattr(os, "write", short_write)
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    lease: SessionExecutionLease | None = None
+    try:
+        lease = SessionExecutionLease.acquire(
+            directory_fd,
+            session_id="session",
+            owner=OwnerHint("headless"),
+        )
+        assert session_owner_status(directory_fd) == (True, os.getpid()), (
+            "runtime lease reader did not recover the published owner"
+        )
+    finally:
+        if lease is not None:
+            lease.close()
+        os.close(directory_fd)
 
 
 def test_second_process_cannot_open_owned_session(tmp_path: Path) -> None:
