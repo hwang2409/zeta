@@ -833,12 +833,14 @@ class ConcurrentDelegatedApprovalBackend:
         if child_prompt is not None and not backend.calls:
             self.child_started[child_prompt].set()
             await self.release_children.wait()
-        elif child_prompt is None and self.parent.calls:
+        stream = backend.complete(messages, tool_schemas)
+        if child_prompt is None and self.parent.calls:
             await asyncio.gather(
                 *(started.wait() for started in self.child_started.values())
             )
+            yield await anext(stream)
             self.release_children.set()
-        async for event in backend.complete(messages, tool_schemas):
+        async for event in stream:
             yield event
 
 
