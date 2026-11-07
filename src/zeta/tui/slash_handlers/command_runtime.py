@@ -9,19 +9,7 @@ from uuid import uuid4
 from ...agent.pending_delivery import NotificationInput
 from ...core.abort import AbortSignal
 from ...core.commands.custom_commands import CustomCommand
-from ...protocol.types import (
-    ASSISTANT_RESPONSE_STATE,
-    ASSISTANT_RESPONSE_SYNTHETIC,
-    MESSAGE_ORIGIN_METADATA,
-    Message,
-    MessageOrigin,
-    MessageRole,
-    StreamEvent,
-    StreamEventType,
-    TextContent,
-    ToolCall,
-    ToolResult,
-)
+from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
 from ...submission.model import Submission
 from ...tools._shared.shell import (
     forget_macro_display,
@@ -275,18 +263,7 @@ class CommandRuntimeMixin:
         else:
             exit_code = structured.get("exit_code")
             status = f"exit {exit_code}" if exit_code is not None else "failed"
-        receipt = f"ran !{target}, {status}"
-        self._record_macro_receipt(receipt)
-        self.loop.store.append_message(
-            Message(
-                MessageRole.ASSISTANT,
-                [TextContent(receipt)],
-                metadata={
-                    ASSISTANT_RESPONSE_STATE: ASSISTANT_RESPONSE_SYNTHETIC,
-                    MESSAGE_ORIGIN_METADATA: MessageOrigin.AUTOMATION_RECEIPT.value,
-                },
-            )
-        )
+        self._record_macro_receipt(f"ran !{target}, {status}")
         self._loop_state = "idle"
         self._streaming = False
         self._invalidate_prompt()

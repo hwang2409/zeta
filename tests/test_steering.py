@@ -1293,54 +1293,30 @@ async def test_passthrough_end_repaints_terminal_card(tmp_path: Path) -> None:
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
-    invalidations = 0
-    end_invalidations: int | None = None
-    original_handle = app._handle_tool_event
+    with create_pipe_input() as pipe:
+        app._active_session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            multiline=True,
+        )
+        rendered_on_invalidate: list[str] = []
+        original_invalidate = app._invalidate_prompt
 
-    def invalidate() -> None:
-        nonlocal invalidations
-        invalidations += 1
+        def invalidate() -> None:
+            original_invalidate()
+            rendered_on_invalidate.append(app._transcript.render(120))
 
-    def handle(event: Any) -> Any:
-        nonlocal end_invalidations
-        result = original_handle(event)
-        if event.type is StreamEventType.TOOL_EXECUTION_END:
-            end_invalidations = invalidations
-        return result
-
-    app._invalidate_prompt = invalidate  # type: ignore[method-assign]
-    app._handle_tool_event = handle  # type: ignore[method-assign]
-    try:
-        app._submit_input("!printf done")
-        task = app._active_task
-        assert task is not None
-        await asyncio.wait_for(asyncio.shield(task), timeout=10)
-        assert end_invalidations is not None
-        assert invalidations > end_invalidations
-    finally:
-        await app.loop.close()
-
-
-@pytest.mark.asyncio
-async def test_passthrough_receipt_is_durable_without_a_model_turn(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
-    )
-    try:
-        app._submit_input("!printf durable")
-        task = app._active_task
-        assert task is not None
-        await asyncio.wait_for(asyncio.shield(task), timeout=10)
-        receipt = next(message for message in store.messages() if message.role is MessageRole.ASSISTANT)
-        assert receipt.content[0].text == "ran !printf durable, exit 0"
-        assert receipt.metadata["response_state"] == "synthetic"
-        assert "ran !printf durable, exit 0" in (store.session_dir / "conversation.jsonl").read_text()
-    finally:
-        await app.loop.close()
+        app._invalidate_prompt = invalidate  # type: ignore[method-assign]
+        try:
+            app._submit_input("!printf done")
+            task = app._active_task
+            assert task is not None
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            assert any("exit 0" in rendered for rendered in rendered_on_invalidate)
+            assert rendered_on_invalidate[-1].find("exit 0") >= 0
+            assert "running" not in rendered_on_invalidate[-1]
+        finally:
+            await app.loop.close()
 
 
 @pytest.mark.asyncio
