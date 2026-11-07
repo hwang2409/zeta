@@ -13,6 +13,7 @@ from zeta.storage_format import WRITER_EPOCH
 StorageHomeShape = Literal[
     "empty",
     "gated",
+    "legacy-oauth",
     "too-new",
     "invalid",
     "locked",
@@ -21,6 +22,7 @@ StorageHomeShape = Literal[
 STORAGE_HOME_SHAPES: tuple[StorageHomeShape, ...] = (
     "empty",
     "gated",
+    "legacy-oauth",
     "too-new",
     "invalid",
     "locked",
@@ -37,6 +39,11 @@ def prepared_storage_home(home: Path, shape: StorageHomeShape) -> Iterator[None]
 
     if shape == "gated":
         (home / "sessions" / "existing").mkdir(parents=True)
+    elif shape == "legacy-oauth":
+        (home / "codex-oauth.json").write_text(
+            '{"version":1,"access_token":"legacy-access",'
+            '"refresh_token":"legacy-refresh","expires_at":1}\n'
+        )
     elif shape == "too-new":
         (home / "storage-format.json").write_text(
             f'{{"writer_epoch":{WRITER_EPOCH + 1}}}\n'

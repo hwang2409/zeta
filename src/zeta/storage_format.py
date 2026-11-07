@@ -79,7 +79,7 @@ _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
-class StorageFormatError(ValueError):
+class StorageFormatError(Exception):
     """Raised when a home cannot be accessed by this stored-format version."""
 
 

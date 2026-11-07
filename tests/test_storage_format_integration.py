@@ -43,11 +43,9 @@ def _assert_future(path: Path) -> None:
 
 
 def _run_cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    environment["ZETA_HOME"] = str(home)
     return subprocess.run(
         [str(Path(sys.executable).with_name("zeta")), *arguments],
-        env=environment,
+        env=_console_environment(home),
         capture_output=True,
         text=True,
         timeout=60,
@@ -279,6 +277,34 @@ def test_real_console_start_has_one_storage_format_owner(
             assert return_code == 2
             assert stderr.splitlines() == [f"zeta: {expected_error}"]
             assert _tree_digest(home) == before
+            if shape == "legacy-oauth":
+                assert (home / "codex-oauth.json").is_file()
+                assert not (home / "accounts").exists()
+                assert not (home / "accounts.json").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("project", "create", "created", "--scope", "test"),
+        ("project", "init", ".", "--name", "initialized", "--scope", "test"),
+    ),
+)
+def test_real_project_creation_bootstraps_empty_home(
+    tmp_path: Path, arguments: tuple[str, ...]
+) -> None:
+    home = tmp_path / "home"
+
+    created = _run_cli(home, *arguments)
+
+    assert created.returncode == 0, created.stderr
+    assert "Traceback" not in created.stderr
+    assert json.loads((home / "storage-format.json").read_text()) == {
+        "writer_epoch": WRITER_EPOCH
+    }
+    following = _run_cli(home, "session", "list")
+    assert following.returncode == 0, following.stderr
+    assert "Traceback" not in following.stderr
 
 
 def test_storage_format_advance_defaults_to_writer_epoch(tmp_path: Path) -> None:
