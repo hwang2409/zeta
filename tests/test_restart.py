@@ -125,7 +125,7 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
     monkeypatch.setattr(app, "_rebuild_transcript_async", lambda: asyncio.sleep(0, result=True))
     monkeypatch.setattr("zeta.tui.app.run_prompt_toolkit", run_prompt_toolkit)
     monkeypatch.setattr(FullScreenPromptSession, "restore_terminal", restore_terminal)
-    monkeypatch.setattr(cli_main, "create_app", lambda _args: app)
+    monkeypatch.setattr(cli_main, "_create_tui_app", lambda *_args: app)
     monkeypatch.setattr(cli_main.os, "execv", execv)
     monkeypatch.setattr(sys, "argv", ["/Users/henry/.local/bin/zeta"])
 

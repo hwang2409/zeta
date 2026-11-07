@@ -32,6 +32,7 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
 from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
+from ..terminal_errors import TerminalRenderError
 
 
 def _tool_patterns_arg(value: str) -> str:
@@ -835,8 +836,6 @@ def _run_tui_lifecycle(
     restart_session_id: str | None = None
     exit_status = 0
     app: object | None = None
-    from ..tui.key_bindings import TerminalRenderError
-
     try:
         while True:
             app = _create_tui_app(args, parser)
