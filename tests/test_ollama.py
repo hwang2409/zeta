@@ -10,6 +10,7 @@ import pytest
 
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
 from zeta.core.project_context import ProjectContext
@@ -1351,7 +1352,7 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
         async def aiter_bytes(self):
             yield json.dumps({"message": {"content": "hello"}}).encode() + b"\n"
             self.started.set()
-            await self.release.wait()
+            await await_or_fail(self.release.wait(), what="self.release.wait()")
 
     class Context:
         def __init__(self, response):
@@ -1396,7 +1397,7 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
             await asyncio.sleep(0)
             running.cancel()
             try:
-                await running
+                await await_or_fail(running, what="running")
             except asyncio.CancelledError:
                 pass
             await asyncio.sleep(0)
@@ -1508,7 +1509,7 @@ async def test_ollama_cancelled_real_transport_does_not_leak_fds(
             await asyncio.wait_for(first_event.wait(), timeout=_CLIENT_DEADLINE_SECONDS)
             turn.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await turn
+                await await_or_fail(turn, what="turn")
             await backend.aclose()
         await asyncio.wait_for(all_closed.wait(), timeout=_CLIENT_DEADLINE_SECONDS)
         await asyncio.sleep(0)
@@ -1520,7 +1521,7 @@ async def test_ollama_cancelled_real_transport_does_not_leak_fds(
         for task in tuple(handlers):
             task.cancel()
         if handlers:
-            await asyncio.gather(*handlers, return_exceptions=True)
+            await await_or_fail(asyncio.gather(*handlers, return_exceptions=True), what="asyncio.gather(*handlers, return_exceptions=True)")
 
 
 @pytest.mark.asyncio

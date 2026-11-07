@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.memory import entry_request, entry_store
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
@@ -2433,7 +2434,7 @@ async def test_continuous_turns_fire_by_default_max_wait_and_repeat(
             await asyncio.sleep(0)
         while runner._seen_activity_generation < runner._activity_generation:
             await asyncio.sleep(0)
-        await runner._drained.wait()
+        await await_or_fail(runner._drained.wait(), what="runner._drained.wait()")
         clock.now += 30
     for _ in range(10):
         await asyncio.sleep(0)

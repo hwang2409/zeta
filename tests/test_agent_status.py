@@ -1,3 +1,4 @@
+
 import gc
 import json
 import os
@@ -15,6 +16,7 @@ from tests.support.fake_backend import (
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.owned import await_or_fail
 from zeta.agent.receipt import encode_json
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
@@ -163,7 +165,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     )
 
     backend.release_children.set()
-    await loop._background_owner.wait()
+    await await_or_fail(loop._background_owner.wait(), what="loop._background_owner.wait()")
     all_status = await _status(loop)
     children = all_status["structuredContent"]["children"]
     assert children == []

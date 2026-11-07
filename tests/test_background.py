@@ -26,6 +26,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -354,7 +355,7 @@ class _GatedFakeBackend(FakeBackend):
         )
         if gated:
             self.completion_started.set()
-            await self.completion_gate.wait()
+            await await_or_fail(self.completion_gate.wait(), what="self.completion_gate.wait()")
         async for event in super().complete(
             messages, tool_schemas, control=completion_control()
         ):

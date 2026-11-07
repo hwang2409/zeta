@@ -1,3 +1,5 @@
+
+from tests.support.owned import await_or_fail
 from zeta.skills import SkillCatalog
 
 import asyncio
@@ -3119,7 +3121,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
         status_code = 200
 
         async def aiter_lines(self):
-            await stopped.wait()
+            await await_or_fail(stopped.wait(), what="stopped.wait()")
             yield ""
 
     class Stream:
@@ -3145,7 +3147,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="task")
 
 
 @pytest.mark.asyncio
@@ -3214,7 +3216,7 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
         async def aiter_lines(self):
             yield 'data: {"type":"message_start","message":{}}'
             yield ""
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             yield ""
 
     class Stream:
@@ -3259,7 +3261,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
 
         async def __aexit__(self, exc_type, exc_value, traceback):
             cleanup_started.set()
-            await never.wait()
+            await await_or_fail(never.wait(), what="never.wait()")
 
     class Client:
         def stream(self, method, url, *, headers, content):
@@ -3270,7 +3272,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
     task = asyncio.create_task(
         anext(AnthropicBackend(client=Client(), token_store=store).complete([], [], control=completion_control()))
     )
-    await cleanup_started.wait()
+    await await_or_fail(cleanup_started.wait(), what="cleanup_started.wait()")
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
         await asyncio.wait_for(task, 10)

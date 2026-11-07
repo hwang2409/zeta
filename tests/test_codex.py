@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import http.server
@@ -15,6 +16,7 @@ import pytest
 import zeta.providers.codex as codex_module
 from tests.support.completion import completion_control
 from tests.support.credentials import codex_credentials
+from tests.support.owned import await_or_fail
 from zeta.accounts import AccountCredentials
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
@@ -4159,7 +4161,7 @@ async def test_consumer_aclose_finishes_without_leaking_cleanup(
         async def aiter_lines(self):
             for line in sse(message_stream()[:1]).splitlines():
                 yield line
-            await never.wait()
+            await await_or_fail(never.wait(), what="never.wait()")
 
     class Stream:
         async def __aenter__(self):
@@ -4200,7 +4202,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 
         async def __aexit__(self, exc_type, exc_value, traceback):
             cleanup_started.set()
-            await never.wait()
+            await await_or_fail(never.wait(), what="never.wait()")
 
     class Client:
         def stream(self, method, url, *, headers, json):
@@ -4217,7 +4219,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
     await asyncio.wait_for(cleanup_started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
-        await task
+        await await_or_fail(task, what="task")
     assert isinstance(raised.value.__cause__, CodexStreamError)
 
 

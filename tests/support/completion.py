@@ -1,3 +1,6 @@
+
+from tests.support.owned import await_or_fail
+
 """Explicit completion controls for tests that call providers directly."""
 
 import asyncio
@@ -26,7 +29,7 @@ class ManualDeadlineClock(DeadlineClock):
         self.waiters.append((deadline, future))
         self.waiter_added.set()
         try:
-            await future
+            await await_or_fail(future, what="future")
         finally:
             self.waiters = [item for item in self.waiters if item[1] is not future]
 
@@ -39,12 +42,12 @@ class ManualDeadlineClock(DeadlineClock):
     async def expire_next(self) -> None:
         while not self.waiters:
             self.waiter_added.clear()
-            await self.waiter_added.wait()
+            await await_or_fail(self.waiter_added.wait(), what="self.waiter_added.wait()")
         for _ in range(10):
             await asyncio.sleep(0)
         while not self.waiters:
             self.waiter_added.clear()
-            await self.waiter_added.wait()
+            await await_or_fail(self.waiter_added.wait(), what="self.waiter_added.wait()")
         deadline, future = min(self.waiters, key=lambda item: item[0])
         self.advance(deadline)
         while any(waiter is future for _, waiter in self.waiters):

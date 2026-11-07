@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import json
@@ -17,6 +18,7 @@ import zeta.providers.codex as codex_module
 import zeta.providers.completion as completion_module
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
@@ -1539,12 +1541,12 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
                 content=TextContent("partial"),
             )
             self.update_seen.set()
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     backend = WaitingBackend()
     store = ConversationStore(tmp_path)
     task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER)))
-    await backend.update_seen.wait()
+    await await_or_fail(backend.update_seen.wait(), what="backend.update_seen.wait()")
 
     with patch.object(
         store,
@@ -1554,7 +1556,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         warnings.simplefilter("error")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="task")
 
 
 @pytest.mark.asyncio
@@ -1691,7 +1693,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
                     "usage": {"output_tokens": 23},
                 },
             )
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     store = ConversationStore(tmp_path)
     metadata_seen = asyncio.Event()
@@ -1707,7 +1709,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
     await asyncio.wait_for(metadata_seen.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
 
     partial = store.messages()[-1]
     assert partial.content == [TextContent("partial")]
@@ -2386,7 +2388,7 @@ async def test_abort_during_backoff_keeps_ui_and_store_consistent(
 ) -> None:
     async def blocked_sleep(delay: float) -> None:
         del delay
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     signal = AbortSignal()
     retry_seen = asyncio.Event()

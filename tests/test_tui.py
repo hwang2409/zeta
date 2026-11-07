@@ -69,6 +69,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from zeta.accounts import (
@@ -4826,7 +4827,7 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
     session.default_buffer.insert_text("third draft")
     await asyncio.sleep(0.25)
 
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     backend.release.set()
     await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
@@ -4865,7 +4866,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     app._submit_input(session.default_buffer.text)
     session.default_buffer.reset()
 
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     backend.release.set()
     await asyncio.wait_for(app._active_task, 10)
     await wait_until(lambda: len(backend.calls) == 2)
@@ -10881,6 +10882,7 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
     )
 
     app._submit_input(text)
+    # test-contract: latency ui task startup is the product readiness contract
     await asyncio.sleep(0.05)
     if app._active_task is not None:
         await asyncio.wait_for(app._active_task, 10)
@@ -10954,6 +10956,7 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     )
 
     app._submit_input("approve the plan")
+    # test-contract: latency ui task startup is the product readiness contract
     await asyncio.sleep(0.05)
     if app._active_task is not None:
         await asyncio.wait_for(app._active_task, 10)
@@ -10982,7 +10985,7 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     app._submit_input("first")
     app._submit_input("second")
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
 
     backend.release.set()
     await asyncio.wait_for(app._active_task, 10)
@@ -11016,7 +11019,7 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
     app.undo_sent_turn()
     app._submit_input("same")
     await asyncio.sleep(0)
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
     await asyncio.sleep(0)
     if app._active_task is not None:
         await asyncio.wait_for(app._active_task, 10)
@@ -11047,9 +11050,9 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
 
     raw = "  //status  \n"
     await app._handle_prompt_value(raw)
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
 
     assert session.app.current_buffer.text == raw
     await app._handle_prompt_value(raw)
@@ -13298,10 +13301,10 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     app._pending_attachment_tokens["[Image #1]"] = staged
     await app._handle_prompt_value("inspect [Image #1]")
     assert app._active_task is not None
-    await backend.started.wait()
+    await await_or_fail(backend.started.wait(), what="backend.started.wait()")
 
     app.undo_sent_turn()
-    await asyncio.gather(app._active_task, return_exceptions=True)
+    await await_or_fail(asyncio.gather(app._active_task, return_exceptions=True), what="asyncio.gather(app._active_task, return_exceptions=True)")
 
     assert app._pending_attachment_tokens == {"[Image #1]": staged}
     assert app._pending_attachments == [staged]

@@ -1,3 +1,5 @@
+
+from tests.support.owned import await_or_fail
 from zeta.providers.completion import owned_completion
 from pathlib import Path
 import asyncio
@@ -1630,7 +1632,7 @@ async def test_summary_aclose_cancellation_propagates_after_success() -> None:
 
         async def aclose(self):
             close_started.set()
-            await release_close.wait()
+            await await_or_fail(release_close.wait(), what="release_close.wait()")
 
     class Backend:
         @owned_completion
@@ -1640,10 +1642,10 @@ async def test_summary_aclose_cancellation_propagates_after_success() -> None:
     task = asyncio.create_task(
         CompactionPolicy(Backend()).summarize_chunked([text(MessageRole.USER, "source")])
     )
-    await close_started.wait()
+    await await_or_fail(close_started.wait(), what="close_started.wait()")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
     release_close.set()
 
 
@@ -1744,7 +1746,7 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
     await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="task")
     assert set(finalized) == set(started)
     assert len(started) <= 3
 

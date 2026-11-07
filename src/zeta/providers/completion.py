@@ -114,6 +114,31 @@ def merge_exception(
     return primary
 
 
+def _first_provider_error(*errors: BaseException | None) -> BaseException | None:
+    for error in errors:
+        current = error
+        while isinstance(current, BaseException):
+            if not is_control_exception(current):
+                return current
+            current = current.__cause__
+    return None
+
+
+def select_completion_outcome(
+    primary: BaseException | None,
+    producer: BaseException | None,
+    cleanup: BaseException,
+) -> BaseException:
+    """Select the visible outcome while preserving provider failure causes."""
+    selected = merge_exception(primary, cleanup)
+    if is_control_exception(selected):
+        provider_error = _first_provider_error(producer, cleanup, primary)
+        if provider_error is not None:
+            selected.__cause__ = provider_error
+            selected.__context__ = provider_error
+    return selected
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPlan:
     attempt: int
@@ -560,11 +585,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     continue
             self._observe(event)
             if self._attempt_completed:
-                await self._finish_completed_attempt()
+                if await self._finish_completed_attempt():
+                    continue
                 self._closed = True
             return event
 
-    async def _finish_completed_attempt(self) -> None:
+    async def _finish_completed_attempt(self) -> bool:
         assert self._attempt is not None
         try:
             while True:
@@ -573,8 +599,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     raise RuntimeError("provider event followed completion")
         except StopAsyncIteration:
             await self._finish_attempt()
+            return False
         except BaseException as error:
+            retry = await self._retry(error)
             await self._finish_attempt(error)
+            if retry:
+                return True
             raise
 
     async def _open_attempt(self) -> None:
@@ -780,39 +810,14 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
             producer_error = getattr(attempt, "_producer_error", None)
-            if (
-                primary_error is not None
-                and is_control_exception(primary_error)
-                and isinstance(producer_error, BaseException)
-                and not is_control_exception(producer_error)
-            ):
-                primary_error.__cause__ = producer_error
-                primary_error.__context__ = producer_error
-            if primary_error is not None and is_control_exception(cleanup_error):
-                raise cleanup_error from primary_error
-            if primary is not None and primary_error is None:
-                if is_control_exception(cleanup_error):
-                    cleanup_error.__cause__ = primary
-                    cleanup_error.__context__ = primary
-                    raise
-            else:
-                if (
-                    primary_error is not None
-                    and is_control_exception(primary_error)
-                    and is_control_exception(cleanup_error)
-                    and cleanup_error.__cause__ is not None
-                    and not is_control_exception(cleanup_error.__cause__)
-                ):
-                    primary_error.__cause__ = cleanup_error.__cause__
-                    primary_error.__context__ = cleanup_error.__cause__
-                selected = merge_exception(primary_error, cleanup_error)
-                if selected is cleanup_error:
-                    if primary is None and not is_control_exception(cleanup_error):
-                        raise CompletionCleanupError(str(cleanup_error)) from cleanup_error
-                    if primary_error is not None:
-                        raise selected from primary_error
-                    raise selected
-            if not is_control_exception(cleanup_error):
+            selected = select_completion_outcome(
+                primary_error,
+                producer_error if isinstance(producer_error, BaseException) else None,
+                cleanup_error,
+            )
+            if primary_error is None and selected is cleanup_error and not is_control_exception(cleanup_error):
+                raise CompletionCleanupError(str(cleanup_error)) from cleanup_error
+            if selected is not cleanup_error and not is_control_exception(cleanup_error):
                 asyncio.get_running_loop().call_exception_handler(
                     {
                         "message": "provider completion cleanup failed",
@@ -820,6 +825,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         "provider": self._adapter.provider,
                     }
                 )
+            raise selected
 
     async def aclose(self) -> None:
         if self._closed and self._attempt is None:

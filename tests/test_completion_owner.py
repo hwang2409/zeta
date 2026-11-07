@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.protocol.types import (
     ErrorInfo,
     Message,
@@ -49,7 +50,7 @@ class _ManualClock(DeadlineClock):
         self.waiters.append((deadline, future))
         self.waiter_added.set()
         try:
-            await future
+            await await_or_fail(future, what="future")
         finally:
             self.waiters = [item for item in self.waiters if item[1] is not future]
 

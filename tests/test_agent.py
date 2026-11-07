@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import os
@@ -33,6 +34,7 @@ from tests.support.agent_lifecycle import (
 )
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
@@ -3906,7 +3908,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aiter_bytes(self) -> AsyncIterator[bytes]:
             stream_started.set()
             yield b'{"message":{"content":"partial"}}\n'
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
 
     class StreamContext:
         def __init__(self) -> None:
@@ -3919,7 +3921,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def __aexit__(self, *args: object) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -3937,7 +3939,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
         async def aclose(self) -> None:
             self.close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 raise
@@ -3963,9 +3965,9 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
             consume_stream,
         )
     )
-    await stream_started.wait()
+    await await_or_fail(stream_started.wait(), what="stream_started.wait()")
     deadlines.expire(state)
-    result = await model_turn
+    result = await await_or_fail(model_turn, what="model_turn")
     await asyncio.sleep(0)
 
     assert result is not None
@@ -7607,7 +7609,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
-    events = await task
+    events = await await_or_fail(task, what="task")
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
@@ -9565,7 +9567,7 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
 
     async def wait_for_cancel(*_args, **_kwargs) -> bool:
         backoff_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
         return True
 
     backend = EarlyCloseThenAnswerBackend()
@@ -9589,10 +9591,10 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
             first_events.append(event)
 
     turn = asyncio.create_task(consume_first_turn())
-    await backoff_started.wait()
+    await await_or_fail(backoff_started.wait(), what="backoff_started.wait()")
     turn.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await turn
+        await await_or_fail(turn, what="turn")
 
     assert not any(
         event.type
@@ -17424,7 +17426,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
                 self.prompt_attempts += 1
                 if prompt_outcome == "cancellation" and self.prompt_attempts == 1:
                     self.blocked.set()
-                    await asyncio.Event().wait()
+                    await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
                 if prompt_outcome == "failure" and self.prompt_attempts == 1:
                     yield StreamEvent(
                         StreamEventType.ERROR,
@@ -17499,7 +17501,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
         await asyncio.wait_for(backend.blocked.wait(), 1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="task")
         assert loop.step_delivery.prompt_priority == priority
         await run_once(stop_at_evidence=False)
     else:

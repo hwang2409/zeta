@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as server_event
 from tests.support.server_client import request as server_request
@@ -849,7 +850,7 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
 
     async def invoke(prompt: str, budget) -> str:
         started.set()
-        await release.wait()
+        await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(tmp_path, invoke)
@@ -862,7 +863,7 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
             ticks += 1
 
     runner.before_eviction(1, 2)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
     await ticker()
     assert ticks == 5
     release.set()
@@ -1030,14 +1031,14 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
         prompts.append(prompt)
         if len(prompts) == 1:
             started.set()
-            await release.wait()
+            await await_or_fail(release.wait(), what="release.wait()")
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(
         tmp_path, invoke, transcript_count=2, token_threshold=1, minimum_interval=0
     )
     runner.activity(2)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
     _write_transcript(runner.session_dir, 8)
     runner.activity(5)
     runner.activity(8)
@@ -1816,7 +1817,7 @@ async def test_close_cancels_inflight_request_quietly(
     async def invoke(_prompt: str, budget) -> str:
         started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="asyncio.Event().wait()")
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -1828,7 +1829,7 @@ async def test_close_cancels_inflight_request_quietly(
         shutdown_grace_seconds=0.01,
     )
     runner.before_eviction(1, 4)
-    await started.wait()
+    await await_or_fail(started.wait(), what="started.wait()")
 
     await asyncio.wait_for(runner.close(), timeout=0.2)
     await asyncio.sleep(0)
