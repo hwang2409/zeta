@@ -684,7 +684,6 @@ def _format_status(status: SlashStatus) -> str:
         "context:",
         f"  window: {window_text}",
         f"  fill: {context_gauge}",
-        "transcript_navigation: ctrl+f find, ctrl+up/down users, pageup/pagedown scroll",
         "compaction_history:",
     ]
     lines.extend(

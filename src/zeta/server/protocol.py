@@ -90,6 +90,16 @@ class ErrorDescriptor(Enum):
         "invalid_content_read",
         "content_read parameters are invalid",
     )
+    INVALID_SESSION_GRANTS_PARAMS = (
+        -32602,
+        "invalid_session_grants_params",
+        "session_grants parameters are invalid",
+    )
+    INVALID_SESSION_GRANTS_REVOKE = (
+        -32602,
+        "invalid_session_grants_revoke",
+        "revoke_session_grants parameters are invalid",
+    )
     LOGIN_IN_PROGRESS = (-32005, "login_in_progress", "a login is already pending")
     OBSERVER_READ_ONLY = (
         -32008,
@@ -105,6 +115,11 @@ class ErrorDescriptor(Enum):
         -32000,
         "project_registry_busy",
         "another process holds the project registry lock",
+    )
+    SESSION_GRANT_NOT_FOUND = (
+        -32602,
+        "session_grant_not_found",
+        "the requested session grant does not exist",
     )
     SESSION_NOT_FOUND = (
         -32602,
@@ -178,6 +193,7 @@ class EventDescriptor(StrEnum):
     TURN_ABORTED = "turn_aborted"
     USAGE = "usage"
     USER_MESSAGE = "user_message"
+    SESSION_GRANTS_CHANGED = "session_grants_changed"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -208,6 +224,7 @@ FEATURES = (
     "session_history_fidelity",
     "served_turn_end",
     "content_read",
+    "session_grants",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128

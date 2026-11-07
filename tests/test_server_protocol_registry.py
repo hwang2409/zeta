@@ -536,6 +536,18 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid content read","data":{"code":"invalid_content_read"}}}\n',
     ),
     (
+        ErrorDescriptor.INVALID_SESSION_GRANTS_PARAMS,
+        "session_grants takes no params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session_grants takes no params","data":{"code":"invalid_session_grants_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.INVALID_SESSION_GRANTS_REVOKE,
+        "invalid revoke_session_grants params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid revoke_session_grants params","data":{"code":"invalid_session_grants_revoke"}}}\n',
+    ),
+    (
         ErrorDescriptor.LOGIN_IN_PROGRESS,
         "login is already pending",
         None,
@@ -558,6 +570,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "project registry busy",
         {"retryable": False},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"project registry busy","data":{"code":"project_registry_busy","retryable":false}}}\n',
+    ),
+    (
+        ErrorDescriptor.SESSION_GRANT_NOT_FOUND,
+        "session grant not found",
+        {"grant": "bash"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session grant not found","data":{"code":"session_grant_not_found","grant":"bash"}}}\n',
     ),
     (
         ErrorDescriptor.SESSION_NOT_FOUND,
@@ -592,7 +610,7 @@ def test_documented_slash_table_matches_shared_registry() -> None:
     assert documented == actual
 
 
-def test_structured_error_frames_match_origin_main_bytes() -> None:
+def test_structured_error_frames_match_pinned_bytes() -> None:
     codec = FrameCodec()
     assert {descriptor for descriptor, _, _, _ in STRUCTURED_ERROR_FIXTURES} == {
         descriptor for descriptor in ErrorDescriptor if descriptor.data_code is not None
@@ -601,8 +619,16 @@ def test_structured_error_frames_match_origin_main_bytes() -> None:
         assert codec.error_response(7, descriptor, message, fields) == origin_main_frame
 
 
-def test_merged_protocol_values_match_origin_main_bytes() -> None:
+def test_registered_protocol_values_match_pinned_bytes() -> None:
     codec = FrameCodec()
+    assert (
+        codec.notification(
+            EventDescriptor.SESSION_GRANTS_CHANGED,
+            "s1",
+            data={"change": "clear", "changed": ["bash"], "grants": {}},
+        )
+        == b'{"jsonrpc":"2.0","method":"event","params":{"event":"session_grants_changed","session_id":"s1","data":{"change":"clear","changed":["bash"],"grants":{}}}}\n'
+    )
     assert (
         codec.response(
             7,
