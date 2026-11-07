@@ -117,22 +117,30 @@ def test_agent_discovery_rejects_within_tier_duplicates_and_external_symlinks(
     assert any("outside agents root" in notice for notice in catalog.notices)
 
 
-def test_agent_discovery_accepts_official_claude_scalar_tools(
+def test_profile_tools_preserve_session_and_external_names_and_normalize_aliases(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "home" / "agents" / "reader.md"
+    path = tmp_path / "home" / "agents" / "worker.md"
     _write_agent(
         path,
-        "reader",
-        "read-only child",
+        "worker",
+        "session tools",
         "body",
-        "tools: Read, Glob, Grep\n",
+        "tools: [Read, session_clock, slack__slack_read_channel, run_background, agent_send]\n",
     )
 
     catalog = discover_session_agents(home=tmp_path / "home")
 
-    assert catalog.find("reader").tool_names == frozenset({"read"})
-    assert sum("unknown tool name" in notice for notice in catalog.notices) == 2
+    assert catalog.find("worker").tool_names == frozenset(
+        {
+            "read",
+            "session_clock",
+            "slack__slack_read_channel",
+            "run_background",
+            "agent_send",
+        }
+    )
+    assert not any("unknown tool name" in notice for notice in catalog.notices)
 
 
 def test_agent_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:

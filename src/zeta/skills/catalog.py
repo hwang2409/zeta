@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -396,51 +395,6 @@ def load_skill_prompt(meta: SkillMeta) -> str:
     return body
 
 
-def replace_skill_index(prompt: str, catalog: SkillCatalog) -> str:
-    """Replace only the skill index in a saved system prompt."""
-
-    return replace_skill_index_metadata(prompt, catalog, {})[0]
-
-
-def replace_skill_index_metadata(
-    prompt: str,
-    catalog: SkillCatalog,
-    components: dict[str, dict[str, int | str]],
-) -> tuple[str, dict[str, dict[str, int | str]]]:
-    """Replace the skill index and move or resize owned prompt components."""
-
-    start_marker = "<zeta-skills>"
-    end_marker = "</zeta-skills>"
-    start = prompt.find(start_marker)
-    if start < 0:
-        return prompt, {key: dict(value) for key, value in components.items()}
-    end = prompt.find(end_marker, start)
-    if end < 0:
-        raise ValueError("saved prompt has an unterminated skill index")
-    end += len(end_marker)
-    replacement = catalog.index()
-    updated = prompt[:start] + replacement + prompt[end:]
-    delta = len(replacement) - (end - start)
-    updated_components: dict[str, dict[str, int | str]] = {}
-    for key, component in components.items():
-        offset = int(component["offset"])
-        length = int(component["length"])
-        component_end = offset + length
-        if offset >= end:
-            offset += delta
-        elif offset <= start and component_end >= end:
-            length += delta
-        elif component_end > start:
-            raise ValueError("skill index partially overlaps a prompt component")
-        digest = hashlib.sha256(updated[offset : offset + length].encode()).hexdigest()
-        updated_components[key] = {
-            "offset": offset,
-            "length": length,
-            "digest": digest,
-        }
-    return updated, updated_components
-
-
 __all__ = [
     "SKILL_INDEX_BYTE_LIMIT",
     "SkillCatalog",
@@ -453,6 +407,4 @@ __all__ = [
     "is_slash_safe_name",
     "load_skill",
     "load_skill_prompt",
-    "replace_skill_index",
-    "replace_skill_index_metadata",
 ]

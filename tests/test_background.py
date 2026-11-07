@@ -565,9 +565,8 @@ def test_child_question_notification_renders_question() -> None:
     assert "unavailable" not in plain
 
 
-def test_child_idle_notification_renders_one_line_notice() -> None:
+def test_child_idle_notification_renders_readable_report() -> None:
     from zeta.protocol.types import StreamEvent, StreamEventType
-    from zeta.tui import theme
     from zeta.tui.render import render_agent_notification
 
     rendered = render_agent_notification(
@@ -584,16 +583,12 @@ def test_child_idle_notification_renders_one_line_notice() -> None:
     )
 
     assert rendered is not None
-    assert rendered.style == theme.NOTICE
-    assert rendered.plain.startswith("◌ finish PR #529 with a long report · idle")
-    assert "the child's report" not in rendered.plain
-    assert "\n" not in rendered.plain
-    assert all(
-        not (ord(character) < 32 or 0x80 <= ord(character) <= 0x9F)
-        for character in rendered.plain
-    )
-    assert rendered.overflow == "ellipsis"
-    assert rendered.no_wrap is True
+    plain = _renderable_plain(rendered)
+    assert "idle ← finish PR #529 with a long report :203 · idle" in plain
+    assert "the child's report is not shown in the notice" in plain
+    assert "\x1b" not in plain
+    assert "\x9b" not in plain
+    assert "\x07" not in plain
 
 
 def test_child_idle_notification_without_description_shows_error_line() -> None:
@@ -637,7 +632,7 @@ def test_child_question_withdrawn_notification_renders_text() -> None:
 
     assert rendered is not None
     plain = _renderable_plain(rendered)
-    assert "withdraw ← child :208" in plain
+    assert "withdraw ← child question withdrawn :208" in plain
     assert "b2517c6f0fbb448e86dbb8b34fe0fbc0" in plain
     assert "question withdrawn: child finished" not in plain
 
@@ -698,9 +693,11 @@ def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
     from zeta.tui.render import render_agent_notification
 
     def render(data: dict) -> str:
-        return render_agent_notification(
+        rendered = render_agent_notification(
             StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
-        ).plain
+        )
+        assert rendered is not None
+        return _renderable_plain(rendered).strip()
 
     task_line = render(
         {
