@@ -557,9 +557,18 @@ class MCPManagementService:
         self._transaction_task = task
 
         outcome = asyncio.gather(task, return_exceptions=True)
-        results = await asyncio.shield(outcome)
+        try:
+            results = await asyncio.shield(outcome)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            if self._transaction_task is task:
+                self._transaction_task = None
+            raise
         result = results[0]
         if isinstance(result, BaseException):
+            if self._transaction_task is task:
+                self._transaction_task = None
             raise result
         candidate = result
         self._durable_candidate = candidate
