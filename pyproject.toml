@@ -41,11 +41,9 @@ exclude = ["**/tests/**"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "src/zeta"]
 asyncio_mode = "auto"
-addopts = "-m 'not benchmark'"
 faulthandler_timeout = 300
 faulthandler_exit_on_timeout = true
 markers = [
-    "benchmark: measured performance check excluded from required test runs",
     "environment_sensitive: test behavior that depends on terminal environment",
 ]
 
