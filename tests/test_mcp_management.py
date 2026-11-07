@@ -1322,6 +1322,7 @@ async def test_failed_transaction_does_not_poison_next_call(
             raise MCPManagementError("forced transaction failure")
         return original_transaction(mutation)
 
+    # test-contract: seam force one failed transaction before the next public call
     monkeypatch.setattr(manager, "_transaction", fail_once)
     with pytest.raises(MCPManagementError, match="forced transaction failure"):
         await manager.add("first", scope="project", command=sys.executable)
