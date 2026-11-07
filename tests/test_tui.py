@@ -12584,28 +12584,66 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
 
 @pytest.mark.asyncio
 async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[tuple[str, int]] = []
+    notice_delivered = asyncio.Event()
+
+    def notice_sink(message: str) -> None:
+        notices.append((message, threading.get_ident()))
+        notice_delivered.set()
+
     persistence = DraftPersistence(
         tmp_path / "draft",
         delay=0,
-        notice_sink=lambda message: notices.append((message, threading.get_ident())),
+        notice_sink=notice_sink,
     )
+    loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
+    call_soon_threadsafe = loop.call_soon_threadsafe
+    late_notice: tuple[Callable[..., object], tuple[object, ...]] | None = None
+
+    def capture_late_notice(
+        callback: Callable[..., object],
+        *args: object,
+        context: object = None,
+    ) -> object:
+        nonlocal late_notice
+        if callback is notice_sink:
+            late_notice = (callback, args)
+            return None
+        return call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", capture_late_notice)
 
     def fail(*_args, **_kwargs) -> None:
         raise OSError("disk unavailable")
 
     _patch_draft_publish(monkeypatch, fail)
-    persistence.schedule("first")
-    with pytest.raises(OSError, match="disk unavailable"):
-        await persistence.flush_pending()
+    notice_handle: asyncio.Handle | None = None
+    try:
+        persistence.schedule("first")
+        with pytest.raises(OSError, match="disk unavailable"):
+            await persistence.flush_pending()
 
-    assert notices == [(
-        "composer draft was not saved; your text remains unsaved. copy it before exiting.",
-        loop_thread,
-    )]
+        assert late_notice is not None
+        callback, args = late_notice
+        notice_handle = loop.call_soon(callback, *args)
+        await asyncio.wait_for(notice_delivered.wait(), 10)
+    finally:
+        if notice_handle is not None and not notice_delivered.is_set():
+            notice_handle.cancel()
+        if late_notice is not None and not notice_delivered.is_set():
+            callback, args = late_notice
+            callback(*args)
+
+    assert notices == [
+        (
+            "composer draft was not saved; your text remains unsaved. copy it before exiting.",
+            loop_thread,
+        )
+    ]
 
 
 @pytest.mark.asyncio
