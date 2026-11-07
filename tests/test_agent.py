@@ -55,6 +55,7 @@ from zeta.agent.runner import (
     _compose_child_system_prompt,
 )
 from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.config.settings import SettingsError, load_settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.checkpoints import ConversationEntry
@@ -4868,7 +4869,6 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
@@ -4975,7 +4975,6 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(
     )
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
@@ -6112,29 +6111,165 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("explicit_tool_schemas", [False, True])
 @pytest.mark.asyncio
-async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
-    nested = _agent_call("nested")
+async def test_root_at_depth_cap_hides_agent_schema_and_rejects_forged_call(
+    tmp_path: Path, explicit_tool_schemas: bool
+) -> None:
     backend = FakeBackend(
         [
-            ScriptedTurn(tool_calls=[_agent_call()]),
-            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn(tool_calls=[_agent_call("blocked")]),
+            ScriptedTurn([TextContent("complete")]),
+        ]
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path / "session"),
+        registry=registry,
+        tool_schemas=registry.schemas if explicit_tool_schemas else None,
+        max_agent_depth=0,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert "agent" not in {
+        schema["name"] for schema in backend.calls[0][1]
+    }
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[1][0]
+        if message.tool_result and message.tool_result.tool_call_id == "blocked"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_default_depth_allows_three_delegations_and_stops_there(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
+            ScriptedTurn(tool_calls=[_agent_call("great-grandchild")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused-depth-four")]),
+            ScriptedTurn([TextContent("depth three complete")]),
+            ScriptedTurn([TextContent("depth two complete")]),
+            ScriptedTurn([TextContent("depth one complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert ["agent" in {schema["name"] for schema in schemas} for _, schemas in backend.calls[:4]] == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[4][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused-depth-four"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_configured_depth_five_allows_five_delegations(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        "[agents]\nmax_depth = 5\n", encoding="utf-8"
+    )
+    try:
+        configured_depth = getattr(
+            load_settings(home=home).settings, "agents_max_depth", None
+        )
+    except SettingsError:
+        configured_depth = None
+    assert configured_depth == 5
+
+    backend = FakeBackend(
+        [
+            *(
+                ScriptedTurn(tool_calls=[_agent_call(f"depth-{depth}")])
+                for depth in range(1, 6)
+            ),
+            ScriptedTurn([TextContent("depth five complete")]),
+            *(
+                ScriptedTurn([TextContent(f"depth {depth} complete")])
+                for depth in range(4, 0, -1)
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session")
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        max_agent_depth=configured_depth,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert [
+        "agent" in {schema["name"] for schema in schemas}
+        for _, schemas in backend.calls[:6]
+    ] == [True, True, True, True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_custom_profile_can_grant_itself_delegation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "delegator.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: delegator\ndescription: delegates work\ntools: [agent]\n---\n"
+        "delegate the task\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child", "delegator")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
             ScriptedTurn([TextContent("grandchild complete")]),
             ScriptedTurn([TextContent("child complete")]),
         ]
     )
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
 
     await _collect(
         AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.content.startswith("child complete")
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -6142,52 +6277,128 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
+    assert not child_result.is_error
     assert child_result.content.startswith("grandchild complete")
-    grandchild_schemas = {schema["name"] for schema in backend.calls[2][1]}
-    assert "agent" not in grandchild_schemas
+
+    explore_backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("explore", "explore")]),
+            ScriptedTurn([TextContent("explore complete")]),
+        ]
+    )
+    explore_store = ConversationStore(tmp_path / "explore-session")
+    await _collect(
+        AgentLoop(
+            explore_backend,
+            explore_store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", origin=MessageOrigin.USER)
+    )
+    explore_tools = {schema["name"] for schema in explore_backend.calls[1][1]}
+    assert "agent" not in explore_tools
 
 
 @pytest.mark.asyncio
-async def test_nested_child_uses_selected_profile_not_parent_profile(
-    tmp_path: Path,
-) -> None:
-    nested = _agent_call("grandchild")
-    child = _agent_call("child", "explore")
+async def test_explicit_agent_profile_starts_at_its_depth_cap(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "capped-delegator.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: capped-delegator\ndescription: capped delegator\n"
+        "tools: [agent]\nmax_child_depth: 1\n---\ndelegate when available\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
     backend = FakeBackend(
         [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("grandchild complete")]),
-            ScriptedTurn([TextContent("child complete")]),
+            ScriptedTurn(tool_calls=[_agent_call("capped child", "capped-delegator")]),
+            ScriptedTurn(tool_calls=[_agent_call("refused grandchild")]),
+            ScriptedTurn([TextContent("capped child complete")]),
         ]
     )
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path / "session")
+    registry = ToolRegistry(
+        store.cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
 
     await _collect(
         AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    child_tools = {schema["name"] for schema in backend.calls[1][1]}
-    grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
-    assert "project_update" not in child_tools
-    assert "project_update" not in grandchild_tools
-    assert all(
-        "project_update" not in {schema["name"] for schema in schemas}
-        for _, schemas in backend.calls
+    assert "agent" not in {schema["name"] for schema in backend.calls[1][1]}
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[2][0]
+        if message.tool_result
+        and message.tool_result.tool_call_id == "refused grandchild"
     )
-    assert child_tools == {
-        "agent",
-        "agent_output",
-        "agent_status",
-        "fetch",
-        "read",
-        "skill",
-        "websearch",
-    }
-    assert "bash" in grandchild_tools
-    assert "agent" not in grandchild_tools
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 1"
+    )
+    child_result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert not child_result.is_error
+    assert child_result.content.startswith("capped child complete")
+
+
+@pytest.mark.asyncio
+async def test_profile_max_child_depth_only_lowers_the_parent_limit(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    agents = home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "lower.md").write_text(
+        "---\nname: lower\ndescription: lower limit\nmax_child_depth: 1\n---\nlower\n",
+        encoding="utf-8",
+    )
+    (agents / "raise.md").write_text(
+        "---\nname: raise\ndescription: cannot raise\nmax_child_depth: 5\n---\nraise\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    assert catalog.find("lower").max_child_depth == 1
+    assert all("max_child_depth" not in item for item in catalog.to_snapshot())
+
+    async def child_agent_schemas(profile_name: str, parent_limit: int) -> set[str]:
+        backend = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[_agent_call("child", profile_name)]),
+                ScriptedTurn([TextContent("child complete")]),
+            ]
+        )
+        store = ConversationStore(tmp_path / profile_name)
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=catalog,
+        )
+        loop = AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        loop.max_agent_depth = parent_limit
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        return {schema["name"] for schema in backend.calls[1][1]}
+
+    assert "agent" not in await child_agent_schemas("lower", 3)
+    assert "agent" not in await child_agent_schemas("raise", 1)
 
 
 @pytest.mark.asyncio
