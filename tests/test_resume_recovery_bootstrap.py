@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 
 from tests.support.fake_backend import FakeBackend
-from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -295,19 +294,12 @@ async def test_warm_writer_appends_are_structurally_isolated(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_resume_recovery_does_not_republish_durable_completion(
-    tmp_path: Path,
-) -> None:
+async def test_resume_recovery_restores_durable_completion(tmp_path: Path) -> None:
     home = tmp_path / "home"
     session_id = await asyncio.to_thread(_seed_session, home, tmp_path, children=2)
     runtime = _runtime(home, tmp_path)
 
-    with patch.object(
-        ConversationChannel,
-        "produce_to",
-        side_effect=AssertionError("recovery republished a durable completion"),
-    ):
-        await runtime.resume_session(session_id)
+    await runtime.resume_session(session_id)
     try:
         assert runtime.opened is not None
         assert runtime.opened.store.agent_children() == {}

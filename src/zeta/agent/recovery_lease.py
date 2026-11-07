@@ -6,10 +6,7 @@ import asyncio
 import threading
 from contextlib import ExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
-
-if TYPE_CHECKING:
-    from .pending_delivery import NotificationInput
+from typing import Any, Protocol
 
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationStore
@@ -20,7 +17,6 @@ class AgentLoopForRecovery(Protocol):
     store: ConversationStore
     _background_owner: Any
     _children_recovered: bool
-    _pending_child_recovery: tuple[NotificationInput, ...]
 
     def _canceled_agent_result(
         self, tool_call_id: str, **kwargs: Any
@@ -108,25 +104,8 @@ def bootstrap_agent_children(loop: AgentLoopForRecovery) -> None:
 
     from .background import recover_agent_children
 
-    deliveries = recover_agent_children(loop)
-    for item in deliveries:
-        loop.store._commit_delivery_input(item)
-    loop._pending_child_recovery = deliveries
+    recover_agent_children(loop)
     loop._children_recovered = True
-
-
-async def publish_recovered_children(loop: AgentLoopForRecovery) -> None:
-    async def publish() -> None:
-        for item in loop._pending_child_recovery:
-            await loop._background_owner.conversation_channel.produce_to(None, item)
-        loop._pending_child_recovery = ()
-
-    publication = asyncio.create_task(publish())
-    try:
-        await asyncio.shield(publication)
-    except asyncio.CancelledError:
-        await publication
-        raise
 
 
 def _has_recovery_work(loop: AgentLoopForRecovery) -> bool:
@@ -141,8 +120,6 @@ async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
         if _has_recovery_work(loop):
             await recover_agent_children_off_loop(loop)
         loop._children_recovered = True
-    if loop._pending_child_recovery:
-        await publish_recovered_children(loop)
 
 
 async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
@@ -153,7 +130,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
 
     stop_recovery = threading.Event()
 
-    def recover() -> tuple[NotificationInput, ...]:
+    def recover() -> None:
         from .background import _recover_agent_children
 
         with ConversationStore(
@@ -181,9 +158,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
                 )
 
     async def complete_recovery() -> None:
-        deliveries = await root._to_thread_store(recover)
-        for item in deliveries:
-            await loop._background_owner.conversation_channel.produce_to(None, item)
+        await root._to_thread_store(recover)
         await root._refresh_off_loop()
         if notification is not root:
             await notification._refresh_off_loop()

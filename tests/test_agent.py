@@ -17189,9 +17189,7 @@ async def test_completion_recovery_is_durable_for_every_recipient(
             _existing_tool_result=lambda _call_id: False,
         )
 
-    async def recover(
-        store: ConversationStore,
-    ) -> tuple[pending_delivery_module.NotificationInput, ...]:
+    async def recover(store: ConversationStore) -> None:
         task = asyncio.create_task(
             asyncio.to_thread(recover_agent_children, recovery_loop(store))
         )
@@ -17214,14 +17212,14 @@ async def test_completion_recovery_is_durable_for_every_recipient(
         return await asyncio.wait_for(task, timeout=10)
 
     try:
-        deliveries = await recover(root)
+        await recover(root)
         if scenario in {
             "crash after recovery queued before commit",
             "duplicate recovery",
         }:
             root.close()
             root = ConversationStore(tmp_path, session_id="root")
-            assert await recover(root) == ()
+            await recover(root)
 
         recovered_parent = (
             root
@@ -17243,7 +17241,6 @@ async def test_completion_recovery_is_durable_for_every_recipient(
             ]
             assert len(root_completions) == 1
             assert len(parent_completions) == 1
-            assert deliveries == ()
             assert root_completions[0].data.get("display_only") is (
                 True if parent is not root else None
             )
@@ -17288,11 +17285,8 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     )
     child.close()
     owner = BackgroundAgentOwner(parent)
-    flow = pending_delivery_module.StepDeliveryFlow(parent)
-    owner.conversation_channel.register_delivery_flow(None, flow)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
-    for item in await asyncio.to_thread(recover_agent_children, loop):
-        await flow.produce(item)
+    await asyncio.to_thread(recover_agent_children, loop)
     notices = [
         item
         for item in parent.agent_notifications(pending_only=False)
@@ -17300,8 +17294,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     ]
     assert len(notices) == 1
     assert notices[0].data["summary"] == "recovered"
-    for item in await asyncio.to_thread(recover_agent_children, loop):
-        await flow.produce(item)
+    await asyncio.to_thread(recover_agent_children, loop)
     assert (
         len(
             [

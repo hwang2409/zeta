@@ -14,7 +14,6 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background import recover_agent_children
-from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -79,10 +78,7 @@ async def test_recovery_does_not_duplicate_notification_appended_after_indexing(
         "sync_agent_completion_notification",
         side_effect=sync_after_external_completion,
     ):
-        deliveries = await asyncio.to_thread(recover_agent_children, loop)
-        flow = StepDeliveryFlow(store)
-        for delivery in deliveries:
-            await flow.produce(delivery)
+        await asyncio.to_thread(recover_agent_children, loop)
 
     notifications = [
         entry
@@ -134,10 +130,7 @@ async def test_nested_recovery_refreshes_both_notification_stores_per_child(
         "sync_agent_completion_notification",
         side_effect=sync_after_indexes,
     ):
-        deliveries = await asyncio.to_thread(recover_agent_children, loop)
-        flow = StepDeliveryFlow(root_store)
-        for delivery in deliveries:
-            await flow.produce(delivery)
+        await asyncio.to_thread(recover_agent_children, loop)
 
     with ConversationStore(child_paths[2].parent, session_id="2") as child_2:
         assert child_2.agent_canceled() is None
@@ -184,10 +177,7 @@ async def test_nested_recovery_uses_notification_returned_by_second_store(
         "sync_agent_completion_notification",
         side_effect=sync_after_fallback,
     ):
-        deliveries = await asyncio.to_thread(recover_agent_children, loop)
-        flow = StepDeliveryFlow(root_store)
-        for delivery in deliveries:
-            await flow.produce(delivery)
+        await asyncio.to_thread(recover_agent_children, loop)
 
     with ConversationStore(child_path.parent, session_id=child_path.name) as child:
         assert child.agent_canceled() is None

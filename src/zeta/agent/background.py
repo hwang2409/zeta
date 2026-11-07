@@ -754,28 +754,26 @@ def _recover_completion_notification(
     )
 
 
-def recover_agent_children(
-    loop: AgentLoopForRecovery,
-) -> tuple[NotificationInput, ...]:
+def recover_agent_children(loop: AgentLoopForRecovery) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
-    return _recover_agent_children(loop)
+    _recover_agent_children(loop)
 
 
 def _recover_agent_children(
     loop: AgentLoopForRecovery,
     *,
     should_stop: Callable[[], bool] | None = None,
-) -> tuple[NotificationInput, ...]:
+) -> None:
     child_markers = loop.store.agent_children()
     if not child_markers:
         recover_orphaned_questions(loop.store)
-        return ()
+        return
     notification_store = loop._background_owner.notification_store
     busy_child_subtrees: set[str] = set()
     for marker_key, marker in child_markers.items():
         if should_stop is not None and should_stop():
-            return ()
+            return
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_instance_id = marker.get(
@@ -927,7 +925,6 @@ def _recover_agent_children(
     recover_orphaned_questions(
         loop.store, excluded_child_subtrees=busy_child_subtrees
     )
-    return ()
 
 
 BuildResult = Callable[..., dict[str, object]]
