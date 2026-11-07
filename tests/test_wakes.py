@@ -299,8 +299,9 @@ async def test_timer_rechecks_utc_after_one_sixty_second_slice() -> None:
     async def controlled_wait(_changed: asyncio.Event, timeout: float) -> None:
         waits.append(timeout)
         wait_started.set()
-        async with asyncio.timeout(10):
-            await (release_wait if len(waits) == 1 else hold_timer).wait()
+        await asyncio.wait_for(
+            (release_wait if len(waits) == 1 else hold_timer).wait(), timeout=10
+        )
 
     scheduler = WakeScheduler(
         "top_level",
