@@ -801,7 +801,7 @@ def main() -> None:
     names = ARGS.session or ["fresh", "phoebe", "orchestrator"]
     selected = set(ARGS.probe or PROBES)
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    with Sandbox("bench", keep=ARGS.keep) as box:
+    with Sandbox("sandbox-bench", keep=ARGS.keep) as box:
         box.write_sitecustomize(SITECUSTOMIZE)
         child_zeta = subprocess.run(
             [sys.executable, "-c", "import zeta; print(zeta.__file__)"],

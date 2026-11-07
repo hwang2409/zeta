@@ -619,7 +619,7 @@ def main() -> None:
         "started_load": load(),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-    with Sandbox("store", keep=args.keep) as BOX:
+    with Sandbox("sandbox-store", keep=args.keep) as BOX:
         result.update(PROBES[args.probe](args))
     result["finished_load"] = load()
     RESULTS.mkdir(parents=True, exist_ok=True)
