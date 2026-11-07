@@ -198,7 +198,20 @@ class RecoveryStatus:
 
 
 StrictReopen = Callable[[], None]
-FaultInjector = Callable[[FaultStep], None]
+_ALLOWED_STATE_MEMORY_STEPS: frozenset[tuple[RepairState, MemoryStep]] = frozenset(
+    {
+        ("pending", "not_required"),
+        ("pending", "review_pending"),
+        ("committed", "not_required"),
+        ("committed", "review_pending"),
+        ("committed", "resumed"),
+        ("abandoned", "not_required"),
+    }
+)
+
+
+def _after_recovery_step(_step: FaultStep) -> None:
+    """Private fault boundary for transaction tests."""
 
 
 def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
@@ -272,6 +285,8 @@ def parse_recovery_record(value: Mapping[str, Any]) -> RecoveryRecord:
         raise TranscriptRecoveryIntegrityError("invalid recovery state")
     if memory_step not in {"not_required", "review_pending", "resumed"}:
         raise TranscriptRecoveryIntegrityError("invalid recovery memory step")
+    if (state, memory_step) not in _ALLOWED_STATE_MEMORY_STEPS:
+        raise TranscriptRecoveryIntegrityError("invalid recovery state and memory step")
     return RecoveryRecord(
         quarantine_id=_record_id(value.get("quarantine_id")),
         target=_parse_target(value.get("target")),
@@ -315,12 +330,9 @@ def repair_transcript(
     *,
     strict_reopen: StrictReopen,
     memory_review_required: bool,
-    fault: FaultInjector | None = None,
-    quarantine_id: str | None = None,
 ) -> RepairResult:
     """Run one already-owned repair transaction; no production caller exists yet."""
-    fault = fault or (lambda _step: None)
-    quarantine_id = _record_id(quarantine_id or uuid.uuid4().hex)
+    quarantine_id = uuid.uuid4().hex
     payload_name = _payload_name(quarantine_id)
     evidence_name = _evidence_name(quarantine_id)
     state_name = _state_name(quarantine_id)
@@ -352,7 +364,7 @@ def repair_transcript(
         finally:
             os.close(payload_fd)
         os.fsync(directory_fd)
-        fault("quarantine_synced")
+        _after_recovery_step("quarantine_synced")
 
         staged_fd = open_session_file(
             directory_fd, staged_name, os.O_RDWR | os.O_CREAT | os.O_EXCL
@@ -361,12 +373,12 @@ def repair_transcript(
             os.lseek(source_fd, 0, os.SEEK_SET)
             _copy_exact(source_fd, staged_fd, source.prefix.end_offset)
             warning = _warning_entry(target, quarantine_id, source, source_digest)
-            os.write(staged_fd, _encoded_line(warning.to_dict()))
+            _write_all(staged_fd, _encoded_line(warning.to_dict()))
             os.fsync(staged_fd)
             repaired_digest = _hash_fd(staged_fd)
         finally:
             os.close(staged_fd)
-        fault("staged_active_synced")
+        _after_recovery_step("staged_active_synced")
 
         manifest = EvidenceManifest(
             quarantine_id=quarantine_id,
@@ -384,7 +396,7 @@ def repair_transcript(
         )
         _publish_immutable_json(directory_fd, evidence_name, manifest.to_dict())
         evidence_published = True
-        fault("evidence_published")
+        _after_recovery_step("evidence_published")
 
         record = RecoveryRecord(
             quarantine_id=quarantine_id,
@@ -397,7 +409,7 @@ def repair_transcript(
             memory_step="review_pending" if memory_review_required else "not_required",
         )
         write_json_file(directory_fd, state_name, record.to_dict())
-        fault("state_pending")
+        _after_recovery_step("state_pending")
 
         os.replace(
             staged_name,
@@ -407,13 +419,13 @@ def repair_transcript(
         )
         active_replaced = True
         os.fsync(directory_fd)
-        fault("active_replaced")
+        _after_recovery_step("active_replaced")
         strict_reopen()
-        fault("strict_reopened")
+        _after_recovery_step("strict_reopened")
         write_json_file(
             directory_fd, state_name, replace(record, state="committed").to_dict()
         )
-        fault("state_committed")
+        _after_recovery_step("state_committed")
         return RepairResult(
             quarantine_id=quarantine_id,
             target=target,
@@ -430,7 +442,9 @@ def repair_transcript(
                     write_json_file(
                         directory_fd,
                         state_name,
-                        replace(pending, state="abandoned").to_dict(),
+                        replace(
+                            pending, state="abandoned", memory_step="not_required"
+                        ).to_dict(),
                     )
             except (OSError, TranscriptRecoveryError):
                 pass
@@ -486,7 +500,7 @@ def reconcile_pending(
                 strict_reopen()
                 record = replace(record, state="committed")
             elif active_digest == record.expected_source_digest:
-                record = replace(record, state="abandoned")
+                record = replace(record, state="abandoned", memory_step="not_required")
             else:
                 raise TranscriptRecoveryIntegrityError(
                     "active transcript does not match pending recovery"

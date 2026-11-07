@@ -50,7 +50,6 @@ class _ReadResult:
     last_entry_id: str | None
     full: bool
     bytes_read: int
-    recovery_generation: int
 
 
 def _bounded_text(value: str, max_chars: int) -> str:
@@ -160,8 +159,6 @@ def _read_transcript(
     path: Path,
     cursor: _Cursor | None,
     append_receipts: tuple[PersistedAppend, ...] | None = None,
-    *,
-    recovery_generation: int = 0,
 ) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
@@ -211,17 +208,13 @@ def _read_transcript(
                 if value.get("type") == "header":
                     if not full or rows:
                         if not full:
-                            return _read_transcript(
-                                path, None, recovery_generation=recovery_generation
-                            )
+                            return _read_transcript(path, None)
                         raise ValueError("unexpected transcript header")
                     continue
                 entry = ConversationEntry.from_dict(value)
                 if entry.seq != last_seq + 1:
                     if not full:
-                        return _read_transcript(
-                            path, None, recovery_generation=recovery_generation
-                        )
+                        return _read_transcript(path, None)
                     raise ValueError("transcript sequence is not contiguous")
                 rows.append(_project_entry(entry))
                 last_seq = entry.seq
@@ -238,7 +231,6 @@ def _read_transcript(
             last_entry_id,
             full,
             bytes_read,
-            recovery_generation,
         )
     finally:
         os.close(fd)

@@ -20,8 +20,6 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
-from zeta.transcript_search.index import TranscriptSource
-from zeta.transcript_search.source import _read_transcript
 
 
 def _recovery():
@@ -139,6 +137,35 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
     ).read_bytes() == payload_before
 
 
+def test_repair_retries_short_warning_write_and_strictly_reopens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, diagnosis = _diagnosed_store(tmp_path)
+    recovery = _recovery()
+    real_write = recovery.os.write
+    shortened = False
+
+    def short_warning_write(fd: int, data: bytes | memoryview) -> int:
+        nonlocal shortened
+        raw = bytes(data)
+        if not shortened and b'"kind":"transcript_recovery"' in raw:
+            shortened = True
+            return real_write(fd, raw[:2])
+        return real_write(fd, data)
+
+    monkeypatch.setattr(recovery.os, "write", short_warning_write)
+    with session_directory(root, "damaged") as (_, directory_fd):
+        recovery.repair_transcript(
+            directory_fd,
+            recovery.RepairTarget("damaged"),
+            diagnosis._source_facts,
+            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            memory_review_required=False,
+        )
+    assert shortened
+    _strict_reopen(root, "damaged")
+
+
 @pytest.mark.parametrize(
     ("step", "active_replaced", "evidence_published"),
     [
@@ -153,6 +180,7 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
 )
 def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     step: str,
     active_replaced: bool,
     evidence_published: bool,
@@ -160,12 +188,13 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
     root, damaged, diagnosis = _diagnosed_store(tmp_path, session_id=step)
     recovery = _recovery()
     target = recovery.RepairTarget(step)
-    quarantine_id = "a" * 32
 
     def stop_at(current: str) -> None:
         if current == step:
             raise OSError(f"fault at {step}")
 
+    # test-contract: seam inject each durable transaction boundary
+    monkeypatch.setattr(recovery, "_after_recovery_step", stop_at)
     with session_directory(root, step) as (_, directory_fd):
         with pytest.raises(OSError, match=f"fault at {step}"):
             recovery.repair_transcript(
@@ -174,8 +203,6 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
                 diagnosis._source_facts,
                 strict_reopen=lambda: _strict_reopen(root, step),
                 memory_review_required=False,
-                fault=stop_at,
-                quarantine_id=quarantine_id,
             )
         active = (root / step / "conversation.jsonl").read_bytes()
         if active_replaced:
@@ -188,12 +215,18 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
             assert resolved[0].state == "committed"
         else:
             assert active == damaged
-        evidence = root / step / f"conversation.quarantine.{quarantine_id}.json"
-        payload = root / step / f"conversation.quarantine.{quarantine_id}.jsonl"
-        assert evidence.exists() is evidence_published
-        assert payload.exists() is evidence_published
+        evidence_files = list((root / step).glob("conversation.quarantine.*.json"))
+        payload_files = list((root / step).glob("conversation.quarantine.*.jsonl"))
+        assert bool(evidence_files) is evidence_published
+        assert bool(payload_files) is evidence_published
         if evidence_published:
-            assert payload.read_bytes() == damaged
+            assert len(evidence_files) == len(payload_files) == 1
+            quarantine_id = (
+                evidence_files[0]
+                .name.removeprefix("conversation.quarantine.")
+                .removesuffix(".json")
+            )
+            assert payload_files[0].read_bytes() == damaged
             record = recovery.read_recovery_record(directory_fd, quarantine_id)
             if record is None:
                 record = recovery.reconcile_pending(
@@ -275,9 +308,39 @@ def test_nested_target_resolution_uses_public_identity_and_no_symlinks(
         pass
 
 
-def test_record_parser_rejects_unknown_fields_and_search_carries_generation(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("state", "memory_step"),
+    [
+        ("pending", "resumed"),
+        ("abandoned", "review_pending"),
+        ("abandoned", "resumed"),
+    ],
+)
+def test_record_parser_rejects_illegal_state_memory_pairs(
+    tmp_path: Path, state: str, memory_step: str
 ) -> None:
+    root, _, diagnosis = _diagnosed_store(tmp_path)
+    recovery = _recovery()
+    with session_directory(root, "damaged") as (_, directory_fd):
+        result = recovery.repair_transcript(
+            directory_fd,
+            recovery.RepairTarget("damaged"),
+            diagnosis._source_facts,
+            strict_reopen=lambda: _strict_reopen(root, "damaged"),
+            memory_review_required=False,
+        )
+        value = recovery.read_recovery_record(
+            directory_fd, result.quarantine_id
+        ).to_dict()
+    value.update(state=state, memory_step=memory_step)
+    with pytest.raises(
+        recovery.TranscriptRecoveryIntegrityError,
+        match="state and memory step",
+    ):
+        recovery.parse_recovery_record(value)
+
+
+def test_record_parser_rejects_unknown_fields(tmp_path: Path) -> None:
     root, _, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
     target = recovery.RepairTarget("damaged")
@@ -295,15 +358,3 @@ def test_record_parser_rejects_unknown_fields_and_search_carries_generation(
     value["unexpected"] = True
     with pytest.raises(recovery.TranscriptRecoveryIntegrityError, match="shape"):
         recovery.parse_evidence_manifest(value)
-
-    source = TranscriptSource(
-        session_id="damaged",
-        session_dir=root / "damaged",
-        recovery_generation=7,
-    )
-    read = _read_transcript(
-        source.conversation_path,
-        None,
-        recovery_generation=source.recovery_generation,
-    )
-    assert read.recovery_generation == 7
