@@ -700,26 +700,19 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-async def close_direct_test_runtime_owners(
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-    tmp_path: Path,
-):
+async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
-    from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
-    from zeta.memory.auto import AutoMemoryReconciler
-    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
     from zeta.storage_format import StorageFormatError, advance, open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
     loops: list[AgentLoop] = []
-    stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
-    memory_runners: list[AutoMemoryReconciler] = []
+    stores: list[ConversationStore] = []
+    composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
@@ -727,7 +720,6 @@ async def close_direct_test_runtime_owners(
     loop_init = AgentLoop.__init__
     loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
-    memory_runner_init = AutoMemoryReconciler.__init__
     manager_init = SessionManager.__init__
 
     @wraps(loop_init)
@@ -738,8 +730,6 @@ async def close_direct_test_runtime_owners(
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
     background_init = BackgroundTaskRegistry.__init__
-    project_init = ProjectRegistry.__init__
-    account_init = AccountStore.__init__
     store_close = ConversationStore.close
     registry_close = ToolRegistry.close
 
@@ -765,32 +755,6 @@ async def close_direct_test_runtime_owners(
                 raise error[0]
             test_home_leases[canonical] = result[0]
 
-    test_file = Path(str(request.node.fspath)).name
-    if not test_file.startswith(
-        (
-            "test_storage_format",
-            "test_background",
-            "test_composer_completion",
-            "test_server.py",
-        )
-    ):
-        ensure_format(tmp_path)
-    if test_file == "test_mcp_oauth.py":
-        ensure_format(tmp_path / "zeta-home")
-        os.chmod(tmp_path / "zeta-home", 0o700)
-
-    @wraps(project_init)
-    def tracked_project_init(project_registry, *args, **kwargs):
-        root = Path(args[0]) if args else Path(kwargs["root"])
-        ensure_format(root.parent)
-        project_init(project_registry, *args, **kwargs)
-
-    @wraps(account_init)
-    def tracked_account_init(account_store, *args, **kwargs):
-        home = Path(args[0]) if args else Path(kwargs["home"])
-        ensure_format(home)
-        account_init(account_store, *args, **kwargs)
-
     @wraps(store_init)
     def tracked_store_init(store, *args, **kwargs):
         root_value = args[0] if args else kwargs.get("session_dir")
@@ -804,12 +768,11 @@ async def close_direct_test_runtime_owners(
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        stores.add(store)
-
-    @wraps(memory_runner_init)
-    def tracked_memory_runner_init(runner, *args, **kwargs):
-        memory_runner_init(runner, *args, **kwargs)
-        memory_runners.append(runner)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            stores.append(store)
+        else:
+            composed_stores.add(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
@@ -851,15 +814,9 @@ async def close_direct_test_runtime_owners(
         registries.append(registry)
 
     # test-contract: seam tracks process-owned resources created across tests
-    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_init)
-    # test-contract: seam tracks process-owned resources created across tests
-    monkeypatch.setattr(AccountStore, "__init__", tracked_account_init)
-    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
-    # test-contract: seam tracks process-owned resources created across tests
-    monkeypatch.setattr(AutoMemoryReconciler, "__init__", tracked_memory_runner_init)
     # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     # test-contract: seam tracks process-owned resources created across tests
@@ -881,12 +838,7 @@ async def close_direct_test_runtime_owners(
                 await registry_close(registry)
             except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
                 pass
-    for runner in reversed(memory_runners):
-        try:
-            await runner.close()
-        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
-            pass
-    for store in reversed(tuple(stores)):
+    for store in reversed((*stores, *composed_stores)):
         if not store._closed:
             try:
                 store_close(store)
@@ -921,6 +873,7 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
         if _is_repository_test_path(caller):
             loops.append(loop)
 
+    # test-contract: seam tracks loops created across tests for deterministic cleanup
     monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
     yield
     for loop in reversed(loops):
@@ -957,6 +910,7 @@ def stable_terminal_defaults(
             kwargs.setdefault("no_color", False)
         original_init(self, *args, **kwargs)
 
+    # test-contract: seam makes terminal rendering deterministic across test hosts
     monkeypatch.setattr(Console, "__init__", init_with_stable_defaults)
 
     yield
