@@ -6616,7 +6616,7 @@ async def test_truncated_response_notice_is_printed_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
 
     class TruncatedBackend(CompletionBackend):

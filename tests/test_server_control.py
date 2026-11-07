@@ -99,9 +99,7 @@ class _ControllerConnection:
             "Server",
             (),
             {
-                "runtime": type(
-                    "Runtime", (), {"set_post_stream_provider_retry": lambda *_: None}
-                )()
+                "runtime": type("Runtime", (), {})()
             },
         )()
 

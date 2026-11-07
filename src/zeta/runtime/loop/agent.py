@@ -154,8 +154,6 @@ class AgentLoop(
     ProjectInboxNotificationMixin,
     MCPSession,
 ):
-    post_stream_provider_retry = True
-
     def __init__(
         self,
         backend: CompletionBackend,
@@ -801,6 +799,8 @@ class AgentLoop(
         recovering_tool_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
+        provider_retry_budget: CompletionRetryBudget | None = None
+        provider_budget_prompt_id: str | None = None
         while (
             self.max_turns is None
             or turn_number < self.max_turns
@@ -810,7 +810,6 @@ class AgentLoop(
             or recovering_tool_limit
         ):
             if not retrying_context:
-                self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
                 turn_number += 1
@@ -919,8 +918,13 @@ class AgentLoop(
                     yield StreamEvent(StreamEventType.ERROR, error=disposition)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
-                provider_retry_budget = CompletionRetryBudget()
-                self._turn_provider_retry_records = provider_retry_budget.records
+                if (
+                    provider_retry_budget is None
+                    or prepared_delivery.prompt_id != provider_budget_prompt_id
+                ):
+                    provider_retry_budget = CompletionRetryBudget()
+                    provider_budget_prompt_id = prepared_delivery.prompt_id
+                    self._turn_provider_retry_records = provider_retry_budget.records
                 admitted_request = prepared_delivery.admitted_request
                 assert admitted_request is not None
                 completion = self.context_assembler.dispatch_admitted_request(
@@ -928,11 +932,7 @@ class AgentLoop(
                     admitted_request,
                     control=CompletionControl(
                         abort=turn_abort_signal,
-                        reset=(
-                            ResetPolicy.ALLOW_ASSISTANT_RESET
-                            if self.post_stream_provider_retry
-                            else ResetPolicy.NO_RESET
-                        ),
+                        reset=ResetPolicy.ALLOW_ASSISTANT_RESET,
                         budget=provider_retry_budget,
                         task_deadline=task_deadline,
                     ),
@@ -1019,7 +1019,9 @@ class AgentLoop(
                 if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
-                error = _error_info(exc, provider_error=True)
+                error = _error_info(
+                    exc, provider_error=getattr(exc, "provider_error", True)
+                )
                 provider_error = error
                 provider_error_source = exc
                 completion = None
@@ -1071,7 +1073,10 @@ class AgentLoop(
                     if isinstance(original, ErrorInfo):
                         provider_error = original
                     elif isinstance(original, BaseException):
-                        provider_error = _error_info(original, provider_error=True)
+                        provider_error = _error_info(
+                            original,
+                            provider_error=getattr(original, "provider_error", True),
+                        )
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )

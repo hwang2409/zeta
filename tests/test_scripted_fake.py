@@ -381,7 +381,7 @@ async def test_serve_scripted_provider_error_reaches_client(
 ) -> None:
     monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, BASH_SCRIPT)))
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     script = parse_fake_script(BASH_SCRIPT)
     server = ZetaServer(

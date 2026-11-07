@@ -37,7 +37,7 @@ from zeta.providers.anthropic import (
     build_messages_payload,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
-from zeta.providers.retry_policy import (
+from zeta.providers.completion import (
     MAX_PROVIDER_ATTEMPTS,
     MAX_PROVIDER_RETRY_SECONDS,
 )
@@ -3018,7 +3018,7 @@ async def test_early_eof_retry_omits_empty_salvaged_text_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     truncated = (
         'data: {"type":"message_start","message":{}}\n\n'
@@ -4087,7 +4087,7 @@ async def test_max_tokens_mid_tool_call_recovers_and_next_response_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     requests: list[dict[str, object]] = []
     executed: list[dict[str, object]] = []
@@ -4142,7 +4142,7 @@ async def test_two_consecutive_max_tokens_mid_tool_calls_end_with_max_tokens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     requests: list[httpx.Request] = []
 
@@ -4192,7 +4192,7 @@ async def test_max_tokens_mid_tool_call_has_no_provider_retry_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     requests = 0
 
@@ -4233,7 +4233,7 @@ async def test_real_anthropic_stream_disconnect_still_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
     requests = 0
     disconnected = (

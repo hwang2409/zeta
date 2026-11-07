@@ -1143,7 +1143,7 @@ async def test_clean_eof_without_tool_call_discards_partial_and_retries(
 ) -> None:
     requests: list[httpx.Request] = []
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda *_args: 0.0
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:

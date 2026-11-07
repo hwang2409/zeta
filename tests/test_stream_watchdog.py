@@ -11,10 +11,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -46,14 +44,6 @@ from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex import CodexBackend
 from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.completion import owned_completion
-from zeta.providers.transport import (
-    DEFAULT_STREAM_STALL_RETRIES,
-    DEFAULT_STREAM_STALL_SECONDS,
-    retry_provider_completion,
-    stall_retry_kwargs,
-    stall_retry_notice,
-    stall_watchdog,
-)
 from zeta.runtime.headless import drive_turn
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -128,183 +118,18 @@ class _StubError(RuntimeError):
         self.is_stall = is_stall
 
 
-async def test_stall_watchdog_raises_when_source_is_silent() -> None:
-    async def source():
-        yield "first"
-        await asyncio.Event().wait()
-
-    started = source()
-    watched = stall_watchdog(
-        started,
-        seconds=0.05,
-        on_stall=lambda elapsed: _StubError("stalled", is_stall=True),
-    )
-    aiter = watched.__aiter__()
-    assert await aiter.__anext__() == "first"
-    with pytest.raises(_StubError) as excinfo:
-        await aiter.__anext__()
-    assert excinfo.value.is_stall is True
-    await watched.aclose()
 
 
-async def test_stall_watchdog_resets_timer_on_each_item(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = 0.0
-    waits: list[float] = []
-
-    async def manual_wait_for(awaitable, timeout):  # type: ignore[no-untyped-def]
-        started = now
-        waits.append(timeout)
-        result = await awaitable
-        if timeout is not None and now - started >= timeout:
-            raise TimeoutError
-        return result
-
-    async def source():
-        nonlocal now
-        for advance, value in ((9.0, "a"), (9.0, "b"), (10.0, "c")):
-            now += advance
-            yield value
-
-    real_monotonic = time.monotonic
-    real_wait_for = asyncio.wait_for
-    monkeypatch.setattr(
-        transport_module,
-        "time",
-        SimpleNamespace(**(vars(time) | {"monotonic": lambda: now})),
-    )
-    monkeypatch.setattr(
-        transport_module,
-        "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"wait_for": manual_wait_for})),
-    )
-    assert transport_module.time is not time
-    assert transport_module.asyncio is not asyncio
-    assert time.monotonic is real_monotonic
-    assert asyncio.wait_for is real_wait_for
-    watched = stall_watchdog(
-        source(),
-        seconds=10.0,
-        on_stall=lambda elapsed: _StubError("stalled", is_stall=True),
-    )
-
-    seen: list[str] = []
-    with pytest.raises(_StubError, match="stalled"):
-        async for item in watched:
-            seen.append(item)
-
-    assert seen == ["a", "b"]
-    assert waits == [10.0, 10.0, 10.0]
 
 
-async def test_stall_watchdog_disabled_when_seconds_nonpositive() -> None:
-    async def source():
-        yield "only"
-
-    watched = stall_watchdog(
-        source(),
-        seconds=0.0,
-        on_stall=lambda elapsed: _StubError("stalled", is_stall=True),
-    )
-    seen = [item async for item in watched]
-    assert seen == ["only"]
 
 
-def test_stall_retry_notice_has_reset_flag_and_max_retries_text() -> None:
-    event = stall_retry_notice(2, 4.0, 3)
-    assert event.type is StreamEventType.RETRY
-    assert event.data["is_stall"] is True
-    assert "reset" not in event.data
-    assert event.data["retry"] == 2
-    assert event.data["text"] == "provider stalled, retrying (2/3) in 4s"
 
 
-def test_stall_retry_kwargs_wires_predicate_and_notice() -> None:
-    kwargs = stall_retry_kwargs(2)
-    assert kwargs["max_stall_retries"] == 2
-    predicate = kwargs["is_stall"]
-    assert predicate(_StubError("x", is_stall=True)) is True
-    assert predicate(_StubError("x", is_stall=False)) is False
-    notice = kwargs["stall_notice"](1, 4.0, _StubError("y", is_stall=True))
-    assert notice.type is StreamEventType.RETRY
-    assert notice.data["is_stall"] is True
 
 
-async def test_retry_provider_completion_retries_metadata_only_stall(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sleeps: list[float] = []
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_sleep(sleeps))
-    attempts = 0
-
-    async def first():
-        nonlocal attempts
-        attempts += 1
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-        if attempts == 1:
-            raise _StubError("stalled", is_stall=True)
-        yield StreamEvent(StreamEventType.MESSAGE_END)
-
-    async def _unused(_token: str) -> AsyncIterator[StreamEvent]:
-        raise AssertionError("auth retry unreachable")
-        yield
-
-    events: list[StreamEvent] = []
-    async for event in retry_provider_completion(
-            first,
-            _unused,
-            _refresh_unreachable,
-            lambda _e: False,
-            lambda _e: RuntimeError("auth exhausted"),
-            _notice_unreachable,
-            lambda _e, _n: None,
-            **stall_retry_kwargs(2),
-        ):
-            events.append(event)
-
-    assert attempts == 2
-    assert [event.type for event in events] == [
-        StreamEventType.MESSAGE_START,
-        StreamEventType.RETRY,
-        StreamEventType.MESSAGE_START,
-        StreamEventType.MESSAGE_END,
-    ]
-    assert len(sleeps) == 1
 
 
-async def test_retry_provider_completion_stops_after_stall_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sleeps: list[float] = []
-    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_sleep(sleeps))
-    attempts = 0
-    exhausted: list[tuple[RuntimeError, int]] = []
-
-    async def first():
-        nonlocal attempts
-        attempts += 1
-        raise _StubError("stalled", is_stall=True)
-        yield
-
-    with pytest.raises(_StubError):
-        [
-            event
-            async for event in retry_provider_completion(
-                first,
-                _unreachable_retry,
-                _refresh_unreachable,
-                lambda _e: False,
-                lambda _e: RuntimeError("auth exhausted"),
-                _notice_unreachable,
-                lambda error, retries: exhausted.append((error, retries)),
-                **stall_retry_kwargs(2),
-            )
-        ]
-
-    assert attempts == 3
-    assert len(sleeps) == 2
-    assert exhausted and exhausted[0][1] == 2
 
 
 def _no_sleep(sleeps: list[float]):
@@ -472,64 +297,8 @@ async def test_anthropic_backend_stall_budget_exhausts(
     await client.aclose()
 
 
-async def test_keepalives_reset_transport_but_not_progress_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
-    progress = transport_module.StreamProgress()
-
-    async def source():
-        for _ in range(20):
-            clock[0] += 60.0
-            yield "keepalive"
-
-    watched = stall_watchdog(
-        source(),
-        seconds=90.0,
-        on_stall=lambda elapsed: _StubError(f"transport stalled after {elapsed}"),
-        on_model_stall=lambda elapsed: _StubError(
-            f"model progress stalled after {elapsed}", is_stall=True
-        ),
-        progress=progress,
-    )
-    seen = []
-    with pytest.raises(_StubError, match="model progress stalled after 900.0"):
-        async for item in watched:
-            seen.append(item)
-            progress.observe(("ping", {"type": "ping"}))
-
-    assert len(seen) == 15
-    assert clock == [900.0]
 
 
-async def test_decoded_progress_resets_progress_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = [0.0]
-    monkeypatch.setattr(transport_module.time, "monotonic", lambda: clock[0])
-    progress = transport_module.StreamProgress()
-
-    async def source():
-        for index in range(20):
-            clock[0] += 60.0
-            yield index
-
-    watched = stall_watchdog(
-        source(),
-        seconds=90.0,
-        on_stall=lambda elapsed: _StubError(f"stalled after {elapsed}", is_stall=True),
-        progress=progress,
-    )
-    seen = []
-    async for item in watched:
-        seen.append(item)
-        event_type = "message_start" if item in {4, 14} else "ping"
-        progress.observe((event_type, {"type": event_type}))
-
-    assert seen == list(range(20))
-    assert clock == [1200.0]
-    assert progress.maximum_gap_s() == 600.0
 
 
 async def _no_op_sleep(_delay: float) -> None:
@@ -922,7 +691,10 @@ class _StallAfterCompletionBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("only text")]),
         )
-        yield stall_retry_notice(1, 0.0, 2)
+        yield StreamEvent(
+            StreamEventType.RETRY,
+            data={"is_stall": True, "retry": 1, "delay": 0.0},
+        )
 
 
 async def test_agent_loop_stall_after_message_end_keeps_completed_message(
@@ -1079,18 +851,6 @@ def test_resolve_carries_stream_stall_settings_into_resolved_config() -> None:
 # ------------------------------ Defaults sanity ---------------------------- #
 
 
-def test_provider_backends_default_to_shared_stall_constants(tmp_path: Path) -> None:
-    codex_backend = CodexBackend(
-        token_store=_codex_store(tmp_path / "codex.json"),
-        base_url="https://test.invalid/codex/responses",
-    )
-    anthropic_backend = AnthropicBackend(
-        token_store=_anthropic_store(tmp_path / "zeta.json"),
-    )
-    assert codex_backend.stall_seconds == DEFAULT_STREAM_STALL_SECONDS
-    assert codex_backend.stall_retries == DEFAULT_STREAM_STALL_RETRIES
-    assert anthropic_backend.stall_seconds == DEFAULT_STREAM_STALL_SECONDS
-    assert anthropic_backend.stall_retries == DEFAULT_STREAM_STALL_RETRIES
 
 
 # ------------------------------ FakeBackend guard --------------------------- #

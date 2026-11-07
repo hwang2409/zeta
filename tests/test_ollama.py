@@ -818,7 +818,7 @@ async def test_ollama_retries_connect_error_and_closes_owned_client(
 
     clients: list[OwnedClient] = []
     monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", OwnedClient)
-    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.completion.retry_wait_seconds", lambda *args: 0)
     backend = OllamaBackend(stall_retries=1)
     with pytest.raises(OllamaError):
         [event async for event in backend.complete([], [], control=completion_control())]
@@ -1324,7 +1324,7 @@ async def test_ollama_retries_only_before_events_are_emitted(monkeypatch) -> Non
         )
 
     monkeypatch.setattr(
-        "zeta.providers.retry_policy.retry_wait_seconds", lambda error, retry: 0
+        "zeta.providers.completion.retry_wait_seconds", lambda error, retry: 0
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(OllamaError, match="ended before"):

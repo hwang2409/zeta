@@ -17,8 +17,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-import zeta.providers.codex as codex_module
-import zeta.providers.transport as transport_module
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
 from tests.support.credentials import named_account_credentials
@@ -48,7 +46,7 @@ from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
 from zeta.providers.codex import CodexBackend
-from zeta.providers.retry_policy import ProviderRetryBudget
+from zeta.providers.completion import CompletionRetryBudget
 from zeta.skills import SkillCatalog
 from zeta.tui import TUIApp
 
@@ -89,10 +87,10 @@ def test_anthropic_429_is_not_classified_without_fixture() -> None:
 def test_classified_limit_is_not_retried_and_other_retries_unchanged() -> None:
     exhausted = _failure(429, json.loads(FIXTURE.read_text()))
     exhausted.subscription_limit = classify_subscription_limit("codex", ACCOUNT, exhausted)
-    budget = ProviderRetryBudget()
-    budget.start_attempt("test")
-    assert budget.plan(exhausted, owner="test") is None
-    assert budget.plan(SimpleNamespace(status_code=429), owner="test") is not None
+    budget = CompletionRetryBudget()
+    budget.start_attempt("completion", 0.0)
+    assert budget.plan(exhausted, 0.0) is None
+    assert budget.plan(SimpleNamespace(status_code=429), 0.0) is not None
 
 
 def test_limit_marks_account_known_exhausted_until_reset(tmp_path: Path) -> None:
@@ -961,7 +959,7 @@ async def test_account_switch_never_replays_transcript(
 
 @pytest.mark.asyncio
 async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     context, opened, first, second = await asyncio.to_thread(
         _account_context, tmp_path
@@ -987,21 +985,13 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
     async def fail_retry_sleep(_delay: float) -> None:
         raise AssertionError("classified account limit must not wait to retry")
 
-    retry_provider_completion = transport_module.retry_provider_completion
-
-    def completion_without_retry_sleep(*args: object, **kwargs: object):
-        kwargs["sleep"] = fail_retry_sleep
-        return retry_provider_completion(*args, **kwargs)
-
-    monkeypatch.setattr(
-        codex_module, "retry_provider_completion", completion_without_retry_sleep
-    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     backend = CodexBackend(
         client=client,
         token_store=named_account_credentials(context.home, "codex", "first"),
         base_url="https://test.invalid/codex/responses",
     )
+    backend._completion_wait = fail_retry_sleep
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     loop.manager = context.manager
     loop.session_metadata = context.metadata

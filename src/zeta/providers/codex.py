@@ -61,7 +61,6 @@ from .transport import (
     task_is_cancelling,
 )
 from .usage import normalize_usage
-from .retry_policy import current_retry_budget
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -311,12 +310,11 @@ class CodexBackend(CompletionBackend):
                 and self.diagnostics_path is not None
                 and getattr(primary_exception, "code", None) == "server_error"
             ):
-                budget = current_retry_budget()
                 primary_exception.stream_diagnostic = (
                     self.diagnostics_path,
                     self.model,
                     getattr(primary_exception, "diagnostic_context", {}),
-                    budget.attempts if budget is not None else 1,
+                    1,
                 )
             primary_exception = await cleanup_transport(
                 stream_context=stream_context,

@@ -90,7 +90,6 @@ def compose_runtime(
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
-    post_stream_provider_retry: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -296,7 +295,6 @@ def compose_runtime(
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
-        loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata
         loop.account_context = account_context

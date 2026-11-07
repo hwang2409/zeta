@@ -18,7 +18,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex_errors import CodexHTTPError, CodexStreamError
-from zeta.providers.retry_policy import retryable_provider_error
+from zeta.providers.completion import retryable_provider_error
 from zeta.providers.transport import (
     build_response_error,
     cleanup_transport,

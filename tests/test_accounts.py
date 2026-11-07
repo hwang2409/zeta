@@ -59,9 +59,8 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
 )
-from zeta.providers.completion import owned_completion
+from zeta.providers.completion import owned_completion, retryable_provider_error
 from zeta.providers.factory import build_backend, credential_store
-from zeta.providers.retry_policy import retryable_provider_error
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch

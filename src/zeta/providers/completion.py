@@ -101,6 +101,7 @@ class CompletionRetryBudget:
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
     started_at: float | None = None
+    committed: bool = False
 
     def start_attempt(self, owner: str, now: float, *, is_stall: bool = False) -> bool:
         if self.attempts >= self.max_attempts:
@@ -389,8 +390,9 @@ class TaskDeadlineExceeded(RuntimeError):
 
 
 class PrematureCompletionError(RuntimeError):
+    provider_error = False
     retryable = True
-    retry_reason = "premature_eof"
+    retry_reason = "stream_error"
     code = "stream_error"
 
 
@@ -436,6 +438,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._closed = False
         self._attempt_completed = False
         self._pending: deque[StreamEvent] = deque()
+        self._pending_retry: RetryPlan | None = None
         self._transport_deadline = 0.0
         self._model_deadline = 0.0
         self._last_model_progress: float | None = None
@@ -446,6 +449,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
 
     def commit(self) -> None:
         self._committed = True
+        self._control.budget.committed = True
 
     async def __anext__(self) -> StreamEvent:
         while True:
@@ -453,6 +457,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 return self._pending.popleft()
             if self._closed:
                 raise StopAsyncIteration
+            if self._pending_retry is not None:
+                plan = self._pending_retry
+                self._pending_retry = None
+                await self._wait_for_retry(plan.delay)
+                self._control.budget.record_retry(plan)
             if self._attempt is None:
                 await self._open_attempt()
             assert self._attempt is not None
@@ -588,7 +597,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         error: BaseException | object,
         event_data: Mapping[str, Any] | None = None,
     ) -> bool:
-        if self._committed:
+        if self._committed or self._control.budget.committed:
             self._control.budget.records.append(
                 {
                     "decision": "skipped-after-output",
@@ -632,8 +641,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 return False
             self._pending.append(StreamEvent(StreamEventType.ASSISTANT_RESET))
             self._emitted = False
-        await self._wait_for_retry(plan.delay)
-        self._control.budget.record_retry(plan)
+        self._pending_retry = plan
         return True
 
     async def _wait_for_retry(self, delay: float) -> None:
@@ -657,6 +665,9 @@ class CompletionRun(AsyncIterator[StreamEvent]):
     def _record_failure_decision(self, error: object, *, will_retry: bool) -> None:
         if getattr(error, "stream_diagnostic", None) is None:
             return
+        diagnostic = error.stream_diagnostic
+        if isinstance(diagnostic, tuple) and len(diagnostic) == 4:
+            error.stream_diagnostic = (*diagnostic[:3], self._control.budget.attempts)
         from .stream_diagnostics import StreamDiagnostics
 
         StreamDiagnostics.record_failure_decision(
@@ -676,6 +687,9 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                         f"({stall_attempt}/{self._control.budget.max_stall_retries})"
                         f" in {format_retry_delay(plan.delay)}s"
                     ),
+                    "kind": "provider_stall",
+                    "attempt": plan.attempt,
+                    "reason": plan.reason,
                     "retry": stall_attempt,
                     "delay": plan.delay,
                     "is_stall": True,
@@ -688,6 +702,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     f"{retry_error_label(error)}, retrying in {plan.delay:g}s "
                     f"(attempt {plan.attempt}/{MAX_PROVIDER_ATTEMPTS})"
                 ),
+                "kind": "provider_retry",
+                "attempt": plan.attempt,
                 "retry": plan.attempt - 1,
                 "delay": plan.delay,
                 "reason": plan.reason,
