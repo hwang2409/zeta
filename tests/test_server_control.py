@@ -646,7 +646,7 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
 
         async def wait_idle(*args: object) -> bool:
             idle_waiting.set()
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
             return True
 
         class OwnedFinishGate(FinishGateState):

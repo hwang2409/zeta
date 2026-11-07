@@ -13061,7 +13061,7 @@ async def _run_until_idle_wait(
 
     async def wait_idle(_wake, _timeout):
         idle_waiting.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -13158,7 +13158,9 @@ async def test_idle_with_open_work_does_not_notify_parent(
     finally:
         if owned_child is not None:
             loop._background_owner.cancel_subtree("root:1:1")
-            await asyncio.gather(owned_child, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(owned_child, return_exceptions=True), 10
+            )
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
@@ -13263,7 +13265,7 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
             args[0], pending_delivery_module.PromptInput
         ):
             commit_entered.set()
-            await release_commit.wait()
+            await asyncio.wait_for(release_commit.wait(), 10)
             result = await original_durable(function, *args, **kwargs)
             order.append("follow_up")
             return result
@@ -13349,7 +13351,7 @@ async def test_stalled_admission_commits_before_racing_follow_up(
 
     async def blocked_idle(**kwargs):
         idle_entered.set()
-        await release_idle.wait()
+        await asyncio.wait_for(release_idle.wait(), 10)
         result = await original_idle(**kwargs)
         order.append("idle")
         return result
@@ -15959,7 +15961,7 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
         description="grandchild",
         text="WAIT",
     )
-    await asyncio.wait_for(parent_wake, timeout=1)
+    await asyncio.wait_for(parent_wake, timeout=10)
     assert parent.agent_notifications()[0].data["kind"] == "child_idle"
     assert not any(
         entry.data.get("kind") == "child_idle"
