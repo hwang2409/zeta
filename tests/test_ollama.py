@@ -11,7 +11,6 @@ import pytest
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
-from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
 from zeta.core.slash import resolve_session_budget
@@ -32,6 +31,7 @@ from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 from zeta.runtime.cleanup import close_session
 from zeta.runtime.composition import compose_runtime
+from zeta.runtime.loop import AgentLoop
 from zeta.server import model_selection
 from zeta.server import runtime as server_runtime
 from zeta.skills.agent_catalog import AgentCatalog

@@ -104,12 +104,6 @@ class HistoryFinder:
         snapshot = await asyncio.to_thread(self._load_snapshot)
         yield snapshot, True
 
-    async def build_finder_candidates(
-        self, request: HistoryCandidateRequest
-    ) -> HistorySnapshot:
-        del request
-        return await asyncio.to_thread(self._load_snapshot)
-
     def _load_snapshot(self) -> HistorySnapshot:
         return build_history_candidates(self._history_snapshot())
 
@@ -122,11 +116,6 @@ class HistoryFinder:
     ) -> bool:
         if not complete:
             return False
-        return self.finder_publish_candidates(request, snapshot)
-
-    def finder_publish_candidates(
-        self, request: HistoryCandidateRequest, snapshot: HistorySnapshot
-    ) -> bool:
         if self._finder is None or request.generation != self._generation:
             return False
         self._entries = dict(snapshot.entries)

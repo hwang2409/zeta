@@ -125,9 +125,9 @@ def test_layer_module_parameters_cover_discovered_modules() -> None:
 def test_absolute_import_boundary_has_teeth(tmp_path: Path) -> None:
     mutated_root = tmp_path / "zeta"
     shutil.copytree(ROOT, mutated_root)
-    loop_path = mutated_root / "core" / "loop.py"
-    loop_path.write_text(
-        "from zeta.tools import ToolRegistry\n" + loop_path.read_text(encoding="utf-8"),
+    core_path = mutated_root / "core" / "session.py"
+    core_path.write_text(
+        "from zeta.tools import ToolRegistry\n" + core_path.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
 
@@ -139,7 +139,7 @@ def test_absolute_import_boundary_has_teeth(tmp_path: Path) -> None:
     ]
 
     assert any(
-        "core/loop.py" in violation and "zeta.tools" in violation
+        "core/session.py" in violation and "zeta.tools" in violation
         for violation in violations
     ), "\n".join(violations)
 
