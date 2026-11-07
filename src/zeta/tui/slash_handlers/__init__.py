@@ -155,6 +155,11 @@ class SlashHandlerMixin:
             transcript_index_failure=self.loop.transcript_index_failure(
                 self._viewed_session_path().name
             ),
+            unavailable_accounts=(
+                context.unavailable_accounts
+                if (context := getattr(self.loop, "account_context", None)) is not None
+                else ()
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -198,6 +203,7 @@ class SlashHandlerMixin:
             {item.account: item.detail for item in displays if item.detail},
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
+            {item.account for item in displays if not item.available},
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())

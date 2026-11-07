@@ -480,6 +480,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
                         "account": str(item),
                         "id": str(item.account),
                         "detail": item.detail,
+                        "available": item.available,
                         "default": store.default(item.account.provider) == item.account,
                         "usage": usage_json(item.usage),
                     }
@@ -495,7 +496,15 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             if store.default(item.account.provider) == item.account
             else ""
         )
-        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
+        availability = (
+            "  unavailable: credentials missing" if not item.available else ""
+        )
+        lines.append(
+            str(item)
+            + (f"  {item.detail}" if item.detail else "")
+            + availability
+            + marker
+        )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -1087,6 +1096,9 @@ def main(argv: list[str] | None = None) -> int:
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
+        except AccountError as exc:
+            print(f"zeta: {exc}", file=sys.stderr)
+            return 2
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
             return 2
@@ -1111,10 +1123,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt is not None:
         from ..runtime.headless import run_headless
 
-        return run_headless(args, args.prompt)
+        try:
+            return run_headless(args, args.prompt)
+        except AccountError as exc:
+            print(f"zeta: {exc}", file=sys.stderr)
+            return 2
     if args.format != "text":
         parser.error("--format requires --print")
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    try:
+        exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    except AccountError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status

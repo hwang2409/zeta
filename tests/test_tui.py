@@ -14067,6 +14067,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
         {"codex": account},
         {account: "henry@example.com"},
         {account: "henry"},
+        unavailable={account},
     )
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(picker.render())
@@ -14074,6 +14075,7 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
 
     assert "codex:henry" in plain
     assert "henry@example.com" in plain
+    assert "unavailable: credentials missing" in plain
     assert "n rename" in plain
 
 

@@ -75,6 +75,7 @@ class SessionAccountContext:
     _active_provider: str | None = None
     _switch_sequences: dict[str, int] = field(default_factory=dict)
     _account_state_unknown: bool = False
+    _unavailable_accounts: tuple[str, ...] = ()
     _unknown_state: _UnknownAccountState | None = field(default=None, init=False, repr=False)
     _switch_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
@@ -109,6 +110,8 @@ class SessionAccountContext:
             and not api_key_mode(metadata.provider)
         ):
             context.resolve(metadata.provider)
+        if validate:
+            context._refresh_account_availability()
         return context
 
     @property
@@ -128,6 +131,17 @@ class SessionAccountContext:
     @property
     def active_provider(self) -> str | None:
         return self._active_provider
+
+    @property
+    def unavailable_accounts(self) -> tuple[str, ...]:
+        return self._unavailable_accounts
+
+    def _refresh_account_availability(self) -> tuple[AccountDisplay, ...]:
+        displays = tuple(self.store.list_display())
+        self._unavailable_accounts = tuple(
+            str(item.account) for item in displays if not item.available
+        )
+        return displays
 
     @property
     def account_state_unknown(self) -> bool:
@@ -160,12 +174,15 @@ class SessionAccountContext:
                 raise AccountError(
                     f"session account {selected} no longer exists; choose another with /accounts"
                 )
+            if not self._frozen:
+                self.store.require_available(selected)
             return selected
         if self._frozen:
             raise AccountError(
                 f"child account snapshot has no {canonical} account; start a new child"
             )
         selected = self.store.resolve_account(provider)
+        self.store.require_available(selected)
         if self.store.contains(selected):
             with self.store.pin_guard({canonical: selected}):
                 self._pins[canonical] = selected
@@ -189,7 +206,7 @@ class SessionAccountContext:
         selected = self.snapshot()
 
         def load() -> AccountListSnapshot:
-            displays = tuple(self.store.list_display())
+            displays = self._refresh_account_availability()
             providers = {item.account.provider for item in displays}
             defaults = {
                 provider: account
@@ -219,6 +236,7 @@ class SessionAccountContext:
             _frozen=True,
             _active_provider=canonical,
             _switch_sequences=dict(self._switch_sequences),
+            _unavailable_accounts=self._unavailable_accounts,
         )
 
     async def switch_active(
@@ -237,6 +255,7 @@ class SessionAccountContext:
                 raise AccountError("child account snapshots cannot be changed")
             if not self.store.contains(account):
                 raise AccountError(f"account {account} does not exist; use /accounts")
+            self.store.require_available(account)
             assert self.manager is not None
             return self.manager._apply_account_selection(
                 metadata, account, boundary=boundary, switched=True

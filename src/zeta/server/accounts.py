@@ -52,6 +52,7 @@ async def list_accounts(
                 "account": str(item.account),
                 "label": item.label,
                 "detail": item.detail,
+                "available": item.available,
                 "current": snapshot.selected.get(item.account.provider) == item.account,
                 "default": snapshot.defaults.get(item.account.provider) == item.account,
                 "usage": usage_json(
