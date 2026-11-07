@@ -21,6 +21,7 @@ from ..core.project_context import (
     PromptArgumentError,
     associate_project_discovery,
     discover_project,
+    project_context_projection_for_discovery,
     resolve_project_context_from_projects,
     resolve_prompt_argument,
 )
@@ -349,32 +350,32 @@ def _create_app_with_root(
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
     registry = manager.project_registry
-    if (
-        config.auto_project
-        and not ephemeral
-        and not resuming
-        and registry is not None
-        and manager.project_registry_unavailable is None
-    ):
-        discovery = associate_project_discovery(discovery, registry)
-    selected_project_id = (
-        metadata.project_id
-        if resuming
-        else discovery.project.project_id
-        if discovery.project is not None
-        else None
-    )
-    projection = (
-        registry.project_context_projection(selected_project_id)
-        if registry is not None
-        else None
-    )
+    projection = None
+    if registry is not None:
+        if resuming:
+            projection = registry.project_context_projection(metadata.project_id)
+        else:
+            projection = project_context_projection_for_discovery(discovery, registry)
+            if (
+                projection.session_project is None
+                and (projection.health is None or not registry.root.exists())
+                and config.auto_project
+                and not ephemeral
+                and manager.project_registry_unavailable is None
+            ):
+                discovery = associate_project_discovery(discovery, registry)
+                if discovery.project is not None:
+                    projection = registry.project_context_projection(
+                        discovery.project.project_id
+                    )
     cwd_project = (
         resolve_project_context_from_projects(discovery, projection.projects)
         if projection is not None
         else None
     )
     session_project = projection.session_project if projection is not None else None
+    if not resuming and session_project is not None:
+        discovery = replace(discovery, project=session_project)
     if not resuming and session_project is None and cwd_project is not None:
         session_project = cwd_project
         discovery = replace(discovery, project=cwd_project)

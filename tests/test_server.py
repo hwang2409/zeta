@@ -5135,12 +5135,19 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "task_cause",
-    ["foreground child completion cleanup", "tool registry closed"],
-    ids=["child-cleanup", "registry-close"],
+    "task_cause, wait_for_acknowledgement",
+    [
+        ("foreground child completion cleanup", False),
+        ("tool registry closed", False),
+        ("tool registry closed", True),
+    ],
+    ids=["child-cleanup", "registry-close", "acknowledged-before-lookup"],
 )
 async def test_close_kill_cause_reaches_live_serve_event(
-    tmp_path: Path, task_cause: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    task_cause: str,
+    wait_for_acknowledgement: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
@@ -5231,11 +5238,19 @@ async def test_close_kill_cause_reaches_live_serve_event(
         ]
         assert len(task_rows) == 1
         assert task_cause in task_rows[0]["content"][0]["text"]
+        task_frames = history_frames
+        if wait_for_acknowledgement:
+            # Wait for the notification turn to acknowledge the row before lookup.
+            task_frames += await _frames_until_event(reader, "turn_end")
         notification = next(
-            entry
-            for entry in store.agent_notifications()
-            if entry.data.get("kind") == "task_exited"
+            (
+                entry
+                for entry in store.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "task_exited"
+            ),
+            None,
         )
+        assert notification is not None, "durable task-exited notification was not found"
         rendered = render_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
@@ -5251,7 +5266,6 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert rendered is not None
         assert task_cause in rendered.plain
 
-        task_frames = history_frames
         if not any(
             frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
         ):
