@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Mapping
 from enum import Enum, StrEnum
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class _Frame(bytes):
+    """A complete wire frame constructed by FrameCodec."""
 
 
 class ErrorDescriptor(Enum):
@@ -230,7 +237,7 @@ class FrameWriteCancelled(asyncio.CancelledError):
 FRAME_CANCEL_GRACE = 1.0
 
 
-async def finish_frame_write(codec: FrameCodec, writer: Any, payload: bytes) -> bool:
+async def finish_frame_write(codec: FrameCodec, writer: Any, payload: _Frame) -> bool:
     """Write one frame; through cancellation, report whether it was written.
 
     Cancellation before this call writes nothing. Cancellation during the
@@ -393,7 +400,7 @@ class FrameCodec:
             )
         return {"id": raw_request_id, "method": method, "params": params}
 
-    def response(self, request_id: str | int | None, result: object) -> bytes:
+    def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}
         return self._bounded_json(value, request_id=request_id)
 
@@ -423,7 +430,14 @@ class FrameCodec:
         descriptor: ErrorDescriptor,
         message: str,
         data: dict[str, object] | None = None,
-    ) -> bytes:
+    ) -> _Frame:
+        if not isinstance(descriptor, ErrorDescriptor):
+            logger.error("refusing unregistered error descriptor: %r", descriptor)
+            return self._minimal_error(
+                request_id,
+                ErrorDescriptor.INTERNAL_ERROR,
+                ErrorDescriptor.INTERNAL_ERROR.meaning,
+            )
         error: dict[str, Any] = {"code": descriptor.code, "message": message}
         wire_data = descriptor.data(data)
         if wire_data is not None:
@@ -433,7 +447,10 @@ class FrameCodec:
 
     def notification(
         self, event: EventDescriptor, session_id: str | None, **fields: object
-    ) -> bytes:
+    ) -> _Frame | None:
+        if not isinstance(event, EventDescriptor):
+            logger.error("refusing unregistered event descriptor: %r", event)
+            return None
         params: dict[str, object] = {"event": event.value}
         if session_id is not None:
             params["session_id"] = session_id
@@ -451,9 +468,12 @@ class FrameCodec:
             session_id, event, "event exceeds the size limit"
         )
 
-    async def write(self, writer: Any, payload: bytes) -> bool:
+    async def write(self, writer: Any, payload: _Frame) -> bool:
         """Write one codec-produced frame; report a disconnected peer."""
 
+        if not isinstance(payload, _Frame):
+            logger.error("refusing frame not constructed by FrameCodec")
+            return False
         if len(payload) > MAX_FRAME_BYTES:
             payload = self.error_response(
                 None,
@@ -469,7 +489,7 @@ class FrameCodec:
 
     def _bounded_json(
         self, value: Mapping[str, Any], *, request_id: str | int | None
-    ) -> bytes:
+    ) -> _Frame:
         try:
             payload = self._json_bytes(value)
         except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
@@ -487,20 +507,22 @@ class FrameCodec:
         )
 
     @staticmethod
-    def _json_bytes(value: object) -> bytes:
-        return (
-            json.dumps(
-                value,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
+    def _json_bytes(value: object) -> _Frame:
+        return _Frame(
+            (
+                json.dumps(
+                    value,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
 
     def _minimal_error(
         self, request_id: str | int | None, descriptor: ErrorDescriptor, message: str
-    ) -> bytes:
+    ) -> _Frame:
         safe_id = _safe_request_id(request_id)
         value = {
             "jsonrpc": "2.0",
@@ -515,7 +537,7 @@ class FrameCodec:
 
     def _error_notification(
         self, session_id: str | None, event: EventDescriptor, message: str
-    ) -> bytes:
+    ) -> _Frame:
         params: dict[str, object] = {
             "event": EventDescriptor.ERROR.value,
             "error": {"code": "frame_too_large", "message": message},

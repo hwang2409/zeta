@@ -16,7 +16,8 @@ from tests.test_server import TIMEOUT, _socket_path
 from zeta.protocol.types import TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
-from zeta.server.protocol import EventDescriptor
+from zeta.server import server as server_module
+from zeta.server.protocol import ErrorDescriptor, EventDescriptor
 from zeta.server.server import _Client
 
 Transport = Literal["unix", "websocket"]
@@ -136,6 +137,66 @@ async def _ready_connection(
         if state.role == role
     )
     return server, reader, writer, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_unregistered_descriptors_do_not_break_live_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transport: Transport,
+) -> None:
+    server, reader, writer, state = await _ready_connection(
+        tmp_path, transport, "controller"
+    )
+    try:
+        invalid_event = await asyncio.gather(
+            server.connections.publish_controller("unregistered", "session"),
+            return_exceptions=True,
+        )
+        assert invalid_event == [False]
+
+        assert await server.connections.publish_controller(
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="still-open"
+        )
+        event = await _read_json(reader, transport)
+        assert event["params"]["delta"] == "still-open"
+
+        client = state.connection
+        original_dispatch = client._dispatch
+
+        async def fail_dispatch(
+            request_id: str | int | None, method: str, params: dict[str, Any]
+        ) -> object:
+            if method == "ping":
+                raise RuntimeError("injected failure")
+            return await original_dispatch(request_id, method, params)
+
+        monkeypatch.setattr(client, "_dispatch", fail_dispatch)
+        with monkeypatch.context() as context:
+            invalid_descriptors = type(
+                "Invalid", (), {"INTERNAL_ERROR": "unregistered"}
+            )
+            context.setattr(server_module, "ErrorDescriptor", invalid_descriptors)
+            await _send_json(
+                writer,
+                transport,
+                {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+            )
+            error = await _read_json(reader, transport)
+        assert error["id"] == 2
+        assert error["error"]["code"] == ErrorDescriptor.INTERNAL_ERROR.code
+
+        await _send_json(
+            writer,
+            transport,
+            {"jsonrpc": "2.0", "id": 3, "method": "status", "params": {}},
+        )
+        assert (await _read_json(reader, transport))["id"] == 3
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
 
 
 def _retained(output: Any) -> tuple[int, int]:

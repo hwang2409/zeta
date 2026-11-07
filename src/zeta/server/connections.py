@@ -14,6 +14,7 @@ from .protocol import (
     FrameCodec,
     FrameWriteCancelled,
     ProtocolError,
+    _Frame,
 )
 
 OBSERVER_REQUESTS = frozenset({
@@ -39,7 +40,7 @@ class ControllerMetadata:
 
 @dataclass
 class _OutputFrame:
-    payload: bytes
+    payload: _Frame
     future: asyncio.Future[bool] | None = None
 
 
@@ -58,7 +59,7 @@ class _OutputState:
     pending_callers: int = 0
     retained_bytes: int = 0
     retained_frames: int = 0
-    overflow_frame: bytes | None = None
+    overflow_frame: _Frame | None = None
     overflow_deadline_task: asyncio.Task[None] | None = None
     overflowed: bool = False
     released: bool = False
@@ -186,6 +187,8 @@ class ConnectionRegistry:
         ):
             return False
         frame = state.connection.codec.notification(event, session_id, **fields)
+        if frame is None:
+            return False
         output = state.output
         assert output is not None
         if output.phase not in {"claimed_buffering", "flushing", "ready"}:
@@ -213,7 +216,7 @@ class ConnectionRegistry:
         if output is not None:
             self._release_output(output, state.role)
 
-    async def send(self, connection: Any, frame: bytes) -> bool:
+    async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
         if state is None or state.output is None:
             return False
@@ -224,7 +227,7 @@ class ConnectionRegistry:
             return False
         return await self._send_frame(output, frame)
 
-    async def _send_hello(self, state: _Connection, frame: bytes) -> bool:
+    async def _send_hello(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         assert output is not None
         if (
@@ -256,7 +259,7 @@ class ConnectionRegistry:
         finally:
             self._finish_caller(output)
 
-    async def _send_frame(self, output: _OutputState, frame: bytes) -> bool:
+    async def _send_frame(self, output: _OutputState, frame: _Frame) -> bool:
         future = self.loop.create_future()
         item = _OutputFrame(frame, future)
         self._enqueue(output, item)
@@ -383,7 +386,7 @@ class ConnectionRegistry:
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
 
-    def _fits(self, output: _OutputState, frame: bytes) -> bool:
+    def _fits(self, output: _OutputState, frame: _Frame) -> bool:
         control = output.overflow_frame
         assert control is not None
         return (
@@ -391,7 +394,7 @@ class ConnectionRegistry:
             and output.retained_frames + 2 <= OUTPUT_MAX_FRAMES
         )
 
-    def _admit(self, state: _Connection, frame: bytes) -> bool:
+    def _admit(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         assert output is not None
         if output.overflowed:
@@ -446,7 +449,7 @@ class ConnectionRegistry:
         self._finish_future(output.ready, False)
 
     @staticmethod
-    def _overflow_frame(role: str) -> bytes:
+    def _overflow_frame(role: str) -> _Frame:
         descriptor = (
             ErrorDescriptor.CONTROLLER_OUTPUT_OVERFLOW
             if role == "controller"
@@ -456,7 +459,7 @@ class ConnectionRegistry:
 
     @staticmethod
     async def _write_physical(
-        connection: Any, payload: bytes
+        connection: Any, payload: _Frame
     ) -> tuple[bool, FrameWriteCancelled | None]:
         try:
             return await connection._write_physical(payload), None

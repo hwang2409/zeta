@@ -335,7 +335,9 @@ async def test_canceled_write_ignoring_abort_and_cancel_is_bounded(
 
     async def publish() -> None:
         try:
-            await protocol_module.finish_frame_write(codec, StubbornWriter(), b"{}")
+            await protocol_module.finish_frame_write(
+                codec, StubbornWriter(), codec.response(None, {})
+            )
         except protocol_module.FrameWriteCancelled as cancelled:
             outcomes.append(cancelled.written)
             raise
@@ -389,8 +391,12 @@ async def test_repeated_stalled_unix_writes_close_each_transport(
                 return await _original(target, payload)
 
             codec.write = write  # type: ignore[method-assign]
+            large_frame = codec.response(
+                None, "x" * (protocol_module.MAX_FRAME_BYTES - 64)
+            )
+            assert len(large_frame) > 1_000_000
             task = asyncio.create_task(
-                protocol_module.finish_frame_write(codec, writer, b"x" * (2**20))
+                protocol_module.finish_frame_write(codec, writer, large_frame)
             )
             await write_started.wait()
             task.cancel()
@@ -436,8 +442,9 @@ async def test_live_slow_write_is_not_aborted(
         transport = Transport()
 
     writer = Writer()
+    codec = protocol_module.FrameCodec()
     task = asyncio.create_task(
-        protocol_module.finish_frame_write(protocol_module.FrameCodec(), writer, b"{}")
+        protocol_module.finish_frame_write(codec, writer, codec.response(None, {}))
     )
     await asyncio.sleep(0)
     await asyncio.sleep(0.03)
@@ -468,8 +475,9 @@ async def test_abort_error_still_completes_canceled_write(
         transport = Transport()
 
     writer = Writer()
+    codec = protocol_module.FrameCodec()
     task = asyncio.create_task(
-        protocol_module.finish_frame_write(protocol_module.FrameCodec(), writer, b"{}")
+        protocol_module.finish_frame_write(codec, writer, codec.response(None, {}))
     )
     await asyncio.sleep(0)
     task.cancel()
@@ -495,7 +503,9 @@ async def test_canceled_write_surfaces_unexpected_error(
 
     task = asyncio.create_task(
         protocol_module.finish_frame_write(
-            protocol_module.FrameCodec(), FailingWriter(), b"{}"
+            protocol_module.FrameCodec(),
+            FailingWriter(),
+            protocol_module.FrameCodec().response(None, {}),
         )
     )
     await asyncio.sleep(0)

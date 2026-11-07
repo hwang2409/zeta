@@ -37,6 +37,7 @@ from .protocol import (
     ErrorDescriptor,
     FrameCodec,
     ProtocolError,
+    _Frame,
     finish_frame_write,
     hello_result,
     negotiate_protocol_version,
@@ -931,10 +932,10 @@ class _Client:
             "next_offset": end if end < len(available) else None,
         }, page_ids
 
-    async def _write(self, payload: bytes) -> bool:
+    async def _write(self, payload: _Frame) -> bool:
         return await self.connections.send(self, payload)
 
-    async def _write_physical(self, payload: bytes) -> bool:
+    async def _write_physical(self, payload: _Frame) -> bool:
         async with self._write_lock:
             return await finish_frame_write(self.codec, self.writer, payload)
 
