@@ -1928,14 +1928,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
             if test_error is None:
                 raise
             test_error.add_note(f"background owner cleanup failed: {cleanup_error!r}")
-        finally:
-            cleanup_error = sys.exception()
-            try:
-                await close_serve(server, writer)
-            except BaseException as close_error:
-                if cleanup_error is None:
-                    raise
-                cleanup_error.add_note(f"server cleanup failed: {close_error!r}")
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2965,8 +2958,10 @@ async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
     server = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
-    reader, writer = await _connect(server)
+    writers = []
     try:
+        reader, writer = await _connect(server)
+        writers.append(writer)
         await _request(
             reader,
             writer,
@@ -2978,7 +2973,7 @@ async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
         unknown = await _request(reader, writer, 3, "abort", {"scope": "turn"})
         assert unknown[-1]["error"]["code"] == -32602
     finally:
-        await close_serve(server, writer)
+        await close_serve(server, *writers)
 
 
 @pytest.mark.asyncio

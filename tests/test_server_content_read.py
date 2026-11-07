@@ -232,9 +232,11 @@ async def test_history_cache_is_keyed_by_row_shaping_features(
 async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
     from zeta.server import ZetaServer
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
-    reader, writer = await _connect(server)
     raw = _PNG
+    writers = []
     try:
+        reader, writer = await _connect(server)
+        writers.append(writer)
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
         session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
         store = server.runtime.opened.store
@@ -247,7 +249,7 @@ async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
         reply = (await _request(reader, writer, 4, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
     finally:
-        await close_serve(server, writer)
+        await close_serve(server, *writers)
 
 
 @pytest.mark.asyncio
