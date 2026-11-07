@@ -427,7 +427,10 @@ def status_card_float(
 
     def card_width() -> int:
         terminal_width = get_app().output.get_size().columns
-        natural_width = status_window.preferred_width(terminal_width).preferred
+        if isinstance(status_window, Window):
+            natural_width = status_window.content.preferred_width(terminal_width) or 1
+        else:
+            natural_width = status_window.preferred_width(terminal_width).preferred
         return max(
             1,
             min(
@@ -443,6 +446,8 @@ def status_card_float(
         natural_height = status_window.preferred_height(width, size.rows).preferred
         return max(1, min(natural_height, max(1, size.rows - STATUS_CARD_MARGIN * 2)))
 
+    if isinstance(status_window, Window):
+        status_window.width = card_width
     return Float(content, width=card_width, height=card_height, z_index=10)
 
 
