@@ -26,11 +26,11 @@ from zeta.attention_forks import (
     release_discussion_fork,
 )
 from zeta.attention_records import AttentionStore
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 from zeta.tools.resolve_attention import register_fork

@@ -343,6 +343,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "websearch",
         _websearch,
+        binding="shared",
         approval_subject="query",
         description=(
             "Search the web using the available search backend. "

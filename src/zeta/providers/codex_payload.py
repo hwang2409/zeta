@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..codex import CodexHTTPError
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
@@ -25,7 +26,6 @@ from ..protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
-from .codex_errors import CodexHTTPError
 from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
     images_before_prompt,

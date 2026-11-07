@@ -26,6 +26,7 @@ import zeta.providers.transport as transport_module
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountCredentials
+from zeta.codex import CodexStreamError
 from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -43,7 +44,6 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex import CodexBackend
-from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,

@@ -21,7 +21,6 @@ from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.protocol.types import (
@@ -43,6 +42,7 @@ from zeta.providers.ollama import _messages as ollama_messages
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
 from zeta.providers.transport import retry_provider_completion
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
     build_nudge_message,
