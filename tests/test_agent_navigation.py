@@ -477,25 +477,29 @@ async def test_child_todo_refresh_coalesces_pending_requests(
         nonlocal refreshes
         refreshes += 1
         started.set()
-        assert release.wait(5)
+        assert release.wait(10)
         return original_refresh(source)
 
     monkeypatch.setattr(AgentTodoSource, "refresh", blocked_refresh)
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
-    for _ in range(100):
-        if started.is_set():
-            break
-        await asyncio.sleep(0.01)
-    assert started.is_set()
-    task = navigation._todo_control._task
-    assert task is not None
+    task = None
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        # test-contract: seam no public pending-refresh task interface exists.
+        task = navigation._todo_control._task
+        assert task is not None
 
-    for _ in range(20):
-        navigation._todo_control.request(child)
-    assert navigation._todo_control._task is task
-    release.set()
+        for _ in range(20):
+            navigation._todo_control.request(child)
+        assert navigation._todo_control._task is task
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+
+    assert task is not None
     await task
 
     assert refreshes == 2
@@ -1105,6 +1109,24 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
     return app, store, child, session, notices
 
 
+async def _await_child_send_completion(app: TUIApp) -> None:
+    # test-contract: seam no public child-send completion interface exists.
+    tasks = tuple(entry[0] for entry in app._child_send_tasks.values())
+    assert tasks
+    remaining = len(tasks)
+    published = asyncio.Event()
+
+    def mark_published(_task: object) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0:
+            published.set()
+
+    for task in tasks:
+        task.add_done_callback(mark_published)
+    await asyncio.wait_for(published.wait(), 10)
+
+
 @pytest.mark.asyncio
 async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1122,9 +1144,9 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
     session.default_buffer.text = "keep me"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     release.set()
-    await asyncio.sleep(0.05)
+    await _await_child_send_completion(app)
     assert session.default_buffer.text == "keep me"
     assert any("child finished" in notice for notice in notices)
     assert await asyncio.to_thread(child.pending_prompts) == []
@@ -1145,7 +1167,7 @@ async def test_child_send_exception_preserves_text_and_shows_notice(
     monkeypatch.setattr(agent_runtime, "send_to_run", fail)
     session.default_buffer.text = "keep me"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.sleep(0.05)
+    await _await_child_send_completion(app)
     assert session.default_buffer.text == "keep me"
     assert any("send failed" in notice for notice in notices)
     assert store.messages() == []
@@ -1170,15 +1192,12 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
     buffer = session.default_buffer
     buffer.text = "same"
     assert app._submit_input(buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     buffer.text = "something else"
     buffer.text = "same"
     release.set()
-    for _ in range(100):
-        if not app._child_send_tasks:
-            break
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.05)
+    await _await_child_send_completion(app)
+
     def persisted_prompts() -> list[str]:
         with ConversationStore(
             child.session_dir.parent, session_id=child.session_id
@@ -1202,19 +1221,30 @@ async def test_close_waits_for_in_flight_child_send_outcome(
 
     async def send(*args: object, **kwargs: object) -> str | None:
         started.set()
-        await asyncio.to_thread(release.wait, 5)
+        await asyncio.to_thread(release.wait, 10)
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "at exit"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
+    close_started = asyncio.Event()
+    release_ui_ownership = app._release_ui_ownership
+    ui_generation = getattr(app, "_ui_generation", 0)
+
+    def track_release_ui_ownership() -> None:
+        release_ui_ownership()
+        close_started.set()
+
+    # test-contract: seam no public child-send drain-entry signal exists.
+    monkeypatch.setattr(app, "_release_ui_ownership", track_release_ui_ownership)
     closing = asyncio.create_task(app.close())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(close_started.wait(), 10)
+    assert getattr(app, "_ui_generation", 0) == ui_generation + 1
     assert not closing.done()
     notices_before_release = list(notices)
     release.set()
-    await asyncio.wait_for(closing, 5)
+    await asyncio.wait_for(closing, 10)
     assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["at exit"]
     assert store.messages() == []
     assert notices == notices_before_release
@@ -1341,9 +1371,9 @@ async def test_child_send_double_enter_queues_once(
     session.default_buffer.text = "once"
     assert app._submit_input(session.default_buffer.text) is False
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     release.set()
-    await asyncio.sleep(0.05)
+    await _await_child_send_completion(app)
     assert calls == 1
     assert len(await asyncio.to_thread(child.pending_prompts)) == 1
     assert store.messages() == []
@@ -1420,10 +1450,10 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "follow up"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=10)
     assert session.default_buffer.text == "follow up"
     release.set()
-    await asyncio.wait_for(queued.wait(), timeout=2)
+    await asyncio.wait_for(queued.wait(), timeout=10)
     assert session.default_buffer.text == ""
     assert [entry.data["text"] for entry in await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts)] == ["follow up"]
     assert store.messages() == []

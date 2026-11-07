@@ -193,7 +193,9 @@ async def test_model_name_matching_nothing_is_still_used_as_typed(
 @pytest.mark.asyncio
 async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="offline")
-    app._active_task = asyncio.create_task(asyncio.sleep(1))
+    active_turn = asyncio.Event()
+    # test-contract: seam no public active-turn setup interface exists.
+    app._active_task = asyncio.create_task(active_turn.wait())
 
     try:
         output = await create_slash_registry(
@@ -348,6 +350,29 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
     active = True
     moves: list[int] = []
     actions: list[str] = []
+    prompt_ready = asyncio.Event()
+    moves_published = asyncio.Event()
+    select_published = asyncio.Event()
+    cancel_published = asyncio.Event()
+    text_published = asyncio.Event()
+    expected_text = ""
+
+    def move(delta: int) -> None:
+        moves.append(delta)
+        if moves == [1, -1]:
+            moves_published.set()
+
+    def select() -> None:
+        actions.append("select")
+        select_published.set()
+
+    def cancel() -> None:
+        actions.append("cancel")
+        cancel_published.set()
+
+    def text_changed(buffer: object) -> None:
+        if getattr(buffer, "text", None) == expected_text:
+            text_published.set()
 
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -358,39 +383,48 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
                 on_history_next=lambda _buffer: None,
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_picker_move=moves.append,
-                on_picker_select=lambda: actions.append("select"),
-                on_picker_cancel=lambda: actions.append("cancel"),
+                on_picker_move=move,
+                on_picker_select=select,
+                on_picker_cancel=cancel,
                 picker_active=lambda: active,
             ),
             multiline=True,
         )
+        session.default_buffer.on_text_changed += text_changed
         session.app.ttimeoutlen = 0.02
         session.app.timeoutlen = 0.02
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
+        task = asyncio.create_task(
+            session.prompt_async(" > ", pre_run=prompt_ready.set)
+        )
+        await asyncio.wait_for(prompt_ready.wait(), 10)
 
         pipe.send_text("\x1b[B\x1b[A")
-        await wait_until(lambda: moves == [1, -1])
+        await asyncio.wait_for(moves_published.wait(), 10)
 
-        pipe.send_text("typed")
-        await wait_until(lambda: session.default_buffer.text == "typed")
-        pipe.send_text("\x1b[B\x1b[A")
-        await asyncio.sleep(0.1)
+        expected_text = "typed"
+        text_published.clear()
+        pipe.send_text(expected_text)
+        await asyncio.wait_for(text_published.wait(), 10)
+        expected_text = "typed!"
+        text_published.clear()
+        pipe.send_text("\x1b[B\x1b[A!")
+        await asyncio.wait_for(text_published.wait(), 10)
         assert moves == [1, -1]
         assert actions == []
 
         session.default_buffer.reset()
         pipe.send_text("\r")
-        await wait_until(lambda: actions == ["select"])
+        await asyncio.wait_for(select_published.wait(), 10)
         assert session.default_buffer.text == ""
 
         pipe.send_text("\x1b")
-        await wait_until(lambda: actions == ["select", "cancel"])
+        await asyncio.wait_for(cancel_published.wait(), 10)
 
         active = False
-        pipe.send_text("\x1b[B")
-        await asyncio.sleep(0.1)
+        expected_text = "done"
+        text_published.clear()
+        pipe.send_text("\x1b[Bdone")
+        await asyncio.wait_for(text_published.wait(), 10)
         assert moves == [1, -1]
 
         task.cancel()

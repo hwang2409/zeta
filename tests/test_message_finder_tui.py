@@ -37,6 +37,27 @@ def _rank_finder(transcript: TranscriptWidget, query: str) -> None:
     assert transcript.finder_publish(result)
 
 
+def _visible_transcript_text(transcript: TranscriptWidget) -> str:
+    content = transcript.create_content(80, 1)
+    return "".join(fragment[1] for fragment in content.get_line(0))
+
+
+def _track_virtual_search_publication(
+    transcript: TranscriptWidget, monkeypatch: pytest.MonkeyPatch
+) -> asyncio.Event:
+    published = asyncio.Event()
+    continue_search = transcript._continue_virtual_search_index
+
+    def track(key: tuple[int, int, str], *, bounded: bool = True) -> None:
+        continue_search(key, bounded=bounded)
+        if transcript._virtual_search_complete:
+            published.set()
+
+    # test-contract: seam no public incremental search-index completion signal exists.
+    monkeypatch.setattr(transcript, "_continue_virtual_search_index", track)
+    return published
+
+
 def _app_for_finder(
     transcript: TranscriptWidget, *, child: TranscriptWidget | None = None
 ) -> Any:
@@ -596,7 +617,9 @@ def test_accept_highlights_target_and_continues_navigation(
 
 
 @pytest.mark.asyncio
-async def test_virtual_accept_stays_on_target_while_search_index_builds() -> None:
+async def test_virtual_accept_stays_on_target_while_search_index_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("an earlier zebra match"))
     for index in range(70):
@@ -604,7 +627,7 @@ async def test_virtual_accept_stays_on_target_while_search_index_builds() -> Non
     target = transcript.append(Text("the selected zebra target"))
     for index in range(70):
         transcript.append(Text(f"tail {index}"))
-    later = transcript.append(Text("a later zebra match"))
+    transcript.append(Text("a later zebra match"))
     transcript.create_content(80, 1)
 
     await _open_finder_async(transcript)
@@ -617,26 +640,20 @@ async def test_virtual_accept_stays_on_target_while_search_index_builds() -> Non
         if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
+    search_published = _track_virtual_search_publication(transcript, monkeypatch)
 
     assert transcript.finder_accept()
-    assert transcript._virtual_start is not None
-    assert transcript._virtual_start[0] == transcript._units.index(target)
-    deadline = asyncio.get_running_loop().time() + 5
-    while not transcript._virtual_search_complete:
-        assert asyncio.get_running_loop().time() < deadline
-        await asyncio.sleep(0.001)
-    assert transcript._virtual_search_complete
-    assert transcript._virtual_start is not None
-    assert transcript._virtual_start[0] == transcript._units.index(target)
+    assert "the selected zebra target" in _visible_transcript_text(transcript)
+    await asyncio.wait_for(search_published.wait(), 10)
+    assert "the selected zebra target" in _visible_transcript_text(transcript)
     assert transcript.next_search_match()
-    assert transcript._virtual_start is not None
-    assert transcript._virtual_start[0] == transcript._units.index(later)
+    assert "a later zebra match" in _visible_transcript_text(transcript)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forward", [True, False])
 async def test_removed_virtual_search_anchor_keeps_navigation_working(
-    forward: bool,
+    forward: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     transcript = TranscriptWidget()
     earlier = transcript.append(Text("an earlier zebra match"))
@@ -659,24 +676,20 @@ async def test_removed_virtual_search_anchor_keeps_navigation_working(
         if row.candidate.key == target.key
     )
     transcript.finder_move(selected)
+    search_published = _track_virtual_search_publication(transcript, monkeypatch)
 
     assert transcript.finder_accept()
     transcript.remove(target)
-    viewport = transcript._virtual_start
-    transcript.create_content(80, 1)
-    deadline = asyncio.get_running_loop().time() + 5
-    while not transcript._virtual_search_complete:
-        assert asyncio.get_running_loop().time() < deadline
-        await asyncio.sleep(0.001)
+    visible_after_removal = _visible_transcript_text(transcript)
+    await asyncio.wait_for(search_published.wait(), 10)
 
-    assert transcript._virtual_start == viewport
+    assert _visible_transcript_text(transcript) == visible_after_removal
     navigate = (
         transcript.next_search_match if forward else transcript.previous_search_match
     )
     assert navigate()
-    assert transcript._virtual_start is not None
     expected = later if forward else earlier
-    assert transcript._virtual_start[0] == transcript._units.index(expected)
+    assert expected.value.plain in _visible_transcript_text(transcript)
 
 
 @pytest.mark.parametrize("forward", [True, False])
