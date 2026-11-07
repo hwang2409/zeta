@@ -404,9 +404,7 @@ class ServeControl:
             )
         return result
 
-    async def publish_session_grant_change(
-        self, change: SessionGrantChange
-    ) -> None:
+    async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
         connections = self.server.connections
         session_id = self.server.runtime.session_id
         if connections is None or session_id is None:
@@ -961,7 +959,9 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
 FEATURE = "session_grants"
 READ = "session_grants"
 REVOKE = "revoke_session_grants"
-EVENT = "session_grants_changed"
+EVENT = event_contract.AUXILIARY_WIRE_EVENTS[
+    event_contract.AuxiliaryEvent.SESSION_GRANTS_CHANGED
+]
 
 
 def require_feature(features: frozenset[str]) -> None:
@@ -977,9 +977,8 @@ def read(
 ) -> dict[str, object]:
     if params:
         raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS,
+            ErrorDescriptor.INVALID_SESSION_GRANTS_PARAMS,
             "session_grants takes no params",
-            {"code": "invalid_session_grants_params"},
         )
     if policy is None or session_id is None:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
@@ -1001,9 +1000,8 @@ def revoke(
     valid_clear = set(params) == {"clear"} and params.get("clear") is True
     if not (valid_grant or valid_clear):
         raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS,
+            ErrorDescriptor.INVALID_SESSION_GRANTS_REVOKE,
             "invalid revoke_session_grants params",
-            {"code": "invalid_session_grants_revoke"},
         )
     try:
         change = (
@@ -1013,9 +1011,9 @@ def revoke(
         )
     except SessionGrantNotFound as exc:
         raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS,
+            ErrorDescriptor.SESSION_GRANT_NOT_FOUND,
             "session grant not found",
-            {"code": "session_grant_not_found", "grant": exc.grant},
+            {"grant": exc.grant},
         ) from exc
     return {
         "removed": list(change.changed),

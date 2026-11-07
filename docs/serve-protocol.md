@@ -971,10 +971,13 @@ Error descriptors are:
 | `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
 | `host_binding_required` | `-32003` | `host_binding_required` | the session requires a host binding |
 | `invalid_content_read` | `-32602` | `invalid_content_read` | content_read parameters are invalid |
+| `invalid_session_grants_params` | `-32602` | `invalid_session_grants_params` | session_grants parameters are invalid |
+| `invalid_session_grants_revoke` | `-32602` | `invalid_session_grants_revoke` | revoke_session_grants parameters are invalid |
 | `login_in_progress` | `-32005` | `login_in_progress` | a login is already pending |
 | `observer_read_only` | `-32008` | `observer_read_only` | a read-only observer requested a write method |
 | `project_not_found` | `-32602` | `project_not_found` | the requested project does not exist |
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
+| `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 
 Error objects have `code` and `message`, and may have a method-specific
@@ -1108,6 +1111,7 @@ Event fields are:
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
+| `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
