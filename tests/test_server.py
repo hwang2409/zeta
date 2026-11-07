@@ -83,6 +83,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
+from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -7196,7 +7197,28 @@ async def test_slash_status_transcript_work_does_not_block_serve(
     )
     entered = threading.Event()
     release = threading.Event()
+    worker_completed = threading.Event()
+    worker_errors: list[BaseException] = []
     request_task: asyncio.Task[None] | None = None
+
+    def capture_worker_error(args: threading.ExceptHookArgs) -> None:
+        worker_errors.append(args.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", capture_worker_error)
+    assert server.connections is not None
+    loop = server.connections.loop
+    call_soon_threadsafe = loop.call_soon_threadsafe
+
+    def track_read_completion(
+        callback: Callable[..., object], *args: object
+    ) -> asyncio.Handle:
+        try:
+            return call_soon_threadsafe(callback, *args)
+        finally:
+            if callback is ConnectionRegistry._read_done:
+                worker_completed.set()
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", track_read_completion)
     try:
         await _request(
             observer_reader,
@@ -7295,6 +7317,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
 
         entered.clear()
         release.clear()
+        worker_completed.clear()
         writer.write(
             json.dumps(
                 {
@@ -7323,6 +7346,8 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(request_task, 10)
         release.set()
+        assert await asyncio.to_thread(worker_completed.wait, 10)
+        assert not worker_errors
         frames = await _frames_until_eof(reader)
         assert not any(
             frame.get("id") == "cancelled-status"
@@ -7337,6 +7362,104 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         if request_task is not None and not request_task.done():
             request_task.cancel()
         await _close(server, observer_writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    _reader, writer, sid = await _ready_extensions(server)
+    entered = threading.Event()
+    release = threading.Event()
+    worker_completed = asyncio.Event()
+    worker_errors: list[BaseException] = []
+    shutdown_started = asyncio.Event()
+    closing: asyncio.Task[None] | None = None
+    loop_closed = False
+
+    def capture_worker_error(args: threading.ExceptHookArgs) -> None:
+        worker_errors.append(args.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", capture_worker_error)
+    assert server.runtime.loop is not None
+    store = server.runtime.loop.store
+    source = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("source")])
+    )
+    store.append_compaction_marker("summary", source.seq, source.seq)
+    original_counter = server.runtime.loop.context_assembler.token_counter
+
+    def blocked_counter(message: Message) -> int:
+        entered.set()
+        assert release.wait(30), "status transcript worker was not released"
+        return original_counter(message)
+
+    # test-contract: seam hold the real synchronous transcript projection
+    monkeypatch.setattr(
+        server.runtime.loop.context_assembler, "token_counter", blocked_counter
+    )
+    assert server.connections is not None
+    loop = server.connections.loop
+    call_soon_threadsafe = loop.call_soon_threadsafe
+    is_closed = loop.is_closed
+
+    def close_aware_call_soon_threadsafe(
+        callback: Callable[..., object], *args: object
+    ) -> asyncio.Handle:
+        try:
+            if loop_closed:
+                raise RuntimeError("Event loop is closed")
+            return call_soon_threadsafe(callback, *args)
+        finally:
+            if callback is ConnectionRegistry._read_done:
+                call_soon_threadsafe(worker_completed.set)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", close_aware_call_soon_threadsafe)
+    monkeypatch.setattr(loop, "is_closed", lambda: loop_closed or is_closed())
+    close_control = server.control.close
+
+    async def track_shutdown() -> None:
+        shutdown_started.set()
+        await close_control()
+
+    monkeypatch.setattr(server.control, "close", track_shutdown)
+    try:
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "closing-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        writer.close()
+        await writer.wait_closed()
+        closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(shutdown_started.wait(), 10)
+        loop_closed = True
+        release.set()
+        await asyncio.wait_for(worker_completed.wait(), 10)
+        assert not worker_errors
+        loop_closed = False
+        await asyncio.wait_for(closing, 10)
+    finally:
+        loop_closed = False
+        release.set()
+        if closing is not None and not closing.done():
+            closing.cancel()
+            with suppress(asyncio.CancelledError):
+                await closing
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
+        await server.close()
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])
