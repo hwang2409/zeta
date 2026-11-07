@@ -103,16 +103,20 @@ class ConversationChannel:
         self, target: _DeliveryTarget, item: DeliveryInput, /
     ) -> ProducerResult:
         if target.loop is asyncio.get_running_loop():
-            return await target.flow.produce(item)
-        concurrent = asyncio.run_coroutine_threadsafe(
-            target.flow.produce(item), target.loop
-        )
-        future = asyncio.wrap_future(concurrent)
-        target.accepted.add(future)
-        try:
-            return await future
-        finally:
-            target.accepted.discard(future)
+            result = await target.flow.produce(item)
+        else:
+            concurrent = asyncio.run_coroutine_threadsafe(
+                target.flow.produce(item), target.loop
+            )
+            future = asyncio.wrap_future(concurrent)
+            target.accepted.add(future)
+            try:
+                result = await future
+            finally:
+                target.accepted.discard(future)
+        if result.changed:
+            self._owner.causal_episodes.associate(entry.id for entry in result.entries)
+        return result
 
     async def produce_to_parent_of(
         self, child_instance_id: str, item: DeliveryInput, /
@@ -264,6 +268,9 @@ class ConversationChannel:
                 ),
             )
             notification = root_result.entries[0]
+        self._owner.causal_episodes.associate_member(
+            child_instance_id, (entry.id for entry in result.entries)
+        )
         return notification
 
     async def publish_question(
