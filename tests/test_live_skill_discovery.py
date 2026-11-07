@@ -13,8 +13,8 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_server import (
-    _close,
     _ready_extensions,
     _request,
     _seed_slash_fixtures,
@@ -418,7 +418,7 @@ async def test_serve_discovers_new_skill_for_slash_list_then_run(
         assert "live body" in result["text"]
         assert "request" in result["text"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

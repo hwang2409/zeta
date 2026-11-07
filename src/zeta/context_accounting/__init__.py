@@ -6,7 +6,7 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from math import ceil
 from typing import Any
 
@@ -125,6 +125,43 @@ def message_token_count(message: Message) -> int:
         ceil(compact_json_length(value) / 4)
         + image_count * IMAGE_TOKEN_ESTIMATE,
     )
+
+
+class MessageTokenCounts:
+    """Reuse token counts of messages decoded from unchanged persisted entries.
+
+    A count is reused only for the exact message object that `track` bound to
+    its source entry, and only for the same counter. Resident store entries are
+    append-only, so changed content is a new entry object and misses.
+    """
+
+    def __init__(self) -> None:
+        self._sources: dict[int, tuple[Message, object]] = {}
+        self._counts: dict[int, tuple[object, Callable[[Message], int], int]] = {}
+
+    def track(self, pairs: Iterable[tuple[object, Message]]) -> None:
+        """Bind decoded messages to their sources; keep counts for these only."""
+
+        sources = {id(message): (message, source) for source, message in pairs}
+        counts = self._counts
+        self._counts = {
+            key: counts[key]
+            for _message, source in sources.values()
+            if (key := id(source)) in counts and counts[key][0] is source
+        }
+        self._sources = sources
+
+    def count(self, message: Message, counter: Callable[[Message], int]) -> int:
+        bound = self._sources.get(id(message))
+        if bound is None or bound[0] is not message:
+            return counter(message)
+        source = bound[1]
+        cached = self._counts.get(id(source))
+        if cached is not None and cached[0] is source and cached[1] is counter:
+            return cached[2]
+        tokens = counter(message)
+        self._counts[id(source)] = (source, counter, tokens)
+        return tokens
 
 
 def compact_json_chunks(value: Any) -> Iterator[str]:

@@ -11,6 +11,8 @@ import stat
 import time
 from pathlib import Path
 
+from ..core.fsio import write_all
+
 MCP_STDERR_LOG_FILE_BYTES = 2 * 1024 * 1024
 MCP_STDERR_LOG_FILE_COUNT = 3
 _READ_BYTES = 64 * 1024
@@ -149,10 +151,7 @@ class RotatingStderrLog:
                         fd = -1
                         self._rotate()
                         fd = self._open_log(0, create=True)
-                    view = memoryview(payload)
-                    while view:
-                        written = os.write(fd, view)
-                        view = view[written:]
+                    write_all(fd, payload)
                 finally:
                     if fd >= 0:
                         os.close(fd)
