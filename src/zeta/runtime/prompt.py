@@ -99,6 +99,42 @@ def _with_prompt_text(prompt: str | Message, text: str) -> str | Message:
     return replace(prompt, content=[TextContent(text)])
 
 
+def replace_runtime_prompt(
+    base: RuntimePrompt,
+    text: str,
+    components: Mapping[str, Mapping[str, int | str]],
+) -> RuntimePrompt:
+    """Prepare a whole prompt replacement while preserving its wire shape."""
+
+    return RuntimePrompt(
+        _with_prompt_text(base.system_prompt, text),
+        {key: dict(component) for key, component in components.items()},
+    )
+
+
+def owned_fragment(prompt: RuntimePrompt, key: str) -> PromptFragment:
+    """Extract one validated owned span for reuse through the ownership seam."""
+
+    text = _prompt_text(prompt.system_prompt)
+    spans = {name: _span(value) for name, value in prompt.prompt_components.items()}
+    for name, span in spans.items():
+        _validate_span(text, name, span)
+    _validate_relationships(spans)
+    target = spans[key]
+    descendants = {
+        name: OwnedSpan(
+            span.offset - target.offset,
+            span.length,
+            span.digest,
+        )
+        for name, span in spans.items()
+        if _strictly_contains(target, span)
+    }
+    return PromptFragment(
+        text[target.offset : target.offset + target.length], descendants
+    )
+
+
 def replace_owned_fragment(
     prompt: RuntimePrompt, key: str, fragment: PromptFragment
 ) -> RuntimePrompt:
@@ -152,6 +188,7 @@ __all__ = [
     "OwnedSpan",
     "PromptFragment",
     "RuntimePrompt",
+    "owned_fragment",
     "owned_span",
     "replace_owned_fragment",
 ]
