@@ -28,6 +28,7 @@ OBSERVER_REQUESTS = frozenset(
         "session_settings",
         "ping",
         "delivery_status",
+        "session_grants",
     }
 )
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
@@ -238,6 +239,29 @@ class ConnectionRegistry:
             return True
         return await self._send_frame(output, frame, admitted=admitted)
 
+    async def publish_feature_event(
+        self,
+        feature: str,
+        event: EventDescriptor,
+        session_id: str,
+        *,
+        data: dict[str, object],
+    ) -> None:
+        """Queue one live event for every connection that negotiated a feature."""
+        states = tuple(
+            state
+            for state in (self._controller, *self._observers)
+            if state is not None and feature in state.features
+        )
+        for state in states:
+            frame = state.connection.codec.notification(event, session_id, data=data)
+            if frame is None:
+                continue
+            if state is self._controller:
+                await self.send(state.connection, frame)
+            else:
+                self._publish_observer(state, frame)
+
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)
         if state is None:
@@ -429,6 +453,17 @@ class ConnectionRegistry:
         self._finish_future(output.ready, result, error=error)
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
+
+    def _publish_observer(self, state: _Connection, frame: _Frame) -> None:
+        output = state.output
+        if (
+            state.connection not in self._connections
+            or output is None
+            or output.phase != "ready"
+            or not self._admit(state, frame)
+        ):
+            return
+        self._enqueue(output, _OutputFrame(frame))
 
     def _fits(self, output: _OutputState, frame: _Frame) -> bool:
         control = output.overflow_frame
@@ -694,9 +729,14 @@ class ConnectionRegistry:
             try:
                 result = job()
             except Exception as exc:  # noqa: BLE001 - worker must return every job failure
-                self.loop.call_soon_threadsafe(self._read_done, future, None, exc)
+                result, error = None, exc
             else:
-                self.loop.call_soon_threadsafe(self._read_done, future, result, None)
+                error = None
+            try:
+                self.loop.call_soon_threadsafe(self._read_done, future, result, error)
+            except RuntimeError:
+                if not self.loop.is_closed():
+                    raise
 
     @staticmethod
     def _read_done(
