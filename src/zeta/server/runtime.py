@@ -15,9 +15,9 @@ from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
-    associate_project_discovery,
     discover_project,
     load_project_context,
+    project_context_projection_for_discovery,
     resolve_project_context_from_projects,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
@@ -383,18 +383,8 @@ class ServerRuntime:
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         registry = self.manager.project_registry
-        associated = (
-            associate_project_discovery(discovery, registry, create=False)
-            if registry is not None
-            and self.manager.project_registry_unavailable is None
-            else discovery
-        )
         projection = (
-            registry.project_context_projection(
-                associated.project.project_id
-                if associated.project is not None
-                else None
-            )
+            project_context_projection_for_discovery(discovery, registry)
             if registry is not None
             else None
         )

@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend
-from tests.test_server import _close, _connect, _request
+from tests.support.serve_close import close_serve
+from tests.test_server import _connect, _request
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer, slash_commands
@@ -103,7 +104,7 @@ def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
 
 
 @pytest.mark.asyncio
-async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
+async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
@@ -130,12 +131,18 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
     )
     try:
         await server.start()
-        assert server.runtime.manager.project_registry_unavailable is not None
+        assert server.runtime.manager.project_registry_unavailable is None
 
         metadata = await server.runtime.create_session()
 
         assert metadata.project_id == healthy.project_id
         assert server.runtime.loop.root_project_id == healthy.project_id
+        assert server.runtime.loop.project_context_health is not None
+        assert server.runtime.loop.project_context_health.code == "malformed_project"
+        assert (
+            server.runtime.loop.project_context_health.project_id
+            == malformed.project_id
+        )
     finally:
         await server.close()
 
@@ -223,14 +230,14 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
         operation.cancel()
         preparation_release.set()
         with pytest.raises(asyncio.CancelledError):
-            await operation
+            await asyncio.wait_for(operation, 10)
         await _await_setup_reapers(server)
         assert await asyncio.to_thread(preparation_done.wait, 2)
         assert opened and opened[0]._closed
         assert not preparation_active
     finally:
         preparation_release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -285,13 +292,13 @@ async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_s
         opened[0].close = tracked_close
         operation.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await operation
+            await asyncio.wait_for(operation, 10)
         await _await_setup_reapers(server)
         assert compose_done.is_set()
         assert worker_saw_closed == [False]
         assert close_count == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -347,7 +354,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
         assert server.runtime.state is None
     finally:
         compose_release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -411,7 +418,7 @@ async def test_serve_resume_cancel_reaper_closes_store_after_compose(
         assert server.runtime.session_id == previous
     finally:
         compose_release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -465,7 +472,7 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
         assert server.runtime.state is None
     finally:
         compose_release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -514,7 +521,7 @@ async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
         assert compositions[0].opened.store._closed
     finally:
         compose_release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -554,7 +561,6 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
     operation = asyncio.create_task(
         client._dispatch(2, "resume", {"session_id": first.session_id})
     )
-    shutdown = False
     try:
         assert await asyncio.to_thread(compose_started.wait, 2)
         operation.cancel()
@@ -562,7 +568,6 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
             await asyncio.wait_for(operation, 2)
         assert not compose_release.is_set()
         await asyncio.wait_for(server.close(), 2)
-        shutdown = True
         assert any(
             "abandoned session setup task(s) still running at shutdown"
             in record.message
@@ -576,8 +581,7 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
         assert server.runtime.state is None
     finally:
         compose_release.set()
-        if not shutdown:
-            await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -694,7 +698,7 @@ async def test_serve_blocking_git_does_not_block_ping(
             release.set()
         if holder is not None:
             holder.join(2)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -757,7 +761,7 @@ async def test_project_requests_run_registry_reads_off_event_loop(
             reader, writer, 4, "project_inbox", {"project_id": project.project_id}
         )
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
     assert {kind for kind, _thread in calls} >= {"list", "memory", "inbox"}
     assert all(thread != event_loop_thread for _kind, thread in calls)
 
@@ -773,7 +777,7 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
         assert response[-1]["result"]["projects"] == []
         assert _filesystem_snapshot(empty_server.home) == before
     finally:
-        await _close(empty_server, writer)
+        await close_serve(empty_server, writer)
 
     server = _server(tmp_path / "populated")
     registry = ProjectRegistry(server.home / "projects")
@@ -832,7 +836,7 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
         inbox_response = response[-1]["result"]
         assert [item["id"] for item in inbox_response["messages"]] == [message_id]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -892,7 +896,7 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
             "message": "limit is out of range",
         }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -922,7 +926,7 @@ async def test_project_inbox_rejects_missing_required_directory(tmp_path: Path) 
             "message": "project storage is invalid or unavailable",
         }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -937,7 +941,7 @@ async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> No
         response = await _request(reader, writer, 2, "list_projects")
         assert response[-1]["error"]["code"] == -32601
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     server = _server(tmp_path / "enabled")
     reader, writer = await _connect(server)
@@ -954,7 +958,7 @@ async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> No
             "project_inbox",
         }.issubset(hello["capabilities"]["requests"])
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1135,7 +1139,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
         assert attached["project"]["id"] == alpha.project_id
         assert _mtimes(server.home) == attached_before
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1188,7 +1192,7 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
         assert invalid[-1]["error"]["code"] == -32602
         assert _mtimes(server.home) == before
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1255,7 +1259,7 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(
                 "project_id": "p_" + "f" * 32,
             }
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1298,7 +1302,7 @@ async def test_project_inbox_isolates_and_reports_invalid_messages(
             }
         ]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1373,7 +1377,7 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
         assert external_page["untrusted"] is True
         assert external_page["next_offset"] is None
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
@@ -1487,7 +1491,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
         )
         assert {item["id"] for item in response[-1]["result"]["messages"]} == valid_ids
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     claimed = inbox.claim(project.project_id, next(iter(valid_ids)), "e" * 32)
     assert claimed is not None
@@ -1547,4 +1551,4 @@ async def test_project_inbox_omits_large_unknown_structured_fields(
         assert message["to_session"] == "f" * 32
         assert json.loads(path.read_text())["future_metadata"] == field_value
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
