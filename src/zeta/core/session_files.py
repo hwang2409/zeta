@@ -158,7 +158,7 @@ def write_session_file(
             pass
 
 
-def write_session_json(
+def write_json_file(
     directory_fd: int, name: str, value: object, *, sync: bool = True
 ) -> None:
     write_session_file(

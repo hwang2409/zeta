@@ -4120,15 +4120,14 @@ class ReadyServer(ZetaServer):
         print("ready", flush=True)
 
 
-async def main() -> None:
-    server = ReadyServer(
-        home=sys.argv[1], socket_path=sys.argv[2], provider="codex"
-    )
-    await run_server(server)
-
-
-asyncio.run(main())
+server = ReadyServer(
+    home=sys.argv[1], socket_path=sys.argv[2], provider="codex"
+)
+asyncio.run(run_server(server))
 """
+    from zeta.storage_format import advance
+
+    advance(tmp_path, expected_epoch=0)
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
     process = await asyncio.create_subprocess_exec(
@@ -8386,9 +8385,12 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999)
         )
     AccountStore(home).set_default(first)
+    from zeta.storage_format import advance
+
+    advance(home, expected_epoch=0)
+    server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
 
     async def run() -> None:
-        server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
         reader, writer, sid = await _ready_extensions(server)
         assert server._client is not None and server.runtime.loop is not None
         first_client = server._client
