@@ -7726,9 +7726,7 @@ async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
 @pytest.mark.asyncio
 async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
     observed = [
-        await _hello_wire_line(
-            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
-        ),
+        await _hello_wire_line(tmp_path / "hello-1.0", {"protocol_version": "1.0"}),
         await _hello_wire_line(
             tmp_path / "hello-1.1",
             {
@@ -7844,8 +7842,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
-        "# baseline origin/main 66c084d8; accepted deltas: "
-        "W1, W2, W3, W5, text->output"
+        "# baseline origin/main 66c084d8; accepted deltas: W1, W2, W3, W5, text->output"
     )
     assert observed == rows[1:]
 
@@ -9152,7 +9149,9 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
         # MCP config commands mutate shared config — must reject.
-        assert (await run("mcp-disable", "/mcp disable example"))["error"]["code"] == -32004
+        assert (await run("mcp-disable", "/mcp disable example"))["error"][
+            "code"
+        ] == -32004
         # `/project init` mutates the session association — must reject.
         assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.

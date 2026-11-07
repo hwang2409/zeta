@@ -508,10 +508,13 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
-        why = "\n".join(
-            f"why paragraph {index} has useful context " + "useful context " * 12
-            for index in range(17)
-        ) + "\ntail-marker"
+        why = (
+            "\n".join(
+                f"why paragraph {index} has useful context " + "useful context " * 12
+                for index in range(17)
+            )
+            + "\ntail-marker"
+        )
         item = _item(
             "1" * 32,
             "Which deployment should we use?",
@@ -614,7 +617,10 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         assert "↑ more · pgup" in wheel_text
 
         press(Keys.PageUp)
-        assert app._decisions_panel_control.offset < app._decisions_panel_control._max_offset()
+        assert (
+            app._decisions_panel_control.offset
+            < app._decisions_panel_control._max_offset()
+        )
         second = _item("2" * 32, "Other decision", "short", ["Keep"])
         app._decisions_panel.set_items([second])
         app._refresh_decisions_panel()

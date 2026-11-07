@@ -782,6 +782,7 @@ def build_key_bindings(
                 on_decisions_key(key)
 
         for decisions_page_key in ("pageup", "pagedown"):
+
             @bindings.add(decisions_page_key, filter=decisions_answer_mode, eager=True)
             def decisions_answer_page(
                 event: KeyPressEvent, key: str = decisions_page_key
