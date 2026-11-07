@@ -710,6 +710,38 @@ class AgentLoop(
             recovery_state=recovery_state,
             error=error,
         )
+    async def _handle_toolless_turn(
+        self,
+        step_delivery: StepDeliveryFlow,
+        assistant_message: Message,
+        *,
+        iteration_consuming_notifications: bool,
+        notification_turn: bool,
+        recovery_state: EmptyTurnRecoveryState,
+        turn_number: int,
+    ) -> tuple[_ToollessTransition, tuple[StreamEvent, ...]]:
+        transition = await self._toolless_transition(
+            step_delivery,
+            assistant_message,
+            iteration_consuming_notifications=iteration_consuming_notifications,
+            notification_turn=notification_turn,
+            recovery_state=recovery_state,
+        )
+        if transition.error is not None:
+            if self.agent_instance_id is None:
+                await step_delivery.admit_terminal("foreground_end")
+            return transition, (
+                StreamEvent(StreamEventType.ERROR, error=transition.error),
+                StreamEvent(StreamEventType.AGENT_END),
+            )
+        return transition, (
+            StreamEvent(
+                StreamEventType.TURN_END,
+                message=assistant_message,
+                data={"turn": turn_number, "tool_calls": 0},
+            ),
+        )
+
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -1174,7 +1206,7 @@ class AgentLoop(
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             if not calls:
-                transition = await self._toolless_transition(
+                transition, events = await self._handle_toolless_turn(
                     step_delivery,
                     assistant_message,
                     iteration_consuming_notifications=(
@@ -1182,20 +1214,14 @@ class AgentLoop(
                     ),
                     notification_turn=notification_turn,
                     recovery_state=recovery_state,
+                    turn_number=turn_number,
                 )
                 recovery_state = transition.recovery_state
                 nudge_turn_pending = transition.nudge_turn_pending
+                for event in events:
+                    yield event
                 if transition.error is not None:
-                    yield StreamEvent(StreamEventType.ERROR, error=transition.error)
-                    if self.agent_instance_id is None:
-                        await step_delivery.admit_terminal("foreground_end")
-                    yield StreamEvent(StreamEventType.AGENT_END)
                     return
-                yield StreamEvent(
-                    StreamEventType.TURN_END,
-                    message=assistant_message,
-                    data={"turn": turn_number, "tool_calls": 0},
-                )
                 consuming_notifications = transition.consuming_notifications
                 if transition.continue_turn:
                     continue
