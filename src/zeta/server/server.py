@@ -52,40 +52,21 @@ from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-)
-_DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
 
+def _legacy_handler(method: str) -> Handler:
+    async def handle(
+        client: object, request_id: str | int, params: dict[str, Any]
+    ) -> object:
+        return await client._dispatch_legacy(request_id, method, params)  # type: ignore[attr-defined]
 
-async def _legacy_handler(
-    client: object, request_id: str | int, params: dict[str, Any]
-) -> object:
-    return await client._dispatch_legacy(request_id, client._current_method, params)  # type: ignore[attr-defined]
+    return handle
 
 
 HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _legacy_handler for descriptor in MethodDescriptor
+    descriptor: _legacy_handler(descriptor.wire) for descriptor in MethodDescriptor
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
-_METHODS = {descriptor.wire: descriptor for descriptor in MethodDescriptor}
 
 
 class _UnixSocketListener:
@@ -568,7 +549,7 @@ class _Client:
         handled, result = await self._route_request(request_id, method, params)
         if handled:
             return result
-        descriptor = _METHODS.get(method)
+        descriptor = MethodDescriptor.for_wire(method)
         if descriptor is None:
             raise ProtocolError(
                 ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
@@ -590,14 +571,13 @@ class _Client:
                 else f"{method} requires the negotiated {descriptor.feature} feature"
             )
             raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, feature_message)
-        self._current_method = method
+        if descriptor.access is Access.SESSION_MUTATION:
+            self.server.control._reject_if_unhealthy()
         return await HANDLERS[descriptor](self, request_id, params)
 
     async def _dispatch_legacy(
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
-        if method in LOADED_SESSION_MUTATIONS and method not in _DELIVERY_MUTATIONS:
-            self.server.control._reject_if_unhealthy()
         if method in login.REQUESTS:
             if self.protocol_version == "1.0":
                 raise ProtocolError(
@@ -826,7 +806,6 @@ class _Client:
         )
         if extended:
             self.server.turn_contexts.add_request(requests, self.features)
-        requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],

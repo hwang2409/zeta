@@ -260,16 +260,16 @@ class MethodDescriptor(Enum):
     SET_SETTINGS = ("set_settings", "1.1", None, Access.SESSION_MUTATION)
     SET_COMPACTION = ("set_compaction", "1.1", None, Access.SESSION_MUTATION)
     SEND_IMAGES = ("send_images", "1.1", None, Access.DELIVERY)
-    SLASH_LIST = ("slash_list", "1.1", None, Access.READ)
+    SLASH_LIST = ("slash_list", "1.1", None, Access.CONTROLLER_READ)
     SLASH_RUN = ("slash_run", "1.1", None, Access.SESSION_MUTATION)
-    ACCOUNT_LIST = ("account_list", "1.1", None, Access.READ)
+    ACCOUNT_LIST = ("account_list", "1.1", None, Access.CONTROLLER_READ)
     ACCOUNT_LOGOUT = ("account_logout", "1.1", None, Access.CONTROLLER_WRITE)
     ACCOUNT_REFRESH = ("account_refresh", "1.1", None, Access.CONTROLLER_WRITE)
     ACCOUNT_SWITCH = ("account_switch", "1.1", None, Access.CONTROLLER_WRITE)
     LOGIN_START = ("login_start", "1.1", None, Access.CONTROLLER_WRITE)
-    LOGIN_STATUS = ("login_status", "1.1", None, Access.READ)
+    LOGIN_STATUS = ("login_status", "1.1", None, Access.CONTROLLER_READ)
     LOGIN_CANCEL = ("login_cancel", "1.1", None, Access.CONTROLLER_WRITE)
-    LOGIN_PROVIDERS = ("login_providers", "1.1", None, Access.READ)
+    LOGIN_PROVIDERS = ("login_providers", "1.1", None, Access.CONTROLLER_READ)
     PING = ("ping", "1.1", "ping", Access.READ)
     SET_TURN_CONTEXT = (
         "set_turn_context",
@@ -277,9 +277,14 @@ class MethodDescriptor(Enum):
         "turn_context",
         Access.SESSION_MUTATION,
     )
-    LIST_PROJECTS = ("list_projects", "1.1", "projects", Access.READ)
-    PROJECT_SHOW = ("project_show", "1.1", "projects", Access.READ)
-    PROJECT_MEMORY_LOG = ("project_memory_log", "1.1", "projects", Access.READ)
+    LIST_PROJECTS = ("list_projects", "1.1", "projects", Access.CONTROLLER_READ)
+    PROJECT_SHOW = ("project_show", "1.1", "projects", Access.CONTROLLER_READ)
+    PROJECT_MEMORY_LOG = (
+        "project_memory_log",
+        "1.1",
+        "projects",
+        Access.CONTROLLER_READ,
+    )
     PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_WRITE)
     CLEAR_STEERING = ("clear_steering", None, "abort_scope", Access.SESSION_MUTATION)
     DELIVERY_STATUS = ("delivery_status", None, "delivery_id", Access.READ)
@@ -299,22 +304,19 @@ class MethodDescriptor(Enum):
         self.wire, self.since, self.feature, self.access = wire, since, feature, access
 
     @classmethod
+    def for_wire(cls, wire: str) -> MethodDescriptor | None:
+        return next((item for item in cls if item.wire == wire), None)
+
+    @classmethod
     def advertised(cls, version: str, features: frozenset[str], role: str) -> list[str]:
         methods = [
             item.wire
             for item in cls
             if (item.since is None or version != "1.0")
             and (item.feature is None or item.feature in features)
+            and (role != "observer" or item.access is Access.READ)
         ]
-        if role == "observer":
-            methods = sorted(
-                item.wire
-                for item in cls
-                if item.access is Access.READ
-                and (item.since is None or version != "1.0")
-                and (item.feature is None or item.feature in features)
-            )
-        return methods
+        return sorted(methods) if role == "observer" else methods
 
 
 Handler = Callable[[object, str | int, dict[str, object]], object]

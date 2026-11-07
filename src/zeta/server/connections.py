@@ -13,24 +13,11 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
+    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
 
-OBSERVER_REQUESTS = frozenset(
-    {
-        "list_sessions",
-        "status",
-        "session_tree",
-        "session_history",
-        "content_read",
-        "model_catalog",
-        "session_settings",
-        "ping",
-        "delivery_status",
-        "session_grants",
-    }
-)
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
@@ -738,12 +725,6 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    @staticmethod
-    def requests_for_role(role: str, requests: list[str]) -> list[str]:
-        if role == "observer":
-            return sorted(OBSERVER_REQUESTS.intersection(requests))
-        return requests
-
     async def route_request(
         self,
         connection: Any,
@@ -754,7 +735,8 @@ class ConnectionRegistry:
         state = self._connections.get(connection)
         if state is None or state.role != "observer":
             return False, None
-        if method not in OBSERVER_REQUESTS:
+        descriptor = MethodDescriptor.for_wire(method)
+        if descriptor is None or descriptor.access.value != "read":
             return False, None
         if method == "list_sessions" and "project_id" in params:
             raise ProtocolError(

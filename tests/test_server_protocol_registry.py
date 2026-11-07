@@ -11,6 +11,7 @@ from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
+    MethodDescriptor,
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
 )
@@ -70,6 +71,20 @@ def _documented_slash_error_codes(document: str) -> set[str]:
         "The shared slash registry",
     )
     return set(re.findall(r"^\| `([a-z_]+)` \|", section, re.MULTILINE))
+
+
+def test_method_registry_matches_documented_table() -> None:
+    document = PROTOCOL_DOC.read_text(encoding="utf-8")
+    section = _section(document, "## method table", "## common JSON-RPC shapes")
+    rows = re.findall(
+        r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$",
+        section,
+        re.MULTILINE,
+    )
+    assert rows == [
+        (item.wire, item.since or "1.0", item.feature or "none", item.access.value)
+        for item in MethodDescriptor
+    ], "document every method in descriptor order"
 
 
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
