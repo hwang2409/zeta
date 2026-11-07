@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
+
+import pytest
 
 from zeta.protocol.types import (
     CompletionBackend,
@@ -31,6 +33,36 @@ class ScriptedTurn:
 
 
 ACTOR_WAIT_TIMEOUT = 30
+_CREATED_FAKE_BACKENDS: list[FakeBackend] = []
+
+
+@pytest.fixture(autouse=True)
+def reject_shared_fake_backend() -> Iterator[None]:
+    _CREATED_FAKE_BACKENDS.clear()
+    yield
+    violations = [
+        backend._actor_violation
+        for backend in _CREATED_FAKE_BACKENDS
+        if backend._actor_violation is not None
+    ]
+    _CREATED_FAKE_BACKENDS.clear()
+    if violations:
+        first, second = violations[0]
+        pytest.fail(
+            f"one FakeBackend served actors {first!r} and {second!r}; "
+            "use PerActorFakeBackend from tests/support/fake_backend.py"
+        )
+
+
+def consume_fake_backend_actor_violations() -> list[tuple[str, str]]:
+    violations = [
+        backend._actor_violation
+        for backend in _CREATED_FAKE_BACKENDS
+        if backend._actor_violation is not None
+    ]
+    for backend in _CREATED_FAKE_BACKENDS:
+        backend._actor_violation = None
+    return violations
 
 
 class FakeBackend(CompletionBackend):
@@ -50,6 +82,7 @@ class FakeBackend(CompletionBackend):
         self.request_bytes: list[bytes] = []
         self._previous_request: bytes | None = None
         self._actor_prompt: str | None = None
+        self._actor_violation: tuple[str, str] | None = None
         self._scripted_child_prompts = {
             prompt
             for turn in turns
@@ -57,6 +90,7 @@ class FakeBackend(CompletionBackend):
             if call.name == "agent" and call.arguments.get("background") is True
             if isinstance(prompt := call.arguments.get("prompt"), str)
         }
+        _CREATED_FAKE_BACKENDS.append(self)
 
     async def complete(
         self,
@@ -67,11 +101,8 @@ class FakeBackend(CompletionBackend):
             actor_prompt = _script_actor_prompt(messages, self._scripted_child_prompts)
             if self._actor_prompt is None:
                 self._actor_prompt = actor_prompt
-            elif actor_prompt != self._actor_prompt:
-                raise AssertionError(
-                    "FakeBackend cannot serve multiple actors; use PerActorFakeBackend "
-                    f"for {self._actor_prompt!r} and {actor_prompt!r}"
-                )
+            elif actor_prompt != self._actor_prompt and self._actor_violation is None:
+                self._actor_violation = (self._actor_prompt, actor_prompt)
         index = len(self.calls)
         self.calls.append((list(messages), list(tool_schemas)))
         turn = self.turns[index]

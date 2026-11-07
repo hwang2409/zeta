@@ -6929,8 +6929,14 @@ async def test_failed_background_receipt_matches_error_flag(
 ) -> None:
     call = _background_agent_call()
     store = ConversationStore(tmp_path)
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[call])],
+        {"inspect the task": [ScriptedTurn()]},
+        parent_prompt="start",
+        gated_child_call=0,
+    )
     loop = AgentLoop(
-        FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn()]),
+        backend,
         store,
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
@@ -6938,27 +6944,30 @@ async def test_failed_background_receipt_matches_error_flag(
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await wait_background_owner(loop)
-    notification = store.agent_notifications(pending_only=False)[0]
-    terminal = next(
-        event
-        for event in background_events
-        if event.type is StreamEventType.TOOL_EXECUTION_END
-    )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await wait_background_owner(loop)
+        notification = store.agent_notifications(pending_only=False)[0]
+        terminal = next(
+            event
+            for event in background_events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
 
-    assert notification.data["status"] == "error"
-    assert notification.data["text"].count("error=true") == 1
-    assert notification.data["text"].count("canceled=false") == 1
-    assert terminal.tool_result is not None
-    assert terminal.tool_result.is_error is True
-    assert terminal.tool_result.is_canceled is False
-    rendered = render_event(terminal)
-    assert rendered is not None
-    assert "failed" in rendered.plain
-    assert "error=" not in rendered.plain
-    assert "canceled=" not in rendered.plain
-    await loop.close()
+        assert notification.data["status"] == "error"
+        assert notification.data["text"].count("error=true") == 1
+        assert notification.data["text"].count("canceled=false") == 1
+        assert terminal.tool_result is not None
+        assert terminal.tool_result.is_error is True
+        assert terminal.tool_result.is_canceled is False
+        rendered = render_event(terminal)
+        assert rendered is not None
+        assert "failed" in rendered.plain
+        assert "error=" not in rendered.plain
+        assert "canceled=" not in rendered.plain
+    finally:
+        backend.release_children.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio

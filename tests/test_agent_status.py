@@ -100,85 +100,88 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start foreground", origin=MessageOrigin.USER))
-    foreground_result = next(
-        message.tool_result
-        for message in store.messages()
-        if message.tool_result
-        and message.tool_result.tool_call_id == foreground_call.id
-    )
-    assert foreground_result.structured_content is not None
-    foreground_handle = foreground_result.structured_content["child_instance_id"]
-    assert type(foreground_handle) is str
+    try:
+        await _collect(loop.run_turn("start foreground", origin=MessageOrigin.USER))
+        foreground_result = next(
+            message.tool_result
+            for message in store.messages()
+            if message.tool_result
+            and message.tool_result.tool_call_id == foreground_call.id
+        )
+        assert foreground_result.structured_content is not None
+        foreground_handle = foreground_result.structured_content["child_instance_id"]
+        assert type(foreground_handle) is str
 
-    foreground_status = await _status(loop, foreground_handle)
-    foreground_child = foreground_status["structuredContent"]["children"][0]
-    assert foreground_child["handle"] == foreground_handle
-    assert foreground_child["state"] == "completed"
-    assert foreground_child["final_result"] == foreground_result.content
-    assert foreground_child["final_result"].startswith("foreground done")
-    assert foreground_child["turns_used"] == 1
-    assert foreground_child["depth"] == 1
-    assert foreground_child["agent_type"] == "general"
-    assert foreground_child["finished_at"] is not None
-    assert foreground_child["elapsed"] >= 0
+        foreground_status = await _status(loop, foreground_handle)
+        foreground_child = foreground_status["structuredContent"]["children"][0]
+        assert foreground_child["handle"] == foreground_handle
+        assert foreground_child["state"] == "completed"
+        assert foreground_child["final_result"] == foreground_result.content
+        assert foreground_child["final_result"].startswith("foreground done")
+        assert foreground_child["turns_used"] == 1
+        assert foreground_child["depth"] == 1
+        assert foreground_child["agent_type"] == "general"
+        assert foreground_child["finished_at"] is not None
+        assert foreground_child["elapsed"] >= 0
 
-    await _collect(loop.run_turn("start background", origin=MessageOrigin.USER))
-    background_result = next(
-        message.tool_result
-        for message in store.messages()
-        if message.tool_result
-        and message.tool_result.structured_content is not None
-        and message.tool_result.structured_content.get("status") == "running"
-    )
-    assert background_result.structured_content is not None
-    background_handle = background_result.structured_content["child_instance_id"]
-    assert type(background_handle) is str
+        await _collect(loop.run_turn("start background", origin=MessageOrigin.USER))
+        background_result = next(
+            message.tool_result
+            for message in store.messages()
+            if message.tool_result
+            and message.tool_result.structured_content is not None
+            and message.tool_result.structured_content.get("status") == "running"
+        )
+        assert background_result.structured_content is not None
+        background_handle = background_result.structured_content["child_instance_id"]
+        assert type(background_handle) is str
 
-    child_path = background_result.structured_content["child_session_path"]
-    assert type(child_path) is str
-    durable_lifecycle = json.loads(
-        (Path(child_path) / "agent_lifecycle.json").read_text(encoding="utf-8")
-    )
-    assert durable_lifecycle["current_step"] == "starting"
+        child_path = background_result.structured_content["child_session_path"]
+        assert type(child_path) is str
+        durable_lifecycle = json.loads(
+            (Path(child_path) / "agent_lifecycle.json").read_text(encoding="utf-8")
+        )
+        assert durable_lifecycle["current_step"] == "starting"
 
-    live_status = await _status(loop, background_handle)
-    live_child = live_status["structuredContent"]["children"][0]
-    assert live_child["state"] == "running"
-    assert live_child["finished_at"] is None
-    assert live_child["current_step"] == "turn 1: thinking"
+        live_status = await _status(loop, background_handle)
+        live_child = live_status["structuredContent"]["children"][0]
+        assert live_child["state"] == "running"
+        assert live_child["finished_at"] is None
+        assert live_child["current_step"] == "turn 1: thinking"
 
-    live_list_status = await _status(loop)
-    live_list_child = live_list_status["structuredContent"]["children"][0]
-    assert live_list_child["handle"] == background_handle
-    assert live_list_child["state"] == "running"
-    assert live_list_child["finished_at"] is None
-    assert live_list_status["structuredContent"]["finished_omitted"] == 1
-    assert (
-        "1 finished children omitted (query by handle for results)"
-        in live_list_status["content"][0]["text"]
-    )
+        live_list_status = await _status(loop)
+        live_list_child = live_list_status["structuredContent"]["children"][0]
+        assert live_list_child["handle"] == background_handle
+        assert live_list_child["state"] == "running"
+        assert live_list_child["finished_at"] is None
+        assert live_list_status["structuredContent"]["finished_omitted"] == 1
+        assert (
+            "1 finished children omitted (query by handle for results)"
+            in live_list_status["content"][0]["text"]
+        )
 
-    backend.release_children.set()
-    await asyncio.wait_for(loop._background_owner.wait(), 10)
-    all_status = await _status(loop)
-    children = all_status["structuredContent"]["children"]
-    assert children == []
-    assert all_status["structuredContent"]["finished_omitted"] == 2
-    assert (
-        "2 finished children omitted (query by handle for results)"
-        in all_status["content"][0]["text"]
-    )
-    assert all("final_result" not in child for child in children)
-    background_status = await _status(loop, background_handle)
-    assert background_status["structuredContent"]["children"][0][
-        "final_result"
-    ].startswith("background done")
+        backend.release_children.set()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        all_status = await _status(loop)
+        children = all_status["structuredContent"]["children"]
+        assert children == []
+        assert all_status["structuredContent"]["finished_omitted"] == 2
+        assert (
+            "2 finished children omitted (query by handle for results)"
+            in all_status["content"][0]["text"]
+        )
+        assert all("final_result" not in child for child in children)
+        background_status = await _status(loop, background_handle)
+        assert background_status["structuredContent"]["children"][0][
+            "final_result"
+        ].startswith("background done")
 
-    unknown = await _status(loop, "missing-child")
-    assert unknown["isError"] is True
-    assert "unknown child handle" in unknown["content"][0]["text"]
-    await loop.close()
+        unknown = await _status(loop, "missing-child")
+        assert unknown["isError"] is True
+        assert "unknown child handle" in unknown["content"][0]["text"]
+    finally:
+        backend.release_children.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
