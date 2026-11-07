@@ -434,26 +434,7 @@ class BackgroundTaskRegistry:
             owner=owner,
         )
         try:
-            async with self._transition_lock:
-                rows = self._persistence_rows((*self._records.values(), record))
-
-                def publish_start() -> None:
-                    self._records[task_id] = record
-                    record.monitor = asyncio.create_task(
-                        self._monitor(record, log_handle)
-                    )
-                    self._task_start_generation += 1
-
-                await self._commit_transition(
-                    rows,
-                    publish_start,
-                    BackgroundTaskNotice(
-                        f"background task {task_id} started: {command_headline(command)}",
-                        task_id,
-                        "started",
-                        owner,
-                    ),
-                )
+            await self._register_start(record, log_handle)
         except BaseException:
             await _terminate_process(
                 process,
@@ -469,9 +450,31 @@ class BackgroundTaskRegistry:
                 )
                 if isinstance(monitor_result[0], BaseException):
                     raise monitor_result[0]
-            self._records.pop(task_id, None)
             raise
         return task_id, process.pid
+
+    async def _register_start(
+        self, record: _BackgroundRecord, log_handle: IO[bytes]
+    ) -> None:
+        async with self._transition_lock:
+            rows = self._persistence_rows((*self._records.values(), record))
+
+            def publish() -> None:
+                self._records[record.task_id] = record
+                record.monitor = asyncio.create_task(self._monitor(record, log_handle))
+                self._task_start_generation += 1
+
+            await self._commit_transition(
+                rows,
+                publish,
+                BackgroundTaskNotice(
+                    f"background task {record.task_id} started: "
+                    f"{command_headline(record.command)}",
+                    record.task_id,
+                    "started",
+                    record.owner,
+                ),
+            )
 
     async def wait(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
         """Wait for one background process and return its terminal status."""
@@ -895,22 +898,26 @@ class BackgroundTaskRegistry:
                     logger.exception(
                         "failed to archive background task output for %s", record.task_id
                     )
-            committed = await self._commit_terminal(record, process.returncode)
-            if committed and record.notify_on_exit:
-                await self._notify_exit(
-                    record.task_id,
-                    record.command,
-                    record.exit_code,
-                    output_tail(record.output),
-                    None if record.remove_log_on_archive else record.log_path,
-                    record.note,
-                    owner=record.owner,
-                    phase=record.terminal_phase,
-                )
+            await self._commit_terminal(record, process.returncode)
             if archive_error is not None:
                 raise archive_error
 
     async def _commit_terminal(
+        self, record: _BackgroundRecord, exit_code: int | None
+    ) -> bool:
+        finalization = asyncio.create_task(self._finalize_terminal(record, exit_code))
+        cancelled = False
+        while not finalization.done():
+            try:
+                await asyncio.shield(finalization)
+            except asyncio.CancelledError:
+                cancelled = True
+        committed = finalization.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return committed
+
+    async def _finalize_terminal(
         self, record: _BackgroundRecord, exit_code: int | None
     ) -> bool:
         async with self._transition_lock:
@@ -946,7 +953,9 @@ class BackgroundTaskRegistry:
             except Exception:
                 self._pending_terminals[record.task_id] = candidate, notice
                 raise
-            return True
+            self._pending_terminals.pop(record.task_id, None)
+        await self._notify_terminal_exit(candidate)
+        return True
 
     @staticmethod
     def _publish_terminal(
@@ -976,6 +985,8 @@ class BackgroundTaskRegistry:
                 self._pending_terminals.pop(task_id, None)
 
         await self._commit_transition(rows, publish, None)
+        for _, (candidate, _) in pending:
+            await self._notify_terminal_exit(candidate)
 
     async def _read_output(
         self,
@@ -1062,18 +1073,7 @@ class BackgroundTaskRegistry:
                 raise monitor_result
         if monitor_cutoff:
             record.note = f"{record.note}; {OUTPUT_CUTOFF_NOTE}"
-        committed = await self._commit_terminal(record, process.returncode)
-        if committed and record.notify_on_exit:
-            await self._notify_exit(
-                record.task_id,
-                record.command,
-                record.exit_code,
-                output_tail(record.output),
-                record.log_path,
-                record.note,
-                owner=record.owner,
-                phase=record.terminal_phase,
-            )
+        await self._commit_terminal(record, process.returncode)
 
     async def _close_stdin(self, record: _BackgroundRecord) -> None:
         lock = record.stdin_lock
@@ -1132,6 +1132,20 @@ class BackgroundTaskRegistry:
     def _notice(self, notice: BackgroundTaskNoticeSinkValue) -> None:
         if self._notice_sink is not None:
             self._notice_sink(notice)
+
+    async def _notify_terminal_exit(self, record: _BackgroundRecord) -> None:
+        if not record.notify_on_exit:
+            return
+        await self._notify_exit(
+            record.task_id,
+            record.command,
+            record.exit_code,
+            output_tail(record.output),
+            None if record.remove_log_on_archive else record.log_path,
+            record.note,
+            owner=record.owner,
+            phase=record.terminal_phase or "natural_exit",
+        )
 
     async def _notify_exit(
         self,

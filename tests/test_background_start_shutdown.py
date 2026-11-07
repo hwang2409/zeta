@@ -19,6 +19,7 @@ from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import (
     BackgroundTaskNotice,
     BackgroundTaskRegistry,
+    TaskExitInput,
     _group_exists,
 )
 
@@ -149,12 +150,18 @@ async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notices: list[BackgroundTaskNotice] = []
+    exits: list[TaskExitInput] = []
+
+    async def notify_exit(notification: TaskExitInput) -> None:
+        exits.append(notification)
+
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     registry = BackgroundTaskRegistry(
         session_dir=tmp_path,
         directory_fd=directory_fd,
         term_grace=0.03,
         notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+        notification_sink=notify_exit,
     )
     os.close(directory_fd)
     entered = threading.Event()
@@ -179,21 +186,83 @@ async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
     starting = asyncio.create_task(registry.start("sleep 30", tmp_path))
     assert await asyncio.to_thread(entered.wait, 10)
     starting.cancel()
-    await asyncio.sleep(0)
-    returned_before_persist = starting.done()
-
     release.set()
     result = await asyncio.gather(starting, return_exceptions=True)
     assert await asyncio.to_thread(completed.wait, 10)
 
-    assert not returned_before_persist
     assert isinstance(result[0], asyncio.CancelledError)
     rows = json.loads((tmp_path / "background_tasks.json").read_text())
     assert len(rows) == 1
     assert rows[0]["running"] is False
     assert not _group_exists(rows[0]["pid"])
+    assert len(registry.snapshot()) == 1
+    assert registry.snapshot()[0].task_id == rows[0]["task_id"]
+    assert not registry.snapshot()[0].running
     assert len([notice for notice in notices if notice.phase != "started"]) == 1
     assert notices[-1].phase == "natural_exit"
+    assert [(item.task_id, item.phase) for item in exits] == [
+        (rows[0]["task_id"], "natural_exit")
+    ]
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_commit_notifies_exit_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[BackgroundTaskNotice] = []
+    exits: list[TaskExitInput] = []
+
+    async def notify_exit(notification: TaskExitInput) -> None:
+        exits.append(notification)
+
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    registry = BackgroundTaskRegistry(
+        session_dir=tmp_path,
+        directory_fd=directory_fd,
+        term_grace=0.03,
+        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
+        notification_sink=notify_exit,
+    )
+    os.close(directory_fd)
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    notices.clear()
+    entered = threading.Event()
+    release = threading.Event()
+    cutoff = asyncio.Event()
+    original_persist = registry._persist
+    persist_calls = 0
+
+    def gated_terminal_persist(rows=None) -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 1:
+            entered.set()
+            assert release.wait(10)
+        original_persist(rows)
+
+    original_wait = asyncio.wait
+
+    async def force_monitor_cutoff(fs, *, timeout=None, **kwargs):
+        if timeout == process_module.BACKGROUND_OUTPUT_DRAIN_TIMEOUT:
+            assert await asyncio.to_thread(entered.wait, 10)
+            cutoff.set()
+            return set(), set(fs)
+        return await original_wait(fs, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
+    monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
+    killing = asyncio.create_task(registry.kill(task_id))
+    await cutoff.wait()
+    release.set()
+    await killing
+
+    rows = json.loads((tmp_path / "background_tasks.json").read_text())
+    assert len(rows) == 1
+    assert rows[0]["running"] is False
+    assert not registry.snapshot()[0].running
+    assert [notice.phase for notice in notices] == ["task_kill"]
+    assert [(item.task_id, item.phase) for item in exits] == [(task_id, "task_kill")]
     await registry.close()
 
 
