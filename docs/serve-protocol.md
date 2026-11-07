@@ -1408,7 +1408,6 @@ implementation for the frontend client. Two RPCs cover the surface.
     `/status`, this is the same operational view as the TUI, including configured
     hooks, recent cache-hit history, and model-attributed estimated cost. The
     shared view omits terminal-only navigation key hints.
-  - `text`: `text` is the MCP status output to render as normal text.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
     an opaque `input_id` and the typed `display_text`; the resolved text and
@@ -1424,10 +1423,50 @@ Structured slash error codes are:
 | --- | --- |
 | `mcp_credential_store` | an MCP credential file could not be loaded or deleted safely |
 
+The shared slash registry has this order and surface availability:
+
+| command | serve | description |
+| --- | --- | --- |
+| `status` | yes | show session status |
+| `keys` | no | show keyboard shortcuts |
+| `mcp` | yes | show MCP server status |
+| `model` | yes | pick a model or switch to one: `/model [name]` |
+| `vim` | yes | show or change vim mode |
+| `plan` | no | show or change plan mode |
+| `implement` | no | implement the proposed plan |
+| `project-instructions` | yes | open or create private project instructions in your editor |
+| `init` | yes | generate or improve project instructions |
+| `paste` | no | paste an image |
+| `compact` | yes | compact the context |
+| `checkpoint` | no | save a checkpoint |
+| `fork` | no | fork from a prior user message or checkpoint |
+| `tree` | no | list branches or switch to one |
+| `tools` | no | list tools or trust project tools |
+| `undo` | no | restore the previous workspace snapshot |
+| `redo` | no | restore the next workspace snapshot |
+| `new` | no | start a fresh session in this window |
+| `name` | no | name the current session for the picker |
+| `project` | yes | show or initialize the current project |
+| `inbox` | yes | list this project's inbox |
+| `memory` | yes | show, retry, or undo automatic memory updates |
+| `theme` | no | list themes or switch the active theme |
+| `runs` | no | list live agent runs |
+| `tasks` | no | inspect background processes |
+| `decisions` | no | answer or discuss open decisions |
+| `send` | no | send a follow-up to a run: `/send <id> <message>` |
+| `help` | yes | list commands |
+| `approve` | no | `/approve [key]` |
+| `always` | no | `/always [key]` — allow this tool/action for the running session |
+| `deny` | no | `/deny [key]` |
+| `accounts` | yes | list, switch, or label accounts |
+| `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
+| `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
+
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/memory`, `/model`, `/project`, `/project-instructions`,
-`/status`, and `/vim`. `/project` shows the current association, and `/project
-init` discovers the working directory and associates the session. The mutating
+`/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/project`,
+`/project-instructions`, `/status`, and `/vim`. `/project` shows the current
+association, and `/project init` discovers the working directory and associates
+this session. The mutating
 form is rejected while a turn, child, or approval is active. Runnable user
 commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
