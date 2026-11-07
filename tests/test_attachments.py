@@ -29,7 +29,7 @@ from zeta.protocol.types import (
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.skills import SkillCatalog
-from zeta.tui import composer, paste_runtime
+from zeta.tui import _attachments, composer, paste_runtime
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     ATTACHMENT_MAX_TEXT_BYTES,
@@ -1095,6 +1095,100 @@ async def test_corrupt_image_reference_reports_one_visible_notice(tmp_path: Path
 
     assert notices == ["@./broken.png not attached: not decodable"]
     assert backend.calls[0][0][-1].content == [TextContent("inspect @./broken.png")]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "prompt.txt"
+    source.write_text("context", encoding="utf-8")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([TextContent("done")])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    staged = store.session_dir / "clipboard-mixed.png"
+    encoded: list[bytes] = []
+    read_counts: dict[Path, int] = {}
+    real_b64encode = _attachments.base64.b64encode
+    real_read_attachment = _attachments._read_attachment
+
+    def b64encode(data: bytes) -> bytes:
+        encoded.append(data)
+        return real_b64encode(data)
+
+    def read_attachment(path: Path, *args: object, **kwargs: object) -> object:
+        read_counts[path] = read_counts.get(path, 0) + 1
+        return real_read_attachment(path, *args, **kwargs)
+
+    def paste_image(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(_attachments.base64, "b64encode", b64encode)
+    monkeypatch.setattr(_attachments, "_read_attachment", read_attachment)
+    monkeypatch.setattr(paste_runtime, "_read_attachment", read_attachment)
+    monkeypatch.setattr(paste_runtime, "paste_image", paste_image)
+    token = await app.paste_from_clipboard()
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    resolve_entered = asyncio.Event()
+    resolve_release = threading.Event()
+    resolve_threads: list[int] = []
+    real_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == source:
+            resolve_threads.append(threading.get_ident())
+            if threading.get_ident() != loop_thread:
+                loop.call_soon_threadsafe(resolve_entered.set)
+                resolve_release.wait()
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    submission = asyncio.create_task(
+        app._handle_prompt_value(f"use @./prompt.txt {token}")
+    )
+    entered = asyncio.create_task(resolve_entered.wait())
+    done, _ = await asyncio.wait(
+        {submission, entered}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if entered in done:
+        prompt_loop_ran = asyncio.Event()
+        loop.call_soon(prompt_loop_ran.set)
+        await prompt_loop_ran.wait()
+        assert not submission.done()
+        resolve_release.set()
+    await submission
+    if app._active_task is not None:
+        await app._active_task
+    entered.cancel()
+    await asyncio.gather(entered, return_exceptions=True)
+
+    user = next(
+        message for message in store.messages() if message.role is MessageRole.USER
+    )
+    paths = [
+        block.path
+        for block in user.content
+        if isinstance(block, (ImageContent, TextContent)) and block.path is not None
+    ]
+    resolved_source = real_resolve(source)
+    assert paths == [str(resolved_source), str(staged.absolute())]
+    assert read_counts == {resolved_source: 1, staged.absolute(): 1}
+    assert encoded == [PNG]
+    assert entered in done
+    assert resolve_threads and set(resolve_threads) != {loop_thread}
     await app.loop.close()
 
 
