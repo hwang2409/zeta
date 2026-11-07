@@ -613,7 +613,7 @@ async def test_provider_stalls_waiting_for_response_headers(
 
     async def no_headers(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=30)
         raise AssertionError("unreachable")
 
     client = _mock_client(no_headers)
