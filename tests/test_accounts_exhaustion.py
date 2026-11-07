@@ -50,9 +50,13 @@ from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, Tex
 from zeta.providers.codex import CodexBackend
 from zeta.providers.retry_policy import ProviderRetryBudget
 from zeta.skills import SkillCatalog
+from zeta.storage_format import advance
 from zeta.tui import TUIApp
 
-FIXTURE = Path(__file__).parent / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
+FIXTURE = (
+    Path(__file__).parent
+    / "fixtures/usage/codex_responses_429_usage_limit_reached.json"
+)
 NOW = datetime(2026, 10, 22, 16, 0, tzinfo=UTC)
 ACCOUNT = AccountId("codex", "pro")
 SATURATED_RACE_TIMEOUT_SECONDS = 10
@@ -62,33 +66,98 @@ def _failure(status: int, body: object) -> SimpleNamespace:
     return SimpleNamespace(status_code=status, response_body=json.dumps(body).encode())
 
 
-def _state(percent: float, *, age: timedelta = timedelta(), provider: str = "codex") -> UsageState:
+def _state(
+    percent: float, *, age: timedelta = timedelta(), provider: str = "codex"
+) -> UsageState:
     kind = "primary" if provider == "codex" else "five_hour"
     return UsageState(
-        UsageSnapshot(NOW - age, "usage_endpoint", (UsageWindow(kind, percent, 10_080, NOW + timedelta(days=1)),)),
+        UsageSnapshot(
+            NOW - age,
+            "usage_endpoint",
+            (UsageWindow(kind, percent, 10_080, NOW + timedelta(days=1)),),
+        ),
         "now" if age <= timedelta(minutes=15) else "stale",
     )
 
 
 def test_codex_usage_limit_reached_fixture_is_classified() -> None:
     payload = json.loads(FIXTURE.read_text())
-    result = classify_subscription_limit("codex", ACCOUNT, _failure(429, {"error": payload["error"]}))
-    assert result == SubscriptionLimit(ACCOUNT, datetime.fromtimestamp(1793082708, UTC), 10080)
+    result = classify_subscription_limit(
+        "codex", ACCOUNT, _failure(429, {"error": payload["error"]})
+    )
+    assert result == SubscriptionLimit(
+        ACCOUNT, datetime.fromtimestamp(1793082708, UTC), 10080
+    )
 
 
 def test_unknown_429_and_changed_schema_are_not_exhaustion() -> None:
-    assert classify_subscription_limit("codex", ACCOUNT, _failure(429, {"error": {"type": "other"}})) is None
-    assert classify_subscription_limit("codex", ACCOUNT, _failure(429, {"error": {"type": "usage_limit_reached", "resets_at": "soon", "limit_window_minutes": 10080}})) is None
-    assert classify_subscription_limit("codex", ACCOUNT, _failure(500, {"error": {"type": "usage_limit_reached", "resets_at": 1793082708, "limit_window_minutes": 10080}})) is None
+    assert (
+        classify_subscription_limit(
+            "codex", ACCOUNT, _failure(429, {"error": {"type": "other"}})
+        )
+        is None
+    )
+    assert (
+        classify_subscription_limit(
+            "codex",
+            ACCOUNT,
+            _failure(
+                429,
+                {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "resets_at": "soon",
+                        "limit_window_minutes": 10080,
+                    }
+                },
+            ),
+        )
+        is None
+    )
+    assert (
+        classify_subscription_limit(
+            "codex",
+            ACCOUNT,
+            _failure(
+                500,
+                {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "resets_at": 1793082708,
+                        "limit_window_minutes": 10080,
+                    }
+                },
+            ),
+        )
+        is None
+    )
 
 
 def test_anthropic_429_is_not_classified_without_fixture() -> None:
-    assert classify_subscription_limit("anthropic", AccountId("anthropic", "pro"), _failure(429, {"error": {"type": "usage_limit_reached", "resets_at": 1793082708, "limit_window_minutes": 10080}})) is None
+    assert (
+        classify_subscription_limit(
+            "anthropic",
+            AccountId("anthropic", "pro"),
+            _failure(
+                429,
+                {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "resets_at": 1793082708,
+                        "limit_window_minutes": 10080,
+                    }
+                },
+            ),
+        )
+        is None
+    )
 
 
 def test_classified_limit_is_not_retried_and_other_retries_unchanged() -> None:
     exhausted = _failure(429, json.loads(FIXTURE.read_text()))
-    exhausted.subscription_limit = classify_subscription_limit("codex", ACCOUNT, exhausted)
+    exhausted.subscription_limit = classify_subscription_limit(
+        "codex", ACCOUNT, exhausted
+    )
     budget = ProviderRetryBudget()
     budget.start_attempt("test")
     assert budget.plan(exhausted, owner="test") is None
@@ -115,20 +184,35 @@ def test_offers_switch_only_with_exactly_one_fresh_unexhausted_alternative() -> 
     a, b, c = AccountId("codex", "a"), AccountId("codex", "b"), AccountId("codex", "c")
     assert recovery_alternatives(a, {a: _state(100), b: _state(20)}, NOW) == (b,)
     assert recovery_alternatives(a, {a: _state(100)}, NOW) == ()
-    assert recovery_alternatives(a, {a: _state(100), b: _state(20), c: _state(30)}, NOW) == ()
-    assert recovery_alternatives(a, {a: _state(100), b: _state(20, age=timedelta(minutes=16))}, NOW) == ()
+    assert (
+        recovery_alternatives(a, {a: _state(100), b: _state(20), c: _state(30)}, NOW)
+        == ()
+    )
+    assert (
+        recovery_alternatives(
+            a, {a: _state(100), b: _state(20, age=timedelta(minutes=16))}, NOW
+        )
+        == ()
+    )
     assert recovery_alternatives(a, {a: _state(100), b: _state(100)}, NOW) == ()
 
 
 def test_switch_never_replays_failed_request() -> None:
     # Recovery returns a selection only; the caller must wait for new user input.
     other = AccountId("codex", "other")
-    assert recovery_alternatives(ACCOUNT, {ACCOUNT: _state(100), other: _state(1)}, NOW) == (other,)
+    assert recovery_alternatives(
+        ACCOUNT, {ACCOUNT: _state(100), other: _state(1)}, NOW
+    ) == (other,)
 
 
 def test_child_limit_failure_never_switches_parent() -> None:
     limit = SubscriptionLimit(ACCOUNT, NOW + timedelta(hours=1), 10080)
-    assert limit.recovery_event(frozen=True, alternatives=(AccountId("codex", "other"),))["action"] == "none"
+    assert (
+        limit.recovery_event(frozen=True, alternatives=(AccountId("codex", "other"),))[
+            "action"
+        ]
+        == "none"
+    )
 
 
 def _codex_token(account_id: str) -> str:
@@ -153,6 +237,7 @@ def _account_context(
     tmp_path: Path,
 ) -> tuple[SessionAccountContext, object, AccountId, AccountId]:
     home = tmp_path / "home"
+    advance(home, expected_epoch=0)
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
@@ -188,7 +273,9 @@ def _assert_switch_state(
     assert context.manager is not None
     persisted = context.manager.read_metadata(context.metadata.session_id)
     assert persisted.selected_accounts == {"codex": str(account)}
-    assert persisted.account_switch_sequences == ({"codex": sequence} if sequence else {})
+    assert persisted.account_switch_sequences == (
+        {"codex": sequence} if sequence else {}
+    )
     assert persisted.native_context_boundaries == {"codex": boundary}
     assert context.metadata.to_dict() == persisted.to_dict()
     assert context.snapshot()["codex"] == account
@@ -201,9 +288,7 @@ def _assert_switch_state(
 async def test_switch_cancelled_during_prepare_changes_nothing(
     tmp_path: Path,
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -240,9 +325,7 @@ async def test_switch_cancelled_during_prepare_changes_nothing(
 async def test_switch_apply_is_infallible_no_split_when_backend_build_fails(
     tmp_path: Path,
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     first_backend = object()
     loop = _switch_loop(first_backend)
 
@@ -298,9 +381,7 @@ async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
         monkeypatch.setattr(
             context.manager,
             "_write_unlocked",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                OSError("persist failed")
-            ),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("persist failed")),
         )
         return await commit(self, *args, **kwargs)
 
@@ -328,9 +409,7 @@ async def test_switch_commit_sees_concurrent_writer_converges_to_disk(
 async def test_switch_persist_failure_keeps_old_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     first_backend = object()
     second_backend = object()
     loop = _switch_loop(first_backend)
@@ -379,9 +458,7 @@ async def test_switch_persist_raises_reread_new_applies_new(
         build_backend=lambda _account: second_backend,
     )
 
-    _assert_switch_state(
-        context, second, second_backend, loop, sequence=1, boundary=3
-    )
+    _assert_switch_state(context, second, second_backend, loop, sequence=1, boundary=3)
     opened.store.close()
 
 
@@ -389,9 +466,7 @@ async def test_switch_persist_raises_reread_new_applies_new(
 async def test_switch_persist_raises_reread_fails_marks_unknown_and_blocks_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     first_backend = FakeBackend([])
     second_backend = FakeBackend([])
     loop = AgentLoop(first_backend, opened.store, skill_catalog=SkillCatalog.empty())
@@ -428,9 +503,7 @@ async def test_switch_persist_raises_reread_fails_marks_unknown_and_blocks_provi
     events = [
         event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
     ]
-    assert any(
-        event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events
-    )
+    assert any(event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events)
     error = next(event for event in events if event.type is StreamEventType.ERROR)
     assert error.error is not None and "/accounts" in error.error.message
     assert first_backend.calls == []
@@ -484,9 +557,7 @@ async def test_unknown_account_state_rederives_from_disk_on_next_turn(
         event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)
     ]
 
-    assert any(
-        event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events
-    )
+    assert any(event.type is StreamEventType.ACCOUNT_STATE_UNKNOWN for event in events)
     assert len(second_backend.calls) == 1
     assert not context.account_state_unknown
     _assert_switch_state(context, second, second_backend, loop, sequence=1, boundary=3)
@@ -612,9 +683,7 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
         writer_manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
 
         def rename(index: int) -> object:
-            return writer_manager.rename(
-                context.metadata.session_id, f"rename {index}"
-            )
+            return writer_manager.rename(context.metadata.session_id, f"rename {index}")
 
         def queue_renames() -> None:
             event_loop.set_default_executor(executor)
@@ -810,9 +879,7 @@ async def test_cancel_after_commit_returns_releases_metadata_lock(
     ) -> None:
         def read_while_apply_is_pending() -> None:
             try:
-                other.read_metadata(
-                    context.metadata.session_id, lock_timeout=0.05
-                )
+                other.read_metadata(context.metadata.session_id, lock_timeout=0.05)
             except BaseException as exc:  # noqa: BLE001 - captured across thread
                 reader_errors.append(exc)
 
@@ -845,9 +912,7 @@ async def test_cancel_after_commit_returns_releases_metadata_lock(
 
 @pytest.mark.asyncio
 async def test_overlapping_switches_are_serialized(tmp_path: Path) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     first_entered = threading.Event()
     second_entered = threading.Event()
     release_first = threading.Event()
@@ -900,9 +965,7 @@ async def test_overlapping_switches_are_serialized(tmp_path: Path) -> None:
 async def test_account_switch_never_replays_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
 
     def fail_replay(_store: ConversationStore) -> list[object]:
         raise AssertionError("account switching must not replay the transcript")
@@ -963,9 +1026,7 @@ async def test_account_switch_never_replays_transcript(
 async def test_codex_limit_end_to_end_emits_account_limit_once_without_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    context, opened, first, second = await asyncio.to_thread(
-        _account_context, tmp_path
-    )
+    context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
     now = datetime.now(UTC)
     snapshot = UsageSnapshot(
         now,
