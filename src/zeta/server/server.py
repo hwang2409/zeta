@@ -68,42 +68,35 @@ if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
 
 _LOGIN_METHODS = frozenset(
-    {
-        MethodDescriptor.LOGIN_START,
-        MethodDescriptor.LOGIN_STATUS,
-        MethodDescriptor.LOGIN_CANCEL,
-        MethodDescriptor.LOGIN_PROVIDERS,
-    }
+    MethodDescriptor[name]
+    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
 )
 _ERGONOMICS_METHODS = frozenset(
-    {
-        MethodDescriptor.RENAME_SESSION,
-        MethodDescriptor.DELETE_SESSION,
-        MethodDescriptor.SESSION_TREE,
-        MethodDescriptor.SESSION_HISTORY,
-        MethodDescriptor.CONTENT_READ,
-        MethodDescriptor.MODEL_CATALOG,
-        MethodDescriptor.SESSION_SETTINGS,
-        MethodDescriptor.SET_SETTINGS,
-        MethodDescriptor.SET_COMPACTION,
-        MethodDescriptor.SEND_IMAGES,
-        MethodDescriptor.SWITCH_BRANCH,
-        MethodDescriptor.FORK_MESSAGE,
-        MethodDescriptor.SLASH_LIST,
-        MethodDescriptor.SLASH_RUN,
-        MethodDescriptor.ACCOUNT_LIST,
-        MethodDescriptor.ACCOUNT_LOGOUT,
-        MethodDescriptor.ACCOUNT_REFRESH,
-        MethodDescriptor.ACCOUNT_SWITCH,
-    }
+    MethodDescriptor[name]
+    for name in (
+        "RENAME_SESSION",
+        "DELETE_SESSION",
+        "SESSION_TREE",
+        "SESSION_HISTORY",
+        "CONTENT_READ",
+        "MODEL_CATALOG",
+        "SESSION_SETTINGS",
+        "SET_SETTINGS",
+        "SET_COMPACTION",
+        "SEND_IMAGES",
+        "SWITCH_BRANCH",
+        "FORK_MESSAGE",
+        "SLASH_LIST",
+        "SLASH_RUN",
+        "ACCOUNT_LIST",
+        "ACCOUNT_LOGOUT",
+        "ACCOUNT_REFRESH",
+        "ACCOUNT_SWITCH",
+    )
 )
 _PROJECT_METHODS = frozenset(
-    {
-        MethodDescriptor.LIST_PROJECTS,
-        MethodDescriptor.PROJECT_SHOW,
-        MethodDescriptor.PROJECT_MEMORY_LOG,
-        MethodDescriptor.PROJECT_INBOX,
-    }
+    MethodDescriptor[name]
+    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
 )
 
 
