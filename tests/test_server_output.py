@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Awaitable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
@@ -96,6 +97,26 @@ async def _rpc(
         frame = await _read_json(reader, transport)
         if frame.get("id") == request_id:
             return frame
+
+
+async def _rpc_within_test_bound(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    transport: Transport,
+    request_id: int,
+    method: str,
+    params: dict[str, object] | None = None,
+    *,
+    pending: list[asyncio.Task[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    request = asyncio.create_task(
+        _rpc(reader, writer, transport, request_id, method, params)
+    )
+    try:
+        return await asyncio.wait_for(asyncio.shield(request), 10)
+    except TimeoutError:
+        pending.append(request)
+        return None
 
 
 async def _event(
@@ -330,6 +351,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     old_publish: asyncio.Task[bool] | None = None
     rejected_writer: asyncio.StreamWriter | None = None
     replay_writer: asyncio.StreamWriter | None = None
+    pending_requests: list[asyncio.Task[dict[str, Any]]] = []
     fenced = False
 
     def gated_release(reconnect: bool) -> Awaitable[None]:
@@ -423,7 +445,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
             0.0,
             raising=False,
         )
-        rejected = await _rpc(
+        rejected = await _rpc_within_test_bound(
             rejected_reader,
             rejected_writer,
             transport,
@@ -434,7 +456,9 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
                 "role": "controller",
                 "features": ["approval_reconnect"],
             },
+            pending=pending_requests,
         )
+        assert rejected is not None, "no hello reply within the bound"
         assert type(rejected["error"]["code"]) is int
         assert rejected["error"] == {
             "code": -32001,
@@ -477,6 +501,9 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     finally:
         release_gate.set()
         old_output_gate.set()
+        for request in pending_requests:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(request, 10)
         if old_publish is not None and not old_publish.done():
             old_publish.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -485,7 +512,8 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
             if writer is not None:
                 writer.close()
                 await writer.wait_closed()
-        await asyncio.wait_for(server.close(), 10)
+        with suppress(asyncio.CancelledError, TimeoutError):
+            await asyncio.wait_for(server.close(), 10)
 
 
 @pytest.mark.asyncio
