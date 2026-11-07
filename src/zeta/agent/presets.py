@@ -131,14 +131,6 @@ AGENT_PRESETS: dict[AgentType, AgentPreset] = {
     for preset in (GENERAL_PRESET, EXPLORE_PRESET, PLAN_PRESET, RUN_PRESET)
 }
 
-EXPLICIT_FINISH_GUIDANCE = (
-    "With explicit finish enabled, this run ends only when you call the `finish` "
-    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
-    "apply). Ending a turn without calling `finish` leaves you idle for "
-    "follow-ups; call it when the contract's exit criteria are met or when you "
-    "are blocked."
-)
-
 
 def get_agent_preset(agent_type: object) -> AgentPreset | None:
     """Return a built-in preset, without defaulting unknown values."""
@@ -149,6 +141,10 @@ def get_agent_preset(agent_type: object) -> AgentPreset | None:
         (preset for preset in AGENT_PRESETS.values() if preset.name == agent_type),
         None,
     )
+
+
+
+
 
 
 def compose_system_prompt(
