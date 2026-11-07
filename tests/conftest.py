@@ -28,7 +28,6 @@ _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
-os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
 def _is_repository_test_path(path: Path) -> bool:
@@ -369,9 +368,7 @@ class LiveHomeWriteGuard:
 # These variables control the test harness itself and must survive environment
 # isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
 # change CI behavior.
-_TEST_HARNESS_ENV_ALLOWLIST = frozenset(
-    {"ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", "ZETA_TEST_PARENT_PID"}
-)
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset({"ZETA_TEST_PARENT_PID"})
 
 
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
@@ -519,9 +516,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
-    previous_count = (
-        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
-    )
+    previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
     if previous_count is not None and len(after) > previous_count:
         gc.collect()
         after = _open_file_descriptors()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -33,7 +34,6 @@ def _assert_future(path: Path) -> None:
 def _run_cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(home)
-    environment.pop("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", None)
     return subprocess.run(
         [str(Path(sys.executable).with_name("zeta")), *arguments],
         env=environment,
@@ -44,9 +44,34 @@ def _run_cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_bare_home_error_names_exact_storage_format_advance_command(
+def _tree_digest(home: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(home.rglob("*")):
+        digest.update(path.relative_to(home).as_posix().encode())
+        digest.update(b"d" if path.is_dir() else b"f")
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def test_cli_bootstraps_a_truly_empty_home_before_starting(tmp_path: Path) -> None:
+    result = _run_cli(
+        tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
+    )
+
+    assert "stored-format manifest is missing" not in result.stderr
+    assert json.loads((tmp_path / "storage-format.json").read_text()) == {
+        "writer_epoch": WRITER_EPOCH
+    }
+
+
+def test_cli_refuses_one_existing_session_without_changing_home(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / ".storage-format.lock").touch()
+    (tmp_path / "sessions" / "existing").mkdir(parents=True)
+    before = _tree_digest(tmp_path)
+
     result = _run_cli(
         tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
     )
@@ -56,6 +81,8 @@ def test_bare_home_error_names_exact_storage_format_advance_command(
         f"zeta storage-format advance --expected-epoch 0 --target-epoch {WRITER_EPOCH}"
         in result.stderr
     )
+    assert not (tmp_path / "storage-format.json").exists()
+    assert _tree_digest(tmp_path) == before
 
 
 def test_storage_format_advance_defaults_to_writer_epoch(tmp_path: Path) -> None:

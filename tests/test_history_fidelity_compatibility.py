@@ -94,7 +94,6 @@ def test_predecessor_store_rejects_new_history_shapes_without_mutation(
         env={
             **os.environ,
             "PYTHONPATH": str(predecessor_src_path),
-            "ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT": "1",
         },
         capture_output=True,
         text=True,
