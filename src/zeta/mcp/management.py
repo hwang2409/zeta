@@ -556,19 +556,12 @@ class MCPManagementService:
         task = asyncio.create_task(asyncio.to_thread(self._transaction, mutation))
         self._transaction_task = task
 
-        def consume_closed_outcome(completed: asyncio.Task[_ManagementCandidate]) -> None:
-            if not completed.cancelled():
-                completed.exception()
-
-        task.add_done_callback(consume_closed_outcome)
-        try:
-            candidate = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            if self._transaction_task is task:
-                self._transaction_task = None
-            raise
+        outcome = asyncio.gather(task, return_exceptions=True)
+        results = await asyncio.shield(outcome)
+        result = results[0]
+        if isinstance(result, BaseException):
+            raise result
+        candidate = result
         self._durable_candidate = candidate
         if self._transaction_task is task:
             self._transaction_task = None
@@ -587,24 +580,14 @@ class MCPManagementService:
             except BaseException:  # noqa: BLE001,S110 - consume the owned outcome
                 pass
             return
-        cancelled = False
-        current = asyncio.current_task()
-        baseline = current.cancelling() if current is not None else 0
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                cancelled = True
-            except MCPManagementClosedError:
-                pass
-        while current is not None and current.cancelling() > baseline:
-            current.uncancel()
         try:
-            task.result()
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if not task.cancelled() or (current is not None and current.cancelling()):
+                raise
         except MCPManagementClosedError:
             pass
-        if cancelled:
-            raise asyncio.CancelledError
 
     async def _repair_lag_locked(self) -> None:
         assert self._transaction_gate.locked(), "repair requires transaction gate"

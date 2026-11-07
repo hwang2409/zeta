@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import fcntl
+import gc
 import inspect
 import json
 import subprocess
@@ -18,7 +19,6 @@ from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
 from zeta.mcp.management import (
-    MCPManagementClosedError,
     MCPManagementError,
     MCPManagementService,
 )
@@ -126,34 +126,67 @@ async def test_management_close_ignores_cancelled_transaction_from_closed_loop(
 
 
 @pytest.mark.asyncio
-async def test_management_close_propagates_outer_cancellation_after_join(
+async def test_cancelled_transaction_waiter_retrieves_closed_worker_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_transaction = manager._transaction
+
+    def gated_transaction(mutation=None):
+        started.set()
+        try:
+            if not release.wait(10):
+                raise AssertionError("transaction was not released")
+            return original_transaction(mutation)
+        finally:
+            finished.set()
+
+    # test-contract: seam force cancellation between the public waiter and worker
+    monkeypatch.setattr(manager, "_transaction", gated_transaction)
+    exceptions: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
+    waiter = asyncio.create_task(manager.runtime_config())
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        waiter.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(waiter, return_exceptions=True), 10
+        )
+        manager._closed.set()
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 10)
+        manager._transaction_task = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert exceptions == []
+    finally:
+        release.set()
+        manager._closed.set()
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_management_close_propagates_outer_cancellation(
     tmp_path: Path,
 ) -> None:
     manager = service(tmp_path)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def transaction_that_fails_after_close() -> None:
-        started.set()
-        await asyncio.to_thread(manager._closed.wait)
-        await asyncio.wait_for(release.wait(), 10)
-        raise MCPManagementClosedError("MCP management service is closed")
-
-    transaction = asyncio.create_task(transaction_that_fails_after_close())
+    transaction_event = asyncio.Event()
+    transaction = asyncio.create_task(asyncio.wait_for(transaction_event.wait(), 10))
     manager._transaction_task = transaction
     closing = asyncio.create_task(manager.aclose())
     try:
-        await asyncio.wait_for(started.wait(), 10)
-        assert await asyncio.to_thread(manager._closed.wait, 10)
+        assert await asyncio.to_thread(manager._closed.wait, timeout=10)
         closing.cancel()
-        release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(closing, 10)
-        assert transaction.done()
-        assert isinstance(transaction.exception(), MCPManagementClosedError)
     finally:
-        if not transaction.done():
-            transaction.cancel()
+        transaction.cancel()
         await asyncio.wait_for(asyncio.gather(transaction, return_exceptions=True), 10)
 
 
