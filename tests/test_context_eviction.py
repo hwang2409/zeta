@@ -127,6 +127,55 @@ def test_legacy_pinned_message_uses_original_source_order() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_reopened_legacy_marker_matches_delivered_user_source(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    older_request = store.append_message(text(MessageRole.USER, "older request"))
+    older_answer = store.append_message(text(MessageRole.ASSISTANT, "older answer"))
+    delivered_request = text(MessageRole.USER, "latest request")
+    store.append_client_delivery(
+        "delivery-1",
+        "send",
+        "delivered",
+        {"accepted": True, "session_id": store.session_id},
+        message=delivered_request,
+    )
+    latest_answer = store.append_message(text(MessageRole.ASSISTANT, "latest answer"))
+    later_update = store.append_message(text(MessageRole.ASSISTANT, "later update"))
+    store.append_compaction_marker(
+        "summary",
+        older_request.seq,
+        later_update.seq,
+        kind="evict",
+        pinned_message=delivered_request,
+        view=[
+            {"seq": older_request.seq, "message": older_request.data["message"]},
+            {"seq": older_answer.seq, "message": older_answer.data["message"]},
+            {"seq": latest_answer.seq, "message": latest_answer.data["message"]},
+            {"seq": later_update.seq, "message": later_update.data["message"]},
+        ],
+    )
+    session_id = store.session_id
+    store.close()
+
+    reopened = ConversationStore(
+        tmp_path / "sessions", session_id=session_id, _must_exist=True
+    )
+    try:
+        assembled = await ContextAssembler(
+            reopened, token_budget=100_000, retained_tail=1
+        ).assemble_context()
+        assert [message.content[0].text for message in assembled.messages] == [
+            "older request",
+            "older answer",
+            "latest request",
+            "latest answer",
+            "later update",
+        ]
+    finally:
+        reopened.close()
+
+
 def test_view_seq_is_authoritative_over_metadata_source_seq() -> None:
     message = Message(
         MessageRole.ASSISTANT,

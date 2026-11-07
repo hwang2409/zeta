@@ -14,6 +14,7 @@ from ...context_eviction import (
 )
 from ...protocol.types import Message, MessageRole, TextContent
 from ..store import ConversationEntry
+from ..store._client_delivery import without_client_delivery_marker
 from .types import _ContextItem
 
 
@@ -98,7 +99,10 @@ class ContextMarkerMixin:
             <= source.seq
             <= entry.data["source_seq_end"]
             and source.type == "message"
-            and Message.from_dict(source.data["message"]) == pinned
+            and without_client_delivery_marker(
+                Message.from_dict(source.data["message"])
+            )
+            == without_client_delivery_marker(pinned)
         ]
         return matches[-1] if matches else None
 
@@ -138,11 +142,14 @@ class ContextMarkerMixin:
                         cooperative_pause()
                     continue
             if pinned is not None and type(pinned_seq) is not int:
-                candidate = ContextMarkerMixin._eviction_view_message(item)
+                candidate = without_client_delivery_marker(
+                    ContextMarkerMixin._eviction_view_message(item)
+                )
+                normalized_pinned = without_client_delivery_marker(pinned)
                 if (
-                    candidate.role is pinned.role
-                    and candidate.content == pinned.content
-                    and candidate.tool_result == pinned.tool_result
+                    candidate.role is normalized_pinned.role
+                    and candidate.content == normalized_pinned.content
+                    and candidate.tool_result == normalized_pinned.tool_result
                     and {
                         key: value
                         for key, value in candidate.metadata.items()
@@ -150,7 +157,7 @@ class ContextMarkerMixin:
                     }
                     == {
                         key: value
-                        for key, value in pinned.metadata.items()
+                        for key, value in normalized_pinned.metadata.items()
                         if key != "source_seq"
                     }
                 ):
