@@ -1,5 +1,4 @@
 """The provider-neutral agent loop."""
-
 from __future__ import annotations
 
 import asyncio
@@ -106,8 +105,7 @@ from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
     build_tool_limit_recovery_message,
-    empty_turn_error,
-    has_visible_output,
+    empty_turn_recovery_error,
     output_limit_error,
     read_turn_metadata,
     should_nudge_empty_turn,
@@ -132,10 +130,7 @@ def _sanitize_account_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=message.metadata,
     )
-
-
 TaskResult = TypeVar("TaskResult")
-
 
 @dataclass(frozen=True, slots=True)
 class _ToollessTransition:
@@ -145,8 +140,6 @@ class _ToollessTransition:
     empty_nudge_count: int
     empty_nudge_episode: int
     error: ErrorInfo | None = None
-
-
 class AgentLoop(
     BackendOwnerMixin,
     TurnPersistenceMixin,
@@ -159,7 +152,6 @@ class AgentLoop(
     MCPSession,
 ):
     post_stream_provider_retry = True
-
     def __init__(
         self,
         backend: CompletionBackend,
@@ -506,17 +498,14 @@ class AgentLoop(
                     self._background_owner.store_leases.close
                 )
         return killed
-
     async def close(
         self, *, cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
-
         Returns the ids of background tasks killed by this close so a completing
         child can report them to its parent.
         """
-
         self._closed = True
         killed: tuple[str, ...] = ()
         if self.memory_reconciler is not None:
@@ -559,11 +548,9 @@ class AgentLoop(
                 background_task_cause=background_task_cause
             )
         return killed
-
     def session_start(self) -> None:
         if self.hooks is not None:
             self.hooks.session_start()
-
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
@@ -574,10 +561,8 @@ class AgentLoop(
                 tui_presented=item.tui_presented,
             )
         )
-
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
-
         if self._activated:
             return
         self.store.bind_owner_thread()
@@ -598,7 +583,6 @@ class AgentLoop(
         # connect in the background. Operations that require MCP await this task.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-
     async def resume_pending_tool(
         self,
         request_id: str,
@@ -608,7 +592,6 @@ class AgentLoop(
         host_environment: Mapping[str, str] | None = None,
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
-
         await self._ensure_mcp_servers()
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
@@ -627,7 +610,6 @@ class AgentLoop(
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
-
         def lifecycle(kind: str) -> None:
             if event_sink is None:
                 return
@@ -638,7 +620,6 @@ class AgentLoop(
             }.get(kind)
             if event_type is not None:
                 event_sink(StreamEvent(event_type, tool_call=tool_call))
-
         try:
             result = await self.tool_registry.execute(
                 tool_call,
@@ -674,10 +655,8 @@ class AgentLoop(
                 )
             )
         return result
-
     def finalize_canceled(self, request_id: str) -> ToolResult | None:
         """Persist one canceled result for a durable approval request."""
-
         state = self.store.approval_states().get(request_id)
         if state is None:
             return None
@@ -686,12 +665,9 @@ class AgentLoop(
         if existing is not None:
             return existing
         return self._finalize_tool_results([tool_call], [None])[0]
-
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
-
-    async def _toolless_transition(
-        self,
+    async def _toolless_transition(        self,
         step_delivery: StepDeliveryFlow,
         assistant_message: Message,
         *,
@@ -713,27 +689,15 @@ class AgentLoop(
                 nudge_count=empty_nudge_count,
             )
         )
-        exhausted_after_tool = (
-            not notification_turn
-            and not iteration_consuming_notifications
-            and not should_nudge
-            and not has_visible_output(assistant_message)
-            and tool_result_episode > 0
-            and last_tool_call is not None
-            and last_tool_result is not None
+        error = empty_turn_recovery_error(
+            assistant_message,
+            notification_turn=notification_turn,
+            consuming_notifications=iteration_consuming_notifications,
+            should_nudge=should_nudge,
+            tool_result_episode=tool_result_episode,
+            tool_call=last_tool_call,
+            tool_result=last_tool_result,
         )
-        error = None
-        if exhausted_after_tool:
-            state = (
-                "cancelled"
-                if last_tool_result.is_canceled
-                else "error"
-                if last_tool_result.is_error
-                else "ok"
-            )
-            error = empty_turn_error(
-                last_tool_call.name, last_tool_call.id, f"{state}"
-            )
         if should_nudge:
             await step_delivery.admit_terminal("nudge")
             await self._append_turn_message(build_nudge_message())
@@ -748,7 +712,6 @@ class AgentLoop(
             empty_nudge_episode=(tool_result_episode if should_nudge else empty_nudge_episode),
             error=error,
         )
-
     async def _run_turn_impl(
         self,
         user_text: str,

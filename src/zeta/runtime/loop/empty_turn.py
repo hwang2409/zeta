@@ -156,3 +156,31 @@ def empty_turn_error(
         "child returned an empty final assistant message after tool "
         f"`{tool_name}` ({tool_call_id}) {tool_state}",
     )
+
+
+def empty_turn_tool_error(tool_call: Any, result: Any) -> ErrorInfo:
+    state = "cancelled" if result.is_canceled else "error" if result.is_error else "ok"
+    return empty_turn_error(tool_call.name, tool_call.id, state)
+
+
+def empty_turn_recovery_error(
+    message: Message,
+    *,
+    notification_turn: bool,
+    consuming_notifications: bool,
+    should_nudge: bool,
+    tool_result_episode: int,
+    tool_call: Any,
+    tool_result: Any,
+) -> ErrorInfo | None:
+    if (
+        notification_turn
+        or consuming_notifications
+        or should_nudge
+        or has_visible_output(message)
+        or tool_result_episode == 0
+        or tool_call is None
+        or tool_result is None
+    ):
+        return None
+    return empty_turn_tool_error(tool_call, tool_result)
