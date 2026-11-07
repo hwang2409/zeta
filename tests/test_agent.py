@@ -89,6 +89,7 @@ from zeta.providers.codex import CodexStreamError
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop.empty_turn import empty_turn_tool_error
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.runtime.tool_setup import select_tool_registry
 from zeta.skills import SkillCatalog, SkillMeta
@@ -10773,14 +10774,9 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.register(
         "ping",
-        lambda *_args, **_kwargs: {
-            "content": [{"text": "pong"}],
-            "isError": False,
-            "structuredContent": None,
-        },
+        lambda *_args, **_kwargs: "pong",
         description="ping",
         requires_approval=False,
-        binding="shared",
     )
 
     await _collect(
@@ -10800,8 +10796,15 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     assert result.is_error
     assert "empty final assistant message after tool `ping`" in result.content
     assert "ping-call" in result.content
-    assert " error" in result.content
     assert len(result.content) <= 400
+
+
+def test_empty_turn_tool_error_reports_ok_for_successful_tool() -> None:
+    error = empty_turn_tool_error(
+        ToolCall("ping-call", "ping", {}), ToolResult("ping-call", "pong")
+    )
+
+    assert "(ping-call) ok" in error.message
 
 
 @pytest.mark.asyncio
