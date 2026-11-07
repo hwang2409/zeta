@@ -1039,6 +1039,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "agent",
         _agent,
+        binding="shared",
         description=description,
         parameters=parameters,
         requires_approval=False,

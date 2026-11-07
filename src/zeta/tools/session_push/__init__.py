@@ -60,6 +60,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "session_push",
         _push,
+        binding="shared",
         approval_subject="host",
         description=(
             "Upload the current session and linked project memory through SSH. "

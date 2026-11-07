@@ -520,6 +520,7 @@ def _register_handoff(
     child_loop.tool_registry.register(
         "agent_handoff",
         handoff,
+        binding="loop",
         description=(
             "Hand off running background work to the parent. Sub-agents "
             "continue and report to the parent. Background tasks cannot be "

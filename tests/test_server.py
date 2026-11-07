@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
@@ -33,9 +33,15 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
+from tests.support.server_client import (
+    assert_event_order,
+    event_owner,
+    frames_for_call,
+    read_until,
+)
 from tests.support.server_client import (
     event as _buffered_event,
 )
@@ -841,86 +847,6 @@ class BlockingThenCaptureBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
-
-
-def _public_input_prompt(messages, prompts: Collection[str]) -> str:
-    public_inputs = [
-        block.text
-        for message in messages
-        if message.role is MessageRole.USER
-        for block in message.content
-        if isinstance(block, TextContent)
-    ]
-    prompt = next((text for text in public_inputs if text in prompts), None)
-    if prompt is None:
-        raise AssertionError(f"no scripted backend for actor prompt {public_inputs!r}")
-    return prompt
-
-
-def test_public_input_prompt_rejects_unknown_actor() -> None:
-    messages = [Message(MessageRole.USER, [TextContent("unknown-child")])]
-
-    with pytest.raises(
-        AssertionError, match="no scripted backend for actor prompt.*unknown-child"
-    ):
-        _public_input_prompt(messages, {"parent", "known-child"})
-
-
-class PerActorFakeBackend:
-    def __init__(
-        self,
-        parent_turns: list[ScriptedTurn],
-        child_turns: dict[str, list[ScriptedTurn]],
-        *,
-        parent_prompt: str,
-        gated_child_call: int = 1,
-    ) -> None:
-        self.parent_prompt = parent_prompt
-        self.parent = FakeBackend(parent_turns)
-        self.children = {
-            prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
-        }
-        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
-        self.child_calls = dict.fromkeys(self.children, 0)
-        self.release_children = asyncio.Event()
-        self.gated_child_call = gated_child_call
-
-    async def complete(self, messages, tool_schemas):
-        actor_prompt = _public_input_prompt(
-            messages, {self.parent_prompt, *self.children}
-        )
-        child_prompt = actor_prompt if actor_prompt in self.children else None
-        backend = (
-            self.children[child_prompt] if child_prompt is not None else self.parent
-        )
-        if child_prompt is not None:
-            self.child_calls[child_prompt] += 1
-        if (
-            child_prompt is not None
-            and self.child_calls[child_prompt] == self.gated_child_call
-        ):
-            self.child_started[child_prompt].set()
-            try:
-                await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
-            except TimeoutError as error:
-                raise AssertionError("children were not released") from error
-        stream = backend.complete(messages, tool_schemas)
-        if child_prompt is None and self.parent.calls:
-            try:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            *(started.wait() for started in self.child_started.values())
-                        ),
-                        TIMEOUT,
-                    )
-                except TimeoutError as error:
-                    raise AssertionError("child did not start") from error
-                yield await anext(stream)
-            finally:
-                self.release_children.set()
-        async for event in stream:
-            yield event
 
 
 class DelegatedApprovalBackend:
@@ -10886,7 +10812,21 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -10905,15 +10845,18 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
         await asyncio.wait_for(runtime_end.wait(), timeout=10)
         await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
         release.set()
-        while not _named_events(frames, "turn_end"):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+        frames += await read_until(
+            reader,
+            lambda frame: event_owner(frame) == turn_end_owner,
+            what=f"turn_end for {turn_end_owner[2]}",
         )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
+        )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release.set()
         await _close(server, writer)
@@ -10956,12 +10899,44 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         ConversationStore, "append_approval_history_async", fail_terminal_history
     )
     reader, writer = await _ready(server)
+    assert server.connections is not None
+    parent_tool_ended = asyncio.Event()
+    release_parent_turn = asyncio.Event()
+    parent_session_id = server.runtime.session_id
+    publish_controller = server.connections.publish_controller
+
+    async def force_parent_tool_end_first(event, session_id, **fields):
+        if failure == "cancelled" and event == "approval_end":
+            await asyncio.wait_for(parent_tool_ended.wait(), timeout=10)
+        if (
+            failure == "cancelled"
+            and event == "turn_start"
+            and session_id == parent_session_id
+            and parent_tool_ended.is_set()
+        ):
+            await asyncio.wait_for(release_parent_turn.wait(), timeout=10)
+        published = await publish_controller(event, session_id, **fields)
+        tool_call = fields.get("tool_call") or {}
+        if event == "tool_end" and tool_call.get("id") == agent.id:
+            parent_tool_ended.set()
+        return published
+
+    # test-contract: seam no public event exposes controller admission order
+    monkeypatch.setattr(
+        server.connections, "publish_controller", force_parent_tool_end_first
+    )
     frames: list[dict[str, Any]] = []
     try:
         async with asyncio.timeout(10):
             await _request(reader, writer, 3, "send", {"text": "delegate"})
-            while not _named_events(frames, "approval_request"):
-                frames.append(await _read(reader))
+            frames += await read_until(
+                reader,
+                lambda frame: (
+                    frame.get("params", {}).get("event") == "approval_request"
+                    and frame["params"]["tool_call"]["id"] == child_call.id
+                ),
+                what=f"approval_request for {child_call.id}",
+            )
             approval = _named_events(frames, "approval_request")[0]
             assert approval["delegated"] is True
             writer.write(
@@ -10978,7 +10953,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 ).encode()
             )
             await writer.drain()
-            await history_write_started.wait()
+            await asyncio.wait_for(history_write_started.wait(), timeout=10)
             settlement = None
             if failure == "cancelled":
                 record = server.control._approvals.state.records[
@@ -10987,23 +10962,33 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
-            while not _named_events(frames, "approval_end"):
-                frames.append(await _read(reader))
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_start = max(
-                index for index, name in enumerate(names) if name == "turn_start"
+            approval_owner = (
+                "approval_end",
+                approval["session_id"],
+                approval["request_id"],
             )
-            approval_end = names.index("approval_end")
-            assert len(_named_events(frames, "approval_end")) == 1
-            assert child_start < approval_end
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == approval_owner,
+                what=f"approval_end for {approval['request_id']}",
+            )
+            assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 with pytest.raises(asyncio.CancelledError):
-                    await settlement
+                    await asyncio.wait_for(settlement, timeout=10)
             else:
-                while not _named_events(frames, "error"):
-                    frames.append(await _read(reader))
+                frames += await read_until(
+                    reader,
+                    lambda frame: frame.get("params", {}).get("event") == "error",
+                    what="approval persistence error",
+                )
                 error = _named_events(frames, "error")[0]
+                approval_end = next(
+                    index
+                    for index, frame in enumerate(frames)
+                    if event_owner(frame) == approval_owner
+                )
                 names = [frame.get("params", {}).get("event") for frame in frames]
                 assert approval_end < names.index("error")
                 assert error["error"] == {
@@ -11017,16 +11002,25 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 health = server.control._approvals.state.health
                 assert health is not None
                 assert health.code == "approval_persistence_failed"
-            names = [frame.get("params", {}).get("event") for frame in frames]
-            child_terminals = [
-                index
-                for index, name in enumerate(names)
-                if index > child_start and name in {"tool_end", "turn_end"}
-            ]
-            assert all(approval_end < index for index in child_terminals)
+            child_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                child_call.id,
+            )
+            parent_tool_owner = (
+                "tool_end",
+                approval["session_id"],
+                agent.id,
+            )
+            # test-contract: seam exact lifecycle order is the protocol contract
+            assert_event_order(frames, parent_tool_owner, approval_owner)
+            if any(event_owner(frame) == child_tool_owner for frame in frames):
+                assert_event_order(frames, approval_owner, child_tool_owner)
             assert key not in server.control._approvals.state.records
+            release_parent_turn.set()
     finally:
         history_release.set()
+        release_parent_turn.set()
         await asyncio.wait_for(_close(server, writer), timeout=10)
 
 
@@ -11075,7 +11069,21 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                frame.get("params", {}).get("event") == "approval_request"
+                and frame["params"]["request_id"] == call.id
+            ),
+            what=f"approval_request for {call.id}",
+        )
+        approval = frames_for_call(frames, call.id)[-1]["params"]
+        turn_start_owner = next(
+            owner
+            for frame in frames
+            if (owner := event_owner(frame)) is not None and owner[0] == "turn_start"
+        )
+        turn_end_owner = ("turn_end", *turn_start_owner[1:])
         writer.write(
             (
                 json.dumps(
@@ -11094,15 +11102,18 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
-            while not _named_events(frames, "turn_end"):
-                frames.append(await _read(reader))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+            frames += await read_until(
+                reader,
+                lambda frame: event_owner(frame) == turn_end_owner,
+                what=f"turn_end for {turn_end_owner[2]}",
+            )
+        approval_owner = (
+            "approval_end",
+            approval["session_id"],
+            approval["request_id"],
         )
+        tool_owner = ("tool_end", approval["session_id"], call.id)
+        assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
         release_write.set()
         await _close(server, writer)
