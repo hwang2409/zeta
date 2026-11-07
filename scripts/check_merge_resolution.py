@@ -68,7 +68,7 @@ def load_sources(
     return result
 
 
-def _collection_elements(value: ast.expr) -> list[ast.expr]:
+def _collection_elements(value: ast.expr) -> list[ast.expr] | None:
     if isinstance(value, (ast.Set, ast.Tuple, ast.List)):
         return list(value.elts)
     if isinstance(value, ast.Dict):
@@ -81,13 +81,14 @@ def _collection_elements(value: ast.expr) -> list[ast.expr]:
         and isinstance(value.args[0], (ast.Set, ast.Tuple, ast.List))
     ):
         return list(value.args[0].elts)
-    return []
+    return None
 
 
 def parse_items(
     path: str, tree: ast.Module, collection_lookup: dict[str, list[ast.expr]]
-) -> list[Item]:
+) -> tuple[list[Item], set[tuple[str, str]]]:
     result: list[Item] = []
+    unresolved: set[tuple[str, str]] = set()
 
     def add_memberships(node: ast.AST, qualname: str) -> None:
         for comparison in ast.walk(node):
@@ -99,8 +100,12 @@ def parse_items(
                 continue
             right = comparison.comparators[0]
             elements = _collection_elements(right)
-            if not elements:
-                elements = collection_lookup.get(ast.unparse(right), [])
+            if elements is None:
+                name = ast.unparse(right)
+                elements = collection_lookup.get(name)
+                if elements is None:
+                    unresolved.add((path, f"{qualname}|{ast.unparse(comparison.left)}"))
+                    continue
             left = ast.unparse(comparison.left)
             for element in elements:
                 result.append(
@@ -153,16 +158,18 @@ def parse_items(
                                 rendered,
                             )
                         )
-                        for element in _collection_elements(value):
-                            result.append(
-                                Item(
-                                    path,
-                                    "collection element",
-                                    name,
-                                    element.lineno,
-                                    ast.unparse(element),
+                        elements = _collection_elements(value)
+                        if elements is not None:
+                            for element in elements:
+                                result.append(
+                                    Item(
+                                        path,
+                                        "collection element",
+                                        name,
+                                        element.lineno,
+                                        ast.unparse(element),
+                                    )
                                 )
-                            )
                     if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
                         for key in value.keys if isinstance(value, ast.Dict) else []:
                             if isinstance(key, ast.Constant) and isinstance(
@@ -193,7 +200,7 @@ def parse_items(
                         )
 
     visit_body(tree.body)
-    return result
+    return result, unresolved
 
 
 def _owner_was_removed(
@@ -367,7 +374,7 @@ def _revision_index(
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             elements = _collection_elements(node.value)
-            if not elements:
+            if elements is None:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
@@ -398,13 +405,34 @@ def _path_lookup(
                     }
                 )
         elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or module.rsplit(".", 1)[0]
+            if node.level:
+                package = module.split(".")[:-1]
+                module_name = ".".join(package[: len(package) - node.level + 1])
+                if node.module:
+                    module_name = (
+                        f"{module_name}.{node.module}" if module_name else node.module
+                    )
+            else:
+                module_name = node.module or module.rsplit(".", 1)[0]
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                full = f"{module_name}.{alias.name}"
-                if full in module_collections:
-                    lookup[alias.asname or alias.name] = module_collections[full]
+                imported_name = alias.asname or alias.name
+                if node.module is None:
+                    prefix = (
+                        f"{module_name}.{alias.name}" if module_name else alias.name
+                    )
+                    lookup.update(
+                        {
+                            f"{imported_name}.{full[len(prefix) + 1 :]}": elements
+                            for full, elements in module_collections.items()
+                            if full.startswith(f"{prefix}.")
+                        }
+                    )
+                else:
+                    full = f"{module_name}.{alias.name}" if module_name else alias.name
+                    if full in module_collections:
+                        lookup[imported_name] = module_collections[full]
     return lookup
 
 
@@ -412,20 +440,23 @@ def parse_revisions(
     revisions: list[str], paths: set[str], sources: dict[tuple[str, str], str | None]
 ) -> tuple[
     dict[str, dict[tuple[str, str, str, str], Item]],
+    set[tuple[str, str]],
     tuple[str, str, SyntaxError] | None,
 ]:
     parsed = {revision: {} for revision in revisions}
+    unresolved: set[tuple[str, str]] = set()
     for revision in revisions:
         try:
             trees, module_collections = _revision_index(paths, sources, revision)
         except SyntaxError as error:
-            return parsed, (revision, error.filename or "<unknown>", error)
+            return parsed, unresolved, (revision, error.filename or "<unknown>", error)
         for path, tree in trees.items():
-            found = parse_items(
+            found, unresolved_in_file = parse_items(
                 path, tree, _path_lookup(path, tree, module_collections)
             )
+            unresolved.update(unresolved_in_file)
             parsed[revision].update({item_key(item): item for item in found})
-    return parsed, None
+    return parsed, unresolved, None
 
 
 def main() -> int:
@@ -460,7 +491,7 @@ def main() -> int:
     all_paths = {p for p in all_paths if p.endswith(".py") and p.startswith(ROOTS)}
     revisions = [base, main, branch, commit]
     sources = load_sources(revisions, all_paths)
-    parsed, error = parse_revisions(revisions, all_paths, sources)
+    parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
     if error:
         revision, path, syntax = error
         print(
@@ -495,6 +526,10 @@ def main() -> int:
         if (
             item.kind not in {"collection element", "membership element"}
             or key in merge_items
+            or (
+                item.kind == "membership element"
+                and (item.path, item.name) in unresolved
+            )
         ):
             continue
         main_item = main_items.get(key)

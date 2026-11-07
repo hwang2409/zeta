@@ -177,18 +177,53 @@ def test_collection_lookup_is_local_for_correct_two_file_merge(tmp_path: Path):
     (r / "src/z.py").write_text('EVENTS = {"Z"}\n')
     commit(r, "base")
     subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
-    (r / "src/z.py").write_text('EVENTS = {"Z", "C"}\n')
-    commit(r, "branch changes z")
+    (r / "src/z.py").unlink()
+    commit(r, "branch deletes z")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
     (r / "src/a.py").write_text(
         'EVENTS = {"A", "B"}\ndef check(event): return event in EVENTS\n'
     )
-    commit(r, "main adds a")
+    (r / "src/z.py").write_text('EVENTS = {"Z", "C"}\n')
+    commit(r, "main adds a and changes z")
     _set_origin_main(r)
     subprocess.run(
-        ["git", "merge", "--no-ff", "--no-edit", "branch"], cwd=r, check=True
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/z.py").unlink()
+    commit(
+        r,
+        "correct merge deletes z\n\nmerge-resolution: src/z.py collection element EVENTS -> intentional",
     )
     assert run(r).returncode == 0
+
+
+def test_membership_imports_resolve_and_report_only_missing_element(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/render.py").write_text('EVENTS = {"A", "B"}\n')
+    commit(r, "branch adds b")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text('def check(event): return event in ("A", "B")\n')
+    commit(r, "main inlines events")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=True
+    )
+    (r / "src/a.py").write_text(
+        "from . import render\ndef check(event): return event in render.EVENTS\n"
+    )
+    (r / "src/render.py").write_text('EVENTS = {"A"}\n')
+    commit(r, "bad merge loses b")
+    result = run(r)
+    assert result.returncode == 1
+    assert "element \"'B'\"" in result.stdout
+    assert "element \"'A'\"" not in result.stdout
 
 
 def test_collection_lookup_cannot_hide_two_file_loss(tmp_path: Path):
