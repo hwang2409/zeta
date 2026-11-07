@@ -1209,10 +1209,7 @@ class AgentLoop(
             )
             try:
                 async for event in dispatch:
-                    if event.type is StreamEventType.TOOL_EXECUTION_END:
-                        recovery_state.record_tool_result(
-                            event.tool_call, event.tool_result
-                        )
+                    recovery_state.record_event(event)
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is durable before dispatch starts. If

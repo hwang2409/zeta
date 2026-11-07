@@ -56,6 +56,10 @@ class EmptyTurnRecoveryState:
         self.last_tool_result = tool_result
         self.tool_result_episode += 1
 
+    def record_event(self, event: Any) -> None:
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            self.record_tool_result(event.tool_call, event.tool_result)
+
 
 async def complete_empty_turn(
     transition: Any,
