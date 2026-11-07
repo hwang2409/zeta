@@ -114,6 +114,11 @@ from .protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
+from .providers.completion import (
+    CompletionControl,
+    CompletionRetryBudget,
+    ResetPolicy,
+)
 
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 SUMMARY_RETRIES = 2
@@ -596,7 +601,16 @@ class CompactionPolicy:
         completion = None
         try:
             try:
-                completion = completion_backend.complete(summary_messages, [])
+                completion = completion_backend.complete(
+                    summary_messages,
+                    [],
+                    control=CompletionControl(
+                        abort=None,
+                        reset=ResetPolicy.NO_RESET,
+                        budget=CompletionRetryBudget(),
+                        task_deadline=None,
+                    ),
+                )
                 async for event in completion:
                     if event.type is StreamEventType.ASSISTANT_RESET:
                         partial.clear()

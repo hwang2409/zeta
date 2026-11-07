@@ -18,6 +18,7 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,7 @@ class FakeBackend(CompletionBackend):
         self.request_bytes: list[bytes] = []
         self._previous_request: bytes | None = None
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

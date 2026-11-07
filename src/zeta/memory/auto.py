@@ -28,7 +28,7 @@ from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     MessageOrigin,
 )
-from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from ..providers.completion import CompletionRetryBudget
 from ..storage_format import WriterLease, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
@@ -51,7 +51,9 @@ from .reconciliation_state import (
 )
 
 InvokeResult = str | ReconciliationResponse
-Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
+Invoke = Callable[
+    [str, CompletionRetryBudget], InvokeResult | Awaitable[InvokeResult]
+]
 Notice = Callable[[str], None]
 Clock = Callable[[], float]
 IdleWait = Callable[[asyncio.Event, float], Awaitable[None]]
@@ -661,7 +663,7 @@ class AutoMemoryReconciler:
                         return
                     selected_start = int(request.transcript.rows[0]["seq"])
                     selected_end = int(request.transcript.rows[-1]["seq"])
-                    budget = ProviderRetryBudget()
+                    budget = CompletionRetryBudget()
                     try:
                         raw_text, first_usage = await self._invoke_request(
                             request.prompt, budget
@@ -800,14 +802,13 @@ class AutoMemoryReconciler:
                 self._publish_failure_notice()
 
     async def _invoke_request(
-        self, prompt: str, budget: ProviderRetryBudget
+        self, prompt: str, budget: CompletionRetryBudget
     ) -> tuple[str, dict[str, int]]:
         if self._closing:
             raise asyncio.CancelledError
-        with use_retry_budget(budget):
-            raw = self.invoke(prompt)
-            if inspect.isawaitable(raw):
-                raw = await raw
+        raw = self.invoke(prompt, budget)
+        if inspect.isawaitable(raw):
+            raw = await raw
         if isinstance(raw, ReconciliationResponse):
             return raw.text, dict(raw.usage)
         return raw, {}

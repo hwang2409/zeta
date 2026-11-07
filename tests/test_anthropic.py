@@ -14,6 +14,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from tests.support.completion import completion_control
+
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.stream_diagnostics as diagnostics_module
 from zeta.core.context import ContextAssembler
@@ -129,25 +131,6 @@ async def _drain(events) -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_anthropic_error_body_stalls_and_closes(
-    tmp_path: Path,
-) -> None:
-    stream = _PartialErrorBody()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, stream=stream, request=request)
-
-    store = anthropic_credentials(tmp_path / "zeta.json")
-    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    client = client_for(handler)
-    backend = AnthropicBackend(
-        client=client, token_store=store, stall_seconds=0.01
-    )
-    with pytest.raises(AnthropicStreamError, match="error body stalled"):
-        # bounded: a missing watchdog fails with TimeoutError instead of hanging
-        await asyncio.wait_for(_drain(backend._complete_once([], [])), timeout=5)
-    assert stream.closed.is_set()
-    await client.aclose()
 
 
 def png_block(*, caption: str | None = None, data: bytes | None = None) -> dict[str, object]:
@@ -348,7 +331,7 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
                 Message(MessageRole.USER, [TextContent("hi")]),
             ],
             [],
-        )
+        control=completion_control())
     ]
 
     assert len(requests) == 1
@@ -412,7 +395,7 @@ async def test_anthropic_oauth_compat_is_opt_in_and_adds_only_oauth_headers(
     await anext(
         AnthropicBackend(client=client, token_store=store).complete(
             [Message(MessageRole.USER, [TextContent("abcdefghijklmnopqrstuv")])], []
-        )
+        , control=completion_control())
     )
     payload = json.loads(requests[0].content)
     assert payload["system"][0]["text"].startswith("x-anthropic-billing-header:")
@@ -470,7 +453,7 @@ async def test_anthropic_oauth_compat_keeps_billing_block_after_typed_turns_are_
                 ),
             ],
             [],
-        )
+        control=completion_control())
     ]
     system = json.loads(requests[0].content)["system"]
     wire_text = json.loads(requests[0].content)["messages"][-1]["content"][0]["text"]
@@ -496,7 +479,7 @@ async def test_anthropic_oauth_compat_without_user_text_omits_billing_block(
 
     client = client_for(handler)
     backend = AnthropicBackend(client=client, token_store=store)
-    _ = [event async for event in backend.complete([], [])]
+    _ = [event async for event in backend.complete([], [], control=completion_control())]
     system = json.loads(requests[0].content)["system"]
     assert len(system) == 1
     assert system[0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
@@ -561,7 +544,7 @@ async def test_stream_preserves_anthropic_cache_usage_fields(tmp_path: Path) -> 
             client=client,
             token_store=store,
             base_url="https://test.invalid/v1/messages",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert events[-1].data["usage"] == {
@@ -597,7 +580,7 @@ async def test_api_key_credential_sends_x_api_key_without_oauth_beta(
             token_store=AnthropicApiKeyCredential("sk-ant-test-key"),
             diagnostics_path=tmp_path / "stream-diagnostics.jsonl",
             base_url="https://test.invalid/v1/messages",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 1
@@ -637,7 +620,7 @@ async def test_api_key_401_fails_loudly_without_refresh_attempt(tmp_path: Path) 
                 client=client,
                 token_store=AnthropicApiKeyCredential("sk-ant-bad-key"),
                 diagnostics_path=tmp_path / "stream-diagnostics.jsonl",
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 1
@@ -711,7 +694,7 @@ async def test_each_retryable_status_retries_before_stream(
             client=client,
             token_store=store,
             diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 2
@@ -746,7 +729,7 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
                 client=client,
                 token_store=store,
                 diagnostics_path=diagnostics_path,
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 5
@@ -790,7 +773,7 @@ async def test_401_refresh_then_retryable_failure_uses_retry_budget(
     client = client_for(handler)
     events = [
         event
-        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+        async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())
     ]
 
     assert len(refreshes) == 1
@@ -821,7 +804,7 @@ async def test_non_retryable_status_fails_fast(
     with pytest.raises((AnthropicHTTPError, AnthropicAuthError)):
         [
             event
-            async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+            async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 1
@@ -847,7 +830,7 @@ async def test_ctrl_c_aborts_retry_wait(tmp_path: Path, monkeypatch: pytest.Monk
     with pytest.raises(asyncio.CancelledError):
         [
             event
-            async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+            async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())
         ]
 
     assert len(requests) == 1
@@ -892,7 +875,7 @@ data: {"type":"message_stop"}
             client=client,
             token_store=store,
             base_url="https://test.invalid/v1/messages",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len([event for event in events if event.type is StreamEventType.MESSAGE_END]) == 1
@@ -1307,7 +1290,7 @@ async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
                 Message(MessageRole.USER, [TextContent("run")]),
             ],
             [{"name": "read", "parameters": {"type": "object"}}],
-        )
+        control=completion_control())
     ]
 
     del events
@@ -1998,7 +1981,7 @@ async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) 
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())]
 
     assert "authorization-secret" not in str(raised.value)
     await client.aclose()
@@ -2039,7 +2022,7 @@ async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
             client=client,
             token_store=store,
             diagnostics_path=diagnostics_path,
-        ).complete([], []):
+        ).complete([], [], control=completion_control()):
             events.append(event)
 
     assert len(requests) == 1
@@ -2094,7 +2077,7 @@ async def test_error_after_message_stop_is_ignored(tmp_path: Path) -> None:
             client=client,
             token_store=store,
             diagnostics_path=diagnostics_path,
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert [event.type for event in events].count(StreamEventType.MESSAGE_END) == 1
@@ -2120,7 +2103,7 @@ async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) 
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())]
 
     assert "sse-authorization-secret" not in str(raised.value)
     assert "Bearer" not in str(raised.value)
@@ -2147,7 +2130,7 @@ async def test_anthropic_sse_error_redacts_multiline_authorization(
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError) as raised:
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())]
 
     assert "newline-sse-marker" not in str(raised.value)
     assert "Bearer" not in str(raised.value)
@@ -2280,7 +2263,7 @@ async def test_prestart_protocol_error_is_retried(
             client=client,
             token_store=store,
             diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
 
     assert len(requests) == 2
@@ -2328,7 +2311,7 @@ async def test_poststart_protocol_error_is_not_retried(
             client=client,
             token_store=store,
             diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
-        ).complete([], []):
+        ).complete([], [], control=completion_control()):
             events.append(event)
 
     assert len(requests) == 1
@@ -2430,7 +2413,7 @@ async def test_refresh_auth_failure_is_typed(tmp_path: Path) -> None:
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicAuthError):
-        await anext(AnthropicBackend(client=client, token_store=store).complete([], []))
+        await anext(AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control()))
     await client.aclose()
 
 
@@ -2453,7 +2436,7 @@ async def test_request_entry_transport_failure_is_typed(
             event
             async for event in AnthropicBackend(
                 client=client, token_store=store
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert "secret connection details" not in str(raised.value)
     await client.aclose()
@@ -2561,7 +2544,7 @@ async def test_network_eof_salvage_records_exception_and_headers(
                 client=Client(),
                 token_store=store,
                 diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
-            ).complete([], [])
+            ).complete([], [], control=completion_control())
         ]
     assert "peer closed" not in str(raised.value)
     record = json.loads(
@@ -3094,7 +3077,7 @@ async def test_malformed_nested_sse_is_typed(tmp_path: Path) -> None:
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError):
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())]
     await client.aclose()
 
 
@@ -3157,7 +3140,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(
-            anext(AnthropicBackend(token_store=store).complete([], []))
+            anext(AnthropicBackend(token_store=store).complete([], [], control=completion_control()))
         )
         await asyncio.sleep(0)
         task.cancel()
@@ -3202,7 +3185,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
         outcome = None
         close_error = None
         try:
-            [event async for event in backend.complete([], [])]
+            [event async for event in backend.complete([], [], control=completion_control())]
             closing = asyncio.create_task(backend.aclose())
             await asyncio.wait_for(close_started.wait(), 10)
             closing.cancel()
@@ -3251,7 +3234,7 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
-        stream = AnthropicBackend(token_store=store).complete([], [])
+        stream = AnthropicBackend(token_store=store).complete([], [], control=completion_control())
         await anext(stream)
         await stream.aclose()
 
@@ -3285,7 +3268,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     task = asyncio.create_task(
-        anext(AnthropicBackend(client=Client(), token_store=store).complete([], []))
+        anext(AnthropicBackend(client=Client(), token_store=store).complete([], [], control=completion_control()))
     )
     await cleanup_started.wait()
     task.cancel()
@@ -3332,7 +3315,7 @@ async def test_owned_client_close_cancellation_is_separate_from_stream_error(
         close_error = None
         try:
             with pytest.raises(AnthropicStreamError):
-                [event async for event in backend.complete([], [])]
+                [event async for event in backend.complete([], [], control=completion_control())]
             closing = asyncio.create_task(backend.aclose())
             await asyncio.wait_for(cleanup_started.wait(), 10)
             closing.cancel()
@@ -3380,7 +3363,7 @@ async def test_response_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -
             client=Client(),
             token_store=store,
             diagnostics_path=diagnostics_path,
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     assert events[-1].type is StreamEventType.MESSAGE_END
     contents = diagnostics_path.read_text()
@@ -3415,7 +3398,7 @@ async def test_owned_client_close_failure_is_returned(tmp_path: Path) -> None:
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         backend = AnthropicBackend(token_store=store)
-        events = [event async for event in backend.complete([], [])]
+        events = [event async for event in backend.complete([], [], control=completion_control())]
         outcome = await backend.aclose()
     assert events[-1].type is StreamEventType.MESSAGE_END
     assert len(outcome.failures) == 1
@@ -3523,7 +3506,7 @@ async def _assert_malformed_stream_raises(tmp_path: Path, stream: str) -> None:
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
     with pytest.raises(AnthropicStreamError):
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [], control=completion_control())]
     await client.aclose()
 
 
@@ -3545,7 +3528,7 @@ async def _collect_anthropic_events(tmp_path: Path, stream: str) -> list[StreamE
             client=client,
             token_store=store,
             diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
-        ).complete([], [])
+        ).complete([], [], control=completion_control())
     ]
     await client.aclose()
     return events

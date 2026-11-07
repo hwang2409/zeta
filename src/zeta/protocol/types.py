@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import math
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
@@ -20,6 +20,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from ..providers.completion import CompletionControl, CompletionRun
     from ..providers.transport import CloseFailureReporter, CloseOutcome
 
 from ..media.images import (
@@ -955,8 +956,10 @@ class CompletionBackend(Protocol):
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        """Return events for one completion. The loop owns turn control."""
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
+        """Return the owner-managed run for one completion."""
 
 
 @runtime_checkable

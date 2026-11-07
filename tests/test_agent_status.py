@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools.agent as agent_tools
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.receipt import encode_json
 from zeta.agent.tool_results import validated_tool_result
@@ -33,6 +34,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
@@ -71,10 +73,11 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     release_background = asyncio.Event()
 
     class GatedBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             if len(self.calls) == 3:
                 await release_background.wait()
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
 
     foreground_call = ToolCall(

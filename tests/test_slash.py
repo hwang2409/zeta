@@ -1,3 +1,4 @@
+from zeta.providers.completion import owned_completion
 from zeta.skills import SkillCatalog
 
 import asyncio
@@ -594,6 +595,7 @@ async def test_manual_compact_avoids_summarization_cost(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) -> None:
     class _ErrorBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append((list(messages), list(tool_schemas)))
             yield StreamEvent(

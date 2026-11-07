@@ -34,6 +34,7 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
@@ -46,6 +47,7 @@ class _GatedBackend(CompletionBackend):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -69,6 +71,7 @@ class _PostTurnBackend(CompletionBackend):
         self.woke = asyncio.Event()
         self.later_woke = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

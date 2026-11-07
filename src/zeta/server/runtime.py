@@ -31,6 +31,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..providers.completion import owned_completion
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -55,6 +56,7 @@ class _TestScriptedBackend(CompletionBackend):
     def __init__(self, model: str) -> None:
         self.model = model
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

@@ -25,6 +25,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 
 
@@ -79,6 +80,7 @@ class _BlockingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -92,6 +94,7 @@ class _BlockingBackend(CompletionBackend):
 
 
 class _FailingBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

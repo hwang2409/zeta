@@ -40,6 +40,14 @@ from .anthropic_errors import (
     AnthropicStreamError,
     http_error as _http_error,
 )
+from .completion import (
+    AuthIteratorProviderAttempt,
+    CompletionControl,
+    CompletionRun,
+    ProviderAttempt,
+    complete as own_completion,
+    report_provider_record,
+)
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -48,19 +56,15 @@ from .transport import (
     HTTPClientLease,
     SSEEventAccumulator,
     StreamFinished,
-    StreamProgress,
+    StreamProgressDiagnostics,
     build_response_error,
     cleanup_transport,
     close_resource,
     close_transport_resources,
     is_control_exception,
-    provider_retry_notice,
     request_error,
-    retry_provider_completion,
     sse_lines,
-    stall_retry_kwargs,
     task_is_cancelling,
-    wait_for_response_headers,
 )
 from .usage import normalize_usage
 from ..protocol.types import (
@@ -471,33 +475,34 @@ class AnthropicBackend(CompletionBackend):
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        return self._complete(messages, tool_schemas)
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
+        return own_completion(self, messages, tool_schemas, control=control)
 
-    async def _complete(
+    def create_attempt(
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
-    ) -> AsyncIterator[StreamEvent]:
-        attempts = retry_provider_completion(
-            lambda: self._complete_once(messages, tool_schemas),
-            lambda token: self._complete_once(messages, tool_schemas, token=token),
+        token: str | None = None,
+    ) -> ProviderAttempt:
+        def map_error(error: BaseException) -> BaseException:
+            if (
+                token is not None
+                and isinstance(error, AnthropicAuthError)
+                and error.status_code == 401
+            ):
+                return AnthropicAuthError(
+                    "Anthropic authentication failed after token refresh; run `zeta login`",
+                    status_code=401,
+                )
+            return error
+
+        return AuthIteratorProviderAttempt(
+            self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
-            lambda error: isinstance(error, AnthropicAuthError) and error.status_code == 401,
-            lambda error: AnthropicAuthError(
-                "Anthropic authentication failed after token refresh; run `zeta login`",
-                status_code=401,
-            ),
-            provider_retry_notice,
-            self._record_retry_exhausted,
-            defer_truncated_message_end=True,
-            **stall_retry_kwargs(self.stall_retries),
+            map_error,
         )
-        try:
-            async for event in attempts:
-                yield event
-        finally:
-            await close_resource(attempts)
 
     @property
     def connection_setup_count(self) -> int:
@@ -523,10 +528,14 @@ class AnthropicBackend(CompletionBackend):
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow() as client:
-            async for event in self._complete_once_with_client(
+            events = self._complete_once_with_client(
                 client, messages, tool_schemas, token=token
-            ):
-                yield event
+            )
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
 
     async def _complete_once_with_client(
         self,
@@ -576,10 +585,7 @@ class AnthropicBackend(CompletionBackend):
                 headers=headers,
                 content=serialize_request_payload(payload),
             )
-            response = await wait_for_response_headers(
-                stream_context.__aenter__(), self.stall_seconds,
-                "Anthropic", AnthropicStreamError,
-            )
+            response = await stream_context.__aenter__()
             entered = True
             try:
                 if response.status_code >= 400:
@@ -652,7 +658,7 @@ async def _decode_response(
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
     finished = StreamFinished()
-    progress = StreamProgress()
+    progress = StreamProgressDiagnostics()
     message_state = "not-started"
     started_at = time.monotonic() if stream_started_at is None else stream_started_at
     last_event_at = started_at
@@ -786,12 +792,12 @@ async def _decode_response(
             "Anthropic",
             AnthropicStreamError,
             finished=finished,
-            progress=progress,
         ):
             bytes_received += len(line.encode()) + 1
             record = decoder.feed(line)
             if record is None:
                 continue
+            report_provider_record(record[1].get("type", record[0]))
             progress.observe(record)
             sse_events_received += 1
             last_event_at = time.monotonic()
@@ -822,6 +828,7 @@ async def _decode_response(
 
     record = decoder.finish()
     if record is not None:
+        report_provider_record(record[1].get("type", record[0]))
         progress.observe(record)
         sse_events_received += 1
         last_event_at = time.monotonic()

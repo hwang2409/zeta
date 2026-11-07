@@ -37,6 +37,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop._completion import _error_info
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
@@ -62,6 +63,7 @@ class SteerToolBackend(CompletionBackend):
         self.turn1_streaming = asyncio.Event()
         self.release_turn1 = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -288,6 +290,7 @@ class _NotificationBackend(CompletionBackend):
         self.exceptions = exceptions or {}
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         index = len(self.calls)
@@ -314,6 +317,7 @@ class _RefusalNotificationBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(list(messages))
@@ -332,6 +336,7 @@ class _BlockingNotificationBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         index = len(self.calls)
@@ -899,6 +904,7 @@ class TextOnlyBackend(CompletionBackend):
         if not block_turn2:
             self.release_turn2.set()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],

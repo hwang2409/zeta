@@ -32,6 +32,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 from zeta.server.delivery import (
     DeliveryRequests,
@@ -65,6 +66,7 @@ class BlockingBackend:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         self.calls += 1
@@ -1238,6 +1240,7 @@ class _FailingActiveTurnBackend:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(list(messages))

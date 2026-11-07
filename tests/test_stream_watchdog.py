@@ -23,6 +23,7 @@ import zeta.accounts.store as account_store
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
+from tests.support.completion import completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import AccountCredentials
@@ -44,6 +45,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex import CodexBackend
 from zeta.providers.codex_errors import CodexStreamError
+from zeta.providers.completion import owned_completion
 from zeta.providers.transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
@@ -463,7 +465,7 @@ async def test_anthropic_backend_stall_budget_exhausts(
         stall_retries=2,
     )
     with pytest.raises(AnthropicStreamError) as excinfo:
-        [event async for event in backend.complete([], [])]
+        [event async for event in backend.complete([], [], control=completion_control())]
 
     assert excinfo.value.is_stall is True
     assert len(requests) == 3
@@ -561,7 +563,7 @@ async def test_anthropic_backend_ignores_stall_after_message_end(
         stall_seconds=0.05,
         stall_retries=2,
     )
-    events = [event async for event in backend.complete([], [])]
+    events = [event async for event in backend.complete([], [], control=completion_control())]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     assert len(requests) == 1
@@ -635,7 +637,7 @@ async def test_provider_stalls_waiting_for_response_headers(
         error_type = CodexStreamError
     try:
         with pytest.raises(error_type, match="response headers stalled") as caught:
-            await asyncio.wait_for(anext(backend.complete([], [])), timeout=0.5)
+            await asyncio.wait_for(anext(backend.complete([], [], control=completion_control())), timeout=0.5)
         assert caught.value.is_stall is True
         assert len(requests) == 1
     finally:
@@ -720,7 +722,7 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
         stall_retries=0,
     )
     with pytest.raises(CodexStreamError, match="model progress stalled for 900s") as excinfo:
-        [event async for event in backend.complete([], [])]
+        [event async for event in backend.complete([], [], control=completion_control())]
 
     assert excinfo.value.is_stall is True
     await client.aclose()
@@ -801,7 +803,7 @@ async def test_codex_backend_stall_budget_exhausts_raises(
         stall_retries=1,
     )
     with pytest.raises(CodexStreamError) as excinfo:
-        [event async for event in backend.complete([], [])]
+        [event async for event in backend.complete([], [], control=completion_control())]
 
     assert excinfo.value.is_stall is True
     assert len(requests) == 2
@@ -834,7 +836,7 @@ async def test_codex_backend_ignores_stall_after_message_end(
         stall_seconds=0.05,
         stall_retries=2,
     )
-    events = [event async for event in backend.complete([], [])]
+    events = [event async for event in backend.complete([], [], control=completion_control())]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     assert len(requests) == 1
@@ -852,6 +854,7 @@ class _StallingBackend:
     def __init__(self) -> None:
         self.attempts = 0
 
+    @owned_completion
     def complete(self, messages, tool_schemas):
         return self._complete(messages, tool_schemas)
 
@@ -908,6 +911,7 @@ class _StallAfterCompletionBackend:
     still produces an ``is_stall`` event; the loop must ignore it rather than
     wipe the already-completed message and bill a fresh attempt."""
 
+    @owned_completion
     def complete(self, messages, tool_schemas):
         return self._complete(messages, tool_schemas)
 
@@ -955,6 +959,7 @@ async def test_agent_loop_stall_after_message_end_keeps_completed_message(
 class _ExhaustingBackend:
     """Emit a stall RETRY, then raise a stall error to model exhaustion."""
 
+    @owned_completion
     def complete(self, messages, tool_schemas):
         return self._complete(messages, tool_schemas)
 

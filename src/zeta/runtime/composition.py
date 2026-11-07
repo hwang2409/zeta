@@ -25,6 +25,7 @@ from ..memory.provider import complete_reconciliation
 from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.completion import CompletionRetryBudget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..storage_format import open_writer
@@ -307,7 +308,9 @@ def compose_runtime(
             memory_backend: CompletionBackend | None = None
             memory_backend_lock = asyncio.Lock()
 
-            async def invoke_memory(prompt: str) -> ReconciliationResponse:
+            async def invoke_memory(
+                prompt: str, budget: CompletionRetryBudget
+            ) -> ReconciliationResponse:
                 nonlocal memory_backend
                 if memory_backend is None:
                     async with memory_backend_lock:
@@ -325,7 +328,7 @@ def compose_runtime(
                                 token_budget=effective_budget,
                             )
                             loop.register_backend_owner(memory_backend)
-                return await complete_reconciliation(memory_backend, prompt)
+                return await complete_reconciliation(memory_backend, prompt, budget)
 
             assert project_registry is not None
             memory_storage_lease = open_writer(home)

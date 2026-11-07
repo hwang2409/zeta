@@ -29,6 +29,7 @@ from tests.support.agent_lifecycle import (
     wait_background_owner,
     watch_delegated_registrations,
 )
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
 from zeta.agent._delivery_notifications import _notification_message
@@ -85,6 +86,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
@@ -344,6 +346,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             if len(self.calls) == 1:
@@ -399,6 +402,7 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             if len(self.calls) == 1:
@@ -461,6 +465,7 @@ async def test_context_overflow_retry_failure_persists_turn_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             error = RuntimeError("prompt is too long: 120 tokens > 100 maximum")
@@ -521,6 +526,7 @@ async def test_overflow_without_reduction_fails_with_diagnostic(tmp_path: Path) 
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             error = RuntimeError("prompt is too long: 220 tokens > 200 maximum")
@@ -661,6 +667,7 @@ async def test_context_overflow_after_partial_output_is_not_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             yield StreamEvent(
@@ -1215,6 +1222,7 @@ class ParallelChildrenBackend(CompletionBackend):
             prompt: asyncio.Event() for prompt in self.child_prompts
         }
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1253,6 +1261,7 @@ class ParallelApprovalBackend(CompletionBackend):
         self.call_count = 0
         self.child_count = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1302,6 +1311,7 @@ class BackgroundBackend(CompletionBackend):
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1346,6 +1356,7 @@ class NotificationWakeBackend(CompletionBackend):
         self.wake_started = asyncio.Event()
         self.release_wake = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1375,6 +1386,7 @@ class NestedBlockingBackend(CompletionBackend):
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1404,6 +1416,7 @@ class NestedBackgroundBackend(CompletionBackend):
         self.call_count = 0
         self.grandchild_started = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1438,6 +1451,7 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
         self.child_notification_started = asyncio.Event()
         self.release_child_notification = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1506,6 +1520,7 @@ class FinishGateBackend(CompletionBackend):
         self.handoff_schema_seen = False
         self.handoff_schema_seen_before_gate = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1651,6 +1666,7 @@ class PostCapBudgetBackend(CompletionBackend):
         self.fresh_prompt_seen = asyncio.Event()
         self.gate_calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1739,6 +1755,7 @@ class FollowUpFinishGateBackend(CompletionBackend):
         self.release_grandchild = asyncio.Event()
         self.gate_turns = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1847,6 +1864,7 @@ class ConversationFinishGateBackend(CompletionBackend):
         self.gate_turns = 0
         self.follow_up_seen = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1982,6 +2000,7 @@ class ParallelNestedReadBackend(CompletionBackend):
             self.calls.append(call)
         self.seen_prompts: set[str] = set()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -3872,7 +3891,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
 
     model_turn = asyncio.create_task(
         state.run_model_turn(
-            child_loop, OllamaBackend(stall_seconds=0).complete([], []), consume_stream
+            child_loop, OllamaBackend(stall_seconds=0).complete([], [], control=completion_control()), consume_stream
         )
     )
     await stream_started.wait()
@@ -4653,12 +4672,11 @@ async def test_run_agent_tool_writes_child_run_started_before_child_work(
     monkeypatch.setattr(agent_runner_module, "_build_child_loop", build_child)
     original_complete = backend.complete
 
-    async def complete(messages, tool_schemas):
+    def complete(messages, tool_schemas, *, control):
         if len(backend.calls) == 1:
             assert any(entry.type == "child_run_started" for entry in store.entries)
             milestones.append("output")
-        async for event in original_complete(messages, tool_schemas):
-            yield event
+        return original_complete(messages, tool_schemas, control=control)
 
     backend.complete = complete
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -6995,10 +7013,11 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     child_started = asyncio.Event()
 
     class StartedBackend(FakeBackend):
+        @owned_completion
         async def complete(
             self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
         ) -> AsyncIterator[StreamEvent]:
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 if (
                     len(self.calls) == 2
                     and event.type is StreamEventType.MESSAGE_UPDATE
@@ -7868,6 +7887,7 @@ class RunBackend(CompletionBackend):
         self.release_child = asyncio.Event()
         self.child_prompts: list[str] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -7917,6 +7937,7 @@ class FollowUpFinishBackend(CompletionBackend):
         self.release_finish = asyncio.Event()
         self.pause_before_finish = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -7980,6 +8001,7 @@ class AskParentFinishBackend(CompletionBackend):
         self.release_question_finish = asyncio.Event()
         self.answer_seen = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8059,6 +8081,7 @@ class RetryBeforeProviderBackend(CompletionBackend):
         self.retry_sent = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8074,6 +8097,7 @@ class CapturePromptBackend(CompletionBackend):
     def __init__(self) -> None:
         self.prompt_count = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8095,6 +8119,7 @@ class CapturePromptBackend(CompletionBackend):
 
 
 class WorkerBackend(RunBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -8111,7 +8136,7 @@ class WorkerBackend(RunBackend):
             "",
         )
         if last_user != "start":
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
             return
         call = ToolCall(
@@ -8293,6 +8318,7 @@ class EarlyCloseThenAnswerBackend(CompletionBackend):
         self.calls: list[list[Message]] = []
         self.first_error = first_error
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(list(messages))
@@ -8804,6 +8830,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -8824,7 +8851,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
         return retry_succeeds or len(backend.calls) < 2
 
     backend = ErrorThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -8842,7 +8869,7 @@ async def test_provider_error_does_not_ack_staged_prompt(
 
     events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert len(backend.calls) == (3 if retry_succeeds else 2)
+    assert len(backend.calls) == (3 if retry_succeeds else 5)
     request_prompt_ids = [
         [
             message.metadata["zeta.pending_prompt_id"]
@@ -8880,7 +8907,7 @@ async def test_early_close_commits_staged_delivery_only_after_successful_retry(
         return True
 
     backend = EarlyCloseThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -8960,7 +8987,7 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
         return True
 
     backend = EarlyCloseThenAnswerBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", wait_for_cancel)
+    backend._completion_wait = wait_for_cancel
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -9005,7 +9032,7 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
     async def retry_now(*_args, **_kwargs) -> bool:
         return True
 
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     retry_events = await _collect(
         loop.run_turn("resume", origin=MessageOrigin.USER)
     )
@@ -9042,7 +9069,7 @@ async def test_stall_commits_staged_prompt_only_after_successful_retry(
         return True
 
     backend = EarlyCloseThenAnswerBackend(StallError("provider stalled"))
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path)
     loop = AgentLoop(
         backend,
@@ -9080,6 +9107,7 @@ async def test_provider_error_root_exit_admits_terminal_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class ErrorBackend(CompletionBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             yield StreamEvent(
@@ -10110,6 +10138,7 @@ async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -10151,6 +10180,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             call = len(self.calls)
@@ -10218,6 +10248,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls.append(list(messages))
             call = len(self.calls)
@@ -10272,6 +10303,7 @@ async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) ->
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -10329,6 +10361,7 @@ async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) 
             self.store = store
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -10445,6 +10478,7 @@ class _TaskOwningChildBackend(CompletionBackend):
     def __init__(self, command: str) -> None:
         self.command = command
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -10529,6 +10563,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         self.follow_up_processed = asyncio.Event()
         self.noise_notification_processed = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11240,6 +11275,7 @@ async def test_killed_task_receipt_never_contains_command_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailingBackend(_TaskOwningChildBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             started = any(
                 message.role is MessageRole.TOOL_RESULT
@@ -11252,7 +11288,7 @@ async def test_killed_task_receipt_never_contains_command_secrets(
             )
             if started:
                 raise CodexStreamError("permanent", code="model_not_found")
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
 
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
@@ -11347,6 +11383,7 @@ class _ChildConsumeBackend(CompletionBackend):
         self.loop: AgentLoop | None = None
         self.saw_notification = False
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11426,6 +11463,7 @@ class _RecordingBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11536,6 +11574,7 @@ class ChildCwdBackend(CompletionBackend):
         self.grandchild_arguments = grandchild_arguments
         self.grandchild_tool_call = grandchild_tool_call
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11792,6 +11831,7 @@ class ChildToolSequenceBackend(CompletionBackend):
         self.child_tool_calls = list(child_tool_calls)
         self.child_prompt = child_arguments["prompt"]
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -11916,6 +11956,7 @@ class ChildRunBackgroundBackend(CompletionBackend):
         self.child_prompt = "child-work"
         self.task_output_requested = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -12805,6 +12846,7 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
             self.child_replied = asyncio.Event()
             self.finish_sent = False
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             last_user = next(
@@ -16561,6 +16603,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
             self.priority_after_retry: str | None = None
             self.priority_before_acceptance: str | None = "not-observed"
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -16621,7 +16664,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
     )
     dispatch_admitted_request = assembler.dispatch_admitted_request
 
-    def capture_dispatch(backend, request):
+    def capture_dispatch(backend, request, *, control):
         admitted_requests.append(request)
         request_texts = _user_texts(request.messages)
         steering = store.pending_client_steering()
@@ -16631,7 +16674,7 @@ async def test_real_loop_prompt_priority_survives_every_pre_evidence_outcome(
                 for text in _user_texts(steering.messages)
                 if text.startswith("steer-") and text in request_texts
             )
-        return dispatch_admitted_request(backend, request)
+        return dispatch_admitted_request(backend, request, control=control)
 
     assembler.dispatch_admitted_request = capture_dispatch
 
@@ -16959,6 +17002,7 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
         def __init__(self) -> None:
             self.calls: list[list[Message]] = []
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))
@@ -16999,7 +17043,7 @@ async def test_session_host_commands_provider_retry_keeps_turn_snapshot(
         return "captured"
 
     backend = RetryThenToolBackend()
-    monkeypatch.setattr(agent_loop_module, "wait_for_provider_retry", retry_now)
+    backend._completion_wait = retry_now
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()

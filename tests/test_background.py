@@ -24,6 +24,7 @@ from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import (
     kill_group_if_present,
@@ -46,6 +47,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -338,6 +340,7 @@ class _GatedFakeBackend(FakeBackend):
         self.completion_started = asyncio.Event()
         self.completion_gate = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -352,7 +355,7 @@ class _GatedFakeBackend(FakeBackend):
         if gated:
             self.completion_started.set()
             await self.completion_gate.wait()
-        async for event in super().complete(messages, tool_schemas):
+        async for event in super().complete(messages, tool_schemas, control=completion_control()):
             yield event
 
 

@@ -59,6 +59,7 @@ from zeta.protocol.types import (
     TextContent,
     ThinkingContent,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.factory import build_backend, credential_store
 from zeta.providers.retry_policy import retryable_provider_error
 from zeta.server.login import Logins
@@ -196,6 +197,7 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     class TurnSetupBackend:
+        @owned_completion
         async def complete(self, _messages, _tool_schemas):
             async with httpx.AsyncClient() as client:
                 await credential.access_token(client)

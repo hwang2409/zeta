@@ -15,6 +15,7 @@ import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.retry_policy as retry_policy_module
+from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
@@ -39,6 +40,7 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
@@ -225,6 +227,7 @@ class AttemptBackend(CompletionBackend):
         self.attempts = list(attempts)
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -246,6 +249,7 @@ class AttemptBackend(CompletionBackend):
 
 
 class ParallelChildFailureBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -423,8 +427,8 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         request_serializer=anthropic_request_bytes,
     )
     same_request = [Message(MessageRole.USER, [TextContent("same")])]
-    await collect(baseline_backend.complete(same_request, []))
-    baseline_events = await collect(baseline_backend.complete(same_request, []))
+    await collect(baseline_backend.complete(same_request, [], control=completion_control()))
+    baseline_events = await collect(baseline_backend.complete(same_request, [], control=completion_control()))
     baseline_read = baseline_events[-1].data["usage"]["cache_read_input_tokens"]
 
     mutated_backend = FakeBackend(
@@ -449,8 +453,8 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         return anthropic_module.serialize_request_payload(payload)
 
     mutated_backend.request_serializer = mutate_first_request
-    await collect(mutated_backend.complete(same_request, []))
-    changed_events = await collect(mutated_backend.complete(same_request, []))
+    await collect(mutated_backend.complete(same_request, [], control=completion_control()))
+    changed_events = await collect(mutated_backend.complete(same_request, [], control=completion_control()))
 
     assert (
         changed_events[-1].data["usage"]["cache_read_input_tokens"]
@@ -1467,6 +1471,7 @@ async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> 
             return event
 
     class PlainBackend(CompletionBackend):
+        @owned_completion
         def complete(
             self,
             messages: Sequence[Message],
@@ -1515,6 +1520,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         def __init__(self) -> None:
             self.update_seen = asyncio.Event()
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1586,6 +1592,7 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) -> None:
     class TruncatedBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1625,6 +1632,7 @@ async def test_cancel_during_retry_backoff_does_not_persist_discarded_partial(
     retry_seen = asyncio.Event()
 
     class WaitingRetryBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1673,6 +1681,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
     tmp_path: Path,
 ) -> None:
     class PartialOnlyRetryBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1708,6 +1717,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
 @pytest.mark.asyncio
 async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> None:
     class WaitingAfterMetadataBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1751,6 +1761,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path) -> None:
     class BrokenBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -1828,6 +1839,7 @@ async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
         def __init__(self) -> None:
             self.stream_calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal budget
             del messages, tool_schemas
@@ -1935,6 +1947,7 @@ async def test_metadata_only_provider_events_are_retry_safe(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
 
@@ -2172,6 +2185,7 @@ async def test_server_error_after_completed_tool_call_is_not_retried(tmp_path: P
     class Backend(CompletionBackend):
         calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2268,6 +2282,7 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2308,6 +2323,7 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal now
             del messages, tool_schemas
@@ -2366,6 +2382,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             nonlocal now
             del messages, tool_schemas
@@ -2589,6 +2606,7 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
     class AbortingBackend(CompletionBackend):
         calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2745,6 +2763,7 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             self.calls += 1
@@ -2801,6 +2820,7 @@ async def test_child_retries_post_stream_even_when_root_serve_client_not_negotia
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             self.calls += 1
             is_child = any(
@@ -2865,6 +2885,7 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
     tmp_path: Path,
 ) -> None:
     class ErrorEventBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -2905,6 +2926,7 @@ async def test_clean_stream_exit_retries_without_duplicate_output(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -2950,6 +2972,7 @@ async def test_clean_stream_exit_after_completed_tool_call_is_not_retried(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -2991,6 +3014,7 @@ async def test_clean_stream_exit_exhausts_normal_retry_budget(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -3021,6 +3045,7 @@ async def test_clean_stream_exit_exhausts_normal_retry_budget(
 @pytest.mark.asyncio
 async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path) -> None:
     class BrokenBackend(CompletionBackend):
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],

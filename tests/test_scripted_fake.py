@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.completion import completion_control
 from tests.support.scripted_provider import (
     FAKE_SCRIPT_ENV,
     FakeScriptError,
@@ -186,7 +187,7 @@ def test_env_lookup_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 async def _events(backend: ScriptedFakeBackend, messages: list[Message]) -> list[Any]:
-    return [event async for event in backend.complete(messages, [])]
+    return [event async for event in backend.complete(messages, [], control=completion_control())]
 
 
 def test_replay_is_deterministic_and_follows_the_conversation() -> None:

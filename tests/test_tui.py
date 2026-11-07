@@ -60,6 +60,7 @@ import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
+from tests.support.completion import completion_control
 from tests.support.credentials import (
     anthropic_credentials,
     codex_credentials,
@@ -93,6 +94,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
@@ -1150,6 +1152,7 @@ class GateBackend(CompletionBackend):
         self.release = asyncio.Event()
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1174,6 +1177,7 @@ class QueueOrderBackend(CompletionBackend):
         self.release = asyncio.Event()
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1204,6 +1208,7 @@ class QueueOrderBackend(CompletionBackend):
 
 
 class ErrorBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1221,6 +1226,7 @@ class AbortThenSuccessBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.calls = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1252,6 +1258,7 @@ class ErrorThenSuccessBackend(CompletionBackend):
         self.calls = 0
         self.request_messages: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1279,6 +1286,7 @@ class ErrorThenSuccessBackend(CompletionBackend):
 
 
 class AlwaysErrorBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1298,6 +1306,7 @@ class WaitingFailureBackend(CompletionBackend):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1322,6 +1331,7 @@ class RaisedErrorBackend(CompletionBackend):
     def __init__(self, error: Exception) -> None:
         self.error = error
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1333,6 +1343,7 @@ class RaisedErrorBackend(CompletionBackend):
 
 
 class GhostPreviewBackend(CompletionBackend):
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1353,6 +1364,7 @@ class EventBackend(CompletionBackend):
     def __init__(self, event: StreamEvent) -> None:
         self.event = event
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1369,6 +1381,7 @@ class BlockingToolBackend(CompletionBackend):
     def __init__(self, call: ToolCall) -> None:
         self.call = call
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1388,6 +1401,7 @@ class StreamingToolBackend(CompletionBackend):
         self.tool_update = asyncio.Event()
         self.allow_message_end = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1413,6 +1427,7 @@ class OrderedToolBackend(CompletionBackend):
         self.calls = calls
         self.index = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -1442,6 +1457,7 @@ class SlowSecondCompletionBackend(CompletionBackend):
         self.release_second = asyncio.Event()
         self.index = 0
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -4234,6 +4250,7 @@ async def test_oauth_refresh_rejection_renders_as_login_problem(tmp_path: Path) 
     driver = AnthropicCredentialDriver(token_url="https://refresh.test/token")
 
     class RefreshFailureBackend:
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del messages, tool_schemas
             async with httpx.AsyncClient(
@@ -4416,6 +4433,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -4472,6 +4490,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -6444,6 +6463,7 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -6508,6 +6528,7 @@ async def test_truncated_response_notice_is_printed_once(
         def __init__(self) -> None:
             self.calls = 0
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -12902,6 +12923,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
             self.calls = 0
             self.release_first = asyncio.Event()
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
@@ -13148,7 +13170,7 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
                 client=client,
                 token_budget=expected_budget,
             )
-            [event async for event in probe.complete([], [])]
+            [event async for event in probe.complete([], [], control=completion_control())]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget

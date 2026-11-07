@@ -20,6 +20,7 @@ from ..context_accounting import (
     cooperative_call as _cooperative_call,
     message_token_count as _message_token_count,
 )
+from ..providers.completion import CompletionControl, CompletionRun
 from .context_parts.admission import (
     AdmittedSessionRequest,
     RequestBudgetExceeded,
@@ -239,10 +240,14 @@ class ContextAssembler(ContextMarkerMixin):
         self,
         backend: CompletionBackend,
         request: AdmittedSessionRequest,
-    ):
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
         """Dispatch a request previously admitted for the current session."""
 
-        return self._request_admission.dispatch(backend, request)
+        return self._request_admission.dispatch(
+            backend, request, control=control
+        )
 
     @property
     def provider_attempt_estimate(self) -> int | None:

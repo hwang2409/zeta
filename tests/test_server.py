@@ -32,6 +32,7 @@ import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
+from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
@@ -75,6 +76,7 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
@@ -761,6 +763,7 @@ class OAuthRefreshFailureBackend:
         self.driver = driver
         self.status_code = status_code
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         async with httpx.AsyncClient(
@@ -779,6 +782,7 @@ class FailingWakeBackend:
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         self.calls += 1
@@ -792,6 +796,7 @@ class DisconnectThenSucceedBackend:
         self.calls = 0
         self.started = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         self.calls += 1
@@ -809,6 +814,7 @@ class AbortTwiceThenSucceedBackend:
         self.calls: list[list[Message]] = []
         self.started = [asyncio.Event(), asyncio.Event()]
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(messages)
@@ -828,6 +834,7 @@ class BlockingThenCaptureBackend:
         self.started = asyncio.Event()
         self.second_started = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         self.calls.append(messages)
@@ -884,6 +891,7 @@ class PerActorFakeBackend:
         self.release_children = asyncio.Event()
         self.gated_child_call = gated_child_call
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         actor_prompt = _public_input_prompt(
             messages, {self.parent_prompt, *self.children}
@@ -903,7 +911,7 @@ class PerActorFakeBackend:
                 await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
             except TimeoutError as error:
                 raise AssertionError("children were not released") from error
-        stream = backend.complete(messages, tool_schemas)
+        stream = backend.complete(messages, tool_schemas, control=completion_control())
         if child_prompt is None and self.parent.calls:
             try:
                 try:
@@ -945,6 +953,7 @@ class DelegatedApprovalBackend:
         self.child_prompt = child_prompt
         self.child_started = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         is_child = any(
             message.role is MessageRole.USER
@@ -959,7 +968,7 @@ class DelegatedApprovalBackend:
             self.child_started.set()
         elif self.parent.calls:
             await self.child_started.wait()
-        async for event in backend.complete(messages, tool_schemas):
+        async for event in backend.complete(messages, tool_schemas, control=completion_control()):
             yield event
 
 
@@ -969,6 +978,7 @@ class BackgroundChildAndForegroundToolBackend:
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del tool_schemas
         if any(
@@ -1029,6 +1039,7 @@ class EarlyCloseRetryBackend:
     def __init__(self) -> None:
         self.calls = 0
 
+    @owned_completion
     async def complete(self, messages, tool_schemas):
         del messages, tool_schemas
         self.calls += 1
@@ -1101,8 +1112,9 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
     sentinel = "raw-reasoning-metadata-sentinel"
 
     class MetadataBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 if (
                     event.type is StreamEventType.MESSAGE_END
                     and event.message is not None
@@ -6497,6 +6509,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
     completions = []
 
     class AccountBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             completions.append(self.model)
             if self.model == "gpt-5.4-mini":
@@ -6513,7 +6526,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
                     ),
                 )
             else:
-                async for event in super().complete(messages, tool_schemas):
+                async for event in super().complete(messages, tool_schemas, control=completion_control()):
                     yield event
 
     def build(provider, model, home):
@@ -6827,6 +6840,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
     from zeta.providers.codex_errors import CodexHTTPError
 
     class DeniedBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             raise CodexHTTPError("Access denied", status_code=403)
             yield  # pragma: no cover - keep the provider's async iterator contract
@@ -6979,6 +6993,7 @@ async def test_stream_access_error_restores_model_over_wire(
     stream = "".join(f"data: {json.dumps(event)}\n\n" for event in stream_events)
 
     class StreamBackend(FakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             if self.model == selected:
                 response = httpx.Response(200, text=stream)
@@ -6988,7 +7003,7 @@ async def test_stream_access_error_restores_model_over_wire(
                 finally:
                     await response.aclose()
             else:
-                async for event in super().complete(messages, tool_schemas):
+                async for event in super().complete(messages, tool_schemas, control=completion_control()):
                     yield event
 
     def build(provider, model, home):
@@ -7491,8 +7506,9 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
     release = asyncio.Event()
 
     class PausedBackend(ServerFakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
@@ -8502,8 +8518,9 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
     release = asyncio.Event()
 
     class PausedBackend(ServerFakeBackend):
+        @owned_completion
         async def complete(self, messages, tool_schemas):
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas, control=completion_control()):
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
@@ -9812,6 +9829,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
+        @owned_completion
         async def complete(self, messages, tool_schemas):
             del tool_schemas
             self.calls.append(list(messages))

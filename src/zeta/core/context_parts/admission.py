@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import CompletionBackend, Message, StreamEvent
+from ...providers.completion import CompletionControl, CompletionRun
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -90,11 +91,15 @@ class SessionRequestAdmission:
         self,
         backend: CompletionBackend,
         request: AdmittedSessionRequest,
-    ) -> AsyncIterator[StreamEvent]:
+        *,
+        control: CompletionControl,
+    ) -> CompletionRun:
         """Dispatch only an admitted request and record its exact estimate."""
 
         self._begin_attempt(request.messages, request.estimated_tokens)
-        return backend.complete(request.messages, request.tool_schemas)
+        return backend.complete(
+            request.messages, request.tool_schemas, control=control
+        )
 
     def update_backend(self, backend: CompletionBackend) -> None:
         """Replace the backend used by admitted compaction requests."""
@@ -105,11 +110,13 @@ class SessionRequestAdmission:
         self,
         messages: Sequence[Message],
         tool_schemas: Sequence[Mapping[str, Any]],
+        *,
+        control: CompletionControl,
     ) -> AsyncIterator[StreamEvent]:
         """Admit and dispatch one compaction request through this object."""
 
         request = await self.admit(messages, tool_schemas)
-        completion = self.dispatch(self._backend, request)
+        completion = self.dispatch(self._backend, request, control=control)
         try:
             async for event in completion:
                 yield event
