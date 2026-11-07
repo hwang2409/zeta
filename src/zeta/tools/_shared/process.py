@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 import tempfile
 import time
 import uuid
@@ -219,7 +220,25 @@ class _BackgroundTaskOwner:
             await self._receipt_release.wait()
         self.state = _OwnerState.EVIDENCE_PENDING
         if self.record.notify_on_exit:
-            await self.registry._notify_terminal_exit(candidate)
+            await self._deliver_exit(
+                TaskExitInput(
+                    task_id=candidate.task_id,
+                    command=command_headline(candidate.command),
+                    exit_code=candidate.exit_code,
+                    output_tail=output_tail(candidate.output),
+                    log_path=(
+                        None
+                        if candidate.remove_log_on_archive
+                        else str(candidate.log_path)
+                        if candidate.log_path is not None
+                        else None
+                    ),
+                    note=candidate.note,
+                    owner=candidate.owner,
+                    phase=candidate.terminal_phase or "natural_exit",
+                    tui_presented=candidate.tui_presented,
+                )
+            )
         self.state = _OwnerState.INSTALLED_TERMINAL
         self.record.running = False
         self.record.exit_code = candidate.exit_code
@@ -258,12 +277,27 @@ class _BackgroundTaskOwner:
                 or self.kill_cause is not None
             ):
                 return process, False
-            self.kill_cause = cause
-            self.killed_by_claimant = True
-            self.record.terminal_phase = phase
-            self.record.note = cause
-            self.record.tui_presented = tui_presented
-            await self.registry._commit_notice(None)
+            candidate = replace(
+                self.record,
+                terminal_phase=phase,
+                note=cause,
+                tui_presented=tui_presented,
+            )
+            rows = self.registry._persistence_rows(
+                tuple(
+                    candidate if item is self.record else item
+                    for item in self.registry._records.values()
+                )
+            )
+
+            def publish() -> None:
+                self.kill_cause = cause
+                self.killed_by_claimant = True
+                self.record.terminal_phase = phase
+                self.record.note = cause
+                self.record.tui_presented = tui_presented
+
+            await self.registry._commit_transition(rows, publish, None)
             return process, True
 
     async def terminate(
@@ -278,16 +312,29 @@ class _BackgroundTaskOwner:
         if claimant and process is not None:
             await self.registry._terminate_owned([process])
         await self.wait()
-        killed = self.killed_by_claimant and self.record.terminal_phase in {
-            "task_kill",
-            "session_shutdown",
-        }
+        killed = (
+            self.killed_by_claimant
+            and self.record.terminal_phase in {"task_kill", "session_shutdown"}
+            and self.record.exit_code in {-signal.SIGTERM, -signal.SIGKILL}
+        )
         return BackgroundTaskKillOutcome(
             killed_by_this_call=claimant and killed,
             cause=self.record.note if killed else None,
             exit_code=self.record.exit_code,
             status="killed" if killed else "exited",
         )
+
+    async def _deliver_exit(self, item: TaskExitInput) -> None:
+        sink = self.registry._notification_sink
+        if sink is None:
+            return
+        try:
+            await sink(item)
+        except ValueError as exc:
+            if str(exc) != "session store is closed":
+                raise
+            return
+        self.registry._pending_recovery.pop(item.task_id, None)
 
     async def finish_for_close(
         self, cause: str
@@ -434,6 +481,9 @@ class BackgroundTaskRegistry:
         if sink is None:
             return ()
         return tuple(self._pending_recovery.values())
+
+    async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
+        await self._owners[item.task_id]._deliver_exit(item)
 
     def bind_session_dir(
         self,
@@ -586,13 +636,20 @@ class BackgroundTaskRegistry:
                 # persisting task_exited would render the same failure twice.
                 # Macro-owned starts have no equivalent tool card, so retain
                 # their durable notification.
-                if notify_on_exit and owner != "run_background":
-                    await self._notify_exit(
-                        task_id,
-                        command,
-                        None,
-                        f"could not execute command: {exc}",
-                        effective_log_path,
+                if (
+                    notify_on_exit
+                    and owner != "run_background"
+                    and self._notification_sink is not None
+                ):
+                    await self._notification_sink(
+                        TaskExitInput(
+                            task_id=task_id,
+                            command=command_headline(command),
+                            exit_code=None,
+                            output_tail=f"could not execute command: {exc}",
+                            log_path=str(effective_log_path),
+                            owner=owner,
+                        )
                     )
                 raise ValueError(f"could not execute command: {exc}") from exc
             # The monitor owns the log after the process starts.
@@ -1077,55 +1134,6 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    async def _notify_terminal_exit(self, record: _BackgroundRecord) -> None:
-        if not record.notify_on_exit:
-            return
-        await self._notify_exit(
-            record.task_id,
-            record.command,
-            record.exit_code,
-            output_tail(record.output),
-            None if record.remove_log_on_archive else record.log_path,
-            record.note,
-            owner=record.owner,
-            phase=record.terminal_phase or "natural_exit",
-            tui_presented=record.tui_presented,
-        )
-
-    async def _notify_exit(
-        self,
-        task_id: str,
-        command: str,
-        exit_code: int | None,
-        output_tail: str,
-        log_path: str | Path | None,
-        note: str | None = None,
-        *,
-        owner: str = "run_background",
-        phase: str = "natural_exit",
-        tui_presented: bool = False,
-    ) -> None:
-        if self._notification_sink is None:
-            return
-        item = TaskExitInput(
-            task_id=task_id,
-            command=command_headline(command),
-            exit_code=exit_code,
-            output_tail=output_tail,
-            log_path=str(log_path) if log_path is not None else None,
-            note=note,
-            owner=owner,
-            phase=phase,
-            tui_presented=tui_presented,
-        )
-        try:
-            await self._notification_sink(item)
-        except ValueError as exc:
-            if str(exc) != "session store is closed":
-                raise
-            return
-        self._pending_recovery.pop(task_id, None)
-
     def _load_previous(self) -> None:
         if self._directory_fd is None:
             return
@@ -1223,8 +1231,10 @@ class BackgroundTaskRegistry:
         publish: Callable[[], None],
         notice: BackgroundTaskNoticeSinkValue | None,
     ) -> None:
-        await run_owned_thread_call(lambda: self._persist(rows))
-        publish()
+        await run_owned_thread_call(
+            lambda: self._persist(rows),
+            lambda _result: publish(),
+        )
         if notice is not None:
             self._notice(notice)
 

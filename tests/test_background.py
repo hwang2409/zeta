@@ -35,6 +35,7 @@ from tests.support.processes import (
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -424,6 +425,15 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
         "1-natural-exit-wins-kill-race",
         "2-agent-kill-wins",
         "3-external-cause",
+        "4-exit-evidence-precedes-not-running",
+        "natural-exit-success",
+        "persist-failure-retries-same-candidate",
+        "duplicate-input",
+        "durable-receipt-dedupe-after-eviction",
+        "live-close-defers-receipt",
+        "restart-recovers-running-row",
+        "suppressed-task-stays-suppressed",
+        "legacy-pending-recovers-once",
     ],
 )
 async def test_background_task_owner_state_table(
@@ -441,36 +451,248 @@ async def test_background_task_owner_state_table(
             lambda item: flow.produce(_task_notification(item))
         )
 
-        if row == "1-natural-exit-wins-kill-race":
-            task_id, _ = await registry.background_tasks.start(
-                _python("import sys; sys.stdin.read(1); raise SystemExit(7)"),
-                Path.cwd(),
+        async def start_registered(command: str) -> str:
+            result = await registry.execute(
+                ToolCall("start", "run_background", {"command": command})
             )
-            owner = registry.background_tasks._owners[task_id]
-            claim_entered = asyncio.Event()
-            claim = owner._claim_termination
+            return result["structuredContent"]["task_id"]
 
-            async def gated_claim(*args, **kwargs):
-                claim_entered.set()
-                return await claim(*args, **kwargs)
+        async def output_registered(task_id: str) -> dict[str, object]:
+            result = await registry.execute(
+                ToolCall("output", "task_output", {"task_id": task_id})
+            )
+            return result["structuredContent"]
 
-            # test-contract: seam force natural exit while kill waits for admission
-            monkeypatch.setattr(owner, "_claim_termination", gated_claim)
-            async with registry.background_tasks._transition_lock:
-                killing = asyncio.create_task(
-                    registry.execute(ToolCall("kill", "task_kill", {"task_id": task_id}))
+        if row in {
+            "restart-recovers-running-row",
+            "suppressed-task-stays-suppressed",
+            "legacy-pending-recovers-once",
+        }:
+            await registry.close()
+            task_id = "persisted-task"
+            persisted: dict[str, object] = {
+                "task_id": task_id,
+                "command": "old command",
+                "pid": 12345,
+                "running": row != "legacy-pending-recovers-once",
+                "exit_code": None,
+                "note": "old terminal",
+                "owner": "run_background",
+            }
+            if row == "suppressed-task-stays-suppressed":
+                persisted["notify_on_exit"] = False
+            elif row == "restart-recovers-running-row":
+                persisted["notify_on_exit"] = True
+            else:
+                persisted["receipt_pending"] = True
+            (store.session_dir / "background_tasks.json").write_text(
+                json.dumps([persisted]), encoding="utf-8"
+            )
+            recovered_tools = ToolRegistry(
+                tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+            )
+            stack.push_async_callback(recovered_tools.close)
+            recovered = recovered_tools.background_tasks
+            pending = recovered.set_notification_sink(
+                lambda item: flow.produce(_task_notification(item))
+            )
+            for item in pending:
+                await recovered.deliver_recovered_exit(item)
+            receipts = store.agent_notifications(pending_only=False)
+            if row == "suppressed-task-stays-suppressed":
+                assert receipts == []
+            else:
+                assert len(receipts) == 1
+                assert receipts[0].data["task_id"] == task_id
+                assert recovered.set_notification_sink(
+                    lambda item: flow.produce(_task_notification(item))
+                ) == ()
+                assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row in {"duplicate-input", "durable-receipt-dedupe-after-eviction"}:
+            item = TaskExitInput(
+                task_id="dedupe-task",
+                command="printf done",
+                exit_code=0,
+                note="exited with code 0",
+                owner="run_background",
+                phase="natural_exit",
+            )
+            await flow.produce(_task_notification(item))
+            await flow.produce(_task_notification(item))
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            if row == "duplicate-input":
+                return
+            await flow.prepare_request("terminal_fallback", [], None)
+            await flow.acknowledge_active()
+            receipt = store.agent_notifications(pending_only=False)[0]
+            store.append_compaction_marker(
+                "receipt evicted",
+                receipt.seq,
+                receipt.seq,
+                kind="evict",
+                view=[
+                    {
+                        "seq": receipt.seq,
+                        "message": Message(
+                            MessageRole.ASSISTANT,
+                            [TextContent("[task exit receipt evicted]")],
+                            metadata={
+                                "context_evicted": True,
+                                "eviction_receipt": "assistant",
+                                "source_seq": receipt.seq,
+                            },
+                        ).to_dict(),
+                    }
+                ],
+            )
+            assembler = ContextAssembler(
+                store,
+                token_budget=1000,
+                retained_tail=1,
+                token_counter=lambda _message: 1,
+            )
+            await assembler.assemble_context(
+                force=True, bypass_eviction_hysteresis=True
+            )
+            marker = next(
+                entry
+                for entry in store.replay()
+                if entry.type == "compaction"
+                and entry.data["source_seq_start"] <= receipt.seq
+                <= entry.data["source_seq_end"]
+            )
+            assert marker.data["source_seq_start"] <= receipt.seq
+            await flow.produce(_task_notification(item))
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "4-exit-evidence-precedes-not-running":
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            produce = flow.produce
+
+            async def gated_produce(item):
+                entered.set()
+                await asyncio.wait_for(release.wait(), 10)
+                return await produce(item)
+
+            # test-contract: seam hold the durable receipt publication at its interface
+            monkeypatch.setattr(flow, "produce", gated_produce)
+            task_id = await start_registered(_python("raise SystemExit(0)"))
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                before = await output_registered(task_id)
+                assert before["running"] is True
+                assert store.agent_notifications(pending_only=False) == []
+            finally:
+                release.set()
+            await _wait_for_exit(registry.background_tasks, task_id)
+            after = await output_registered(task_id)
+            assert after["running"] is False
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "persist-failure-retries-same-candidate":
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            original_persist = registry.background_tasks._persist
+            failed = False
+
+            def fail_terminal_once(rows=None):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("disk full")
+                return original_persist(rows)
+
+            # test-contract: seam inject one durable-row failure at the storage boundary
+            monkeypatch.setattr(registry.background_tasks, "_persist", fail_terminal_once)
+            call = ToolCall("kill-first", "task_kill", {"task_id": task_id})
+            failed_result = await registry.execute(call)
+            assert failed_result["isError"] is True
+            assert "disk full" in failed_result["content"][0]["text"]
+            assert (await output_registered(task_id))["running"] is True
+            assert store.agent_notifications(pending_only=False) == []
+            result = await registry.execute(
+                ToolCall("kill-retry", "task_kill", {"task_id": task_id})
+            )
+            assert result["structuredContent"]["killed_by_this_call"] is True
+            assert (await output_registered(task_id))["running"] is False
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "natural-exit-success":
+            task_id = await start_registered(_python("print('done')"))
+            await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] == 0
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "live-close-defers-receipt":
+            receipt_entered = asyncio.Event()
+            release_receipt = asyncio.Event()
+            produce = flow.produce
+
+            async def gated_close_receipt(item):
+                receipt_entered.set()
+                await asyncio.wait_for(release_receipt.wait(), 10)
+                return await produce(item)
+
+            monkeypatch.setattr(flow, "produce", gated_close_receipt)
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            closing = asyncio.create_task(registry.close())
+            try:
+                await asyncio.wait_for(receipt_entered.wait(), 10)
+                assert not closing.done()
+                persisted = json.loads(
+                    (store.session_dir / "background_tasks.json").read_text()
                 )
-                try:
-                    await asyncio.wait_for(claim_entered.wait(), 10)
-                    await asyncio.wait_for(
-                        registry.background_tasks.input(task_id, "x", eof=True), 10
-                    )
-                    process = owner.process
-                    assert process is not None
-                    await asyncio.wait_for(process.wait(), 10)
-                finally:
-                    if owner.process is not None and owner.process.returncode is None:
-                        owner.process.kill()
+                task_row = next(item for item in persisted if item["task_id"] == task_id)
+                assert task_row["running"] is False
+                assert store.agent_notifications(pending_only=False) == []
+            finally:
+                release_receipt.set()
+            await asyncio.wait_for(closing, 10)
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "1-natural-exit-wins-kill-race":
+            task_id = await start_registered(
+                _python("import sys; sys.stdin.read(1); raise SystemExit(7)")
+            )
+            termination_entered = asyncio.Event()
+            release_termination = asyncio.Event()
+            terminator_name = (
+                "_terminate_processes"
+                if hasattr(process_module, "_terminate_processes")
+                else "_terminate_process"
+            )
+            terminator = getattr(process_module, terminator_name)
+
+            async def gated_terminator(*args, **kwargs):
+                termination_entered.set()
+                await asyncio.wait_for(release_termination.wait(), 10)
+                return await terminator(*args, **kwargs)
+
+            # test-contract: seam hold the shared group terminator while the process exits
+            monkeypatch.setattr(process_module, terminator_name, gated_terminator)
+            killing = asyncio.create_task(
+                registry.execute(ToolCall("kill", "task_kill", {"task_id": task_id}))
+            )
+            try:
+                await asyncio.wait_for(termination_entered.wait(), 10)
+                await asyncio.wait_for(
+                    registry.background_tasks.input(task_id, "x", eof=True), 10
+                )
+                terminal = await asyncio.wait_for(
+                    registry.background_tasks.wait(task_id), 10
+                )
+                assert terminal["exit_code"] == 7
+            finally:
+                release_termination.set()
             result = await asyncio.wait_for(killing, 10)
             assert result["content"][0]["text"] == (
                 f"background task {task_id} exited, code 7"
@@ -481,9 +703,7 @@ async def test_background_task_owner_state_table(
             assert outcome.get("exit_code") == 7
             return
 
-        task_id, _ = await registry.background_tasks.start(
-            _python("import time; time.sleep(30)"), Path.cwd()
-        )
+        task_id = await start_registered(_python("import time; time.sleep(30)"))
         if row == "3-external-cause":
             cause = "task safety deadline expired"
             outcome = await asyncio.wait_for(
