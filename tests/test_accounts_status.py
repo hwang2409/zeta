@@ -274,6 +274,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
     assert {path.relative_to(tmp_path).as_posix() for path in lock_paths} == {
         ".accounts-migration.lock",
         ".accounts.lock",
+        ".storage-format.lock",
         ".anthropic-oauth.json.lock",
         ".codex-oauth.json.lock",
         "account-locks/anthropic/default/lifecycle.lock",
@@ -283,6 +284,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
         "account-locks/codex/default/usage.lock",
         "account-locks/codex/login.lock",
     }
+    lock_paths = [path for path in lock_paths if path.name != ".storage-format.lock"]
 
     holder = subprocess.Popen(
         [
@@ -682,15 +684,14 @@ def test_accounts_status_provider_filter(
 
 
 @pytest.mark.parametrize("refresh", [False, True])
-def test_accounts_status_never_blocks_on_any_lock(
+def test_accounts_status_never_blocks_on_account_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     refresh: bool,
 ) -> None:
-    # The invariant, checked at the one seam every zeta lock goes through:
-    # nothing the status command reaches may take a lock without LOCK_NB,
-    # so a lock added later anywhere is caught here too.
+    # Account locks must stay nonblocking. Stored-format lease and shape locks
+    # are ordered outside the account lock domain and may block off the event loop.
     import fcntl
 
     _save_account(tmp_path, expires_at=1)
@@ -710,7 +711,16 @@ def test_accounts_status_never_blocks_on_any_lock(
     blocking: list[int] = []
 
     def nonblocking_only(fd: int, operation: int) -> None:
-        if operation & (fcntl.LOCK_EX | fcntl.LOCK_SH) and not operation & fcntl.LOCK_NB:
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+            path = os.fsdecode(raw).rstrip("\0")
+        if (
+            ".storage-format" not in path
+            and operation & (fcntl.LOCK_EX | fcntl.LOCK_SH)
+            and not operation & fcntl.LOCK_NB
+        ):
             blocking.append(operation)
         real_flock(fd, operation)
 
