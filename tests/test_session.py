@@ -2336,6 +2336,7 @@ def test_resume_picker_render_shows_preview(
             "zeta.core.session.ConversationStore", reject_read_only_store
         )
         monkeypatch.setattr("builtins.input", lambda prompt: "1")
+        original.loop.store.close()
         resumed = create_app(
             build_parser().parse_args(["--resume", "--provider", "codex"])
         )
@@ -2388,30 +2389,30 @@ def test_resume_picker_matches_direct_resume(
             )
         )
         manager = SessionManager(home)
-        first_opened = manager.open(first.loop.store.session_id)
-        second_opened = manager.open(second.loop.store.session_id)
-        try:
-            first_metadata = first_opened.metadata
-            second_metadata = second_opened.metadata
-            first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
-            second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
-            manager._write(first_metadata)
-            manager._write(second_metadata)
-        finally:
-            first_opened.store.close()
-            second_opened.store.close()
+        first_session_id = first.loop.store.session_id
+        second_session_id = second.loop.store.session_id
+        first_metadata = manager.read_metadata(first_session_id)
+        second_metadata = manager.read_metadata(second_session_id)
+        first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+        second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
+        manager._write(first_metadata)
+        manager._write(second_metadata)
+        first.loop.store.close()
+        second.loop.store.close()
         monkeypatch.setattr("builtins.input", lambda prompt: "2")
 
         picked = create_app(
             build_parser().parse_args(["--resume", "--provider", "codex"])
         )
+        picked_session_id = picked.loop.store.session_id
+        picked.loop.store.close()
         direct = create_app(
             build_parser().parse_args(
-                ["--resume", first.loop.store.session_id, "--provider", "codex"]
+                ["--resume", first_session_id, "--provider", "codex"]
             )
         )
 
-        assert picked.loop.store.session_id == direct.loop.store.session_id
+        assert picked_session_id == direct.loop.store.session_id
     finally:
 
         async def close_apps() -> None:
@@ -2582,6 +2583,7 @@ async def test_forced_override_commits_after_first_successful_request(
         return backend, "claude-sonnet-4-6"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    first.loop.store.close()
     app = await asyncio.to_thread(
         create_app,
         build_parser().parse_args(
@@ -2625,6 +2627,7 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
         return backend, "definitely-not-a-claude-model"
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    first.loop.store.close()
     app = await asyncio.to_thread(
         create_app,
         build_parser().parse_args(
@@ -3440,7 +3443,9 @@ async def test_resume_replays_historical_agent_wait_call_with_scripted_backend(
         )
     )
 
-    resumed = manager.open(opened.store.session_id)
+    session_id = opened.store.session_id
+    opened.store.close()
+    resumed = manager.open(session_id)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("resumed")])])
     loop = AgentLoop(backend, resumed.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("continue", origin=MessageOrigin.USER)]
@@ -3459,8 +3464,10 @@ async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
-    resumed = manager.open(opened.store.session_id)
     expected = await ContextAssembler(opened.store).assemble()
+    session_id = opened.store.session_id
+    opened.store.close()
+    resumed = manager.open(session_id)
     actual = await ContextAssembler(resumed.store).assemble()
 
     assert actual == expected
@@ -3475,7 +3482,9 @@ def test_resume_reemits_pending_approval_state(tmp_path: Path) -> None:
         [(call.id, call)],
     )
 
-    resumed = manager.open(opened.store.session_id)
+    session_id = opened.store.session_id
+    opened.store.close()
+    resumed = manager.open(session_id)
 
     assert resumed.store.pending_approvals() == [(call.id, call)]
 
@@ -3551,6 +3560,7 @@ def test_token_budget_override_pins_and_survives_resume(
     metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
     assert metadata["compaction_budget"] == 12345
     assert metadata["budget_pinned"] is True
+    first.loop.store.close()
 
     resumed = create_app(build_parser().parse_args(["--resume", session_id]))
     assert resumed.loop.context_assembler.token_budget == 12345
@@ -3566,17 +3576,19 @@ def test_resume_retunes_an_unpinned_budget_to_the_model(
     monkeypatch.setattr(
         "zeta.tui.app._load_model_catalog", lambda provider, **kwargs: None
     )
-    session_id = create_app(
+    first = create_app(
         build_parser().parse_args(
             ["--provider", "claude", "--model", "claude-opus-4-5"]
         )
-    ).loop.store.session_id
+    )
+    session_id = first.loop.store.session_id
     assert (
         json.loads((home / "sessions" / session_id / "meta.json").read_text())[
             "compaction_budget"
         ]
         == 200_000
     )
+    first.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(
@@ -3745,7 +3757,7 @@ def test_session_rename_cli_persists_and_clears(tmp_path, monkeypatch):
     session = manager.create(provider="codex", model="offline", cwd=tmp_path)
     sid = session.metadata.session_id
     assert main(["session", "rename", sid[:8], "  useful   name "]) == 0
-    assert SessionManager(tmp_path).open(sid).metadata.name == "useful name"
+    assert SessionManager(tmp_path).read_metadata(sid).name == "useful name"
     assert main(["session", "rename", sid, "  "]) == 0
     assert manager.read_metadata(sid).name == ""
     assert main(["session", "rename", "missing", "name"]) == 1
