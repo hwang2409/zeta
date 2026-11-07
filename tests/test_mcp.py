@@ -265,6 +265,19 @@ def _stdio_config(name: str = "fake") -> MCPServerConfig:
     return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", _stdio_source()))
 
 
+def _stderr_stdio_config(name: str, byte_count: int = 1) -> MCPServerConfig:
+    source = f"""
+import os
+remaining = {byte_count}
+chunk = b"x" * 65536
+while remaining:
+    written = os.write(2, chunk[:remaining])
+    remaining -= written
+os.close(2)
+""" + _stdio_source()
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
 def _failing_stdio_config(name: str = "fail") -> MCPServerConfig:
     source = _stdio_source().replace(
         '    elif method == "tools/call":\n        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}\n',
@@ -816,6 +829,97 @@ async def test_stdio_handshake_list_call_and_close(
     assert result["content"][0]["text"] == "hello"
     assert result["structuredContent"] == {"ok": True, "latency": 1.5}
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_is_private_under_public_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    client = StdioMCPClient(_stderr_stdio_config("private"))
+    previous_umask = os.umask(0o022)
+    try:
+        await client.connect()
+    finally:
+        os.umask(previous_umask)
+        await client.close()
+
+    log_directory = tmp_path / "mcp-logs"
+    assert log_directory.stat().st_mode & 0o777 == 0o700
+    assert (log_directory / "private.log").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_tightens_existing_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    log_directory = tmp_path / "mcp-logs"
+    log_directory.mkdir(mode=0o777)
+    log_directory.chmod(0o777)
+    log_path = log_directory / "existing.log"
+    log_path.write_bytes(b"old")
+    log_path.chmod(0o666)
+
+    client = StdioMCPClient(_stderr_stdio_config("existing"))
+    try:
+        await client.connect()
+    finally:
+        await client.close()
+
+    assert log_directory.stat().st_mode & 0o777 == 0o700
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert log_path.read_bytes() == b"oldx"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "hardlink"])
+async def test_stdio_stderr_log_rejects_link_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_kind: str
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    log_directory = tmp_path / "mcp-logs"
+    log_directory.mkdir(mode=0o700)
+    target = tmp_path / "target.log"
+    target.write_bytes(b"do not write")
+    log_path = log_directory / "unsafe.log"
+    if unsafe_kind == "symlink":
+        log_path.symlink_to(target)
+        reason = "symbolic link"
+    else:
+        os.link(target, log_path)
+        reason = "multiple links"
+
+    client = StdioMCPClient(_stderr_stdio_config("unsafe"))
+    try:
+        with pytest.raises(MCPTransportError) as raised:
+            await client.connect()
+        message = str(raised.value)
+        assert str(log_path) in message
+        assert reason in message
+    finally:
+        await client.close()
+    assert target.read_bytes() == b"do not write"
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_rotates_while_child_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    clients = [
+        StdioMCPClient(_stderr_stdio_config("bounded", 20 * 1024 * 1024)),
+        StdioMCPClient(_stderr_stdio_config("bounded", 1024 * 1024)),
+    ]
+    try:
+        await asyncio.gather(*(client.connect() for client in clients))
+    finally:
+        await asyncio.gather(*(client.close() for client in clients))
+
+    logs = sorted((tmp_path / "mcp-logs").glob("bounded.log*"))
+    assert 2 <= len(logs) <= 3
+    assert all(path.stat().st_size <= 2 * 1024 * 1024 for path in logs)
+    assert sum(path.stat().st_size for path in logs) <= 6 * 1024 * 1024
 
 
 @pytest.mark.asyncio
