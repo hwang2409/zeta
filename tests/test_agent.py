@@ -11011,7 +11011,7 @@ async def test_finish_gate_task_without_exit_reports_safety_bound(
     await asyncio.wait_for(deadlines.started_event.wait(), 10)
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire(state)
-    await run
+    await asyncio.wait_for(run, 10)
     notification = await _completion_after_publication(store, completion_published)
     text = notification.data["text"]
     assert "finish-gate task safety bound expired" in text
