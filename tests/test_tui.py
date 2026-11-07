@@ -11950,7 +11950,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
     mark_task: asyncio.Task[None] | None = None
 
     async def finish_mark(revision: int) -> None:
-        await release_mark.wait()
+        await asyncio.wait_for(release_mark.wait(), 10)
         original_mark_persisted(revision)
         mark_finished.set()
 
@@ -11990,7 +11990,7 @@ async def test_later_successful_snapshot_clears_earlier_failure(
         assert persistence.load() == "second"
         release_mark.set()
         await asyncio.wait_for(mark_finished.wait(), 10)
-        assert persistence._pending_text is None
+        assert persistence.pending_text is None
     finally:
         release_mark.set()
         if mark_task is not None:
