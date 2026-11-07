@@ -111,8 +111,7 @@ class ServerSlashSession:
 
     async def slash_decisions(self, args: str) -> str:
         from ..attention_decisions import open_decisions
-        from ..attention_forks import deliver_attention_decision
-        from ..attention_records import AttentionStore
+        from ..attention_replies import AttentionReplies
 
         loop = self._runtime.loop
         opened = self._runtime.opened
@@ -120,6 +119,9 @@ class ServerSlashSession:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         parts = args.split(maxsplit=2)
         registry_state = self._runtime.manager.project_registry_state
+        await asyncio.to_thread(
+            AttentionReplies(self._runtime.home, opened.metadata.session_id, registry_state=registry_state).recover
+        )
         items = await asyncio.to_thread(
             open_decisions,
             self._runtime.home,
@@ -132,21 +134,17 @@ class ServerSlashSession:
             item = next((item for item in items if item.record.id == parts[1]), None)
             if item is None:
                 return "attention item not found"
-            store = AttentionStore(self._runtime.home / "sessions" / item.session_id)
+            replies = AttentionReplies(self._runtime.home, item.session_id, registry_state=registry_state)
             if parts[0] == "dismiss":
-                await asyncio.to_thread(
-                    store.dismiss, item.record.id, session_id=item.session_id
-                )
+                await asyncio.to_thread(replies.dismiss, item.record.id)
                 return f"dismissed {item.record.id}"
             if len(parts) < 3 or not parts[2].strip():
                 return "reply text must be nonempty"
             await asyncio.to_thread(
-                deliver_attention_decision,
-                self._runtime.home,
-                item.record,
+                replies.reply,
+                item.record.id,
                 parts[2],
-                from_session=opened.metadata.session_id,
-                registry_state=registry_state,
+                opened.metadata.session_id,
             )
             return f"replied to {item.record.id}"
         if not items:

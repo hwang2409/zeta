@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 from typing import TypedDict
 
-from ...attention_forks import (
-    deliver_attention_decision,
-    validate_attention_fork,
-)
+from ...attention_forks import validate_attention_fork
 from ...attention_records import AttentionStore
+from ...attention_replies import AttentionReplies
 from ...protocol.types import StructuredToolResult
 from ...runtime.project_registry_state import ProjectRegistryState
 from .._results import _success_result, text_block
@@ -43,13 +41,14 @@ async def _resolve_attention(
         directory_fd=store.directory_fd,
         registry_state=state,
     )
-    message_id, record, already_resolved = await asyncio.to_thread(
-        deliver_attention_decision,
-        home,
-        validated.record,
+    message_id, already_resolved = await asyncio.to_thread(
+        AttentionReplies(home, validated.record.session_id, registry_state=state).reply,
+        validated.record.id,
         arguments["decision"],
-        from_session=store.session_id,
-        registry_state=state,
+        store.session_id,
+    )
+    record = await asyncio.to_thread(
+        AttentionStore(store.session_dir).get, validated.record.id
     )
     if already_resolved:
         return _success_result(
@@ -74,12 +73,12 @@ async def _close_attention(
     registry: ToolRegistry, arguments: CloseAttentionArguments
 ) -> StructuredToolResult:
     store = registry.session_store
-    record, already_resolved = await asyncio.to_thread(
-        AttentionStore(store.session_dir).resolve,
-        arguments["attention_id"],
-        session_id=store.session_id,
-        decision=arguments["decision"],
+    home = store.session_dir.parent.parent
+    _message_id, already_resolved = await asyncio.to_thread(
+        AttentionReplies(home, store.session_id, registry_state=registry.project_registry_state).reply,
+        arguments["attention_id"], arguments["decision"], store.session_id,
     )
+    record = await asyncio.to_thread(AttentionStore(store.session_dir).get, arguments["attention_id"])
     if already_resolved:
         return _success_result(
             text_block(f"Decision was already resolved ({record.id})."),

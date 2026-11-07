@@ -86,9 +86,12 @@ class DecisionsMixin:
             self.open_decisions_panel()
             return ""
         from ...attention_decisions import open_decisions
-        from ...attention_records import AttentionStore
+        from ...attention_replies import AttentionReplies
 
         parts = args.split(maxsplit=2)
+        await asyncio.to_thread(
+            AttentionReplies(self._home, self._decisions_session_id, registry_state=_registry_state(self)).recover
+        )
         items = await asyncio.to_thread(
             open_decisions,
             self._home,
@@ -106,22 +109,15 @@ class DecisionsMixin:
                 return "attention item not found"
             if parts[0] == "dismiss":
                 await asyncio.to_thread(
-                    AttentionStore(self._home / "sessions" / record.session_id).dismiss,
+                    AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).dismiss,
                     attention_id,
-                    session_id=record.session_id,
                 )
                 return f"dismissed {attention_id}"
             if len(parts) < 3 or not parts[2].strip():
                 return "reply text must be nonempty"
-            from ...attention_forks import deliver_attention_decision
-
             await asyncio.to_thread(
-                deliver_attention_decision,
-                self._home,
-                record,
-                parts[2],
-                from_session=self.loop.store.session_id,
-                registry_state=_registry_state(self),
+                AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self)).reply,
+                record.id, parts[2], self.loop.store.session_id,
             )
             return f"replied to {attention_id}"
         if not items:
@@ -195,6 +191,7 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_open = False
+        asyncio.create_task(self._flush_staged_decisions())
         self._decisions_panel.exit_answer()
         self._stop_decisions_refresh()
         session = self._active_session
@@ -204,6 +201,21 @@ class DecisionsMixin:
             )
             session.layout.focus(session.default_buffer)
         self._invalidate_prompt()
+
+    async def _flush_staged_decisions(self) -> None:
+        from ...attention_replies import AttentionReplies
+
+        try:
+            for session_id in self._decisions_session_ids():
+                await asyncio.to_thread(
+                    AttentionReplies(self._home, session_id, registry_state=_registry_state(self)).flush,
+                    self.loop.store.session_id,
+                )
+        except (OSError, ValueError) as exc:
+            self._print_system(f"decisions not delivered: {exc}")
+
+    def _decisions_session_ids(self) -> tuple[str, ...]:
+        return tuple({item.session_id for item in self._decisions_panel.items})
 
     def _start_decisions_refresh(self) -> None:
         self._stop_decisions_refresh()
@@ -300,17 +312,13 @@ class DecisionsMixin:
         record = item.record
 
         async def run() -> None:
-            from ...attention_forks import deliver_attention_decision
+            from ...attention_replies import AttentionReplies
 
             try:
-                await asyncio.to_thread(
-                    deliver_attention_decision,
-                    self._home,
-                    record,
-                    decision,
-                    from_session=self.loop.store.session_id,
-                    registry_state=_registry_state(self),
-                )
+                replies = AttentionReplies(self._home, record.session_id, registry_state=_registry_state(self))
+                await asyncio.to_thread(replies.stage, record.id, decision)
+                if len(self._decisions_panel.items) <= 1:
+                    await asyncio.to_thread(replies.flush, self.loop.store.session_id)
             except (OSError, ValueError) as exc:
                 self._print_system(f"decision not delivered: {exc}")
             await self._decisions_tick()
@@ -325,13 +333,12 @@ class DecisionsMixin:
             return
 
         async def run() -> None:
-            from ...attention_records import AttentionStore
+            from ...attention_replies import AttentionReplies
 
             try:
                 await asyncio.to_thread(
-                    AttentionStore(self._home / "sessions" / item.session_id).dismiss,
+                    AttentionReplies(self._home, item.session_id, registry_state=_registry_state(self)).dismiss,
                     item.record.id,
-                    session_id=item.session_id,
                 )
             except (OSError, ValueError) as exc:
                 self._print_system(f"attention not dismissed: {exc}")
