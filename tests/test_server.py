@@ -870,13 +870,22 @@ class PerActorFakeBackend:
             and self.child_calls[child_prompt] == self.gated_child_call
         ):
             self.child_started[child_prompt].set()
-            await self.release_children.wait()
+            try:
+                await asyncio.wait_for(self.release_children.wait(), TIMEOUT)
+            except TimeoutError as error:
+                raise AssertionError("children were not released") from error
         stream = backend.complete(messages, tool_schemas)
         if child_prompt is None and self.parent.calls:
-            await asyncio.gather(
-                *(started.wait() for started in self.child_started.values())
-            )
             try:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(started.wait() for started in self.child_started.values())
+                        ),
+                        TIMEOUT,
+                    )
+                except TimeoutError as error:
+                    raise AssertionError("child did not start") from error
                 yield await anext(stream)
             finally:
                 self.release_children.set()
