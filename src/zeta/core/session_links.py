@@ -190,7 +190,7 @@ class ChildLineagePublisher:
             self._owner_active = True
             observed_generation = self._generation
 
-        def ready_collected() -> None:
+        def ready_collection_started() -> None:
             nonlocal observed_generation
             with self._mutex:
                 observed_generation = self._generation
@@ -201,7 +201,7 @@ class ChildLineagePublisher:
                     self._project_registry,
                     self._root_session_dir.parent,
                     self._root_session_dir.name,
-                    ready_collected=ready_collected,
+                    ready_collection_started=ready_collection_started,
                 )
                 if outcome == "failed":
                     raise ProjectRegistryError("child project lineage remains pending")
@@ -244,7 +244,7 @@ def _reconcile_child_links_pass(
     sessions_dir: os.PathLike[str] | str,
     session_id: str,
     *,
-    ready_collected: Callable[[], None] | None = None,
+    ready_collection_started: Callable[[], None] | None = None,
 ) -> _ReconcileOutcome:
     try:
         with session_directory(sessions_dir, session_id) as (_, session_fd):
@@ -259,8 +259,8 @@ def _reconcile_child_links_pass(
             except OSError:
                 return "failed"
             try:
-                if ready_collected is not None:
-                    ready_collected()
+                if ready_collection_started is not None:
+                    ready_collection_started()
                 intents, more, failed = _collect_pending_intents(pending_fd, session_fd)
                 if failed:
                     return "failed"
