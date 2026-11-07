@@ -224,7 +224,7 @@ async def test_live_skill_refresh_discards_stale_plan_prompt(
     assert await asyncio.to_thread(scanned.wait, 5)
     loop.set_plan_mode(True)
     release.set()
-    await refresh
+    await asyncio.wait_for(refresh, timeout=10)
 
     assert loop.plan_mode is True
     assert "live description" not in _runtime_text(loop)
@@ -298,7 +298,7 @@ async def test_live_skill_refresh_discards_stale_memory_prompt(
         )
     )
     release.set()
-    await refresh
+    await asyncio.wait_for(refresh, timeout=10)
 
     assert changed_memory in _runtime_text(loop)
     assert "live description" not in _runtime_text(loop)

@@ -11577,7 +11577,7 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     loop.set_mcp_scope(home=home, project_dir=parent_cwd)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await backend.child_started.wait()
+    await asyncio.wait_for(backend.child_started.wait(), timeout=10)
     child_loops = getattr(loop._background_owner, "project_context_loops", {})
     assert child_loops, "spawned child did not publish its project-context state"
     child_loop = next(iter(child_loops.values()))
