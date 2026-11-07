@@ -12924,7 +12924,7 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
 
 
 
-def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
+def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
@@ -12932,7 +12932,10 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
-    store.append_message(build_nudge_message())
+    nudge = build_nudge_message()
+    assert nudge.role is MessageRole.SYSTEM
+    assert nudge.content[0].text.startswith("[zeta] empty-turn recovery:")
+    store.append_message(nudge)
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
     )
@@ -12948,7 +12951,8 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
 
     rendered = Text.from_ansi(output.getvalue()).plain
     assert "here is the answer" in rendered
-    assert "ended your turn" not in rendered
+    assert "[zeta] empty-turn recovery:" in rendered
+    assert rendered.count("do the thing") == 1
 
 
 @pytest.mark.asyncio

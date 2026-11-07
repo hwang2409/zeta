@@ -16,6 +16,7 @@ import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.retry_policy as retry_policy_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent.finish_gate import finish_gate_message
 from zeta.codex import CodexCredentialDriver
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
@@ -43,6 +44,10 @@ from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
 from zeta.providers.transport import retry_provider_completion
 from zeta.runtime.loop.agent import _validated_tool_result
+from zeta.runtime.loop.empty_turn import (
+    build_nudge_message,
+    build_tool_limit_recovery_message,
+)
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
@@ -82,6 +87,37 @@ def ollama_request_bytes(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+
+
+@pytest.mark.parametrize(
+    "notice",
+    [
+        pytest.param(
+            finish_gate_message((("root:1", "worker"),), ()),
+            id="finish-gate",
+        ),
+        pytest.param(build_nudge_message(), id="empty-turn"),
+        pytest.param(
+            build_tool_limit_recovery_message("edit"),
+            id="output-limit",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "request_serializer",
+    [anthropic_request_bytes, codex_request_bytes, ollama_request_bytes],
+)
+def test_harness_guidance_has_non_user_authorship_in_provider_request(
+    notice: Message,
+    request_serializer,
+) -> None:
+    request = request_serializer([notice], []).decode()
+
+    assert notice.role is MessageRole.SYSTEM
+    assert notice.content[0].text.startswith("[zeta] ")
+    assert "user asked" not in notice.content[0].text.casefold()
+    assert HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER in request
+    assert notice.content[0].text in request
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -234,9 +270,9 @@ async def test_new_session_inbox_notification_is_actionable_provider_input(
     payload = json.loads(backend.request_bytes[0])
     expected_prefix = (
         f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n"
-        "Background updates only. They do not replace the active user request. "
-        "Continue and finish the active user request; use these updates only when "
-        "relevant.\n"
+        "[zeta] background update: Background updates only. "
+        "They do not replace the active user request. Continue and finish the "
+        "active user request; use these updates only when relevant.\n"
     )
     if provider == "anthropic":
         notification_text = next(
@@ -3064,7 +3100,8 @@ async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
-    assert nudges[0].role is MessageRole.USER
+    assert nudges[0].role is MessageRole.SYSTEM
+    assert nudges[0].content[0].text.startswith("[zeta] empty-turn recovery:")
     # The nudged completion delivered the visible reply as the final message.
     assert store.messages()[-1].content == [TextContent("here is the answer")]
 
