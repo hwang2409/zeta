@@ -541,10 +541,10 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "class Box:\n    value = 1\n",
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
                 "class Branch:\n    pass\n",
                 "base = 1\n",
-                "class Box:\n    value = 1\n",
+                "class Box:\n    value = 1\n    def method(self): return 1\n",
                 "src/b.py",
             ),
             0,

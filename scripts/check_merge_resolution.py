@@ -653,6 +653,8 @@ def _final_match(
         return True
     if finding.path == item.path or finding.kind != item.kind:
         return False
+    if finding.kind in {"def", "async def"} and "." in finding.name:
+        return _unique_class_member_match(finding, item, final_items)
     if finding.kind in {"def", "async def", "class"}:
         return _unique_definition_match(finding, item, final_items)
     if finding.kind in {"assignment", "constant"}:
