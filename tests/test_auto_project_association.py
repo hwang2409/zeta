@@ -646,6 +646,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         discovery_threads.append(threading.get_ident())
         return run_discovery_git(*args, **kwargs)
 
+    # test-contract: seam observe the real Git subprocess seam through TUI dispatch
     monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
     plain = tmp_path / "plain"
     plain.mkdir()

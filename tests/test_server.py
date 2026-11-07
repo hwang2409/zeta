@@ -6517,6 +6517,7 @@ async def test_serve_project_init_runs_discovery_off_loop(
         discovery_threads.append(threading.get_ident())
         return run_discovery_git(*args, **kwargs)
 
+    # test-contract: seam observe the real Git subprocess seam through socket RPC
     monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
