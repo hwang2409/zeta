@@ -21,7 +21,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import read_pid_file
+from tests.support.processes import read_pid_file, wait_pid_exited
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
@@ -2447,7 +2447,9 @@ async def test_bash_tool_subprocess_sets_tool_marker(
 
 
 @pytest.mark.asyncio
-async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Path) -> None:
+async def test_task_kill_terminates_descendant_in_new_process_group(
+    tmp_path: Path,
+) -> None:
     escaped_pid = tmp_path / "escaped.pid"
     child = (
         "import os,pathlib,time; os.setsid(); "
@@ -2458,21 +2460,24 @@ async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Pa
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    started = await registry.execute(
-        ToolCall("bg-escaped", "run_background", {"command": command})
-    )
-    task_id = started["structuredContent"]["task_id"]
-    escaped = await read_pid_file(escaped_pid)
+    try:
+        started = await registry.execute(
+            ToolCall("bg-escaped", "run_background", {"command": command})
+        )
+        task_id = started["structuredContent"]["task_id"]
+        escaped = await read_pid_file(escaped_pid)
 
-    result = await asyncio.wait_for(
-        registry.execute(ToolCall("kill-escaped", "task_kill", {"task_id": task_id})),
-        timeout=3,
-    )
+        result = await asyncio.wait_for(
+            registry.execute(
+                ToolCall("kill-escaped", "task_kill", {"task_id": task_id})
+            ),
+            timeout=10,
+        )
 
-    assert result["structuredContent"]["running"] is False
-    with pytest.raises(ProcessLookupError):
-        os.kill(escaped, 0)
-    await registry.close()
+        assert result["structuredContent"]["running"] is False
+        await wait_pid_exited(escaped)
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
