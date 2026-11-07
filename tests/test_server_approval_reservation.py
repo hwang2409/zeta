@@ -681,6 +681,12 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
+        assert server.runtime.loop is not None
+        monkeypatch.setattr(
+            server.runtime.loop,
+            "transcript_index_failure",
+            lambda _session_id: "disk full; pending changes will retry",
+        )
         await _read_raw(reader)  # approval_request
         event = json.loads((await _read_raw(reader)).decode())
         assert event["method"] == "event"
@@ -708,7 +714,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
 
 
 @pytest.mark.asyncio
-async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
+async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _controller_reader, controller_writer, call = await _approval_server(
@@ -730,6 +736,12 @@ async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
     )
     try:
         await _make_unhealthy(server, call, monkeypatch)
+        assert server.runtime.loop is not None
+        monkeypatch.setattr(
+            server.runtime.loop,
+            "transcript_index_failure",
+            lambda _session_id: "disk full; pending changes will retry",
+        )
         response = (await _request(observer_reader, observer_writer, 11, "status"))[-1]
         result = response["result"]
         assert set(result) == {
@@ -739,8 +751,12 @@ async def test_observer_persistent_approval_failure_keeps_legacy_status_shape(
             "pending_approvals",
             "usage",
             "compaction_markers",
+            "transcript_index_failure",
         }
         assert result["state"] == "idle"
+        assert result["transcript_index_failure"] == (
+            "disk full; pending changes will retry"
+        )
         mutation = (
             await _request(
                 observer_reader, observer_writer, 12, "send", {"text": "nope"}

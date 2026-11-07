@@ -665,16 +665,17 @@ async def test_refreshes_coalesce_per_project(
 
 
 @pytest.mark.asyncio
-async def test_refresh_sqlite_failure_is_best_effort(
+async def test_refresh_sqlite_failure_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     def fail(*args, **kwargs) -> None:
         raise sqlite3.OperationalError("disk full")
 
     monkeypatch.setattr(index_module, "_refresh_sources", fail)
-    await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
-    )
+    with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
+        await refresh_transcript_index(
+            tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
+        )
     assert "could not refresh transcript index" in caplog.text
 
 
@@ -713,9 +714,10 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
         original(*args)
 
     monkeypatch.setattr(index_module, "_refresh_sources", fail_once)
-    await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
-    )
+    with pytest.raises(index_module.TranscriptIndexError, match="database is locked"):
+        await refresh_transcript_index(
+            tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
+        )
     await refresh_transcript_index(
         tmp_path / "projects", PROJECT_A, second.session_id, second.session_dir
     )
@@ -724,6 +726,155 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
     assert index.status().session_count == 2
     assert index.search("first canary")
     assert index.search("second canary")
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_append_refresh_stays_degraded_until_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole, TextContent
+
+    projects_root = tmp_path / "projects"
+    store = ConversationStore(tmp_path / "sessions", session_id="one")
+    store.enable_persisted_append_tracking()
+    metadata = {"project_id": PROJECT_A}
+    (store.session_dir / "meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    def message(role: MessageRole, text: str) -> Message:
+        key = "zeta.origin" if role == MessageRole.USER else "response_state"
+        value = "user" if role == MessageRole.USER else "completed"
+        return Message(role, [TextContent(text)], metadata={key: value})
+
+    store.append_message(message(MessageRole.USER, "first indexed question"))
+    store.append_message(message(MessageRole.ASSISTANT, "first indexed answer"))
+    await refresh_transcript_index(
+        projects_root,
+        PROJECT_A,
+        store.session_id,
+        store.session_dir,
+        store.take_persisted_appends(),
+    )
+
+    await store.append_message_async(
+        message(MessageRole.USER, "durableretrycanary")
+    )
+    await store.append_message_async(
+        message(MessageRole.ASSISTANT, "durable retry answer")
+    )
+    receipts = store.take_persisted_appends()
+    original_refresh = index_module._refresh_sources
+    refresh_calls = 0
+
+    def fail_once(*args) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            raise sqlite3.OperationalError("disk full")
+        original_refresh(*args)
+
+    monkeypatch.setattr(index_module, "_refresh_sources", fail_once)
+    with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
+        await refresh_transcript_index(
+            projects_root,
+            PROJECT_A,
+            store.session_id,
+            store.session_dir,
+            receipts,
+        )
+
+    index = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    assert any(
+        entry.data["message"]["content"][0]["text"] == "durableretrycanary"
+        for entry in store.replay()
+        if entry.type == "message"
+    )
+    assert index.search("first indexed question")
+    assert index.search("durableretrycanary") == ()
+    failure = getattr(
+        index_module,
+        "transcript_index_refresh_failure",
+        lambda *_args: None,
+    )(projects_root, PROJECT_A, store.session_id)
+    assert failure == (
+        "disk full; pending changes will retry after the next transcript refresh"
+    )
+
+    await refresh_transcript_index(
+        projects_root,
+        PROJECT_A,
+        store.session_id,
+        store.session_dir,
+    )
+
+    assert refresh_calls == 2
+    assert len(index.search("durableretrycanary")) == 1
+    assert index_module.transcript_index_refresh_failure(
+        projects_root, PROJECT_A, store.session_id
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import PersistedAppend
+    from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
+
+    projects_root = tmp_path / "projects"
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "boundedretrycanary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    (source.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
+    )
+    original_refresh = index_module._refresh_sources
+
+    def fail(*args) -> None:
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(index_module, "_refresh_sources", fail)
+    for offset in range(MAX_PENDING_APPEND_RECEIPTS + 1):
+        receipt = PersistedAppend(
+            start_offset=offset,
+            end_offset=offset + 1,
+            digest=f"{offset:064x}",
+            source_device=1,
+            source_inode=1,
+            before_mtime_ns=offset,
+            before_ctime_ns=offset,
+            after_mtime_ns=offset + 1,
+            after_ctime_ns=offset + 1,
+        )
+        with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
+            await refresh_transcript_index(
+                projects_root,
+                PROJECT_A,
+                source.session_id,
+                source.session_dir,
+                (receipt,),
+            )
+
+    states = index_module._REFRESH_STATES[asyncio.get_running_loop()]
+    pending = states[(projects_root.resolve(), PROJECT_A)].pending[source.session_id]
+    assert pending.append_receipts is None
+
+    monkeypatch.setattr(index_module, "_refresh_sources", original_refresh)
+    await refresh_transcript_index(
+        projects_root,
+        PROJECT_A,
+        source.session_id,
+        source.session_dir,
+        (receipt,),
+    )
+
+    index = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
+    assert len(index.search("boundedretrycanary")) == 1
 
 
 @pytest.mark.asyncio

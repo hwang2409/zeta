@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
-from zeta.core.store import PersistedAppend
+from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS, PersistedAppend
 from zeta.memory.safety import redact_secrets
 from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.source import (
@@ -440,6 +440,7 @@ class _RefreshState:
     pending: dict[str, TranscriptSource] = field(default_factory=dict)
     waiters: list[asyncio.Future[None]] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
+    failure: str | None = None
 
 
 _REFRESH_STATES: weakref.WeakKeyDictionary[
@@ -1045,6 +1046,21 @@ def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
     return EvalResult(len(targets), recall, sum(reciprocal) / len(reciprocal))
 
 
+def transcript_index_refresh_failure(
+    projects_root: Path, project_id: str, session_id: str
+) -> str | None:
+    """Return this loop's refresh failure for one indexed session."""
+    try:
+        states = _REFRESH_STATES.get(asyncio.get_running_loop(), {})
+    except RuntimeError:
+        return None
+    key = (Path(projects_root), project_id)
+    state = states.get(key)
+    if state is None or session_id not in state.pending:
+        return None
+    return state.failure
+
+
 async def refresh_transcript_index(
     projects_root: Path,
     project_id: str,
@@ -1077,6 +1093,7 @@ async def _drain_refreshes(
     state: _RefreshState,
     states: dict[tuple[Path, str], _RefreshState],
 ) -> None:
+    failure: TranscriptIndexError | None = None
     try:
         while state.pending:
             pending = tuple(state.pending.values())
@@ -1085,23 +1102,34 @@ async def _drain_refreshes(
                 await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
             except (OSError, sqlite3.Error, TranscriptIndexError, TypeError, ValueError) as exc:
                 logger.warning("could not refresh transcript index: %s", exc)
-                if _transient_sqlite_contention(exc):
-                    for source in pending:
-                        newer = state.pending.get(source.session_id)
-                        state.pending[source.session_id] = (
-                            _merge_refresh_sources(source, newer)
-                            if newer is not None
-                            else source
-                        )
+                for source in pending:
+                    newer = state.pending.get(source.session_id)
+                    state.pending[source.session_id] = (
+                        _merge_refresh_sources(source, newer)
+                        if newer is not None
+                        else source
+                    )
+                state.failure = (
+                    f"{exc}; pending changes will retry after the next transcript refresh"
+                )
+                failure = TranscriptIndexError(
+                    f"could not refresh transcript index: {exc}"
+                )
                 break
+            else:
+                state.failure = None
     finally:
         waiters, state.waiters = state.waiters, []
         state.task = None
         if not state.pending:
             states.pop(key, None)
         for waiter in waiters:
-            if not waiter.done():
+            if waiter.done():
+                continue
+            if failure is None:
                 waiter.set_result(None)
+            else:
+                waiter.set_exception(failure)
 
 
 def _merge_refresh_sources(
@@ -1112,24 +1140,8 @@ def _merge_refresh_sources(
         if earlier.append_receipts is not None and later.append_receipts is not None
         else None
     )
+    receipts = None if receipts is not None and len(receipts) >= MAX_PENDING_APPEND_RECEIPTS else receipts
     return replace(later, append_receipts=receipts)
-
-
-def _transient_sqlite_contention(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    while current is not None:
-        if isinstance(current, sqlite3.OperationalError):
-            code = getattr(current, "sqlite_errorcode", None)
-            if isinstance(code, int) and code & 0xFF in {
-                sqlite3.SQLITE_BUSY,
-                sqlite3.SQLITE_LOCKED,
-            }:
-                return True
-            message = str(current).casefold()
-            if "locked" in message or "busy" in message:
-                return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _refresh_sources(

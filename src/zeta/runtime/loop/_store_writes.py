@@ -13,6 +13,7 @@ from ...protocol.types import ContentBlock, Message
 from ...transcript_search.index import (
     is_indexable_top_level_project_session,
     refresh_transcript_index,
+    transcript_index_refresh_failure,
 )
 
 if TYPE_CHECKING:
@@ -67,6 +68,19 @@ class StoreWriteMixin:
             tool_registry.project_id = metadata.project_id
         if metadata.project_id is not None:
             self._schedule_transcript_index()
+
+    def transcript_index_failure(
+        self: AgentLoop, session_id: str | None = None
+    ) -> str | None:
+        registry = self.project_registry
+        project_id = self.root_project_id
+        if registry is None or project_id is None:
+            return None
+        return transcript_index_refresh_failure(
+            registry.root,
+            project_id,
+            session_id or self.store.session_id,
+        )
 
     def _schedule_transcript_index(self: AgentLoop) -> None:
         """Refresh completed turns after their transcript rows are durable."""
