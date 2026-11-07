@@ -9,9 +9,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -29,169 +33,163 @@ def _load_sandbox():
     return module
 
 
-# The serve probe path from scripts/bench/bench.py (sandbox, pinned clone,
-# in-process ZetaServer, hello, resume) on a session whose stored provider is
-# claude, then one send so a turn reaches whatever provider resume selected.
-# The keychain fallback stays reachable, as in the 2026-11-07 runs: ZETA_HOME
-# and CLAUDE_CONFIG_DIR are not exported, and the keychain read is stubbed to
-# return fake Claude tokens. A recorder hook, added after the guard, sees every
-# connect and name lookup the guard lets through and refuses non-local ones, so
-# the test never reaches the network.
-PROBE = r"""
-import asyncio, json, os, shutil, sys, tempfile, time
-from pathlib import Path
+# Installed as sitecustomize in the bench.py process, so it applies to the
+# unmodified harness. The recorder logs any connect or name lookup to a
+# non-local host and ends the process at once, so nothing reaches the network.
+# Once the harness adds its own audit hook (the sandbox network guard), the
+# recorder moves behind it and sees only what the guard let through. The
+# keychain read returns fake Claude tokens, so the fallback stays reachable
+# without touching the real keychain.
+SITECUSTOMIZE = r"""
+import os, sys, time
 
-sys.path.insert(0, sys.argv[1])
-out = Path(sys.argv[2])
-from sandbox import Sandbox, pin_stub_provider
-
-from zeta.core.session import SessionManager
-from zeta.oauth import OAuthTokens
-from zeta.providers import anthropic, retry_policy
-from zeta.server import ZetaServer
-
-LOCAL = {"127.0.0.1", "localhost", "::1"}
-escaped, keychain_reads = [], []
+_LOCAL = {"127.0.0.1", "localhost", "::1"}
+_moved = []
 
 
-def recorder(event, args):
+def _record(event, args):
     host = None
     if event == "socket.getaddrinfo":
         host = args[0].decode() if isinstance(args[0], bytes) else args[0]
     elif event == "socket.connect" and isinstance(args[1], tuple):
         host = args[1][0]
-    if host and host not in LOCAL:
-        escaped.append(f"{event} {host}")
-        raise ConnectionRefusedError(f"test recorder refused {host}")
+    if host and host not in _LOCAL:
+        with open(os.environ["BENCH_TEST_RECORD"], "a") as handle:
+            handle.write(f"{event} {host}\n")
+        os._exit(97)
 
 
-def fake_keychain():
-    keychain_reads.append(1)
-    return OAuthTokens("fake-access", "fake-refresh", time.time() + 3600)
+def _early(event, args):
+    if not _moved:
+        _record(event, args)
 
 
-anthropic._keychain_claude_tokens = fake_keychain
-# Each refused attempt is retried; skip the backoff so the test stays fast.
-retry_policy.retry_wait_seconds = lambda *args: 0.0
+_add = sys.addaudithook
 
 
-async def probe(home, sid):
-    # A short path: AF_UNIX paths are limited to about 100 bytes.
-    sock = Path(tempfile.mkdtemp(prefix="zb-", dir="/tmp")) / "s.sock"
-    server = await asyncio.to_thread(
-        lambda: ZetaServer(
-            home=home,
-            socket_path=sock,
-            provider="ollama",
-            model="bench-stub",
-            auto_memory=False,
-            approval_reconnect_grace=0,
-        )
-    )
-    await server.start()
-    reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)
-    ident = 0
-
-    async def call(method, params):
-        nonlocal ident
-        ident += 1
-        line = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
-        writer.write((json.dumps(line) + "\n").encode())
-        await writer.drain()
-
-    async def frame():
-        return json.loads(await asyncio.wait_for(reader.readline(), 60))
-
-    try:
-        await call("hello", {"protocol_version": "1.2"})
-        await call("resume", {"session_id": sid})
-        await call("send", {"text": "hi"})
-        while (event := (await frame()).get("params", {}).get("event")) not in {
-            "agent_end",
-            "error",
-        }:
-            pass
-        return event
-    finally:
-        writer.close()
-        await server.close()
-        sock.unlink(missing_ok=True)
-        shutil.rmtree(sock.parent, ignore_errors=True)
+def _add_then_record(hook):
+    _add(hook)
+    if not _moved:
+        _moved.append(hook)
+        _add(_record)
 
 
-result = {}
-try:
-    with Sandbox("sandbox-test") as box:
-        home = box.root / "home"
-        sessions = {}
-        for name in ("pinned", "unpinned"):
-            opened = SessionManager(home).create(
-                provider="claude",
-                model="claude-opus-5-5",
-                cwd=box.root,
-                auto_project=False,
-            )
-            sessions[name] = opened.metadata.session_id
-            opened.store.close()
-        pin_stub_provider(home / "sessions" / sessions["pinned"])
-        box.use_home(home)
-        for name in ("ZETA_HOME", "ZETA_ACCOUNT_HOME", "CLAUDE_CONFIG_DIR"):
-            os.environ.pop(name, None)
-        sys.addaudithook(recorder)
-        for name, sid in sessions.items():
-            seen = len(box.stub.requests)
-            reads = len(keychain_reads)
-            end = asyncio.run(probe(home, sid))
-            result[name] = {
-                "end": end,
-                "stub_requests": len(box.stub.requests) - seen,
-                "keychain_reads": len(keychain_reads) - reads,
-            }
-except SystemExit as exc:
-    result["guard"] = str(exc)
-result["escaped"] = escaped
-out.write_text(json.dumps(result))
+sys.addaudithook = _add_then_record
+_add(_early)
+
+from zeta.oauth import OAuthTokens
+from zeta.providers import anthropic
+
+anthropic._keychain_claude_tokens = lambda: OAuthTokens(
+    "fake-access", "fake-refresh", time.time() + 3600
+)
 """
 
+# bench.py's default sources, resolved under the throwaway HOME.
+SOURCES = {
+    "phoebe": "7897c1aed2e5444caba907f462306b10",
+    "orchestrator": "86e3d775a40b42ceaa76ca571e27ff1b",
+}
 
-def test_serve_probe_reaches_only_the_local_stub(tmp_path: Path) -> None:
-    out = tmp_path / "result.json"
+
+def _source_sessions(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two sessions stored with provider claude, each with an undelivered child
+    notification, so a serve resume starts a turn on the stored provider."""
+    from zeta.core import session
+    from zeta.core.session import SessionManager
+
+    real_uuid4 = uuid.uuid4
+    for sid in SOURCES.values():
+        ids = iter([uuid.UUID(sid)])
+        monkeypatch.setattr(
+            session.uuid, "uuid4", lambda ids=ids: next(ids, None) or real_uuid4()
+        )
+        opened = SessionManager(home / ".zeta").create(
+            provider="claude",
+            model="claude-opus-5-5",
+            cwd=home,
+            auto_project=False,
+        )
+        try:
+            assert opened.metadata.session_id == sid
+            opened.store.append_agent_notification(
+                f"{sid}:1",
+                child_session_path=str(home / "child"),
+                description="child",
+                status="completed",
+                text="done",
+            )
+        finally:
+            opened.store.close()
+    monkeypatch.setattr(session.uuid, "uuid4", real_uuid4)
+
+
+@pytest.fixture
+def short_home() -> Iterator[Path]:
+    # bench.py binds its serve socket inside the home; AF_UNIX paths are
+    # limited to about 100 bytes, which pytest's tmp_path can exceed.
+    home = Path(tempfile.mkdtemp(prefix="zb-", dir="/tmp"))
+    try:
+        yield home
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_bench_serve_probe_reaches_only_the_local_stub(
+    tmp_path: Path, short_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = short_home
+    _source_sessions(home, monkeypatch)
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
+    record = tmp_path / "record.log"
     env = {
         key: value
         for key, value in os.environ.items()
-        # The conftest exports ZETA_HOME and a scripted provider; the 2026-11-07
-        # runs had neither, so resume picked the stored provider.
-        if key not in {"ZETA_HOME", "ZETA_TEST_SCRIPTED_PROVIDER"}
+        # As in the 2026-11-07 runs: no zeta home, account home, Claude config
+        # dir, scripted provider, or credential variable is exported, so a
+        # session left on claude falls back to the (stubbed) keychain.
+        if not key.startswith("ZETA_")
+        and not any(
+            m in key.upper() for m in ("ANTHROPIC", "CLAUDE", "OPENAI", "CODEX")
+        )
     }
-    # A throwaway HOME: no ~/.claude, ~/.codex, or account home is readable.
+    src = str(ROOT / "src")
     env.update(
-        HOME=str(tmp_path),
-        PYTHONPATH=os.pathsep.join([str(ROOT / "src"), env.get("PYTHONPATH", "")]),
+        HOME=str(home),  # throwaway: bench.py reads its sources under ~/.zeta
+        PYTHONPATH=os.pathsep.join([str(site), src]),
+        ZETA_BENCH_TREE=src,  # already on the tree, so bench.py keeps PYTHONPATH
+        BENCH_TEST_RECORD=str(record),
     )
     run = subprocess.run(
-        [sys.executable, "-c", PROBE, str(ROOT / "scripts/bench"), str(out)],
+        [
+            sys.executable,
+            str(ROOT / "scripts/bench/bench.py"),
+            "--tree",
+            str(ROOT),
+            *("--session", "phoebe", "--session", "orchestrator"),
+            *("--probe", "serve"),
+        ],
         env=env,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=120,
         check=False,
     )
-    assert run.returncode == 0, run.stderr
-    result = json.loads(out.read_text())
 
-    # Nothing passed the guard to a non-local host.
-    assert result["escaped"] == []
-    # The pinned clone (what the harness runs) streams from the local stub only.
-    assert result["pinned"] == {
-        "end": "agent_end",
-        "stub_requests": 1,
-        "keychain_reads": 0,
-    }
-    # A clone left on claude bootstraps from the (fake) keychain, and the guard
-    # refuses its provider host before any connect; the sandbox fails the run.
-    assert result["unpinned"]["stub_requests"] == 0
-    assert result["unpinned"]["keychain_reads"] >= 1
-    assert "api.anthropic.com" in result["guard"]
+    # No connect or lookup to a non-local host got past the harness.
+    assert (record.read_text() if record.exists() else "") == ""
+    assert run.returncode == 0, run.stderr
+    decoder, text, results = json.JSONDecoder(), run.stdout, {}
+    while text := text.lstrip():
+        value, end = decoder.raw_decode(text)
+        results.update(value)
+        text = text[end:]
+    # Every resume of each copied session looked up its model at the local stub.
+    for name in SOURCES:
+        assert results[name]["serve"]["stub_lookups_per_server"] == [1] * 5
 
 
 @pytest.mark.parametrize("failing", ["stub", "env"])

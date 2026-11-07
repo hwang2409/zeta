@@ -118,6 +118,7 @@ class StubOllama:
 
     def __init__(self) -> None:
         self.requests: list[int] = []  # perf_counter_ns at request-line arrival
+        self.lookups = 0  # model lookups (/api/show), e.g. one per resume
         self.stream_seconds: list[float] = []  # per-request stream length; default 0
         self.finished = threading.Event()
         self.on_request: Callable[[], None] | None = None
@@ -141,6 +142,7 @@ class StubOllama:
                 arrived = time.perf_counter_ns()
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if self.path == "/api/show":
+                    stub.lookups += 1
                     reply = json.dumps(
                         {"model_info": {"stub.context_length": 400000}}
                     ).encode()

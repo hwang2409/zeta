@@ -225,8 +225,9 @@ async def serve_one(
 ) -> dict[str, Any]:
     """One `zeta serve` process lifetime: hello, one resume, then history/status.
 
-    The copied session is pinned to the stub, so a wake turn started by resume
-    reaches only the local stub; `stub_requests` counts those requests.
+    The copied session is pinned to the stub, so resume's model lookup and any
+    wake turn reach only the local stub. `stub_lookups` counts the lookups;
+    `stub_requests` counts turn requests that arrived before the last reply.
     """
     socket = home / "bench.sock"
     server = await asyncio.to_thread(
@@ -275,7 +276,7 @@ async def _serve_session(
                     raise RuntimeError(f"{method}: {frame['error']}")
                 return ((time.perf_counter_ns() - started) / 1e6, load1()), frame
 
-    seen = len(stub.requests)
+    seen, lookups = len(stub.requests), stub.lookups
     try:
         await request(
             "hello",
@@ -299,6 +300,7 @@ async def _serve_session(
             "history": history,
             "status": status,
             "stub_requests": len(stub.requests) - seen,
+            "stub_lookups": stub.lookups - lookups,
         }
     finally:
         writer.close()
@@ -316,6 +318,7 @@ def serve_probe(home: Path, sid: str, stub: StubOllama) -> dict[str, Any]:
         "history": summary(runs[0]["history"]),
         "status": summary(runs[0]["status"]),
         "stub_requests_per_server": [r["stub_requests"] for r in runs],
+        "stub_lookups_per_server": [r["stub_lookups"] for r in runs],
     }
 
 
