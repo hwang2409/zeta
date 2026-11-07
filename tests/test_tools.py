@@ -1603,8 +1603,7 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "timeout-child-alive"
-    started = tmp_path / "timeout-child-started"
-    release = tmp_path / "timeout-child-release"
+    child_pid = tmp_path / "timeout-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     execution = asyncio.create_task(
@@ -1614,20 +1613,16 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
                 "bash",
                 {
                     "command": _descendant_command(
-                        marker, delay=1, started=started, release=release
+                        marker, delay=1, child_pid=child_pid
                     ),
                     "timeout": 0.5,
                 },
             )
         )
     )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("descendant did not start")
+    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
     result = await execution
+    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
     assert result["isError"] is True
     assert "timed out after" in result["content"][0]["text"]
@@ -1636,11 +1631,6 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     assert result["structuredContent"]["error"]["kind"] == "timeout"
     assert not marker.exists()
 
-    release.touch()
-    for _ in range(20):
-        if marker.exists():
-            pytest.fail("descendant survived timeout cleanup")
-        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
