@@ -18,12 +18,23 @@ def bind_shell_cwd(
 ) -> tuple[str, int]:
     """Resolve and bind one shell cwd descriptor for process launch."""
 
-    start_cwd = (
-        approved_cwd.cwd
-        if approved_cwd is not None
-        else registry.resolve_shell_cwd(requested_cwd)
-    )
-    registry.verify_cwd_identity(allow_removed=True)
+    if approved_cwd is not None:
+        start_cwd = approved_cwd.cwd
+    elif requested_cwd is None and registry.bash_cwd == str(registry.cwd):
+        try:
+            registry.verify_cwd_identity()
+        except SessionCwdRemoved:
+            start_cwd = registry.recover_shell_cwd(registry.bash_cwd)
+        else:
+            start_cwd = registry.resolve_shell_cwd(requested_cwd)
+    else:
+        start_cwd = registry.resolve_shell_cwd(requested_cwd)
+    if (
+        approved_cwd is not None
+        or requested_cwd is not None
+        or Path(start_cwd) == registry.cwd
+    ):
+        registry.verify_cwd_identity(allow_removed=True)
     if approved_cwd is not None:
         return start_cwd, open_verified_directory(start_cwd, approved_cwd.identity)
     if Path(start_cwd) == registry.cwd:

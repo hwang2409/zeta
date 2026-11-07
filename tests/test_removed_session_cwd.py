@@ -7,7 +7,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -255,13 +255,19 @@ async def test_bash_falls_back_once_when_persisted_cwd_was_removed(
             for message in store.messages()
             if message.metadata.get("zeta_event") == "shell_cwd_recovered"
         ]
-        assert results["fallback-1"].is_error is True
-        assert results["fallback-1"].content == "session cwd was replaced"
-        assert results["fallback-2"].is_error is True
-        assert results["fallback-2"].content == "session cwd was replaced"
-        assert store.bash_cwd == str(session_cwd)
-        assert registry.bash_cwd == str(session_cwd)
-        assert notices == []
+        assert results["fallback-1"].structured_content["stdout"].strip() == str(
+            tmp_path
+        )
+        assert results["fallback-2"].structured_content["stdout"].strip() == str(
+            tmp_path
+        )
+        assert store.bash_cwd == str(tmp_path)
+        assert registry.bash_cwd == str(tmp_path)
+        assert len(notices) == 1
+        assert notices[0].role is MessageRole.SYSTEM
+        assert notices[0].content[0].text == (
+            f"[zeta] shell cwd: {session_cwd} was removed; continuing in {tmp_path}"
+        )
     finally:
         await asyncio.wait_for(loop.close(), 10)
 
@@ -341,8 +347,20 @@ async def test_run_background_falls_back_once_when_session_cwd_was_removed(
             if message.tool_result is not None
             and message.tool_result.tool_call_id == "background"
         )
-        assert result.is_error is True
-        assert result.content == "session cwd was replaced"
+        assert result.is_error is False
+        task_id = result.structured_content["task_id"]
+        await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
+        notices = [
+            message
+            for message in store.messages()
+            if message.metadata.get("zeta_event") == "shell_cwd_recovered"
+        ]
+
+        assert output.read_text().strip() == str(tmp_path)
+        assert len(notices) == 1
+        assert notices[0].content[0].text == (
+            f"[zeta] shell cwd: {session_cwd} was removed; continuing in {tmp_path}"
+        )
     finally:
         await asyncio.wait_for(loop.close(), 10)
 
