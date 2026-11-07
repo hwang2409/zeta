@@ -135,30 +135,74 @@ def marker(line: str, finding: Item) -> bool:
     )
 
 
+def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def resolve_parent(
-    commit: str, parents: list[str], requested: int | None
+    commit: str, parents: list[str], main_sha: str | None
 ) -> tuple[str, str, str] | None:
     p1, p2 = parents
     print(f"parents: 1={p1} 2={p2}")
-    if requested:
-        main, branch = (p1, p2) if requested == 1 else (p2, p1)
-        reason = f"explicit --main-parent {requested}"
-    else:
+    if main_sha is not None:
         try:
-            chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
+            requested = git("rev-parse", "--verify", main_sha).strip()
         except subprocess.CalledProcessError:
-            chain = set()
-        matches = [index for index, parent in enumerate(parents, 1) if parent in chain]
-        if len(matches) != 1:
+            requested = ""
+        if requested not in parents:
             print(
-                f"cannot identify exactly one main parent for {commit}; "
-                "use --main-parent 1 or --main-parent 2",
+                f"--main-sha {main_sha} is not a merge parent of {commit}; "
+                f"pass one of the merge parents ({p1} or {p2})",
                 file=sys.stderr,
             )
             return None
-        index = matches[0]
-        main, branch = (p1, p2) if index == 1 else (p2, p1)
-        reason = "the selected parent is on origin/main first-parent ancestry"
+        index = parents.index(requested)
+        main, branch = (p1, p2) if index == 0 else (p2, p1)
+        reason = f"explicit --main-sha {requested}"
+        print(f"main parent: {main} ({reason})")
+        return main, branch, reason
+
+    try:
+        chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
+        origin_main = git("rev-parse", "--verify", "origin/main").strip()
+    except subprocess.CalledProcessError:
+        chain = set()
+        origin_main = ""
+    matches = [index for index, parent in enumerate(parents) if parent in chain]
+    reason = "the selected parent is on origin/main first-parent ancestry"
+    if not matches and origin_main:
+        matches = [
+            index
+            for index, parent in enumerate(parents)
+            if _is_ancestor(parent, origin_main)
+        ]
+        reason = "the selected parent is an ancestor of origin/main"
+    if len(matches) != 1:
+        details = "neither parent qualifies" if not matches else "both parents qualify"
+        fetch_hint = ""
+        if origin_main:
+            main_date = int(git("show", "-s", "--format=%ct", origin_main).strip())
+            parent_dates = [
+                int(git("show", "-s", "--format=%ct", parent).strip())
+                for parent in parents
+            ]
+            if main_date < min(parent_dates):
+                fetch_hint = "; run git fetch origin"
+        print(
+            f"cannot identify exactly one main parent for {commit}: {details}; "
+            f"pass --main-sha <the parent that carries main> (for a train branch: parent 1)"
+            f"{fetch_hint}",
+            file=sys.stderr,
+        )
+        return None
+    index = matches[0]
+    main, branch = (p1, p2) if index == 0 else (p2, p1)
     print(f"main parent: {main} ({reason})")
     return main, branch, reason
 
@@ -187,7 +231,10 @@ def parse_revisions(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
-    parser.add_argument("--main-parent", type=int, choices=(1, 2))
+    parser.add_argument(
+        "--main-sha",
+        help="exact object name of the merge parent that carries main",
+    )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
     args = parser.parse_args()
@@ -196,7 +243,7 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    resolved = resolve_parent(commit, parents, args.main_parent)
+    resolved = resolve_parent(commit, parents, args.main_sha)
     if resolved is None:
         return 2
     main, branch, _reason = resolved
