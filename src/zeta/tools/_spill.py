@@ -119,25 +119,27 @@ class SpillByteBudget:
         self, byte_count: int, *, directory: _SpillDirectory | None
     ) -> _RetainedArtifact | None:
         with self._condition:
-            while True:
-                if self._used_bytes + byte_count <= self.max_bytes:
-                    self._used_bytes += byte_count
-                    return None
-                for key, artifact in self._retained.items():
-                    if (
-                        key not in self._reclaiming
-                        and artifact.group not in self._protected_groups
-                    ):
-                        self._reclaiming.add(key)
-                        return artifact
-                if self._reclaiming:
-                    for key in self._reclaiming:
-                        artifact = self._retained.get(key)
-                        if artifact is not None and artifact.directory == directory:
-                            return artifact
-                    self._condition.wait()
-                    continue
-                raise SpillFullError("spill budget is full")
+            while self._used_bytes + byte_count > self.max_bytes:
+                artifact, in_progress = self._oldest_reclaimable()
+                if artifact is None:
+                    raise SpillFullError("spill budget is full")
+                if not in_progress or artifact.directory == directory:
+                    return artifact
+                self._condition.wait()
+            self._used_bytes += byte_count
+            return None
+
+    def _oldest_reclaimable(
+        self,
+    ) -> tuple[_RetainedArtifact | None, bool]:
+        for key, artifact in self._retained.items():
+            if artifact.group in self._protected_groups:
+                continue
+            if key in self._reclaiming:
+                return artifact, True
+            self._reclaiming.add(key)
+            return artifact, False
+        return None, False
 
     def _reclaim(
         self,
