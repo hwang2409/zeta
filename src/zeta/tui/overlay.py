@@ -228,6 +228,8 @@ class OverlayControl(UIControl):
             self.scroll(-3)
         elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self.scroll(3)
+        else:
+            return NotImplemented
 
     def _max_offset(self) -> int:
         return max(0, len(self._lines) - self._capacity)
