@@ -14,6 +14,7 @@ from ...context_eviction import (
 )
 from ...protocol.types import Message, MessageRole, TextContent
 from ..store import ConversationEntry
+from ..store._client_delivery import without_client_delivery_marker
 from .types import _ContextItem
 
 
@@ -22,15 +23,37 @@ class ContextMarkerMixin:
 
     @staticmethod
     def _marker_items(
-        entry: ConversationEntry, active_source_seqs: set[int]
+        entry: ConversationEntry,
+        active_source_seqs: set[int],
+        source_entries: Sequence[ConversationEntry] = (),
     ) -> list[_ContextItem]:
         if entry.data.get("kind") == EVICTION_KIND:
             view = entry.data["view"]
             valid = valid_eviction_view(entry, active_source_seqs)
             if valid:
-                messages = ContextMarkerMixin._eviction_view_messages(view)
-                messages.extend(
-                    _fact_floor.projected_fact_floor(entry.data.get("fact_floor"))
+                pinned = entry.data.get("pinned_message")
+                pinned_message = None if pinned is None else Message.from_dict(pinned)
+                if (
+                    pinned_message is not None
+                    and "source_seq" not in pinned_message.metadata
+                ):
+                    pinned_seq = ContextMarkerMixin._legacy_pinned_seq(
+                        entry, pinned_message, source_entries
+                    )
+                    if pinned_seq is not None:
+                        pinned_message = Message(
+                            pinned_message.role,
+                            list(pinned_message.content),
+                            tool_result=pinned_message.tool_result,
+                            metadata={
+                                **pinned_message.metadata,
+                                "source_seq": pinned_seq,
+                            },
+                        )
+                messages = ContextMarkerMixin._eviction_view_messages(
+                    view,
+                    pinned_message,
+                    _fact_floor.projected_fact_floor(entry.data.get("fact_floor")),
                 )
             else:
                 messages = [
@@ -57,19 +80,107 @@ class ContextMarkerMixin:
                 entry.data["summary"],
             )
             items = [_ContextItem(entry, message, fixed=True) for message in messages]
-        pinned = entry.data.get("pinned_message")
-        if pinned is not None:
-            items.append(_ContextItem(entry, Message.from_dict(pinned)))
+        if entry.data.get("kind") != EVICTION_KIND:
+            pinned = entry.data.get("pinned_message")
+            if pinned is not None:
+                items.append(_ContextItem(entry, Message.from_dict(pinned)))
         return items
 
     @staticmethod
-    def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
-        """Project a stored or proposed eviction view into request messages."""
+    def _legacy_pinned_seq(
+        entry: ConversationEntry,
+        pinned: Message,
+        source_entries: Sequence[ConversationEntry],
+    ) -> int | None:
+        matches = [
+            source.seq
+            for source in source_entries
+            if entry.data["source_seq_start"]
+            <= source.seq
+            <= entry.data["source_seq_end"]
+            and source.type == "message"
+            and without_client_delivery_marker(
+                Message.from_dict(source.data["message"])
+            )
+            == without_client_delivery_marker(pinned)
+        ]
+        return matches[-1] if matches else None
+
+    @staticmethod
+    def _eviction_view_messages(
+        view: Sequence[Mapping[str, Any]],
+        pinned: Message | None = None,
+        floor: Sequence[Message] = (),
+    ) -> list[Message]:
+        """Project every evicted message once, at its source sequence."""
+        pinned_seq = None if pinned is None else pinned.metadata.get("source_seq")
+        if pinned is not None and type(pinned_seq) is int:
+            pinned = Message(
+                pinned.role,
+                list(pinned.content),
+                tool_result=pinned.tool_result,
+                metadata={
+                    key: value
+                    for key, value in pinned.metadata.items()
+                    if key != "source_seq"
+                },
+            )
         messages: list[Message] = []
+        pin_index: int | None = None
         for index, item in enumerate(view):
+            seq = item["seq"]
+            if (
+                pinned is not None
+                and type(pinned_seq) is int
+                and seq >= pinned_seq
+                and pin_index is None
+            ):
+                pin_index = len(messages)
+                messages.append(pinned)
+                if seq == pinned_seq:
+                    if index % 4 == 3:
+                        cooperative_pause()
+                    continue
+            if pinned is not None and type(pinned_seq) is not int:
+                candidate = without_client_delivery_marker(
+                    ContextMarkerMixin._eviction_view_message(item)
+                )
+                normalized_pinned = without_client_delivery_marker(pinned)
+                if (
+                    candidate.role is normalized_pinned.role
+                    and candidate.content == normalized_pinned.content
+                    and candidate.tool_result == normalized_pinned.tool_result
+                    and {
+                        key: value
+                        for key, value in candidate.metadata.items()
+                        if key != "source_seq"
+                    }
+                    == {
+                        key: value
+                        for key, value in normalized_pinned.metadata.items()
+                        if key != "source_seq"
+                    }
+                ):
+                    continue
             messages.append(ContextMarkerMixin._eviction_view_message(item))
             if index % 4 == 3:
                 cooperative_pause()
+        if pinned is not None and pin_index is None:
+            pin_index = len(messages)
+            if type(pinned_seq) is not int:
+                last_user = max(
+                    (
+                        i
+                        for i, message in enumerate(messages)
+                        if message.role is MessageRole.USER
+                    ),
+                    default=-1,
+                )
+                pin_index = last_user + 1
+            messages.insert(pin_index, pinned)
+        if floor:
+            floor_index = len(messages) if pin_index is None else pin_index
+            messages[floor_index:floor_index] = floor
         return messages
 
     @staticmethod

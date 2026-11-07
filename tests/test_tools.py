@@ -23,7 +23,6 @@ import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import read_pid_file
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
-from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -34,6 +33,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
 )
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.tools._shared import background_spawn
