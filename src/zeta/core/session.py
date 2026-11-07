@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
@@ -20,10 +21,11 @@ from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
 from ..skills import SkillCatalog
+from ..storage_format import advance, mapping_mutations, open_writer
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
-from .store import ConversationStore
+from .store import ConversationStore, TranscriptLoadError
 from .store.prompt_composition import (
     PromptCompositionMixin,
     parse_prompt_recipe,
@@ -38,7 +40,7 @@ from .session_files import (
     session_directory,
     session_root,
     child_directory,
-    write_session_json,
+    write_session_file,
 )
 from ..project_registry import ProjectRegistryError
 from ..runtime.project_registry_state import (
@@ -511,6 +513,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
     def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None, project_registry_state: ProjectRegistryState | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
+        self._storage_lease = open_writer(self.home)
+        self._release_storage_lease = weakref.finalize(
+            self, self._storage_lease.close
+        )
         self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
         state = project_registry_state or available_project_registry(self.home / "projects")
@@ -590,11 +596,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
+                advance(temporary, expected_epoch=0)
                 staged = SessionManager(temporary)
                 ConversationStore(
                     staged.sessions_dir,
                     session_id=session_id,
                     cwd=resolved_cwd,
+                    _storage_lease=staged._storage_lease,
                 ).close()
                 staged._write(metadata)
                 # mkdir atomically claims the ID without replacing any existing
@@ -639,8 +647,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         _,
                         directory_fd,
                     ):
-                        write_session_json(
-                            directory_fd, "project_link_pending.json", link
+                        self._storage_lease.publish_json(
+                            directory_fd,
+                            "project_link_pending.json",
+                            mapping_mutations(link),
+                            write_session_file,
                         )
                 except (SessionError, OSError) as exc:
                     logger.warning("could not persist project linkage intent: %s", exc)
@@ -661,7 +672,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self._copy_metadata(metadata, current)
         try:
             persist_pending_root_link(
-                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id,
+                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id, self._storage_lease,
             )
         except (SessionError, OSError) as exc:
             logger.warning("could not persist project linkage intent: %s", exc)
@@ -703,7 +714,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 session_id=session_id,
                 _read_only=_read_only,
                 _must_exist=True,
+                _storage_lease=self._storage_lease,
             )
+        except TranscriptLoadError:
+            raise
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
@@ -843,12 +857,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             if directory_fd is None:
                 return False
             current = self._touch(self._read(session_id, directory_fd=directory_fd))
-            write_session_json(
-                directory_fd,
-                "meta.json",
-                current.to_storage_dict(),
-                sync=False,
-            )
+            self._publish_metadata(directory_fd, current, sync=False)
             return True
 
     def persist_tool_policy(
@@ -1126,7 +1135,23 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             self._write_unlocked(metadata, directory_fd=directory_fd)
 
     def _write_unlocked(self, metadata: SessionMetadata, *, directory_fd: int) -> None:
-        write_session_json(directory_fd, "meta.json", metadata.to_storage_dict())
+        self._publish_metadata(directory_fd, metadata)
+
+    def _publish_metadata(
+        self, directory_fd: int, metadata: SessionMetadata, *, sync: bool = True
+    ) -> None:
+        value = metadata.to_storage_dict()
+        delete = () if "tool_allow_layers" in value else ("tool_allow_layers",)
+        self._storage_lease.publish_json(
+            directory_fd,
+            "meta.json",
+            mapping_mutations(
+                value,
+                delete=delete,
+                broad=("prompt_components",),
+            ),
+            lambda fd, name, data: write_session_file(fd, name, data, sync=sync),
+        )
 
     @contextmanager
     def _metadata_lock(

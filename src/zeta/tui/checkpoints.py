@@ -40,6 +40,7 @@ from ..protocol.types import (
     ToolUseContent,
     assistant_text,
     is_passive_harness_message,
+    is_visible_harness_notice,
 )
 from .cards.base import strip_terminal_controls
 from .render import (
@@ -83,6 +84,14 @@ def _age(created_at: str) -> str:
     if seconds < 86_400:
         return f"{seconds // 3_600}h ago"
     return f"{seconds // 86_400}d ago"
+
+
+def _visible_harness_notice_text(message: Message) -> str | None:
+    if not is_visible_harness_notice(message):
+        return None
+    return "\n".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
 
 
 def _parse_force(args: str) -> tuple[str, bool]:
@@ -170,6 +179,7 @@ class CheckpointTranscriptMixin:
                 self.loop.store.session_dir,
                 self.loop.store.session_id,
                 cap=self._workspace_snapshot_cap,
+                storage_lease=self.loop.store._storage_lease,
             )
         return self._workspace_snapshot_store
 
@@ -673,6 +683,16 @@ class CheckpointTranscriptMixin:
                 )
                 yield
                 continue
+            if entry.type == "turn_end":
+                text = {
+                    "user_stop": "turn stopped by the user",
+                    "error": "turn ended with an error",
+                    "disconnect": "turn ended when the controller disconnected",
+                }.get(entry.data["reason"])
+                if text is not None:
+                    self._print_system(text)
+                yield
+                continue
             if entry.type != "message":
                 if (
                     entry.type == "notification"
@@ -692,6 +712,9 @@ class CheckpointTranscriptMixin:
             if message is None:
                 raise RuntimeError("TUI message projection is missing its message")
             if is_passive_harness_message(message):
+                notice_text = _visible_harness_notice_text(message)
+                if notice_text is not None:
+                    self._print_system(notice_text)
                 yield
                 continue
             if message.role is MessageRole.USER:

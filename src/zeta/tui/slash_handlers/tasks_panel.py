@@ -178,14 +178,6 @@ class BackgroundTasksMixin:
         # A mid-stream start lands inside a line; drop that partial first line
         # once so the box opens on clean line boundaries.
         self._tasks_output_trim = start > 0
-        asyncio.create_task(self._tasks_initial_output(detail.task_id, detail.output_lines))
-
-    async def _tasks_initial_output(self, task_id: str, total_lines: int) -> None:
-        await self._pull_output_tail(task_id, total_lines)
-        self._tasks_panel_control.set_lines(
-            self._tasks_panel.render_lines(), keep_offset=True
-        )
-        self._invalidate_prompt()
 
     async def _pull_output_tail(self, task_id: str, total_lines: int) -> None:
         registry = self.loop.tool_registry.background_tasks

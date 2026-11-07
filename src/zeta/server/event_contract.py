@@ -4,11 +4,13 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
-from ..protocol.types import StreamEvent, StreamEventType
+from ..protocol.types import Message, StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
 
 
-def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
+def delivery_status_row(
+    entry: ConversationEntry, accepted_message: Message | None = None
+) -> dict[str, object]:
     """Project one committed steer terminal transition."""
     data = entry.data
     status = data["status"]
@@ -24,10 +26,23 @@ def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
     }
     if "reason" in data:
         row["reason"] = data["reason"]
-        row["content"] = [
-            {"type": "text", "text": f"{text}: {data['reason']}"}
-        ]
+        row["content"] = [{"type": "text", "text": f"{text}: {data['reason']}"}]
+    if accepted_message is not None:
+        row["content"] = accepted_message.to_dict()["content"]
     return row
+
+
+def served_turn_end_row(entry: ConversationEntry) -> dict[str, object]:
+    """Project one durable served-turn completion fact."""
+    return {
+        "id": entry.id,
+        "role": "system",
+        "event": "served_turn_end",
+        "data": {
+            "turn_id": entry.data["turn_id"],
+            "reason": entry.data["reason"],
+        },
+    }
 
 
 def image_stub(block: Mapping[str, object]) -> dict[str, object]:
@@ -68,6 +83,7 @@ def project_tool_value(value: object) -> tuple[object, bool]:
         return result, truncated
     return value, False
 
+
 LEGACY_NOTIFICATION_WIRE_EVENT = "sub_agent_receipt"
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
@@ -87,6 +103,12 @@ def notification_wire_event(kind: object, protocol_version: str) -> str:
     return NOTIFICATION_WIRE_EVENTS.get(kind, LEGACY_NOTIFICATION_WIRE_EVENT)
 
 
+def notification_payload(notification: Mapping[str, object]) -> dict[str, object]:
+    """Preserve additive durable notification fields on the serve wire."""
+
+    return dict(notification)
+
+
 class AuxiliaryEvent(Enum):
     MEMORY_UPDATED = auto()
     TURN_ABORTED = auto()
@@ -100,6 +122,7 @@ AUXILIARY_WIRE_EVENTS = {
     AuxiliaryEvent.USAGE: "usage",
     AuxiliaryEvent.USER_MESSAGE: "user_message",
 }
+
 
 # Custom projections in server.py use this exhaustive contract.
 def _tool_call(event: StreamEvent) -> dict[str, object] | None:
@@ -180,8 +203,10 @@ def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]
             if structured is not None:
                 projected_structured, wire_truncated = project_tool_value(structured)
                 projected["structured_content"] = projected_structured
-                projected["structured_content_truncated"] = structured_content_truncated(
-                    structured, wire_truncated=wire_truncated
+                projected["structured_content_truncated"] = (
+                    structured_content_truncated(
+                        structured, wire_truncated=wire_truncated
+                    )
                 )
             result = projected
     return {

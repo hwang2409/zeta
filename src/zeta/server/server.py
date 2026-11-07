@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import fcntl
 import os
 import socket
 import stat
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
-from ..core.store import ConversationIntegrityError
+from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -61,6 +63,107 @@ LOADED_SESSION_MUTATIONS = frozenset(
     }
 )
 _DELIVERY_MUTATIONS = frozenset({"send", "send_images", "steer"})
+
+
+class _UnixSocketListener:
+    def __init__(
+        self,
+        path: Path,
+        server: asyncio.AbstractServer,
+        lock_fd: int,
+        identity: tuple[int, int],
+    ) -> None:
+        self.path = path
+        self.server = server
+        self._lock_fd = lock_fd
+        self._identity = identity
+
+    @classmethod
+    async def start(
+        cls,
+        path: Path,
+        accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
+    ) -> _UnixSocketListener:
+        cls._prepare_parent(path)
+        lock_fd = os.open(
+            f"{path}.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"a server is already listening on {path}") from exc
+            cls._prepare_path(path)
+            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            identity: tuple[int, int] | None = None
+            try:
+                unix_socket.bind(str(path))
+                socket_stat = path.lstat()
+                identity = (socket_stat.st_dev, socket_stat.st_ino)
+                server = await asyncio.start_unix_server(
+                    accept, sock=unix_socket, limit=MAX_FRAME_BYTES + 1
+                )
+                os.chmod(path, 0o600)
+                return cls(path, server, lock_fd, identity)
+            except BaseException:
+                unix_socket.close()
+                if identity is not None:
+                    cls._unlink_if_owned(path, identity)
+                raise
+        except BaseException:
+            os.close(lock_fd)
+            raise
+
+    async def close(self) -> None:
+        try:
+            self.server.close()
+            await self.server.wait_closed()
+            self._unlink_if_owned(self.path, self._identity)
+        finally:
+            os.close(self._lock_fd)
+
+    @staticmethod
+    def _prepare_parent(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            parent_stat = path.parent.stat()
+            if parent_stat.st_uid == os.getuid():
+                os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+
+    @classmethod
+    def _prepare_path(cls, path: Path) -> None:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(path_stat.st_mode):
+            raise RuntimeError(f"refusing to replace non-socket path: {path}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(str(path))
+        except OSError as exc:
+            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+                raise RuntimeError(f"could not inspect socket: {path}") from exc
+        else:
+            raise RuntimeError(f"a server is already listening on {path}")
+        finally:
+            probe.close()
+        cls._unlink_if_owned(path, (path_stat.st_dev, path_stat.st_ino))
+
+    @staticmethod
+    def _unlink_if_owned(path: Path, identity: tuple[int, int]) -> None:
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if (path_stat.st_dev, path_stat.st_ino) == identity:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 class ZetaServer:
@@ -130,7 +233,7 @@ class ZetaServer:
         self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
-        self._socket_created = False
+        self._unix_listener: _UnixSocketListener | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -150,12 +253,10 @@ class ZetaServer:
         self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
-            self._prepare_socket_path()
-            self._server = await asyncio.start_unix_server(
-                self._accept, path=str(self.socket_path), limit=MAX_FRAME_BYTES + 1
+            self._unix_listener = await _UnixSocketListener.start(
+                self.socket_path, self._accept
             )
-            os.chmod(self.socket_path, 0o600)
-            self._socket_created = True
+            self._server = self._unix_listener.server
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1
@@ -197,47 +298,14 @@ class ZetaServer:
                 try:
                     if self._websocket is not None:
                         await self._websocket.close()
-                    if self._server is not None:
+                    if self._unix_listener is not None:
+                        await self._unix_listener.close()
+                    elif self._server is not None:
                         self._server.close()
                         await self._server.wait_closed()
                 finally:
                     self._server = None
-                    if self.port is None and self._socket_created:
-                        with contextlib.suppress(FileNotFoundError):
-                            if stat.S_ISSOCK(self.socket_path.stat().st_mode):
-                                self.socket_path.unlink()
-                        self._socket_created = False
-
-    def _prepare_socket_path(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            parent_stat = self.socket_path.parent.stat()
-            if parent_stat.st_uid == os.getuid():
-                os.chmod(self.socket_path.parent, 0o700)
-        except OSError:
-            pass
-        try:
-            path_mode = self.socket_path.lstat().st_mode
-        except FileNotFoundError:
-            return
-        if not stat.S_ISSOCK(path_mode):
-            raise RuntimeError(
-                f"refusing to replace non-socket path: {self.socket_path}"
-            )
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.settimeout(0.2)
-            probe.connect(str(self.socket_path))
-        except OSError as exc:
-            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
-                raise RuntimeError(
-                    f"could not inspect socket: {self.socket_path}"
-                ) from exc
-        else:
-            raise RuntimeError(f"a server is already listening on {self.socket_path}")
-        finally:
-            probe.close()
-        self.socket_path.unlink()
+                    self._unix_listener = None
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -336,6 +404,12 @@ class _Client:
                             -32000,
                             str(exc),
                             {"code": exc.code, "retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptLoadError as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id, -32000, str(exc), exc.protocol_data()
                         )
                     )
                 except ConversationIntegrityError as exc:
@@ -494,29 +568,29 @@ class _Client:
                         initial_model = _required_string(params, "model")
                     model_selection.validate(initial_model, initial_mode)
                 candidate = self._host_commands(params)
-                await self.server.control.require_idle()
-                cwd = None
-                if "cwd" in params:
-                    self._require_feature("session_cwd", "cwd")
-                    cwd = _directory(params, "cwd")
-                await self.server.control._terminate_pending_approvals()
-                await self.server.runtime.create_session(
-                    provider=_optional_string(params, "provider"),
-                    model=initial_model,
-                    cwd=cwd,
-                )
-                if initial_model is not None and initial_mode is not None:
-                    await model_selection.apply_rpc(
-                        self.server.runtime, initial_model, initial_mode
+                with self.server.control.reserve_session_swap():
+                    cwd = None
+                    if "cwd" in params:
+                        self._require_feature("session_cwd", "cwd")
+                        cwd = _directory(params, "cwd")
+                    await self.server.control._terminate_pending_approvals()
+                    await self.server.runtime.create_session(
+                        provider=_optional_string(params, "provider"),
+                        model=initial_model,
+                        cwd=cwd,
                     )
-                self.server.control._active_host_commands = candidate
-                self.server.control._host_binding_required = (
-                    "session_host_commands" in self.features
-                )
-                self.server.control.session_replaced()
-                self.server.control.clear_approvals()
-                await self.server.control.controller_ready()
-                return {"session": self._session_snapshot()}
+                    if initial_model is not None and initial_mode is not None:
+                        await model_selection.apply_rpc(
+                            self.server.runtime, initial_model, initial_mode
+                        )
+                    self.server.control._active_host_commands = candidate
+                    self.server.control._host_binding_required = (
+                        "session_host_commands" in self.features
+                    )
+                    self.server.control.session_replaced()
+                    self.server.control.clear_approvals()
+                    await self.server.control.controller_ready()
+                    return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
@@ -525,43 +599,51 @@ class _Client:
         if method == "resume":
             try:
                 candidate = self._host_commands(params)
-                await self.server.control.require_idle()
-                session_id = _required_string(params, "session_id")
-                unhealthy_same_session = (
-                    self.server.control.unhealthy()
-                    and self.server.runtime.session_id == session_id
-                )
-                await self.server.control._terminate_pending_approvals()
-                if unhealthy_same_session:
-                    try:
-                        await self.server.runtime.resume_session(session_id, force=True)
-                    except SessionNotFoundError as exc:
-                        raise ProtocolError(
-                            -32602,
-                            str(exc),
-                            {"code": "session_not_found", "session_id": session_id},
-                        ) from exc
-                    except Exception as exc:
-                        raise ProtocolError(
-                            -32000, "approval persistence failed"
-                        ) from exc
-                else:
-                    try:
-                        await self.server.runtime.resume_session(session_id)
-                    except SessionNotFoundError as exc:
-                        raise ProtocolError(
-                            -32602,
-                            str(exc),
-                            {"code": "session_not_found", "session_id": session_id},
-                        ) from exc
-                self.server.control._active_host_commands = candidate
-                self.server.control._host_binding_required = (
-                    "session_host_commands" in self.features
-                )
-                self.server.control.session_replaced()
-                self.server.control.clear_approvals()
-                await self.server.control.controller_ready()
-                return {"session": self._session_snapshot()}
+                with self.server.control.reserve_session_swap():
+                    session_id = _required_string(params, "session_id")
+                    unhealthy_same_session = (
+                        self.server.control.unhealthy()
+                        and self.server.runtime.session_id == session_id
+                    )
+                    await self.server.control._terminate_pending_approvals()
+                    if unhealthy_same_session:
+                        try:
+                            await self.server.runtime.resume_session(
+                                session_id, force=True
+                            )
+                        except SessionNotFoundError as exc:
+                            raise ProtocolError(
+                                -32602,
+                                str(exc),
+                                {
+                                    "code": "session_not_found",
+                                    "session_id": session_id,
+                                },
+                            ) from exc
+                        except Exception as exc:
+                            raise ProtocolError(
+                                -32000, "approval persistence failed"
+                            ) from exc
+                    else:
+                        try:
+                            await self.server.runtime.resume_session(session_id)
+                        except SessionNotFoundError as exc:
+                            raise ProtocolError(
+                                -32602,
+                                str(exc),
+                                {
+                                    "code": "session_not_found",
+                                    "session_id": session_id,
+                                },
+                            ) from exc
+                    self.server.control._active_host_commands = candidate
+                    self.server.control._host_binding_required = (
+                        "session_host_commands" in self.features
+                    )
+                    self.server.control.session_replaced()
+                    self.server.control.clear_approvals()
+                    await self.server.control.controller_ready()
+                    return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
@@ -776,12 +858,18 @@ class _Client:
                 else []
             )
             truncated = False
-        transcript_index_failure = (
-            runtime.loop.transcript_index_failure(runtime.session_id)
-            if self.protocol_version != "1.0" and runtime.loop is not None
+        loop = runtime.loop
+        fallback_config = (
+            await asyncio.to_thread(runtime._config, None, None)
+            if loop is None
             else None
         )
-        return {
+        transcript_index_failure = (
+            loop.transcript_index_failure(runtime.session_id)
+            if self.protocol_version != "1.0" and loop is not None
+            else None
+        )
+        status = {
             "session": session,
             "state": (
                 "idle"
@@ -789,10 +877,18 @@ class _Client:
                 else runtime.state.status
             ),
             "explicit_finish": (
-                runtime.loop.explicit_finish
-                if runtime.loop is not None
-                else runtime._config(None, None).agents_explicit_finish
+                loop.explicit_finish
+                if loop is not None
+                else fallback_config.agents_explicit_finish
             ),
+        }
+        if self.protocol_version != "1.0":
+            status["max_agent_depth"] = (
+                loop.max_agent_depth
+                if loop is not None
+                else fallback_config.agents_max_depth
+            )
+        suffix = {
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
@@ -803,6 +899,8 @@ class _Client:
             ),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
+        status.update(suffix)
+        return status
 
     def _reconcile_project_links(self, session_ids: list[str]) -> None:
         for session_id in session_ids:

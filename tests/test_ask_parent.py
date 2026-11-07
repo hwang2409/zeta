@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background import BackgroundAgentOwner
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills.catalog import SkillCatalog
 from zeta.tools.agent_send import send_to_run
 from zeta.tools.ask_parent import register_ask_parent
 from zeta.tools.registry import ToolRegistry
+from zeta.tui.render import render_event
 
 
 def _setup(tmp_path: Path):
@@ -147,26 +150,42 @@ async def test_ask_parent_schema_and_handler_reject_oversized_question(
 async def test_child_finish_and_cancel_withdraw_pending_questions(
     tmp_path: Path,
 ) -> None:
-    parent, _child, _registry, handle, owner = _setup_without_loop(tmp_path)
-    channel = owner.conversation_channel
-    for reason in ("finished", "canceled"):
-        await channel.publish_question(
-            child_instance_id=handle,
-            question_id=reason,
-            question=f"Question before {reason}?",
-            options=None,
-        )
-        assert await channel.close_questions(handle, reason=reason) == 1
+    parent, child, _registry, handle, owner = _setup_without_loop(tmp_path)
+    try:
+        channel = owner.conversation_channel
+        for reason in ("finished", "canceled"):
+            await channel.publish_question(
+                child_instance_id=handle,
+                question_id=reason,
+                question=f"Question before {reason}?",
+                options=None,
+            )
+            assert await channel.close_questions(handle, reason=reason) == 1
 
-    pending = parent.agent_notifications()
-    assert [entry.data["kind"] for entry in pending] == [
-        "child_question_withdrawn",
-        "child_question_withdrawn",
-    ]
-    assert [entry.data["text"] for entry in pending] == [
-        "question withdrawn: child finished",
-        "question withdrawn: child canceled",
-    ]
+        pending = parent.agent_notifications()
+        assert [entry.data["kind"] for entry in pending] == [
+            "child_question_withdrawn",
+            "child_question_withdrawn",
+        ]
+        rendered = []
+        for entry in pending:
+            output = StringIO()
+            Console(file=output, width=80, color_system=None).print(
+                render_event(
+                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=entry.data)
+                )
+            )
+            rendered.append(output.getvalue())
+        assert all("worker :1" in output for output in rendered)
+        assert all("child :1" not in output for output in rendered)
+        assert [entry.data["text"] for entry in pending] == [
+            "question withdrawn: child finished",
+            "question withdrawn: child canceled",
+        ]
+    finally:
+        owner.cancel_all()
+        parent.close()
+        child.close()
 
 
 @pytest.mark.asyncio
@@ -299,6 +318,7 @@ async def test_grandchild_question_wakes_direct_parent_then_routes_to_live_ances
     )
     routed = root.agent_notifications()
     assert [entry.data["question_id"] for entry in routed] == ["adopted"]
+    assert routed[0].data["agent_description"] == "background task"
     assert "next live ancestor" in routed[0].data["routing_note"]
     child_task.cancel()
 
@@ -322,6 +342,7 @@ def _setup_without_loop(tmp_path: Path):
         lambda: None,
         None,  # type: ignore[arg-type] - watcher state is not used by this store test
         parent_store=parent,
+        description="worker",
         active_store=child,
     )
     channel = owner.conversation_channel

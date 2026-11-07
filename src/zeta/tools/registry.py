@@ -249,6 +249,7 @@ class ToolRegistry:
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )
+        self._profile_tool_allow: frozenset[str] | None = None
         self._required_tool_names = (
             self.tool_policy.required_exact_names
             if required_tool_names is None
@@ -317,6 +318,9 @@ class ToolRegistry:
             if session_store is not None
             else None,
             command_niceness=command_niceness,
+            storage_lease=(
+                session_store._storage_lease if session_store is not None else None
+            ),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -330,6 +334,7 @@ class ToolRegistry:
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
+        self._schema_hidden_names: frozenset[str] = frozenset()
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
@@ -362,10 +367,20 @@ class ToolRegistry:
     def tool_deny(self) -> tuple[str, ...]:
         return self.tool_policy.deny
 
-    def tool_is_allowed(self, name: str) -> bool:
+    def tool_is_allowed_by_policy(self, name: str) -> bool:
         definition = self._tools.get(name)
-        actions = tuple(definition.actions) if definition and definition.actions else None
+        actions = (
+            tuple(definition.actions) if definition and definition.actions else None
+        )
         return self.tool_policy.allows_tool(name, actions)
+
+    def tool_is_allowed(self, name: str) -> bool:
+        if (
+            self._profile_tool_allow is not None
+            and name not in self._profile_tool_allow
+        ):
+            return False
+        return self.tool_is_allowed_by_policy(name)
 
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
@@ -399,7 +414,11 @@ class ToolRegistry:
     def schemas(self) -> list[ToolSchema]:
         schemas: list[ToolSchema] = []
         for name, definition in self._tools.items():
-            if name in self._mcp_hidden or not self.tool_is_allowed(name):
+            if (
+                name in self._mcp_hidden
+                or name in self._schema_hidden_names
+                or not self.tool_is_allowed(name)
+            ):
                 continue
             schema = definition.schema()
             if definition.actions is not None:
@@ -422,7 +441,11 @@ class ToolRegistry:
         allowed: list[ToolSchema] = []
         for schema in schemas:
             name = schema.get("name")
-            if not isinstance(name, str) or not self.tool_is_allowed(name):
+            if (
+                not isinstance(name, str)
+                or name in self._schema_hidden_names
+                or not self.tool_is_allowed(name)
+            ):
                 continue
             definition = self._tools.get(name)
             if definition is not None and definition.actions is not None:
@@ -455,6 +478,14 @@ class ToolRegistry:
 
         return frozenset(
             name for name in self._tools if self.tool_is_allowed(name)
+        )
+
+    @property
+    def policy_allowed_registered_names(self) -> frozenset[str]:
+        """Return registered names allowed before applying a profile layer."""
+
+        return frozenset(
+            name for name in self._tools if self.tool_is_allowed_by_policy(name)
         )
 
     def register(
@@ -668,12 +699,19 @@ class ToolRegistry:
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        hide_schema_names: set[str] | frozenset[str] = frozenset(),
+        profile_tool_allow: Sequence[str] | None = None,
         cwd: str | Path | None = None,
         image_policy: ImagePolicy | None = None,
     ) -> ToolRegistry:
         if self._cwd_fd is None:
             raise RuntimeError("cannot clone a closed tool registry")
         clone = copy.copy(self)
+        clone._profile_tool_allow = (
+            frozenset(profile_tool_allow)
+            if profile_tool_allow is not None
+            else None
+        )
         if image_policy is not None:
             clone.image_policy = image_policy
         if cwd is not None:
@@ -688,6 +726,7 @@ class ToolRegistry:
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._mcp_excluded_names = frozenset(exclude_names)
+        clone._schema_hidden_names = frozenset(hide_schema_names)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
@@ -719,6 +758,7 @@ class ToolRegistry:
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             command_niceness=clone.command_niceness,
+            storage_lease=store._storage_lease,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -780,7 +820,9 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
+        self.background_tasks.bind_session_dir(
+            store.session_dir, store.directory_fd, store._storage_lease
+        )
         self.bash_cwd = store.bash_cwd
 
     @property
