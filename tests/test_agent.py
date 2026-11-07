@@ -13582,6 +13582,271 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     store.close()
 
 
+@pytest.mark.parametrize(
+    "task_count", [1, 2], ids=["first-task-after-long-idle", "later-task-after-clear"]
+)
+@pytest.mark.asyncio
+async def test_idle_task_safety_window_starts_with_each_running_task_period(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_count: int,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store, finish_gate_task_timeout=5)
+    owner.conversation_channel.register_loop("root:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(store)
+    now = 0.0
+    idle_entries = [asyncio.Event() for _ in range(task_count * 2)]
+    idle_releases = [asyncio.Event() for _ in idle_entries]
+    safety_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+    idle_call = 0
+
+    async def consume(_loop, _prompt, **kwargs):
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(_wake, _timeout):
+        nonlocal idle_call
+        call = idle_call
+        idle_call += 1
+        idle_entries[call].set()
+        await asyncio.wait_for(idle_releases[call].wait(), timeout=10)
+        return True
+
+    async def controlled_task_deadline(task_registry, timeout):
+        evaluated = asyncio.Event()
+        safety_calls.put_nowait((timeout, evaluated))
+        if timeout <= 0:
+            for task in task_registry.snapshot():
+                if task.running:
+                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+            evaluated.set()
+            return tuple(
+                task.task_id for task in task_registry.snapshot() if not task.running
+            )
+        evaluated.set()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+        return ()
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    monkeypatch.setattr(
+        run_consumer_module,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now),
+            create_task=asyncio.create_task,
+            gather=asyncio.gather,
+        ),
+    )
+    monkeypatch.setattr(
+        run_consumer_module, "kill_tasks_after_deadline", controlled_task_deadline
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=store,
+            child_turns=lambda: 1,
+            finish_lifecycle=lambda *_: {},
+            idle_clock=lambda: now,
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(idle_entries[0].wait(), timeout=10)
+        for task_index in range(task_count):
+            now += 10
+            task_id, _pid = await asyncio.wait_for(
+                registry.background_tasks.start(
+                    _python("import time; time.sleep(60)"), tmp_path
+                ),
+                timeout=10,
+            )
+            idle_releases[task_index * 2].set()
+            timeout, evaluated = await asyncio.wait_for(safety_calls.get(), timeout=10)
+            await asyncio.wait_for(evaluated.wait(), timeout=10)
+
+            task = next(
+                item
+                for item in registry.background_tasks.snapshot()
+                if item.task_id == task_id
+            )
+            assert task.running, "a task started after a long idle was killed at once"
+            assert timeout == owner.finish_gate_task_timeout
+
+            await asyncio.wait_for(registry.background_tasks.kill(task_id), timeout=10)
+            if task_index + 1 < task_count:
+                await asyncio.wait_for(
+                    idle_entries[task_index * 2 + 1].wait(), timeout=10
+                )
+                idle_releases[task_index * 2 + 1].set()
+                await asyncio.wait_for(
+                    idle_entries[(task_index + 1) * 2].wait(), timeout=10
+                )
+    finally:
+        run.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run, return_exceptions=True), timeout=10
+        )
+        owner.conversation_channel.unregister_loop("root:1")
+        await asyncio.wait_for(registry.close(), timeout=10)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_task_completion_turn_rearms_full_safety_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="work",
+    )
+    owner = BackgroundAgentOwner(store, finish_gate_task_timeout=5)
+    owner.conversation_channel.register_loop("root:1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.bind_session_store(store)
+    loop = _ExplicitFinishLoop(registry, owner)
+    loop._terminal_transition_fence = TerminalTransitionFence(
+        store,
+        notification_pending=lambda: bool(
+            loop.step_delivery and loop.step_delivery.has_pending_edge
+        ),
+    )
+    first_idle = asyncio.Event()
+    inspect_running_task = asyncio.Event()
+    second_task_idle = asyncio.Event()
+    deadline_calls: list[tuple[float, asyncio.Event, asyncio.Event]] = []
+    deadline_armed = asyncio.Event()
+    task_b_id: str | None = None
+    idle_call = 0
+
+    async def produce_task_exit(item) -> None:
+        await asyncio.wait_for(
+            AgentLoop._produce_task_exit(loop, item), timeout=10  # type: ignore[arg-type]
+        )
+
+    registry.background_tasks.set_notification_sink(produce_task_exit)
+
+    async def consume(_loop, prompt, *, origin, **kwargs):
+        nonlocal task_b_id
+        await asyncio.wait_for(_ack_fake_delivery(store, kwargs), timeout=10)
+        if not prompt and loop.step_delivery.has_pending_edge:
+            await asyncio.wait_for(
+                loop.step_delivery.prepare_request("terminal_fallback", [], None),
+                timeout=10,
+            )
+            await asyncio.wait_for(loop.step_delivery.acknowledge_active(), timeout=10)
+        if origin is MessageOrigin.NOTIFICATION:
+            task_b_id, _pid = await asyncio.wait_for(
+                registry.background_tasks.start(
+                    _python("import time; time.sleep(60)"), tmp_path
+                ),
+                timeout=10,
+            )
+        kwargs["finish_lifecycle"]("idle", "WAIT")
+        return {
+            "content": [],
+            "isError": False,
+            "structuredContent": {"status": "running"},
+        }
+
+    async def wait_idle(wake, _timeout):
+        nonlocal idle_call
+        call = idle_call
+        idle_call += 1
+        if call == 0:
+            first_idle.set()
+            await asyncio.wait_for(inspect_running_task.wait(), timeout=10)
+        else:
+            if call == 2:
+                second_task_idle.set()
+            await asyncio.wait_for(wake(), timeout=10)
+        return True
+
+    async def controlled_task_deadline(task_registry, timeout):
+        expire = asyncio.Event()
+        finished = asyncio.Event()
+        deadline_calls.append((timeout, expire, finished))
+        deadline_armed.set()
+        try:
+            await asyncio.wait_for(expire.wait(), timeout=10)
+            for task in task_registry.snapshot():
+                if task.running:
+                    await asyncio.wait_for(task_registry.kill(task.task_id), timeout=10)
+            return tuple(
+                task.task_id for task in task_registry.snapshot() if not task.running
+            )
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+    monkeypatch.setattr(
+        run_consumer_module, "kill_tasks_after_deadline", controlled_task_deadline
+    )
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(
+            loop,
+            "work",
+            child_store=store,
+            child_turns=lambda: idle_call,
+            finish_lifecycle=lambda *_: {},
+            idle_clock=lambda: 0.0,
+            idle_wait=wait_idle,
+        )
+    )
+    try:
+        await asyncio.wait_for(first_idle.wait(), timeout=10)
+        task_a_id, _pid = await asyncio.wait_for(
+            registry.background_tasks.start(_python("input()"), tmp_path), timeout=10
+        )
+        inspect_running_task.set()
+        await asyncio.wait_for(deadline_armed.wait(), timeout=10)
+        await asyncio.wait_for(
+            registry.background_tasks.input(task_a_id, "done\\n", eof=True), timeout=10
+        )
+        await asyncio.wait_for(second_task_idle.wait(), timeout=10)
+
+        old_timeout, expire_old_window, old_window_finished = deadline_calls[0]
+        expire_old_window.set()
+        await asyncio.wait_for(old_window_finished.wait(), timeout=10)
+        assert task_b_id is not None
+        task_b = next(
+            task
+            for task in registry.background_tasks.snapshot()
+            if task.task_id == task_b_id
+        )
+        assert task_b.running, "task B was killed at task A's old deadline"
+        assert len(deadline_calls) == 2, "task B did not receive a new safety timer"
+        assert old_timeout == owner.finish_gate_task_timeout
+        assert deadline_calls[1][0] == owner.finish_gate_task_timeout
+    finally:
+        run.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(run, return_exceptions=True), timeout=10
+        )
+        owner.conversation_channel.unregister_loop("root:1")
+        await asyncio.wait_for(registry.close(), timeout=10)
+        store.close()
+
+
 async def _idle_nudge_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
