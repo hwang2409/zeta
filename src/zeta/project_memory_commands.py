@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from typing import Protocol
 
 from .memory.reconciliation_state import TerminalReceipt
@@ -16,13 +17,16 @@ class MemoryReconciler(Protocol):
     def scanner_failure(self) -> tuple[int, str] | None: ...
     def terminal_receipts(self) -> tuple[TerminalReceipt, ...]: ...
     def retry_terminal(self, key: str) -> bool: ...
+    def resume_recovery(self, root_session_id: str, quarantine_id: str) -> Awaitable[str]: ...
 
 
 class MemoryRegistry(Protocol):
     def ensure_memory_supported(self, project_id: str) -> None: ...
     def memory_format(self, project_id: str) -> int: ...
     def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]: ...
-    def undo_memory(self, project_id: str) -> list[tuple[str, str]]: ...
+    def undo_memory(
+        self, project_id: str, *, expected_current: str | None = None
+    ) -> list[tuple[str, str]]: ...
     def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]: ...
     def _entry_memory_log(
         self,
@@ -45,10 +49,10 @@ def run_memory_command(
     args: str,
     reconciler: MemoryReconciler | None = None,
     authorization: MemoryMutationAuthorization | None = None,
-) -> str:
+) -> str | Awaitable[str]:
     """Run ``/memory`` actions shared by TUI and serve clients."""
     action = args.strip()
-    format_one_usage = "usage: /memory [log|retry [receipt]|undo|accept <file>]"
+    format_one_usage = "usage: /memory [log|retry [receipt]|undo [version-id]|accept <file>|recovery <session-id> <quarantine-id> resume]"
     try:
         memory_format = registry.memory_format(project_id)
         usage = (
@@ -56,6 +60,13 @@ def run_memory_command(
             if memory_format == 1
             else "usage: /memory [log [kind|entry-id]|retry [receipt]|undo [entry-id|version-id]|accept <entry-id>|resolve <entry-id>...]"
         )
+        if action.startswith("recovery "):
+            parts = action.split()
+            if len(parts) != 4 or parts[3] != "resume" or reconciler is None:
+                return usage
+            root_session_id, quarantine_id = parts[1:3]
+            _authorize(authorization, "recovery", f"{root_session_id} {quarantine_id}")
+            return reconciler.resume_recovery(root_session_id, quarantine_id)
         if action == "retry":
             if reconciler is None:
                 return "memory retry: unavailable for this session"
@@ -99,10 +110,16 @@ def run_memory_command(
                 result = registry._undo_entry_transaction(project_id, target)
                 ids = ", ".join(result.receipts[0].target_ids)
                 return f"memory undo complete: {ids}" if ids else "memory undo complete"
-            if action != "undo":
+            parts = action.split()
+            if len(parts) > 2:
                 return usage
-            _authorize(authorization, "undo", "latest")
-            restored = registry.undo_memory(project_id)
+            expected_current = parts[1] if len(parts) == 2 else None
+            _authorize(authorization, "undo", expected_current or "latest")
+            restored = (
+                registry.undo_memory(project_id, expected_current=expected_current)
+                if expected_current is not None
+                else registry.undo_memory(project_id)
+            )
             names = ", ".join(name for name, _ in restored)
             return f"memory undo complete: {names}" if names else "memory undo complete"
         if action.startswith("accept "):

@@ -29,7 +29,7 @@ from ..protocol.types import (
     MessageOrigin,
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
-from ..storage_format import WriterLease, open_writer
+from ..storage_format import WRITER_EPOCH, WriterLease, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
 from .reconciler import (
@@ -209,6 +209,9 @@ class AutoMemoryReconciler:
         self._transcript_cursor: _TranscriptCursor | None = None
         self._transcript_scan_error: str | None = None
         self._transcript_scan_error_seq: int | None = None
+        self._recovery_generation = self.state.generation
+        self._recovery_cutoff: int | None = None
+        self._paused_for_recovery = False
 
     @property
     def last_reconciled_seq(self) -> int:
@@ -259,11 +262,50 @@ class AutoMemoryReconciler:
             self._ensure_worker()
         return queued
 
+    async def recovery_committed(
+        self, *, retained_last_sequence: int, memory_review_required: bool
+    ) -> None:
+        """Apply a repaired transcript only on this reconciler's owner loop."""
+        if self._storage_lease.observed_epoch != WRITER_EPOCH:
+            raise ProjectRegistryError("memory writes are unavailable before the writer epoch")
+        generation = self.state.generation + 1
+        await asyncio.to_thread(
+            self.state.reset_for_recovery,
+            generation=generation,
+            retained_last_sequence=retained_last_sequence,
+        )
+        self._recovery_generation = generation
+        self._recovery_cutoff = retained_last_sequence
+        self._transcript_cursor = None
+        self._pending.clear()
+        self._resume_catch_up = not memory_review_required
+        self._paused_for_recovery = memory_review_required
+        if not memory_review_required:
+            self._wake.set()
+            self._drained.clear()
+            self._ensure_worker()
+
+    def resume_recovery(self, retained_last_sequence: int) -> None:
+        """Resume after the user accepts the read-only overlap report."""
+        self._recovery_cutoff = retained_last_sequence
+        self._paused_for_recovery = False
+        self._resume_catch_up = True
+        if not self._closing:
+            self._drained.clear()
+            self._ensure_worker()
+            self._wake.set()
+
     def activity(self, seq: int | None = None) -> None:
         """Report a transcript append after it has been durably persisted."""
-        del seq  # The worker reads the authoritative durable sequence itself.
-        if not self.config.enabled or self._closing or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._closing
+            or self._paused_for_login
+            or self._paused_for_recovery
+            or (seq is not None and self._recovery_cutoff is not None and seq <= self._recovery_cutoff)
+        ):
             return
+        # the worker reads the authoritative durable sequence itself.
         self._begin_work_cycle()
         self._activity_generation += 1
         self._idle_deadline = self._clock() + self.config.idle_seconds

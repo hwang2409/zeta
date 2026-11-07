@@ -9,6 +9,7 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -295,7 +296,7 @@ class ServerSlashSession:
             return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             run_memory_command,
             registry,
             project_id,
@@ -303,6 +304,7 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
+        return await result if inspect.isawaitable(result) else result
 
     async def slash_mcp(
         self, args: str

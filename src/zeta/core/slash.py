@@ -606,7 +606,7 @@ class SlashSession(Protocol):
 
     def slash_project(self, args: str) -> str: ...
 
-    def slash_memory(self, args: str) -> str: ...
+    def slash_memory(self, args: str) -> str | Awaitable[str]: ...
 
     def slash_repair_transcript(self, args: str) -> str | Awaitable[str]: ...
 
@@ -862,7 +862,7 @@ def _run_project(session: SlashSession, args: str) -> str:
     return session.slash_project(args)
 
 
-def _run_memory(session: SlashSession, args: str) -> str:
+def _run_memory(session: SlashSession, args: str) -> str | Awaitable[str]:
     return session.slash_memory(args)
 
 
