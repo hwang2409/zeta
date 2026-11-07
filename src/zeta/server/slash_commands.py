@@ -49,6 +49,17 @@ from .runtime import ServerRuntime
 
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
 _UNAVAILABLE_REASON = "requires_tui"
+_SERVE_MCP_VERBS = (
+    "status",
+    "auth",
+    "logout",
+    "add",
+    "remove",
+    "enable",
+    "disable",
+    "trust",
+    "untrust",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,18 +290,7 @@ class ServerSlashSession:
         self, args: str
     ) -> str | ModelInputEnvelope | _ClientOnlySlashResult:
         stripped = args.strip()
-        if stripped.partition(" ")[0] not in {
-            "",
-            "status",
-            "auth",
-            "logout",
-            "add",
-            "remove",
-            "enable",
-            "disable",
-            "trust",
-            "untrust",
-        }:
+        if stripped and stripped.partition(" ")[0] not in _SERVE_MCP_VERBS:
             return _ClientOnlySlashResult("mcp")
         if self._runtime.loop is None:
             raise RuntimeError(_UNAVAILABLE_NOTICE)

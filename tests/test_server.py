@@ -96,9 +96,10 @@ from zeta.server.protocol import (
     MAX_REQUEST_ID_BYTES,
     EventDescriptor,
     FrameCodec,
+    SlashResultKindDescriptor,
 )
 from zeta.server.server import _Client
-from zeta.server.slash_commands import ServerSlashSession
+from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
@@ -7909,6 +7910,25 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
     tmp_path: Path,
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
+    (project / ".zeta" / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "live": {
+                        "transport": "stdio",
+                        "command": "missing-command",
+                        "enabled": False,
+                    },
+                    "oauth": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        "enabled": False,
+                        "auth": {"type": "oauth"},
+                    },
+                }
+            }
+        )
+    )
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -8031,16 +8051,53 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         assert model_with_name["kind"] == "output"
         assert "unsupported" not in str(model_with_name).lower()
 
-        mcp_status = (
+        mcp_arguments = {
+            "status": "",
+            "auth": "live",
+            "logout": "live",
+            "add": "added --stdio missing-command",
+            "remove": "added",
+            "enable": "live",
+            "disable": "live",
+            "trust": "live",
+            "untrust": "live",
+        }
+        assert set(mcp_arguments) == set(_SERVE_MCP_VERBS)
+        registered_kinds = {kind.value for kind in SlashResultKindDescriptor}
+        for number, verb in enumerate(_SERVE_MCP_VERBS, 200):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {
+                        "session_id": sid,
+                        "text": f"/mcp {verb} {mcp_arguments[verb]}".rstrip(),
+                    },
+                )
+            )[-1]["result"]
+            assert result["kind"] in registered_kinds, (verb, result)
+            assert result["kind"] in documented_kinds, (verb, result)
+            assert result["kind"] == "output", (verb, result)
+
+        credential_file = token_store_path("oauth", tmp_path / "home")
+        credential_file.parent.mkdir(parents=True, exist_ok=True)
+        credential_file.write_text("{broken")
+        credential_error = (
             await _request(
                 reader,
                 writer,
-                "mcp-status",
+                "mcp-structured-error",
                 "slash_run",
-                {"session_id": sid, "text": "/mcp status"},
+                {"session_id": sid, "text": "/mcp logout oauth"},
             )
         )[-1]["result"]
-        assert mcp_status["kind"] == "output"
+        assert credential_error["kind"] in registered_kinds
+        assert credential_error["kind"] in documented_kinds
+        assert credential_error["credential_store_error"]["code"] == (
+            "mcp_credential_store"
+        )
 
         invalid = (
             await _request(
