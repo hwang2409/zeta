@@ -13370,6 +13370,15 @@ class _ConsumeTaskSafetyWait:
         return await self.releases.get()
 
 
+async def _task_safety_warning(
+    warnings: asyncio.Queue[str], task_id: str
+) -> str:
+    try:
+        return await asyncio.wait_for(warnings.get(), 10)
+    except TimeoutError:
+        pytest.fail(f"timed out waiting for task safety warning for {task_id}")
+
+
 async def _start_consume_task_safety_harness(
     stack: contextlib.AsyncExitStack,
     tmp_path: Path,
@@ -13470,7 +13479,7 @@ async def _start_consume_task_safety_harness(
                 ToolCall(
                     task_id,
                     "run_background",
-                    {"command": _python("import time; time.sleep(30)")},
+                    {"command": _python("import threading; threading.Event().wait()")},
                 )
             ),
             10,
@@ -13552,7 +13561,7 @@ async def test_consume_run_keeps_late_task_on_its_own_safety_windows(
             await harness.warning_turn_gates.put(gate_a)
             harness.now[0] = 110.0
             await harness.safety_wait.releases.put(False)
-            warning_a = await asyncio.wait_for(harness.warnings.get(), 10)
+            warning_a = await _task_safety_warning(harness.warnings, task_a)
             assert f"task {task_a} (" in warning_a
 
             gate_a.set()
@@ -13590,7 +13599,7 @@ async def test_consume_run_keeps_late_task_on_its_own_safety_windows(
         await harness.warning_turn_gates.put(gate_b)
         harness.now[0] = 125.0
         await harness.safety_wait.releases.put(False)
-        warning_b = await asyncio.wait_for(harness.warnings.get(), 10)
+        warning_b = await _task_safety_warning(harness.warnings, task_b)
         assert f"task {task_b} (" in warning_b
         assert f"task {task_a} (" not in warning_b
 
@@ -13630,7 +13639,7 @@ async def test_consume_run_owner_turn_resets_only_warned_task_window(
         await harness.warning_turn_gates.put(gate_a)
         harness.now[0] = 110.0
         await harness.safety_wait.releases.put(False)
-        warning_a = await asyncio.wait_for(harness.warnings.get(), 10)
+        warning_a = await _task_safety_warning(harness.warnings, task_a)
         assert f"task {task_a} (" in warning_a
         assert f"task {task_b} (" not in warning_a
 
@@ -13645,7 +13654,7 @@ async def test_consume_run_owner_turn_resets_only_warned_task_window(
         await harness.warning_turn_gates.put(gate_b)
         harness.now[0] = 115.0
         await harness.safety_wait.releases.put(False)
-        warning_b = await asyncio.wait_for(harness.warnings.get(), 10)
+        warning_b = await _task_safety_warning(harness.warnings, task_b)
         assert f"task {task_b} (" in warning_b
         assert f"task {task_a} (" not in warning_b
         gate_b.set()
