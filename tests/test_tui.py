@@ -12907,10 +12907,7 @@ async def test_unknown_slash_command_is_rendered_without_model_request(
     try:
         app._submissions.wake()
         app._submissions.submit("/statu", steer=False)
-        for _ in range(100):
-            if not app._submissions.active:
-                break
-            await asyncio.sleep(0.01)
+        await wait_until(lambda: not app._submissions.active)
 
         assert backend.calls == []
         assert "unknown command /statu" in output.getvalue()
