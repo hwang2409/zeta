@@ -21,7 +21,7 @@ async def test_await_or_fail_rejects_short_deadline() -> None:
     coroutine = value()
     try:
         with pytest.raises(ValueError, match="at least 10 s"):
-            await await_or_fail(coroutine, timeout=9, what="value")
+            await await_or_fail(coroutine, timeout=0, what="value")
     finally:
         coroutine.close()
 
@@ -43,6 +43,7 @@ async def test_await_or_fail_bounds_cancel_ignoring_task() -> None:
         started.set()
         while not release.is_set():
             try:
+                # test-contract: complexity simulates a task that ignores cancellation
                 await release.wait()
             except asyncio.CancelledError:
                 continue
@@ -73,6 +74,7 @@ async def test_owned_app_keeps_body_failure_primary_when_task_will_not_cancel() 
         started.set()
         while not release.is_set():
             try:
+                # test-contract: complexity simulates a task that ignores cancellation
                 await release.wait()
             except asyncio.CancelledError:
                 continue

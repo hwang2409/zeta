@@ -30,6 +30,7 @@ AWAIT_DEADLINE_ERROR = (
     "await without a deadline: use `await await_or_fail(x, what=...)` "
     "(tests/support/owned.py), or asyncio.wait_for(x, 10)"
 )
+SYNC_DEADLINE_ERROR = "blocking wait without a deadline: pass timeout=10"
 AWAIT_DEADLINE_CODE = "TQ004"
 RATCHET_PATH = Path("tests/test_quality_ratchet.txt")
 
@@ -309,12 +310,18 @@ def _keyword_is_true(node: ast.Call, name: str) -> bool:
 
 def _timing_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
     if isinstance(node, ast.Call):
-        timeout = _wait_timeout(node)
-        short_override = (
-            _name(node.func) == "await_or_fail"
-            and _keyword_is_true(node, "allow_short")
-            and _has_marker(lines, node.lineno, {"latency"})
+        allow_short = _name(node.func) == "await_or_fail" and _keyword_is_true(
+            node, "allow_short"
         )
+        has_latency_marker = _has_marker(lines, node.lineno, {"latency"})
+        if allow_short and not has_latency_marker:
+            return [
+                Finding(
+                    path, node.lineno, node.col_offset + 1, "TQ001", SHORT_TIMEOUT_ERROR
+                )
+            ]
+        timeout = _wait_timeout(node)
+        short_override = allow_short and has_latency_marker
         if (
             timeout is not None
             and 0 < timeout < MIN_HANG_GUARD_SECONDS
@@ -428,58 +435,153 @@ def _inside_deadline_argument(node: ast.AST, parents: dict[ast.AST, ast.AST]) ->
     return False
 
 
-def _support_function_implements_deadline(
-    path: Path, node: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> bool:
-    if path.parts[:2] != ("tests", "support"):
+def _inside_test_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    return any(
+        isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and ancestor.name.startswith("test_")
+        for ancestor in _enclosing_nodes(node, parents)
+    )
+
+
+def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
         return False
-    function = next(
+    function = node.func
+    if not isinstance(function, ast.Attribute):
+        return False
+    if function.attr == "join":
+        return True
+    return (
+        function.attr == "wait"
+        and isinstance(parents.get(node), ast.Expr)
+        and _inside_test_function(node, parents)
+    )
+
+
+def _is_blocking_to_thread(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call) or _name(node.func) not in {
+        "asyncio.to_thread",
+        "to_thread",
+    }:
+        return False
+    if not node.args or not isinstance(node.args[0], ast.Attribute):
+        return False
+    target = node.args[0]
+    if target.attr in {"recv", "recv_into", "read", "readline", "accept"}:
+        return True
+    return target.attr == "get" and "queue" in _name(target.value).lower()
+
+
+def _bounded_asyncio_wait(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and _name(node.func) == "asyncio.wait"
+        and any(keyword.arg == "timeout" for keyword in node.keywords)
+    )
+
+
+def _assigned_names(node: ast.AST) -> set[str]:
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return set()
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return {
+        part.id
+        for target in targets
+        for part in ast.walk(target)
+        if isinstance(part, ast.Name)
+    }
+
+
+def _earlier_block_statements(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> list[ast.stmt]:
+    child = node
+    for parent in _enclosing_nodes(node, parents):
+        if isinstance(child, ast.stmt):
+            for _, value in ast.iter_fields(parent):
+                if isinstance(value, list) and child in value:
+                    return value[: value.index(child)]
+        child = parent
+    return []
+
+
+def _nearest_assignment(name: str, statements: list[ast.stmt]) -> ast.AST | None:
+    return next(
         (
-            ancestor
-            for ancestor in _enclosing_nodes(node, parents)
-            if isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
+            statement
+            for statement in reversed(statements)
+            if name in _assigned_names(statement)
         ),
         None,
     )
-    if function is None:
+
+
+def _is_bounded_wait_assignment(node: ast.AST | None) -> bool:
+    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+    return isinstance(value, ast.Await) and _bounded_asyncio_wait(value.value)
+
+
+def _support_gather_is_already_done(
+    path: Path, node: ast.Await, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    value = node.value
+    if path.parts[:2] != ("tests", "support") or not (
+        isinstance(value, ast.Call) and _name(value.func) == "asyncio.gather"
+    ):
         return False
-    return any(
-        isinstance(part, ast.Call)
-        and _name(part.func)
-        in {
-            "asyncio.wait",
-            "asyncio.wait_for",
-            "asyncio.timeout",
-            "wait_for",
-            "timeout",
-            "await_or_fail",
-        }
-        for part in ast.walk(function)
+    gathered = {
+        argument.value.id
+        for argument in value.args
+        if isinstance(argument, ast.Starred) and isinstance(argument.value, ast.Name)
+    }
+    earlier = _earlier_block_statements(node, parents)
+    return bool(gathered) and all(
+        _is_bounded_wait_assignment(_nearest_assignment(name, earlier))
+        for name in gathered
     )
 
 
-def _await_deadline_findings(
+def _deadline_findings(
     path: Path,
     node: ast.AST,
     lines: list[str],
     parents: dict[ast.AST, ast.AST],
 ) -> list[Finding]:
+    if _is_unbounded_sync_wait(node, parents):
+        return (
+            []
+            if _has_marker(lines, node.lineno, CONTRACT_KINDS)
+            else [
+                Finding(
+                    path,
+                    node.lineno,
+                    node.col_offset + 1,
+                    AWAIT_DEADLINE_CODE,
+                    SYNC_DEADLINE_ERROR,
+                )
+            ]
+        )
     if not isinstance(node, ast.Await):
         return []
     value = node.value
-    violates = isinstance(value, (ast.Name, ast.Attribute)) or (
-        isinstance(value, ast.Call)
-        and (
-            _name(value.func) == "asyncio.gather"
-            or (isinstance(value.func, ast.Attribute) and value.func.attr == "wait")
+    violates = (
+        isinstance(value, (ast.Name, ast.Attribute))
+        or _is_blocking_to_thread(value)
+        or (
+            isinstance(value, ast.Call)
+            and (
+                _name(value.func) == "asyncio.gather"
+                or (isinstance(value.func, ast.Attribute) and value.func.attr == "wait")
+            )
         )
     )
     if (
         not violates
         or _has_marker(lines, node.lineno, CONTRACT_KINDS)
+        or _bounded_asyncio_wait(value)
+        or _support_gather_is_already_done(path, node, parents)
         or _inside_timeout_context(node, parents)
         or _inside_deadline_argument(node, parents)
-        or _support_function_implements_deadline(path, node, parents)
     ):
         return []
     return [
@@ -522,7 +624,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines))
-        findings.extend(_await_deadline_findings(path, node, lines, parents))
+        findings.extend(_deadline_findings(path, node, lines, parents))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -561,8 +663,9 @@ def finding_ratchet_key(root: Path, finding: Finding) -> str:
     return f"{finding.path}::{_function_at_line(tree, finding.line)}"
 
 
-def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
-    root = Path.cwd() if root is None else root
+def _scan_deadline_findings(
+    root: Path,
+) -> tuple[list[Finding], dict[Path, ast.AST]]:
     findings: list[Finding] = []
     trees: dict[Path, ast.AST] = {}
     for source_path in sorted((root / "tests").rglob("*.py")):
@@ -577,19 +680,27 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
             for child in ast.iter_child_nodes(parent)
         }
         for node in ast.walk(tree):
-            findings.extend(_await_deadline_findings(path, node, lines, parents))
+            findings.extend(_deadline_findings(path, node, lines, parents))
+    return findings, trees
+
+
+def _read_ratchet(root: Path) -> set[str]:
+    ratchet_path = root / RATCHET_PATH
+    if not ratchet_path.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in ratchet_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
+    root = Path.cwd() if root is None else root
+    findings, trees = _scan_deadline_findings(root)
     if not use_ratchet:
         return findings
-    ratchet_path = root / RATCHET_PATH
-    ratchet = (
-        {
-            line.strip()
-            for line in ratchet_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-        if ratchet_path.is_file()
-        else set()
-    )
+    ratchet = _read_ratchet(root)
     return [
         finding
         for finding in findings

@@ -32,10 +32,10 @@ def _lint(
     source: str,
     added_lines: set[int] | None = None,
     diff: str | None = None,
+    path: str = "tests/test_example.py",
 ):
-    path = "tests/test_example.py"
     target = tmp_path / path
-    target.parent.mkdir()
+    target.parent.mkdir(parents=True)
     target.write_text(source)
     return lint_diff(diff or _diff(path, source, added_lines), tmp_path)
 
@@ -163,6 +163,141 @@ def test_await_deadline_rule_catches_both_pr_772_notification_gates(
         ("TQ004", 3),
         ("TQ004", 5),
     ]
+
+
+def test_support_deadline_exemption_applies_only_to_bounded_await(
+    tmp_path: Path,
+) -> None:
+    source = """async def helper():
+    await dangerous.wait()
+    await asyncio.wait_for(other.wait(), 10)
+"""
+
+    findings = _lint(tmp_path, source, path="tests/support/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'await await_or_fail(task, timeout=timeout, what="x", allow_short=True)',
+        'await await_or_fail(task, timeout=float(1), what="x", allow_short=True)',
+        'await await_or_fail(task, timeout=1 + 0, what="x", allow_short=True)',
+        'await await_or_fail(task, what="x", allow_short=True)',
+    ],
+)
+def test_allow_short_always_requires_latency_marker(tmp_path: Path, call: str) -> None:
+    source = f"async def test_wait():\n    {call}\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 2)]
+
+
+def test_support_done_set_must_still_come_from_bounded_wait(tmp_path: Path) -> None:
+    source = """async def helper(task):
+    done, pending = await asyncio.wait([task], timeout=10)
+    done = dangerous_tasks()
+    await asyncio.gather(*done)
+"""
+
+    findings = _lint(tmp_path, source, path="tests/support/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 4)]
+
+
+@pytest.mark.parametrize("target", ["thread", "process"])
+def test_await_deadline_rule_rejects_unbounded_thread_join(
+    tmp_path: Path, target: str
+) -> None:
+    source = f"def test_worker():\n    {target}.join()\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+    assert findings[0].message == "blocking wait without a deadline: pass timeout=10"
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["worker.join(10)", "worker.join(timeout=10)", '", ".join(parts)'],
+)
+def test_await_deadline_rule_accepts_bounded_or_string_join(
+    tmp_path: Path, call: str
+) -> None:
+    source = f"def test_worker():\n    {call}\n"
+
+    assert _lint(tmp_path, source) == []
+
+
+def test_await_deadline_rule_rejects_sync_event_wait(tmp_path: Path) -> None:
+    source = """def test_worker():
+    ready.wait()
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+    assert findings[0].message == "blocking wait without a deadline: pass timeout=10"
+
+
+@pytest.mark.parametrize("call", ["ready.wait(10)", "ready.wait(timeout=10)"])
+def test_await_deadline_rule_accepts_bounded_sync_event_wait(
+    tmp_path: Path, call: str
+) -> None:
+    source = f"def test_worker():\n    {call}\n"
+
+    assert _lint(tmp_path, source) == []
+
+
+def test_await_deadline_rule_catches_pr_774_blocking_pipe_receive(
+    tmp_path: Path,
+) -> None:
+    source = """async def test_other_process():
+    await asyncio.to_thread(parent_pipe.recv)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "socket.recv",
+        "socket.recv_into",
+        "stream.read",
+        "stream.readline",
+        "listener.accept",
+        "queue.get",
+    ],
+)
+def test_await_deadline_rule_rejects_blocking_to_thread(
+    tmp_path: Path, target: str
+) -> None:
+    source = f"async def test_worker():\n    await asyncio.to_thread({target})\n"
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "await asyncio.wait_for(asyncio.to_thread(pipe.recv), 10)",
+        "await await_or_fail(asyncio.to_thread(stream.read), what='stream read')",
+        "async with asyncio.timeout(10):\n        await asyncio.to_thread(listener.accept)",
+    ],
+)
+def test_await_deadline_rule_accepts_bounded_blocking_to_thread(
+    tmp_path: Path, statement: str
+) -> None:
+    source = f"async def test_worker():\n    {statement}\n"
+
+    assert _lint(tmp_path, source) == []
 
 
 def test_await_deadline_rule_accepts_supported_deadlines(tmp_path: Path) -> None:

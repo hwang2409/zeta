@@ -1623,11 +1623,11 @@ skill_catalog=SkillCatalog.empty(),
 
         submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
         owner.task(submission_task)
-        await submission_task
+        await asyncio.wait_for(submission_task, timeout=10)
         await _drain_submission_consumer(app)
         assert app._inline_abort_signals, "inline shell did not start"
         app.abort_active()
-        await submission_task
+        await asyncio.wait_for(submission_task, timeout=10)
         assert app._preprocessing_task is not None
         await app._preprocessing_task
         app._preprocessing_task = None
@@ -2235,9 +2235,12 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
     async with owned_app(app):
         app._input_loop_active = True
 
-        await asyncio.gather(
-            app._handle_prompt_value("/first"),
-            app._handle_prompt_value("/second"),
+        await asyncio.wait_for(
+            asyncio.gather(
+                app._handle_prompt_value("/first"),
+                app._handle_prompt_value("/second"),
+            ),
+            timeout=10,
         )
         await _drain_submission_consumer(app)
         # test-contract: seam no public event reports all command-preprocessing completions.
@@ -2291,7 +2294,7 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
         macro_child = app._active_task
         assert macro_child is not None
         await asyncio.wait_for(macro_child, timeout=10)
-        await macro_task
+        await asyncio.wait_for(macro_task, timeout=10)
         provider_task = app._active_task
         assert provider_task is not None
         await asyncio.wait_for(provider_task, timeout=10)
@@ -2372,6 +2375,7 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
 
         async def background() -> None:
             try:
+                # test-contract: complexity simulates a long-lived background task
                 await background_release.wait()
             except asyncio.CancelledError:
                 canceled.set()

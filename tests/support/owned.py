@@ -50,7 +50,7 @@ async def await_or_fail[T](
     future = asyncio.ensure_future(awaitable)
     done, _ = await asyncio.wait([future], timeout=timeout)
     if done:
-        return await future
+        return future.result()
 
     timeout_error = TimeoutError(f"{what} did not finish within {timeout} s")
     try:
@@ -91,6 +91,7 @@ class AppOwner:
             try:
                 result = action()
                 if asyncio.iscoroutine(result):
+                    # test-contract: complexity cleanup callbacks own their deadline
                     await result
             except BaseException as exc:  # noqa: BLE001 - cleanup must continue
                 if first_error is None:
