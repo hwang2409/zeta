@@ -1231,7 +1231,7 @@ def create_slash_registry(
         SlashCommand("tasks", _run_tasks, "inspect background processes")
     )
     registry.register(
-        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
+        SlashCommand("decisions", _run_decisions, "read, reply to, or dismiss attention items")
     )
     registry.register(
         SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")

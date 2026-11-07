@@ -80,24 +80,51 @@ class DecisionsMixin:
         return self._decisions_panel_open and self._full_screen_active()
 
     async def slash_decisions(self, args: str) -> str:
-        del args
         from ...attention_decisions import open_decisions
+        from ...attention_records import AttentionStore
 
+        parts = args.split(maxsplit=2)
         items = await asyncio.to_thread(
             open_decisions,
             self._home,
             self._decisions_session_id,
             _registry_state(self),
         )
-        if not items:
-            return "no open decisions"
-        lines = ["open decisions:"]
-        for item in items:
-            lines.append(
-                f"  {item.record.title}  "
-                f"[{item.project_name}]"
+        if parts and parts[0] in {"reply", "dismiss"}:
+            if len(parts) < 2:
+                return "usage: /decisions reply <id> <text> or /decisions dismiss <id>"
+            attention_id = parts[1]
+            record = next(
+                (item.record for item in items if item.record.id == attention_id), None
             )
-        return "\n".join(lines)
+            if record is None:
+                return "attention item not found"
+            if parts[0] == "dismiss":
+                await asyncio.to_thread(
+                    AttentionStore(self._home / "sessions" / record.session_id).dismiss,
+                    attention_id,
+                    session_id=record.session_id,
+                )
+                return f"dismissed {attention_id}"
+            if len(parts) < 3 or not parts[2].strip():
+                return "reply text must be nonempty"
+            from ...attention_forks import deliver_attention_decision
+
+            await asyncio.to_thread(
+                deliver_attention_decision,
+                self._home,
+                record,
+                parts[2],
+                from_session=self.loop.store.session_id,
+                registry_state=_registry_state(self),
+            )
+            return f"replied to {attention_id}"
+        if not items:
+            return "no open attention items"
+        return "open attention items:\n" + "\n".join(
+            f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
+            for item in items
+        )
 
     # -- status-bar count poll ----------------------------------------------
 
@@ -134,7 +161,9 @@ class DecisionsMixin:
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
-                self._decisions_panel.render_lines(), keep_offset=True, overflow_hint=True
+                self._decisions_panel.render_lines(),
+                keep_offset=True,
+                overflow_hint=True,
             )
             self._invalidate_prompt()
         elif changed:
@@ -210,6 +239,13 @@ class DecisionsMixin:
             panel.move(-1)
         elif key in {"down", "j"}:
             panel.move(1)
+        elif (
+            key == "d"
+            and panel.selected is not None
+            and panel.selected.record.kind != "decision"
+        ):
+            self._dismiss_selected()
+            return
         elif key == "a":
             panel.enter_answer()
             self._decisions_answer_buffer = ""
@@ -280,6 +316,27 @@ class DecisionsMixin:
             self._refresh_decisions_panel()
 
         self._decisions_panel.exit_answer()
+        asyncio.create_task(run())
+
+    def _dismiss_selected(self) -> None:
+        item = self._decisions_panel.selected
+        if item is None:
+            return
+
+        async def run() -> None:
+            from ...attention_records import AttentionStore
+
+            try:
+                await asyncio.to_thread(
+                    AttentionStore(self._home / "sessions" / item.session_id).dismiss,
+                    item.record.id,
+                    session_id=item.session_id,
+                )
+            except (OSError, ValueError) as exc:
+                self._print_system(f"attention not dismissed: {exc}")
+            await self._decisions_tick()
+            self._refresh_decisions_panel()
+
         asyncio.create_task(run())
 
     def _discuss_selected(self) -> None:

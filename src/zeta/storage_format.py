@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 2
+WRITER_EPOCH: Final = 3
 
 BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
     "memory-current.json": frozenset({("history",)}),
@@ -26,6 +26,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
     "conversation.entry_type": frozenset(
@@ -480,6 +481,12 @@ class WriterLease:
         self.home = home
         self._entry = entry
         self._closed = False
+
+    @property
+    def writer_epoch(self) -> int:
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        return self._entry.epoch
 
     def retain(self) -> WriterLease:
         if self._closed:
