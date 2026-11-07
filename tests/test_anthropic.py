@@ -3008,8 +3008,7 @@ async def test_closed_malformed_tool_with_open_sibling_remains_strict(
 @pytest.mark.asyncio
 async def test_eof_message_delta_is_typed(tmp_path: Path) -> None:
     with pytest.raises(AnthropicStreamError, match="before message completion"):
-        await _collect_anthropic_events(
-            tmp_path,
+        await _collect_anthropic_decoder_events(
             'data: {"type":"message_start","message":{}}\n\n'
             'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}',
         )
@@ -3512,6 +3511,16 @@ async def _assert_malformed_stream_raises(tmp_path: Path, stream: str) -> None:
     await client.aclose()
 
 
+async def _collect_anthropic_decoder_events(stream: str) -> list[StreamEvent]:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        text=stream,
+        request=httpx.Request("GET", "https://example.test/stream"),
+    )
+    return [event async for event in anthropic_module._decode_response(response)]
+
+
 async def _collect_anthropic_events(tmp_path: Path, stream: str) -> list[StreamEvent]:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -3615,19 +3624,19 @@ async def test_delta_before_message_start_is_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_event_after_message_stop_is_rejected(tmp_path: Path) -> None:
-    await _assert_malformed_stream_raises(
-        tmp_path,
-        "\n".join(
-            [
-                'data: {"type":"message_start","message":{}}',
-                "",
-                'data: {"type":"message_stop"}',
-                "",
-                'data: {"type":"message_start","message":{}}',
-                "",
-            ]
-        ),
-    )
+    with pytest.raises(AnthropicStreamError, match="follows message_stop"):
+        await _collect_anthropic_decoder_events(
+            "\n".join(
+                [
+                    'data: {"type":"message_start","message":{}}',
+                    "",
+                    'data: {"type":"message_stop"}',
+                    "",
+                    'data: {"type":"message_start","message":{}}',
+                    "",
+                ]
+            )
+        )
 
 
 @pytest.mark.asyncio
