@@ -2,16 +2,122 @@ from __future__ import annotations
 
 import asyncio
 import os
+import select
 import selectors
 import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from multiprocessing import Process
+from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import TypeVar
 
 _READY_TOKEN = b"ZETA_TEST_READY\n"
+_T = TypeVar("_T")
+
+
+async def _run_child_process_cleanup(
+    process: Process,
+    *,
+    endpoints: tuple[Connection, ...],
+    close: Callable[[], Awaitable[object]] | None,
+    stop: tuple[Connection, object] | None,
+) -> None:
+    try:
+        _ = process.pid
+    except ValueError as error:
+        if str(error) == "process object is closed":
+            return
+        raise
+
+    first_error: BaseException | None = None
+
+    async def attempt(operation: Callable[[], _T]) -> _T | None:
+        nonlocal first_error
+        try:
+            return await asyncio.to_thread(operation)
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            if first_error is None:
+                first_error = error
+            return None
+
+    if close is not None:
+        try:
+            await asyncio.wait_for(close(), 10)
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            if first_error is None:
+                first_error = error
+
+    if stop is not None:
+        endpoint, message = stop
+        await attempt(lambda: endpoint.send(message))
+
+    await attempt(lambda: reap_process(process, timeout=10))
+
+    for endpoint in endpoints:
+        await attempt(endpoint.close)
+    await attempt(lambda: _close_owned_process(process))
+
+    if first_error is not None:
+        raise first_error
+
+
+async def _finish_child_process_cleanup(task: asyncio.Task[None]) -> None:
+    deferred_cancel: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if deferred_cancel is None:
+                deferred_cancel = error
+
+    cleanup_error = task.exception()
+    if deferred_cancel is not None:
+        if cleanup_error is not None:
+            deferred_cancel.add_note(
+                f"cleanup error: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise deferred_cancel
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+@asynccontextmanager
+async def owned_child_process(
+    process: Process,
+    *,
+    endpoints: Iterable[Connection] = (),
+    close: Callable[[], Awaitable[object]] | None = None,
+    stop: tuple[Connection, object] | None = None,
+) -> AsyncIterator[Process]:
+    """Own bounded, cancellation-safe teardown of one multiprocessing child."""
+
+    owned_endpoints = tuple(endpoints)
+
+    async def cleanup() -> None:
+        task = asyncio.create_task(
+            _run_child_process_cleanup(
+                process,
+                endpoints=owned_endpoints,
+                close=close,
+                stop=stop,
+            )
+        )
+        await _finish_child_process_cleanup(task)
+
+    try:
+        yield process
+    except BaseException as primary:
+        try:
+            await cleanup()
+        except BaseException as error:  # noqa: BLE001 - the body error wins
+            primary.add_note(f"cleanup error: {type(error).__name__}: {error}")
+        raise
+    else:
+        await cleanup()
 
 
 class ChildHandshake:
@@ -119,12 +225,101 @@ def read_pty_until(
             output.extend(chunk)
 
 
-def reap_process(process: subprocess.Popen[object], *, timeout: float = 30) -> int:
+def reap_process(
+    process: subprocess.Popen[object] | Process, *, timeout: float = 30
+) -> int | None:
+    if isinstance(process, subprocess.Popen):
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait()
+
     try:
-        return process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        process.join(timeout)
+    except ValueError as error:
+        if str(error) == "process object is closed":
+            return None
+        raise
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout)
+    if process.is_alive():
         process.kill()
-        return process.wait()
+        process.join(timeout)
+    if process.is_alive():
+        raise AssertionError(f"child process {process.pid} remained alive after kill")
+    return process.exitcode
+
+
+def _close_owned_process(process: Process) -> None:
+    try:
+        process.close()
+    except ValueError as error:
+        if str(error) != "process object is closed":
+            raise
+
+
+async def wait_pid_exited(pid: int, timeout: float = 10) -> None:
+    await asyncio.to_thread(_wait_pid_exited_sync, pid, timeout)
+
+
+def _wait_pid_exited_sync(pid: int, timeout: float) -> None:
+    if hasattr(os, "pidfd_open"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(pidfd, selectors.EVENT_READ)
+                if selector.select(timeout):
+                    return
+        finally:
+            os.close(pidfd)
+    elif hasattr(select, "kqueue"):
+        queue = select.kqueue()
+        event = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            if queue.control([event], 1, timeout):
+                return
+        except ProcessLookupError:
+            return
+        finally:
+            queue.close()
+    else:
+        # Poll only on platforms without a process-exit event API.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = _pid_state(pid)
+            if state is None or state.startswith("Z"):
+                return
+            # test-contract: latency compatibility fallback must rate-limit ps polling
+            time.sleep(0.05)
+
+    state = _pid_state(pid)
+    if state is None or state.startswith("Z"):
+        return
+    raise AssertionError(
+        f"pid {pid} did not exit within {timeout}s; last ps state: {state!r}"
+    )
+
+
+def _pid_state(pid: int) -> str | None:
+    result = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def wait_for_path_command(

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from ..core.approval import (
@@ -43,7 +44,13 @@ from .approval_lifecycle import (
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
-from .protocol import FrameWriteCancelled, ProtocolError, bounded
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameWriteCancelled,
+    ProtocolError,
+    bounded,
+)
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -103,6 +110,9 @@ class ServeControl:
     def __init__(self, server: ZetaServer) -> None:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
+        self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._session_swap_active = False
+        self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
@@ -158,9 +168,8 @@ class ServeControl:
     def reject_client_turn_if_detached(self) -> None:
         if self._host_binding_required and self._active_host_commands is None:
             raise ProtocolError(
-                -32003,
+                ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
-                {"code": "host_binding_required"},
             )
 
     def request_turn_failure(self) -> None:
@@ -174,13 +183,39 @@ class ServeControl:
 
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
-        return (self._turn_task is not None and not self._turn_task.done()) or (
-            loop is not None and loop.notification_turn_state != "idle"
+        return (
+            self._session_swap_active
+            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_handoff_task is not None
+                and not self._turn_handoff_task.done()
+            )
+            or (loop is not None and loop.notification_turn_state != "idle")
         )
 
     async def require_idle(self) -> None:
         if self.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
+
+    @contextmanager
+    def reserve_session_swap(self) -> Iterator[None]:
+        if self.turn_busy():
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
+        state = self.server.runtime.state
+        session_id = None if state is None else state.session_id
+        self._session_swap_active = True
+        self._session_swap_id = session_id
+        try:
+            yield
+        finally:
+            self._session_swap_active = False
+            self._session_swap_id = None
+            if session_id is not None:
+                self._schedule_background_wake(session_id)
 
     def model_input_registrar(self, features: frozenset[str]):
         return self._model_inputs.registrar(
@@ -345,7 +380,7 @@ class ServeControl:
         loop = self.server.runtime.loop
         policy = self.server.runtime.policy
         if loop is None or policy is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
@@ -377,10 +412,7 @@ class ServeControl:
         if connections is None or session_id is None:
             return
         await connections.publish_feature_event(
-            FEATURE,
-            EVENT,
-            session_id,
-            data=event_data(change, session_id),
+            FEATURE, EVENT, session_id, data=event_data(change, session_id)
         )
 
     async def publish_session_grant_reset(self) -> None:
@@ -524,7 +556,7 @@ class ServeControl:
                 self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
-        if self.closing:
+        if self.closing or self._session_swap_id == session_id:
             return
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -841,7 +873,7 @@ class ServeControl:
         await self._notify(wire_event, session_id, data=dict(event.data))
 
     async def _start_approval(
-        self, event: StreamEvent, session_id: str | None, wire_event: str
+        self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
         await self._approvals.transition(Start(event, session_id, wire_event))
 
@@ -882,7 +914,7 @@ class ServeControl:
             )
 
     async def _notify(
-        self, event: str, session_id: str | None = None, **fields: object
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
@@ -935,7 +967,8 @@ EVENT = "session_grants_changed"
 def require_feature(features: frozenset[str]) -> None:
     if FEATURE not in features:
         raise ProtocolError(
-            -32601, "session grants require the negotiated session_grants feature"
+            ErrorDescriptor.METHOD_NOT_FOUND,
+            "session grants require the negotiated session_grants feature",
         )
 
 
@@ -944,12 +977,12 @@ def read(
 ) -> dict[str, object]:
     if params:
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "session_grants takes no params",
             {"code": "invalid_session_grants_params"},
         )
     if policy is None or session_id is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     return snapshot_result(permission_snapshot(policy), session_id)
 
 
@@ -959,7 +992,7 @@ def revoke(
     params: dict[str, Any],
 ) -> tuple[dict[str, object], SessionGrantChange]:
     if policy is None or session_id is None:
-        raise ProtocolError(-32003, "no active session")
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
     valid_grant = (
         set(params) == {"grant"}
         and isinstance(params.get("grant"), str)
@@ -968,7 +1001,7 @@ def revoke(
     valid_clear = set(params) == {"clear"} and params.get("clear") is True
     if not (valid_grant or valid_clear):
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "invalid revoke_session_grants params",
             {"code": "invalid_session_grants_revoke"},
         )
@@ -980,7 +1013,7 @@ def revoke(
         )
     except SessionGrantNotFound as exc:
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "session grant not found",
             {"code": "session_grant_not_found", "grant": exc.grant},
         ) from exc

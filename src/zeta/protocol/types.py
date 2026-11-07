@@ -9,13 +9,18 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Literal,
     NotRequired,
     Protocol,
     TypedDict,
+    TypeGuard,
     runtime_checkable,
 )
+
+if TYPE_CHECKING:
+    from ..providers.transport import CloseFailureReporter, CloseOutcome
 
 from ..media.images import (
     IMAGE_DEGRADATION_WARNING,
@@ -705,8 +710,45 @@ class Message:
         )
 
 
+def harness_notice(
+    label: str,
+    text: str,
+    *,
+    event: str,
+    metadata: Mapping[str, Any] | None = None,
+    visible: bool = True,
+) -> Message:
+    """Build model-facing zeta guidance with explicit non-user authorship."""
+
+    return Message(
+        MessageRole.SYSTEM,
+        [TextContent(f"[zeta] {label}: {text}")],
+        metadata={
+            **(metadata or {}),
+            "zeta_event": event,
+            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
+            "zeta.notice_visible": visible,
+        },
+    )
+
+
+def is_visible_harness_notice(message: Message | Mapping[str, Any]) -> bool:
+    """True for zeta-authored system guidance shown as a transcript notice."""
+
+    role = message.role if isinstance(message, Message) else message.get("role")
+    metadata = (
+        message.metadata if isinstance(message, Message) else message.get("metadata", {})
+    )
+    return (
+        role in {MessageRole.SYSTEM, MessageRole.SYSTEM.value}
+        and isinstance(metadata, Mapping)
+        and metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.HARNESS_NUDGE.value
+        and metadata.get("zeta.notice_visible") is True
+    )
+
+
 def is_passive_harness_message(message: Message | Mapping[str, Any]) -> bool:
-    """True for provider-visible harness input hidden from human transcript views."""
+    """True for provider-visible harness input that is not a user message."""
 
     metadata = (
         message.metadata if isinstance(message, Message) else message.get("metadata")
@@ -915,3 +957,24 @@ class CompletionBackend(Protocol):
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
         """Return events for one completion. The loop owns turn control."""
+
+
+@runtime_checkable
+class OwnedCompletionBackend(CompletionBackend, Protocol):
+    provider: str
+    model: str
+
+    @property
+    def connection_setup_count(self) -> int: ...
+
+    def retire(self) -> None: ...
+
+    async def aclose(
+        self, *, report_failure: CloseFailureReporter | None = None
+    ) -> CloseOutcome: ...
+
+
+def is_owned_completion_backend(value: object) -> TypeGuard[OwnedCompletionBackend]:
+    return isinstance(value, OwnedCompletionBackend) and callable(
+        getattr(value, "retire", None)
+    )

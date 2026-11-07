@@ -207,7 +207,9 @@ def build_messages_payload(
                 else:
                     wire_messages.append({"role": "user", "content": content})
                 system_at_head = False
-            previous_message_was_nudge = False
+            previous_message_was_nudge = (
+                message.metadata.get("zeta_event") == "empty_turn_nudge"
+            )
             continue
         system_at_head = False
         if message.role is MessageRole.TOOL_RESULT:
