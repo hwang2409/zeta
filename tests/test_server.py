@@ -8439,6 +8439,9 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
 def _serve_switch_rename_race(home_value: str, results: object) -> None:
     home = Path(home_value)
+    from zeta.storage_format import advance
+
+    advance(home, expected_epoch=0)
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
@@ -8446,9 +8449,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999)
         )
     AccountStore(home).set_default(first)
-    from zeta.storage_format import advance
-
-    advance(home, expected_epoch=0)
     server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
 
     async def run() -> None:

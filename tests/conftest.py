@@ -702,11 +702,14 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
+    from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.memory.auto import AutoMemoryReconciler
+    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
-    from zeta.storage_format import StorageFormatError, advance, open_writer
+    from zeta.storage_format import StorageFormatError, open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
@@ -714,6 +717,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     stores: list[ConversationStore] = []
     composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
+    memory_reconcilers: list[AutoMemoryReconciler] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
     test_home_leases = {}
@@ -721,6 +725,9 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    project_registry_init = ProjectRegistry.__init__
+    account_store_init = AccountStore.__init__
+    memory_reconciler_init = AutoMemoryReconciler.__init__
 
     @wraps(loop_init)
     def tracked_loop_init(loop, *args, **kwargs):
@@ -734,9 +741,6 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     registry_close = ToolRegistry.close
 
     def ensure_format(home: Path) -> None:
-        home.mkdir(parents=True, exist_ok=True)
-        if not (home / "storage-format.json").exists():
-            advance(home, expected_epoch=0)
         canonical = home.resolve()
         if canonical not in test_home_leases:
             result = []
@@ -785,6 +789,23 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager_init(manager, *args, **kwargs)
         managers.append(manager)
 
+    @wraps(project_registry_init)
+    def tracked_project_registry_init(registry, *args, **kwargs):
+        root = Path(args[0] if args else kwargs["root"])
+        ensure_format(root.parent)
+        project_registry_init(registry, *args, **kwargs)
+
+    @wraps(account_store_init)
+    def tracked_account_store_init(store, *args, **kwargs):
+        home = Path(args[0] if args else kwargs["home"])
+        ensure_format(home)
+        account_store_init(store, *args, **kwargs)
+
+    @wraps(memory_reconciler_init)
+    def tracked_memory_reconciler_init(reconciler, *args, **kwargs):
+        memory_reconciler_init(reconciler, *args, **kwargs)
+        memory_reconcilers.append(reconciler)
+
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
         session_dir = Path(args[0])
@@ -819,6 +840,14 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam acquires the test home lease before direct registry setup
+    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_registry_init)
+    # test-contract: seam acquires the test home lease before direct account setup
+    monkeypatch.setattr(AccountStore, "__init__", tracked_account_store_init)
+    # test-contract: seam tracks process-owned resources created across tests
+    monkeypatch.setattr(
+        AutoMemoryReconciler, "__init__", tracked_memory_reconciler_init
+    )
     # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     # test-contract: seam tracks process-owned resources created across tests
@@ -826,6 +855,11 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
+    for reconciler in reversed(memory_reconcilers):
+        try:
+            await reconciler.close()
+        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+            pass
     for loop in reversed(loops):
         if not loop._closed:
             try:
