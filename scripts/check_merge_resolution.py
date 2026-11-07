@@ -729,6 +729,12 @@ def _unique_collection_match(
         for candidate in final_items.values()
         if candidate.kind in {"assignment", "constant"}
         and candidate.name == finding.name
+        and any(
+            element.kind == "collection element"
+            and element.name == candidate.name
+            and element.path == candidate.path
+            for element in final_items.values()
+        )
     ]
     return (
         len(collections) == 1
