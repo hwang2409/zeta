@@ -486,6 +486,7 @@ async def _cancel_archive(registry, owner, monkeypatch) -> None:
         async def archive():
             await hold()
             return await original()
+        # test-contract: seam this row installs the named archive cancellation seam.
         monkeypatch.setattr(owner, "_archive", archive)
 
     await _cancel_at_gate(owner, install, name="archive")
