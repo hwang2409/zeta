@@ -54,6 +54,17 @@ def test_every_notification_kind_has_a_validator() -> None:
         validate_notification_data(payloads[kind])
 
 
+def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store._prepare_durable_writer_snapshot()
+    writer = store._new_persistent_durable_writer()
+    try:
+        assert writer._storage_lease._entry is store._storage_lease._entry
+    finally:
+        writer.close()
+        store.close()
+
+
 def test_store_rejects_unknown_notification_kind_on_write(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
@@ -386,13 +397,13 @@ def test_live_lifecycle_updates_do_not_write_and_finish_persists_final_stats(
     store = ConversationStore(tmp_path)
     _start_agent_lifecycle(store)
     writes: list[str] = []
-    write_session_json = agent_state.write_session_json
+    write_session_file = agent_state.write_session_file
 
-    def record_write(directory_fd: int, name: str, value: object) -> None:
+    def record_write(directory_fd: int, name: str, value: bytes) -> None:
         writes.append(name)
-        write_session_json(directory_fd, name, value)
+        write_session_file(directory_fd, name, value)
 
-    monkeypatch.setattr(agent_state, "write_session_json", record_write)
+    monkeypatch.setattr(agent_state, "write_session_file", record_write)
 
     store.update_agent_lifecycle(current_step="turn 2: running")
     store.update_agent_lifecycle(turns_used=2)
@@ -777,6 +788,8 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
     outer = store.append_message(message(MessageRole.ASSISTANT, "outer"))
 
     assert outer.id != observed[0]
+    monkeypatch.undo()
+    store.close()
     assert [row.data["message"]["content"][0]["text"] for row in store._entries] == [
         "outer",
         "inner",
