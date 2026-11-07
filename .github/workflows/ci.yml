@@ -95,3 +95,17 @@ jobs:
           enable-cache: false
       - name: Run Gamma browser-client protocol tests
         run: uv run --frozen pytest -q tests/test_server_gamma.py
+
+  fresh-old-home:
+    name: fresh zeta on old home
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: Start installed zeta on old home
+        run: python scripts/smoke_old_home.py
