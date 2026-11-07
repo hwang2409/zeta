@@ -11,10 +11,13 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.key_binding import KeyPress
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
@@ -77,8 +80,21 @@ def _approval_presentation_event(
         if app.pending_approvals and expected in output.getvalue():
             approval_presented.set()
 
+    # test-contract: seam no public event reports approval-card publication.
     monkeypatch.setattr(app, "_present_pending_approvals", record_approval_presentation)
     return approval_presented
+
+
+# test-contract: seam no public event reports submission-consumer completion.
+async def _drain_submission_consumer(app: TUIApp) -> None:
+    while (consumer := app._submissions._consumer) is not None:
+        await asyncio.wait_for(asyncio.shield(consumer), timeout=10)
+
+
+# test-contract: seam no public event reports active provider-turn completion.
+async def _wait_for_active_task(app: TUIApp) -> None:
+    assert app._active_task is not None
+    await asyncio.wait_for(asyncio.shield(app._active_task), timeout=10)
 
 
 def test_loads_home_and_project_commands_with_project_precedence(tmp_path: Path) -> None:
@@ -342,7 +358,8 @@ async def test_completion_menu_arrows_do_not_navigate_history(tmp_path: Path) ->
     registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
     output_text = StringIO()
 
-    with create_pipe_input() as pipe:
+    async with owned_app() as owner:
+        pipe = owner.enter_context(create_pipe_input())
         session = PromptSession(
             input=pipe,
             output=Vt100_Output(
@@ -358,25 +375,24 @@ async def test_completion_menu_arrows_do_not_navigate_history(tmp_path: Path) ->
             completer=SlashCompleter(registry),
             multiline=True,
         )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0)
-        pipe.send_text("/r\t")
-        for _ in range(100):
+        completion_opened = asyncio.Event()
+
+        def completion_changed(_buffer: Buffer) -> None:
             if session.app.current_buffer.complete_state is not None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("completion menu did not open")
+                completion_opened.set()
 
-        pipe.send_text("\x1b[A")
-        for _ in range(100):
-            state = session.app.current_buffer.complete_state
-            if state is not None and state.complete_index is not None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("up arrow did not select a completion")
+        session.app.current_buffer.on_completions_changed += completion_changed
+        task = asyncio.create_task(
+            session.prompt_async(" > ", pre_run=lambda: pipe.send_text("/r\t"))
+        )
+        owner.task(task)
+        await asyncio.wait_for(completion_opened.wait(), timeout=10)
 
+        session.app.key_processor.feed(KeyPress(Keys.Up))
+        session.app.key_processor.process_keys()
+
+        state = session.app.current_buffer.complete_state
+        assert state is not None and state.complete_index is not None
         assert session.app.current_buffer.text == "/review"
         session.app.exit()
         await task
@@ -511,16 +527,21 @@ async def test_message_finder_cancels_completion_before_up_navigation(
     _write_command(tmp_path / ".zeta" / "commands", "review", "review")
     output_text = StringIO()
     finder_active = False
+    finder_opened = asyncio.Event()
+    finder_closed = asyncio.Event()
 
     def open_finder() -> None:
         nonlocal finder_active
         finder_active = True
+        finder_opened.set()
 
     def cancel_finder() -> None:
         nonlocal finder_active
         finder_active = False
+        finder_closed.set()
 
-    with create_pipe_input() as pipe:
+    async with owned_app() as owner:
+        pipe = owner.enter_context(create_pipe_input())
         session = FullScreenPromptSession(
             input=pipe,
             output=Vt100_Output(
@@ -542,34 +563,28 @@ async def test_message_finder_cancels_completion_before_up_navigation(
             ),
             multiline=True,
         )
-        task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
-        pipe.send_text("/r\t")
-        for _ in range(100):
+        completion_opened = asyncio.Event()
+
+        def completion_changed(_buffer: Buffer) -> None:
             if session.app.current_buffer.complete_state is not None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("completion menu did not open")
+                completion_opened.set()
+
+        session.app.current_buffer.on_completions_changed += completion_changed
+        task = asyncio.create_task(
+            session.prompt_async(" > ", pre_run=lambda: pipe.send_text("/r\t"))
+        )
+        owner.task(task)
+        await asyncio.wait_for(completion_opened.wait(), timeout=10)
 
         pipe.send_text("\x06")
-        for _ in range(100):
-            if finder_active and session.app.current_buffer.complete_state is None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("message finder did not cancel completion")
+        await asyncio.wait_for(finder_opened.wait(), timeout=10)
+        assert session.app.current_buffer.complete_state is None
 
         pipe.send_text("\x1b")
-        for _ in range(100):
-            if not finder_active:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("message finder did not close")
+        await asyncio.wait_for(finder_closed.wait(), timeout=10)
 
-        pipe.send_text("\x1b[A")
-        await asyncio.sleep(0.05)
+        session.app.key_processor.feed(KeyPress(Keys.Up))
+        session.app.key_processor.process_keys()
         assert session.app.current_buffer.text == "/r"
         session.app.exit()
         await task
@@ -655,17 +670,13 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
         model="offline",
         console=Console(file=output, force_terminal=False),
     )
-    app._input_loop_active = True
+    async with owned_app(app):
+        app._input_loop_active = True
 
-    await app._handle_prompt_value(value)
-    for _ in range(100):
-        if expected in output.getvalue():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError(f"{value} did not dispatch")
-    assert "unavailable while a turn is running" not in output.getvalue()
-    await app.close()
+        await app._handle_prompt_value(value)
+        await _drain_submission_consumer(app)
+        assert expected in output.getvalue(), f"{value} did not dispatch"
+        assert "unavailable while a turn is running" not in output.getvalue()
 
 
 @pytest.mark.asyncio
@@ -679,32 +690,31 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
-    original_dispatch = app._slash_commands.dispatch_async
+    async with owned_app(app):
+        original_dispatch = app._slash_commands.dispatch_async
 
-    async def dispatch(session: object, value: str) -> str | None:
-        if value == "/fail":
-            raise RuntimeError("forced handler failure")
-        return await original_dispatch(session, value)
+        async def dispatch(session: object, value: str) -> str | None:
+            if value == "/fail":
+                raise RuntimeError("forced handler failure")
+            return await original_dispatch(session, value)
 
-    monkeypatch.setattr(app._slash_commands, "dispatch_async", dispatch)
-    app._input_loop_active = True
-    await asyncio.gather(
-        app._handle_prompt_value("/fail"),
-        app._handle_prompt_value("later"),
-    )
+        # test-contract: seam no public injection point controls command-handler failure.
+        monkeypatch.setattr(app._slash_commands, "dispatch_async", dispatch)
+        app._input_loop_active = True
+        await asyncio.gather(
+            app._handle_prompt_value("/fail"),
+            app._handle_prompt_value("later"),
+        )
 
-    for _ in range(100):
-        if len(backend.calls) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("pipeline did not advance after handler failure")
-    assert "submission failed: forced handler failure" in app.console.file.getvalue()
-    user_message = next(
-        message for message in backend.calls[0][0] if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "later"
-    await app.close()
+        await _drain_submission_consumer(app)
+        await _wait_for_active_task(app)
+        # test-contract: durability the next queued submission dispatches exactly once.
+        assert len(backend.calls) == 1, "pipeline did not advance after handler failure"
+        assert "submission failed: forced handler failure" in app.console.file.getvalue()
+        user_message = next(
+            message for message in backend.calls[0][0] if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "later"
 
 
 @pytest.mark.asyncio
@@ -719,41 +729,36 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
     )
-    original_start_turn = app._start_turn
-    attempts = 0
+    async with owned_app(app):
+        original_start_turn = app._start_turn
+        attempts = 0
 
-    def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("forced provider failure")
-        return original_start_turn(*args, **kwargs)
+        def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("forced provider failure")
+            return original_start_turn(*args, **kwargs)
 
-    monkeypatch.setattr(app, "_start_turn", start_turn)
-    app._input_loop_active = True
-    await app._handle_prompt_value("first")
-    for _ in range(100):
-        if "submission failed: forced provider failure" in app.console.file.getvalue():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("provider failure was not handled")
-    await app._handle_prompt_value("later")
+        # test-contract: seam no public injection point controls provider startup failure.
+        monkeypatch.setattr(app, "_start_turn", start_turn)
+        app._input_loop_active = True
+        await app._handle_prompt_value("first")
+        await _drain_submission_consumer(app)
+        assert "submission failed: forced provider failure" in app.console.file.getvalue()
+        await app._handle_prompt_value("later")
 
-    for _ in range(100):
-        if len(backend.calls) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("pipeline did not advance after provider failure")
-    assert attempts == 2
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role is MessageRole.USER
-    )
-    assert user_message.content[0].text == "later"
-    await app.close()
+        await _drain_submission_consumer(app)
+        await _wait_for_active_task(app)
+        # test-contract: durability the next queued submission dispatches exactly once.
+        assert len(backend.calls) == 1, "pipeline did not advance after provider failure"
+        assert attempts == 2
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.USER
+        )
+        assert user_message.content[0].text == "later"
 
 
 @pytest.mark.asyncio
@@ -772,37 +777,36 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
-    original_start_turn = app._start_turn
-    attempts = 0
+    async with owned_app(app):
+        original_start_turn = app._start_turn
+        attempts = 0
 
-    def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("forced provider failure")
-        return original_start_turn(*args, **kwargs)
+        def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("forced provider failure")
+            return original_start_turn(*args, **kwargs)
 
-    monkeypatch.setattr(app, "_start_turn", start_turn)
-    app._input_loop_active = True
-    await asyncio.gather(
-        app._handle_prompt_value("first"),
-        app._handle_prompt_value("second"),
-    )
+        # test-contract: seam no public injection point controls same-tick startup failure.
+        monkeypatch.setattr(app, "_start_turn", start_turn)
+        app._input_loop_active = True
+        await asyncio.gather(
+            app._handle_prompt_value("first"),
+            app._handle_prompt_value("second"),
+        )
 
-    for _ in range(100):
-        if len(backend.calls) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("second submission was not dispatched")
-    assert attempts == 2
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role is MessageRole.USER
-    )
-    assert user_message.content[0].text == "second"
-    await app.close()
+        await _drain_submission_consumer(app)
+        await _wait_for_active_task(app)
+        # test-contract: durability the second queued submission dispatches exactly once.
+        assert len(backend.calls) == 1, "second submission was not dispatched"
+        assert attempts == 2
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.USER
+        )
+        assert user_message.content[0].text == "second"
 
 
 @pytest.mark.asyncio
@@ -826,22 +830,19 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    async with owned_app(app):
 
-    app._answer_first_pending("approve")
-    for _ in range(100):
-        if not app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
+        app._answer_first_pending("approve")
+        await _drain_submission_consumer(app)
 
-    assert not app.pending_approvals
-    assert app._prompt_history.snapshot(store.session_dir) == ()
+        assert not app.pending_approvals
+        assert app._prompt_history.snapshot(store.session_dir) == ()
 
-    await app._handle_prompt_value("/approve missing")
+        await app._handle_prompt_value("/approve missing")
 
-    history = app._prompt_history.snapshot(store.session_dir)
-    assert "/approve missing" in history
-    assert "shortcut-approval" not in history
-    await app.close()
+        history = app._prompt_history.snapshot(store.session_dir)
+        assert "/approve missing" in history
+        assert "shortcut-approval" not in history
 
 
 @pytest.mark.asyncio
@@ -863,18 +864,18 @@ async def test_failed_approval_action_acknowledges_waiter(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    async with owned_app(app):
 
-    def fail_approval(request_id: str | tuple[str, str]) -> bool:
-        del request_id
-        raise OSError("forced approval write failure")
+        def fail_approval(request_id: str | tuple[str, str]) -> bool:
+            del request_id
+            raise OSError("forced approval write failure")
 
-    monkeypatch.setattr(policy, "approve", fail_approval)
-    await asyncio.wait_for(
-        app._submissions.approval_action_wait(ApprovalDecision.ALLOW, call.id),
-        timeout=1,
-    )
-    assert "submission failed: forced approval write failure" in app.console.file.getvalue()
-    await app.close()
+        monkeypatch.setattr(policy, "approve", fail_approval)
+        await asyncio.wait_for(
+            app._submissions.approval_action_wait(ApprovalDecision.ALLOW, call.id),
+            timeout=10,
+        )
+        assert "submission failed: forced approval write failure" in app.console.file.getvalue()
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1013,9 @@ skill_catalog=SkillCatalog.empty(),
     await app.close()
 
 
-async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -> None:
+async def test_inline_shell_approval_covers_the_complete_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     _write_command(
         home / "commands",
@@ -1031,28 +1034,27 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
         approval_policy=policy,
         console=Console(file=output, force_terminal=True, width=120),
     )
+    async with owned_app(app) as owner:
 
-    task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("inline shell approval did not appear")
-    assert len(app.pending_approvals) == 1
-    assert "printf first" in output.getvalue()
-    assert "printf second" in output.getvalue()
-    assert policy.approve(app.pending_approvals[0].key)
-    await task
-    await app._active_task
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, output, "printf second"
+        )
+        task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+        owner.task(task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+        assert len(app.pending_approvals) == 1
+        assert "printf first" in output.getvalue()
+        assert "printf second" in output.getvalue()
+        assert policy.approve(app.pending_approvals[0].key)
+        await task
+        await app._active_task
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "values first and second"
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "values first and second"
 
 
 @pytest.mark.asyncio
@@ -1135,7 +1137,7 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
 
 
 async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "value !`printf ready`")
@@ -1150,31 +1152,32 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("inline shell approval did not appear")
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf ready"
+        )
+        submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+        owner.task(submission_task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
 
-    await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
-    await submission_task
-    assert app._preprocessing_task is not None
-    await app._preprocessing_task
-    app._preprocessing_task = None
-    assert app._active_task is not None
-    await app._active_task
-    assert backend.calls
-    await app.close()
+        await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
+        await submission_task
+        assert app._preprocessing_task is not None
+        await app._preprocessing_task
+        app._preprocessing_task = None
+        assert app._active_task is not None
+        await app._active_task
+        assert backend.calls
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", [ApprovalDecision.ALLOW, ApprovalDecision.DENY])
 async def test_unmapped_durable_approval_is_finalized(
-    tmp_path: Path, decision: ApprovalDecision
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: ApprovalDecision,
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "value !`printf ready`")
@@ -1192,24 +1195,31 @@ async def test_unmapped_durable_approval_is_finalized(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    for _ in range(100):
-        if len(app.pending_approvals) == 2:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("old and inline approvals did not appear")
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf ready"
+        )
+        submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+        owner.task(submission_task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+        assert len(app.pending_approvals) == 2
 
-    inline_key = next(
-        request.key
-        for request in app.pending_approvals
-        if request.key != old_call.id
-    )
-    verb = "approve" if decision is ApprovalDecision.ALLOW else "deny"
-    await app._handle_prompt_value(f"/{verb} {old_call.id}")
-    for _ in range(100):
+        inline_key = next(
+            request.key
+            for request in app.pending_approvals
+            if request.key != old_call.id
+        )
+        verb = "approve" if decision is ApprovalDecision.ALLOW else "deny"
+        await app._handle_prompt_value(f"/{verb} {old_call.id}")
+        await _drain_submission_consumer(app)
+        # test-contract: seam no public event reports durable approval-finalization completion.
+        durable_task = app._submissions._durable_tasks.get(old_call.id)
+        if durable_task is not None:
+            owner.task(durable_task)
+            await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
+            await _drain_submission_consumer(app)
         old_result = next(
             (
                 message.tool_result
@@ -1219,28 +1229,22 @@ async def test_unmapped_durable_approval_is_finalized(
             ),
             None,
         )
-        if old_result is not None:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("unmapped durable approval was not finalized")
-    assert old_result is not None
-    assert {request.key for request in app.pending_approvals} == {inline_key}
+        assert old_result is not None
+        assert {request.key for request in app.pending_approvals} == {inline_key}
 
-    await app._handle_prompt_value(f"/approve {inline_key}")
-    await submission_task
-    await app._preprocessing_task
-    app._preprocessing_task = None
-    await app._active_task
-    assert backend.calls
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role is MessageRole.USER
-    )
-    assert isinstance(user_message.content[0], TextContent)
-    assert user_message.content[0].text == "value ready"
-    await app.close()
+        await app._handle_prompt_value(f"/approve {inline_key}")
+        await submission_task
+        await app._preprocessing_task
+        app._preprocessing_task = None
+        await app._active_task
+        assert backend.calls
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.USER
+        )
+        assert isinstance(user_message.content[0], TextContent)
+        assert user_message.content[0].text == "value ready"
 
 
 @pytest.mark.asyncio
@@ -1277,14 +1281,19 @@ skill_catalog=SkillCatalog.empty(),
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    await app._submissions.approval_action_wait(
-        ApprovalDecision.ALLOW, old_call.id
-    )
-    await asyncio.wait_for(started.wait(), timeout=1)
-    assert app._submissions.active
-    app.abort_active()
+    async with owned_app(app) as owner:
+        await app._submissions.approval_action_wait(
+            ApprovalDecision.ALLOW, old_call.id
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        assert app._submissions.active
+        # test-contract: seam no public event reports durable approval-finalization completion.
+        durable_task = app._submissions._durable_tasks[old_call.id]
+        owner.task(durable_task)
+        app.abort_active()
+        await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
+        await _drain_submission_consumer(app)
 
-    for _ in range(100):
         result = next(
             (
                 message.tool_result
@@ -1294,15 +1303,9 @@ skill_catalog=SkillCatalog.empty(),
             ),
             None,
         )
-        if result is not None:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("durable tool abort was not processed")
-    assert result is not None
-    assert result.content == "tool execution canceled"
+        assert result is not None
+        assert result.content == "tool execution canceled"
 
-    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1339,38 +1342,40 @@ skill_catalog=SkillCatalog.empty(),
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    async with owned_app(app) as owner:
+        owner.release_with(release.set)
 
-    await app._submissions.approval_action_wait(
-        ApprovalDecision.ALLOW, old_call.id
-    )
-    await asyncio.wait_for(started.wait(), timeout=1)
-    await app._submissions.submit_text("later")
-    await asyncio.sleep(0)
-    assert backend.calls == []
-    assert [message.role for message in store.messages()] == [MessageRole.ASSISTANT]
+        await app._submissions.approval_action_wait(
+            ApprovalDecision.ALLOW, old_call.id
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        # test-contract: seam no public event reports durable approval-finalization completion.
+        durable_task = app._submissions._durable_tasks[old_call.id]
+        owner.task(durable_task)
+        await app._submissions.submit_text("later")
+        assert backend.calls == []
+        assert [message.role for message in store.messages()] == [MessageRole.ASSISTANT]
 
-    release.set()
-    for _ in range(100):
-        if len(backend.calls) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("submission was not dispatched after durable result")
+        release.set()
+        await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
+        await _drain_submission_consumer(app)
+        await _wait_for_active_task(app)
+        # test-contract: durability durable finalization releases one provider dispatch.
+        assert len(backend.calls) == 1, "submission was not dispatched after durable result"
 
-    messages = store.messages()
-    assert [message.role for message in messages] == [
-        MessageRole.ASSISTANT,
-        MessageRole.TOOL_RESULT,
-        MessageRole.USER,
-        MessageRole.ASSISTANT,
-    ]
-    assert messages[1].tool_result is not None
-    await app.close()
+        messages = store.messages()
+        assert [message.role for message in messages] == [
+            MessageRole.ASSISTANT,
+            MessageRole.TOOL_RESULT,
+            MessageRole.USER,
+            MessageRole.ASSISTANT,
+        ]
+        assert messages[1].tool_result is not None
 
 
 @pytest.mark.asyncio
 async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "value !`sleep 10`")
@@ -1384,22 +1389,32 @@ async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
+    async with owned_app(app) as owner:
 
-    submission = asyncio.create_task(app._submissions.submit_text("/inspect"))
-    await asyncio.sleep(0.05)
-    assert not submission.done()
+        preprocessing_started = asyncio.Event()
+        start_preprocessing = app._submissions._start_preprocessing
 
-    await app._submissions.close()
-    await asyncio.wait_for(submission, timeout=1)
-    with pytest.raises(RuntimeError, match="submission pipeline is closed"):
-        await app._submissions.submit_text("after close")
-    await app.close()
+        def record_preprocessing(entry: object) -> None:
+            start_preprocessing(entry)  # type: ignore[arg-type]
+            preprocessing_started.set()
+
+        # test-contract: seam no public event reports preprocessing before acknowledgement.
+        monkeypatch.setattr(app._submissions, "_start_preprocessing", record_preprocessing)
+        submission = asyncio.create_task(app._submissions.submit_text("/inspect"))
+        owner.task(submission)
+        await asyncio.wait_for(preprocessing_started.wait(), timeout=10)
+        assert not submission.done()
+
+        await app._submissions.close()
+        await asyncio.wait_for(submission, timeout=10)
+        with pytest.raises(RuntimeError, match="submission pipeline is closed"):
+            await app._submissions.submit_text("after close")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["approve", "deny"])
 async def test_inline_approval_queues_unrelated_submission(
-    tmp_path: Path, decision: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "first !`printf first`")
@@ -1417,50 +1432,54 @@ async def test_inline_approval_queues_unrelated_submission(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    first_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("inline shell approval did not appear")
-
-    await app._handle_prompt_value("second")
-    assert len(app._approval_queue) == 1
-    key = app.pending_approvals[0].key
-    await app._handle_prompt_value(f"/{decision} {key}")
-    await first_task
-
-    expected_call_count = 2 if decision == "approve" else 1
-    for _ in range(100):
-        if len(backend.calls) == expected_call_count:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("queued provider turn did not start")
-
-    user_texts = [
-        next(
-            block.text
-            for message in reversed(messages)
-            if message.role.value == "user"
-            for block in message.content
-            if isinstance(block, TextContent) and block.path is None
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf first"
         )
-        for messages, _schemas in backend.calls
-    ]
-    expected_user_texts = (
-        ["first first", "second"] if decision == "approve" else ["second"]
-    )
-    assert user_texts == expected_user_texts
-    await app.close()
+        first_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+        owner.task(first_task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+
+        await app._handle_prompt_value("second")
+        assert len(app._approval_queue) == 1
+        key = app.pending_approvals[0].key
+        # test-contract: seam no public event reports command-preprocessing completion.
+        preprocessing_task = next(iter(app._preprocessing_tasks.values()))
+        await app._handle_prompt_value(f"/{decision} {key}")
+        await first_task
+        await asyncio.wait_for(asyncio.shield(preprocessing_task), timeout=10)
+
+        expected_call_count = 2 if decision == "approve" else 1
+        for _ in range(expected_call_count):
+            await _drain_submission_consumer(app)
+            provider_task = app._submissions.provider_task
+            assert provider_task is not None
+            await asyncio.wait_for(asyncio.shield(provider_task), timeout=10)
+        await _drain_submission_consumer(app)
+        # test-contract: durability each accepted submission dispatches exactly once.
+        assert len(backend.calls) == expected_call_count, "queued provider turn did not start"
+
+        user_texts = [
+            next(
+                block.text
+                for message in reversed(messages)
+                if message.role.value == "user"
+                for block in message.content
+                if isinstance(block, TextContent) and block.path is None
+            )
+            for messages, _schemas in backend.calls
+        ]
+        expected_user_texts = (
+            ["first first", "second"] if decision == "approve" else ["second"]
+        )
+        assert user_texts == expected_user_texts
 
 
 @pytest.mark.asyncio
 async def test_undo_second_inline_submission_keeps_first_alive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "first", "first !`printf first`")
@@ -1476,61 +1495,56 @@ async def test_undo_second_inline_submission_keeps_first_alive(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    first_task = asyncio.create_task(app._handle_prompt_value("/first"))
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("first inline shell approval did not appear")
-    second_task = asyncio.create_task(app._handle_prompt_value("/second"))
-    for _ in range(100):
-        if len(app.pending_approvals) == 2:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("second inline shell approval did not appear")
+        first_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf first"
+        )
+        first_task = asyncio.create_task(app._handle_prompt_value("/first"))
+        owner.task(first_task)
+        await asyncio.wait_for(first_presented.wait(), timeout=10)
+        second_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf second"
+        )
+        second_task = asyncio.create_task(app._handle_prompt_value("/second"))
+        owner.task(second_task)
+        await asyncio.wait_for(second_presented.wait(), timeout=10)
+        assert len(app.pending_approvals) == 2
 
-    first_id, second_id = app._inline_abort_signals
-    first_signal = app._inline_abort_signals[first_id]
-    second_signal = app._inline_abort_signals[second_id]
-    app.undo_sent_turn()
-    for _ in range(100):
-        if second_signal.is_set():
-            break
-        await asyncio.sleep(0.01)
-    assert not first_signal.is_set()
-    assert second_signal.is_set()
-    for _ in range(100):
-        if len(app.pending_approvals) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("undo did not close the second approval")
+        first_id, second_id = app._inline_abort_signals
+        first_signal = app._inline_abort_signals[first_id]
+        second_signal = app._inline_abort_signals[second_id]
+        # test-contract: seam no public event reports command-preprocessing completion.
+        second_preprocessing = app._preprocessing_tasks[second_id]
+        app.undo_sent_turn()
+        await _drain_submission_consumer(app)
+        assert not first_signal.is_set()
+        assert second_signal.is_set()
+        await asyncio.wait_for(asyncio.shield(second_preprocessing), timeout=10)
+        await _drain_submission_consumer(app)
+        assert len(app.pending_approvals) == 1, "undo did not close the second approval"
 
-    await app._handle_prompt_value(
-        f"/approve {app.pending_approvals[0].key}"
-    )
-    await asyncio.gather(first_task, second_task)
-    await asyncio.gather(
-        *app._preprocessing_tasks.values(), return_exceptions=True
-    )
-    await app._active_task
+        await app._handle_prompt_value(
+            f"/approve {app.pending_approvals[0].key}"
+        )
+        await asyncio.gather(first_task, second_task)
+        await asyncio.gather(
+            *app._preprocessing_tasks.values(), return_exceptions=True
+        )
+        await app._active_task
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "first first"
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "first first"
 
 
 @pytest.mark.asyncio
 async def test_scoped_inline_abort_keeps_other_submission_alive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "first", "first !`printf first`")
@@ -1546,50 +1560,47 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    first_task = asyncio.create_task(app._handle_prompt_value("/first"))
-    second_task = asyncio.create_task(app._handle_prompt_value("/second"))
-    for _ in range(100):
-        if len(app.pending_approvals) == 2:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("both inline shell approvals did not appear")
+        approvals_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "printf second"
+        )
+        first_task = asyncio.create_task(app._handle_prompt_value("/first"))
+        owner.task(first_task)
+        second_task = asyncio.create_task(app._handle_prompt_value("/second"))
+        owner.task(second_task)
+        await asyncio.wait_for(approvals_presented.wait(), timeout=10)
+        assert len(app.pending_approvals) == 2
 
-    first_id, second_id = app._inline_abort_signals
-    first_signal = app._inline_abort_signals[first_id]
-    second_signal = app._inline_abort_signals[second_id]
-    app.abort_active(first_id)
-    for _ in range(100):
-        if first_signal.is_set():
-            break
-        await asyncio.sleep(0.01)
-    assert first_signal.is_set()
-    assert not second_signal.is_set()
-    for _ in range(100):
-        if len(app.pending_approvals) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("scoped abort did not close the first approval")
+        first_id, second_id = app._inline_abort_signals
+        first_signal = app._inline_abort_signals[first_id]
+        second_signal = app._inline_abort_signals[second_id]
+        # test-contract: seam no public event reports command-preprocessing completion.
+        first_preprocessing = app._preprocessing_tasks[first_id]
+        app.abort_active(first_id)
+        await _drain_submission_consumer(app)
+        assert first_signal.is_set()
+        assert not second_signal.is_set()
+        await asyncio.wait_for(asyncio.shield(first_preprocessing), timeout=10)
+        await _drain_submission_consumer(app)
+        assert len(app.pending_approvals) == 1, "scoped abort did not close the first approval"
 
-    await app._handle_prompt_value(
-        f"/approve {app.pending_approvals[0].key}"
-    )
-    await asyncio.gather(first_task, second_task)
-    await asyncio.gather(
-        *app._preprocessing_tasks.values(), return_exceptions=True
-    )
-    await app._active_task
+        await app._handle_prompt_value(
+            f"/approve {app.pending_approvals[0].key}"
+        )
+        await asyncio.gather(first_task, second_task)
+        await asyncio.gather(
+            *app._preprocessing_tasks.values(), return_exceptions=True
+        )
+        await app._active_task
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "second second"
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "second second"
 
 
 async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path) -> None:
@@ -1607,22 +1618,20 @@ skill_catalog=SkillCatalog.empty(),
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
-    for _ in range(100):
-        if app._inline_abort_signals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("inline shell did not start")
-    app.abort_active()
-    await submission_task
-    assert app._preprocessing_task is not None
-    await app._preprocessing_task
-    app._preprocessing_task = None
-    assert backend.calls == []
-    await app.close()
+        submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+        owner.task(submission_task)
+        await submission_task
+        await _drain_submission_consumer(app)
+        assert app._inline_abort_signals, "inline shell did not start"
+        app.abort_active()
+        await submission_task
+        assert app._preprocessing_task is not None
+        await app._preprocessing_task
+        app._preprocessing_task = None
+        assert backend.calls == []
 
 
 async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> None:
@@ -1631,25 +1640,30 @@ async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> No
     registry = ToolRegistry(tmp_path, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     marker = tmp_path / "must-not-execute"
     lifecycle_calls: list[str] = []
-    task = asyncio.create_task(
-        run_inline_shell_batch(
-            registry,
-            ("printf first", f"touch {shlex.quote(str(marker))}"),
-            lifecycle_sink=lambda _kind, call: lifecycle_calls.append(call.id),
-        )
-    )
-    for _ in range(100):
-        if policy.pending_requests():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("inline shell approval did not appear")
-    assert policy.deny(policy.pending_requests()[0].key)
-    output = await task
+    approval_started = asyncio.Event()
 
-    assert output == ("[inline shell failed: denied]", "[inline shell failed: denied]")
-    assert not marker.exists()
-    assert lifecycle_calls
+    def record_lifecycle(kind: str, call: ToolCall) -> None:
+        lifecycle_calls.append(call.id)
+        if kind == "approval_start":
+            approval_started.set()
+
+    async with owned_app() as owner:
+        task = asyncio.create_task(
+            run_inline_shell_batch(
+                registry,
+                ("printf first", f"touch {shlex.quote(str(marker))}"),
+                lifecycle_sink=record_lifecycle,
+            )
+        )
+        owner.task(task)
+        await asyncio.wait_for(approval_started.wait(), timeout=10)
+        assert policy.pending_requests(), "inline shell approval did not appear"
+        assert policy.deny(policy.pending_requests()[0].key)
+        output = await task
+
+        assert output == ("[inline shell failed: denied]", "[inline shell failed: denied]")
+        assert not marker.exists()
+        assert lifecycle_calls
 
 
 async def test_capture_output_does_not_create_file_named_none(tmp_path: Path) -> None:
@@ -1938,21 +1952,22 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
     )
+    async with owned_app(app) as owner:
 
-    approval_presented = _approval_presentation_event(
-        monkeypatch,
-        app,
-        output,
-        "command=printf approved-now",
-    )
-    task = asyncio.create_task(app._handle_prompt_value("/deploy now"))
-    await asyncio.wait_for(approval_presented.wait(), timeout=5)
-    assert "command=printf approved-now" in output.getvalue()
-    assert store.messages() == []
-    assert policy.approve(app.pending_approvals[0].key)
-    await task
-    assert store.messages() == []
-    await app.close()
+        approval_presented = _approval_presentation_event(
+            monkeypatch,
+            app,
+            output,
+            "command=printf approved-now",
+        )
+        task = asyncio.create_task(app._handle_prompt_value("/deploy now"))
+        owner.task(task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+        assert "command=printf approved-now" in output.getvalue()
+        assert store.messages() == []
+        assert policy.approve(app.pending_approvals[0].key)
+        await task
+        assert store.messages() == []
 
 
 def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
@@ -2021,30 +2036,33 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
         approval_policy=policy,
         console=Console(file=output, force_terminal=False, width=120),
     )
+    async with owned_app(app) as owner:
 
-    approval_presented = _approval_presentation_event(
-        monkeypatch,
-        app,
-        output,
-        "argv:",
-    )
-    task = asyncio.create_task(
-        app._handle_prompt_value("/deploy staging release-42 $HOME")
-    )
-    await asyncio.wait_for(approval_presented.wait(), timeout=5)
+        approval_presented = _approval_presentation_event(
+            monkeypatch,
+            app,
+            output,
+            "argv:",
+        )
+        task = asyncio.create_task(
+            app._handle_prompt_value("/deploy staging release-42 $HOME")
+        )
+        owner.task(task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
 
-    card = output.getvalue()
-    assert "argv:" in card
-    assert "[1] staging" in card
-    assert "[2] release-42" in card
-    assert "[3] $HOME" in card
+        card = output.getvalue()
+        assert "argv:" in card
+        assert "[1] staging" in card
+        assert "[2] release-42" in card
+        assert "[3] $HOME" in card
 
-    assert policy.approve(app.pending_approvals[0].key)
-    await task
-    await app.close()
+        assert policy.approve(app.pending_approvals[0].key)
+        await task
 
 
-async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
+async def test_exec_macro_deny_renders_denied_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "deploy", "---\nkind: exec\n---\nprintf deploy")
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
@@ -2058,22 +2076,21 @@ async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
     )
+    async with owned_app(app) as owner:
 
-    task = asyncio.create_task(app._handle_prompt_value("/deploy"))
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("macro approval did not appear")
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, output, "printf deploy"
+        )
+        task = asyncio.create_task(app._handle_prompt_value("/deploy"))
+        owner.task(task)
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
 
-    assert policy.deny(app.pending_approvals[0].key)
-    await task
+        assert policy.deny(app.pending_approvals[0].key)
+        await task
 
-    assert "/deploy · denied" in output.getvalue()
-    assert "/deploy · failed" not in output.getvalue()
-    assert store.messages() == []
-    await app.close()
+        assert "/deploy · denied" in output.getvalue()
+        assert "/deploy · failed" not in output.getvalue()
+        assert store.messages() == []
 
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
@@ -2092,20 +2109,21 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
     )
+    async with owned_app(app):
 
-    task = asyncio.create_task(app._handle_prompt_value("/wait"))
-    for _ in range(100):
-        if app.active:
-            break
-        await asyncio.sleep(0.01)
-    app.abort_active()
-    await asyncio.wait_for(task, timeout=3)
+        app._submit_input("/wait")
+        await _drain_submission_consumer(app)
+        assert app.active
+        # test-contract: seam no public event reports active provider-turn completion.
+        task = app._active_task
+        assert task is not None
+        app.abort_active()
+        await asyncio.wait_for(task, timeout=10)
 
-    assert "/wait · canceled" in output.getvalue()
-    log = next(app.loop.store.session_dir.glob("macro-*.log"))
-    assert log.exists()
-    assert "canceled · log " in output.getvalue()
-    await app.close()
+        assert "/wait · canceled" in output.getvalue()
+        log = next(app.loop.store.session_dir.glob("macro-*.log"))
+        assert log.exists()
+        assert "canceled · log " in output.getvalue()
 
 
 async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path) -> None:
@@ -2144,7 +2162,9 @@ async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path)
     assert "ten=<> ten0=<one;0>" in result.content
 
 
-async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) -> None:
+async def test_macro_input_loop_keeps_processing_approval_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "deploy", "---\nkind: exec\n---\nsleep 0.1")
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
@@ -2157,21 +2177,19 @@ async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) 
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    app._input_loop_active = True
+    async with owned_app(app):
+        app._input_loop_active = True
 
-    await app._handle_prompt_value("/deploy")
+        approval_presented = _approval_presentation_event(
+            monkeypatch, app, app.console.file, "sleep 0.1"
+        )
+        await app._handle_prompt_value("/deploy")
 
-    assert app.active
-    for _ in range(100):
-        if app.pending_approvals:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("macro approval did not appear")
-    key = app.pending_approvals[0].key
-    await app._handle_prompt_value(f"/approve {key}")
-    await asyncio.wait_for(app._active_task, timeout=2)
-    await app.close()
+        assert app.active
+        await asyncio.wait_for(approval_presented.wait(), timeout=10)
+        key = app.pending_approvals[0].key
+        await app._handle_prompt_value(f"/approve {key}")
+        await _wait_for_active_task(app)
 
 
 async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path) -> None:
@@ -2187,17 +2205,17 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    async with owned_app(app):
 
-    await app._handle_prompt_value("/first")
-    await app._handle_prompt_value("/second")
-    await app._handle_prompt_value("continue")
-    await asyncio.wait_for(app._active_task, timeout=2)
+        await app._handle_prompt_value("/first")
+        await app._handle_prompt_value("/second")
+        await app._handle_prompt_value("continue")
+        await _wait_for_active_task(app)
 
-    user_message = next(message for message in backend.calls[0][0] if message.role.value == "user")
-    assert user_message.content[0].text.startswith(
-        "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
-    )
-    await app.close()
+        user_message = next(message for message in backend.calls[0][0] if message.role.value == "user")
+        assert user_message.content[0].text.startswith(
+            "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
+        )
 
 
 async def test_macro_receipts_commit_in_submission_order_when_completion_reverses(
@@ -2214,37 +2232,35 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    app._input_loop_active = True
+    async with owned_app(app):
+        app._input_loop_active = True
 
-    await asyncio.gather(
-        app._handle_prompt_value("/first"),
-        app._handle_prompt_value("/second"),
-    )
-    for _ in range(200):
-        if list(app._macro_receipts) == [
+        await asyncio.gather(
+            app._handle_prompt_value("/first"),
+            app._handle_prompt_value("/second"),
+        )
+        await _drain_submission_consumer(app)
+        # test-contract: seam no public event reports all command-preprocessing completions.
+        command_tasks = tuple(app._submissions.preprocessing_tasks.values())
+        await asyncio.wait_for(asyncio.gather(*command_tasks), timeout=10)
+        await _drain_submission_consumer(app)
+        # test-contract: durability macro receipts publish in submission order exactly once.
+        assert list(app._macro_receipts) == [
             "ran /first, exit 0",
             "ran /second, exit 0",
-        ]:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("macro receipts were committed out of order")
+        ], "macro receipts were committed out of order"
 
-    await app._handle_prompt_value("continue")
-    for _ in range(100):
-        if len(backend.calls) == 1:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("provider turn did not start")
-    await app._active_task
-    user_message = next(
-        message for message in backend.calls[0][0] if message.role.value == "user"
-    )
-    assert user_message.content[0].text.startswith(
-        "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
-    )
-    await app.close()
+        await app._handle_prompt_value("continue")
+        await _drain_submission_consumer(app)
+        await _wait_for_active_task(app)
+        # test-contract: durability the queued prompt dispatches exactly once.
+        assert len(backend.calls) == 1, "provider turn did not start"
+        user_message = next(
+            message for message in backend.calls[0][0] if message.role.value == "user"
+        )
+        assert user_message.content[0].text.startswith(
+            "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
+        )
 
 
 async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
@@ -2261,33 +2277,31 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    app._input_loop_active = True
+    async with owned_app(app) as owner:
+        app._input_loop_active = True
 
-    macro_task = asyncio.create_task(app._handle_prompt_value("/slow"))
-    for _ in range(100):
-        if app.active:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("slow macro did not start")
+        macro_task = asyncio.create_task(app._handle_prompt_value("/slow"))
+        owner.task(macro_task)
+        await macro_task
+        await _drain_submission_consumer(app)
+        assert app.active, "slow macro did not start"
 
-    await app._handle_prompt_value("continue")
-    assert len(app._queued) == 1
-    macro_child = app._active_task
-    assert macro_child is not None
-    await asyncio.wait_for(macro_child, timeout=2)
-    await macro_task
-    provider_task = app._active_task
-    assert provider_task is not None
-    await asyncio.wait_for(provider_task, timeout=2)
+        await app._handle_prompt_value("continue")
+        assert len(app._queued) == 1
+        macro_child = app._active_task
+        assert macro_child is not None
+        await asyncio.wait_for(macro_child, timeout=10)
+        await macro_task
+        provider_task = app._active_task
+        assert provider_task is not None
+        await asyncio.wait_for(provider_task, timeout=10)
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == "ran /slow, exit 0\n\ncontinue"
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == "ran /slow, exit 0\n\ncontinue"
 
 
 async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
@@ -2307,42 +2321,38 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    app._input_loop_active = True
+    async with owned_app(app):
+        app._input_loop_active = True
 
-    await app._handle_prompt_value("/first")
-    if app._active_task is not None:
-        await asyncio.wait_for(app._active_task, timeout=3)
-        app._active_task = None
-    assert list(app._macro_receipts) == ["ran /first, exit 0"]
+        await app._handle_prompt_value("/first")
+        if app._active_task is not None:
+            await _wait_for_active_task(app)
+            app._active_task = None
+        assert list(app._macro_receipts) == ["ran /first, exit 0"]
 
-    await app._handle_prompt_value("/second")
-    for _ in range(100):
-        if app.active:
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("second macro did not start")
+        await app._handle_prompt_value("/second")
+        await _drain_submission_consumer(app)
+        assert app.active, "second macro did not start"
 
-    await app._handle_prompt_value("continue")
-    assert len(app._queued) == 1
+        await app._handle_prompt_value("continue")
+        assert len(app._queued) == 1
 
-    macro_task = app._active_task
-    assert macro_task is not None
-    app.abort_active()
-    await asyncio.wait_for(macro_task, timeout=3)
-    provider_task = app._active_task
-    assert provider_task is not None
-    await asyncio.wait_for(provider_task, timeout=3)
+        macro_task = app._active_task
+        assert macro_task is not None
+        app.abort_active()
+        await asyncio.wait_for(macro_task, timeout=10)
+        provider_task = app._active_task
+        assert provider_task is not None
+        await asyncio.wait_for(provider_task, timeout=10)
 
-    user_message = next(
-        message
-        for message in backend.calls[0][0]
-        if message.role.value == "user"
-    )
-    assert user_message.content[0].text == (
-        "ran /first, exit 0\nran /second, canceled\n\ncontinue"
-    )
-    await app.close()
+        user_message = next(
+            message
+            for message in backend.calls[0][0]
+            if message.role.value == "user"
+        )
+        assert user_message.content[0].text == (
+            "ran /first, exit 0\nran /second, canceled\n\ncontinue"
+        )
 
 
 async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> None:
@@ -2355,30 +2365,34 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    canceled = asyncio.Event()
+    async with owned_app(app) as owner:
+        canceled = asyncio.Event()
+        background_release = asyncio.Event()
+        owner.release_with(background_release.set)
 
-    async def background() -> None:
-        try:
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            canceled.set()
-            raise
+        async def background() -> None:
+            try:
+                await background_release.wait()
+            except asyncio.CancelledError:
+                canceled.set()
+                raise
 
-    watcher = asyncio.create_task(background())
-    app.loop._background_owner.register("background", watcher.cancel, watcher)
-    macro_task = asyncio.create_task(app._handle_prompt_value("/wait"))
-    for _ in range(100):
-        if app.active:
-            break
-        await asyncio.sleep(0.01)
+        watcher = asyncio.create_task(background())
+        owner.task(watcher)
+        app.loop._background_owner.register("background", watcher.cancel, watcher)
+        app._submit_input("/wait")
+        await _drain_submission_consumer(app)
+        assert app.active
+        # test-contract: seam no public event reports active provider-turn completion.
+        macro_task = app._active_task
+        assert macro_task is not None
 
-    app.abort_active()
-    await asyncio.wait_for(macro_task, timeout=3)
-    assert not canceled.is_set()
-    watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
-    app.loop._background_owner.unregister("background")
-    await app.close()
+        app.abort_active()
+        await asyncio.wait_for(macro_task, timeout=10)
+        assert not canceled.is_set()
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        app.loop._background_owner.unregister("background")
 
 
 async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) -> None:

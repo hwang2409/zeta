@@ -135,30 +135,129 @@ def marker(line: str, finding: Item) -> bool:
     )
 
 
-def resolve_parent(
-    commit: str, parents: list[str], requested: int | None
-) -> tuple[str, str, str] | None:
-    p1, p2 = parents
-    print(f"parents: 1={p1} 2={p2}")
-    if requested:
-        main, branch = (p1, p2) if requested == 1 else (p2, p1)
-        reason = f"explicit --main-parent {requested}"
-    else:
-        try:
-            chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
-        except subprocess.CalledProcessError:
-            chain = set()
-        matches = [index for index, parent in enumerate(parents, 1) if parent in chain]
-        if len(matches) != 1:
+def _is_ancestor(ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _parent_candidates(
+    parents: list[str],
+) -> tuple[list[int], str, str]:
+    try:
+        chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
+        origin_main = git("rev-parse", "--verify", "origin/main").strip()
+    except subprocess.CalledProcessError:
+        chain = set()
+        origin_main = ""
+    matches = [index for index, parent in enumerate(parents) if parent in chain]
+    reason = "the selected parent is on origin/main first-parent ancestry"
+    if not matches and origin_main:
+        matches = [
+            index
+            for index, parent in enumerate(parents)
+            if _is_ancestor(parent, origin_main)
+        ]
+        reason = "the selected parent is an ancestor of origin/main"
+    return matches, reason, origin_main
+
+
+def _render_parent_refusal(
+    commit: str, parents: list[str], origin_main: str, details: str
+) -> None:
+    fetch_hint = ""
+    if origin_main:
+        main_date = int(git("show", "-s", "--format=%ct", origin_main).strip())
+        parent_dates = [
+            int(git("show", "-s", "--format=%ct", parent).strip()) for parent in parents
+        ]
+        if main_date < min(parent_dates):
+            fetch_hint = "; run git fetch origin"
+    print(
+        f"cannot identify exactly one main parent for {commit}: {details}; "
+        "pass --main-sha <the parent that carries main> "
+        "(for a train branch: parent 1 is the side put there by git merge --no-ff)"
+        f"{fetch_hint}",
+        file=sys.stderr,
+    )
+
+
+def _validate_override(
+    commit: str,
+    parents: list[str],
+    requested: str,
+    candidates: list[int],
+    origin_main: str,
+) -> int | None:
+    if len(requested) != 40 or any(
+        char not in "0123456789abcdef" for char in requested
+    ):
+        print(
+            f"--main-sha {requested} must be a full 40-hex parent sha", file=sys.stderr
+        )
+        return None
+    if requested not in parents:
+        print(
+            f"--main-sha {requested} is not a merge parent of {commit}; "
+            f"pass one of the merge parents ({parents[0]} or {parents[1]})",
+            file=sys.stderr,
+        )
+        return None
+    index = parents.index(requested)
+    if len(candidates) == 1:
+        if index != candidates[0]:
             print(
-                f"cannot identify exactly one main parent for {commit}; "
-                "use --main-parent 1 or --main-parent 2",
+                f"--main-sha {requested} disagrees with the identified main parent "
+                f"{parents[candidates[0]]}",
                 file=sys.stderr,
             )
             return None
-        index = matches[0]
-        main, branch = (p1, p2) if index == 1 else (p2, p1)
-        reason = "the selected parent is on origin/main first-parent ancestry"
+        return index
+    if candidates:
+        _render_parent_refusal(commit, parents, origin_main, "both parents qualify")
+        return None
+    if not origin_main:
+        _render_parent_refusal(commit, parents, origin_main, "neither parent qualifies")
+        return None
+    base = git("merge-base", "origin/main", commit).strip()
+    carries = [_is_ancestor(base, parent) for parent in parents]
+    permitted = (
+        0
+        if carries == [True, True]
+        else next((i for i, carries_base in enumerate(carries) if carries_base), None)
+    )
+    if permitted is None or index != permitted:
+        _render_parent_refusal(commit, parents, origin_main, "neither parent qualifies")
+        return None
+    return index
+
+
+def resolve_parent(
+    commit: str, parents: list[str], main_sha: str | None
+) -> tuple[str, str, str] | None:
+    p1, p2 = parents
+    print(f"parents: 1={p1} 2={p2}")
+    candidates, reason, origin_main = _parent_candidates(parents)
+    if main_sha is not None:
+        index = _validate_override(commit, parents, main_sha, candidates, origin_main)
+        if index is None:
+            return None
+        reason = f"explicit --main-sha {parents[index]}"
+    elif len(candidates) != 1:
+        _render_parent_refusal(
+            commit,
+            parents,
+            origin_main,
+            "neither parent qualifies" if not candidates else "both parents qualify",
+        )
+        return None
+    else:
+        index = candidates[0]
+    main, branch = (p1, p2) if index == 0 else (p2, p1)
     print(f"main parent: {main} ({reason})")
     return main, branch, reason
 
@@ -187,7 +286,10 @@ def parse_revisions(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("commit", nargs="?", default="HEAD")
-    parser.add_argument("--main-parent", type=int, choices=(1, 2))
+    parser.add_argument(
+        "--main-sha",
+        help="exact object name of the merge parent that carries main",
+    )
     parser.add_argument("--allow", type=argparse.FileType("r"))
     parser.add_argument("--pr-body-file", type=argparse.FileType("r"))
     args = parser.parse_args()
@@ -196,7 +298,7 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    resolved = resolve_parent(commit, parents, args.main_parent)
+    resolved = resolve_parent(commit, parents, args.main_sha)
     if resolved is None:
         return 2
     main, branch, _reason = resolved
