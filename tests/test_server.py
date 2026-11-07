@@ -8087,7 +8087,7 @@ async def test_serve_slash_run_keeps_slash_like_model_text(
         name = text.split("\n", 1)[0][1:].split(maxsplit=1)[0]
         assert result == {"kind": "unknown", "name": name}
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
