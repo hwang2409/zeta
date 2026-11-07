@@ -54,12 +54,14 @@ class _PostStreamRetryBackend(CompletionBackend):
         self.calls += 1
         if self.calls == 1:
             yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
             yield StreamEvent(
                 StreamEventType.ERROR,
                 error=ErrorInfo("timeout", "unsafe provider detail"),
                 data={"retry_after": 0},
             )
             return
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta='{"changes":[]}')
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent('{"changes":[]}')]),
@@ -114,9 +116,10 @@ async def test_original_and_repair_share_one_provider_attempt_budget() -> None:
 async def test_reconciliation_retries_after_partial_stream_before_commit() -> None:
     backend = _PostStreamRetryBackend()
 
-    response = await complete_reconciliation(
-        backend, "safe prompt", CompletionRetryBudget()
-    )
+    with use_response_byte_limit(len(b'{"changes":[]}')):
+        response = await complete_reconciliation(
+            backend, "safe prompt", CompletionRetryBudget()
+        )
 
     assert backend.calls == 2
     assert response.text == '{"changes":[]}'

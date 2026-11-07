@@ -3526,6 +3526,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
     await _event(reader, "approval_request")
     writer.close()
     await writer.wait_closed()
+    # test-contract: latency reconnect must tolerate asynchronous disconnect cleanup
     await asyncio.sleep(0.05)
     second_reader, second_writer = await asyncio.open_unix_connection(
         str(server.socket_path)

@@ -157,7 +157,9 @@ async def test_commit_rejects_retry_after_visible_output() -> None:
         _RetryableError("late disconnect"),
     )
     backend = _AttemptBackend([first, _SequenceAttempt()], clock)
-    completion = backend.complete([], [], control=_control())
+    completion = backend.complete(
+        [], [], control=_control(reset=ResetPolicy.ALLOW_ASSISTANT_RESET)
+    )
     try:
         event = await _within(completion.__anext__())
         assert event.delta == "visible"
