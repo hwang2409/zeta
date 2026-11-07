@@ -1,4 +1,5 @@
 """The provider-neutral agent loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -48,9 +49,7 @@ from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
-from ...mcp import (
-    MCPMount,
-)
+from ...mcp import MCPManagementService, MCPMount
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
@@ -84,12 +83,7 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ..backend_state import (
-    PreparedBackendState,
-    apply_backend_state,
-    effective_backend_budget,
-    prepare_backend_state,
-)
+from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
@@ -107,6 +101,7 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
+from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
@@ -117,6 +112,7 @@ from .empty_turn import (
 )
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
@@ -149,6 +145,7 @@ class _ToollessTransition:
 
 
 class AgentLoop(
+    BackendOwnerMixin,
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
@@ -156,6 +153,7 @@ class AgentLoop(
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
+    ProjectContextRecoveryMixin,
     MCPSession,
 ):
     post_stream_provider_retry = True
@@ -195,7 +193,10 @@ class AgentLoop(
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
     ) -> None:
-        if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
+        if (
+            type(max_agent_depth) is not int
+            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        ):
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
@@ -204,6 +205,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -211,13 +213,14 @@ class AgentLoop(
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
-        # Directory of the ROOT session that owns the durable child-link index;
-        # threaded down every loop so nested children publish their lineage
-        # intent into a single flat directory the root can reconcile.
+        # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_project_context_recovery(
+            registry=None, project_id=None, health=None, prepare=None
+        )
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -249,8 +252,7 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
-        # Partial assistant persistence uses these values so provider metadata is
-        # retained even when the stream later fails or is cancelled.
+        # Preserve provider metadata if the partial assistant stream fails.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
@@ -269,8 +271,9 @@ class AgentLoop(
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = (
-            Path(self.store.cwd).expanduser().resolve()
+        self._mcp_project_dir_value: Path | None = Path(self.store.cwd)
+        self._mcp_management = MCPManagementService(
+            project_dir=self._mcp_project_dir_value
         )
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
@@ -331,7 +334,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: RuntimePrompt | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -375,15 +378,6 @@ class AgentLoop(
             else _sanitize_account_message(message)
             for message in messages
         ]
-
-    def prepare_backend_state(self, backend: CompletionBackend) -> PreparedBackendState:
-        return prepare_backend_state(self, backend)
-
-    def current_backend_state(self) -> PreparedBackendState:
-        return PreparedBackendState(self.backend, self.context_assembler.token_budget)
-
-    def apply_backend_state(self, state: PreparedBackendState) -> None:
-        apply_backend_state(self, state)
 
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
@@ -483,9 +477,12 @@ class AgentLoop(
         self.tool_registry.start_batch()
         return True
 
-    async def _close_delivery_resources(self) -> tuple[str, ...]:
+    async def _close_delivery_resources(
+        self, *, background_task_cause: str
+    ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
             killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
@@ -511,22 +508,26 @@ class AgentLoop(
                 )
         return killed
 
-    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
-        """Close session-owned transports and background processes.
-
-        Returns the ids of background tasks killed by this close so a completing
-        child can report them to its parent.
-        """
+    async def close(
+        self,
+        *,
+        cancel_background: bool = True,
+        background_task_cause: str = "session shutdown",
+    ) -> tuple[str, ...]:
+        """Close owned resources and return task ids killed during close."""
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        await self._close_project_context_recovery()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown()
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
@@ -555,7 +556,10 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
-            killed = await self._close_delivery_resources()
+            await self.close_backend_owners(stage="runtime_close")
+            killed = await self._close_delivery_resources(
+                background_task_cause=background_task_cause
+            )
         return killed
 
     def session_start(self) -> None:
@@ -563,21 +567,14 @@ class AgentLoop(
             self.hooks.session_start()
 
     async def _produce_task_exit(self, item: TaskExitInput) -> ProducerResult:
-        data: dict[str, object] = {
-            "task_id": item.task_id,
-            "headline": item.command,
-            "exit_code": item.exit_code,
-            "output_tail": item.output_tail,
-            "background_owner": item.owner,
-            "background_phase": item.phase,
-        }
-        if item.log_path is not None:
-            data["log_path"] = item.log_path
-        if item.note is not None:
-            data["note"] = item.note
         step_delivery = await self._ensure_step_delivery()
         return await step_delivery.produce(
-            NotificationInput("task_exit", data, dedupe_key=item.task_id)
+            NotificationInput(
+                "task_exit",
+                item.notification_data(),
+                dedupe_key=item.task_id,
+                tui_presented=item.tui_presented,
+            )
         )
 
     async def activate(self) -> None:
@@ -589,15 +586,24 @@ class AgentLoop(
         self._activated = True
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
-            await self._produce_task_exit(item)
+            await self.tool_registry.background_tasks._notify_exit(
+                item.task_id,
+                item.command,
+                item.exit_code,
+                item.output_tail,
+                item.log_path,
+                item.note,
+                owner=item.owner,
+                phase=item.phase,
+                tui_presented=item.tui_presented,
+            )
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
         await self._activate_project_inbox()
-        # Frontends can render immediately while trusted, enabled MCP servers
-        # connect in the background. Operations that require MCP await this task.
+        # Render now; MCP-dependent operations await the background connection.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
 
@@ -738,6 +744,7 @@ class AgentLoop(
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
+        self._advance_project_context_recovery()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")

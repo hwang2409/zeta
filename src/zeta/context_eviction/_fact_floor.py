@@ -456,14 +456,8 @@ class FactFloorPlan:
         self,
         system_messages: Sequence[Message],
         view_messages: Sequence[Message],
-        latest_user: Message | None,
     ) -> list[Message]:
-        return [
-            *system_messages,
-            *view_messages,
-            *([] if self.message is None else [self.message]),
-            *([] if latest_user is None else [latest_user]),
-        ]
+        return [*system_messages, *view_messages]
 
 
 def previous_fact_floor(

@@ -18,17 +18,13 @@ from ..composer import FullScreenPromptSession
 
 
 class MCPManagerMixin:
-    def open_mcp_manager(self, *, restore_composer: bool = True) -> None:
+    def open_mcp_manager(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        if restore_composer:
-            self._status_restore_text = buffer.text
-            self._status_restore_cursor = buffer.cursor_position
-        else:
-            self._status_restore_text = ""
-            self._status_restore_cursor = 0
+        self._status_restore_text = buffer.text
+        self._status_restore_cursor = buffer.cursor_position
         self._mcp_manager.service.mount = self.loop._mcp_mount
         self._mcp_manager_open = True
         self._status_card.set_lines(self._mcp_manager.render())
@@ -48,6 +44,7 @@ class MCPManagerMixin:
             error = public_credential_store_error(exc)
             self._mcp_manager.credential_store_error = error
             self._mcp_manager.last_result = error["text"]
+        await self._mcp_manager.refresh()
         self._refresh_mcp_manager()
 
     def _refresh_mcp_manager(self) -> None:

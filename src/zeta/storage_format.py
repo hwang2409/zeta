@@ -5,23 +5,93 @@ from __future__ import annotations
 import asyncio
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import secrets
+import stat
 import threading
-import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 2
+WRITER_EPOCH: Final = 3
+
+# These are the authoritative stored roots. An empty sessions/ directory is safe:
+# startup can create it before a session exists. The lock, logs, caches, and other
+# derived or ephemeral output are intentionally not gated.
+GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
+    ("sessions/*", "zeta.core.store and zeta.session_retention"),
+    (
+        "projects",
+        "zeta.project_registry projects and legacy lanes, zeta.memory, and zeta.project_inbox",
+    ),
+    ("accounts.json", "zeta.accounts.store"),
+    ("accounts", "zeta.accounts.store OAuth credentials"),
+    ("anthropic-oauth.json", "zeta.accounts.store legacy OAuth credentials"),
+    ("codex-oauth.json", "zeta.accounts.store legacy OAuth credentials"),
+    ("mcp-tokens", "zeta.mcp.oauth_store"),
+)
+
+BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
+    "memory-current.json": frozenset({("history",)}),
+    "meta.json": frozenset({("prompt_components",)}),
+    "workspace.json": frozenset({("snapshots",)}),
+}
+
+CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "account.provider": frozenset({"anthropic", "codex"}),
+    "account_registry.version": frozenset({1}),
+    "conversation.entry_type": frozenset(
+        {
+            "message",
+            "child_run_started",
+            "compaction",
+            "client_delivery",
+            "warning",
+            "checkpoint",
+            "fork",
+            "approval_resolution",
+            "approval_history",
+            "notification",
+            "notification_ack",
+            "notification_tui_presented",
+            "pending_prompt",
+            "pending_prompt_ack",
+            "pending_queue_closed",
+            "terminal_transition",
+        }
+    ),
+    "inbox.kind": frozenset(
+        {"bug_report", "change_request", "question", "info", "reply"}
+    ),
+    "inbox.schema_version": frozenset({1}),
+    "memory.format": frozenset({1, 2}),
+    "project.repo_agents": frozenset({"include", "ignore"}),
+    "project.schema_version": frozenset({1}),
+    "project.session_role": frozenset({"session", "orchestrator", "worker"}),
+    "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
+    "sent_message_ledger.schema_version": frozenset({1}),
+}
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
 class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
+
+
+def require_closed_variant(shape: str, value: object) -> object:
+    """Return a registered stored variant or fail closed."""
+
+    accepted = CLOSED_VARIANTS.get(shape)
+    if accepted is None:
+        raise StorageFormatError(f"stored variant shape is not registered: {shape}")
+    if value not in accepted:
+        raise StorageFormatError(f"unsupported stored variant for {shape}: {value!r}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +118,17 @@ class ReplaceSubtree:
     value: Any
 
 
-type Mutation = SetValue | DeleteValue | ReplaceSubtree
+@dataclass(frozen=True, slots=True)
+class PatchRecords:
+    """Upsert and explicitly delete object records at one owned path."""
+
+    path: tuple[str, ...]
+    upserts: tuple[Mapping[str, Any], ...]
+    identity: str | tuple[str, ...]
+    delete_ids: tuple[str, ...] = ()
+
+
+type Mutation = SetValue | DeleteValue | ReplaceSubtree | PatchRecords
 PublishBytes = Callable[[int, str, bytes], None]
 
 
@@ -57,10 +137,60 @@ class _RegistryEntry:
     fd: int
     references: int
     epoch: int
+    shape_locks: dict[tuple[int, int, str], tuple[threading.Lock, int]]
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
 _REGISTRY_LOCK = threading.RLock()
+
+
+@contextmanager
+def _shape_lock(
+    entry: _RegistryEntry, home: Path, directory_fd: int, name: str
+) -> Iterator[None]:
+    info = os.fstat(directory_fd)
+    shape = (info.st_dev, info.st_ino, name)
+    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).hexdigest()
+    with _REGISTRY_LOCK:
+        thread_lock, users = entry.shape_locks.get(shape, (threading.Lock(), 0))
+        entry.shape_locks[shape] = (thread_lock, users + 1)
+    try:
+        with thread_lock:
+            lock_root = home / ".storage-format-shape-locks"
+            lock_root.mkdir(mode=0o700, exist_ok=True)
+            root_fd = os.open(
+                lock_root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                fd = os.open(
+                    digest,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            finally:
+                os.close(root_fd)
+            try:
+                os.set_inheritable(fd, False)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+    finally:
+        with _REGISTRY_LOCK:
+            _, users = entry.shape_locks[shape]
+            if users == 1:
+                del entry.shape_locks[shape]
+            else:
+                entry.shape_locks[shape] = (thread_lock, users - 1)
 
 
 def _canonical_home(home: str | Path) -> Path:
@@ -78,17 +208,21 @@ def _open_lock(home: Path) -> int:
     return fd
 
 
+def _missing_manifest_error(home: Path) -> StorageFormatError:
+    return StorageFormatError(
+        f"stored-format manifest is missing at {home}; run "
+        "zeta storage-format advance --expected-epoch 0 "
+        f"--target-epoch {WRITER_EPOCH}"
+    )
+
+
 def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
     try:
         raw = (home / _MANIFEST).read_bytes()
     except FileNotFoundError:
         if absent_epoch is not None:
             return absent_epoch
-        raise StorageFormatError(
-            f"stored-format manifest is missing at {home}; run "
-            "zeta storage-format advance --expected-epoch 0 "
-            f"--target-epoch {WRITER_EPOCH}"
-        ) from None
+        raise _missing_manifest_error(home) from None
     try:
         decoder = json.JSONDecoder()
         text = raw.decode()
@@ -109,20 +243,45 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
     return epoch
 
 
-def _bootstrap_test_manifest(home: Path) -> None:
-    if (
-        os.environ.get("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT") != "1"
-        or (home / _MANIFEST).exists()
-    ):
-        return
+def _home_has_gated_state(home: Path) -> bool:
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        advance(home, expected_epoch=0)
-    except StorageFormatError:
-        for _ in range(100):
-            if (home / _MANIFEST).exists():
-                return
-            time.sleep(0.01)
-        raise
+        for pattern, _owner in GATED_HOME_PATHS:
+            name = pattern.removesuffix("/*")
+            try:
+                info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not pattern.endswith("/*") or not stat.S_ISDIR(info.st_mode):
+                return True
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=home_fd,
+                )
+            except OSError:
+                return True
+            try:
+                if os.listdir(child_fd):
+                    return True
+            finally:
+                os.close(child_fd)
+        return False
+    finally:
+        os.close(home_fd)
+
+
+def _bootstrap_empty_home(fd: int, home: Path) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise _missing_manifest_error(home) from None
+    if not (home / _MANIFEST).exists():
+        if _home_has_gated_state(home):
+            _read_manifest(home)
+        _publish_manifest(home, WRITER_EPOCH)
+    fcntl.flock(fd, fcntl.LOCK_SH)
 
 
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
@@ -146,16 +305,20 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
             raise StorageFormatError(
                 "stored-format lock acquisition must run off the event loop"
             )
-        _bootstrap_test_manifest(canonical)
         fd = _open_lock(canonical)
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH)
+            if (canonical / _MANIFEST).exists():
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            else:
+                _bootstrap_empty_home(fd, canonical)
             epoch = _read_manifest(canonical)
             if epoch > capability:
                 raise StorageFormatError(
                     f"stored format {epoch} is newer than writer capability {capability}"
                 )
-            registered = _RegistryEntry(fd=fd, references=1, epoch=epoch)
+            registered = _RegistryEntry(
+                fd=fd, references=1, epoch=epoch, shape_locks={}
+            )
             _REGISTRY[canonical] = registered
             return WriterLease(canonical, registered)
         except BaseException:
@@ -262,6 +425,14 @@ def apply_mutations(raw: object, mutations: Iterable[Mutation]) -> dict[str, Any
             parent.pop(key, None)
         elif isinstance(mutation, ReplaceSubtree):
             parent[key] = copy.deepcopy(mutation.value)
+        elif isinstance(mutation, PatchRecords):
+            parent[key] = _apply_record_mutations(
+                parent.get(key, []),
+                mutation.upserts,
+                identity=mutation.identity,
+                delete_ids=mutation.delete_ids,
+                name=".".join(mutation.path),
+            )
         else:
             current = parent.get(key)
             if type(mutation.value) is dict and type(current) is dict:
@@ -295,11 +466,24 @@ def _require_record_id(value: object, name: str) -> str:
     return value
 
 
+def _record_id(
+    record: Mapping[str, Any], identity: str | tuple[str, ...], name: str
+) -> str:
+    if isinstance(identity, str):
+        return _require_record_id(record.get(identity), name)
+    values = tuple(record.get(field) for field in identity)
+    if not identity or any(
+        not isinstance(value, (str, int)) or isinstance(value, bool) for value in values
+    ):
+        raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+    return json.dumps(values, separators=(",", ":"))
+
+
 def _apply_record_mutations(
     raw: object,
     upserts: Iterable[Mapping[str, Any]],
     *,
-    identity: str,
+    identity: str | tuple[str, ...],
     delete_ids: Iterable[str],
     name: str,
 ) -> list[dict[str, Any]]:
@@ -309,7 +493,7 @@ def _apply_record_mutations(
     output = copy.deepcopy(raw)
     positions: dict[str, int] = {}
     for index, record in enumerate(output):
-        record_id = _require_record_id(record.get(identity), name)
+        record_id = _record_id(record, identity, name)
         if record_id in positions:
             raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
         positions[record_id] = index
@@ -317,7 +501,7 @@ def _apply_record_mutations(
     deleted = {_require_record_id(record_id, name) for record_id in delete_ids}
     seen: set[str] = set()
     for record in upserts:
-        record_id = _require_record_id(record.get(identity), name)
+        record_id = _record_id(record, identity, name)
         if record_id in seen or record_id in deleted:
             raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
         seen.add(record_id)
@@ -329,7 +513,9 @@ def _apply_record_mutations(
             _merge_mapping(current, record)
             output.append(current)
 
-    return [record for record in output if record[identity] not in deleted]
+    return [
+        record for record in output if _record_id(record, identity, name) not in deleted
+    ]
 
 
 class WriterLease:
@@ -360,22 +546,23 @@ class WriterLease:
     ) -> dict[str, Any]:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        except FileNotFoundError:
-            raw = {} if initial is None else initial
-        else:
+        with _shape_lock(self._entry, self.home, directory_fd, name):
             try:
-                with os.fdopen(fd, "rb") as stream:
-                    raw = json.load(stream)
-            except (OSError, ValueError) as exc:
-                raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-        output = apply_mutations(raw, mutations)
-        encoded = (
-            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode()
-        publish(directory_fd, name, encoded)
-        return output
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            except FileNotFoundError:
+                raw = {} if initial is None else initial
+            else:
+                try:
+                    with os.fdopen(fd, "rb") as stream:
+                        raw = json.load(stream)
+                except (OSError, ValueError) as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            output = apply_mutations(raw, mutations)
+            encoded = (
+                json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode()
+            publish(directory_fd, name, encoded)
+            return output
 
     def publish_records(
         self,
@@ -386,33 +573,70 @@ class WriterLease:
         identity: str,
         delete_ids: Iterable[str],
         publish: PublishBytes,
+        path: tuple[str, ...] = (),
+        initial: object | None = None,
     ) -> list[dict[str, Any]]:
         """Patch and explicitly delete object records by identity."""
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        except FileNotFoundError:
-            raw: object = []
-        else:
+        with _shape_lock(self._entry, self.home, directory_fd, name):
             try:
-                with os.fdopen(fd, "rb") as stream:
-                    raw = json.load(stream)
-            except (OSError, ValueError) as exc:
-                raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-        output = _apply_record_mutations(
-            raw,
-            upserts,
-            identity=identity,
-            delete_ids=delete_ids,
-            name=name,
-        )
-        encoded = (
-            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode()
-        publish(directory_fd, name, encoded)
-        return output
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            except FileNotFoundError:
+                raw: object = ([] if not path else {}) if initial is None else initial
+            else:
+                try:
+                    with os.fdopen(fd, "rb") as stream:
+                        raw = json.load(stream)
+                except (OSError, ValueError) as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            records = raw
+            if path:
+                if type(raw) is not dict:
+                    raise StorageFormatError("stored JSON root must be an object")
+                parent, key = _mapping_at(raw, path, create=True)
+                records = parent.get(key, [])
+            output = _apply_record_mutations(
+                records,
+                upserts,
+                identity=identity,
+                delete_ids=delete_ids,
+                name=name,
+            )
+            published: object = output
+            if path:
+                published = apply_mutations(raw, (ReplaceSubtree(path, output),))
+            encoded = (
+                json.dumps(published, separators=(",", ":"), sort_keys=True) + "\n"
+            ).encode()
+            publish(directory_fd, name, encoded)
+            return output
+
+    def delete(self, directory_fd: int, name: str) -> None:
+        """Delete one authoritative shape while excluding all of its publishers."""
+
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        with _shape_lock(self._entry, self.home, directory_fd, name):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
+
+    def publish_append(
+        self,
+        shape: str,
+        variants: Iterable[object],
+        publish: Callable[[], None],
+    ) -> None:
+        """Validate closed variants before an authoritative append."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        for variant in variants:
+            require_closed_variant(shape, variant)
+        publish()
 
     def close(self) -> None:
         if self._closed:

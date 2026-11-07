@@ -80,9 +80,9 @@ from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
-from zeta.core.slash import budget_for_model
+from zeta.core.slash import SlashStatus, budget_for_model
+from zeta.core.slash import UsageSnapshot as SlashUsageSnapshot
 from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
@@ -94,12 +94,12 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
-from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -114,7 +114,7 @@ from zeta.tui.app import (
     background_notice,
     build_backend,
 )
-from zeta.tui.cards import agent_shutdown, agent_sync
+from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -247,11 +247,17 @@ def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
 def test_account_startup_warning_uses_warning_render_path(tmp_path: Path) -> None:
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
-        startup_warnings=("could not clean up account directory /secret; check its mode or ownership, then delete it or fix it",),
+        startup_warnings=(
+            "could not clean up account directory /secret; check its mode or ownership, then delete it or fix it",
+        ),
     )
 
     app._present_startup_output()
@@ -381,8 +387,7 @@ async def _background_event_transcript_count(
     if app_sink is not None:
         app_sink(app)
     blocked_command = (
-        f"{shlex.quote(sys.executable)} -c "
-        "'import threading; threading.Event().wait()'"
+        f"{shlex.quote(sys.executable)} -c 'import threading; threading.Event().wait()'"
     )
     command = {
         "start": blocked_command,
@@ -420,7 +425,7 @@ async def _background_event_transcript_count(
 
         app._run_full_screen = run_full_screen_after_ready  # type: ignore[method-assign]
         running = asyncio.create_task(app.run(session))
-        await input_ready.wait()
+        await asyncio.wait_for(input_ready.wait(), 10)
         if owner == "run_background":
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
@@ -464,9 +469,11 @@ async def _background_event_transcript_count(
 
         if event.startswith("natural_exit"):
             assert task_id is not None
-            await app.loop.tool_registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(
+                app.loop.tool_registry.background_tasks.wait(task_id), 10
+            )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
             await wait_until(lambda: not store.agent_notifications())
         elif event == "task_kill":
             assert task_id is not None
@@ -484,18 +491,19 @@ async def _background_event_transcript_count(
                 )
             )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
                 await wait_until(lambda: not store.agent_notifications())
         elif event == "failed_process_creation" and owner == "background_macro":
             await wait_until(lambda: not store.agent_notifications())
         if event == "session_shutdown" and shutdown_output_error is not None:
+
             def fail_output(*args: object, **kwargs: object) -> None:
                 raise shutdown_output_error("shutdown output unavailable")
 
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await running
+        await asyncio.wait_for(running, 10)
 
     resumed = ""
     if event == "session_shutdown":
@@ -515,9 +523,7 @@ async def _background_event_transcript_count(
                 ),
                 provider="codex",
                 model="offline",
-                console=Console(
-                    file=resumed_output, force_terminal=False, width=160
-                ),
+                console=Console(file=resumed_output, force_terminal=False, width=160),
             )
             resumed_app._rebuild_transcript()
             resumed = (
@@ -551,7 +557,7 @@ async def _background_event_transcript_count(
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"background tasks killed on session exit: {task_id}"
+            f"⏺ task {task_id} exited"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
@@ -562,6 +568,8 @@ async def _background_event_transcript_count(
             else "⏺ /matrix · failed"
         )
     visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
+    if event == "session_shutdown" and owner == "run_background":
+        assert "session shutdown" in visible
     return visible.count(needle), visible
 
 
@@ -764,9 +772,7 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
             resumed_app._rebuild_transcript()
             visible = output.getvalue() + resumed_output.getvalue()
-            assert (
-                visible.count("child child-canceled-presentation · completed") == 1
-            )
+            assert visible.count("child child-canceled-presentation · completed") == 1
         finally:
             await resumed_app.loop.close()
             reopened.close()
@@ -812,9 +818,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         count, rendered = await transcript
         assert count == 1, rendered
-        markers = {
-            entry.type for entry in apps[0].loop.store.tui_replay_entries()
-        }
+        markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
         assert "notification_tui_presented" in markers
     finally:
         release_ack.set()
@@ -873,68 +877,6 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
     store.close()
 
 
-@pytest.mark.asyncio
-async def test_run_background_shutdown_output_failure_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        registry=registry,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    flow = await loop._ensure_step_delivery()
-    producer_started = asyncio.Event()
-    allow_producer = asyncio.Event()
-    original_produce = flow.produce
-
-    async def gated_produce(item):
-        producer_started.set()
-        await allow_producer.wait()
-        return await original_produce(item)
-
-    monkeypatch.setattr(flow, "produce", gated_produce)
-    app = SimpleNamespace(
-        _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
-        _invalidate_prompt=lambda: None,
-        loop=loop,
-    )
-
-    async def close_registry() -> tuple[str, ...]:
-        background_notice(
-            app,
-            BackgroundTaskShutdownNotice(
-                "background tasks killed on session exit: task-1",
-                tasks=(("task-1", "run_background"),),
-            ),
-        )
-        return ()
-
-    monkeypatch.setattr(registry, "close", close_registry)
-    ticks = 0
-    stop_ticker = asyncio.Event()
-
-    async def tick() -> None:
-        nonlocal ticks
-        while not stop_ticker.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
-
-    ticker = asyncio.create_task(tick())
-    close_task = asyncio.create_task(loop.close())
-    await asyncio.wait_for(producer_started.wait(), 1)
-    with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
-        await asyncio.wait_for(close_task, 2)
-    stop_ticker.set()
-    await ticker
-
-    assert ticks > 10
-    assert not loop._tracked_tasks
-    assert store.agent_notifications() == []
-
-
 def test_other_background_notices_remain_visible() -> None:
     rendered: list[Text] = []
     background_notice(
@@ -946,7 +888,12 @@ def test_other_background_notices_remain_visible() -> None:
 
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path),
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -1135,9 +1082,7 @@ def _codex_reasoning_events(items: list[tuple[str, str]]) -> list[dict[str, obje
                     "id": item_id,
                     "status": "completed",
                     "summary": (
-                        [{"type": "summary_text", "text": summary}]
-                        if summary
-                        else []
+                        [{"type": "summary_text", "text": summary}] if summary else []
                     ),
                     "content": (
                         [{"type": "reasoning_text", "text": raw}] if raw else []
@@ -1592,6 +1537,26 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
+def test_task_safety_kill_renders_cause() -> None:
+    cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "task_exited",
+            "task_id": "task-safety",
+            "exit_code": -15,
+            "headline": "watch ci",
+            "background_phase": "task_kill",
+            "note": cause,
+        },
+    )
+
+    rendered = render_agent_notification(event)
+
+    assert rendered is not None
+    assert cause in renderable_plain(rendered)
+
+
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
     payloads = _notification_payloads()
 
@@ -1851,7 +1816,9 @@ def test_scrollback_stream_events_render() -> None:
 
 def test_render_event_compacts_tool_call_and_result() -> None:
     call = ToolCall("call-1", "read", {"path": "README.md", "extra": "x"})
-    start = render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
+    start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
     result = render_event(
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
@@ -1883,9 +1850,16 @@ def test_agent_card_labels_staged_agent_send_as_parent_message(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_agent_card_transcript_hides_passive_harness_message(tmp_path: Path) -> None:
+async def test_agent_card_transcript_hides_passive_harness_message(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path, session_id="child")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("visible prompt")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("visible prompt")]),
+            MessageOrigin.USER,
+        )
+    )
     store.append_message(
         with_message_origin(
             Message(
@@ -1896,7 +1870,9 @@ async def test_agent_card_transcript_hides_passive_harness_message(tmp_path: Pat
             MessageOrigin.HARNESS_NUDGE,
         )
     )
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("visible answer")])
+    )
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
@@ -2200,7 +2176,9 @@ def test_agent_notification_omits_missing_stats() -> None:
     ("path", "language"),
     [("main.py", "python"), ("app.TS", "typescript"), ("notes.unknown", "text")],
 )
-def test_tool_card_language_inference_is_extension_owned(path: str, language: str) -> None:
+def test_tool_card_language_inference_is_extension_owned(
+    path: str, language: str
+) -> None:
     assert infer_language(path) == language
 
 
@@ -2253,7 +2231,9 @@ def test_read_card_uses_no_background_with_custom_code_palette() -> None:
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
                 tool_call=call,
-                tool_result=ToolResult(call.id, "print('hi')\nprint('there')\nprint('ok')"),
+                tool_result=ToolResult(
+                    call.id, "print('hi')\nprint('there')\nprint('ok')"
+                ),
             )
         )
         assert rendered is not None
@@ -2674,9 +2654,7 @@ def test_transcript_search_resize_back_refreshes_current_match_style() -> None:
     def match_styles(content: UIContent) -> tuple[str, str]:
         first, second = (
             next(
-                style
-                for style, text in content.get_line(line)
-                if text == "t" and style
+                style for style, text in content.get_line(line) if text == "t" and style
             )
             for line in (1, 2)
         )
@@ -2995,7 +2973,6 @@ def test_transcript_completion_swap_preserves_scrolled_anchor() -> None:
     assert transcript._line_locations[transcript.scroll_offset][0] is unit
 
 
-
 def _render_layout(
     session: FullScreenPromptSession, mouse_handlers: MouseHandlers
 ) -> None:
@@ -3043,7 +3020,9 @@ def test_mouse_reporting_leaves_out_pointer_motion(tmp_path: Path) -> None:
     assert "\x1b[?1003h" not in written  # every pointer move
 
 
-async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: Path) -> None:
+async def test_wheel_scrolls_transcript_from_transcript_and_composer(
+    tmp_path: Path,
+) -> None:
     app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -3066,7 +3045,9 @@ async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: P
         assert app._transcript.scroll_offset == tail_offset - 3
 
 
-async def test_transcript_left_drag_does_not_copy_or_show_notice(tmp_path: Path) -> None:
+async def test_transcript_left_drag_does_not_copy_or_show_notice(
+    tmp_path: Path,
+) -> None:
     app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -3246,6 +3227,7 @@ async def test_composer_mouse_maps_combining_mark_wrap_gaps_to_the_next_column(
 
     assert session.default_buffer.cursor_position == 3
 
+
 def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("line"))
@@ -3421,7 +3403,10 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
     tool_region = "\n".join(
         renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected_end)}"
+    assert (
+        tool_region
+        == f"{renderable_plain(expected_start)}\n{renderable_plain(expected_end)}"
+    )
     assert "  ↳ [stdout] chunk" not in tool_region
 
 
@@ -3446,7 +3431,7 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
             ConversationStore(tmp_path),
             tools={"stream": stream},
             max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -3482,7 +3467,10 @@ skill_catalog=SkillCatalog.empty(),
     tool_region = "\n".join(
         renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
+    assert (
+        tool_region
+        == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
+    )
     for index in range(200):
         assert f"  ↳ [stdout] chunk-{index}" not in tool_region
 
@@ -3510,7 +3498,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
             store,
             tools={"stream": stream},
             max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -3555,13 +3543,14 @@ skill_catalog=SkillCatalog.empty(),
     tool_region = "\n".join(
         renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
+    assert (
+        tool_region
+        == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
+    )
     assert "  ↳ [stdout] first" not in tool_region
     assert app._loop_state == "interrupted"
     results = [
-        message.tool_result
-        for message in store.messages()
-        if message.tool_result
+        message.tool_result for message in store.messages() if message.tool_result
     ]
     assert len(results) == 1
     assert results[0] is not None
@@ -3678,10 +3667,7 @@ def test_image_placeholders_use_dim_style() -> None:
         "[image block] media_type=image/png bytes=70\nanswer"
     )
 
-    assert any(
-        span.start == 0 and span.style == DIM
-        for span in rendered.spans
-    )
+    assert any(span.start == 0 and span.style == DIM for span in rendered.spans)
 
 
 def test_render_helpers_use_the_zeta_palette() -> None:
@@ -3830,7 +3816,11 @@ def _bash_card(exit_code: int) -> Panel:
             tool_result=ToolResult(
                 "bash-x",
                 "stdout:\nout\nstderr:\n",
-                structured_content={"stdout": "out", "stderr": "", "exit_code": exit_code},
+                structured_content={
+                    "stdout": "out",
+                    "stderr": "",
+                    "exit_code": exit_code,
+                },
                 is_error=exit_code != 0,
             ),
         )
@@ -3944,7 +3934,10 @@ def test_canceled_tool_card_shows_single_neutral_canceled_status() -> None:
     failure = _generic_failed_card(
         ToolResult("gen", "tool execution canceled", is_error=True, is_canceled=True)
     )
-    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+    for view in (
+        renderable_plain(failure),
+        renderable_plain(compact_tool_card(failure)),
+    ):
         assert view.count("· canceled") == 1
         assert "· error" not in view
         assert "· denied" not in view
@@ -3959,7 +3952,10 @@ def test_denied_tool_card_shows_single_neutral_denied_status() -> None:
             structured_content={"error": {"kind": "denied"}},
         )
     )
-    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+    for view in (
+        renderable_plain(failure),
+        renderable_plain(compact_tool_card(failure)),
+    ):
         assert view.count("· denied") == 1
         assert "· error" not in view
         assert "· canceled" not in view
@@ -3967,7 +3963,10 @@ def test_denied_tool_card_shows_single_neutral_denied_status() -> None:
 
 def test_real_failure_tool_card_shows_single_error_status() -> None:
     failure = _generic_failed_card(ToolResult("gen", "boom", is_error=True))
-    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+    for view in (
+        renderable_plain(failure),
+        renderable_plain(compact_tool_card(failure)),
+    ):
         assert view.count("· error") == 1
         assert "· canceled" not in view
         assert "· denied" not in view
@@ -3975,7 +3974,10 @@ def test_real_failure_tool_card_shows_single_error_status() -> None:
 
 def test_failed_bash_card_keeps_single_exit_status_in_both_views() -> None:
     failure = _bash_card(1)
-    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+    for view in (
+        renderable_plain(failure),
+        renderable_plain(compact_tool_card(failure)),
+    ):
         # Bash surfaces failure through its own exit status, never a second
         # generic "· error" marker, and the status survives the compact toggle.
         assert "exit 1" in view
@@ -4083,9 +4085,7 @@ def test_tool_card_preserves_preamble_without_sections() -> None:
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=ToolCall("tool-6", "bash", {"command": "sleep 1"}),
-            tool_result=ToolResult(
-                "tool-6", "timed out after 30s", is_error=True
-            ),
+            tool_result=ToolResult("tool-6", "timed out after 30s", is_error=True),
         )
     )
 
@@ -4250,7 +4250,11 @@ async def test_provider_failure_card_is_visible_in_both_modes(
     tmp_path: Path, full_screen: bool
 ) -> None:
     app = TUIApp(
-        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            ErrorBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -4329,7 +4333,7 @@ async def test_transport_failure_shapes_render_error_cards(
         AgentLoop(
             RaisedErrorBackend(error),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4359,10 +4363,13 @@ async def test_ollama_model_window_error_renders_in_tui(tmp_path: Path) -> None:
         token_budget=10,
         retained_tail=1,
         system_prompt="system prompt is much too large",
-        token_counter=lambda message: 1 + sum(
-            len(block.text)
-            for block in message.content
-            if isinstance(block, TextContent)
+        token_counter=lambda message: (
+            1
+            + sum(
+                len(block.text)
+                for block in message.content
+                if isinstance(block, TextContent)
+            )
         ),
         backend=backend,
     )
@@ -4419,9 +4426,10 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
         "partial response",
         "second response",
     ]
-    assert sum(
-        message.role is MessageRole.USER for message in backend.request_messages[1]
-    ) == 1
+    assert (
+        sum(message.role is MessageRole.USER for message in backend.request_messages[1])
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -4430,7 +4438,7 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
         AgentLoop(
             AlwaysErrorBackend(),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -4470,7 +4478,11 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER
+        )
+    )
     backend = CompactionBackend()
     assembler = ContextAssembler(
         store,
@@ -4481,7 +4493,12 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
         backend=backend,
     )
     app = TUIApp(
-        AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            context_assembler=assembler,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -4534,7 +4551,11 @@ async def test_compaction_error_event_aborts_and_preserves_source(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER
+        )
+    )
     baseline = [entry.id for entry in store.replay()]
     backend = PartialThenErrorBackend()
     assembler = ContextAssembler(
@@ -4546,7 +4567,12 @@ async def test_compaction_error_event_aborts_and_preserves_source(
         backend=backend,
     )
     app = TUIApp(
-        AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            store,
+            context_assembler=assembler,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -4568,8 +4594,6 @@ async def test_compaction_error_event_aborts_and_preserves_source(
 
     assert backend.calls == 3
     assert store.messages()[-1].content[0].text == "done"
-
-
 
 
 @pytest.mark.asyncio
@@ -4643,7 +4667,11 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER
+        )
+    )
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -4654,9 +4682,7 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
             },
         )
     )
-    store.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("recovered")])
-    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("recovered")]))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -4673,7 +4699,11 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER
+        )
+    )
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -4683,7 +4713,11 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
             },
         )
     )
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("second")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("second")]), MessageOrigin.USER
+        )
+    )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -4700,7 +4734,11 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
 async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     backend = WaitingFailureBackend()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -4817,9 +4855,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     assert first_image.exists()
     assert second_image.exists()
     user_messages = [
-        message
-        for message in store.messages()
-        if message.role is MessageRole.USER
+        message for message in store.messages() if message.role is MessageRole.USER
     ]
     assert user_messages[0].content[1].path == str(first_image)
     assert user_messages[1].content[1].path == str(second_image)
@@ -4923,7 +4959,7 @@ def test_agent_running_card_shows_step_elapsed_and_turns() -> None:
 
     rendered = render_agent_progress(
         call,
-        "task research: turn 3: tool: read {\"path\":\"README.md\"}",
+        'task research: turn 3: tool: read {"path":"README.md"}',
         elapsed_seconds=4.2,
     )
 
@@ -5002,9 +5038,7 @@ def test_child_todo_event_does_not_change_parent_widget_state(tmp_path: Path) ->
         )
     )
 
-    assert store.todo_items() == [
-        {"content": "parent work", "status": "pending"}
-    ]
+    assert store.todo_items() == [{"content": "parent work", "status": "pending"}]
     assert app._todo_widget.visible
 
 
@@ -5197,7 +5231,9 @@ async def test_nested_agent_lifecycle_reaches_tui_with_depth(
     events = [
         event
         async for event in AgentLoop(
-            backend, ConversationStore(tmp_path), max_turns=1,
+            backend,
+            ConversationStore(tmp_path),
+            max_turns=1,
             skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     ]
@@ -5319,9 +5355,7 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
             "agent_type": "plan",
         },
     )
-    store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
-    )
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
             MessageRole.TOOL_RESULT,
@@ -5337,7 +5371,11 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
             ),
         )
     )
-    app = TUIApp(AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()), provider="codex", model="offline")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
     app._active_session = app._make_session()
 
     app._rebuild_transcript()
@@ -5370,9 +5408,11 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
         ),
     )
     transcript = TranscriptWidget()
-    transcript.start_tool(call.id, call, render_event(
-        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
-    ))
+    transcript.start_tool(
+        call.id,
+        call,
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
+    )
     transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
@@ -5400,9 +5440,13 @@ def test_agent_cards_remain_in_sequential_order() -> None:
                 structured_content={"turns_used": index + 1, "child_session_path": ""},
             ),
         )
-        transcript.start_tool(call.id, call, render_event(
-            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
-        ))
+        transcript.start_tool(
+            call.id,
+            call,
+            render_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+            ),
+        )
         transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
@@ -5655,9 +5699,16 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
     assert "live tail" in rendered
 
 
-def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
+def test_canceled_agent_card_can_expand_with_persisted_child_tail(
+    tmp_path: Path,
+) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
-    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("cancelled task")]), MessageOrigin.USER))
+    child.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("cancelled task")]),
+            MessageOrigin.USER,
+        )
+    )
     call = ToolCall(
         "agent-canceled-expand",
         "agent",
@@ -5677,9 +5728,11 @@ def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path
         ),
     )
     transcript = TranscriptWidget()
-    transcript.start_tool(call.id, call, render_event(StreamEvent(
-        StreamEventType.TOOL_EXECUTION_START, tool_call=call
-    )))
+    transcript.start_tool(
+        call.id,
+        call,
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
+    )
     transcript.finish_tool(call.id, render_event(event), event)
 
     assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
@@ -5699,7 +5752,9 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         store.session_dir / "agents", session_id="1", cwd=store.cwd
     )
     child.mark_agent_parent(call.id)
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved child tail")]))
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("saved child tail")])
+    )
     store.allocate_agent_index()
     store.register_agent_child(
         call,
@@ -5707,17 +5762,21 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         description="task research",
         turns_used=2,
     )
+    child.close()
 
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     await loop.activate()
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
+
     def render_transcript() -> str:
         transcript = TranscriptWidget()
         transcript.start_tool(
@@ -5762,9 +5821,11 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
         ),
     )
     transcript = TranscriptWidget()
-    transcript.start_tool(call.id, call, render_event(StreamEvent(
-        StreamEventType.TOOL_EXECUTION_START, tool_call=call
-    )))
+    transcript.start_tool(
+        call.id,
+        call,
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
+    )
     transcript.finish_tool(call.id, render_event(event), event)
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "5.0s" in rendered
@@ -5900,6 +5961,7 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         pipe.send_text("\\x04")
         await asyncio.wait_for(resumed_task, timeout=2)
 
+
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
@@ -5985,18 +6047,6 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
         await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
         await task
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:
@@ -6174,7 +6224,11 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
     )
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="anthropic",
         model="claude-sonnet-4-6",
         console=Console(file=output, force_terminal=False),
@@ -6219,7 +6273,9 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
     handler.served = False
 
     credentials = codex_credentials(tmp_path / "codex.json")
-    credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
+    credentials.save(
+        OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000)
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     output = StringIO()
     app = TUIApp(
@@ -6230,7 +6286,7 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
                 base_url="https://test.invalid/codex/responses",
             ),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model=DEFAULT_CODEX_MODEL,
@@ -6255,7 +6311,10 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     blocks = (
         [("redacted_thinking", '"data":"opaque"'), ("thinking", '"thinking":"plan"')]
         if redacted_first
-        else [("thinking", '"thinking":"plan"'), ("redacted_thinking", '"data":"opaque"')]
+        else [
+            ("thinking", '"thinking":"plan"'),
+            ("redacted_thinking", '"data":"opaque"'),
+        ]
     )
     lines = [
         'data: {"type":"message_start","message":{}}',
@@ -6307,7 +6366,11 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     )
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="anthropic",
         model="claude-sonnet-4-6",
         console=Console(file=output, force_terminal=False),
@@ -6320,6 +6383,81 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     assert rendered.count("✱ thought · redacted") == 1
     assert rendered.count("✱ thought ·") == 2
     assert rendered.count("\n  plan") == 1
+
+
+def test_status_card_output_fixture_uses_shared_status_text() -> None:
+    status = SlashStatus(
+        session_id="status-fixture",
+        provider="codex",
+        model="gpt-5.6-luna",
+        retained_tail=6,
+        tokens_used_this_session=150,
+        tokens_in_current_context=120,
+        compaction_marker_count=1,
+        pending_approvals=("approval-1 (bash)",),
+        checkpoint_count=2,
+        cache_read_input_tokens=60,
+        cache_creation_input_tokens=30,
+        uncached_input_tokens=10,
+        output_tokens_this_session=50,
+        context_files=("/repo/AGENTS.md",),
+        hooks=("stop: true",),
+        usage_history=(
+            SlashUsageSnapshot(
+                turn=1,
+                input_tokens=10,
+                output_tokens=50,
+                cache_read_input_tokens=60,
+                cache_creation_input_tokens=30,
+                model="gpt-5.6-luna",
+                estimated_cost_usd=0.000123,
+            ),
+        ),
+        usage_cost_by_model=(
+            SlashUsageSnapshot(
+                turn=0,
+                input_tokens=10,
+                output_tokens=50,
+                cache_read_input_tokens=60,
+                cache_creation_input_tokens=30,
+                model="gpt-5.6-luna",
+                estimated_cost_usd=0.000123,
+            ),
+        ),
+        model_window=1_050_000,
+        mcp_summary="mcp: 1 mounted, 0 failed",
+        explicit_finish=True,
+    )
+
+    rendered = "\n".join(
+        "".join(text for _style, text in line)
+        for line in tui_app_module._status_card_lines(status)
+    )
+
+    assert rendered == (
+        "Status\n\0overlay-rule\0\n"
+        "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "completion_client_setups: none\n"
+        "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
+        "retained_tail: 6\ntokens_used_this_session: 150\n"
+        "tokens_in_current_context: 120\ncompaction_marker_count: 1\n"
+        "checkpoint_count: 2\nlive_pending_approvals: 1 (approval-1 (bash))\n"
+        "mcp: 1 mounted, 0 failed\nusage:\n  input_tokens: 10\n"
+        "  output_tokens: 50\n  cache_read_tokens: 60\n  cache_write_tokens: 30\n"
+        "  cache_hit_rate: 60.0%\n  child_cache_read_tokens: 0\n"
+        "  child_cache_write_tokens: 0\n  child_uncached_input_tokens: 0\n"
+        "  child_output_tokens: 0\n  child_cache_hit_rate: n/a\n"
+        "  cache_hit_trend: 1:60%\n  estimated_cost_usd: $0.000123\n"
+        "prompt_cache_read: 60\nprompt_cache_write: 30\n"
+        "prompt_cache_uncached_input: 10\nprompt_cache_hit_rate: 60.0%\n"
+        "output_tokens_this_session: 50\ncontext:\n  window: 120 / 1050000\n"
+        "  fill: [--------------------] 0%\ncompaction_history:\n  none\n"
+        "context_files: /repo/AGENTS.md\n"
+        "hooks: stop: true\nautomatic_memory_failure: none\n"
+        "transcript_index_failure: none\nproject_context_health: healthy\n"
+        "\0overlay-rule\0\n"
+        "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
+    )
 
 
 @pytest.mark.asyncio
@@ -6344,15 +6482,50 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         return "disk full; pending changes will retry"
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
-
-    lines = tui_app_module._status_card_lines(app.slash_status())
-    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
-
-    assert requested == ["child-session"]
-    assert (
-        "transcript_index_failure: disk full; pending changes will retry" in rendered
+    app.loop.project_context_health = SimpleNamespace(
+        summary="malformed_memory (p_root/memory/state.md): project memory is malformed"
     )
-    await app.close()
+    vars(app.loop._background_owner)["project_context_loops"] = {
+        "child-session": SimpleNamespace(
+            project_context_health=SimpleNamespace(
+                summary=(
+                    "malformed_memory (p_child/memory/brief.md): "
+                    "project memory is malformed"
+                )
+            )
+        )
+    }
+    monkeypatch.setattr(
+        AgentLoop,
+        "connection_setup_counts",
+        lambda _loop: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+        raising=False,
+    )
+
+    try:
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+
+        assert requested == ["child-session"]
+        assert (
+            "transcript_index_failure: disk full; pending changes will retry"
+            in rendered
+        )
+        assert (
+            "project_context_health: malformed_memory "
+            "(p_child/memory/brief.md): project memory is malformed" in rendered
+        )
+        assert "completion_client_setups: codex/gpt-test=1" in rendered
+
+        app._agent_navigation.current_path = app._agent_navigation.root_path
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+        assert (
+            "project_context_health: malformed_memory "
+            "(p_root/memory/state.md): project memory is malformed" in rendered
+        )
+    finally:
+        await app.close()
 
 
 @pytest.mark.parametrize(
@@ -6510,7 +6683,7 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
             EarlyCloseRetryBackend(),
             ConversationStore(tmp_path / "sessions"),
             tool_schemas=[],
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -6564,7 +6737,7 @@ async def test_truncated_response_notice_is_printed_once(
             TruncatedBackend(),
             ConversationStore(tmp_path / "sessions"),
             tool_schemas=[],
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -6579,7 +6752,11 @@ skill_catalog=SkillCatalog.empty(),
 
 def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -6613,7 +6790,11 @@ def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) ->
 
 def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -6648,7 +6829,11 @@ def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
 
 def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -6658,9 +6843,7 @@ def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> N
         ThinkingContent("block-one", "sig-1"),
         ThinkingContent("block-two", "sig-2"),
     ):
-        app._consume_text(
-            StreamEvent(StreamEventType.MESSAGE_UPDATE, content=content)
-        )
+        app._consume_text(StreamEvent(StreamEventType.MESSAGE_UPDATE, content=content))
     app._flush_pending_stream()
 
     rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
@@ -6672,7 +6855,11 @@ def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> N
 def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
     source = "logical-line-that-reflows"
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -6687,9 +6874,7 @@ def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
     app._flush_pending_stream()
 
     assert any(
-        source in getattr(unit, "plain", "")
-        for unit in app._transcript.units
-        if unit
+        source in getattr(unit, "plain", "") for unit in app._transcript.units if unit
     )
     narrow = [Text.from_ansi(line).plain for line in app._transcript.lines(18)]
     wide = [Text.from_ansi(line).plain for line in app._transcript.lines(80)]
@@ -6701,7 +6886,11 @@ def test_thought_updates_keep_active_unit_after_interleaved_output(
     tmp_path: Path,
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -6726,7 +6915,11 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     monkeypatch.setattr("zeta.tui.app.time.monotonic", lambda: next(ticks))
     output = StringIO()
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -6749,7 +6942,11 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -6758,7 +6955,9 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
     app._consume_text(
         StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
-            content=TextContent("first paragraph\nsecond paragraph\n```python\nprint('hi')\n```"),
+            content=TextContent(
+                "first paragraph\nsecond paragraph\n```python\nprint('hi')\n```"
+            ),
         )
     )
     app._finish_message(
@@ -6766,7 +6965,11 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
             StreamEventType.MESSAGE_END,
             message=Message(
                 MessageRole.ASSISTANT,
-                [TextContent("first paragraph\nsecond paragraph\n```python\nprint('hi')\n```")],
+                [
+                    TextContent(
+                        "first paragraph\nsecond paragraph\n```python\nprint('hi')\n```"
+                    )
+                ],
             ),
         )
     )
@@ -6778,7 +6981,11 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            ErrorBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -6811,7 +7018,11 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            ErrorBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         verbose=True,
@@ -6881,7 +7092,11 @@ async def test_verbose_transition_flushes_before_raw_event(
     raw_marker: str,
 ) -> None:
     app = TUIApp(
-        AgentLoop(EventBackend(event), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            EventBackend(event),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         verbose=True,
@@ -6906,8 +7121,7 @@ async def test_verbose_transition_flushes_before_raw_event(
     raw_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", "").startswith("{")
-        and raw_marker in item.plain
+        if getattr(item, "plain", "").startswith("{") and raw_marker in item.plain
     )
     assert line_index < raw_index
     await app.close()
@@ -6987,7 +7201,11 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
     backend = QueueOrderBackend()
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -7031,14 +7249,10 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        read_pty_until(
-            master_fd, b" \xe2\x80\xba ", process=process, output=output
-        )
+        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
 
         os.write(master_fd, b"\x04")
-        read_pty_until(
-            master_fd, b"\x1b[?1049l", process=process, output=output
-        )
+        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
         reap_process(process, timeout=10)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
@@ -7075,9 +7289,7 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(
-            master_fd, needle, process=process, output=output, start=start
-        )
+        read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -7129,9 +7341,7 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(
-            master_fd, needle, process=process, output=output, start=start
-        )
+        read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -7228,7 +7438,7 @@ def test_completed_markdown_fixture_renders_the_capability_set() -> None:
     assert "[x] done" in plain and "nested" in plain
     assert "│ quote" in plain and "│ │ nested quote" in plain
     assert "left" in plain and "center" in plain and "right" in plain
-    assert "print(\"python\")" in plain and "const value = 1" in plain
+    assert 'print("python")' in plain and "const value = 1" in plain
     assert "old" in plain and "new" in plain
     assert "literal*" in plain and "hard break\nnext line" in plain
     assert "\x1b[9m" in rendered
@@ -7237,7 +7447,10 @@ def test_completed_markdown_fixture_renders_the_capability_set() -> None:
 
 @pytest.mark.parametrize(
     ("source", "expected"),
-    [("<div>raw html</div>", "<div>raw html</div>"), ("    indented code", "indented code")],
+    [
+        ("<div>raw html</div>", "<div>raw html</div>"),
+        ("    indented code", "indented code"),
+    ],
 )
 def test_completed_markdown_keeps_visible_literal_blocks(
     source: str, expected: str
@@ -7252,7 +7465,11 @@ def test_completed_message_replaces_streaming_unit_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7290,7 +7507,11 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
 ) -> None:
     call = ToolCall("mixed-1", "read", {"path": "README.md"})
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7346,9 +7567,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         elif event.type is StreamEventType.MESSAGE_END:
             app._finish_message(event)
 
-    plain = "\n".join(
-        Text.from_ansi(line).plain for line in app._transcript.lines(80)
-    )
+    plain = "\n".join(Text.from_ansi(line).plain for line in app._transcript.lines(80))
     assert plain.count("before tool") == 1
     assert plain.count("after tool") == 1
     assert calls == [before, after]
@@ -7402,7 +7621,11 @@ def test_large_markdown_table_falls_back_within_render_budget(
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7428,7 +7651,11 @@ def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
 
 def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7464,12 +7691,15 @@ def test_completed_message_renders_final_message_text(
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLORTERM", "truecolor")
     source = (
-        "1. **Round 2 (parallel):** use **four** workers, then "
-        "**single `fallback`**."
+        "1. **Round 2 (parallel):** use **four** workers, then **single `fallback`**."
     )
     partial = source[: source.index("`fallback`") + 1]
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7501,7 +7731,11 @@ def test_completed_message_rerenders_text_split_by_thinking(
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLORTERM", "truecolor")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7551,7 +7785,11 @@ def test_completed_message_rerenders_text_split_by_tool(
     monkeypatch.setenv("COLORTERM", "truecolor")
     call = ToolCall("split-1", "read", {"path": "README.md"})
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -7650,7 +7888,11 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER
+        )
+    )
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -7881,7 +8123,9 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
         activation_started.set()
         await asyncio.Event().wait()
 
-    async def type_then_crash(session: FullScreenPromptSession, owner: object) -> object:
+    async def type_then_crash(
+        session: FullScreenPromptSession, owner: object
+    ) -> object:
         del session, owner
         await activation_started.wait()
         assert app._submit_input("queued before render crash")
@@ -8079,7 +8323,9 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
         )
     )
 
-    queued = [payload for kind, payload in app._startup_runtime_events if kind == "event"]
+    queued = [
+        payload for kind, payload in app._startup_runtime_events if kind == "event"
+    ]
     assert [event.type for event in queued] == [
         StreamEventType.TOOL_EXECUTION_START,
         StreamEventType.TOOL_EXECUTION_UPDATE,
@@ -8177,7 +8423,9 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         session = FullScreenPromptSession(input=pipe, output=DummyOutput())
         run_task = asyncio.create_task(app.run(session))
         assert await asyncio.to_thread(recovery_mutated.wait, 5)
-        assert app._input_loop_active, "TUI input did not start during activation recovery"
+        assert app._input_loop_active, (
+            "TUI input did not start during activation recovery"
+        )
         app.request_exit()
         await activation_cancelled.wait()
         recovery_release.set()
@@ -8256,7 +8504,11 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(100):
-        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent(str(index))]), MessageOrigin.USER))
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(str(index))]), MessageOrigin.USER
+            )
+        )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -8281,7 +8533,9 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         replay_completed.append(None)
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    # test-contract: seam Observe transcript rebuild through the application boundary.
     monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
+    # test-contract: seam Observe the production heap-freeze boundary.
     monkeypatch.setattr(
         "zeta.tui.checkpoints.freeze_long_lived_heap",
         lambda: freeze_calls.append(None),
@@ -8303,7 +8557,11 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER
+        )
+    )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -8368,7 +8626,10 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
         store = ConversationStore(tmp_path / name)
         for index in range(25):
             store.append_message(
-                with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"message {index}")]),
+                    MessageOrigin.USER,
+                )
             )
         return TUIApp(
             AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -8425,11 +8686,9 @@ async def test_rebuild_transcript_matches_character_stream(
     ]
     app = TUIApp(
         AgentLoop(
-            FakeBackend(
-                [ScriptedTurn(content=source_parts)]
-            ),
+            FakeBackend([ScriptedTurn(content=source_parts)]),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -8451,7 +8710,12 @@ async def test_run_replays_resumed_transcript_before_prompt(
     tmp_path: Path, full_screen: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered user")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("remembered user")]),
+            MessageOrigin.USER,
+        )
+    )
     call = ToolCall("resume-read", "read", {"path": "README.md"})
     store.append_message(
         Message(
@@ -8606,7 +8870,11 @@ def test_rebuild_renders_closed_turn_end_reasons(
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("old reply")]))
     store.append_compaction_marker("provider summary", 1, 2)
     app = TUIApp(
@@ -8630,7 +8898,11 @@ async def test_run_keeps_empty_resumed_transcript_blank(
 ) -> None:
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
@@ -8653,7 +8925,7 @@ async def test_run_keeps_empty_resumed_transcript_blank(
             else app_session(app, pipe)
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: app._input_loop_active)
         pipe.send_text("\x04")
         await run_task
 
@@ -8664,23 +8936,26 @@ async def test_run_keeps_empty_resumed_transcript_blank(
 def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [
-                TextContent("inspect notes.txt and [Image #1]"),
-                TextContent(
-                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                    "/tmp/notes.txt",
-                    12,
-                ),
-                ImageContent(
-                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                    "image/png",
-                    "/tmp/image.png",
-                    68,
-                ),
-            ],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [
+                    TextContent("inspect notes.txt and [Image #1]"),
+                    TextContent(
+                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                        "/tmp/notes.txt",
+                        12,
+                    ),
+                    ImageContent(
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                        "image/png",
+                        "/tmp/image.png",
+                        68,
+                    ),
+                ],
+            ),
+            MessageOrigin.USER,
+        )
     )
     read_call = ToolCall("resume-read", "read", {"path": "README.md"})
     agent_call = ToolCall(
@@ -8724,12 +8999,21 @@ def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store.append_compaction_marker("provider summary", 1, 4)
     store._append_row("warning", {"message": "filtered warning"})
     checkpoint = store.append_checkpoint("base")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("abandoned branch")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("abandoned branch")]),
+            MessageOrigin.USER,
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")])
     )
     store.append_fork(str(checkpoint.seq))
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new branch")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("new branch")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")]))
     store.append_checkpoint("saved")
     return store
@@ -8770,9 +9054,7 @@ def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
     )
 
 
-async def _run_reopened_session(
-    store: ConversationStore, full_screen: bool
-) -> str:
+async def _run_reopened_session(store: ConversationStore, full_screen: bool) -> str:
     reopened = ConversationStore(store.root_dir, session_id=store.session_id)
     output = StringIO()
     app = _test_tui_app(reopened, output)
@@ -8823,9 +9105,7 @@ async def test_resume_replays_only_the_forked_branch(
             "forked to checkpoint 'saved' at seq 13"
         )
 
-    rendered = Text.from_ansi(
-        await _run_reopened_session(store, full_screen)
-    ).plain
+    rendered = Text.from_ansi(await _run_reopened_session(store, full_screen)).plain
     assert "kept reply" in rendered
     assert "new branch" in rendered
     assert "abandoned branch" not in rendered
@@ -8845,7 +9125,11 @@ async def test_aborted_turn_does_not_reorder_the_next_reply(
     monkeypatch.setenv("COLORTERM", "truecolor")
     backend = AbortThenSuccessBackend()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -8881,7 +9165,7 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
         AgentLoop(
             ErrorThenSuccessBackend(),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -8909,7 +9193,11 @@ def test_empty_final_message_removes_streamed_assistant_text(
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLORTERM", "truecolor")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -8942,18 +9230,18 @@ def test_inline_message_commits_canonical_text_once(
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLORTERM", "truecolor")
     call = ToolCall("inline-split", "read", {"path": "README.md"})
-    middle = (
-        ThinkingContent("plan")
-        if boundary == "thinking"
-        else ToolUseContent(call)
-    )
+    middle = ThinkingContent("plan") if boundary == "thinking" else ToolUseContent(call)
     message = Message(
         MessageRole.ASSISTANT,
         [TextContent("before **"), middle, TextContent("bold** after")],
     )
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -8979,17 +9267,20 @@ def test_rebuild_user_attachment_hides_file_content(
     monkeypatch.setenv("COLORTERM", "truecolor")
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [
-                TextContent("inspect @notes.txt"),
-                TextContent(
-                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
-                    "/tmp/notes.txt",
-                    12,
-                ),
-            ],
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [
+                    TextContent("inspect @notes.txt"),
+                    TextContent(
+                        "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                        "/tmp/notes.txt",
+                        12,
+                    ),
+                ],
+            ),
+            MessageOrigin.USER,
+        )
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -9010,7 +9301,11 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
     tmp_path: Path,
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -9024,7 +9319,9 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
     assert rendered == ["intro", "", "1. first", "", "2. second after"]
 
 
-@pytest.mark.parametrize("value", ["*unclosed", "**unclosed", "_unclosed", "__unclosed"])
+@pytest.mark.parametrize(
+    "value", ["*unclosed", "**unclosed", "_unclosed", "__unclosed"]
+)
 def test_render_line_keeps_unmatched_emphasis_literal(value: str) -> None:
     rendered = render_line(value)
 
@@ -9057,7 +9354,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from tempfile import TemporaryDirectory
 
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
+        from zeta.runtime.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
@@ -9108,7 +9405,9 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
 
 
 def test_status_includes_provider_state_and_usage() -> None:
-    status = format_status("fake", "offline", "streaming", {"input_tokens": 2}, "partial")
+    status = format_status(
+        "fake", "offline", "streaming", {"input_tokens": 2}, "partial"
+    )
 
     assert "streaming" in status.plain
     assert "2 (0%)" in status.plain
@@ -9124,9 +9423,7 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
         session_id="abcdef12",
     )
 
-    assert footer.plain == (
-        "idle  18.6K (9%)  /status · abcdef12"
-    )
+    assert footer.plain == ("idle  18.6K (9%)  /status · abcdef12")
     assert "ctrl+u undo" not in footer.plain
 
     undo_footer = format_status(
@@ -9266,9 +9563,13 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         for width, frame in ((80, 0), (120, 1), (200, 2))
     ]
 
-    assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
+    assert all(
+        len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200))
+    )
     assert all("5 (0%)" in status.plain for status in statuses)
-    assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
+    assert all(
+        marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●"))
+    )
     assert "/status" in statuses[1].plain
     assert all(value in statuses[2].plain for value in ("abc12345", "/status"))
 
@@ -9344,11 +9645,7 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
                 None,
             )
 
-        cells = [
-            screen.data_buffer[y][x]
-            for y in range(24)
-            for x in range(40)
-        ]
+        cells = [screen.data_buffer[y][x] for y in range(24) for x in range(40)]
         composer_cells = [cell for cell in cells if "class:text-area" in cell.style]
         assert composer_cells
         assert all(
@@ -9376,8 +9673,7 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
             y
             for y in range(24)
             if any(
-                "class:text-area" in screen.data_buffer[y][x].style
-                for x in range(40)
+                "class:text-area" in screen.data_buffer[y][x].style for x in range(40)
             )
         }
         composer_top = min(composer_rows)
@@ -9413,7 +9709,9 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
     )
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=160))
     monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
-    monkeypatch.setattr("zeta.tui.composer.get_app", lambda: SimpleNamespace(output=output))
+    monkeypatch.setattr(
+        "zeta.tui.composer.get_app", lambda: SimpleNamespace(output=output)
+    )
 
     meta = "".join(value for _, value in app._status_toolbar())
 
@@ -9490,7 +9788,11 @@ def test_status_toolbar_preserves_live_state_at_production_widths(
 
 def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -9702,14 +10004,13 @@ async def test_pending_todo_keeps_priority_over_agent_list_across_short_heights(
         )
         panels_by_height[height] = (todo_visible, list_visible)
 
-    assert panels_by_height == {
-        height: (True, height >= 13) for height in range(8, 15)
-    }
+    assert panels_by_height == {height: (True, height >= 13) for height in range(8, 15)}
     for height in range(8, 14):
         for panel in range(2):
-            assert not panels_by_height[height][panel] or panels_by_height[height + 1][
-                panel
-            ]
+            assert (
+                not panels_by_height[height][panel]
+                or panels_by_height[height + 1][panel]
+            )
 
 
 @pytest.mark.asyncio
@@ -9750,8 +10051,6 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         await run_task
 
 
-
-
 @pytest.mark.parametrize(
     ("terminal_width", "right_segments"),
     [
@@ -9774,7 +10073,7 @@ def test_full_screen_footer_fits_content_column(
                 session_id="abcdef123456",
                 cwd=Path.home(),
             ),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -9831,10 +10130,9 @@ def test_full_screen_pty_keeps_padded_margins_clean(
     socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
     socket = socket_dir / "sock"
     env = _fixed_terminal_env(tmp_path / "zeta-home")
+
     def cleanup() -> None:
-        subprocess.run(
-            ["tmux", "-S", str(socket), "kill-server"], check=False
-        )
+        subprocess.run(["tmux", "-S", str(socket), "kill-server"], check=False)
 
     try:
         subprocess.run(
@@ -9938,9 +10236,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
     transcript.append(render_line("## result\n\n1. first item\n2. second item"))
     transcript.append_blank()
     transcript.append(
-        render_event(
-            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
-        )
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
     )
     transcript.append_blank()
     transcript.append(
@@ -9984,7 +10280,11 @@ def test_full_screen_transcript_preserves_markdown_list_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=_test_console(),
@@ -10003,7 +10303,11 @@ def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -10019,7 +10323,9 @@ def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
 
     assert wide_lines
     assert narrow_lines
-    plain = Text.from_ansi("\n".join(narrow_lines)).plain.replace(" ", "").replace("\n", "")
+    plain = (
+        Text.from_ansi("\n".join(narrow_lines)).plain.replace(" ", "").replace("\n", "")
+    )
     assert "abcdefghijk" in plain
 
 
@@ -10028,7 +10334,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
         AgentLoop(
             GateBackend(),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10052,7 +10358,11 @@ def test_status_toolbar_preserves_vim_state_style(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -10076,7 +10386,11 @@ def test_status_toolbar_preserves_vim_state_style(
 
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -10093,7 +10407,11 @@ def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -10129,7 +10447,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
             backend,
             ConversationStore(tmp_path / "sessions"),
             tools={"read": slow_tool},
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10157,7 +10475,11 @@ skill_catalog=SkillCatalog.empty(),
 async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
     backend = GateBackend()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -10173,22 +10495,27 @@ async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
 
     assert "interrupted" in states
     assert app._loop_state == "interrupted"
-    assert "interrupted" in format_status(
-        app.provider,
-        app.model,
-        app._loop_state,
-        session_id="session",
-    ).plain
+    assert (
+        "interrupted"
+        in format_status(
+            app.provider,
+            app.model,
+            app._loop_state,
+            session_id="session",
+        ).plain
+    )
 
 
 @pytest.mark.asyncio
-async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Path) -> None:
+async def test_app_surfaces_compacting_state_before_provider_output(
+    tmp_path: Path,
+) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10244,7 +10571,7 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
         AgentLoop(
             FakeBackend([ScriptedTurn(), ScriptedTurn()]),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10268,7 +10595,7 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         AgentLoop(
             GhostPreviewBackend(),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10279,7 +10606,9 @@ skill_catalog=SkillCatalog.empty(),
 
     await app._consume_turn("prompt")
 
-    assert [Text.from_ansi(line).plain.strip() for line in app._transcript.lines(120)] == [
+    assert [
+        Text.from_ansi(line).plain.strip() for line in app._transcript.lines(120)
+    ] == [
         "",
         "prompt",
         "",
@@ -10294,7 +10623,7 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
         AgentLoop(
             FakeBackend([ScriptedTurn([TextContent("answer")])]),
             ConversationStore(tmp_path / "sessions"),
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10325,7 +10654,7 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
             backend,
             ConversationStore(tmp_path / "sessions"),
             tools={"read": lambda _: "tool result"},
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10353,7 +10682,9 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path: Path) -> None:
+async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
+    tmp_path: Path,
+) -> None:
     bash = ToolCall("bash-visual", "bash", {"cmd": "seq 24"})
     read = ToolCall("read-visual", "read", {"path": "README.md", "limit": 120})
     backend = FakeBackend(
@@ -10379,7 +10710,7 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
                 "bash": lambda _: "\n".join(f"line-{i}" for i in range(24)),
                 "read": lambda _: "title\nbody",
             },
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -10392,9 +10723,7 @@ skill_catalog=SkillCatalog.empty(),
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()
     lines = snapshot.splitlines()
-    panel_lines = [
-        line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
-    ]
+    panel_lines = [line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))]
     assert "inspect the session" in snapshot
     assert "✱ thought ·" in snapshot
     assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
@@ -10403,9 +10732,7 @@ skill_catalog=SkillCatalog.empty(),
     assert len(panel_lines) == 28
     assert all(cell_len(line) <= 72 for line in panel_lines)
     assert all(
-        cell_len(line) == 70
-        for line in panel_lines
-        if line.startswith(("  ╭", "  ╰"))
+        cell_len(line) == 70 for line in panel_lines if line.startswith(("  ╭", "  ╰"))
     )
     await app.close()
 
@@ -10416,13 +10743,9 @@ def test_transcript_units_share_the_padded_content_edges(terminal_width: int) ->
     transcript = TranscriptWidget()
     call = ToolCall("visual", "bash", {"cmd": "printf output"})
     transcript.append(Text("assistant prose that wraps at the shared edge."))
+    transcript.append(Text('> quoted markdown\n\n```python\nprint("hello")\n```'))
     transcript.append(
-        Text("> quoted markdown\n\n```python\nprint(\"hello\")\n```")
-    )
-    transcript.append(
-        render_event(
-            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
-        )
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
     )
     transcript.append(
         render_event(
@@ -10442,11 +10765,7 @@ def test_transcript_units_share_the_padded_content_edges(terminal_width: int) ->
 
     lines = [Text.from_ansi(line).plain for line in transcript.lines(width)]
     assert all(cell_len(line) <= width for line in lines)
-    panel_lines = [
-        line
-        for line in lines
-        if line.startswith(("╭", "│", "╰"))
-    ]
+    panel_lines = [line for line in lines if line.startswith(("╭", "│", "╰"))]
     assert panel_lines
     assert all(cell_len(line) == width for line in panel_lines)
     assert any(line.startswith("╭") and line.endswith("╮") for line in panel_lines)
@@ -10661,7 +10980,9 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path) -> None:
+async def test_submission_undo_cancels_only_the_exact_rapid_enter(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -10737,7 +11058,9 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         return "unreachable"
 
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"block": block}, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend, store, tools={"block": block}, skill_catalog=SkillCatalog.empty()
+    )
     with create_pipe_input() as pipe:
         app = TUIApp(
             loop,
@@ -10750,8 +11073,10 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         await tool_started.wait()
         pipe.send_text("\x03")
         await wait_until(
-            lambda: len(store.messages()) == 3
-            and store.messages()[-1].tool_result is not None
+            lambda: (
+                len(store.messages()) == 3
+                and store.messages()[-1].tool_result is not None
+            )
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
@@ -10769,7 +11094,12 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
     call = ToolCall("partial-call", "block", {})
     backend = StreamingToolBackend(call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"block": lambda _: "unused"}, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"block": lambda _: "unused"},
+        skill_catalog=SkillCatalog.empty(),
+    )
     with create_pipe_input() as pipe:
         app = TUIApp(
             loop,
@@ -10782,8 +11112,10 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         await backend.tool_update.wait()
         pipe.send_text("\x03")
         await wait_until(
-            lambda: len(store.messages()) == 3
-            and store.messages()[-1].tool_result is not None
+            lambda: (
+                len(store.messages()) == 3
+                and store.messages()[-1].tool_result is not None
+            )
         )
         pipe.send_text("\x04")
         await run_task
@@ -10805,7 +11137,12 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
         session = PromptSession(
             input=pipe,
             output=DummyOutput(),
-            key_bindings=build_key_bindings(on_history_previous=lambda _buffer: None, on_history_next=lambda _buffer: None, on_interrupt=lambda: None, on_exit=lambda: None),
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" ❯ "))
@@ -10879,11 +11216,18 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
         task = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
         pipe.send_text("keep this buffer")
-        await wait_until(lambda: session is not None and session.app.current_buffer.text == "keep this buffer")
+        await wait_until(
+            lambda: (
+                session is not None
+                and session.app.current_buffer.text == "keep this buffer"
+            )
+        )
         pipe.send_text("\x1b")
         await wait_until(
-            lambda: session is not None
-            and session.app.vi_state.input_mode.value == "vi-navigation"
+            lambda: (
+                session is not None
+                and session.app.vi_state.input_mode.value == "vi-navigation"
+            )
         )
         pipe.send_text("\r")
         await task
@@ -10944,8 +11288,8 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
         try:
             await wait_until(lambda: session.app.is_running)
             modes_after_key: list[str] = []
-            session.app.key_processor.after_key_press += lambda _: modes_after_key.append(
-                session.app.vi_state.input_mode.value
+            session.app.key_processor.after_key_press += lambda _: (
+                modes_after_key.append(session.app.vi_state.input_mode.value)
             )
             pipe.send_text("\x1b")
             await wait_until(lambda: bool(modes_after_key))
@@ -10978,7 +11322,9 @@ async def test_vi_composer_paced_dd_and_gg_commands() -> None:
         task = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
         pipe.send_text("first line\nsecond line")
-        await wait_until(lambda: session.app.current_buffer.text == "first line\nsecond line")
+        await wait_until(
+            lambda: session.app.current_buffer.text == "first line\nsecond line"
+        )
         pipe.send_text("\x1b")
         await wait_until(
             lambda: session.app.vi_state.input_mode.value == "vi-navigation"
@@ -11033,7 +11379,9 @@ async def test_vi_composer_ctrl_c_interrupts_in_insert_and_normal_modes() -> Non
 
 
 @pytest.mark.asyncio
-async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission() -> None:
+async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission() -> (
+    None
+):
     submitted: list[str] = []
     long_line = "wrapped " + "x" * 160
     with create_pipe_input() as pipe:
@@ -11062,8 +11410,10 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
         await asyncio.sleep(0)
         pipe.send_text("\x1b[200~pasted line 1\npasted line 2\x1b[201~")
         await wait_until(
-            lambda: session is not None
-            and session.app.current_buffer.text == "pasted line 1\npasted line 2"
+            lambda: (
+                session is not None
+                and session.app.current_buffer.text == "pasted line 1\npasted line 2"
+            )
         )
         pipe.send_text("\x1b[200~\n" + long_line + "\x1b[201~\r")
         await task
@@ -11071,13 +11421,15 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
     assert submitted == ["pasted line 1\npasted line 2\n" + long_line]
 
 
-
-
 @pytest.mark.asyncio
 async def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
     session = PromptSession()
     app = TUIApp(
-        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         session=session,
@@ -11107,7 +11459,7 @@ async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
             store,
             tools={"danger": lambda _: "done"},
             approval_policy=policy,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
@@ -11208,10 +11560,6 @@ async def test_vi_composer_escape_and_insert_update_native_state() -> None:
         await task
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
     answered: list[str] = []
@@ -11263,12 +11611,15 @@ def _fd_count() -> int:
 
 @pytest.mark.asyncio
 async def test_tui_close_rejects_inflight_transcript_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
     child.close()
@@ -11294,6 +11645,7 @@ async def test_tui_close_rejects_inflight_transcript_source(
         assert release.wait(5)
         return tree
 
+    # test-contract: seam Hold the transcript source at its production refresh boundary.
     monkeypatch.setattr(agent_sync.AgentTranscriptSource, "__init__", record_init)
     monkeypatch.setattr(agent_sync.AgentTranscriptSource, "refresh", gated_refresh)
     app._agent_navigation.selected_index = 1
@@ -11314,12 +11666,15 @@ async def test_tui_close_rejects_inflight_transcript_source(
 
 @pytest.mark.asyncio
 async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
     child.close()
@@ -11333,7 +11688,8 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     navigation.selected_index = 1
     navigation.open_selected()
     assert navigation.transcript_control._sync_task is not None
-    await navigation.transcript_control._sync_task
+    # test-contract: seam no public transcript-sync completion event exists
+    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
     source = navigation.transcript_control._source
     assert source is not None
     previous = navigation.transcript_control._snapshot
@@ -11357,6 +11713,38 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     monkeypatch.setattr(source, "refresh", blocked_refresh)
     # test-contract: seam no public transcript-source closed event exists
     monkeypatch.setattr(source, "close", close_and_signal)
+    transcript_handed_off = asyncio.Event()
+    todo_cleanup_release = asyncio.Event()
+    transcript_cleanup_tasks: set[asyncio.Task[None]] = set()
+    finish_transcript_cleanup = agent_lifetime.finish_cleanup_or_handoff
+    finish_todo_cleanup = agent_sync.finish_cleanup_or_handoff
+
+    async def record_transcript_cleanup(tasks, close, *, deadline, label) -> None:
+        before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+        try:
+            await finish_transcript_cleanup(
+                tasks, close, deadline=deadline, label=label
+            )
+            transcript_cleanup_tasks.update(
+                agent_shutdown._LATE_CLEANUP_TASKS - before
+            )
+        finally:
+            transcript_handed_off.set()
+
+    async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
+        await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
+        # Keep the empty todo cleanup pending until both owners have handed off.
+        blocker = asyncio.create_task(
+            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
+        )
+        await finish_todo_cleanup(
+            (blocker, *tasks), close, deadline=deadline, label=label
+        )
+
+    monkeypatch.setattr(
+        agent_lifetime, "finish_cleanup_or_handoff", record_transcript_cleanup
+    )
+    monkeypatch.setattr(agent_sync, "finish_cleanup_or_handoff", block_todo_cleanup)
     # test-contract: seam no public shutdown-budget injection exists
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
@@ -11368,9 +11756,17 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
         await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
         # test-contract: durability shutdown retains one late transcript cleanup
-        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
+        assert len(transcript_cleanup_tasks) == 1 and transcript_cleanup_tasks <= (
+            agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        )
     finally:
         agent_sync._REFRESH_LOCK.release()
+        todo_cleanup_release.set()
+        late_cleanup_tasks = agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
+        if late_cleanup_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*late_cleanup_tasks, return_exceptions=True), timeout=10
+            )
 
     assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
@@ -11381,12 +11777,15 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
 
 @pytest.mark.asyncio
 async def test_tui_close_hands_off_blocked_todo_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     child.close()
     app = TUIApp(
@@ -11445,7 +11844,8 @@ async def test_tui_close_hands_off_blocked_todo_source(
 
 @pytest.mark.asyncio
 async def test_tui_close_closes_todo_when_transcript_close_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     app = TUIApp(
@@ -11462,7 +11862,9 @@ async def test_tui_close_closes_todo_when_transcript_close_fails(
         nonlocal todo_closed
         todo_closed = True
 
-    monkeypatch.setattr(app._agent_navigation.transcript_control, "close", fail_transcript_close)
+    monkeypatch.setattr(
+        app._agent_navigation.transcript_control, "close", fail_transcript_close
+    )
     monkeypatch.setattr(app._agent_navigation._todo_control, "close", close_todo)
 
     with pytest.raises(RuntimeError, match="transcript close failed"):
@@ -11511,7 +11913,9 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
     child.close()
@@ -11538,11 +11942,15 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
 
 
 @pytest.mark.asyncio
-async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Path) -> None:
+async def test_recursive_agent_navigation_keys_drive_real_controls(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
+        json.dumps(
+            {"description": "Explore", "agent_type": "general", "state": "running"}
+        )
     )
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     grandchild.agent_lifecycle_path.write_text(
@@ -11551,13 +11959,23 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     child.append_message(
         Message(
             MessageRole.ASSISTANT,
-                [TextContent("child marker  \n" + "  \n".join(f"child line {i}" for i in range(100)))],
+            [
+                TextContent(
+                    "child marker  \n"
+                    + "  \n".join(f"child line {i}" for i in range(100))
+                )
+            ],
         )
     )
     grandchild.append_message(
         Message(
             MessageRole.ASSISTANT,
-                [TextContent("grandchild marker  \n" + "  \n".join(f"grandchild line {i}" for i in range(100)))],
+            [
+                TextContent(
+                    "grandchild marker  \n"
+                    + "  \n".join(f"grandchild line {i}" for i in range(100))
+                )
+            ],
         )
     )
     navigation = AgentNavigation(store)
@@ -11626,41 +12044,55 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 
         pipe.send_text("\r")
         await wait_until(
-            lambda: navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
+            lambda: (
+                navigation.current_path == child.session_dir
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
-            lambda: navigation.transcript_control._path == child.session_dir
-            and navigation.transcript_control._snapshot is not None
+            lambda: (
+                navigation.transcript_control._path == child.session_dir
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         assert session.layout.has_focus(navigation.transcript_window)
 
         pipe.send_text("g")
         await wait_until(
-            lambda: navigation.transcript_window.render_info is not None
-            and navigation.transcript_window.render_info.vertical_scroll == 0
+            lambda: (
+                navigation.transcript_window.render_info is not None
+                and navigation.transcript_window.render_info.vertical_scroll == 0
+            )
         )
         before_scroll = navigation.transcript_window.render_info.vertical_scroll
         pipe.send_text("j")
         await wait_until(
-            lambda: navigation.transcript_window.render_info is not None
-            and navigation.transcript_window.render_info.vertical_scroll > before_scroll
+            lambda: (
+                navigation.transcript_window.render_info is not None
+                and navigation.transcript_window.render_info.vertical_scroll
+                > before_scroll
+            )
         )
         assert navigation.transcript_window.render_info is not None
-        assert navigation.transcript_window.render_info.vertical_scroll == navigation.transcript_control.offset
+        assert (
+            navigation.transcript_window.render_info.vertical_scroll
+            == navigation.transcript_control.offset
+        )
 
         pipe.send_text("\x1b[B")
-        await wait_until(
-            navigation.list_focused
-        )
+        await wait_until(navigation.list_focused)
         pipe.send_text("\r")
         await wait_until(
-            lambda: navigation.current_path == grandchild.session_dir
-            and navigation.child_view_focused()
+            lambda: (
+                navigation.current_path == grandchild.session_dir
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
-            lambda: navigation.transcript_control._path == grandchild.session_dir
-            and navigation.transcript_control._snapshot is not None
+            lambda: (
+                navigation.transcript_control._path == grandchild.session_dir
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         assert navigation.list_visible
         assert navigation.entries[0].label == "main"
@@ -11670,12 +12102,16 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 
         pipe.send_text("h")
         await wait_until(
-            lambda: navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
+            lambda: (
+                navigation.current_path == child.session_dir
+                and navigation.child_view_focused()
+            )
         )
         await wait_until(
-            lambda: navigation.transcript_control._path == child.session_dir
-            and navigation.transcript_control._snapshot is not None
+            lambda: (
+                navigation.transcript_control._path == child.session_dir
+                and navigation.transcript_control._snapshot is not None
+            )
         )
         child_text = Text.from_ansi(
             navigation.transcript_control.transcript.render(120)
@@ -11693,8 +12129,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         await wait_until(navigation.list_focused)
         pipe.send_text("\r")
         await wait_until(
-            lambda: navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
+            lambda: (
+                navigation.current_path == child.session_dir
+                and navigation.child_view_focused()
+            )
         )
         pipe.send_text("\x1b")
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
@@ -11715,22 +12153,6 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -11784,12 +12206,6 @@ async def test_many_flushed_writers_leave_no_live_threads() -> None:
     assert not [thread for thread in threads if thread.is_alive()]
 
 
-
-
-
-
-
-
 def _patch_draft_publish(
     monkeypatch: pytest.MonkeyPatch, write: Callable[..., None]
 ) -> None:
@@ -11821,7 +12237,8 @@ def _patch_draft_publish(
 
 @pytest.mark.asyncio
 async def test_draft_write_runs_off_loop_and_flushes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     loop_thread = threading.get_ident()
@@ -11843,7 +12260,8 @@ async def test_draft_write_runs_off_loop_and_flushes(
 
 @pytest.mark.asyncio
 async def test_failed_draft_write_keeps_pending_text_for_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     persistence.schedule("old draft")
@@ -11877,7 +12295,8 @@ async def test_failed_draft_write_keeps_pending_text_for_retry(
 
 @pytest.mark.asyncio
 async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
     storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
@@ -11936,12 +12355,31 @@ async def test_failed_shutdown_retry_queued_before_worker_retires_still_commits(
 
 @pytest.mark.asyncio
 async def test_later_successful_snapshot_clears_earlier_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
     first_finished = threading.Event()
     writes = 0
     original_write = persistence_module.write_json_file
+    original_mark_persisted = persistence._mark_persisted
+    mark_started = asyncio.Event()
+    release_mark = asyncio.Event()
+    mark_finished = asyncio.Event()
+    mark_task: asyncio.Task[None] | None = None
+
+    async def finish_mark(revision: int) -> None:
+        await asyncio.wait_for(release_mark.wait(), 10)
+        original_mark_persisted(revision)
+        mark_finished.set()
+
+    def gated_mark_persisted(revision: int) -> None:
+        nonlocal mark_task
+        mark_started.set()
+        mark_task = asyncio.create_task(finish_mark(revision))
+
+    # test-contract: seam no public event reports that pending draft state was cleared
+    monkeypatch.setattr(persistence, "_mark_persisted", gated_mark_persisted)
 
     def write(*args: object, **kwargs: object) -> None:
         nonlocal writes
@@ -11954,23 +12392,34 @@ async def test_later_successful_snapshot_clears_earlier_failure(
             first_finished.set()
 
     monkeypatch.setattr(persistence_module, "write_json_file", write)
-    persistence.schedule("first")
-    assert await asyncio.to_thread(first_finished.wait, 1)
-    persistence.schedule("second")
-    error: OSError | None = None
     try:
-        await persistence.flush_pending()
-    except OSError as exc:
-        error = exc
+        persistence.schedule("first")
+        assert await asyncio.to_thread(first_finished.wait, 10)
+        persistence.schedule("second")
+        error: OSError | None = None
+        try:
+            await persistence.flush_pending()
+        except OSError as exc:
+            error = exc
 
-    assert error is None, "a successful newer snapshot retained the earlier write failure"
-    assert persistence.load() == "second"
-    assert persistence._pending_text is None
+        assert error is None, (
+            "a successful newer snapshot retained the earlier write failure"
+        )
+        await asyncio.wait_for(mark_started.wait(), 10)
+        assert persistence.load() == "second"
+        release_mark.set()
+        await asyncio.wait_for(mark_finished.wait(), 10)
+        assert persistence.pending_text is None
+    finally:
+        release_mark.set()
+        if mark_task is not None:
+            await asyncio.wait_for(mark_task, 10)
 
 
 @pytest.mark.asyncio
 async def test_runtime_close_draft_writer_owns_its_directory_fd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
@@ -12019,7 +12468,9 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
 
 @pytest.mark.asyncio
 async def test_dup_failure_is_reported_not_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     directory_fd = os.open(tmp_path, os.O_RDONLY)
     storage_lease = await asyncio.to_thread(open_writer, tmp_path.parent)
@@ -12056,14 +12507,19 @@ async def test_dup_failure_is_reported_not_success(
         storage_lease.close()
 
     assert exceptions == []
-    assert caplog.messages.count(
-        "failed to persist composer draft: [Errno 24] Too many open files"
-    ) == 1
+    assert (
+        caplog.messages.count(
+            "failed to persist composer draft: [Errno 24] Too many open files"
+        )
+        == 1
+    )
     assert DraftPersistence(tmp_path / "draft").load() == "first"
 
 
 def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     app = TUIApp(
         AgentLoop(
@@ -12089,9 +12545,13 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
         return False, False
 
     _patch_draft_publish(monkeypatch, fail_write)
+    # test-contract: seam Run the CLI against the controlled application.
     monkeypatch.setattr(cli_main_module, "create_app", lambda _args: app)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
-    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
+    )
 
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
@@ -12149,8 +12609,11 @@ def test_new_session_continues_after_failed_draft_save(
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
-    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
+    )
 
     assert cli_main_module.main([]) == 0
     stderr = capsys.readouterr().err
@@ -12236,9 +12699,13 @@ def test_failed_active_draft_is_printed_on_every_exit(
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
-    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
+    )
 
     if exit_kind == "keyboard_interrupt":
         with pytest.raises(KeyboardInterrupt):
@@ -12316,9 +12783,13 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    # test-contract: seam Observe the CLI restart boundary without replacing the process.
     monkeypatch.setattr(cli_main_module, "_exec_restart", exec_restart)
-    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
+    )
 
     if exit_kind == "unexpected_error":
         with pytest.raises(RuntimeError, match="unexpected failure"):
@@ -12333,7 +12804,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
 
 
 def test_new_session_with_successful_draft_prints_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     names = iter(("old", "new"))
     runs = 0
@@ -12359,9 +12832,13 @@ def test_new_session_with_successful_draft_prints_nothing(
         await app.close()
         return False, False
 
+    # test-contract: seam Run the CLI against controlled session applications.
     monkeypatch.setattr(cli_main_module, "create_app", create)
+    # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
-    monkeypatch.setattr(cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
+    )
 
     assert cli_main_module.main([]) == 0
     assert runs == 2
@@ -12370,7 +12847,8 @@ def test_new_session_with_successful_draft_prints_nothing(
 
 @pytest.mark.asyncio
 async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
     zeta_home = tmp_path / "zeta-home"
@@ -12421,7 +12899,8 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
 
 @pytest.mark.asyncio
 async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
     terminal_calls: list[str] = []
@@ -12497,7 +12976,8 @@ def test_tui_diagnostic_record_is_not_visible_before_write(
 
 
 def test_tui_diagnostic_write_ignores_fd_exhaustion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_open(*_args: object, **_kwargs: object) -> int:
         raise OSError(errno.EMFILE, "Too many open files")
@@ -12574,7 +13054,8 @@ async def test_draft_failure_notice_runs_on_loop_thread_after_late_capture(
 
 @pytest.mark.asyncio
 async def test_failed_final_draft_flush_is_visible_during_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, _session = _agent_list_session(tmp_path, 0)
 
@@ -12595,7 +13076,9 @@ async def test_failed_final_draft_flush_is_visible_during_exit(
 
 @pytest.mark.asyncio
 async def test_draft_write_failure_is_reported_once_without_raising(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0)
 
@@ -12610,21 +13093,16 @@ async def test_draft_write_failure_is_reported_once_without_raising(
     with pytest.raises(OSError, match="disk unavailable"):
         await persistence.flush_pending()
 
-    assert caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
+    assert (
+        caplog.messages.count("failed to persist composer draft: disk unavailable") == 1
+    )
     assert persistence._pending_text == "second"
-
-
-
-
-
-
 
 
 @pytest.mark.asyncio
 async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
     persistence.schedule("line one\nline two")
-    await asyncio.sleep(0.02)
     await persistence.flush_pending()
     assert persistence.load() == "line one\nline two"
 
@@ -12650,8 +13128,6 @@ def test_draft_persistence_restores_attachment_metadata(tmp_path: Path) -> None:
     assert state.next_image_token == 2
 
 
-
-
 @pytest.mark.asyncio
 async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -12660,13 +13136,15 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     secret.write_text("must not be sent", encoding="utf-8")
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([ScriptedTurn([TextContent("done")])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
-    app._slash_commands.set_mcp_prompts(
-        [("fake:review", "fake", MCPPrompt("review"))]
-    )
+    app._slash_commands.set_mcp_prompts([("fake:review", "fake", MCPPrompt("review"))])
 
     async def resolve(_name: str, _arguments: dict[str, str]) -> str:
         return f"@./{secret.name} $ARGUMENTS !`echo unsafe`"
@@ -12742,12 +13220,14 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
     await app.loop.close()
 
 
-
-
 @pytest.mark.asyncio
 async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -12769,7 +13249,11 @@ async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
@@ -12872,9 +13356,7 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     await app._active_task
 
     user_messages = [
-        message
-        for message in store.messages()
-        if message.role is MessageRole.USER
+        message for message in store.messages() if message.role is MessageRole.USER
     ]
     assert isinstance(user_messages[-1].content[1], ImageContent)
     assert user_messages[-1].content[1].data == base64.b64encode(PNG).decode()
@@ -12900,9 +13382,7 @@ async def test_undo_restores_next_image_token_after_deleted_token(
         console=Console(file=StringIO(), force_terminal=False),
     )
     app._pending_attachments[:] = [first, second]
-    app._pending_attachment_tokens.update(
-        {"[Image #1]": first, "[Image #2]": second}
-    )
+    app._pending_attachment_tokens.update({"[Image #1]": first, "[Image #2]": second})
     app._next_image_token = 3
 
     await app._handle_prompt_value("inspect [Image #2]")
@@ -12910,15 +13390,15 @@ async def test_undo_restores_next_image_token_after_deleted_token(
     app.undo_sent_turn()
     await asyncio.gather(app._active_task, return_exceptions=True)
 
-    monkeypatch.setattr("zeta.tui.paste_runtime.paste_image", lambda _, **kwargs: pasted)
+    monkeypatch.setattr(
+        "zeta.tui.paste_runtime.paste_image", lambda _, **kwargs: pasted
+    )
     assert await app.slash_paste("") == "[Image #3]"
     assert app._pending_attachment_tokens == {
         "[Image #2]": second,
         "[Image #3]": pasted,
     }
     await app.loop.close()
-
-
 
 
 @pytest.mark.asyncio
@@ -12988,7 +13468,6 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     await app.loop.close()
 
 
-
 @pytest.mark.asyncio
 async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
@@ -13032,7 +13511,11 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
+        )
+    )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("working")]))
     store.append_agent_notification(
         "child-1",
@@ -13123,9 +13606,7 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
     loop.backend = backend
     loop.context_assembler.update_backend(backend)
 
-    context = SessionAccountContext.load(
-        manager.home, manager, opened.metadata
-    )
+    context = SessionAccountContext.load(manager.home, manager, opened.metadata)
     loop.account_context = context
 
     async def persist_model_and_effective_budget(selected: str):
@@ -13166,14 +13647,18 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
             return httpx.Response(
                 200,
                 content=(
-                    json.dumps({"message": {"content": "ok"}, "done": True})
-                    + "\n"
+                    json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
                 ).encode(),
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            backend.client = client
-            [event async for event in backend.complete([], [])]
+            probe = OllamaBackend(
+                model=backend.model,
+                base_url=backend.base_url,
+                client=client,
+                token_budget=expected_budget,
+            )
+            [event async for event in probe.complete([], [])]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget
@@ -13207,9 +13692,7 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
     context = SessionAccountContext.load(
         manager.home, manager, opened.metadata, validate=False
     )
-    loop = AgentLoop(
-        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
-    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
     calls = 0
     transition = SessionAccountContext.switch_model
@@ -13265,9 +13748,7 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
     context = SessionAccountContext.load(
         manager.home, manager, opened.metadata, validate=False
     )
-    loop = AgentLoop(
-        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()
-    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
 
     async def switch_model(selected: str):
@@ -13719,9 +14200,13 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         "last_attempt_at": "2020-01-01T00:00:00Z",
         "last_error": "rate limited; retry later",
     }
-    store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
+    await asyncio.to_thread(
+        store._write_usage_bytes, account, (json.dumps(usage) + "\n").encode()
+    )
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="offline", cwd=tmp_path
+    )
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -13732,7 +14217,9 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
     rendered: list[Panel] = []
     app._presenter.print_unit = rendered.append
-    app._transcript.replace = lambda unit, replacement: rendered.append(replacement) or replacement
+    app._transcript.replace = lambda unit, replacement: (
+        rendered.append(replacement) or replacement
+    )
 
     refreshed = False
 
@@ -13787,8 +14274,8 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     rendered: list[Panel] = []
     refresh_rendered = asyncio.Event()
     app._presenter.print_unit = lambda panel: rendered.append(panel) or panel
-    app._transcript.replace = (
-        lambda unit, replacement: rendered.append(replacement) or replacement
+    app._transcript.replace = lambda unit, replacement: (
+        rendered.append(replacement) or replacement
     )
     repaint = app._repaint_accounts_picker
 
@@ -13839,7 +14326,9 @@ async def test_accounts_refresh_does_not_block_event_loop(
         OAuthTokens("access", "refresh", 9_999_999_999),
     )
     manager = SessionManager(home)
-    opened = await asyncio.to_thread(manager.create, provider="claude", model="offline", cwd=tmp_path)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="offline", cwd=tmp_path
+    )
     context = await asyncio.to_thread(
         SessionAccountContext.load, home, manager, opened.metadata
     )
@@ -13911,7 +14400,10 @@ async def test_tui_accounts_named_login_uses_supplied_label(
 
     monkeypatch.setattr(slash_handlers_module, "login_named_account", login)
     try:
-        assert await app.slash_accounts("login codex personal") == "logged in as codex:personal"
+        assert (
+            await app.slash_accounts("login codex personal")
+            == "logged in as codex:personal"
+        )
         assert logins == [("codex", "personal")]
     finally:
         await app.close()
@@ -14062,8 +14554,12 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
     rendered: list[Panel] = []
-    app._presenter.print_unit = lambda renderable: rendered.append(renderable) or renderable
-    app._transcript.replace = lambda _unit, replacement: rendered.append(replacement) or replacement
+    app._presenter.print_unit = lambda renderable: (
+        rendered.append(renderable) or renderable
+    )
+    app._transcript.replace = lambda _unit, replacement: (
+        rendered.append(replacement) or replacement
+    )
     logout = AccountStore.logout
     off_loop_calls = 0
 
@@ -14081,9 +14577,10 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
         Console(file=confirmation, force_terminal=False, width=160).print(rendered[-1])
-        assert "press x again to log out codex:removed" in Text.from_ansi(
-            confirmation.getvalue()
-        ).plain
+        assert (
+            "press x again to log out codex:removed"
+            in Text.from_ansi(confirmation.getvalue()).plain
+        )
 
         task = app.accounts_picker_logout()
         assert task is not None
@@ -14114,7 +14611,9 @@ def test_accounts_picker_rename_and_email_render(tmp_path: Path) -> None:
     assert "n rename" in plain
 
 
-def _limit_tui(tmp_path: Path) -> tuple[TUIApp, SessionAccountContext, ConversationStore]:
+def _limit_tui(
+    tmp_path: Path,
+) -> tuple[TUIApp, SessionAccountContext, ConversationStore]:
     home = tmp_path / "home"
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
@@ -14341,7 +14840,14 @@ async def test_history_finder_does_not_cross_session_boundaries(
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
-    candidates = await second._history_finder.build_finder_candidates(request)
+    batches = [
+        batch
+        async for batch, complete in second._history_finder.build_finder_candidate_batches(
+            request
+        )
+        if complete
+    ]
 
-    assert [candidate.text for candidate in candidates.candidates] == []
+    assert len(batches) == 1
+    assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()

@@ -18,7 +18,7 @@ from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .entry_project_views import EntryProjectViews
-from .protocol import FrameCodec
+from .protocol import ErrorDescriptor, FrameCodec
 
 if TYPE_CHECKING:
     from .runtime import ServerRuntime
@@ -169,9 +169,7 @@ class ProjectRequests:
         ]
         return self._page(request_id, "projects", projects, offset, limit)
 
-    def _show(
-        self, request_id: str | int, project: Project
-    ) -> dict[str, object]:
+    def _show(self, request_id: str | int, project: Project) -> dict[str, object]:
         sessions = self.runtime.manager.list_sessions_read_only()
         state = self.registry.memory_state(project.project_id)
         automatic = set(state.automatic_files)
@@ -217,7 +215,9 @@ class ProjectRequests:
             if not isinstance(name, str) or name not in PROJECT_MEMORY_FILES:
                 raise RequestValidationError("file must name a project memory file")
             if "offset" in params or "limit" in params:
-                raise RequestValidationError("offset and limit cannot be used with version_id")
+                raise RequestValidationError(
+                    "offset and limit cannot be used with version_id"
+                )
             retained = self.registry.memory_log(project.project_id, limit=10_000)
             if version not in {item.get("version") for item in retained}:
                 raise RequestValidationError(f"memory version not found: {version}")
@@ -248,7 +248,9 @@ class ProjectRequests:
                 value = str(detail[field])
                 size = len(value.encode())
                 if size == 0:
-                    raise RuntimeError("memory version metadata exceeds the frame limit")
+                    raise RuntimeError(
+                        "memory version metadata exceeds the frame limit"
+                    )
                 detail[field], _ = _truncate_utf8(value, size // 2)
                 detail[f"{field}_truncated"] = True
             return result
@@ -256,7 +258,10 @@ class ProjectRequests:
         limit = self._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
-        records = [self._record(item) for item in self.registry.memory_log(project.project_id, limit=10_000)]
+        records = [
+            self._record(item)
+            for item in self.registry.memory_log(project.project_id, limit=10_000)
+        ]
         return self._page(request_id, "versions", records, offset, limit)
 
     def _inbox(
@@ -274,9 +279,7 @@ class ProjectRequests:
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
         state = self.inbox.read(project.project_id)
-        messages = [
-            self._bounded_message(request_id, item) for item in state[status]
-        ]
+        messages = [self._bounded_message(request_id, item) for item in state[status]]
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
@@ -377,9 +380,8 @@ class ProjectRequests:
         offset: int,
         limit: int,
         *,
-        extra_for_page: Callable[
-            [list[dict[str, object]]], dict[str, object]
-        ] | None = None,
+        extra_for_page: Callable[[list[dict[str, object]]], dict[str, object]]
+        | None = None,
     ) -> dict[str, object]:
         def metadata(items: list[dict[str, object]]) -> dict[str, object]:
             return extra_for_page(items) if extra_for_page is not None else {}
@@ -448,9 +450,7 @@ class ProjectRequests:
         project: Project, sessions: list[Any], *, include_dates: bool = False
     ) -> dict[str, object]:
         linked = [item for item in sessions if item.project_id == project.project_id]
-        last_activity = max(
-            [project.updated_at, *(item.updated_at for item in linked)]
-        )
+        last_activity = max([project.updated_at, *(item.updated_at for item in linked)])
         result: dict[str, object] = {
             "id": project.project_id,
             "name": project.name,
@@ -494,8 +494,10 @@ class ProjectRequests:
         maximum: int | None = None,
     ) -> int:
         value = params.get(name, default)
-        if type(value) is not int or value < minimum or (
-            maximum is not None and value > maximum
+        if (
+            type(value) is not int
+            or value < minimum
+            or (maximum is not None and value > maximum)
         ):
             raise RequestValidationError(f"{name} is out of range")
         return value
@@ -583,21 +585,29 @@ def _message_strings(
 
 def project_request_error(
     error: Exception,
-) -> tuple[int, str, dict[str, str] | None]:
+) -> tuple[ErrorDescriptor, str, dict[str, object] | None]:
     """Map project request and storage errors to safe protocol fields."""
     if isinstance(error, ProjectNotFound):
         return (
-            -32602,
+            ErrorDescriptor.PROJECT_NOT_FOUND,
             str(error),
-            {"code": "project_not_found", "project_id": error.project_id},
+            {"project_id": error.project_id},
         )
     if isinstance(error, RequestValidationError):
-        return -32602, str(error), None
+        return ErrorDescriptor.INVALID_PARAMS, str(error), None
     if isinstance(error, ProjectRegistryBusyError):
-        return -32000, str(error), {"code": error.code, "retryable": error.retryable}
+        return (
+            ErrorDescriptor.PROJECT_REGISTRY_BUSY,
+            str(error),
+            {"retryable": error.retryable},
+        )
     if isinstance(error, UnsupportedMemoryFormatError):
-        return -32000, str(error), None
-    return -32000, "project storage is invalid or unavailable", None
+        return ErrorDescriptor.INTERNAL_ERROR, str(error), None
+    return (
+        ErrorDescriptor.INTERNAL_ERROR,
+        "project storage is invalid or unavailable",
+        None,
+    )
 
 
 def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
