@@ -8862,29 +8862,37 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
     )
     reader, writer = await _connect(server)
 
-    async def raw_status_frames() -> bytes:
+    async def raw_request_frames(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> bytes:
         request = json.dumps(
-            {"jsonrpc": "2.0", "id": 3, "method": "status", "params": {}}
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
         ).encode() + b"\n"
         writer.write(request)
         await asyncio.wait_for(writer.drain(), 10)
         frames: list[bytes] = []
         while True:
             frame = await asyncio.wait_for(reader.readline(), 10)
-            assert frame, "server closed before the status response"
+            assert frame, f"server closed before the {method} response"
             frames.append(frame)
-            if json.loads(frame).get("id") == 3:
+            if json.loads(frame).get("id") == request_id:
                 return b"".join(frames)
 
     try:
-        await _request(
-            reader,
-            writer,
-            1,
-            "hello",
-            {"protocol_version": "1.1", "features": []},
+        await asyncio.wait_for(
+            raw_request_frames(
+                1, "hello", {"protocol_version": "1.1", "features": []}
+            ),
+            30,
         )
-        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await asyncio.wait_for(
+            raw_request_frames(2, "new_session", {"provider": "codex"}), 30
+        )
         assert server.runtime.loop is not None
         profile = tmp_path / "agents" / "specialist.md"
         profile.parent.mkdir(parents=True)
@@ -8898,11 +8906,15 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
         await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
         assert len(prepared_events) == 1
 
-        base_frames = await asyncio.wait_for(raw_status_frames(), 30)
+        base_frames = await asyncio.wait_for(
+            raw_request_frames(3, "status", {}), 30
+        )
         await asyncio.wait_for(
             server.control._event(prepared_events[0], background=True), 10
         )
-        actual_frames = await asyncio.wait_for(raw_status_frames(), 30)
+        actual_frames = await asyncio.wait_for(
+            raw_request_frames(3, "status", {}), 30
+        )
 
         assert actual_frames == base_frames
     finally:
