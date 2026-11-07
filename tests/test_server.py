@@ -1839,6 +1839,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
 @pytest.mark.asyncio
 async def test_child_cancel_while_approval_pending_emits_one_matching_approval_end(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
@@ -1854,7 +1855,41 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
+    parent_tool_end_release = asyncio.Event()
+    parent_tool_end_sent = asyncio.Event()
+    approval_end_release = asyncio.Event()
+    notify = server.control._notify
+
+    async def wait_for_gate(gate: asyncio.Event, name: str) -> None:
+        try:
+            await asyncio.wait_for(gate.wait(), 10)
+        except TimeoutError:
+            pytest.fail(f"{name} was not released within 10 s")
+
+    async def force_parent_tool_end_before_approval_end(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        tool_call = fields.get("tool_call")
+        is_parent_tool_end = (
+            event == "tool_end"
+            and isinstance(tool_call, dict)
+            and tool_call.get("id") == "agent-one"
+        )
+        if is_parent_tool_end:
+            await wait_for_gate(parent_tool_end_release, "parent tool_end release gate")
+        elif event == "approval_end":
+            await wait_for_gate(approval_end_release, "approval_end release gate")
+        published = await notify(event, session_id, **fields)
+        if is_parent_tool_end:
+            parent_tool_end_sent.set()
+        return published
+
+    # test-contract: seam no public hook controls notification publication order
+    monkeypatch.setattr(
+        server.control, "_notify", force_parent_tool_end_before_approval_end
+    )
     reader, writer = await _ready(server)
+    background_wait: asyncio.Task[None] | None = None
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
@@ -1863,14 +1898,60 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         assert server.runtime.loop._background_owner.cancel(
             approval["agent_instance_id"]
         )
-        await server.runtime.loop._background_owner.wait()
+        # test-contract: seam no public completion hook exists for child cancellation
+        background_wait = asyncio.create_task(
+            server.runtime.loop._background_owner.wait()
+        )
         frames = await _request(reader, writer, 4, "status")
-        frames += await _frames_until_event(reader, "tool_end")
+        parent_tool_end_release.set()
+        await wait_for_gate(parent_tool_end_sent, "parent tool_end publication gate")
+        approval_end_release.set()
+        try:
+            async with asyncio.timeout(10):
+                while not _named_events(frames, "approval_end"):
+                    frames.append(await _read(reader))
+                while True:
+                    frame = await _read(reader)
+                    frames.append(frame)
+                    params = frame.get("params", {})
+                    event = params.get("event")
+                    tool_call = params.get("tool_call")
+                    if (
+                        event == "tool_end"
+                        and isinstance(tool_call, dict)
+                        and tool_call.get("id") == "child-call"
+                    ) or event in {"turn_end", "turn_aborted", "agent_end"}:
+                        break
+        except TimeoutError:
+            pytest.fail(
+                f"no approval_end for {approval['request_id']} within 10 s after child cancel"
+            )
         ends = _named_events(frames, "approval_end")
+        # test-contract: seam exact lifecycle cardinality is the protocol contract
         assert len(ends) == 1
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
-        await _close(server, writer)
+        test_error = sys.exception()
+        parent_tool_end_release.set()
+        approval_end_release.set()
+        try:
+            if background_wait is not None:
+                try:
+                    await asyncio.wait_for(background_wait, 10)
+                except TimeoutError:
+                    pytest.fail("background owner task did not finish within 10 s")
+        except BaseException as cleanup_error:
+            if test_error is None:
+                raise
+            test_error.add_note(f"background owner cleanup failed: {cleanup_error!r}")
+        finally:
+            cleanup_error = sys.exception()
+            try:
+                await _close(server, writer)
+            except BaseException as close_error:
+                if cleanup_error is None:
+                    raise
+                cleanup_error.add_note(f"server cleanup failed: {close_error!r}")
 
 
 @pytest.mark.asyncio
