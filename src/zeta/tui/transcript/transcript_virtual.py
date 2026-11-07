@@ -751,25 +751,6 @@ class TranscriptVirtualMixin:
                 lines.pop(0)
         return lines[-height:] or [[]]
 
-    def _keyed_locations(self) -> list[tuple[int | None, int]]:
-        """Return paint-local locations, or the cached eager location map."""
-
-        if self._uses_virtual_history():
-            return [
-                (unit.key if unit is not None else None, offset)
-                for unit, offset in self._virtual_locations
-            ]
-        width = self._content_width
-        cached = self._keyed_cache
-        if cached is not None and cached[0] == width and cached[1] == self._revision:
-            return cached[2]
-        keyed = [
-            (unit.key if unit is not None else None, offset)
-            for unit, offset in self._locations(width)
-        ]
-        self._keyed_cache = (width, self._revision, keyed)
-        return keyed
-
     @staticmethod
     def _plain_lines(rendered: str) -> list[str]:
         if "\x1b" in rendered:

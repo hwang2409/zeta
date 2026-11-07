@@ -169,7 +169,6 @@ def test_removed_and_cleared_units_leave_the_per_unit_caches() -> None:
 
     assert not transcript._unit_lines_cache
     assert not transcript._unit_locations_cache
-    assert transcript._keyed_cache is None
 
 
 def test_search_highlight_path_still_paints_matches() -> None:
