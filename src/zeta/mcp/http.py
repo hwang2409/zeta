@@ -239,7 +239,7 @@ class StreamableHTTPMCPClient(MCPClient):
         if response is not None:
             try:
                 await asyncio.wait_for(response.aclose(), HTTP_TIMEOUT_SECONDS)
-            except Exception:  # noqa: BLE001 - cleanup failure must not lose ownership
+            except Exception:
                 logger.warning(
                     "failed to close an MCP HTTP deadline response", exc_info=True
                 )
