@@ -3801,12 +3801,13 @@ async def test_session_swap_rejects_pending_notification_handoff(
         {"prompt": "wait", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend(
+    backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[parent_call]),
-            ScriptedTurn(tool_calls=[child_call]),
             ScriptedTurn([TextContent("parent done")]),
-        ]
+        ],
+        {"wait": [ScriptedTurn(tool_calls=[child_call])]},
+        parent_prompt="start",
     )
     server = ZetaServer(
         provider="codex",
