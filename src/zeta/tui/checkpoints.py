@@ -268,8 +268,7 @@ class CheckpointTranscriptMixin:
             for index, entry, preview in forkpoints:
                 snap_note = _snapshot_note(snapshots.by_checkpoint(entry.id))
                 lines.append(
-                    f"{index} · seq {entry.seq} · {snap_note} · "
-                    f"{preview or '(empty)'}"
+                    f"{index} · seq {entry.seq} · {snap_note} · {preview or '(empty)'}"
                 )
         if checkpoints:
             lines.append("explicit checkpoint labels:")
@@ -290,16 +289,13 @@ class CheckpointTranscriptMixin:
         forkpoints = self.loop.store.list_user_message_forkpoints()
         if index < 1 or index > len(forkpoints):
             return (
-                "fork failed: user message index out of range "
-                f"(1..{len(forkpoints)})"
+                f"fork failed: user message index out of range (1..{len(forkpoints)})"
             )
         _, source, _ = forkpoints[index - 1]
         snapshots = self._snapshots()
         target_snapshot = snapshots.by_checkpoint(source.id)
         if target_snapshot is not None:
-            dirty_warning = _dirty_guard(
-                snapshots, self.loop.store.bash_cwd, forced
-            )
+            dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
             if dirty_warning is not None:
                 return dirty_warning
         try:
@@ -388,9 +384,7 @@ class CheckpointTranscriptMixin:
         snapshots = self._snapshots()
         if snapshots.is_corrupt and not forced:
             return snapshots.corruption_message
-        target = (
-            snapshots.undo_target() if verb == "undo" else snapshots.redo_target()
-        )
+        target = snapshots.undo_target() if verb == "undo" else snapshots.redo_target()
         if target is None:
             if snapshots.is_corrupt:
                 return snapshots.corruption_message
@@ -453,18 +447,13 @@ class CheckpointTranscriptMixin:
         )
         return True
 
-
     def _defer_startup_runtime_event(self, event: StreamEvent) -> bool:
         if not self._startup_replay_active:
             return False
-        if (
-            event.data.get("agent_instance_id") is not None
-            and event.type
-            not in {
-                StreamEventType.TOOL_APPROVAL_START,
-                StreamEventType.TOOL_APPROVAL_END,
-            }
-        ):
+        if event.data.get("agent_instance_id") is not None and event.type not in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+        }:
             return True
         if event.type not in {
             StreamEventType.TOOL_APPROVAL_START,
@@ -695,6 +684,14 @@ class CheckpointTranscriptMixin:
                 continue
             if entry.type != "message":
                 if (
+                    entry.type == "warning"
+                    and entry.data.get("kind") == "transcript_recovery"
+                ):
+                    self._print_system(
+                        "transcript recovered; preserved corrupt bytes in quarantine "
+                        f"{entry.data['quarantine_id']}"
+                    )
+                elif (
                     entry.type == "notification"
                     and entry.id not in acknowledged_notifications
                     and entry.id not in presented_notifications
@@ -857,9 +854,7 @@ def _fork_banner(entry: object) -> str:
     return f"forked to checkpoint '{label}' at seq {from_seq}"
 
 
-def _format_checkpoint_result(
-    seq: int, label: str, snapshot: WorkspaceSnapshot
-) -> str:
+def _format_checkpoint_result(seq: int, label: str, snapshot: WorkspaceSnapshot) -> str:
     if snapshot.mode != SNAPSHOT_MODE_GIT:
         return (
             f"checkpoint '{label}' at seq {seq} "

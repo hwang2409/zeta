@@ -261,6 +261,19 @@ class ServerSlashSession:
                 runtime.loop._set_runtime_project(runtime.metadata)
         return view.text
 
+    async def slash_repair_transcript(self, args: str) -> str:
+        parts = args.split()
+        if len(parts) != 2 or parts[1] != "confirm":
+            return "usage: /repair-transcript <session-id> confirm"
+        result = await asyncio.to_thread(
+            self._runtime.manager.repair_transcript, parts[0]
+        )
+        return (
+            f"repaired transcript {parts[0]}; quarantine "
+            f"{result.quarantine_id}; retained through sequence "
+            f"{result.retained_last_sequence}"
+        )
+
     async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
@@ -453,9 +466,7 @@ async def run_command(
     raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
 
 
-async def _run_mcp_command(
-    runtime: ServerRuntime, tail: str
-) -> dict[str, object]:
+async def _run_mcp_command(runtime: ServerRuntime, tail: str) -> dict[str, object]:
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
     if verb not in {

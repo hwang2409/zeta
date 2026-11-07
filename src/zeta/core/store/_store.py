@@ -53,6 +53,7 @@ from ..session_files import (
     session_root,
 )
 from ..todo import TodoItem, parse_todo_items
+from ..transcript_recovery import RepairResult
 from ._approval_display import (
     ApprovalAuditRequest,
     normalize_approval_requests,
@@ -127,6 +128,7 @@ class ConversationStore(
         _execution_lease: session_execution.SessionExecutionLease | None = None,
         _owner_surface: session_execution.OwnerSurface = "tui",
         _recovery_owner: bool = False,
+        _repair_explicit: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -157,6 +159,8 @@ class ConversationStore(
             self.session_dir = self.root_dir / self.session_id
             self._read_only = _read_only
             self._must_exist = _must_exist
+            self._repair_explicit = _repair_explicit
+            self._last_repair_result: RepairResult | None = None
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
@@ -235,6 +239,10 @@ class ConversationStore(
                     self._storage_lease,
                 )
             storage_ownership.pop_all()
+
+    @property
+    def last_repair_result(self) -> RepairResult | None:
+        return self._last_repair_result
 
     def bind_owner_thread(self) -> None:
         self._owner_thread_id = threading.get_ident()

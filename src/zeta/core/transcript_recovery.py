@@ -514,6 +514,22 @@ def reconcile_pending(
     return tuple(resolved)
 
 
+def validate_recovery_records(directory_fd: int, target: RepairTarget) -> None:
+    """Strictly validate evidence and pending state without changing it."""
+    _manifests, records = _read_all_records(directory_fd, target)
+    pending = tuple(record for record in records.values() if record.state == "pending")
+    if not pending:
+        return
+    active_digest = _hash_named_file(directory_fd, "conversation.jsonl")
+    if any(
+        active_digest not in {record.expected_source_digest, record.repaired_digest}
+        for record in pending
+    ):
+        raise TranscriptRecoveryIntegrityError(
+            "active transcript does not match pending recovery"
+        )
+
+
 def recovery_status(directory_fd: int, target: RepairTarget) -> RecoveryStatus:
     manifests, records = _read_all_records(directory_fd, target)
     latest = max(

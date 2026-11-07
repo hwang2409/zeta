@@ -8043,9 +8043,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
             for _ in range(1_000)
         )
-        store.append_compaction_marker(
-            "summary", sources[0].seq, sources[-1].seq
-        )
+        store.append_compaction_marker("summary", sources[0].seq, sources[-1].seq)
         original_counter = server.runtime.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
@@ -8075,7 +8073,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                         probe_frames.append(json.loads(stream.readline()))
                         probe_ready.set()
                         if not entered.wait(10):
-                            raise AssertionError("status transcript worker did not start")
+                            raise AssertionError(
+                                "status transcript worker did not start"
+                            )
                         stream.write(
                             b'{"jsonrpc":"2.0","id":"live","method":"status",'
                             b'"params":{}}\n'
@@ -8153,9 +8153,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             or frame.get("params", {}).get("event") is not None
             for frame in frames
         )
-        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
-            -1
-        ]["id"] == "after"
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[-1][
+            "id"
+        ] == "after"
     finally:
         release.set()
         if request_task is not None and not request_task.done():
@@ -9682,12 +9682,67 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
                 "row": 2,
                 "repairable": True,
                 "session_id": session_id,
-                "actions": [],
+                "actions": [
+                    {
+                        "method": "repair_transcript",
+                        "session_id": session_id,
+                        "requires_confirmation": True,
+                    }
+                ],
             },
         }
         assert "must-not-leak" not in json.dumps(response)
         assert str(path) not in json.dumps(response)
         assert path.read_bytes() == damaged
+
+        refusal = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": False},
+            )
+        )[-1]
+        assert refusal["error"]["message"] == "repair_transcript requires confirm=true"
+        repaired = (
+            await _request(
+                reader,
+                writer,
+                6,
+                "repair_transcript",
+                {"session_id": session_id, "confirm": True},
+            )
+        )[-1]["result"]
+        quarantine_id = repaired["quarantine_id"]
+        assert repaired == {
+            "session_id": session_id,
+            "quarantine_id": quarantine_id,
+            "retained_last_sequence": 0,
+            "memory_review_required": True,
+        }
+        assert (
+            path.with_name(
+                f"conversation.quarantine.{quarantine_id}.jsonl"
+            ).read_bytes()
+            == damaged
+        )
+        resumed = (
+            await _request(reader, writer, 7, "resume", {"session_id": session_id})
+        )[-1]
+        assert resumed["result"]["session"]["session_id"] == session_id
+        history = (
+            await _request(
+                reader,
+                writer,
+                8,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        recovery = history[-1]["transcript_recovery"]
+        assert recovery["quarantine_id"] == quarantine_id
+        assert recovery["session_id"] == session_id
     finally:
         await _close(server, writer)
 

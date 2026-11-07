@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 3
+WRITER_EPOCH: Final = 4
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -74,6 +74,9 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1}),
+    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
+    "warning.transcript_recovery.kind": frozenset({"transcript_recovery"}),
 }
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"

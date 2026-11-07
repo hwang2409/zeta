@@ -25,6 +25,7 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore, TranscriptLoadError
+from .transcript_recovery import RepairResult
 from .session_execution import (
     OwnerHint,
     OwnerSurface,
@@ -361,6 +362,32 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             store.close()
             raise
         return OpenedSession(metadata, store)
+
+    def repair_transcript(self, session_id: str) -> RepairResult:
+        """Repair one diagnosed root transcript while holding its execution owner."""
+        metadata = self.read_metadata(session_id)
+        store = ConversationStore(
+            self.sessions_dir,
+            session_id=session_id,
+            _must_exist=True,
+            _storage_lease=self._storage_lease,
+            _owner_surface="recovery",
+            _recovery_owner=True,
+            _repair_explicit=True,
+        )
+        try:
+            if store.cwd != metadata.cwd:
+                raise SessionError(
+                    f"session {session_id} cwd does not match its metadata"
+                )
+            result = store.last_repair_result
+            if result is None:
+                raise SessionError(
+                    f"session {session_id} does not need transcript repair"
+                )
+            return result
+        finally:
+            store.close()
 
     def _reconcile_project_link(self, session_id: str) -> None:
         registry = self.project_registry

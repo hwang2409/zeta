@@ -31,7 +31,12 @@ from ..checkpoints import (
     load_session_json,
 )
 from ..session_files import open_session_file
-from ..transcript_recovery import TranscriptSourceFacts, ValidatedPrefix
+from ..transcript_recovery import (
+    RepairTarget,
+    TranscriptSourceFacts,
+    ValidatedPrefix,
+    repair_transcript,
+)
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -130,8 +135,17 @@ class TranscriptLoadError(ConversationIntegrityError):
             "row": self.row_number,
             "repairable": self.repairable,
             "session_id": self.session_id,
-            # Diagnosis-only PR: no repair request exists yet.
-            "actions": [],
+            "actions": (
+                [
+                    {
+                        "method": "repair_transcript",
+                        "session_id": self.session_id,
+                        "requires_confirmation": True,
+                    }
+                ]
+                if self.repairable
+                else []
+            ),
         }
 
 
@@ -787,27 +801,12 @@ class ConversationLogMixin:
             self._load_full()
             return
         if torn_at is not None:
-            if getattr(self, "_strict_snapshot_sync", False):
-                self._strict_snapshot_sync = False
-                self._load_full()
-                return
             if self._read_only:
                 raise ConversationIntegrityError(
                     f"invalid conversation row {len(self._entries) + len(entries) + 2}: {self.path}"
                 )
-            self._repair_torn_tail(known_offset + torn_at)
-            # Parse any complete rows before the torn suffix before recording the warning.
-            try:
-                accepted = self._accept_incremental_entries(entries)
-            except ConversationIntegrityError:
-                self._load_full()
-                return
-            if not accepted:
-                self._load_full()
-                return
-            self._log_offset = known_offset + torn_at
-            self._publish_entries_installed(tuple(entries))
-            self._append_torn_warning()
+            self._strict_snapshot_sync = False
+            self._load_full()
             return
 
         try:
@@ -956,14 +955,28 @@ class ConversationLogMixin:
 
         validator = _FullLoadValidator(self, raw, stat)
         torn_offset: int | None = None
-        for physical_row in self._iter_physical_rows(
-            raw, stat, validator.validated_prefix
-        ):
-            if physical_row.torn:
-                torn_offset = physical_row.byte_offset
-                break
-            validator.accept(physical_row)
-        validator.finish()
+        try:
+            for physical_row in self._iter_physical_rows(
+                raw, stat, validator.validated_prefix
+            ):
+                if physical_row.torn:
+                    torn_offset = physical_row.byte_offset
+                    break
+                validator.accept(physical_row)
+            validator.finish()
+        except TranscriptLoadError as error:
+            if not self._repair_explicit or error._source_facts is None:
+                raise
+            self._last_repair_result = repair_transcript(
+                self.directory_fd,
+                RepairTarget(self.session_id),
+                error._source_facts,
+                strict_reopen=self._strict_reopen_repaired_transcript,
+                memory_review_required=True,
+            )
+            self._repair_explicit = False
+            self._load_full()
+            return
 
         delta = (
             self._installed_delta_from_baseline(self._entries, baseline)
@@ -971,10 +984,32 @@ class ConversationLogMixin:
             else ()
         )
         if torn_offset is not None:
-            self._repair_torn_tail(torn_offset)
-            self._log_offset = torn_offset
-            self._publish_entries_installed(delta)
-            self._append_torn_warning()
+            prefix = validator.validated_prefix(torn_offset)
+            source = TranscriptSourceFacts(
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                size=stat.st_size,
+                source_digest=hashlib.sha256(raw).hexdigest(),
+                prefix_digest=hashlib.sha256(raw[:torn_offset]).hexdigest(),
+                first_bad_row=len(raw[:torn_offset].splitlines()) + 1,
+                first_bad_offset=torn_offset,
+                prefix=prefix,
+                diagnosed_at=_now(),
+            )
+            self._last_repair_result = repair_transcript(
+                self.directory_fd,
+                RepairTarget(self.session_id),
+                source,
+                strict_reopen=self._strict_reopen_repaired_transcript,
+                memory_review_required=False,
+            )
+            warnings.warn(
+                f"dropped torn final conversation line from {self.path}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._load_full()
+            return
         elif not self._read_only and not raw.endswith(b"\n"):
             self._write_bytes(b"\n")
             self._publish_entries_installed(delta)
@@ -1070,25 +1105,15 @@ class ConversationLogMixin:
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def _repair_torn_tail(self: ConversationStore, offset: int) -> None:
-        with os.fdopen(
-            open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR),
-            "r+b",
-        ) as handle:
-            handle.truncate(offset)
-            handle.flush()
-            os.fsync(handle.fileno())
-            self._set_log_stat(os.fstat(handle.fileno()))
-
-    def _append_torn_warning(self: ConversationStore) -> None:
-        self._append_row_unlocked(
-            "warning", {"message": "dropped torn final conversation line"}
+    def _strict_reopen_repaired_transcript(self: ConversationStore) -> None:
+        candidate = type(self)(
+            self.root_dir,
+            session_id=self.session_id,
+            _read_only=True,
+            _must_exist=True,
+            _storage_lease=self._storage_lease,
         )
-        warnings.warn(
-            f"dropped torn final conversation line from {self.path}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        candidate.close()
 
     def _write_line(self: ConversationStore, row: dict[str, Any]) -> None:
         encoded = encode_json(row) + b"\n"

@@ -93,10 +93,7 @@ class DecisionsMixin:
             return "no open decisions"
         lines = ["open decisions:"]
         for item in items:
-            lines.append(
-                f"  {item.record.title}  "
-                f"[{item.project_name}]"
-            )
+            lines.append(f"  {item.record.title}  [{item.project_name}]")
         return "\n".join(lines)
 
     # -- status-bar count poll ----------------------------------------------
@@ -134,7 +131,9 @@ class DecisionsMixin:
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items)
             self._decisions_panel_control.set_lines(
-                self._decisions_panel.render_lines(), keep_offset=True, overflow_hint=True
+                self._decisions_panel.render_lines(),
+                keep_offset=True,
+                overflow_hint=True,
             )
             self._invalidate_prompt()
         elif changed:

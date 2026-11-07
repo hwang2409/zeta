@@ -56,6 +56,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "deny",
         "fork_message",
         "rename_session",
+        "repair_transcript",
         "revoke_session_grants",
         "send",
         "send_images",
@@ -832,6 +833,23 @@ class _Client:
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
+        if method == "repair_transcript":
+            await self.server.control.require_idle()
+            if params.get("confirm") is not True:
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "repair_transcript requires confirm=true",
+                )
+            session_id = _required_string(params, "session_id")
+            result = await asyncio.to_thread(
+                runtime.manager.repair_transcript, session_id
+            )
+            return {
+                "session_id": session_id,
+                "quarantine_id": result.quarantine_id,
+                "retained_last_sequence": result.retained_last_sequence,
+                "memory_review_required": result.memory_review_required,
+            }
         if method in {"rename_session", "delete_session"}:
             return await ergonomics.mutate_session(
                 runtime,
