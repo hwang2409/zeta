@@ -334,9 +334,10 @@ async def test_address_commit_owner_refusal_writes_nothing(
     )
     process.start()
     try:
-        assert await asyncio.wait_for(
-            asyncio.to_thread(parent_control.recv), 11
-        ) == "ready"
+        assert (
+            await asyncio.wait_for(asyncio.to_thread(parent_control.recv), 11)
+            == "ready"
+        )
         with pytest.raises(ConversationTargetOwned) as raised:
             await commit_conversation_async(
                 ConversationAddress("project", "root", "root"),
