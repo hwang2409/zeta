@@ -121,7 +121,7 @@ class ServeControl:
         self._active_host_commands: SessionHostCommands | None = None
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
-            publish=lambda *args, **kwargs: self._notify(*args, **kwargs),
+            publish=self._publish_approval,
             admit=self._admit_controller,
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
@@ -918,6 +918,12 @@ class ServeControl:
                     message=message,
                 )
             )
+
+    async def _publish_approval(
+        self, event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        admission = self._admit_controller(event, session_id=session_id, **fields)
+        return admission.kind != "rejected"
 
     def _admit_controller(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object

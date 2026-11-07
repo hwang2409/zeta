@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 ApprovalKey = str | tuple[str, str]
 
-
 @dataclass(frozen=True, slots=True)
 class _ApprovalTarget:
     key: ApprovalKey
@@ -34,7 +33,6 @@ class _ApprovalTarget:
     store_request_id: str
     request: ApprovalRequest | None = None
     history_store: ConversationStore | None = None
-
 
 @dataclass(frozen=True, slots=True)
 class ApprovalRecord:
@@ -55,12 +53,10 @@ class ApprovalRecord:
     terminal_result: Admission | None = None
     terminal_watchdog: asyncio.Task[None] | None = None
 
-
 @dataclass(frozen=True, slots=True)
 class SessionHealth:
     code: str
     message: str
-
 
 @dataclass(frozen=True, slots=True)
 class ApprovalMachineState:
@@ -70,13 +66,11 @@ class ApprovalMachineState:
     records: Mapping[ApprovalKey, ApprovalRecord] = MappingProxyType({})
     health: SessionHealth | None = None
 
-
 @dataclass(frozen=True, slots=True)
 class Register:
     request: ApprovalRequest
     store: ConversationStore
     child_instance_id: str
-
 
 @dataclass(frozen=True, slots=True)
 class Start:
@@ -1050,14 +1044,16 @@ class ApprovalLifecycle:
                     if terminal is not None:
                         record = self._change(record, terminal_result=terminal_result, terminal=None)
                 else:
-                    admission = self._admit(
+                    await self._publish(
                         event_contract.STREAM_EVENT_WIRE_EVENTS[
                             StreamEventType.TOOL_APPROVAL_END
                         ],
-                        session_id=self._session_id(),
+                        self._session_id(),
                         **payload,
                     )
-                    record = self._change(record, live_end=admission)
+                    record = self._change(
+                        record, live_end=Admission("admitted")
+                    )
                     self._release_gate(record, resolution=resolution)
             elif isinstance(record.target.key, tuple):
                 self._release_terminal(record)
