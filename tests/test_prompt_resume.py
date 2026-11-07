@@ -15,6 +15,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.session_execution import SessionOwnedError
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
@@ -116,7 +117,9 @@ def _staggered_resumes(
         "zeta.runtime.prompt_resume", fromlist=["_adopted_context"]
     )._adopted_context
 
-    def pause_after_persist(metadata: object, notices: tuple[str, ...]) -> ProjectContext:
+    def pause_after_persist(
+        metadata: object, notices: tuple[str, ...]
+    ) -> ProjectContext:
         if threading.current_thread().name == "first-resumer":
             persisted.set()
             assert release_first.wait(timeout=5)
@@ -162,7 +165,9 @@ def _staggered_resumes(
     return results
 
 
-def _numbered_default_contexts(cwd: Path) -> tuple[Callable[..., ProjectContext], list[int]]:
+def _numbered_default_contexts(
+    cwd: Path,
+) -> tuple[Callable[..., ProjectContext], list[int]]:
     calls: list[int] = []
 
     def load(**kwargs: object) -> ProjectContext:
@@ -195,23 +200,27 @@ def _assert_one_persisted_prompt(
 async def test_conservative_resume_discovers_new_skill(tmp_path: Path) -> None:
     home = tmp_path / "home"
     original_prompt = "unknown recipe prompt bytes"
-    manager, session_id = await asyncio.to_thread(lambda: _manager_with_prompt(
-        home,
-        tmp_path,
-        system_prompt=original_prompt,
-        prompt_recipe=None,
-    ))
+    manager, session_id = await asyncio.to_thread(
+        lambda: _manager_with_prompt(
+            home,
+            tmp_path,
+            system_prompt=original_prompt,
+            prompt_recipe=None,
+        )
+    )
     _write_skill(home / "skills" / "new-skill" / "SKILL.md")
 
-    resumed = await asyncio.to_thread(lambda: _resume(
-        manager,
-        session_id,
-        home,
-        tmp_path,
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError(f"unexpected default rebuild: {kwargs}")
-        ),
-    ))
+    resumed = await asyncio.to_thread(
+        lambda: _resume(
+            manager,
+            session_id,
+            home,
+            tmp_path,
+            lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"unexpected default rebuild: {kwargs}")
+            ),
+        )
+    )
     registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
     loaded = await registry.execute(
         ToolCall("load-new-skill", "skill", {"name": "new-skill"}),
@@ -229,14 +238,18 @@ async def test_child_of_conservative_resumed_session_sees_new_skill(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
-    manager, session_id = await asyncio.to_thread(lambda: _manager_with_prompt(
-        home,
-        tmp_path,
-        system_prompt="unknown recipe prompt bytes",
-        prompt_recipe=None,
-    ))
+    manager, session_id = await asyncio.to_thread(
+        lambda: _manager_with_prompt(
+            home,
+            tmp_path,
+            system_prompt="unknown recipe prompt bytes",
+            prompt_recipe=None,
+        )
+    )
     _write_skill(home / "skills" / "new-skill" / "SKILL.md")
-    resumed = await asyncio.to_thread(lambda: _resume(manager, session_id, home, tmp_path, lambda **kwargs: None))
+    resumed = await asyncio.to_thread(
+        lambda: _resume(manager, session_id, home, tmp_path, lambda **kwargs: None)
+    )
     parent_registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
     child_store = ConversationStore(tmp_path / "child-session")
     try:
@@ -356,10 +369,7 @@ async def test_concurrent_resume_child_uses_one_fresh_profile_generation(
         agent_schema = next(
             schema for schema in registry.schemas if schema["name"] == "agent"
         )
-        _ = [
-            event
-            async for event in loop.run_turn("start", origin=MessageOrigin.USER)
-        ]
+        _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
 
         assert len(backend.calls) == 2, "child did not start from runtime b's catalog"
         preset = second.agent_catalog.find("specialist")
@@ -520,10 +530,13 @@ def test_custom_prompt_without_owned_skill_span_stays_unchanged_and_notices_rest
     )
 
     assert resumed.context.system_prompt == prompt
-    assert resumed.context.notices.count(
-        "skills changed, but this session's prompt predates owned skill spans; "
-        "restart the session to refresh its skill index"
-    ) == 1
+    assert (
+        resumed.context.notices.count(
+            "skills changed, but this session's prompt predates owned skill spans; "
+            "restart the session to refresh its skill index"
+        )
+        == 1
+    )
 
 
 def test_live_runtime_adoption_uses_current_skill_index_in_memory(
@@ -603,7 +616,7 @@ def _start_resume_process(
     close_before_ready: bool,
 ) -> subprocess.Popen[bytes]:
     close = "opened.store.close()" if close_before_ready else ""
-    script = f'''from pathlib import Path
+    script = f"""from pathlib import Path
 import os
 import time
 from zeta.core.project_context import ProjectContext
@@ -624,7 +637,7 @@ while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
     except ProcessLookupError:
         break
     time.sleep(0.1)
-'''
+"""
     return subprocess.Popen([sys.executable, "-c", script], cwd=cwd)
 
 
@@ -682,8 +695,8 @@ def test_process_exit_releases_runtime_lease(tmp_path: Path) -> None:
     try:
         _wait_for(ready)
         loader, calls = _numbered_default_contexts(tmp_path)
-        adopted = _resume(manager, session_id, home, tmp_path, loader)
-        assert adopted.context.system_prompt == "child runtime"
+        with pytest.raises(SessionOwnedError, match="active in another zeta process"):
+            _resume(manager, session_id, home, tmp_path, loader)
         assert calls == []
         child.kill()
         child.wait(timeout=10)
