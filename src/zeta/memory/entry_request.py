@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from .entry_store import MAX_ENTRY_TEXT_BYTES, MemoryEntry, MemoryState
+from .entry_store import (
+    MAX_ENTRY_TEXT_BYTES,
+    MemoryEntry,
+    MemoryState,
+)
 from .reconciler import (
     ReconciliationError,
     RequestTooLargeError,
@@ -101,6 +105,16 @@ class _EntryPreparedRequest:
     visible_entry_ids: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedEntry:
+    component: tuple[str, dict[str, object], str]
+    opaque: frozenset[str]
+    words: frozenset[str]
+
+
+_ENTRY_CACHE: tuple[tuple[str, str], dict[str, _CachedEntry]] | None = None
+
+
 def _active_entries_by_priority(state: MemoryState) -> list[MemoryEntry]:
     priorities = {kind.key: kind.prompt_priority for kind in state.schema.kinds}
     return sorted(
@@ -172,8 +186,43 @@ def _transcript_relevance_text(transcript: Transcript) -> str:
     return "\n".join(chunks)
 
 
+def _entry_relevance_terms(entry: MemoryEntry) -> tuple[frozenset[str], frozenset[str]]:
+    return _relevance_terms(
+        f"{entry.id} {entry.text}",
+        max_chars=_MAX_RELEVANCE_ENTRY_CHARS,
+        max_tokens=_MAX_RELEVANCE_ENTRY_TOKENS,
+    )
+
+
+def _cached_entries(
+    state: MemoryState, *, snapshot_digest: str
+) -> dict[str, _CachedEntry]:
+    global _ENTRY_CACHE
+    key = (state.project_id, snapshot_digest)
+    if _ENTRY_CACHE is not None and _ENTRY_CACHE[0] == key:
+        return _ENTRY_CACHE[1]
+    cached: dict[str, _CachedEntry] = {}
+    for entry in _active_entries_by_priority(state):
+        projection = _entry_projection(entry)
+        entry_opaque, entry_words = _entry_relevance_terms(entry)
+        cached[entry.id] = _CachedEntry(
+            (
+                _entry_index(entry),
+                projection,
+                json.dumps(projection, ensure_ascii=False, separators=(",", ":")),
+            ),
+            entry_opaque,
+            entry_words,
+        )
+    _ENTRY_CACHE = (key, cached)
+    return cached
+
+
 def _active_entries_for_request(
-    state: MemoryState, transcript: Transcript
+    state: MemoryState,
+    transcript: Transcript,
+    *,
+    cached: dict[str, _CachedEntry],
 ) -> list[MemoryEntry]:
     active = _active_entries_by_priority(state)
     transcript_opaque, transcript_words = _relevance_terms(
@@ -185,11 +234,7 @@ def _active_entries_for_request(
         return active
 
     def score(entry: MemoryEntry) -> tuple[int, int]:
-        entry_opaque, entry_words = _relevance_terms(
-            f"{entry.id} {entry.text}",
-            max_chars=_MAX_RELEVANCE_ENTRY_CHARS,
-            max_tokens=_MAX_RELEVANCE_ENTRY_TOKENS,
-        )
+        entry_opaque, entry_words = cached[entry.id].opaque, cached[entry.id].words
         return (
             len(transcript_opaque & entry_opaque),
             len(transcript_words & entry_words),
@@ -345,20 +390,21 @@ def _render_transcript_row(session_id: str, row: dict[str, Any]) -> str:
 
 
 def _prepare_request(
-    transcript: Transcript, state: MemoryState, *, as_of: date
+    transcript: Transcript,
+    state: MemoryState,
+    *,
+    as_of: date,
+    snapshot_digest: str,
 ) -> _EntryPreparedRequest:
     empty = Transcript(transcript.session_id, ())
     priority = _active_entries_by_priority(state)
-    components = {}
-    for entry in priority:
-        projection = _entry_projection(entry)
-        rendered = json.dumps(projection, ensure_ascii=False, separators=(",", ":"))
-        components[entry.id] = (_entry_index(entry), projection, rendered)
+    cached = _cached_entries(state, snapshot_digest=snapshot_digest)
+    components = {entry.id: cached[entry.id].component for entry in priority}
     empty_size = len(_prompt(empty, state, as_of=as_of).encode())
 
     def entry_parts(rows: Sequence[dict[str, Any]]):
         candidate = Transcript(transcript.session_id, tuple(rows))
-        active = _active_entries_for_request(state, candidate)
+        active = _active_entries_for_request(state, candidate, cached=cached)
         return active, _entry_prompt_parts(active, components, base_size=empty_size)
 
     preliminary_size = entry_parts(())[1][4]
