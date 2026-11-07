@@ -7,6 +7,7 @@ import gc
 import json
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -600,15 +601,15 @@ async def _replace_registry_controller(
 def _assert_raw_frames_preserved(actual: bytes, expected: bytes) -> None:
     actual_frames = actual.splitlines(keepends=True)
     expected_frames = expected.splitlines(keepends=True)
-    assert {
-        parsed["id"]: frame
+    assert Counter(
+        (parsed["id"], frame)
         for frame in actual_frames
         if (parsed := json.loads(frame)).get("id") is not None
-    } == {
-        parsed["id"]: frame
+    ) == Counter(
+        (parsed["id"], frame)
         for frame in expected_frames
         if (parsed := json.loads(frame)).get("id") is not None
-    }
+    )
     assert [
         frame for frame in actual_frames if b'"method":"event"' in frame
     ] == [frame for frame in expected_frames if b'"method":"event"' in frame]
