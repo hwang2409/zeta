@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -37,6 +37,7 @@ from ..protocol.types import (
     ToolCall,
     ToolResult,
     assistant_text,
+    is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
@@ -58,7 +59,7 @@ from .presets import (
     compose_system_prompt,
     resolve_child_profile_tools,
 )
-from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
+from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
 
@@ -243,6 +244,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if gate_result.outcome == "task_safety_expired":
+                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
@@ -317,19 +320,14 @@ async def consume_run(
         **kwargs,
     )
 
-
 def resolve_child_backend(
-    loop: AgentLoop,
-    model: object,
+    loop: AgentLoop, model: object
 ) -> tuple[CompletionBackend | None, str | None]:
-    """Pick the backend a child runs on, returning an error message instead of raising.
-
-    Without a model the child inherits the parent's backend, which is what every
-    agent did before cross-provider spawning existed.
-    """
-
+    """Give composed child loops a distinct backend owner."""
     if model is None:
-        return loop.backend, None
+        if not is_owned_completion_backend(loop.backend):
+            return loop.backend, None
+        model = loop.backend.model
     if type(model) is not str or not model.strip():
         return None, "agent error: model must be a nonempty string"
     try:
@@ -338,16 +336,12 @@ def resolve_child_backend(
         return None, f"agent error: {exc}"
     context = getattr(loop, "account_context", None)
     account_kwargs = context.backend_kwargs(provider) if context is not None else {}
-    # Check credentials up front: the alternative is a child that spawns, burns a
-    # turn, and dies on an auth error the parent cannot act on.
     store = credential_store(provider, **account_kwargs)
     if store is not None:
         tokens = store.read() or store.bootstrap()
         if tokens is None:
-            return None, (
-                f"agent error: not logged in to {provider}; "
-                f"run zeta login --provider {provider}"
-            )
+            message = f"agent error: not logged in to {provider}; "
+            return None, message + f"run zeta login --provider {provider}"
     try:
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget
@@ -358,7 +352,6 @@ def resolve_child_backend(
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
-
 
 async def _build_child_loop(
     loop: AgentLoop,
@@ -376,6 +369,16 @@ async def _build_child_loop(
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
+    child_loop: AgentLoop | None = None
+
+    async def close_construction(*, background_task_cause: str) -> None:
+        if child_loop is not None:
+            await child_loop.close(background_task_cause=background_task_cause)
+        elif is_owned_completion_backend(child_backend):
+            await loop.close_backend(child_backend, stage="child_construction")
+        if child_registry is not None:
+            await child_registry.close(background_task_cause=background_task_cause)
+
     try:
         explicit_finish = explicit_finish_eligible(
             global_enabled=loop.explicit_finish,
@@ -489,16 +492,16 @@ async def _build_child_loop(
         child_loop.set_background_event_sink(loop._publish_background_event)
         return child_loop, child_policy
     except asyncio.CancelledError:
-        if child_registry is not None:
-            cleanup = asyncio.create_task(child_registry.close())
-            try:
+        cleanup = asyncio.create_task(
+            close_construction(background_task_cause="child spawn setup canceled")
+        )
+        while not cleanup.done():
+            with suppress(asyncio.CancelledError):
                 await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await asyncio.shield(cleanup)
+        cleanup.result()
         raise
     except BaseException:
-        if child_registry is not None:
-            await child_registry.close()
+        await close_construction(background_task_cause="child spawn setup failed")
         raise
 
 
@@ -1046,8 +1049,8 @@ async def run_agent_tool(
             loop._background_owner.mark_store_finished(child_store)
             loop._background_owner.release_unused_stores()
 
-        async def close_background_child() -> tuple[str, ...]:
-            return tuple(await child_loop.close(cancel_background=False))
+        async def close_background_child(cause: str) -> tuple[str, ...]:
+            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
 
         async def finish_background() -> None:
             await finish_background_child(
@@ -1137,8 +1140,7 @@ async def run_agent_tool(
             (child_task, abort_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        # A completed child wins a same-turn abort race so its descendants can
-        # be adopted by receipt processing rather than canceled as unreachable.
+        # A completed child wins an abort race so descendants can be adopted by receipt processing.
         if child_task in done:
             result = child_task.result()
             if follow_up_loop:
@@ -1167,8 +1169,7 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(cancel_background=False)
-
+        await child_loop.close(cancel_background=False, background_task_cause=child_cleanup_details("foreground", child_task.cancelled())[0])
 
 def _child_base_system_prompt(
     loop: AgentLoop,
