@@ -418,6 +418,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         await _collect_turn(closing_app.loop, "close")
         close_task = asyncio.create_task(closing_app.close())
         await asyncio.to_thread(close_read_entered.wait)
+        # test-contract: seam Prove close joins the held projection read.
         assert not close_task.done()
         close_read_release.set()
         await close_task
