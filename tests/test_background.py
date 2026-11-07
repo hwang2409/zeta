@@ -1031,29 +1031,47 @@ async def test_background_task_owner_state_table(
             return
 
         if row == "4-exit-evidence-precedes-not-running":
-            entered = asyncio.Event()
-            release = asyncio.Event()
-            produce = flow.produce
+            from tests.test_agent import (
+                _TaskFinishGateBackend,
+                _completion_after_publication,
+                _start_task_gate,
+            )
 
-            async def gated_produce(item):
-                entered.set()
-                await asyncio.wait_for(release.wait(), 10)
-                return await produce(item)
-
-            # test-contract: seam hold the durable receipt publication at its interface
-            monkeypatch.setattr(flow, "produce", gated_produce)
-            task_id = await start_registered(_python("raise SystemExit(0)"))
+            backend = _TaskFinishGateBackend(
+                _python("import time; time.sleep(30)"), action="kill"
+            )
+            gate_store, gate_loop, run, completion_published = await _start_task_gate(
+                tmp_path / "finish-gate", backend
+            )
             try:
-                await asyncio.wait_for(entered.wait(), 10)
-                before = await output_registered(task_id)
-                assert before["running"] is True
-                assert store.agent_notifications(pending_only=False) == []
+                await asyncio.wait_for(run, 10)
+                completion = await _completion_after_publication(
+                    gate_store, completion_published
+                )
+                child_path = Path(completion.data["child_session_path"])
+                child_store = ConversationStore(
+                    child_path.parent, session_id=child_path.name
+                )
+                try:
+                    task_receipts = [
+                        entry
+                        for entry in child_store.agent_notifications(
+                            pending_only=False
+                        )
+                        if entry.data.get("kind") == "task_exited"
+                    ]
+                    assert len(task_receipts) == 1
+                    rows = json.loads(
+                        (child_store.session_dir / "background_tasks.json").read_text()
+                    )
+                    assert len(rows) == 1
+                    assert rows[0]["running"] is False
+                    assert task_receipts[0].data["background_phase"] == rows[0]["terminal_phase"]
+                finally:
+                    child_store.close()
             finally:
-                release.set()
-            await _wait_for_exit(registry.background_tasks, task_id)
-            after = await output_registered(task_id)
-            assert after["running"] is False
-            assert len(store.agent_notifications(pending_only=False)) == 1
+                await gate_loop.close()
+                gate_store.close()
             return
 
         if row == "persist-failure-retries-same-candidate":
