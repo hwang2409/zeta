@@ -929,16 +929,46 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         cls, directory_fd: int, *, repair_torn_final: bool
     ) -> list[dict[str, object]]:
         """Read the bounded JSONL reference file from one pinned regular fd."""
+        maximum = MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
         with cls._open_session_records(
             directory_fd, repair_torn_final=repair_torn_final
         ) as fd:
             if fd is None:
                 return []
             try:
-                data = cls._read_session_record_bytes(
-                    fd, repair_torn_final=repair_torn_final
-                )
-                return cls._decode_session_records(data)
+                records: list[dict[str, object]] = []
+                pending = bytearray()
+                total = 0
+                while total <= maximum:
+                    data = os.read(fd, min(64 * 1024, maximum + 1 - total))
+                    if not data:
+                        break
+                    total += len(data)
+                    pending.extend(data)
+                    while True:
+                        try:
+                            position = pending.index(10)
+                        except ValueError:
+                            if len(pending) > MAX_SESSION_REFERENCE_SIZE:
+                                raise ProjectRegistryError(
+                                    "project session reference is too large"
+                                )
+                            break
+                        records.append(
+                            cls._decode_session_record_line(bytes(pending[:position]))
+                        )
+                        if len(records) > MAX_SESSION_REFERENCES:
+                            raise ProjectRegistryError(
+                                "project session references exceed the limit"
+                            )
+                        del pending[: position + 1]
+                if total > maximum:
+                    raise ProjectRegistryError(
+                        "project session references exceed the limit"
+                    )
+                if pending and repair_torn_final:
+                    os.ftruncate(fd, total - len(pending))
+                return records
             except OSError as exc:
                 raise ProjectRegistryError(
                     "project session references are unreadable"
