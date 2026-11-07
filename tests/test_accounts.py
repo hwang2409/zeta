@@ -37,6 +37,7 @@ from tests.support.account_processes import (
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
     AccountError,
@@ -47,7 +48,6 @@ from zeta.accounts import (
 )
 from zeta.agent.runner import resolve_child_backend
 from zeta.core.login_flow import LoginPublicationError
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens, ProviderLoginRequiredError
@@ -61,6 +61,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.factory import build_backend, credential_store
 from zeta.providers.retry_policy import retryable_provider_error
+from zeta.runtime.loop import AgentLoop
 from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
@@ -73,7 +74,9 @@ _SENTINEL = "token-text-must-not-escape"
 
 
 def _hold_lifecycle_lock(
-    home: str, account: AccountId, ready: multiprocessing.synchronize.Event,
+    home: str,
+    account: AccountId,
+    ready: multiprocessing.synchronize.Event,
     release: multiprocessing.synchronize.Event,
 ) -> None:
     with AccountStore(home).lifecycle_guard(account):
@@ -288,9 +291,8 @@ def test_resolve_account_does_not_migrate(
     monkeypatch.setattr(AccountStore, "migrate", migrate_once)
     monkeypatch.setattr(tui_bootstrap, "env_home", lambda: tmp_path)
     sentinel = object()
-    monkeypatch.setattr(
-        tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel
-    )
+    # test-contract: seam isolates migration from TUI construction
+    monkeypatch.setattr(tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel)
 
     assert tui_bootstrap.create_app(SimpleNamespace(no_session=False)) is sentinel
     assert calls == 1
@@ -300,12 +302,16 @@ def test_resolve_account_does_not_migrate(
 @pytest.mark.asyncio
 async def test_blocking_account_lock_on_loop_thread_raises(tmp_path: Path) -> None:
     store = AccountStore(tmp_path)
-    with (
-        store._home() as home_fd,
-        pytest.raises(AccountLoopThreadLockError, match="event-loop thread"),
-        store._lock_at(home_fd, ".accounts.lock"),
-    ):
-        pass
+    lease = await asyncio.to_thread(account_store.open_writer, tmp_path)
+    try:
+        with (
+            store._home() as home_fd,
+            pytest.raises(AccountLoopThreadLockError, match="event-loop thread"),
+            store._lock_at(home_fd, ".accounts.lock"),
+        ):
+            pass
+    finally:
+        lease.close()
 
 
 def tokens() -> OAuthTokens:
@@ -365,7 +371,9 @@ def test_explicit_credential_store_has_no_recovery_side_effect(
     named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
 
     def fail_resolve(*_args: object, **_kwargs: object) -> AccountId:
-        raise AssertionError("explicit account construction must not recover credentials")
+        raise AssertionError(
+            "explicit account construction must not recover credentials"
+        )
 
     monkeypatch.setattr(AccountStore, "resolve_account", fail_resolve)
     credential = credential_store("codex", home=tmp_path, account=account)
@@ -478,7 +486,9 @@ def test_oauth_refresh_network_failure_is_not_auth_error(driver_type: type) -> N
         raise httpx.ConnectError("connection failed", request=request)
 
     async def run() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(disconnect)) as client:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(disconnect)
+        ) as client:
             with pytest.raises(RuntimeError) as raised:
                 await driver.refresh("old-refresh", client)
         assert raised.value.code != "auth_error"
@@ -542,6 +552,7 @@ def test_anthropic_email_address_captured_on_refresh(tmp_path: Path) -> None:
 
 
 def _write_legacy(home: Path, provider: str) -> Path:
+    initialize_storage_home(home)
     path = home / f"{provider}-oauth.json"
     path.write_text(json.dumps(tokens().to_dict()))
     return path
@@ -581,7 +592,7 @@ def test_migration_happy_path_anthropic(tmp_path: Path) -> None:
 
 def test_migration_bounds_refused_directory_warnings(tmp_path: Path) -> None:
     # a long home path (as on CI runners) must not hide the account name
-    home = tmp_path / ("h" * 150)
+    home = initialize_storage_home(tmp_path / ("h" * 150))
     provider_root = home / "accounts" / "codex"
     provider_root.mkdir(parents=True)
     for index in range(20):
@@ -655,14 +666,16 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
             lambda args, count: args[1] == "default" and count == 6,
         )
     elif step == "credential_file":
-        original = wrap("_atomic_publish", lambda args, count: args[1] == "oauth.json")
+        original = wrap("atomic_publish", lambda args, count: args[1] == "oauth.json")
     elif step == "credential_directory_sync":
-        original = wrap("_write_token_bytes", lambda args, count: True)
+        original = wrap(
+            "_stage_account_tokens", lambda args, count: True, owner=AccountStore
+        )
     elif step == "credential_verification":
         original = wrap("_read_tokens", lambda args, count: count == 2)
     elif step == "registry_file":
         original = wrap(
-            "_atomic_publish", lambda args, count: args[1] == "accounts.json"
+            "atomic_publish", lambda args, count: args[1] == "accounts.json"
         )
     elif step == "registry_directory_sync":
         original = wrap("_write_registry", lambda args, count: True, AccountStore)
@@ -679,10 +692,10 @@ def test_migration_crash_at_each_step_keeps_a_working_login(
             "accounts_directory": "_mkdir_child_durable",
             "provider_directory": "_mkdir_child_durable",
             "account_directory": "_mkdir_child_durable",
-            "credential_file": "_atomic_publish",
-            "credential_directory_sync": "_write_tokens",
+            "credential_file": "atomic_publish",
+            "credential_directory_sync": "_stage_account_tokens",
             "credential_verification": "_read_tokens",
-            "registry_file": "_atomic_publish",
+            "registry_file": "atomic_publish",
             "registry_directory_sync": "_write_registry",
             "legacy_unlink": "_unlink_legacy_file",
             "legacy_directory_sync": "_unlink_legacy",
@@ -932,10 +945,7 @@ def test_accounts_list_shows_migrated_legacy_login(
 
     assert cli_main._handle_accounts(args) == 0
 
-    assert capsys.readouterr().out == (
-        "codex:default  ★ default\n"
-        "  usage unknown\n"
-    )
+    assert capsys.readouterr().out == ("codex:default  ★ default\n  usage unknown\n")
     assert not legacy.exists()
 
 
@@ -1019,14 +1029,12 @@ def test_migration_then_every_reader_uses_the_account_store(
     manager = SessionManager(tmp_path)
     opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
     context = SessionAccountContext.load(tmp_path, manager, opened.metadata)
-    assert tui_models.load_model_catalog(
-        "claude", account_context=context
-    ) == frozenset()
+    assert (
+        tui_models.load_model_catalog("claude", account_context=context) == frozenset()
+    )
     opened.store.close()
 
-    expected = AccountStore(tmp_path).credential_path(
-        AccountId("anthropic", "default")
-    )
+    expected = AccountStore(tmp_path).credential_path(AccountId("anthropic", "default"))
     assert error is None
     assert child is not None
     stores = [
@@ -1044,6 +1052,7 @@ def test_refresh_after_migration_writes_the_account_credential(
 ) -> None:
     expired = OAuthTokens("old-access", "old-refresh", 1.0)
     fresh = OAuthTokens("fresh-access", "fresh-refresh", 9_999_999_999.0)
+    initialize_storage_home(tmp_path)
     (tmp_path / "anthropic-oauth.json").write_text(json.dumps(expired.to_dict()))
     AccountStore(tmp_path).migrate()
     store = credential_store("claude", home=tmp_path)
@@ -1135,8 +1144,10 @@ def test_crash_between_credential_and_registry_publish_recovers_account(
             credential.bootstrap()
         else:
             credential.save(expected)
+    # test-contract: seam restore the publication boundary before recovery
     monkeypatch.setattr(AccountStore, "_write_registry", real_write_registry)
     pending = credential.path.with_name("publish-pending.json")
+    # test-contract: durability verify the crash leaves its recovery marker
     assert pending.exists()
 
     def bootstrap_must_not_run() -> OAuthTokens:
@@ -1219,9 +1230,12 @@ def test_bootstrap_refresh_runs_without_the_registry_lock(
 
     def resolve() -> None:
         try:
+
             async def access() -> None:
                 async with httpx.AsyncClient() as client:
-                    assert await credential.access_token(client) == refreshed.access_token
+                    assert (
+                        await credential.access_token(client) == refreshed.access_token
+                    )
 
             asyncio.run(access())
         except Exception as exc:  # noqa: BLE001 - report thread failures in test
@@ -1245,7 +1259,9 @@ def test_bootstrap_refresh_runs_without_the_registry_lock(
     registry_thread = threading.Thread(target=mutate_registry)
     registry_thread.start()
     try:
-        assert operations_done.wait(timeout=1), "registry remained locked during refresh"
+        assert operations_done.wait(timeout=1), (
+            "registry remained locked during refresh"
+        )
     finally:
         release_refresh.set()
         refresh_thread.join(timeout=5)
@@ -1366,7 +1382,9 @@ def test_account_credential_write_fsyncs_file_then_directory(
     real_replace = os.replace
 
     def observed_fsync(fd: int) -> None:
-        events.append("directory-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync")
+        events.append(
+            "directory-fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file-fsync"
+        )
         real_fsync(fd)
 
     def observed_replace(*args, **kwargs) -> None:
@@ -1405,6 +1423,7 @@ def test_cli_and_serve_login_share_provider_lock(
     cli_thread = threading.Thread(target=cli_main._run_login, args=("anthropic",))
     cli_thread.start()
     assert cli_entered.wait(timeout=5)
+
     async def run_serve_login() -> dict:
         return await Logins(tmp_path)._run(
             "claude", asyncio.get_running_loop().create_future()
@@ -1471,7 +1490,9 @@ def test_resumed_session_without_selection_pins_default_at_load(tmp_path: Path) 
     resumed.store.close()
 
 
-def test_session_with_missing_pinned_account_fails_naming_accounts(tmp_path: Path) -> None:
+def test_session_with_missing_pinned_account_fails_naming_accounts(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "home"
     manager = SessionManager(home)
     opened = manager.create(provider="codex", model="gpt-5.6-luna", cwd=tmp_path)
@@ -1641,9 +1662,14 @@ def test_account_switch_filters_stale_native_artifacts(tmp_path: Path) -> None:
 
     asyncio.run(run())
 
-    stale = next(message for message in backend.calls[0][0] if message.role == MessageRole.ASSISTANT)
+    stale = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role == MessageRole.ASSISTANT
+    )
     assert stale.content == [ThinkingContent("summary"), TextContent("answer")]
     store.close()
+
 
 @pytest.mark.asyncio
 async def test_grandchild_inherits_child_snapshot_not_global_default(
@@ -1691,7 +1717,9 @@ async def test_grandchild_inherits_child_snapshot_not_global_default(
 
     monkeypatch.setattr(agent_runner, "consume_child", consume_child)
     call = ToolCall(
-        "child", "agent", {"prompt": "work", "description": "child", "background": False}
+        "child",
+        "agent",
+        {"prompt": "work", "description": "child", "background": False},
     )
     try:
         result = await parent._run_agent_tool(
@@ -1730,7 +1758,9 @@ async def test_live_child_websearch_ignores_later_parent_switch(
         SessionAccountContext.load, home, manager, opened.metadata
     )
     parent = AgentLoop(
-        FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty(),
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
         agent_catalog=discover_packaged_agents(),
     )
     parent.account_context = resolver
@@ -1759,7 +1789,9 @@ async def test_live_child_websearch_ignores_later_parent_switch(
     monkeypatch.setattr(websearch.codex, "search", capture)
     monkeypatch.setattr(agent_runner, "consume_child", consume_child)
     call = ToolCall(
-        "child", "agent", {"prompt": "work", "description": "child", "background": False}
+        "child",
+        "agent",
+        {"prompt": "work", "description": "child", "background": False},
     )
     try:
         result = await parent._run_agent_tool(
@@ -1899,6 +1931,7 @@ def test_logout_crash_partway_through_cleanup_is_swept(tmp_path: Path) -> None:
 
 
 def test_migrate_sweeps_round_three_logout_tombstone(tmp_path: Path) -> None:
+    initialize_storage_home(tmp_path)
     path = tmp_path / "accounts" / "codex" / ".logout-deadbeef" / "oauth.json"
     path.parent.mkdir(parents=True)
     os.chmod(path.parent, 0o700)
@@ -1914,11 +1947,16 @@ def test_migrate_preserves_pending_login_and_completes_it(tmp_path: Path) -> Non
     credential = named_account_credentials(tmp_path, account.provider, account.name)
     credential.save(tokens())
     pending = credential.path.with_name("publish-pending.json")
-    pending.write_text(json.dumps({
-        "provider": account.provider,
-        "name": account.name,
-        "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
-    }) + "\n")
+    pending.write_text(
+        json.dumps(
+            {
+                "provider": account.provider,
+                "name": account.name,
+                "sha256": hashlib.sha256(credential.path.read_bytes()).hexdigest(),
+            }
+        )
+        + "\n"
+    )
 
     AccountStore(tmp_path).migrate()
     assert pending.exists()
@@ -2456,12 +2494,8 @@ def test_list_shows_email_metadata_when_present_offline(tmp_path: Path) -> None:
         error_type=RuntimeError,
     )
     assert identity.email == "codex@example.com"
-    codex = OAuthTokens(
-        "access", "refresh", 9_999_999_999, email="henry@example.com"
-    )
-    anthropic = OAuthTokens(
-        "access", "refresh", 9_999_999_999, workspace="Acme"
-    )
+    codex = OAuthTokens("access", "refresh", 9_999_999_999, email="henry@example.com")
+    anthropic = OAuthTokens("access", "refresh", 9_999_999_999, workspace="Acme")
     named_account_credentials(tmp_path, "codex", "work").save(codex)
     named_account_credentials(tmp_path, "anthropic", "team").save(anthropic)
 

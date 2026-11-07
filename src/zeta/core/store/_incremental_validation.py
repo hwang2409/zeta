@@ -20,6 +20,15 @@ APPROVAL_RESOLUTION_REASONS = frozenset(
 )
 
 
+def validate_approval_reason(decision: str, reason: str | None) -> None:
+    if reason is not None and (
+        type(reason) is not str
+        or decision != "abort"
+        or reason not in APPROVAL_RESOLUTION_REASONS
+    ):
+        raise ValueError("invalid approval resolution reason")
+
+
 class IncrementalValidationMixin:
     """Validate linear appended entries without rescanning the full log."""
 
@@ -39,6 +48,7 @@ class IncrementalValidationMixin:
         self._active_pending_prompt_messages: dict[str, Message] = {}
         self._active_notification_delivery_message: Message | None = None
         self._active_last_message: Message | None = None
+        self._active_last_turn_end: ConversationEntry | None = None
 
     def _rebuild_incremental_validation_state(self) -> None:
         """Build O(1) integrity indexes after a complete validation pass."""
@@ -59,9 +69,7 @@ class IncrementalValidationMixin:
                 time.sleep(0.0001)
             self._record_active_entry(entry)
 
-    def _accept_incremental_entries(
-        self, entries: list[ConversationEntry]
-    ) -> bool:
+    def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
         staged = copy.copy(self)
         staged._entries = list(self._entries)
@@ -91,6 +99,7 @@ class IncrementalValidationMixin:
             self._active_notification_delivery_message
         )
         staged._active_last_message = self._active_last_message
+        staged._active_last_turn_end = self._active_last_turn_end
         staged._task_notification_ids = set(self._task_notification_ids)
         staged._sent_message_receipts = list(self._sent_message_receipts)
         for index, entry in enumerate(entries):
@@ -111,9 +120,7 @@ class IncrementalValidationMixin:
         self._active_agent_receipts = staged._active_agent_receipts
         self._notification_ids = staged._notification_ids
         self._active_notifications = staged._active_notifications
-        self._active_completion_notifications = (
-            staged._active_completion_notifications
-        )
+        self._active_completion_notifications = staged._active_completion_notifications
         self._active_notification_presentations = (
             staged._active_notification_presentations
         )
@@ -124,6 +131,7 @@ class IncrementalValidationMixin:
             staged._active_notification_delivery_message
         )
         self._active_last_message = staged._active_last_message
+        self._active_last_turn_end = staged._active_last_turn_end
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
@@ -163,7 +171,10 @@ class IncrementalValidationMixin:
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))
-        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+        if (
+            entry.type == "notification"
+            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+        ):
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
@@ -254,7 +265,9 @@ class IncrementalValidationMixin:
         self._active_pending_prompt_entries[entry.id] = entry
 
     def _record_active_entry(self, entry: ConversationEntry) -> None:
-        if entry.type == "message":
+        if entry.type == "turn_end":
+            self._active_last_turn_end = entry
+        elif entry.type == "message":
             self._record_message_entry(entry)
         elif entry.type == "approval_request":
             raise ConversationIntegrityError(

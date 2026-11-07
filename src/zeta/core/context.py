@@ -432,8 +432,11 @@ class ContextAssembler(ContextMarkerMixin):
             )
             if truncated is not None:
                 return self._save(truncated, False)
+        # Every evicted user is either pinned at its source position or sent to the summary.
         candidates = [
-            item for index, item in enumerate(items[:boundary]) if index != latest_user
+            item
+            for index, item in enumerate(items[:boundary])
+            if pinned_user is None or index != latest_user
         ]
         evicted = await self._evict_context(
             backend=backend,
@@ -616,7 +619,12 @@ class ContextAssembler(ContextMarkerMixin):
             committed_tokens = self._count(committed_messages)
         pinned_user = (
             items[latest_user]
-            if latest_user is not None and latest_user < boundary
+            if latest_user is not None
+            and latest_user < boundary
+            and not any(
+                self._is_completed_assistant(item)
+                for item in items[latest_user + 1 : boundary]
+            )
             else None
         )
         prefix_has_uncompacted_items = any(
@@ -848,12 +856,23 @@ class ContextAssembler(ContextMarkerMixin):
                 else _EvictionPlan("none-fallback")
             )
         view = eviction_view(records, result)
-        view_messages = self._eviction_view_messages(view)
-        proposed = floor_plan.proposed_messages(
-            system_messages,
-            view_messages,
-            None if latest_user_item is None else latest_user_item.message,
+        pinned_message = None
+        if latest_user_item is not None:
+            pinned_message = Message(
+                latest_user_item.message.role,
+                list(latest_user_item.message.content),
+                tool_result=latest_user_item.message.tool_result,
+                metadata={
+                    **latest_user_item.message.metadata,
+                    "source_seq": latest_user_item.entry.seq,
+                },
+            )
+        view_messages = self._eviction_view_messages(
+            view,
+            pinned_message,
+            ([] if floor_plan.message is None else [floor_plan.message]),
         )
+        proposed = floor_plan.proposed_messages(system_messages, view_messages)
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
             for m in view_messages
@@ -874,7 +893,7 @@ class ContextAssembler(ContextMarkerMixin):
             source_start,
             source_end,
             replaces,
-            None if latest_user_item is None else latest_user_item.message,
+            pinned_message,
             tuple(view),
             telemetry,
             floor_plan.floor,
@@ -974,6 +993,22 @@ class ContextAssembler(ContextMarkerMixin):
             item.message.tool_result is None
             or call_indexes.get(item.message.tool_result.tool_call_id, -1) >= boundary
             for item in items[boundary:]
+        )
+
+    @staticmethod
+    def _is_completed_assistant(item: _ContextItem) -> bool:
+        return (
+            item.entry is not None
+            and item.entry.type == "message"
+            and item.message.role is MessageRole.ASSISTANT
+            and (
+                item.message.metadata.get(ASSISTANT_RESPONSE_STATE)
+                == ASSISTANT_RESPONSE_COMPLETED
+                or (
+                    ASSISTANT_RESPONSE_STATE not in item.message.metadata
+                    and not item.message.metadata.get(FAILED_TURN_MARKER)
+                )
+            )
         )
 
     @staticmethod
@@ -1105,7 +1140,7 @@ class ContextAssembler(ContextMarkerMixin):
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1134,7 +1169,7 @@ class ContextAssembler(ContextMarkerMixin):
             items.append(_ContextItem(entry, without_client_delivery_marker(message)))
         for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
         return items
 
     @staticmethod

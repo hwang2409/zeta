@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import stat
@@ -26,8 +27,10 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+pytest_plugins = (
+    ("pytester", "tests.support.fake_backend") if _IS_REPOSITORY_TESTS else ()
+)
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
-os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
 def _is_repository_test_path(path: Path) -> bool:
@@ -38,6 +41,24 @@ def _is_repository_test_path(path: Path) -> bool:
 
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if not _IS_REPOSITORY_TESTS:
+        return
+    root = Path(str(session.config.rootpath)).resolve()
+    if root != _REPOSITORY_ROOT:
+        return
+    import zeta
+
+    imported = Path(zeta.__file__).resolve()
+    source = (root / "src").resolve()
+    if not imported.is_relative_to(source):
+        pytest.exit(
+            f"wrong zeta import: {imported}; expected source under {source}. "
+            f"run uv run pytest from the worktree root or set PYTHONPATH={source}",
+            returncode=2,
+        )
 
 
 def pytest_collection_modifyitems(
@@ -368,9 +389,7 @@ class LiveHomeWriteGuard:
 # These variables control the test harness itself and must survive environment
 # isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
 # change CI behavior.
-_TEST_HARNESS_ENV_ALLOWLIST = frozenset(
-    {"ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT", "ZETA_TEST_PARENT_PID"}
-)
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset({"ZETA_TEST_PARENT_PID"})
 
 
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
@@ -518,6 +537,10 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
+    previous_count = _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
+    if previous_count is not None and len(after) > previous_count:
+        gc.collect()
+        after = _open_file_descriptors()
     _update_fd_owners(after, item.nodeid)
     added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
     grouped = _group_fds_by_path_prefix(added)
@@ -581,7 +604,9 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    gc.collect()
     end = _open_file_descriptors()
+    _update_fd_owners(end, "session-finish")
     _FD_RETAINED_COUNTS.append(len(end))
     start = _FD_START_COUNT if _FD_START_COUNT is not None else len(end)
     growth = len(end) - start
@@ -702,11 +727,14 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
+    from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.memory.auto import AutoMemoryReconciler
+    from zeta.project_registry import ProjectRegistry
     from zeta.runtime.loop import AgentLoop
-    from zeta.storage_format import StorageFormatError, advance, open_writer
+    from zeta.storage_format import open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
@@ -714,6 +742,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     stores: list[ConversationStore] = []
     composed_stores: weakref.WeakSet[ConversationStore] = weakref.WeakSet()
     managers: list[SessionManager] = []
+    memory_reconcilers: list[AutoMemoryReconciler] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
     test_home_leases = {}
@@ -721,6 +750,9 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+    project_registry_init = ProjectRegistry.__init__
+    account_store_init = AccountStore.__init__
+    memory_reconciler_init = AutoMemoryReconciler.__init__
 
     @wraps(loop_init)
     def tracked_loop_init(loop, *args, **kwargs):
@@ -734,18 +766,15 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     registry_close = ToolRegistry.close
 
     def ensure_format(home: Path) -> None:
-        home.mkdir(parents=True, exist_ok=True)
-        if not (home / "storage-format.json").exists():
-            advance(home, expected_epoch=0)
         canonical = home.resolve()
         if canonical not in test_home_leases:
             result = []
-            error = []
+            error: list[BaseException] = []
 
             def open_test_writer() -> None:
                 try:
                     result.append(open_writer(home))
-                except StorageFormatError as exc:
+                except BaseException as exc:  # noqa: BLE001 - preserve thread errors
                     error.append(exc)
 
             thread = threading.Thread(target=open_test_writer)
@@ -785,6 +814,31 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         manager_init(manager, *args, **kwargs)
         managers.append(manager)
 
+    def on_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    @wraps(project_registry_init)
+    def tracked_project_registry_init(registry, *args, **kwargs):
+        if on_event_loop():
+            root = Path(args[0] if args else kwargs["root"])
+            ensure_format(root.parent)
+        project_registry_init(registry, *args, **kwargs)
+
+    @wraps(account_store_init)
+    def tracked_account_store_init(store, *args, **kwargs):
+        home = Path(args[0] if args else kwargs["home"])
+        ensure_format(home)
+        account_store_init(store, *args, **kwargs)
+
+    @wraps(memory_reconciler_init)
+    def tracked_memory_reconciler_init(reconciler, *args, **kwargs):
+        memory_reconciler_init(reconciler, *args, **kwargs)
+        memory_reconcilers.append(reconciler)
+
     @wraps(workspace_init)
     def tracked_workspace_init(workspace, *args, **kwargs):
         session_dir = Path(args[0])
@@ -819,6 +873,14 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam acquires the test home lease before direct registry setup
+    monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_registry_init)
+    # test-contract: seam acquires the test home lease before direct account setup
+    monkeypatch.setattr(AccountStore, "__init__", tracked_account_store_init)
+    # test-contract: seam tracks process-owned resources created across tests
+    monkeypatch.setattr(
+        AutoMemoryReconciler, "__init__", tracked_memory_reconciler_init
+    )
     # test-contract: seam tracks and closes workspace stores created by tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     # test-contract: seam tracks and closes tool registries created by tests
@@ -826,6 +888,11 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
+    for reconciler in reversed(memory_reconcilers):
+        try:
+            await reconciler.close()
+        except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+            pass
     for loop in reversed(loops):
         if not loop._closed:
             try:

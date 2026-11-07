@@ -58,7 +58,6 @@ markers = [
 "src/zeta/core/context.py" = ["I001"]
 "src/zeta/core/hooks.py" = ["BLE001", "I001", "UP041"]
 "src/zeta/core/login_flow.py" = ["I001", "UP041", "UP046", "UP047"]
-"src/zeta/core/loop.py" = ["F822", "I001"]
 "src/zeta/core/session.py" = ["I001", "UP035"]
 "src/zeta/core/tool_dispatch.py" = ["BLE001", "S112"]
 "src/zeta/mcp/server_actor.py" = ["B008", "BLE001", "F401", "I001", "RUF100"]

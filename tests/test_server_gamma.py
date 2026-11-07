@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
+    TIMEOUT,
     _close,
     _connect,
     _event,
@@ -28,7 +30,7 @@ from zeta.core.session import SessionMetadata
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer, image_delivery
 from zeta.server.protocol import FEATURES as SERVER_FEATURES
 
 FEATURES = [
@@ -702,7 +704,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
     heartbeat = asyncio.Event()
     heartbeat_reached_thread = threading.Event()
     decoded_after_heartbeat: list[bool] = []
-    original_decode = ergonomics.base64.b64decode
+    original_decode = image_delivery.base64.b64decode
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
@@ -710,7 +712,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
-    monkeypatch.setattr(ergonomics.base64, "b64decode", record_decode)
+    monkeypatch.setattr(image_delivery.base64, "b64decode", record_decode)
     output = io.BytesIO()
     Image.new("RGB", (3000, 180), "white").save(output, format="PNG")
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
@@ -756,7 +758,7 @@ async def test_cancelled_send_images_publishes_nothing(
     worker_started = threading.Event()
     release_worker = threading.Event()
     worker_finished = threading.Event()
-    original_normalize = ergonomics.normalize_image_bytes
+    original_normalize = image_delivery.normalize_image_bytes
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
@@ -766,7 +768,7 @@ async def test_cancelled_send_images_publishes_nothing(
         finally:
             worker_finished.set()
 
-    monkeypatch.setattr(ergonomics, "normalize_image_bytes", gated_normalize)
+    monkeypatch.setattr(image_delivery, "normalize_image_bytes", gated_normalize)
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -809,7 +811,7 @@ async def test_send_images_publication_is_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     publication_threads: list[int] = []
-    original_publish = ergonomics.write_session_file
+    original_publish = image_delivery.write_session_file
     output = io.BytesIO()
     Image.new("RGB", (3318, 180), "white").save(output, format="PNG")
     oversized = output.getvalue()
@@ -818,7 +820,7 @@ async def test_send_images_publication_is_off_event_loop(
         publication_threads.append(threading.get_ident())
         original_publish(*args, **kwargs)
 
-    monkeypatch.setattr(ergonomics, "write_session_file", record_publish)
+    monkeypatch.setattr(image_delivery, "write_session_file", record_publish)
     backend = FakeBackend([ScriptedTurn([TextContent("seen")])])
     server = _server(
         tmp_path, backend, _launch(tmp_path), provider="anthropic"
@@ -1454,7 +1456,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
         if turn in {0, 2}:
             gate = turn // 2
             entered[gate].set()
-            await release_backend[gate].wait()
+            await asyncio.wait_for(release_backend[gate].wait(), TIMEOUT)
         async for event in original_complete(messages, tool_schemas):
             yield event
 
@@ -1463,6 +1465,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
     reader, writer = await _connect(server)
     started = asyncio.Event()
     release_resume = asyncio.Event()
+    resume = None
     try:
         await _hello(reader, writer, ["session_host_commands"])
         created = await _request(
@@ -1477,7 +1480,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
 
         async def paused_resume(*args, **kwargs):
             started.set()
-            await release_resume.wait()
+            await asyncio.wait_for(release_resume.wait(), TIMEOUT)
             return await real_resume(*args, **kwargs)
 
         monkeypatch.setattr(server.runtime, "resume_session", paused_resume)
@@ -1493,7 +1496,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
                 },
             )
         )
-        await started.wait()
+        await asyncio.wait_for(started.wait(), TIMEOUT)
         server.runtime.opened.store.append_agent_notification(
             "wake-a",
             child_session_path="/wake-a",
@@ -1502,11 +1505,14 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             text="wake a",
         )
         server.control._schedule_background_wake(session_id)
-        await entered[0].wait()
+        assert server.control._turn_task is None
         release_resume.set()
-        assert "result" in (await resume)[-1]
+        assert "result" in (await asyncio.wait_for(resume, TIMEOUT))[-1]
+        await asyncio.wait_for(entered[0].wait(), TIMEOUT)
         release_backend[0].set()
-        approval = await _event(reader, "approval_request")
+        approval = await asyncio.wait_for(
+            _event(reader, "approval_request"), TIMEOUT
+        )
         assert approval["request_id"] == call_a.id
         await _request(
             reader,
@@ -1515,10 +1521,15 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             "approve",
             {"request_id": call_a.id},
         )
-        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-a"
-        await _event(reader, "agent_end")
+        assert (
+            _tool_stdout(
+                await asyncio.wait_for(_event(reader, "tool_end"), TIMEOUT)
+            )
+            == "snapshot-b"
+        )
+        await asyncio.wait_for(_event(reader, "agent_end"), TIMEOUT)
         assert any(
-            isinstance(block, TextContent) and "gamma-a" in block.text
+            isinstance(block, TextContent) and "gamma-b" in block.text
             for message in backend.calls[1][0]
             if message.role is MessageRole.SYSTEM
             for block in message.content
@@ -1532,9 +1543,11 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             text="wake b",
         )
         server.control._schedule_background_wake(session_id)
-        await entered[1].wait()
+        await asyncio.wait_for(entered[1].wait(), TIMEOUT)
         release_backend[1].set()
-        approval = await _event(reader, "approval_request")
+        approval = await asyncio.wait_for(
+            _event(reader, "approval_request"), TIMEOUT
+        )
         assert approval["request_id"] == call_b.id
         await _request(
             reader,
@@ -1543,8 +1556,13 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             "approve",
             {"request_id": call_b.id},
         )
-        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-b"
-        await _event(reader, "agent_end")
+        assert (
+            _tool_stdout(
+                await asyncio.wait_for(_event(reader, "tool_end"), TIMEOUT)
+            )
+            == "snapshot-b"
+        )
+        await asyncio.wait_for(_event(reader, "agent_end"), TIMEOUT)
         assert any(
             isinstance(block, TextContent) and "gamma-b" in block.text
             for message in backend.calls[3][0]
@@ -1552,6 +1570,14 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             for block in message.content
         )
     finally:
+        release_resume.set()
+        for release in release_backend:
+            release.set()
+        if resume is not None:
+            if not resume.done():
+                resume.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(resume, TIMEOUT)
         await _close(server, writer)
 
 

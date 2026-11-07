@@ -227,7 +227,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._unit_locations_cache: dict[int, tuple[str, list[str], list[int]]] = {}
         self._unit_search_cache: dict[int, dict[int, tuple[int, str]]] = {}
         self._unit_search_widths: OrderedDict[int, None] = OrderedDict()
-        self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
         self._prefix_lines = 0
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
@@ -357,7 +356,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._unit_search_cache.clear()
         self._unit_search_widths.clear()
         self._height_indexes.clear()
-        self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()
         self._anchor = None

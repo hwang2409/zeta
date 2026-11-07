@@ -16,13 +16,15 @@ from ..core.session import SessionMetadata, persist_metadata_change
 from ..core.slash import resolve_session_budget
 from ..models.catalog import known_model_names, provider_for_model
 from ..protocol.types import ErrorInfo
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
 
 def validate(model: str, mode: str) -> None:
     if model not in known_model_names() or mode not in {"ask", "allow", "deny"}:
-        raise ProtocolError(-32602, "invalid model or approval mode")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "invalid model or approval mode"
+        )
 
 
 async def apply(
@@ -57,10 +59,14 @@ async def apply(
                 metadata.model,
                 loop.context_assembler.token_budget,
             )
-        if selected_fallback is not None and (
-            provider,
-            selected_model,
-        ) == selected_fallback[:2]:
+        if (
+            selected_fallback is not None
+            and (
+                provider,
+                selected_model,
+            )
+            == selected_fallback[:2]
+        ):
             selected_fallback = None
         account_provider_name = account_provider(provider)
         if (
@@ -84,7 +90,9 @@ async def apply(
 
     def build_backend(metadata: SessionMetadata):
         account = None
-        selected = metadata.selected_accounts.get(account_provider(metadata.provider) or "")
+        selected = metadata.selected_accounts.get(
+            account_provider(metadata.provider) or ""
+        )
         if selected is not None:
             account = AccountId(*selected.split(":", 1))
         return runtime.backend_for_model(
@@ -111,14 +119,15 @@ async def apply(
     approval_mode = authoritative.approval_mode or mode
     runtime.policy.default = ApprovalDecision(approval_mode)
 
+
 async def apply_rpc(runtime: ServerRuntime, model: str, mode: str) -> None:
     try:
         await apply(runtime, model, mode)
     except AccountCredentialLockTimeoutError as exc:
         raise ProtocolError(
-            -32008,
+            ErrorDescriptor.ACCOUNT_LOCK_TIMEOUT,
             str(exc),
-            {"code": exc.code, "retryable": exc.retryable},
+            {"retryable": exc.retryable},
         ) from exc
 
 
