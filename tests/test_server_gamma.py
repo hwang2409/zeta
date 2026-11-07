@@ -167,8 +167,6 @@ async def _create_session_in(tmp_path: Path, cwd: Path) -> str:
         created = await _request(reader, writer, 2, "new_session", {})
         return created[-1]["result"]["session"]["session_id"]
     finally:
-        # Drain the session owner before tearing down the client transport.
-        await server.runtime.close()
         await _close(server, writer)
 
 
