@@ -39,7 +39,8 @@ def hold_provider_login_lock(
 ) -> None:
     with AccountStore(home).provider_login_lock(provider):
         ready.set()
-        release.wait()
+        if not release.wait(timeout=10):
+            raise TimeoutError("provider login lock was not released within 10 seconds")
 
 
 def hold_account_credential_lock(
@@ -50,4 +51,5 @@ def hold_account_credential_lock(
 ) -> None:
     with AccountStore(home).credential_guard(account):
         ready.set()
-        release.wait()
+        if not release.wait(timeout=10):
+            raise TimeoutError("credential lock was not released within 10 seconds")
