@@ -182,6 +182,7 @@ class AgentLoop(
         parent_session_id: str | None = None,
         root_session_dir: Any = None,
         project_registry: Any = None,
+        child_lineage_publisher: ChildLineagePublisher | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         skill_home: Path | None = None,
@@ -204,11 +205,15 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
-        self._child_lineage_publisher = (
-            ChildLineagePublisher(project_registry, self.root_session_dir)
-            if root_project_id is not None and project_registry is not None
-            else None
-        )
+        self._child_lineage_publisher = child_lineage_publisher
+        if (
+            self._child_lineage_publisher is None
+            and root_project_id is not None
+            and project_registry is not None
+        ):
+            self._child_lineage_publisher = ChildLineagePublisher(
+                project_registry, self.root_session_dir
+            )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()

@@ -468,6 +468,7 @@ async def _build_child_loop(
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
             project_registry=loop.project_registry,
+            child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )

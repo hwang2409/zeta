@@ -63,11 +63,14 @@ class StoreWriteMixin:
         self.session_metadata = metadata
         self.root_project_id = metadata.project_id
         self.parent_session_id = metadata.parent_session_id
-        self._child_lineage_publisher = (
-            ChildLineagePublisher(self.project_registry, self.root_session_dir)
-            if metadata.project_id is not None and self.project_registry is not None
-            else None
-        )
+        if (
+            self._child_lineage_publisher is None
+            and metadata.project_id is not None
+            and self.project_registry is not None
+        ):
+            self._child_lineage_publisher = ChildLineagePublisher(
+                self.project_registry, self.root_session_dir
+            )
         self._configure_transcript_index()
         tool_registry = getattr(self, "tool_registry", None)
         if tool_registry is not None:
