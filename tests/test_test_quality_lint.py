@@ -1,3 +1,4 @@
+import difflib
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,16 @@ def _diff(path: str, source: str, added_lines: set[int] | None = None) -> str:
             *hunks,
         ]
     )
+
+
+def _replacement_diff(path: str, before: str, after: str) -> str:
+    body = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    )
+    return f"diff --git a/{path} b/{path}\n" + "".join(body)
 
 
 def _lint(
@@ -214,6 +225,41 @@ def test_internal_contract_rule_rejects_bare_seam_marker(tmp_path: Path) -> None
 
     assert [finding.code for finding in findings] == ["TQ003"]
     assert "seam <reason>" in findings[0].message
+
+
+@pytest.mark.parametrize("layout", ["one-line", "split"])
+@pytest.mark.parametrize("marked", [False, True])
+def test_private_patch_rule_is_layout_independent(
+    tmp_path: Path, layout: str, marked: bool
+) -> None:
+    path = "tests/test_example.py"
+    one_line = '    monkeypatch.setattr(target, "_private", replacement)\n'
+    if layout == "one-line":
+        call = one_line
+        if marked:
+            call = (
+                "    # test-contract: seam no public replacement hook exists\n" + call
+            )
+    else:
+        marker = (
+            "  # test-contract: seam no public replacement hook exists"
+            if marked
+            else ""
+        )
+        call = (
+            "    monkeypatch.setattr(\n"
+            '        target, "_private", replacement\n'
+            f"    ){marker}\n"
+        )
+    source = "def test_case(monkeypatch):\n" + call
+    new_diff = _replacement_diff(path, "def test_case(monkeypatch):\n", source)
+    reflow_diff = _replacement_diff(
+        path, "def test_case(monkeypatch):\n" + one_line, source
+    )
+
+    new_findings = _lint(tmp_path, source, diff=new_diff)
+    assert [finding.code for finding in new_findings] == ([] if marked else ["TQ003"])
+    assert lint_diff(reflow_diff, tmp_path) == []
 
 
 def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:

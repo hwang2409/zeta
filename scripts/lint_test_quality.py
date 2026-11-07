@@ -6,6 +6,7 @@ import ast
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +23,7 @@ DIGEST_ERROR = "assert semantic fields, not a hash"
 CONTRACT_ERROR = (
     "assert through <public interface> or mark the contract with "
     "'# test-contract: complexity <reason>', 'durability <reason>', or "
-    "'seam <reason>' on this line or the line above"
+    "'seam <reason>' on the line above or anywhere in the statement"
 )
 CONTRACT_KINDS = {"complexity", "durability", "latency", "seam"}
 MIN_HANG_GUARD_SECONDS = 10
@@ -103,6 +104,44 @@ def _added_lines(diff: str) -> dict[Path, set[int]]:
             else:
                 changed[changed_path].add(line_number)
     return changed
+
+
+def _base_source(diff: str, path: Path, source: str) -> str | None:
+    current = source.splitlines()
+    previous: list[str] = []
+    cursor = 0
+    selected = False
+    in_hunk = False
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if selected:
+                break
+            in_hunk = False
+            continue
+        if line.startswith("+++ "):
+            selected = _diff_header_path(line[4:]) == path
+            continue
+        if not selected:
+            continue
+        match = hunk.match(line)
+        if match:
+            next_cursor = int(match.group(1)) - 1
+            previous.extend(current[cursor:next_cursor])
+            cursor = next_cursor
+            in_hunk = True
+        elif in_hunk and line.startswith(" "):
+            previous.append(current[cursor])
+            cursor += 1
+        elif in_hunk and line.startswith("+"):
+            cursor += 1
+        elif in_hunk and line.startswith("-"):
+            previous.append(line[1:])
+    if not selected and not previous:
+        return None
+    previous.extend(current[cursor:])
+    ending = "\n" if source.endswith("\n") else ""
+    return "\n".join(previous) + ending
 
 
 def _is_test_path(path: Path) -> bool:
@@ -350,18 +389,61 @@ def _digest_findings(
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ002", DIGEST_ERROR)]
 
 
-def _contract_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
-    violates = (isinstance(node, ast.Call) and _private_patch(node)) or (
-        _mock_contract_assertion(node)
+def _private_patch_identity(node: ast.Call) -> str:
+    return ast.dump(node, include_attributes=False)
+
+
+def _new_private_patch_nodes(tree: ast.AST, base_source: str | None) -> set[int]:
+    previous: Counter[str] = Counter()
+    if base_source is not None:
+        try:
+            base_tree = ast.parse(base_source)
+        except SyntaxError:
+            base_tree = None
+        if base_tree is not None:
+            previous.update(
+                _private_patch_identity(node)
+                for node in ast.walk(base_tree)
+                if isinstance(node, ast.Call) and _private_patch(node)
+            )
+
+    new_nodes: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _private_patch(node):
+            continue
+        identity = _private_patch_identity(node)
+        if previous[identity]:
+            previous[identity] -= 1
+        else:
+            new_nodes.add(id(node))
+    return new_nodes
+
+
+def _node_has_marker(lines: list[str], node: ast.AST, contracts: set[str]) -> bool:
+    end = getattr(node, "end_lineno", node.lineno)
+    return any(
+        _has_marker(lines, line, contracts) for line in range(node.lineno, end + 1)
     )
-    if not violates or _has_marker(
-        lines, node.lineno, {"complexity", "durability", "seam"}
+
+
+def _contract_findings(
+    path: Path, node: ast.AST, lines: list[str], new_private_patches: set[int]
+) -> list[Finding]:
+    violates = (
+        isinstance(node, ast.Call)
+        and _private_patch(node)
+        and id(node) in new_private_patches
+    ) or _mock_contract_assertion(node)
+    if not violates or _node_has_marker(
+        lines, node, {"complexity", "durability", "seam"}
     ):
         return []
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ003", CONTRACT_ERROR)]
 
 
-def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
+def lint_source(
+    path: Path, source: str, added: set[int], base_source: str | None = None
+) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
@@ -378,13 +460,14 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     lines = source.splitlines()
     literal_names = _literal_names(tree)
     serialized_names = _serialized_names(tree)
+    new_private_patches = _new_private_patch_nodes(tree, base_source)
     findings: list[Finding] = []
     for node in ast.walk(tree):
         if not hasattr(node, "lineno") or not _touches_added_line(node, added):
             continue
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
-        findings.extend(_contract_findings(path, node, lines))
+        findings.extend(_contract_findings(path, node, lines, new_private_patches))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -397,7 +480,12 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
         source_path = root / path
         if source_path.is_file():
             findings.extend(
-                lint_source(path, source_path.read_text(encoding="utf-8"), added)
+                lint_source(
+                    path,
+                    source := source_path.read_text(encoding="utf-8"),
+                    added,
+                    _base_source(diff, path, source),
+                )
             )
     return sorted(
         findings, key=lambda item: (str(item.path), item.line, item.column, item.code)
