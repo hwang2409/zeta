@@ -62,12 +62,50 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "memory_operations": frozenset({"operations"}),
     "memory_entry": frozenset({"id", "kind", "content", "created_at", "updated_at"}),
     "account_credential": frozenset({"provider", "name", "sha256"}),
-    "client_delivery_queued": frozenset({"delivery_id", "method", "status"}),
-    "client_delivery_delivered": frozenset({"delivery_id", "method", "status"}),
-    "client_delivery_failed": frozenset({"delivery_id", "method", "status", "reason"}),
-    "client_delivery_queued_steer_acceptance": frozenset(
+    "account_publication_marker": frozenset({"provider", "name", "sha256"}),
+    "project_session_reference": frozenset({"session_id", "role", "created_at"}),
+    "memory_state_root": frozenset({"format", "entries", "sources"}),
+    "memory_missing_entry": frozenset({"id", "missing"}),
+    "memory_source": frozenset({"id", "kind", "uri", "digest"}),
+    "memory_migration_source": frozenset({"path", "digest", "format"}),
+    "memory_operation_receipt": frozenset({"operation_id", "status", "error"}),
+    "remote_memory_sync_state": frozenset({"version", "entries", "conflicts"}),
+    "remote_memory_sync_conflict": frozenset({"id", "local", "remote"}),
+    "entry_sync_state": frozenset({"version", "entries", "conflicts", "transitions"}),
+    "entry_sync_schema": frozenset({"version", "kind", "fields"}),
+    "entry_sync_conflict": frozenset({"id", "local", "remote", "resolution"}),
+    "entry_sync_transition": frozenset({"id", "from", "to", "at"}),
+    "entry_sync_resolution_candidate": frozenset({"id", "value", "source"}),
+    "background_output_journal_commit": frozenset({"task_id", "offset", "digest", "committed_at"}),
+    "client_delivery_send_acceptance": frozenset(
+        {"delivery_id", "method", "status", "outcome"}
+    ),
+    "client_delivery_steer_acceptance": frozenset(
+        {"delivery_id", "method", "status", "outcome"}
+    ),
+    "client_delivery_queued_steer_acceptance_message": frozenset(
+        {"delivery_id", "method", "status", "outcome", "accepted_message"}
+    ),
+    "client_delivery_delivered_transition": frozenset(
+        {"delivery_id", "method", "status"}
+    ),
+    "client_delivery_dropped_transition": frozenset(
         {"delivery_id", "method", "status", "reason"}
     ),
+    "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
+    "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),
+    "pending_queue_closed": frozenset(),
+    "fact_floor_root": frozenset({"version", "facts"}),
+    "fact_floor_aggregate": frozenset({"kind", "count", "first_seq", "last_seq"}),
+    "fact_floor_record": frozenset({"kind", "value"}),
+    "tool_result_text": frozenset({"type", "text"}),
+    "tool_result_image": frozenset({"type", "source"}),
+    "tool_result_resource": frozenset({"type", "resource"}),
+    "tool_result_resource_contents": frozenset({"uri", "mimeType", "text", "blob"}),
+    "tool_result_annotations": frozenset({"audience", "priority", "lastModified"}),
+    "attention_record": frozenset({"id", "kind", "title", "body", "created_at", "read_at"}),
+    "attention_fork_meta": frozenset({"source_id", "fork_id", "created_at", "reason"}),
+    "storage_manifest": frozenset({"writer_epoch"}),
 }
 
 
