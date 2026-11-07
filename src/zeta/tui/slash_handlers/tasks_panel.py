@@ -40,46 +40,17 @@ class BackgroundTasksMixin:
         self._tasks_restore_text = ""
         self._tasks_restore_cursor = 0
 
-    def _open_overlay_from_submit(self, value: str) -> bool:
-        """Open the overlay a bare ``/status``, ``/mcp``, or ``/tasks`` names.
-
-        A submitted overlay command is consumed, not a draft to restore when the
-        transient view closes.
-        """
-
-        session = self._active_session
-        command = value.strip()
-        if not isinstance(session, FullScreenPromptSession):
-            return False
-        if command not in {"/status", "/mcp", "/tasks", "/decisions"}:
-            return False
-        session.default_buffer.reset()
-        self._draft.clear()
-        if command == "/mcp":
-            self.open_mcp_manager(restore_composer=False)
-        elif command == "/tasks":
-            self.open_tasks_panel(restore_composer=False)
-        elif command == "/decisions":
-            self.open_decisions_panel(restore_composer=False)
-        else:
-            self.open_status_card(restore_composer=False)
-        return True
-
     @property
     def tasks_panel_active(self) -> bool:
         return self._tasks_panel_open and self._full_screen_active()
 
-    def open_tasks_panel(self, *, restore_composer: bool = True) -> None:
+    def open_tasks_panel(self) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        if restore_composer:
-            self._tasks_restore_text = buffer.text
-            self._tasks_restore_cursor = buffer.cursor_position
-        else:
-            self._tasks_restore_text = ""
-            self._tasks_restore_cursor = 0
+        self._tasks_restore_text = buffer.text
+        self._tasks_restore_cursor = buffer.cursor_position
         self._sync_tasks_snapshot()
         self._tasks_panel_control.set_lines(self._tasks_panel.render_lines())
         self._tasks_panel_open = True
@@ -223,7 +194,10 @@ class BackgroundTasksMixin:
     # -- text fallback (non-full-screen) ------------------------------------
 
     def slash_tasks(self, args: str) -> str:
-        del args
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_tasks_panel()
+            return ""
         registry = self.loop.tool_registry.background_tasks
         tasks = registry.snapshot()
         if not tasks:
