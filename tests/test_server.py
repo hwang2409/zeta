@@ -4974,7 +4974,10 @@ async def test_close_kill_cause_reaches_live_serve_event(
                     asyncio.to_thread(admission_held_past_old_deadline.wait, 10), 10
                 )
                 release_admission.set()
-            await asyncio.wait_for(close_task, 10)
+            close_result = await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
+            assert close_result == [(task_id,)]
         finally:
             release_admission.set()
             if not close_task.done():

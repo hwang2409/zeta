@@ -546,24 +546,65 @@ async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_close_uses_archive_when_notification_store_is_closed(
+async def test_task_exit_recovers_original_receipt_after_store_closes(
     tmp_path: Path,
 ) -> None:
-    registry = BackgroundTaskRegistry()
+    from tests.support.fake_backend import FakeBackend
 
-    async def closed_store(_item: TaskExitInput) -> None:
-        raise ValueError("session store is closed")
-
-    registry.set_notification_sink(closed_store)
+    store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    tools.background_tasks.set_notification_sink(
+        lambda item: flow.produce(_task_notification(item))
+    )
+    task_id, _ = await tools.background_tasks.start("sleep 30", tmp_path)
+    cause = "test closed-store kill cause"
     try:
-        task_id, _ = await registry.start("sleep 30", tmp_path)
-        registry.begin_shutdown("test shutdown cause")
-        assert await asyncio.wait_for(registry.close(), 10) == (task_id,)
-        info = registry.snapshot()[0]
-        assert info.note == "test shutdown cause"
-        assert info.terminal_phase == "task_kill"
+        store.close()
+        await tools.background_tasks.kill(
+            task_id, cause=cause, tui_presented=True
+        )
     finally:
-        await asyncio.wait_for(registry.close(), 10)
+        await asyncio.wait_for(tools.close(), 10)
+
+    archived_rows = json.loads(
+        (store.session_dir / "background_tasks.json").read_text()
+    )
+    assert archived_rows[0]["receipt_pending"] is True
+    assert archived_rows[0]["note"] == cause
+    assert archived_rows[0]["terminal_phase"] == "task_kill"
+    assert archived_rows[0]["tui_presented"] is True
+
+    resumed_store = ConversationStore(
+        tmp_path / "session", session_id=store.session_id
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        resumed_store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        await loop.activate()
+        receipts = [
+            entry
+            for entry in resumed_store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert len(receipts) == 1
+        assert receipts[0].data["task_id"] == task_id
+        assert receipts[0].data["note"] == cause
+        assert receipts[0].data["background_phase"] == "task_kill"
+        assert resumed_store.is_agent_notification_presented_to_tui(receipts[0].id)
+        rows = json.loads(
+            (resumed_store.session_dir / "background_tasks.json").read_text()
+        )
+        assert rows[0]["receipt_pending"] is False
+    finally:
+        await loop.close()
+        resumed_store.close()
 
 
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
@@ -1261,7 +1302,9 @@ async def test_background_stdin_serializes_writes_and_bounds_input(tmp_path: Pat
         tmp_path,
     )
     parts = [f"{index:03d}" for index in range(20)]
-    await asyncio.gather(*(tasks.input(task_id, part) for part in parts))
+    await asyncio.wait_for(
+        asyncio.gather(*(tasks.input(task_id, part) for part in parts)), 10
+    )
     await tasks.input(task_id, eof=True)
     await _wait_for_exit(tasks, task_id)
     assert (await tasks.output(task_id))["output"] == "".join(parts)

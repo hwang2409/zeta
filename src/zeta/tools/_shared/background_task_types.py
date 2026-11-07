@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Literal
 
@@ -28,6 +29,38 @@ class BackgroundTaskShutdownNotice:
 
 
 BackgroundTaskNoticeSinkValue = BackgroundTaskNotice | BackgroundTaskShutdownNotice
+
+
+@dataclass(slots=True)
+class _BackgroundRecord:
+    task_id: str
+    command: str
+    pid: int
+    process: asyncio.subprocess.Process | None = None
+    stdin: asyncio.StreamWriter | None = None
+    stdin_lock: asyncio.Lock | None = None
+    stdin_closed: bool = False
+    output: bytearray | None = None
+    total_bytes: int = 0
+    total_lines: int = 0
+    base_cursor: int = 0
+    started_at: float | None = None
+    ended_at: float | None = None
+    running: bool = True
+    exit_code: int | None = None
+    note: str | None = None
+    log_path: str | None = None
+    remove_log_on_archive: bool = False
+    log_fd: int | None = None
+    storage_lock: asyncio.Lock | None = None
+    notify_on_exit: bool = True
+    receipt_pending: bool = False
+    tui_presented: bool = False
+    owner: str = "run_background"
+    terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (
+        None
+    )
+    monitor: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
