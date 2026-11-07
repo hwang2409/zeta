@@ -661,11 +661,17 @@ work. The result contains `cleared`, the number of removed messages.
 
 ### `status`
 
-Params: none. The result contains `session` (full metadata or `null`), `state`
-(`idle`, `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`,
-and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
-and `delegated`. Delegated approvals also have `agent_instance_id`, the child
-agent instance that owns the approval.
+Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
+the result includes `connection_setup_counts`, an array of objects with
+`provider` (string), `model` (string), and `count` (integer). Each object reports
+the number of HTTP clients created by one completion backend. The field is
+omitted when the parameter is absent or false.
+
+The result contains `session` (full metadata or `null`), `state` (`idle`,
+`running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
+`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
+`delegated`. Delegated approvals also have `agent_instance_id`, the child agent
+instance that owns the approval.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
