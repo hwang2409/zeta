@@ -170,6 +170,9 @@ def _notification_kwargs(**fields: object) -> dict[str, object]:
     return values
 
 
+from tests.support.owned import await_or_fail
+
+
 @pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
 def test_append_rejects_invalid_killed_task_fields(
     tmp_path: Path, fields: dict[str, object]
@@ -1411,7 +1414,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     assert await asyncio.to_thread(snapshot_ready.wait, 2)
     store.append_message(message(MessageRole.ASSISTANT, "owner"))
     release_snapshot.set()
-    await write
+    await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
@@ -1441,7 +1444,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
     assert await asyncio.to_thread(worker_ready.wait, 2)
     store.append_message(message(MessageRole.ASSISTANT, "owner"))
     release_worker.set()
-    await write
+    await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
@@ -1483,7 +1486,7 @@ async def test_async_publish_matches_fresh_load_after_each_owner_worker_race(
         assert await asyncio.to_thread(worker_ready.wait, 2)
         store.append_message(message(MessageRole.ASSISTANT, f"owner {index}"))
         release_worker.set()
-        await write
+        await await_or_fail(write, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
         assert store._detach_log_state() == fresh._detach_log_state()
@@ -1530,7 +1533,7 @@ async def test_durable_publish_preserves_newer_owner_state(
         )
 
     release_commit.set()
-    await write
+    await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
@@ -1583,7 +1586,7 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
         )
 
     release_snapshot.set()
-    await refresh
+    await await_or_fail(refresh, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
@@ -1708,10 +1711,12 @@ async def test_off_loop_refresh_cancellation_is_prompt(
     try:
         assert refresh.done()
         with pytest.raises(asyncio.CancelledError):
-            await refresh
+            await await_or_fail(refresh, what="test await")
     finally:
         release.set()
-        await asyncio.gather(refresh, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(refresh, return_exceptions=True), what="test await"
+        )
 
 
 @pytest.mark.asyncio
@@ -1733,16 +1738,19 @@ async def test_async_writes_reuse_one_detached_store_open(
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "__init__", count_open)
 
-    await asyncio.gather(
-        store._commit_method_async(store.append_pending_prompt, "follow up"),
-        store._commit_method_async(
-            store.append_agent_notification,
-            "root:1",
-            child_session_path="/child",
-            description="child",
-            status="completed",
-            text="done",
+    await await_or_fail(
+        asyncio.gather(
+            store._commit_method_async(store.append_pending_prompt, "follow up"),
+            store._commit_method_async(
+                store.append_agent_notification,
+                "root:1",
+                child_session_path="/child",
+                description="child",
+                status="completed",
+                text="done",
+            ),
         ),
+        what="test await",
     )
 
     assert open_count == 1
@@ -1786,14 +1794,21 @@ async def test_async_write_failure_discards_writer_before_next_write(
 async def test_mixed_async_writes_keep_fifo_order(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="persistent-fifo")
 
-    await asyncio.gather(
-        store.append_message_async(
-            with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER)
+    await await_or_fail(
+        asyncio.gather(
+            store.append_message_async(
+                with_message_origin(
+                    message(MessageRole.USER, "first"), MessageOrigin.USER
+                )
+            ),
+            store._commit_method_async(store.append_pending_prompt, "second"),
+            store.append_message_async(
+                with_message_origin(
+                    message(MessageRole.USER, "third"), MessageOrigin.USER
+                )
+            ),
         ),
-        store._commit_method_async(store.append_pending_prompt, "second"),
-        store.append_message_async(
-            with_message_origin(message(MessageRole.USER, "third"), MessageOrigin.USER)
-        ),
+        what="test await",
     )
 
     assert [entry.seq for entry in store._entries] == [1, 2, 3]
@@ -1817,7 +1832,7 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
     )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="test await")
     assert not started.is_set()
     assert store._entries == []
 
@@ -1842,7 +1857,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         task.cancel()
         release_fsync.set()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await await_or_fail(task, what="test await")
 
     assert store._entries
 
@@ -2468,7 +2483,7 @@ async def test_async_append_defers_repeated_cancellation_until_fsync(
         assert not append.done()
         release_fsync.set()
         with pytest.raises(asyncio.CancelledError):
-            await append
+            await await_or_fail(append, what="test await")
 
     assert [item.content[0].text for item in store.messages()] == ["durable"]
 
@@ -2502,7 +2517,7 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
         try:
             assert not close_finished.wait(timeout=0.1)
             release_fsync.set()
-            await append
+            await await_or_fail(append, what="test await")
         finally:
             release_fsync.set()
             close_thread.join(timeout=2)
@@ -2535,7 +2550,7 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(
         release.start()
         try:
             store.close()
-            await append
+            await await_or_fail(append, what="test await")
         finally:
             release_fsync.set()
             release.join(timeout=2)

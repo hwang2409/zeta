@@ -89,7 +89,11 @@ class AsyncDurableWritesMixin:
             raise ConversationIntegrityError(
                 "resident generation changed before committed delta installation"
             )
-        entries = list(copy.deepcopy(delta.entries_to_install))
+        entries = (
+            list(delta.entries_to_install)
+            if delta._resident_patch.replace_entries
+            else list(copy.deepcopy(delta.entries_to_install))
+        )
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
             self._entries = entries
@@ -126,7 +130,10 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
             self._publish_entries_installed(delta.entries_to_install)
-        if isinstance(command, _MethodMutation) and command.persisted_callback is not None:
+        if (
+            isinstance(command, _MethodMutation)
+            and command.persisted_callback is not None
+        ):
             command.persisted_callback()
         return delta
 
@@ -230,6 +237,8 @@ class AsyncDurableWritesMixin:
             cancelled_before_write.set,
             lambda: not cancelled_before_write.write_started.is_set(),
         )
+        task = asyncio.current_task()
+        cancelled = cancelled or (task is not None and task.cancelling() > 0)
         with self._durable_write_condition:
             if not self._closing and not self._closed:
                 self._install_committed_delta(delta)
@@ -238,7 +247,10 @@ class AsyncDurableWritesMixin:
             self._publish_entries_installed("reset")
         elif delta.entries_to_install:
             self._publish_prepared_entries_installed(delta.entries_to_install)
-        if isinstance(command, _MethodMutation) and command.persisted_callback is not None:
+        if (
+            isinstance(command, _MethodMutation)
+            and command.persisted_callback is not None
+        ):
             command.persisted_callback()
         if cancelled:
             raise asyncio.CancelledError

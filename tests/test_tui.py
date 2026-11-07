@@ -573,6 +573,9 @@ async def _background_event_transcript_count(
     return visible.count(needle), visible
 
 
+from tests.support.owned import await_or_fail
+
+
 @pytest.mark.asyncio
 async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> None:
     app = TUIApp(
@@ -823,7 +826,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await transcript
+        count, rendered = await await_or_fail(transcript, what="test await")
         assert count == 1, rendered
         markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
         assert "notification_tui_presented" in markers
@@ -831,7 +834,9 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         if not transcript.done():
             transcript.cancel()
-            await asyncio.gather(transcript, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(transcript, return_exceptions=True), what="test await"
+            )
 
 
 @pytest.mark.asyncio
@@ -11733,9 +11738,7 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
             await finish_transcript_cleanup(
                 tasks, close, deadline=deadline, label=label
             )
-            transcript_cleanup_tasks.update(
-                agent_shutdown._LATE_CLEANUP_TASKS - before
-            )
+            transcript_cleanup_tasks.update(agent_shutdown._LATE_CLEANUP_TASKS - before)
         finally:
             transcript_handed_off.set()
 

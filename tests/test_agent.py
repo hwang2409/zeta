@@ -338,6 +338,9 @@ def _approval_capability(name: str, arguments: dict[str, object]) -> ResolvedCap
     )
 
 
+from tests.support.owned import await_or_fail
+
+
 @pytest.mark.parametrize("error_event", [False, True])
 @pytest.mark.asyncio
 async def test_context_overflow_compacts_and_retries_same_turn(
@@ -3596,16 +3599,23 @@ async def _run_post_cap_tool_cycle(
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    exhausted_wait = asyncio.create_task(backend.post_cap_exhausted.wait())
-    terminal_wait = asyncio.create_task(terminal_published.wait())
-    done, pending = await asyncio.wait(
-        {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+    exhausted_wait = asyncio.create_task(
+        asyncio.wait_for(backend.post_cap_exhausted.wait(), 10)
+    )
+    terminal_wait = asyncio.create_task(asyncio.wait_for(terminal_published.wait(), 10))
+    done, pending = await await_or_fail(
+        asyncio.wait(
+            {exhausted_wait, terminal_wait}, return_when=asyncio.FIRST_COMPLETED
+        ),
+        what="test await",
     )
     assert exhausted_wait in done
     assert terminal_wait not in done
     for task in pending:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(*pending, return_exceptions=True), what="test await"
+    )
 
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     if send_fresh_prompt:
@@ -3618,7 +3628,7 @@ async def _run_post_cap_tool_cycle(
             )
             is None
         )
-        await backend.fresh_prompt_seen.wait()
+        await await_or_fail(backend.fresh_prompt_seen.wait(), what="test await")
 
     state = next(
         state
@@ -3626,9 +3636,9 @@ async def _run_post_cap_tool_cycle(
         if deadlines._wakes[id(state)][1] == child_handle
     )
     deadlines.expire_child_bound(state)
-    await terminal_published.wait()
+    await await_or_fail(terminal_published.wait(), what="test await")
     backend.release_grandchild.set()
-    await owner.wait()
+    await await_or_fail(owner.wait(), what="test await")
     await loop.close()
     return backend
 
@@ -3680,7 +3690,7 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     async def events() -> AsyncIterator[StreamEvent]:
         try:
             model_started.set()
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="test await")
         except asyncio.CancelledError:
             task.running = False
             registry.running_count = 0
@@ -3696,9 +3706,9 @@ async def test_finish_gate_model_timeout_defers_task_exit_during_cancellation(
     model_turn = asyncio.create_task(
         state.run_model_turn(child_loop, events(), consume)
     )
-    await model_started.wait()
+    await await_or_fail(model_started.wait(), what="test await")
     deadlines.expire_model_bound(state)
-    result = await model_turn
+    result = await await_or_fail(model_turn, what="test await")
 
     assert result is None
     store.close()
@@ -3989,11 +3999,11 @@ async def test_finish_gate_real_transport_close_propagates_caller_cancellation(
     model_turn = asyncio.create_task(
         state.run_model_turn(child_loop, transport.events(), _consume_one_event)
     )
-    await transport.response_started.wait()
+    await await_or_fail(transport.response_started.wait(), what="test await")
 
     model_turn.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await model_turn
+        await await_or_fail(model_turn, what="test await")
     await asyncio.sleep(0)
 
     assert transport.response_closed.is_set()
@@ -4037,7 +4047,7 @@ async def test_finish_gate_task_deadline_bounds_stream_close(
         async def aclose(self) -> None:
             close_started.set()
             try:
-                await asyncio.Event().wait()
+                await await_or_fail(asyncio.Event().wait(), what="test await")
             except asyncio.CancelledError:
                 close_cancelled.set()
                 raise
@@ -4050,9 +4060,9 @@ async def test_finish_gate_task_deadline_bounds_stream_close(
     model_turn = asyncio.create_task(
         state.run_model_turn(child_loop, Events(), consume)
     )
-    await close_started.wait()
+    await await_or_fail(close_started.wait(), what="test await")
     deadlines.expire(state)
-    result = await model_turn
+    result = await await_or_fail(model_turn, what="test await")
 
     assert close_cancelled.is_set()
     assert result is not None
@@ -6268,7 +6278,7 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     async def wait_forever(arguments: dict[str, object], abort_signal) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()
+        await await_or_fail(abort_signal.wait(), what="test await")
         return "stopped"
 
     backend = FakeBackend(
@@ -6297,7 +6307,7 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
         except TimeoutError:
             pytest.fail("child turn never started")
         loop.abort()
-        await task
+        await await_or_fail(task, what="test await")
     finally:
         if not task.done():
             task.cancel()
@@ -6727,7 +6737,9 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
             else:
                 blocks = [TextContent("child a done")]
         elif prompt == "child-b":
-            release_wait = asyncio.create_task(self.release_child_b.wait())
+            release_wait = asyncio.create_task(
+                asyncio.wait_for(self.release_child_b.wait(), 10)
+            )
             try:
                 await asyncio.wait_for(release_wait, 10)
             except TimeoutError as exc:
@@ -6737,7 +6749,10 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
             finally:
                 if not release_wait.done():
                     release_wait.cancel()
-                await asyncio.gather(release_wait, return_exceptions=True)
+                await await_or_fail(
+                    asyncio.gather(release_wait, return_exceptions=True),
+                    what="test await",
+                )
             blocks = [TextContent("child b done")]
         else:
             blocks = [TextContent("done")]
@@ -9793,7 +9808,7 @@ async def test_cancel_after_notification_ack_commit_keeps_completion_visible(
     next_event.cancel()
     release_ack.set()
     with pytest.raises(asyncio.CancelledError):
-        await next_event
+        await await_or_fail(next_event, what="test await")
     await stream.aclose()
 
     assert store.agent_notifications() == []
@@ -11219,7 +11234,7 @@ class _TaskFinishGateBackend(CompletionBackend):
             self.task_exited.set()
         if last_user == "grandchild prompt":
             self.grandchild_started.set()
-            await self.release_grandchild.wait()
+            await await_or_fail(self.release_grandchild.wait(), what="test await")
             blocks: list = [TextContent("grandchild evidence")]
         elif last_user == "start":
             blocks = [
@@ -11283,7 +11298,7 @@ class _TaskFinishGateBackend(CompletionBackend):
                 self.gate_seen.set()
                 if self.gate_delay:
                     try:
-                        await asyncio.Event().wait()
+                        await await_or_fail(asyncio.Event().wait(), what="test await")
                     except asyncio.CancelledError:
                         self.gate_delay_cancelled.set()
                         raise
@@ -11326,7 +11341,7 @@ class _TaskFinishGateBackend(CompletionBackend):
         elif started:
             if self.pause_before_gate:
                 self.child_turn_paused.set()
-                await self.release_child_turn.wait()
+                await await_or_fail(self.release_child_turn.wait(), what="test await")
             blocks = [TextContent("premature child answer")]
         else:
             blocks = [TextContent("root complete")]
@@ -11392,19 +11407,19 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await backend.task_started.wait()
-    await backend.gate_seen.wait()
+    await await_or_fail(backend.task_started.wait(), what="test await")
+    await await_or_fail(backend.gate_seen.wait(), what="test await")
     assert len(deadlines.started) == 1
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_model_bound(state)
-    await backend.gate_delay_cancelled.wait()
+    await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
     release.touch()
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
-    await backend.task_exited.wait()
-    await backend.task_output_read.wait()
-    await run
+    await await_or_fail(backend.task_exited.wait(), what="test await")
+    await await_or_fail(backend.task_output_read.wait(), what="test await")
+    await await_or_fail(run, what="test await")
     await loop.close()
 
 
@@ -11432,20 +11447,20 @@ async def test_finish_gate_task_with_pending_subagent_keeps_task_past_model_boun
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await backend.task_started.wait()
-    await backend.gate_seen.wait()
+    await await_or_fail(backend.task_started.wait(), what="test await")
+    await await_or_fail(backend.gate_seen.wait(), what="test await")
     assert len(deadlines.started) == 1
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_model_bound(state)
-    await backend.gate_delay_cancelled.wait()
+    await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
     release.touch()
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
-    await backend.task_exited.wait()
-    await backend.task_output_read.wait()
+    await await_or_fail(backend.task_exited.wait(), what="test await")
+    await await_or_fail(backend.task_output_read.wait(), what="test await")
     backend.release_grandchild.set()
-    await run
+    await await_or_fail(run, what="test await")
     await loop.close()
 
 
@@ -11475,18 +11490,18 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
     )
 
     try:
-        await backend.child_turn_paused.wait()
+        await await_or_fail(backend.child_turn_paused.wait(), what="test await")
         assert deadlines.started == []
         owner.finish_gate_task_timeout = 0.08
         backend.release_child_turn.set()
-        await backend.task_started.wait()
-        await backend.gate_seen.wait()
+        await await_or_fail(backend.task_started.wait(), what="test await")
+        await await_or_fail(backend.gate_seen.wait(), what="test await")
         assert len(deadlines.started) == 1
         state, configured_timeout = deadlines.started[0]
         assert configured_timeout == 0.08
 
         deadlines.expire(state)
-        await run
+        await await_or_fail(run, what="test await")
         notification = await _completion_after_publication(store, completion_published)
         assert "finish-gate task safety bound expired" in notification.data["text"]
         assert notification.data.get("killed_task_ids")
@@ -11494,7 +11509,9 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         try:
             await loop.close()
         finally:
-            await asyncio.gather(run, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True), what="test await"
+            )
 
 
 @pytest.mark.asyncio
@@ -11525,8 +11542,8 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
     )
 
     try:
-        await backend.task_started.wait()
-        await backend.gate_seen.wait()
+        await await_or_fail(backend.task_started.wait(), what="test await")
+        await await_or_fail(backend.gate_seen.wait(), what="test await")
         assert len(deadlines.started) == 1
         state, configured_timeout = deadlines.started[0]
         assert configured_timeout == 1
@@ -11543,7 +11560,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
             is None
         )
 
-        await backend.follow_up_processed.wait()
+        await await_or_fail(backend.follow_up_processed.wait(), what="test await")
         assert state.task_deadline == original_deadline
         deadlines.expire(state)
         notification = await _completion_after_publication(store, completion_published)
@@ -11553,7 +11570,9 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
         try:
             await loop.close()
         finally:
-            await asyncio.gather(run, return_exceptions=True)
+            await await_or_fail(
+                asyncio.gather(run, return_exceptions=True), what="test await"
+            )
 
 
 @pytest.mark.asyncio
@@ -11585,8 +11604,8 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
 
-    await backend.task_started.wait()
-    await backend.gate_seen.wait()
+    await await_or_fail(backend.task_started.wait(), what="test await")
+    await await_or_fail(backend.gate_seen.wait(), what="test await")
     assert len(deadlines.started) == 1
     child_handle, marker = next(iter(store.agent_children().items()))
     child_path = Path(marker["child_session_path"])
@@ -11607,7 +11626,9 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
             ),
         )
         if index == 0:
-            await backend.noise_notification_processed.wait()
+            await await_or_fail(
+                backend.noise_notification_processed.wait(), what="test await"
+            )
         assert not [
             entry
             for entry in store.agent_notifications(pending_only=False)
@@ -11618,9 +11639,9 @@ async def test_finish_gate_turn_cap_does_not_kill_running_task(
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
-    await backend.task_exited.wait()
-    await backend.task_output_read.wait()
-    await run
+    await await_or_fail(backend.task_exited.wait(), what="test await")
+    await await_or_fail(backend.task_output_read.wait(), what="test await")
+    await await_or_fail(run, what="test await")
     await loop.close()
 
 
@@ -15477,16 +15498,16 @@ async def test_recovery_refresh_never_runs_on_event_loop(
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     owner_thread = threading.get_ident()
     refresh_threads: list[int] = []
-    original_load = ConversationStore._load_detached_store_state
+    original_before = ConversationStore._before_committed_mutation
 
-    def guarded_refresh_load(target: ConversationStore):
+    def guarded_refresh_load(target: ConversationStore) -> None:
         refresh_threads.append(threading.get_ident())
         if threading.get_ident() == owner_thread:
             raise RuntimeError("refresh load ran on event-loop thread")
-        return original_load(target)
+        original_before(target)
 
     monkeypatch.setattr(
-        ConversationStore, "_load_detached_store_state", guarded_refresh_load
+        ConversationStore, "_before_committed_mutation", guarded_refresh_load
     )
 
     await loop.activate()

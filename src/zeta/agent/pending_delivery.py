@@ -173,6 +173,7 @@ class StepDeliveryFlow:
             return
         async with self._initialize_lock:
             if not self._initialized:
+                self.store._prepare_durable_writer_snapshot()
                 await self.store._commit_method_async(
                     self.store._warm_step_delivery_writer
                 )

@@ -106,6 +106,9 @@ class _FailingBackend(CompletionBackend):
             yield StreamEvent(StreamEventType.MESSAGE_START)
 
 
+from tests.support.owned import await_or_fail
+
+
 @pytest.mark.asyncio
 async def test_session_history_fidelity_projects_bounded_tool_data_over_socket(
     tmp_path: Path,
@@ -632,7 +635,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         assert not announcement.done()
 
         release.set()
-        await announcement
+        await await_or_fail(announcement, what="test await")
         rows = await _history(reader, writer, session_id)
         assert [
             row["data"]["reason"]

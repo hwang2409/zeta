@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from ..session_execution import SessionOwnedError
 from ..session_files import read_session_file, session_directory
+from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
 from . import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
 from .entry_types import sent_message_receipts
-from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
     from ..store._store import ConversationStore
@@ -444,9 +444,7 @@ def _execute_method[ResultT](
         generation_after=store.conversation_generation,
         committed_entries=copy.deepcopy(entries),
         entries_to_install=copy.deepcopy(entries),
-        _resident_patch=_ResidentPatch(
-            changed_patch, expected_patch, replace_entries
-        ),
+        _resident_patch=_ResidentPatch(changed_patch, expected_patch, replace_entries),
         result=result,
         log_cursor=_cursor(store),
         dedupe_key=None,

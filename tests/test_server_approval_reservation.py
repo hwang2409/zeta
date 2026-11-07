@@ -123,6 +123,9 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
     )
 
 
+from tests.support.owned import await_or_fail
+
+
 @pytest.mark.asyncio
 async def test_approval_lifecycle_transition_rejects_unknown_event(
     tmp_path: Path,
@@ -1568,7 +1571,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         if competing_event != "none":
             original_resolve(call.id, "abort", reason=reasons[competing_event])
         release.set()
-        frames = await rpc
+        frames = await await_or_fail(rpc, what="test await")
         await server.control.wait_for_approval_settlement()
 
         resolution = store.approval_resolution_data(call.id)
@@ -1918,7 +1921,9 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace = server.control._grace_task
         assert grace is not None
         grace.cancel()
-        await asyncio.gather(grace, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(grace, return_exceptions=True), what="test await"
+        )
         server.approval_reconnect_grace = 0
         gate.install(monkeypatch)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())

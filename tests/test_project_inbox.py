@@ -15,6 +15,7 @@ import pytest
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
@@ -1338,7 +1339,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await first_turn
+            await await_or_fail(first_turn, what="test await")
         # test-contract: seam releases the next turn from the injected pause
         monkeypatch.setattr(store, "_run_committed_mutation", original_durable_write)
         await _collect_turn(loop, "second")
