@@ -11,6 +11,8 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import bash as bash_tool
+from zeta.tools._shared import process as process_tools
 
 
 async def _execute(registry: ToolRegistry, call: ToolCall) -> dict[str, object]:
@@ -83,6 +85,72 @@ async def test_shell_replacement_between_verification_and_spawn_fails_closed(
         assert _fd_count() == baseline
     finally:
         await asyncio.wait_for(registry.close(), 10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["bash", "run_background"])
+async def test_shell_removal_after_fd_bind_fails_then_next_call_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> None:
+    registry: ToolRegistry | None = None
+    session_cwd = tmp_path / "parent" / "worktree"
+    replacement_target = tmp_path / "replacement-target"
+    replacement_marker = replacement_target / "marker"
+    spawn_module = bash_tool if route == "bash" else process_tools
+    original_spawn = spawn_module.create_subprocess_shell_in_fd
+
+    try:
+        session_cwd.mkdir(parents=True)
+        replacement_target.mkdir()
+        registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+
+        async def replace_after_bind(
+            command: str, directory_fd: int, **kwargs: object
+        ) -> asyncio.subprocess.Process:
+            shutil.rmtree(session_cwd)
+            session_cwd.symlink_to(replacement_target, target_is_directory=True)
+            return await original_spawn(command, directory_fd, **kwargs)
+
+        monkeypatch.setattr(
+            spawn_module, "create_subprocess_shell_in_fd", replace_after_bind
+        )
+        first = await _execute_shell_route(registry, route, "pwd; touch marker")
+
+        if route == "bash":
+            structured = first["structuredContent"]
+            assert first["isError"] is True or structured["exit_code"] != 0
+            assert structured["stdout"] or structured["stderr"]
+        else:
+            task_id = first["structuredContent"]["task_id"]
+            status = await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
+            output = await asyncio.wait_for(registry.background_tasks.output(task_id), 10)
+            assert status["exit_code"] != 0
+            assert output["output"]
+        assert replacement_marker.exists() is False
+
+        monkeypatch.setattr(
+            spawn_module, "create_subprocess_shell_in_fd", original_spawn
+        )
+        session_cwd.unlink()
+        recovered = await _execute_shell_route(registry, route, "pwd")
+        assert recovered["isError"] is False
+        if route == "bash":
+            assert recovered["structuredContent"]["stdout"].strip() == str(
+                session_cwd.parent
+            )
+        else:
+            task_id = recovered["structuredContent"]["task_id"]
+            output = await asyncio.wait_for(registry.background_tasks.output(task_id), 10)
+            assert output["output"].strip() == str(session_cwd.parent)
+        assert registry.bash_cwd == str(session_cwd.parent)
+        assert registry.take_cwd_recovery_notices() == (
+            (str(session_cwd), str(session_cwd.parent)),
+        )
+    finally:
+        if registry is not None:
+            await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
