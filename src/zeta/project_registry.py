@@ -938,18 +938,21 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
 
     @classmethod
     def _session_record_exists(cls, fd: int, session_id: str) -> bool:
+        """Return early only after all byte-matching rows validate and one matches."""
         session_id_field = b'"session_id": ' + json.dumps(session_id).encode("utf-8")
         found = False
+        invalid_candidate = False
         for line in cls._iter_session_record_lines(fd, repair_torn_final=True):
             if session_id_field not in line:
                 continue
             try:
                 candidate = cls._decode_session_record_line(line)
             except ProjectRegistryError:
+                invalid_candidate = True
                 continue
             if candidate["session_id"] == session_id:
                 found = True
-        return found
+        return found and not invalid_candidate
 
     @classmethod
     def _read_session_records(
