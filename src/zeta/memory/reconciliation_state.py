@@ -822,6 +822,7 @@ class ReconciliationState:
             return empty
         for name in (
             "seq",
+            "generation",
             "transcript_bytes",
             "transcript_tokens",
             "early_trigger_seq",
@@ -841,6 +842,15 @@ class ReconciliationState:
             ):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
+        quarantine_id = value.get("recovery_quarantine_id")
+        if quarantine_id is None or isinstance(quarantine_id, str) and quarantine_id:
+            empty["recovery_quarantine_id"] = quarantine_id
+        cutoff = value.get("recovery_cutoff")
+        if cutoff is None or type(cutoff) is int and cutoff >= 0:
+            empty["recovery_cutoff"] = cutoff
+        paused = value.get("recovery_paused")
+        if type(paused) is bool:
+            empty["recovery_paused"] = paused
         for key, item in value.items():
             if key not in empty:
                 empty[key] = item

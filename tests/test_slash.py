@@ -850,6 +850,17 @@ async def test_tui_repair_resets_and_pauses_real_automatic_memory_state(
     assert memory_state["seq"] == 1
     assert memory_state["transcript_bytes"] == 0
     assert memory_state["recovery_paused"] is True
+    from zeta.memory.reconciliation_state import ReconciliationState
+
+    reloaded = ReconciliationState(
+        transcript.parent / "memory-reconcile.json",
+        project_id=project.project_id,
+        session_id=damaged.metadata.session_id,
+        diagnostics_path=transcript.parent / "memory-reconcile-errors.jsonl",
+        storage_lease=current.store._storage_lease,
+    )
+    assert reloaded.generation == 1
+    assert reloaded.paused_for_recovery is True
     recovery_files = list(transcript.parent.glob("conversation.recovery.*.json"))
     assert len(recovery_files) == 1
     recovery = json.loads(recovery_files[0].read_text(encoding="utf-8"))
