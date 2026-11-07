@@ -28,7 +28,6 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
-from zeta.providers import ollama as ollama_provider
 from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 from zeta.runtime.cleanup import close_session
@@ -1613,21 +1612,6 @@ async def test_ollama_watchdog_retries_real_transport_stall(
     )
     monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
 
-    original_wait_for_headers = ollama_provider.wait_for_response_headers
-    header_attempts = 0
-
-    async def wait_for_headers_with_retry_headroom(enter, *args):
-        nonlocal header_attempts
-        header_attempts += 1
-        if header_attempts == 1:
-            return await original_wait_for_headers(enter, *args)
-        return await enter
-
-    monkeypatch.setattr(
-        ollama_provider,
-        "wait_for_response_headers",
-        wait_for_headers_with_retry_headroom,
-    )
     transport = _LoopbackAsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport) as client:
 
@@ -1637,7 +1621,7 @@ async def test_ollama_watchdog_retries_real_transport_stall(
                 async for event in OllamaBackend(
                     client=client,
                     base_url=tcp_http_server.url,
-                    stall_seconds=_STALL_SECONDS,
+                    stall_seconds=1.0,
                     stall_retries=1,
                 ).complete([], [])
             ]
