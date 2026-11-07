@@ -47,7 +47,8 @@ class CloseOutcome:
 
 
 def _exception_type_name(error: BaseException) -> str:
-    return f"{type(error).__module__}.{type(error).__qualname__}"
+    name = f"{type(error).__module__}.{type(error).__qualname__}"
+    return name.encode()[:128].decode(errors="ignore")
 
 
 def _primary_outcome(primary_exception: BaseException | None) -> str:
@@ -127,18 +128,16 @@ def _release_background_close(
     report_failure: CloseFailureReporter | None,
 ) -> None:
     _BACKGROUND_CLOSE_TASKS.discard(task)
-    try:
-        task.result()
-    except BaseException as exc:
-        if is_control_exception(exc):
-            return
-        if report_failure is None:
-            _report_loop_cleanup_failure(
-                exc, stage="background_close", index=index
-            )
-        else:
-            with contextlib.suppress(BaseException):
-                report_failure(index, exc)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None or is_control_exception(error):
+        return
+    if report_failure is None:
+        _report_loop_cleanup_failure(error, stage="background_close", index=index)
+    else:
+        with contextlib.suppress(BaseException):
+            report_failure(index, error)
 
 
 def _retain_background_closes(
