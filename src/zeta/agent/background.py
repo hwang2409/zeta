@@ -88,9 +88,8 @@ class BackgroundAgentOwner:
         self.notification_store = notification_store
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
-        # Tasks may outlive the short model-turn safety bound. This internal
-        # bound is not a user setting; it only prevents an abandoned task from
-        # living forever when it never exits.
+        # This internal bound lets tasks outlive a turn but stops abandoned tasks
+        # that never exit; it is not a user setting.
         self.finish_gate_task_timeout = float(finish_gate_task_timeout)
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
@@ -107,6 +106,7 @@ class BackgroundAgentOwner:
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
+        self.project_context_loops: dict[str, Any] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._cancel_requested: set[str] = set()

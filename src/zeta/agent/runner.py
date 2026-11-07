@@ -14,17 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import (
-    discover_project,
-    load_project_context,
-    resolve_project_context,
-)
+from ..core.project_context import ProjectContext
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
+from ..project_context.projection import ProjectContextProjection
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
@@ -41,13 +38,20 @@ from ..protocol.types import (
 )
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
+from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
+from . import child_context as _child_context
 from .background import CancellationRequest, finish_background_child
+from .child_context import (
+    _child_base_system_prompt,
+    _compose_child_project_context,
+    _load_child_project_context,
+)
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
@@ -56,12 +60,13 @@ from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
     AgentPreset,
-    compose_system_prompt,
     resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState, child_cleanup_details
 from .run_consumer import consume_run as consume_follow_up_run
 from .terminal_fence import TerminalTransitionFence
+
+_compose_child_system_prompt = _child_context._compose_child_system_prompt
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
@@ -320,6 +325,7 @@ async def consume_run(
         **kwargs,
     )
 
+
 def resolve_child_backend(
     loop: AgentLoop, model: object
 ) -> tuple[CompletionBackend | None, str | None]:
@@ -352,6 +358,7 @@ def resolve_child_backend(
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
+
 
 async def _build_child_loop(
     loop: AgentLoop,
@@ -452,9 +459,21 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        child_context = await asyncio.to_thread(
+            _child_base_system_prompt, loop, cwd_override, child_registry
+        )
+        child_scope = getattr(loop, "_live_config_scope", None)
         child_home = Path(loop.active_home) if loop.active_home else env_home()
-        child_prompt, child_project_dir = await asyncio.to_thread(
-            _child_base_system_prompt, loop, cwd_override, child_registry)
+        child_project_dir = (
+            child_scope.project_dir
+            if child_scope is not None
+            else Path(child_registry.cwd)
+        )
+        child_context = _compose_child_project_context(
+            child_context,
+            preset,
+            explicit_finish=explicit_finish,
+        )
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -463,15 +482,15 @@ async def _build_child_loop(
             max_turns=None,
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
-            system_prompt=_compose_child_system_prompt(
-                child_prompt,
-                preset,
-                explicit_finish=explicit_finish,
+            runtime_prompt=RuntimePrompt(
+                child_context.system_prompt, child_context.prompt_components
             ),
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
-            max_agent_depth=budget.depth_limit(loop.max_agent_depth, preset.max_child_depth),
+            max_agent_depth=budget.depth_limit(
+                loop.max_agent_depth, preset.max_child_depth
+            ),
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -481,9 +500,36 @@ async def _build_child_loop(
             usage_sink=record_child_usage,
             live_config_home=child_home,
             live_config_project_dir=child_project_dir,
-            freeze_live_config=getattr(loop, "_live_config_scope", None) is None,
+            freeze_live_config=child_scope is None,
         )
+
         await child_loop.refresh_live_config(publish=False)
+
+        def prepare_child_project_context(
+            projection: ProjectContextProjection,
+        ) -> ProjectContext:
+            context = _load_child_project_context(
+                loop,
+                cwd_override,
+                child_registry,
+                projection=projection,
+            )
+            return _compose_child_project_context(
+                context,
+                preset,
+                explicit_finish=explicit_finish,
+            )
+
+        inherited_prompt = cwd_override is None or same_physical_path(
+            cwd_override, loop.store.cwd
+        )
+        child_loop._configure_project_context_recovery(
+            registry=loop.project_registry,
+            project_id=loop.root_project_id,
+            health=child_context.health,
+            prepare=prepare_child_project_context,
+            replace_component=("project_memory" if inherited_prompt else None),
+        )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
         child_loop.account_context = child_registry.account_context
@@ -607,7 +653,9 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = budget.child_depth(loop.agent_depth, loop.max_agent_depth, background)
+    child_depth, nesting_error = budget.child_depth(
+        loop.agent_depth, loop.max_agent_depth, background
+    )
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -659,12 +707,13 @@ async def run_agent_tool(
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = loop._background_owner.store_leases.enter_context(
-        ConversationStore(
+    child_store = await loop.store._to_thread_store(
+        lambda: ConversationStore(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
             _storage_lease=loop.store._storage_lease,
+            _owner_surface="child",
         )
     )
     try:
@@ -672,6 +721,7 @@ async def run_agent_tool(
     except BaseException:
         await child_store._to_thread_store(child_store.close)
         raise
+    loop._background_owner.store_leases.enter_context(child_store)
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
@@ -786,6 +836,9 @@ async def run_agent_tool(
             description=description,
             child_account_context=child_account_pins,
         )
+        loop._background_owner.project_context_loops[child_store.session_id] = (
+            child_loop
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
@@ -852,7 +905,9 @@ async def run_agent_tool(
         if background:
             child_store.update_agent_lifecycle(turns_used=turns_used)
         else:
-            child_store.finish_agent_lifecycle(state, final_result=text, turns_used=turns_used)
+            child_store.finish_agent_lifecycle(
+                state, final_result=text, turns_used=turns_used
+            )
         return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
@@ -937,7 +992,9 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
-    loop._background_owner.causal_episodes.associate_new_member(child_instance_id, loop.agent_instance_id)
+    loop._background_owner.causal_episodes.associate_new_member(
+        child_instance_id, loop.agent_instance_id
+    )
     finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
@@ -1048,6 +1105,9 @@ async def run_agent_tool(
             loop._background_owner.conversation_channel.unregister_loop(
                 child_instance_id
             )
+            loop._background_owner.project_context_loops.pop(
+                child_store.session_id, None
+            )
             loop._background_owner.unregister(child_instance_id)
             if child_policy is not None:
                 await child_policy.cleanup()
@@ -1055,42 +1115,46 @@ async def run_agent_tool(
             loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
-            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
+            return tuple(
+                await child_loop.close(
+                    background_task_cause=cause, cancel_background=False
+                )
+            )
 
         async def finish_background() -> None:
             await finish_background_child(
-                    child_task=child_task,
-                    child_store=child_store,
-                    parent_store=loop.store,
-                    tool_call=tool_call,
-                    child_instance_id=child_instance_id,
-                    child_path=child_path,
-                    description=description,
-                    child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                        child_result(
-                            text,
-                            error=error,
-                            status=status,
-                            stats=stats,
-                            include_stats=True,
-                            notice=notice,
-                            notice_items=notice_items,
-                            max_bytes=background_receipt_bytes,
-                        )
-                    ),
-                    validate_result=validate_result,
-                    publish_event=loop._publish_background_event,
-                    cleanup=cleanup_background_child,
-                    close_child=close_background_child,
-                    error_message=error_message,
-                    marker_key=child_marker_key,
-                    agent_instance_id=loop.agent_instance_id,
-                    background_owner=loop._background_owner,
-                    max_receipt_bytes=background_receipt_bytes,
-                    explicit_finish=terminal_fence is not None,
-                    child_loop=child_loop,
-                    finish_gate_state=finish_gate_state,
+                child_task=child_task,
+                child_store=child_store,
+                parent_store=loop.store,
+                tool_call=tool_call,
+                child_instance_id=child_instance_id,
+                child_path=child_path,
+                description=description,
+                child_turns=child_turns,
+                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                    child_result(
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
+                    )
+                ),
+                validate_result=validate_result,
+                publish_event=loop._publish_background_event,
+                cleanup=cleanup_background_child,
+                close_child=close_background_child,
+                error_message=error_message,
+                marker_key=child_marker_key,
+                agent_instance_id=loop.agent_instance_id,
+                background_owner=loop._background_owner,
+                max_receipt_bytes=background_receipt_bytes,
+                explicit_finish=terminal_fence is not None,
+                child_loop=child_loop,
+                finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())
@@ -1168,75 +1232,16 @@ async def run_agent_tool(
         raise
     finally:
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
+        loop._background_owner.project_context_loops.pop(child_store.session_id, None)
         loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
             await child_policy.cleanup()
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(cancel_background=False, background_task_cause=child_cleanup_details("foreground", child_task.cancelled())[0])
-
-def _child_base_system_prompt(
-    loop: AgentLoop,
-    cwd_override: str | None,
-    child_registry: ToolRegistry | None = None,
-) -> tuple[str | Message, Path]:
-    if cwd_override is None or same_physical_path(cwd_override, loop.store.cwd):
-        scope = getattr(loop, "_live_config_scope", None)
-        project_dir = getattr(scope, "project_dir", Path(loop.store.cwd))
-        return loop.context_assembler.system_prompt, project_dir
-    if child_registry is not None:
-        child_registry.verify_cwd_identity()
-    zeta_home = Path(loop.active_home) if loop.active_home else env_home()
-    discovery = discover_project(cwd_override, user_home=zeta_home.parent)
-    registry, session_project = loop.project_registry, None
-    if loop.root_project_id is not None and registry is not None:
-        try:
-            session_project = registry.show_project(loop.root_project_id)
-        except ProjectRegistryError:
-            pass
-    cwd_project = (
-        resolve_project_context(discovery, registry) if registry is not None else None
-    )
-    context = load_project_context(
-        cwd=cwd_override,
-        repo_root=discovery.primary_root or discovery.cwd,
-        zeta_home=zeta_home,
-        catalog=loop.tool_registry.skill_catalog,
-        session_project=session_project,
-        cwd_project=cwd_project,
-        inbox_enabled=False,
-    )
-    return context.system_prompt, discovery.primary_root or discovery.cwd
-
-
-_EXPLICIT_FINISH_GUIDANCE = (
-    "With explicit finish enabled, this run ends only when you call the `finish` "
-    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
-    "apply). Ending a turn without calling `finish` leaves you idle for "
-    "follow-ups; call it when the contract's exit criteria are met or when you "
-    "are blocked."
-)
-
-
-def _compose_child_system_prompt(
-    system_prompt: str | Message,
-    preset: AgentPreset,
-    *,
-    explicit_finish: bool = False,
-) -> str | Message:
-    """Apply the preset preamble and custom body to the child prompt."""
-
-    composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = preset.prompt_suffix
-    if explicit_finish:
-        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
-    if not body:
-        return composed
-    if isinstance(composed, Message):
-        return Message(
-            MessageRole.SYSTEM,
-            [*composed.content, TextContent(body)],
-            metadata=dict(composed.metadata),
+        await child_loop.close(
+            cancel_background=False,
+            background_task_cause=child_cleanup_details(
+                "foreground", child_task.cancelled()
+            )[0],
         )
-    return composed + "\n\n" + body

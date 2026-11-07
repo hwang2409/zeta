@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from ...agent.plan_mode import plan_mode_prompt
 from ...config.live import (
     LiveConfigBase,
     LiveConfigListener,
@@ -77,10 +78,31 @@ class LiveConfigMixin:
         self.context_assembler.system_prompt = runtime_prompt.system_prompt
         self._prompt_generation += 1
 
-    def _live_prompt_base(self) -> RuntimePrompt:
+    def _skill_prompt_base(self) -> RuntimePrompt:
         if self._plan_mode and self._plan_mode_prior_prompt is not None:
             return self._plan_mode_prior_prompt
         return self._runtime_prompt
+
+    def _live_prompt_base(self) -> RuntimePrompt:
+        return self._skill_prompt_base()
+
+    def _prompt_base_is_current(self, generation: int, base: RuntimePrompt) -> bool:
+        return generation == self._prompt_generation and base is self._skill_prompt_base()
+
+    def _commit_prepared_prompt(
+        self, generation: int, base: RuntimePrompt, prepared: RuntimePrompt
+    ) -> bool:
+        if not self._prompt_base_is_current(generation, base):
+            return False
+        if self._plan_mode:
+            self._plan_mode_prior_prompt = prepared
+            displayed = RuntimePrompt(
+                plan_mode_prompt(prepared.system_prompt), prepared.prompt_components
+            )
+        else:
+            displayed = prepared
+        self._set_runtime_prompt(displayed)
+        return True
 
     def add_live_config_listener(self, listener: LiveConfigListener) -> None:
         self._live_config_listeners.append(listener)
@@ -124,9 +146,9 @@ class LiveConfigMixin:
                 )
             self.tool_schemas = candidate.tool_schemas
             if candidate.runtime_prompt is not base.runtime_prompt:
-                if self._plan_mode:
-                    self._plan_mode_prior_prompt = candidate.prompt_base
-                self._set_runtime_prompt(candidate.runtime_prompt)
+                self._commit_prepared_prompt(
+                    base.prompt_generation, base.prompt_base, candidate.prompt_base
+                )
             for listener, prepared in candidate.listener_updates:
                 listener.commit_live_config(prepared)
             self._live_skill_catalog_snapshot = candidate.skill_snapshot

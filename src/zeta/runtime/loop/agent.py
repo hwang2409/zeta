@@ -113,6 +113,7 @@ from .empty_turn import (
 from .live_config import LiveConfigMixin
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
@@ -152,6 +153,7 @@ class AgentLoop(
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
+    ProjectContextRecoveryMixin,
     MCPSession,
 ):
     post_stream_provider_retry = True
@@ -191,7 +193,10 @@ class AgentLoop(
         live_config_project_dir: Path | None = None,
         freeze_live_config: bool = False,
     ) -> None:
-        if type(max_agent_depth) is not int or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH:
+        if (
+            type(max_agent_depth) is not int
+            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        ):
             raise ValueError(
                 f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
@@ -208,13 +213,14 @@ class AgentLoop(
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
-        # Directory of the ROOT session that owns the durable child-link index;
-        # threaded down every loop so nested children publish their lineage
-        # intent into a single flat directory the root can reconcile.
+        # Nested loops publish lineage through the root session directory.
         self.root_session_dir = (
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_project_context_recovery(
+            registry=None, project_id=None, health=None, prepare=None
+        )
         self._child_lineage_publisher = child_lineage_publisher
         if (
             self._child_lineage_publisher is None
@@ -246,8 +252,7 @@ class AgentLoop(
         self.explicit_finish = False
         self._explicit_finish_report: dict[str, object] | None = None
         self._delivering_prompt_id: str | None = None
-        # Partial assistant persistence uses these values so provider metadata is
-        # retained even when the stream later fails or is cancelled.
+        # Preserve provider metadata if the partial assistant stream fails.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self.memory_reconciler: AutoMemoryReconciler | None = None
@@ -297,7 +302,7 @@ class AgentLoop(
             self.tool_registry.set_approval_policy(approval_policy)
         if self.tool_registry.approval_policy is not None:
             self.tool_registry.bind_approval_store(store)
-        self.tool_schemas = tuple(
+        self.tool_schemas = list(
             tool_schemas if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
@@ -330,7 +335,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: RuntimePrompt | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -510,14 +515,11 @@ class AgentLoop(
         cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
-        """Close session-owned transports and background processes.
-
-        Returns the ids of background tasks killed by this close so a completing
-        child can report them to its parent.
-        """
+        """Close owned resources and return task ids killed during close."""
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        await self._close_project_context_recovery()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
@@ -586,8 +588,15 @@ class AgentLoop(
         await self._ensure_step_delivery()
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks._notify_exit(
-                item.task_id, item.command, item.exit_code, item.output_tail, item.log_path, item.note,
-                owner=item.owner, phase=item.phase, tui_presented=item.tui_presented,
+                item.task_id,
+                item.command,
+                item.exit_code,
+                item.output_tail,
+                item.log_path,
+                item.note,
+                owner=item.owner,
+                phase=item.phase,
+                tui_presented=item.tui_presented,
             )
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
@@ -595,8 +604,7 @@ class AgentLoop(
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
         await self._activate_project_inbox()
-        # Frontends can render immediately while trusted, enabled MCP servers
-        # connect in the background. Operations that require MCP await this task.
+        # Render now; MCP-dependent operations await the background connection.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
 
@@ -737,6 +745,7 @@ class AgentLoop(
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
+        self._advance_project_context_recovery()
         await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")

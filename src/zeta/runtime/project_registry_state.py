@@ -16,10 +16,7 @@ class ProjectRegistryUnavailable:
 
     @property
     def warning(self) -> str:
-        return (
-            f"warning: project registry unavailable at {self.path}: {self.reason}; "
-            "project features are disabled"
-        )
+        return "warning: project registry is temporarily unavailable; try again later"
 
 
 @dataclass(frozen=True)
@@ -52,12 +49,12 @@ def load_project_registry(root: Path | str) -> ProjectRegistryState:
         return state
     except OSError as exc:
         return ProjectRegistryState(
-            None, ProjectRegistryUnavailable(registry.root, str(exc))
+            registry, ProjectRegistryUnavailable(registry.root, str(exc))
         )
     try:
         registry.list_projects()
     except (OSError, ProjectRegistryError) as exc:
         return ProjectRegistryState(
-            None, ProjectRegistryUnavailable(registry.root, str(exc))
+            registry, ProjectRegistryUnavailable(registry.root, str(exc))
         )
     return state
