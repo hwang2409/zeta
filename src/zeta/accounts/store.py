@@ -45,15 +45,7 @@ from ..storage_format import (
     open_writer,
     require_closed_variant,
 )
-from .availability import (
-    AccountDisplay,
-)
-from .availability import (
-    catalog_display as _catalog_display,
-)
-from .availability import (
-    list_display as _list_display,
-)
+from . import availability
 from .files import (
     exists as _exists,
 )
@@ -267,13 +259,13 @@ class AccountStore:
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
-    def list_catalog(self) -> list[AccountDisplay]:
+    def list_catalog(self) -> list[availability.AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
-        return _catalog_display(value)
+        return availability.catalog_display(value)
 
-    def list_display(self) -> list[AccountDisplay]:
-        return _list_display(self)
+    def list_display(self) -> list[availability.AccountDisplay]:
+        return availability.list_display(self)
 
     def require_available(self, account: AccountId) -> None:
         if not any(
