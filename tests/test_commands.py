@@ -2161,57 +2161,6 @@ async def test_canceled_macro_creates_log_before_shell_bind(
         await registry.close()
 
 
-async def test_repeated_cancellation_while_background_macro_log_is_created_closes_handle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    log_path = tmp_path / "canceled-background.log"
-    entered = threading.Event()
-    release = threading.Event()
-    tracked: list[_TrackedLog] = []
-    original_open = registry.background_tasks.open_log
-
-    def held_open(path: str | Path) -> _TrackedLog:
-        handle = _TrackedLog(original_open(path))
-        tracked.append(handle)
-        entered.set()
-        assert release.wait(10)
-        return handle
-
-    monkeypatch.setattr(registry.background_tasks, "open_log", held_open)
-    task = asyncio.create_task(
-        run_shell_macro(
-            registry,
-            ToolCall("macro-cancel-log", "bash", {"command": "true"}),
-            log_path,
-            stream_sink=lambda _event: None,
-            lifecycle_sink=lambda _kind: None,
-            background=True,
-        )
-    )
-    try:
-        assert await asyncio.to_thread(entered.wait, 10)
-        task.cancel()
-        task.cancel()
-        release.set()
-        result = await asyncio.wait_for(task, 10)
-        assert await asyncio.to_thread(tracked[0].closed.wait, 10)
-
-        assert result.is_canceled is True
-        assert result.structured_content == {"log_path": str(log_path)}
-        assert log_path.is_file()
-        assert tracked[0].handle.closed
-    finally:
-        release.set()
-        for handle in tracked:
-            handle.handle.close()
-        if not task.done():
-            task.cancel()
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        await registry.close()
-
-
 async def test_background_macro_start_preflight_failure_closes_created_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

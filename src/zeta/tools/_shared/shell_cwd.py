@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...core.approval import ApprovedCwdExecution
+from ...core.thread_call import run_owned_thread_call
 from .cwd_state import (
     SessionCwdRemoved,
     nearest_existing_directory,
@@ -42,9 +42,7 @@ def _bind_shell_cwd(
             recovery = (start_cwd, fallback)
             start_cwd = fallback
             identity = os.lstat(fallback)
-            fd = open_verified_directory(
-                fallback, (identity.st_dev, identity.st_ino)
-            )
+            fd = open_verified_directory(fallback, (identity.st_dev, identity.st_ino))
     else:
         if requested_cwd is None and not Path(start_cwd).is_dir():
             fallback = nearest_existing_directory(start_cwd)
@@ -66,19 +64,10 @@ async def bind_shell_cwd_async(
 ) -> tuple[str, int]:
     """Bind a shell cwd off-loop and commit recovery only after its fd is bound."""
 
-    worker = asyncio.create_task(
-        asyncio.to_thread(_bind_shell_cwd, registry, requested_cwd, approved_cwd)
+    start_cwd, fd, recovery = await run_owned_thread_call(
+        lambda: _bind_shell_cwd(registry, requested_cwd, approved_cwd),
+        lambda result: os.close(result[1]),
     )
-    try:
-        start_cwd, fd, recovery = await asyncio.shield(worker)
-    except BaseException:
-        try:
-            result = await asyncio.shield(worker)
-        except BaseException as cleanup_error:  # noqa: BLE001 - drain every worker outcome
-            cleanup_error.add_note("shell cwd binding failed during cancellation")
-        else:
-            os.close(result[1])
-        raise
     if recovery is not None:
         registry.commit_cwd_recovery(*recovery)
     return start_cwd, fd
