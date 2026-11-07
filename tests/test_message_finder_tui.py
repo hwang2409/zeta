@@ -53,6 +53,7 @@ def _track_virtual_search_publication(
         if transcript._virtual_search_complete:
             published.set()
 
+    # test-contract: no public seam reports incremental search-index completion.
     monkeypatch.setattr(transcript, "_continue_virtual_search_index", track)
     return published
 

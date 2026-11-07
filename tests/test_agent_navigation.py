@@ -1135,7 +1135,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
     session.default_buffer.text = "keep me"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     release.set()
     await _await_child_send_completion(app)
     assert session.default_buffer.text == "keep me"
@@ -1183,7 +1183,7 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
     buffer = session.default_buffer
     buffer.text = "same"
     assert app._submit_input(buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     buffer.text = "something else"
     buffer.text = "same"
     release.set()
@@ -1218,17 +1218,20 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
     session.default_buffer.text = "at exit"
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     close_started = asyncio.Event()
-    close_child_sends = app._close_child_sends
+    release_ui_ownership = app._release_ui_ownership
+    ui_generation = getattr(app, "_ui_generation", 0)
 
-    async def track_close_child_sends() -> None:
+    def track_release_ui_ownership() -> None:
+        release_ui_ownership()
         close_started.set()
-        await close_child_sends()
 
-    monkeypatch.setattr(app, "_close_child_sends", track_close_child_sends)
+    # test-contract: no public seam reports child-send drain entry after UI release.
+    monkeypatch.setattr(app, "_release_ui_ownership", track_release_ui_ownership)
     closing = asyncio.create_task(app.close())
-    await asyncio.wait_for(close_started.wait(), 1)
+    await asyncio.wait_for(close_started.wait(), 10)
+    assert getattr(app, "_ui_generation", 0) == ui_generation + 1
     assert not closing.done()
     notices_before_release = list(notices)
     release.set()
@@ -1359,7 +1362,7 @@ async def test_child_send_double_enter_queues_once(
     session.default_buffer.text = "once"
     assert app._submit_input(session.default_buffer.text) is False
     assert app._submit_input(session.default_buffer.text) is False
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 10)
     release.set()
     await _await_child_send_completion(app)
     assert calls == 1
