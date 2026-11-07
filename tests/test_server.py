@@ -55,7 +55,7 @@ from zeta.core.store import (
     ConversationStore,
 )
 from zeta.core.store._validation import NOTIFICATION_KINDS
-from zeta.mcp.oauth_store import MCPOAuthToken, token_store_path
+from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_path
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
@@ -8513,6 +8513,22 @@ async def test_slash_run_mcp_credential_evidence_recovery(
     server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
+        project_config = project / ".zeta" / "mcp.json"
+        add_response = (
+            await _request(
+                reader,
+                writer,
+                "mcp-add-client-only",
+                "slash_run",
+                {
+                    "session_id": sid,
+                    "text": "/mcp add surprise --http https://mcp.test",
+                },
+            )
+        )[-1]["result"]
+        assert add_response == {"kind": "client_only", "name": "mcp"}
+        assert not project_config.exists()
+
         response = (
             await _request(
                 reader,
@@ -8587,5 +8603,17 @@ async def test_slash_run_mcp_credential_evidence_recovery(
             "recovered-token"
         )
         assert moved_evidence.read_text() == record
+
+        logged_out = (
+            await _request(
+                reader,
+                writer,
+                "mcp-logout-recovered",
+                "slash_run",
+                {"session_id": sid, "text": "/mcp logout live"},
+            )
+        )[-1]["result"]
+        assert logged_out == {"kind": "output", "text": "logged out live."}
+        assert (await MCPCredentialStore(home=home).load("live")).token is None
     finally:
         await _close(server, writer)

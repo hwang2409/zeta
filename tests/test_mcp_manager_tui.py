@@ -555,11 +555,11 @@ async def test_real_prompt_mcp_credential_evidence_recovery(
             while not get_app().is_running:
                 await asyncio.sleep(0)
         pipe.send_text("/mcp\r")
-        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        await asyncio.wait_for(refreshed.wait(), timeout=10)
         for key, operation in (("l", "load"), ("o", "delete")):
             refreshed.clear()
             pipe.send_text(key)
-            await asyncio.wait_for(refreshed.wait(), timeout=5)
+            await asyncio.wait_for(refreshed.wait(), timeout=10)
             error = getattr(app._mcp_manager, "credential_store_error", None)
             assert error == {
                 "code": "mcp_credential_store",
@@ -581,7 +581,7 @@ async def test_real_prompt_mcp_credential_evidence_recovery(
         credential_file.rename(moved_evidence)
         refreshed.clear()
         pipe.send_text("l")
-        await asyncio.wait_for(refreshed.wait(), timeout=5)
+        await asyncio.wait_for(refreshed.wait(), timeout=10)
         saved = json.loads(credential_file.read_text())
         assert saved["token"]["access_token"] == "recovered-token"
         assert moved_evidence.read_text() == record

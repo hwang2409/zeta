@@ -68,11 +68,11 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            self._mcp_management_service = MCPManagementService(
+            service = MCPManagementService(
                 home=self._mcp_home_hint,
                 project_dir=self._mcp_project_dir_value,
             )
-            config = self._mcp_management_service.runtime_config()
+            config = service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry,
                 config,
@@ -95,11 +95,6 @@ class MCPSession:
         if self._mcp_mount is not None:
             raise ValueError("MCP mount already attached")
         self._mcp_mount = mount
-        self._mcp_management_service = MCPManagementService(
-            home=self._mcp_home_hint,
-            project_dir=self._mcp_project_dir_value,
-            mount=mount,
-        )
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
 
@@ -189,8 +184,11 @@ class MCPSession:
             return f"mcp error: {self._mcp_config_error}"
         if mount is None:
             return "mcp: no configured servers"
-        service = self._mcp_management_service
-        service.mount = mount
+        service = MCPManagementService(
+            home=self._mcp_home_hint,
+            project_dir=self._mcp_project_dir_value,
+            mount=mount,
+        )
         if not parts:
             return await self._render_mcp_status(mount, service)
         verb = parts[0]

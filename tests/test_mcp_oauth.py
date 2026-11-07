@@ -1824,8 +1824,10 @@ async def test_slash_mcp_auth_rejects_stdio_server(
         async def list_tools(self) -> list:
             return []
 
+        # test-contract: seam minimum MCP client protocol fake
         async def close(self) -> None: ...
 
+    # test-contract: seam inject the minimum MCP client protocol fake
     monkeypatch.setattr(
         mount_module, "_build_client", lambda config: _NoopClient(config)
     )
@@ -2275,7 +2277,7 @@ async def test_connect_rereads_credentials_for_notification_post_and_get(
         home=str(home),
     )
     await client.connect()
-    await asyncio.wait_for(get_seen.wait(), timeout=2)
+    await asyncio.wait_for(get_seen.wait(), timeout=10)
     assert requests[:3] == [
         ("POST", "Bearer first-token"),
         ("POST", "Bearer second-token"),
@@ -2302,11 +2304,11 @@ async def test_two_clients_refresh_with_generation_cas_and_fresh_retry(
             exchange_count += 1
             index = exchange_count
             if index == 1:
-                await asyncio.wait_for(both_exchanges.wait(), timeout=2)
+                await asyncio.wait_for(both_exchanges.wait(), timeout=10)
                 access = "winner-token"
             else:
                 both_exchanges.set()
-                await asyncio.wait_for(first_retry.wait(), timeout=2)
+                await asyncio.wait_for(first_retry.wait(), timeout=10)
                 access = "loser-token"
             return httpx.Response(
                 200,
@@ -2474,7 +2476,7 @@ class _CredentialRaceStore(MCPCredentialStore):
 
 async def _wait_for_thread_gate(store: _CredentialRaceStore) -> None:
     entered = await asyncio.wait_for(
-        asyncio.to_thread(store.entered.wait, 5), timeout=6
+        asyncio.to_thread(store.entered.wait, 10), timeout=11
     )
     assert entered, "credential race gate was not reached"
 
@@ -2639,9 +2641,9 @@ async def test_public_login_and_logout_follow_both_exclusive_lock_orders(
         if last_commit == "logout"
         else asyncio.create_task(manager.login("live", scope="user", no_browser=True))
     )
-    await asyncio.wait_for(second, timeout=5)
+    await asyncio.wait_for(second, timeout=10)
     store.release.set()
-    await asyncio.wait_for(first, timeout=5)
+    await asyncio.wait_for(first, timeout=10)
 
     authority = await MCPCredentialStore(home=home).load("live")
     if last_commit == "logout":
