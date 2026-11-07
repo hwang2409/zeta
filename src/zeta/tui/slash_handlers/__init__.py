@@ -29,7 +29,7 @@ from ...core.session import (
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import SlashStatus
+from ...core.slash import SlashStatus, _format_status
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -99,6 +99,13 @@ class SlashHandlerMixin:
             await self.resolve_local_approval(decision, requested_key, always=always)
             return
         await controller.resolve_approval(decision, requested_key, always=always)
+
+    def slash_status_command(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_status_card()
+            return ""
+        return _format_status(self.slash_status())
 
     def slash_status(self) -> SlashStatus:
         pending = tuple(

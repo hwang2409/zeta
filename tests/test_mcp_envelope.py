@@ -743,7 +743,7 @@ async def test_mcp_status_serve_executes_available_command(tmp_path) -> None:
             {"session_id": session_id, "text": "/mcp status"},
         )
 
-        assert response["result"]["kind"] == "text"
+        assert response["result"]["kind"] == "output"
         assert "mcp limits: deadline 300s" in response["result"]["text"]
     finally:
         await client.close()
