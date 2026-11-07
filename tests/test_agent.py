@@ -1936,7 +1936,7 @@ class ConversationFinishGateBackend(CompletionBackend):
                     )
                 )
             ]
-        elif last_user.startswith("You have "):
+        elif gate is not None:
             self.gate_turns += 1
             self.gate_seen.set()
             if self.gate_turns == 1:
@@ -3025,7 +3025,7 @@ async def test_post_cap_question_answer_completion_uses_three_causal_turns(
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     assert backend.notification_turns == 1
     assert backend.follow_up_seen
-    assert backend.gate_turns == 2
+    assert backend.gate_turns == 1
 
     backend.release_grandchild.set()
     await wait_background_owner(loop)
@@ -13925,8 +13925,12 @@ async def _idle_nudge_run(
     loop = _ExplicitFinishLoop(registry, owner)
     loop._terminal_transition_fence = fence
     prompts: list[str] = []
+    notices: list[Message] = []
 
     async def fake_consume(_loop, prompt, **kwargs):
+        notice = kwargs.get("harness_notice_message")
+        if isinstance(notice, Message):
+            notices.append(notice)
         await _ack_fake_delivery(store, kwargs)
         if not prompt and loop.step_delivery.has_prompt_edge:
             prepared = await loop.step_delivery.prepare_request(
@@ -13957,7 +13961,7 @@ async def _idle_nudge_run(
             idle_wait=idle_wait,
         )
     )
-    return run, prompts, owner, registry, store
+    return run, prompts, notices, owner, registry, store
 
 
 @pytest.mark.asyncio
@@ -13970,12 +13974,18 @@ async def test_idle_nudge_after_ten_minutes_without_running_work(
         waits.append(timeout)
         return False
 
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, notices, owner, registry, store = await _idle_nudge_run(
         tmp_path, monkeypatch, idle_wait=expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
     assert waits == [600.0]
     assert prompts[1].startswith("you ended your turn without calling `finish`")
+    assert [notice.role for notice in notices] == [
+        MessageRole.SYSTEM,
+        MessageRole.SYSTEM,
+    ]
+    assert notices[1].content[0].text.startswith("[zeta] idle reminder:")
+    assert "user asked" not in notices[1].content[0].text.casefold()
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
@@ -14001,7 +14011,7 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
         waits.append(timeout)
         return len(waits) < 5
 
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, _notices, owner, registry, store = await _idle_nudge_run(
         tmp_path,
         monkeypatch,
         idle_wait=wake_then_expire,
@@ -14046,7 +14056,7 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
         return False
 
     fence = PromptAfterEligibilityFence()
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, _notices, owner, registry, store = await _idle_nudge_run(
         tmp_path,
         monkeypatch,
         idle_wait=expire,
@@ -14086,7 +14096,7 @@ async def test_idle_wake_resets_nudge_clock(
         waits.append(timeout)
         return len(waits) == 1
 
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, _notices, owner, registry, store = await _idle_nudge_run(
         tmp_path, monkeypatch, idle_wait=wake_then_expire, finish_after_calls=3
     )
     await asyncio.wait_for(run, 1)
@@ -14110,7 +14120,7 @@ async def test_idle_nudge_stops_after_three_lifetime_nudges(
         await wait()
         return True
 
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, _notices, owner, registry, store = await _idle_nudge_run(
         tmp_path, monkeypatch, idle_wait=expire_then_block
     )
     await asyncio.wait_for(fourth_wait.wait(), 1)
@@ -14139,7 +14149,7 @@ async def test_idle_child_never_auto_finishes_for_time_or_count(
         await wait()
         return True
 
-    run, prompts, owner, registry, store = await _idle_nudge_run(
+    run, prompts, _notices, owner, registry, store = await _idle_nudge_run(
         tmp_path, monkeypatch, idle_wait=expire_then_block
     )
     await asyncio.wait_for(blocked.wait(), 1)

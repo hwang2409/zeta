@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Collection
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 import pytest
+from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
@@ -34,6 +35,7 @@ import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.processes import wait_for_path_command
+from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     event as _buffered_event,
 )
@@ -3789,9 +3791,11 @@ async def test_parameterless_new_session_uses_server_defaults_after_override(
 
 
 @pytest.mark.asyncio
-async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+async def test_session_swap_rejects_pending_notification_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    transport: str,
 ) -> None:
     parent_call = ToolCall(
         "agent-one",
@@ -3806,58 +3810,269 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
             ScriptedTurn([TextContent("parent done")]),
         ]
     )
-    server = ZetaServer(provider="codex",
+    server = ZetaServer(
+        provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
+        ws_port=0 if transport == "websocket" else None,
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer = await _ready(server)
-    assert server._client is not None
+    await server.start()
+    if transport == "unix":
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        client = ServeClient(reader=reader, writer=writer)
+    else:
+        assert server._websocket is not None
+        websocket = await connect(
+            f"ws://127.0.0.1:{server._websocket.port}/",
+            subprotocols=["zeta.v1", f"zeta.bearer.{server._websocket.token}"],
+        )
+        client = ServeClient(websocket=websocket)
     agent_end_published = asyncio.Event()
+    release_agent_end = asyncio.Event()
+    notification_captured = asyncio.Event()
+    release_notification = asyncio.Event()
     original_notify = server.control._notify
+    original_notification_turn = server.turn_contexts.run_notification_turn
 
     async def notify(event: str, *args: object, **kwargs: object) -> None:
         await original_notify(event, *args, **kwargs)
         if event == "agent_end":
             agent_end_published.set()
+            await asyncio.wait_for(release_agent_end.wait(), TIMEOUT)
 
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        notification_captured.set()
+        await asyncio.wait_for(release_notification.wait(), TIMEOUT)
+        return await original_notification_turn(*args, **kwargs)
+
+    # test-contract: seam serve has no public agent-end publication gate
     monkeypatch.setattr(server.control, "_notify", notify)
-    old_session_id = server.runtime.session_id
-    assert server.runtime.opened is not None
-    old_store = server.runtime.opened.store
-    for index in range(300):
-        old_store.append_message(
-            with_message_origin(
-                Message(MessageRole.USER, [TextContent(f"history-{index}")]),
-                MessageOrigin.USER,
-            )
-        )
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )  # test-contract: seam serve has no public notification-turn start gate
+    notification_turn: asyncio.Task[None] | None = None
     try:
-        await _request(reader, writer, 3, "send", {"text": "start"})
-        approval = await _event(reader, "approval_request")
+        await asyncio.wait_for(
+            client.request("hello", "hello", {"protocol_version": "1.1"}), TIMEOUT
+        )
+        await asyncio.wait_for(
+            client.request("new", "new_session", {"provider": "codex"}), TIMEOUT
+        )
+        old_session_id = server.runtime.session_id
+        await asyncio.wait_for(
+            client.request("send", "send", {"text": "start"}), TIMEOUT
+        )
+        approval = await asyncio.wait_for(client.event("approval_request"), TIMEOUT)
         assert approval["delegated"] is True
-        # A child approval and per-provider turn_end do not signal that the
-        # parent agent loop is idle. agent_end is the session-swap handoff.
-        await asyncio.wait_for(agent_end_published.wait(), timeout=30)
-        await _event(reader, "agent_end")
-        swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "codex"})
+        await asyncio.wait_for(agent_end_published.wait(), timeout=TIMEOUT)
+
+        rejected = await asyncio.wait_for(
+            client.request("busy-swap", "new_session", {"provider": "codex"}),
+            TIMEOUT,
+        )
+        assert rejected["error"]["code"] == -32004
+
+        release_agent_end.set()
+        await asyncio.wait_for(client.event("agent_end"), TIMEOUT)
+        await asyncio.wait_for(
+            client.request(
+                "approve",
+                "approve",
+                {"request_id": approval["request_id"]},
+            ),
+            TIMEOUT,
+        )
+        await asyncio.wait_for(notification_captured.wait(), timeout=TIMEOUT)
+        notification_turn = server.control._turn_task
+        assert notification_turn is not None
+        release_notification.set()
+        await asyncio.wait_for(asyncio.shield(notification_turn), timeout=TIMEOUT)
+
+        swapped = await asyncio.wait_for(
+            client.request("swap", "new_session", {"provider": "codex"}), TIMEOUT
+        )
+        new_session_id = swapped["result"]["session"]["session_id"]
+        assert new_session_id != old_session_id
+
+        resumed = await asyncio.wait_for(
+            client.request("resume", "resume", {"session_id": old_session_id}),
+            TIMEOUT,
+        )
+        assert resumed["result"]["session"]["session_id"] == old_session_id
+        history = await asyncio.wait_for(
+            client.request(
+                "history", "session_history", {"session_id": old_session_id}
+            ),
+            TIMEOUT,
+        )
+        assert "result" in history, history
+        assert any(
+            message.get("role") == "assistant"
+            and message.get("content")
+            == [{"type": "text", "text": "parent done"}]
+            for message in history["result"]["messages"]
+        )
+    finally:
+        release_agent_end.set()
+        release_notification.set()
+        if notification_turn is not None:
+            if not notification_turn.done():
+                notification_turn.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(notification_turn, TIMEOUT)
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_session_swap_reserves_child_completion_during_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BackgroundChildAndForegroundToolBackend("unused")
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        cwd=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        cli_yolo=True,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server, protocol_version="1.1")
+    old_session_id = server.runtime.session_id
+    setup_entered = asyncio.Event()
+    release_setup = asyncio.Event()
+    wake_attempted = asyncio.Event()
+    notification_captured = asyncio.Event()
+    release_notification = asyncio.Event()
+    original_run_setup = server.runtime._run_setup
+    original_terminate_approvals = server.control._terminate_pending_approvals
+    original_schedule_wake = server.control._schedule_background_wake
+    original_notification_turn = server.turn_contexts.run_notification_turn
+    setup_calls = 0
+    termination_calls = 0
+    watcher: asyncio.Task[None] | None = None
+    wake_task: asyncio.Task[None] | None = None
+    swap: asyncio.Task[list[dict[str, Any]]] | None = None
+
+    async def gated_run_setup(*args: object, **kwargs: object):
+        nonlocal setup_calls
+        setup_calls += 1
+        if setup_calls == 2:
+            raise RuntimeError("forced setup failure")
+        return await original_run_setup(*args, **kwargs)
+
+    async def gated_terminate_approvals(*args: object, **kwargs: object) -> None:
+        nonlocal termination_calls
+        termination_calls += 1
+        if termination_calls == 1:
+            setup_entered.set()
+            await asyncio.wait_for(release_setup.wait(), TIMEOUT)
+        await original_terminate_approvals(*args, **kwargs)
+
+    def observe_schedule_wake(session_id: str) -> None:
+        nonlocal wake_task
+        original_schedule_wake(session_id)
+        if setup_entered.is_set():
+            wake_task = server.control._turn_task
+            wake_attempted.set()
+
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        notification_captured.set()
+        await asyncio.wait_for(release_notification.wait(), TIMEOUT)
+        return await original_notification_turn(*args, **kwargs)
+
+    # test-contract: seam serve has no public session-setup gate
+    monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    # test-contract: seam serve has no public pre-setup gate
+    monkeypatch.setattr(
+        server.control, "_terminate_pending_approvals", gated_terminate_approvals
+    )
+    # test-contract: seam serve has no public background-wake observation
+    monkeypatch.setattr(server.control, "_schedule_background_wake", observe_schedule_wake)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )  # test-contract: seam serve has no public notification-turn start gate
+    try:
+        await _request(reader, writer, 3, "send", {"text": "start child"})
+        await asyncio.wait_for(_event(reader, "agent_end"), TIMEOUT)
+        await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
+
+        swap = asyncio.create_task(
+            _request(reader, writer, 4, "new_session", {"provider": "codex"})
+        )
+        await asyncio.wait_for(setup_entered.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        owner = loop._background_owner
+        assert len(owner._watchers) == 1
+        watcher = next(iter(owner._watchers.values()))
+        loop.set_background_wake_callback(None)
+        backend.release_child.set()
+        # test-contract: seam serve has no public child-completion join
+        await asyncio.wait_for(asyncio.shield(watcher), TIMEOUT)
+        server.control._schedule_background_wake(old_session_id)
+        await asyncio.wait_for(wake_attempted.wait(), TIMEOUT)
+        if wake_task is not None:
+            await asyncio.wait_for(notification_captured.wait(), TIMEOUT)
+        release_setup.set()
+        swap_frames = await asyncio.wait_for(swap, TIMEOUT)
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
-        assert all(
-            frame.get("params", {}).get("session_id") == old_session_id
-            for frame in swap_frames
-            if frame.get("params") is not None
-        )
+        release_notification.set()
+        if wake_task is not None:
+            result = await asyncio.wait_for(
+                asyncio.gather(wake_task, return_exceptions=True), TIMEOUT
+            )
+            assert result == [None], result
 
-        old_notifications = old_store.agent_notifications()
-        assert old_notifications
-        assert all(
-            entry.data["child_instance_id"].startswith(f"{old_session_id}:")
-            for entry in old_notifications
+        failed = await _request(
+            reader, writer, 5, "new_session", {"provider": "codex"}
         )
-        status = await _request(reader, writer, 5, "status")
-        assert status[-1]["result"]["session"]["session_id"] == new_session_id
+        assert failed[-1]["error"]["code"] == -32000
+        retry = await _request(
+            reader, writer, 6, "new_session", {"provider": "codex"}
+        )
+        assert "result" in retry[-1], retry[-1]
+
+        resumed = await _request(
+            reader, writer, 7, "resume", {"session_id": old_session_id}
+        )
+        assert resumed[-1]["result"]["session"]["session_id"] == old_session_id
+        await asyncio.wait_for(_event(reader, "turn_end"), TIMEOUT)
+        history = await _request(
+            reader,
+            writer,
+            8,
+            "session_history",
+            {"session_id": old_session_id},
+        )
+        assert any(
+            message.get("role") == "assistant"
+            and message.get("content")
+            == [{"type": "text", "text": "notification handled"}]
+            for message in history[-1]["result"]["messages"]
+        )
     finally:
+        backend.release_child.set()
+        release_setup.set()
+        release_notification.set()
+        if wake_task is not None:
+            if not wake_task.done():
+                wake_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(wake_task, TIMEOUT)
+        if swap is not None:
+            if not swap.done():
+                swap.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(swap, TIMEOUT)
+        if watcher is not None:
+            if not watcher.done():
+                watcher.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(watcher, TIMEOUT)
         await _close(server, writer)
 
 
@@ -4399,27 +4614,25 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_passive_harness_message(
+async def test_session_history_shows_zeta_notice_as_system_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
     monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
         expected = []
+        notice_id = ""
         for index in range(9):
             if index == 4:
-                store.append_message(
-                    with_message_origin(
-                        Message(
-                            MessageRole.USER,
-                            [TextContent("hidden inbox status")],
-                            metadata={"zeta_event": "project_inbox_sent_status"},
-                        ),
-                        MessageOrigin.HARNESS_NUDGE,
-                    )
-                )
+                notice = build_nudge_message()
+                assert notice.role is MessageRole.SYSTEM
+                assert notice.content[0].text.startswith("[zeta] empty-turn recovery:")
+                notice_id = store.append_message(notice).id
+                expected.append(notice_id)
             expected.append(
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
@@ -4445,11 +4658,15 @@ async def test_session_history_hides_passive_harness_message(
             )
         )[-1]["result"]
 
-        assert [row["id"] for row in first["messages"]] == expected[:8]
+        rows = [*first["messages"], *second["messages"]]
+        assert [row["id"] for row in rows] == expected
         assert first["next_offset"] == 8
-        assert [row["id"] for row in second["messages"]] == expected[8:]
         assert second["next_offset"] is None
-        assert "hidden inbox status" not in json.dumps([first, second])
+        notice_row = next(row for row in rows if row["id"] == notice_id)
+        assert notice_row["role"] == "system"
+        assert notice_row["content"][0]["text"].startswith(
+            "[zeta] empty-turn recovery:"
+        )
     finally:
         await _close(server, writer)
 

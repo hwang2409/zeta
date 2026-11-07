@@ -762,7 +762,7 @@ def test_agent_send_pending_prompt_is_not_labeled_user(tmp_path: Path) -> None:
 
 
 def test_empty_turn_nudge_is_not_labeled_user() -> None:
-    assert _label(_message_row(build_nudge_message())) == "harness_nudge"
+    assert _label(_message_row(build_nudge_message())) == "harness"
 
 
 def test_agent_completion_notification_is_not_labeled_user(tmp_path: Path) -> None:
