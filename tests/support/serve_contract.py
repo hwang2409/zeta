@@ -62,6 +62,14 @@ class ServeClient:
         method: str,
         params: dict[str, object] | None = None,
     ) -> dict[str, Any]:
+        return json.loads(await self.request_raw(request_id, method, params))
+
+    async def request_raw(
+        self,
+        request_id: str,
+        method: str,
+        params: dict[str, object] | None = None,
+    ) -> str:
         frame = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -70,9 +78,10 @@ class ServeClient:
         }
         await self._send(frame)
         while True:
-            reply = await self._receive()
+            raw = await self._receive_raw()
+            reply = json.loads(raw)
             if reply.get("id") == request_id:
-                return reply
+                return raw
             self._events.append(reply)
 
     async def event(self, name: str) -> dict[str, Any]:
@@ -99,17 +108,19 @@ class ServeClient:
         await self._writer.drain()
 
     async def _receive(self) -> dict[str, Any]:
+        frame = json.loads(await self._receive_raw())
+        assert isinstance(frame, dict)
+        return frame
+
+    async def _receive_raw(self) -> str:
         if self._websocket is not None:
             payload = await self._websocket.recv()
             assert isinstance(payload, str), "serve sent a binary WebSocket frame"
-        else:
-            assert self._reader is not None
-            line = await self._reader.readline()
-            assert line, "serve closed the Unix socket"
-            payload = line.decode()
-        frame = json.loads(payload)
-        assert isinstance(frame, dict)
-        return frame
+            return payload
+        assert self._reader is not None
+        line = await self._reader.readline()
+        assert line, "serve closed the Unix socket"
+        return line.decode()
 
 
 class ServeContract:

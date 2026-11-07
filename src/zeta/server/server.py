@@ -30,7 +30,6 @@ from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
-    PROJECT_REQUESTS,
     ProjectRequests,
     project_request_error,
 )
@@ -67,6 +66,37 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
+
+_LOGIN_METHODS = frozenset(
+    {
+        MethodDescriptor.LOGIN_START,
+        MethodDescriptor.LOGIN_STATUS,
+        MethodDescriptor.LOGIN_CANCEL,
+        MethodDescriptor.LOGIN_PROVIDERS,
+    }
+)
+_ERGONOMICS_METHODS = frozenset(
+    {
+        MethodDescriptor.RENAME_SESSION,
+        MethodDescriptor.DELETE_SESSION,
+        MethodDescriptor.SESSION_TREE,
+        MethodDescriptor.SESSION_HISTORY,
+        MethodDescriptor.CONTENT_READ,
+        MethodDescriptor.MODEL_CATALOG,
+        MethodDescriptor.SESSION_SETTINGS,
+        MethodDescriptor.SET_SETTINGS,
+        MethodDescriptor.SET_COMPACTION,
+        MethodDescriptor.SEND_IMAGES,
+    }
+)
+_PROJECT_METHODS = frozenset(
+    {
+        MethodDescriptor.LIST_PROJECTS,
+        MethodDescriptor.PROJECT_SHOW,
+        MethodDescriptor.PROJECT_MEMORY_LOG,
+        MethodDescriptor.PROJECT_INBOX,
+    }
+)
 
 
 class _UnixSocketListener:
@@ -550,32 +580,113 @@ class _Client:
         if handled:
             return result
         descriptor = MethodDescriptor.for_wire(method)
-        if descriptor is None:
-            raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-            )
-        if self.role == "observer" and descriptor.access is not Access.READ:
+        if self.role == "observer" and (
+            descriptor is None or descriptor.access is not Access.READ
+        ):
             raise ProtocolError(
                 ErrorDescriptor.OBSERVER_READ_ONLY,
                 "method is unavailable to read-only observers",
                 {"method": method},
             )
-        if descriptor.since is not None and tuple(
-            int(part) for part in self.protocol_version.split(".")
-        ) < tuple(int(part) for part in descriptor.since.split(".")):
+        if descriptor is None:
             raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires protocol 1.1"
+                ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
             )
         if descriptor.access is Access.SESSION_MUTATION:
             self.server.control._reject_if_unhealthy()
+        if descriptor.since is not None and tuple(
+            int(part) for part in self.protocol_version.split(".")
+        ) < tuple(int(part) for part in descriptor.since.split(".")):
+            raise self._descriptor_protocol_error(descriptor)
         if descriptor.feature is not None and descriptor.feature not in self.features:
-            feature_message = (
-                "session grants require the negotiated session_grants feature"
-                if descriptor.feature == "session_grants"
-                else f"{method} requires the negotiated {descriptor.feature} feature"
-            )
-            raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, feature_message)
+            raise self._descriptor_feature_error(descriptor)
         return await HANDLERS[descriptor](self, request_id, params)
+
+    def _descriptor_protocol_error(self, descriptor: MethodDescriptor) -> ProtocolError:
+        if descriptor in _LOGIN_METHODS:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND, "login is unavailable on this server"
+            )
+        if descriptor in _ERGONOMICS_METHODS:
+            if descriptor is MethodDescriptor.CONTENT_READ:
+                return ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND,
+                    "content_read requires the negotiated content_read feature",
+                )
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND, "request requires protocol 1.1"
+            )
+        if descriptor is MethodDescriptor.PING:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "ping requires the negotiated ping feature",
+            )
+        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "set_turn_context requires negotiated turn_context feature",
+            )
+        if descriptor in _PROJECT_METHODS:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                f"{descriptor.wire} requires the negotiated projects feature",
+            )
+        if descriptor in {
+            MethodDescriptor.SESSION_GRANTS,
+            MethodDescriptor.REVOKE_SESSION_GRANTS,
+        }:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "session grants require the negotiated session_grants feature",
+            )
+        return ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND,
+            f"{descriptor.wire} requires protocol 1.1",
+        )
+
+    def _descriptor_feature_error(self, descriptor: MethodDescriptor) -> ProtocolError:
+        if descriptor is MethodDescriptor.CLEAR_STEERING:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "clear_steering requires the negotiated abort_scope feature",
+            )
+        if descriptor is MethodDescriptor.DELIVERY_STATUS:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "delivery_status requires negotiated feature 'delivery_id'",
+            )
+        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "set_turn_context requires negotiated turn_context feature",
+            )
+        if descriptor in {
+            MethodDescriptor.SESSION_GRANTS,
+            MethodDescriptor.REVOKE_SESSION_GRANTS,
+        }:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "session grants require the negotiated session_grants feature",
+            )
+        if descriptor in _PROJECT_METHODS:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                f"{descriptor.wire} requires the negotiated projects feature",
+            )
+        if descriptor is MethodDescriptor.PING:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "ping requires the negotiated ping feature",
+            )
+        if descriptor is MethodDescriptor.CONTENT_READ:
+            return ProtocolError(
+                ErrorDescriptor.METHOD_NOT_FOUND,
+                "content_read requires the negotiated content_read feature",
+            )
+        return ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND,
+            f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
+        )
 
     async def _dispatch_descriptor(
         self,
@@ -584,18 +695,9 @@ class _Client:
         params: dict[str, Any],
     ) -> object:
         method = descriptor.wire
-        if method in login.REQUESTS:
-            if self.protocol_version == "1.0":
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "login is unavailable on this server",
-                )
+        if descriptor in _LOGIN_METHODS:
             return await self.logins.request(method, params)
-        if method in ergonomics.EXTENSION_REQUESTS:
-            if self.protocol_version == "1.0":
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND, "request requires protocol 1.1"
-                )
+        if descriptor in _ERGONOMICS_METHODS:
             return await self._ergonomics(descriptor, params)
         if descriptor is MethodDescriptor.PING:
             if "ping" not in self.features:
@@ -607,12 +709,7 @@ class _Client:
         if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
             contexts = self.server.turn_contexts
             return contexts.set_request(self.features, self.server.runtime, params)
-        if method in PROJECT_REQUESTS:
-            if "projects" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    f"{method} requires the negotiated projects feature",
-                )
+        if descriptor in _PROJECT_METHODS:
             assert self.projects is not None
             return await asyncio.to_thread(
                 self.projects.dispatch,
@@ -851,7 +948,9 @@ class _Client:
         if isinstance(descriptor, str):
             descriptor = MethodDescriptor.for_wire(descriptor)
             if descriptor is None:
-                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
+                raise ProtocolError(
+                    ErrorDescriptor.METHOD_NOT_FOUND, "method not found"
+                )
         runtime = self.server.runtime
         method = descriptor.wire
         if descriptor in {
