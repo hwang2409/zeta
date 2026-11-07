@@ -131,7 +131,6 @@ class SlashResultKindDescriptor(StrEnum):
     """One documented slash_run result kind."""
 
     OUTPUT = "output"
-    TEXT = "text"
     MODEL_INPUT = "model_input"
     CLIENT_ONLY = "client_only"
     UNKNOWN = "unknown"

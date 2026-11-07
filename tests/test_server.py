@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import re
 import shlex
 import signal
 import socket
@@ -7640,6 +7641,143 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
     return project
 
 
+async def _raw_response_line(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request_id: str,
+    method: str,
+    params: dict[str, Any],
+) -> str:
+    writer.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    )
+    await writer.drain()
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=TIMEOUT)
+        frame = json.loads(line)
+        if frame.get("id") == request_id:
+            return line.decode().removesuffix("\n")
+
+
+async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
+    server = ZetaServer(home=home, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        return await _raw_response_line(reader, writer, "hello", "hello", params)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> None:
+    observed = [
+        await _hello_wire_line(
+            tmp_path / "hello-1.0", {"protocol_version": "1.0"}
+        ),
+        await _hello_wire_line(
+            tmp_path / "hello-1.1",
+            {
+                "protocol_version": "1.1",
+                "features": ["model_input_ids"],
+            },
+        ),
+    ]
+    observer_home = tmp_path / "hello-observer"
+    observer_server = ZetaServer(
+        home=observer_home,
+        port=0,
+        provider="codex",
+    )
+    controller_reader, controller_writer = await _connect(observer_server)
+    await _request(
+        controller_reader,
+        controller_writer,
+        "controller",
+        "hello",
+        {"protocol_version": "1.2", "features": ["serve_observers"]},
+    )
+    assert observer_server.port is not None
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", observer_server.port
+    )
+    try:
+        observed.append(
+            await _raw_response_line(
+                observer_reader,
+                observer_writer,
+                "observer",
+                "hello",
+                {
+                    "protocol_version": "1.2",
+                    "role": "observer",
+                    "features": ["serve_observers"],
+                },
+            )
+        )
+    finally:
+        observer_writer.close()
+        await observer_writer.wait_closed()
+        await _close(observer_server, controller_writer)
+
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        observed.extend(
+            [
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-default",
+                    "slash_list",
+                    {"session_id": sid},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "list-complete",
+                    "slash_list",
+                    {"session_id": sid, "include_unavailable": True},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-bare",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp"},
+                ),
+                await _raw_response_line(
+                    reader,
+                    writer,
+                    "mcp-status",
+                    "slash_run",
+                    {"session_id": sid, "text": "/mcp status"},
+                ),
+            ]
+        )
+    finally:
+        await _close(server, writer)
+
+    fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
+    rows = fixture.read_text().splitlines()
+    assert rows[0] == (
+        "# baseline origin/main ba695c06; accepted deltas: "
+        "W1, W3, W5, text->output"
+    )
+    assert observed == rows[1:]
+
+
 @pytest.mark.asyncio
 async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
     tmp_path: Path,
@@ -7676,7 +7814,19 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
             "review",
             "greet",
         } <= set(runnable_by_name)
-        assert {"keys", "plan", "fork", "theme", "local", "shell"} <= unavailable
+        assert {
+            "always",
+            "approve",
+            "deny",
+            "fork",
+            "keys",
+            "local",
+            "permissions",
+            "plan",
+            "restart",
+            "shell",
+            "theme",
+        } <= unavailable
         assert all(entry["unavailable"] is None for entry in runnable_by_name.values())
         assert all(
             complete_by_name[name]["unavailable"] == "requires_tui"
@@ -7686,6 +7836,13 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         assert runnable_by_name["review"]["source"] == "project"
         assert runnable_by_name["greet"]["kind"] == "skill"
 
+        documented_kinds = set(
+            re.findall(
+                r"^  - `([a-z_]+)`: ",
+                (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(),
+                re.MULTILINE,
+            )
+        )
         for number, name in enumerate(runnable_by_name, 10):
             response = (
                 await _request(
@@ -7695,17 +7852,43 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
                     "slash_run",
                     {
                         "session_id": sid,
-                        "text": "/mcp status" if name == "mcp" else f"/{name}",
+                        "text": f"/{name}",
                     },
                 )
             )[-1]
             assert "result" in response, (name, response)
             result = response["result"]
+            assert result["kind"] in documented_kinds, (name, result)
             assert result["kind"] not in {"client_only", "error", "unknown"}, (
                 name,
                 result,
             )
             assert "unsupported" not in str(result).lower()
+
+        for number, name in enumerate(unavailable, 100):
+            result = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {"session_id": sid, "text": f"/{name}"},
+                )
+            )[-1]["result"]
+            assert result["kind"] in documented_kinds, (name, result)
+            assert result == {"kind": "client_only", "name": name}
+
+        help_result = (
+            await _request(
+                reader,
+                writer,
+                "help",
+                "slash_run",
+                {"session_id": sid, "text": "/help"},
+            )
+        )[-1]["result"]
+        assert "/status" in help_result["text"]
+        assert "/keys" not in help_result["text"]
 
         model_with_name = (
             await _request(
@@ -7728,7 +7911,7 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
                 {"session_id": sid, "text": "/mcp status"},
             )
         )[-1]["result"]
-        assert mcp_status["kind"] == "text"
+        assert mcp_status["kind"] == "output"
 
         invalid = (
             await _request(
@@ -7771,7 +7954,7 @@ async def test_serve_does_not_advertise_or_run_tui_approval_commands(
             await _request(reader, writer, "list", "slash_list", {"session_id": sid})
         )[-1]["result"]
 
-        assert run_result == {"kind": "unknown", "name": "approve"}
+        assert run_result == {"kind": "client_only", "name": "approve"}
         assert {entry["name"] for entry in list_result["commands"]}.isdisjoint(
             {"approve", "deny"}
         )
@@ -10063,7 +10246,7 @@ async def test_slash_run_mcp_credential_evidence_recovery(
             "Move this file aside, then run '/mcp auth live'."
         )
         assert response == {
-            "kind": "text",
+            "kind": "output",
             "text": expected_text,
             "credential_store_error": {
                 "code": "mcp_credential_store",

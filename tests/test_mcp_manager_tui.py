@@ -14,6 +14,7 @@ from prompt_toolkit.shortcuts import yes_no_dialog as real_yes_no_dialog
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.submissions import await_submission_pipeline
 from zeta.core.store import ConversationStore
 from zeta.mcp.management import ManagedServer, MCPManagementService
 from zeta.mcp.oauth_store import MCPOAuthToken
@@ -47,6 +48,7 @@ async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
     app._install_full_screen_layout(session)
 
     app._submit_input("/mcp")
+    await await_submission_pipeline(app)
     assert app.status_card_active
     assert app._mcp_manager_open
     assert app._status_card._lines[0][0][1] == "MCP servers"

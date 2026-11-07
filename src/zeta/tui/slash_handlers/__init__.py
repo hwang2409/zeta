@@ -32,6 +32,7 @@ from ...core.session import (
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
+    _format_status,
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
@@ -103,6 +104,13 @@ class SlashHandlerMixin:
             await self.resolve_local_approval(decision, requested_key, always=always)
             return
         await controller.resolve_approval(decision, requested_key, always=always)
+
+    def slash_status_command(self, args: str) -> str:
+        if not args.strip() and self._full_screen_active():
+            self._consume_overlay_submission()
+            self.open_status_card()
+            return ""
+        return _format_status(self.slash_status())
 
     def slash_status(self) -> SlashStatus:
         context_assembler = self.loop.context_assembler

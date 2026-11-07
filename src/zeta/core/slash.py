@@ -535,9 +535,21 @@ class SlashStatus:
 
 
 class SlashSession(Protocol):
-    def slash_status(self) -> SlashStatus: ...
+    def slash_status_command(self, args: str) -> str: ...
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
+
+    async def slash_approve(self, args: str) -> str: ...
+
+    async def slash_always(self, args: str) -> str: ...
+
+    async def slash_deny(self, args: str) -> str: ...
+
+    async def slash_accounts(self, args: str) -> str: ...
+
+    def slash_restart(self, args: str) -> str: ...
+
+    def slash_permissions(self, args: str) -> str: ...
 
     async def slash_mcp_prompt(
         self, name: str, arguments: dict[str, str]
@@ -599,6 +611,17 @@ SlashResult = (
 SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
+def _never(_args: str) -> bool:
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class ServeSlash:
+    """Serve-specific policy for one shared slash command."""
+
+    mutates: Callable[[str], bool] = _never
+
+
 @dataclass(frozen=True, slots=True)
 class SlashCommand:
     """One named command in the input-time registry."""
@@ -606,15 +629,19 @@ class SlashCommand:
     name: str
     handler: SlashHandler
     description: str = ""
+    serve: ServeSlash | None = None
 
     def run(self, session: SlashSession, args: str) -> SlashResult:
         return self.handler(session, args)
 
 
 class SlashCommandRegistry:
-    """Map registered command names to their handlers."""
+    """Map registered command names to their handlers for one surface."""
 
-    def __init__(self) -> None:
+    def __init__(self, surface: str = "tui") -> None:
+        if surface not in {"tui", "serve"}:
+            raise ValueError(f"unknown slash-command surface: {surface}")
+        self.surface = surface
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
         self._skills: dict[str, SkillMeta] = {}
@@ -667,6 +694,16 @@ class SlashCommandRegistry:
 
         return frozenset(self._warning_notices)
 
+    def command_for(self, name: str) -> SlashCommand | None:
+        """Return the shared builtin named ``name``, if it exists."""
+
+        return self._commands.get(name)
+
+    def available(self, command: SlashCommand) -> bool:
+        """Return whether a builtin is available on this registry's surface."""
+
+        return self.surface == "tui" or command.serve is not None
+
     @property
     def completion_entries(self) -> tuple[tuple[str, str, str], ...]:
         """Return command names, descriptions, and custom source badges."""
@@ -674,6 +711,7 @@ class SlashCommandRegistry:
         builtins = tuple(
             (command.name, command.description, "")
             for command in self._commands.values()
+            if self.available(command)
         )
         custom = tuple(
             (command.name, command.description, command.source)
@@ -761,7 +799,7 @@ class SlashCommandRegistry:
         if not is_slash_safe_name(name):
             return None
         command = self._commands.get(name)
-        if command is not None:
+        if command is not None and self.available(command):
             result = command.run(session, parts[1] if len(parts) == 2 else "")
             if isinstance(result, ModelInputEnvelope):
                 return replace(result, display_text=value)
@@ -853,6 +891,8 @@ class SlashCommandRegistry:
 
         lines = ["built-in commands:"]
         for command in self._commands.values():
+            if not self.available(command):
+                continue
             description = f" — {command.description}" if command.description else ""
             lines.append(f"  /{command.name}{description}")
         lines.append("custom commands:")
@@ -1023,8 +1063,7 @@ def _format_estimated_cost(status: SlashStatus) -> str:
 
 
 def _run_status(session: SlashSession, args: str) -> str:
-    del args
-    return _format_status(session.slash_status())
+    return session.slash_status_command(args)
 
 
 async def _run_mcp(session: SlashSession, args: str) -> str | ModelInputEnvelope:
@@ -1141,6 +1180,42 @@ enter submit · ctrl+j insert newline
 esc cancel popup · tab toggle finder preview"""
 
 
+def _run_approve(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_approve(args)
+
+
+def _run_always(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_always(args)
+
+
+def _run_deny(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_deny(args)
+
+
+def _run_accounts(session: SlashSession, args: str) -> SlashResult:
+    return session.slash_accounts(args)
+
+
+def _run_restart(session: SlashSession, args: str) -> str:
+    return session.slash_restart(args)
+
+
+def _run_permissions(session: SlashSession, args: str) -> str:
+    return session.slash_permissions(args)
+
+
+def _has_args(args: str) -> bool:
+    return bool(args.strip())
+
+
+def _vim_mutates(args: str) -> bool:
+    return args.strip().lower() in {"on", "off", "toggle"}
+
+
+def _project_mutates(args: str) -> bool:
+    return args.strip() == "init"
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -1148,25 +1223,38 @@ def create_slash_registry(
     project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
-    extra_commands: Sequence[SlashCommand] = (),
+    surface: str = "tui",
 ) -> SlashCommandRegistry:
-    """Register built-ins and frontend commands before custom commands and skills."""
+    """Register shared builtins before custom commands and skills."""
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
-    registry = SlashCommandRegistry()
+    registry = SlashCommandRegistry(surface)
     private_project_root = (
         Path(project_dir).expanduser().resolve()
         if project_dir is not None
         else discover_project_root(Path.cwd())
     )
     project_root = None if project_eligible is False else private_project_root
-    registry.register(SlashCommand("status", _run_status, "show session status"))
-    registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
-    registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
-        SlashCommand("model", _run_model, "pick a model or switch to one: /model [name]")
+        SlashCommand("status", _run_status, "show session status", ServeSlash())
     )
-    registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
+    registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
+    registry.register(
+        SlashCommand("mcp", _run_mcp, "show MCP server status", ServeSlash())
+    )
+    registry.register(
+        SlashCommand(
+            "model",
+            _run_model,
+            "pick a model or switch to one: /model [name]",
+            ServeSlash(mutates=_has_args),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "vim", _run_vim, "show or change vim mode", ServeSlash(mutates=_vim_mutates)
+        )
+    )
     registry.register(
         SlashCommand("plan", _run_plan, "show or change plan mode")
     )
@@ -1181,16 +1269,22 @@ def create_slash_registry(
     registry.register(SlashCommand(
         "project-instructions", instruction_handler,
         "open or create private project instructions in your editor",
+        ServeSlash(),
     ))
     registry.register(
         SlashCommand(
             "init",
             lambda session, args: _run_init(session, args, project_root),
             "generate or improve project instructions",
+            ServeSlash(),
         )
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
-    registry.register(SlashCommand("compact", _run_compact, "compact the context"))
+    registry.register(
+        SlashCommand(
+            "compact", _run_compact, "compact the context", ServeSlash(mutates=lambda _args: True)
+        )
+    )
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
     registry.register(
         SlashCommand(
@@ -1218,11 +1312,23 @@ def create_slash_registry(
         SlashCommand("name", _run_name, "name the current session for the picker")
     )
     registry.register(
-        SlashCommand("project", _run_project, "show or initialize the current project")
+        SlashCommand(
+            "project",
+            _run_project,
+            "show or initialize the current project",
+            ServeSlash(mutates=_project_mutates),
+        )
     )
-    registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
     registry.register(
-        SlashCommand("memory", _run_memory, "show, retry, or undo automatic memory updates")
+        SlashCommand("inbox", _run_inbox, "list this project's inbox", ServeSlash())
+    )
+    registry.register(
+        SlashCommand(
+            "memory",
+            _run_memory,
+            "show, retry, or undo automatic memory updates",
+            ServeSlash(),
+        )
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
@@ -1238,10 +1344,44 @@ def create_slash_registry(
         SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
     )
     registry.register(
-        SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
+        SlashCommand(
+            "help",
+            lambda _session, _args: registry.help_text(),
+            "list commands",
+            ServeSlash(),
+        )
     )
-    for command in extra_commands:
-        registry.register(command)
+    registry.register(SlashCommand("approve", _run_approve, "/approve [key]"))
+    registry.register(
+        SlashCommand(
+            "always",
+            _run_always,
+            "/always [key] — allow this tool/action for the running session",
+        )
+    )
+    registry.register(SlashCommand("deny", _run_deny, "/deny [key]"))
+    registry.register(
+        SlashCommand(
+            "accounts",
+            _run_accounts,
+            "list or label accounts",
+            ServeSlash(mutates=_has_args),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "restart",
+            _run_restart,
+            "restart this session from the local checkout (reinstall after pyproject changes)",
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "permissions",
+            _run_permissions,
+            "show rules; revoke a session grant: /permissions revoke <grant>; clear all: /permissions clear",
+        )
+    )
     result = load_custom_commands(
         home=effective_home,
         project_dir=project_dir or Path.cwd(),
