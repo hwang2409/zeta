@@ -130,11 +130,16 @@ def test_non_merge_is_clean(tmp_path: Path):
     assert "not a two-parent merge" in run(r).stdout
 
 
-def make_merge(r: Path, *, into: str, from_branch: str) -> tuple[str, str, str]:
+def make_merge(
+    r: Path, *, into: str, from_branch: str, restore: str | None = None
+) -> tuple[str, str, str]:
     subprocess.run(["git", "checkout", "-q", into], cwd=r, check=True)
     subprocess.run(
-        ["git", "merge", "--no-ff", "--no-edit", from_branch], cwd=r, check=True
+        ["git", "merge", "--no-ff", "--no-commit", from_branch], cwd=r, check=True
     )
+    if restore is not None:
+        subprocess.run(["git", "checkout", into, "--", restore], cwd=r, check=True)
+    commit(r, "merge")
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
@@ -246,7 +251,7 @@ def test_main_sha_override_and_removed_parent_flag(tmp_path: Path):
     (r / "src/a.py").write_text("x = 1\n")
     commit(r, "base")
     subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
-    (r / "src/a.py").write_text("x = 2\n")
+    (r / "src/a.py").write_text("x = 2\ndef main_only(): pass\n")
     commit(r, "main change")
     main = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
@@ -257,11 +262,24 @@ def test_main_sha_override_and_removed_parent_flag(tmp_path: Path):
     subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
     (r / "src/b.py").write_text("x = 3\n")
     commit(r, "branch change")
-    merge, p1, p2 = make_merge(r, into="branch", from_branch="main")
-    assert run(r, merge, "--main-sha", p2).returncode == 0
+    merge, p1, p2 = make_merge(r, into="branch", from_branch="main", restore="src/a.py")
+    default = run(r, merge)
+    assert default.returncode == 1
+    assert f"main parent: {p2}" in default.stdout
+    assert "main_only" in default.stdout
+    wrong_side = run(r, merge, "--main-sha", p1)
+    assert wrong_side.returncode == 2
+    assert "disagrees with the identified main parent" in wrong_side.stderr
+    correct = run(r, merge, "--main-sha", p2)
+    assert correct.returncode == 1
+    assert f"main parent: {p2}" in correct.stdout
+    assert "main_only" in correct.stdout
+    abbreviated = run(r, merge, "--main-sha", p2[:8])
+    assert abbreviated.returncode == 2
+    assert "full 40-hex parent sha" in abbreviated.stderr
     wrong = run(r, merge, "--main-sha", "HEAD~2")
     assert wrong.returncode == 2
-    assert "not a merge parent" in wrong.stderr
+    assert "full 40-hex parent sha" in wrong.stderr
     removed = run(r, merge, "--main-parent", "1")
     assert removed.returncode == 2
     assert "unrecognized arguments" in removed.stderr
