@@ -32,6 +32,7 @@ def service(tmp_path, mount=None):
 
 _ADD_MCP_SERVER_PROCESS = """
 import asyncio
+import inspect
 import sys
 
 from zeta.mcp.management import MCPManagementService
@@ -39,7 +40,9 @@ from zeta.mcp.management import MCPManagementService
 manager = MCPManagementService(home=sys.argv[1], project_dir=sys.argv[2])
 print("ready", flush=True)
 sys.stdin.readline()
-asyncio.run(manager.add(sys.argv[3], scope="user", command=sys.executable))
+result = manager.add(sys.argv[3], scope="user", command=sys.executable)
+if inspect.isawaitable(result):
+    asyncio.run(result)
 """
 
 
@@ -207,7 +210,12 @@ async def test_multiprocess_mutations_do_not_lose_writers(tmp_path):
     try:
         for process in processes:
             assert process.stdout is not None
-            assert await asyncio.to_thread(process.stdout.readline) == "ready\n"
+            assert (
+                await asyncio.wait_for(
+                    asyncio.to_thread(process.stdout.readline), 10
+                )
+                == "ready\n"
+            )
         for process in processes:
             assert process.stdin is not None
             process.stdin.write("start\n")
@@ -234,12 +242,166 @@ async def test_multiprocess_mutations_do_not_lose_writers(tmp_path):
                 if stream is not None:
                     stream.close()
 
+    document = json.loads((tmp_path / "home" / "mcp.json").read_text())
+    assert set(document["servers"]) == {"process-one", "process-two"}
+
+
+@pytest.mark.parametrize(
+    ("route", "gated_read", "expected_reconciles"),
+    (
+        ("sync_runtime", 1, 2),
+        ("refresh", 1, 2),
+        ("refresh_credentials", 2, 3),
+    ),
+)
+@pytest.mark.asyncio
+async def test_management_routes_cannot_publish_stale_candidates(
+    tmp_path, monkeypatch, route, gated_read, expected_reconciles
+):
+    manager = service(tmp_path)
+    stale_read = threading.Event()
+    release_stale = threading.Event()
+    original_transaction = manager._transaction
+    read_count = 0
+    read_count_lock = threading.Lock()
+
+    def gated_transaction(mutation=None):
+        nonlocal read_count
+        candidate = original_transaction(mutation)
+        if mutation is None:
+            with read_count_lock:
+                read_count += 1
+                should_gate = read_count == gated_read
+            if should_gate:
+                stale_read.set()
+                assert release_stale.wait(10), "timed out releasing stale transaction"
+        return candidate
+
+    reconciled = []
+
+    async def record_reconcile(desired):
+        reconciled.append(set(desired.configured_servers))
+
+    # test-contract: seam force the transaction-to-publication interleaving
+    monkeypatch.setattr(manager, "_transaction", gated_transaction)
+    # test-contract: seam observe runtime reconciliation order without a real server
+    monkeypatch.setattr(manager, "_reconcile", record_reconcile)
+    route_task = asyncio.create_task(getattr(manager, route)())
+    add_task = None
+    try:
+        assert await asyncio.to_thread(stale_read.wait, 10), "transaction did not start"
+        add_task = asyncio.create_task(
+            manager.add("new", scope="user", command=sys.executable)
+        )
+        if not manager._transaction_gate.locked():
+            await asyncio.wait_for(asyncio.shield(add_task), 10)
+        release_stale.set()
+        await asyncio.wait_for(route_task, 10)
+        await asyncio.wait_for(add_task, 10)
+    finally:
+        release_stale.set()
+        for task in (route_task, add_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True), 10
+                )
+
+    durable = set(json.loads(manager.path("user").read_text())["servers"])
+    assert {item.name for item in manager.snapshot.entries} == durable
+    assert reconciled == [set()] * (expected_reconciles - 1) + [durable]
+
+
+@pytest.mark.parametrize("cancel_at", ("gate", "transaction", "reconcile"))
+@pytest.mark.asyncio
+async def test_cancelled_management_owner_keeps_old_snapshot(
+    tmp_path, monkeypatch, cancel_at
+):
     manager = service(tmp_path)
     await manager.refresh()
-    assert {item.name for item in manager.snapshot.entries} == {
-        "process-one",
-        "process-two",
-    }
+    before = manager.snapshot
+    release_gate = False
+    release_thread = threading.Event()
+    thread_finished = threading.Event()
+    release_reconcile = asyncio.Event()
+
+    if cancel_at == "gate":
+        await manager._transaction_gate.acquire()
+        release_gate = True
+    elif cancel_at == "transaction":
+        started = threading.Event()
+        original_transaction = manager._transaction
+
+        def blocked_transaction(mutation=None):
+            try:
+                candidate = original_transaction(mutation)
+                started.set()
+                assert release_thread.wait(10), "timed out releasing transaction"
+                return candidate
+            finally:
+                thread_finished.set()
+
+        # test-contract: seam pause the worker transaction await before publication
+        monkeypatch.setattr(manager, "_transaction", blocked_transaction)
+    else:
+        started_async = asyncio.Event()
+
+        async def blocked_reconcile(_desired):
+            started_async.set()
+            await release_reconcile.wait()
+
+        # test-contract: seam pause runtime reconciliation before publication
+        monkeypatch.setattr(manager, "_reconcile", blocked_reconcile)
+
+    entered = asyncio.Event()
+
+    async def refresh():
+        entered.set()
+        return await manager.refresh()
+
+    task = asyncio.create_task(refresh())
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if cancel_at == "transaction":
+            assert await asyncio.to_thread(started.wait, 10), "transaction did not start"
+        elif cancel_at == "reconcile":
+            await asyncio.wait_for(started_async.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+    finally:
+        if release_gate:
+            manager._transaction_gate.release()
+        release_thread.set()
+        release_reconcile.set()
+        if cancel_at == "transaction":
+            assert await asyncio.wait_for(
+                asyncio.to_thread(thread_finished.wait, 10), 10
+            )
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 10
+            )
+
+    assert manager.snapshot is before
+
+
+@pytest.mark.asyncio
+async def test_reconcile_failure_does_not_publish_candidate(tmp_path, monkeypatch):
+    manager = service(tmp_path)
+    await manager.refresh()
+    before = manager.snapshot
+
+    async def fail_reconcile(_desired):
+        raise RuntimeError("reconcile failed")
+
+    # test-contract: seam inject a runtime reconciliation failure
+    monkeypatch.setattr(manager, "_reconcile", fail_reconcile)
+    with pytest.raises(RuntimeError, match="reconcile failed"):
+        await manager.add("new", scope="user", command=sys.executable)
+
+    assert manager.snapshot is before
 
 
 @pytest.mark.asyncio
@@ -250,7 +412,9 @@ async def test_concurrent_mutations_do_not_lose_writers(tmp_path):
         await manager.add(f"server-{index}", scope="user", command=sys.executable)
 
     async def run_all():
-        await asyncio.gather(*(add(index) for index in range(12)))
+        await asyncio.wait_for(
+            asyncio.gather(*(add(index) for index in range(12))), 10
+        )
 
     await run_all()
     assert {
@@ -664,7 +828,7 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(
     async def slow_mount(registry, config=None, *, notice_sink=None, home=None):
         del config, notice_sink
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return MCPMount(registry, {}, {}, home=home)
 
     monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", slow_mount)
@@ -674,12 +838,20 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(
         skill_catalog=SkillCatalog.empty(),
     )
     await loop.activate()
-    await started.wait()
-    assert loop._mcp_mount_task is not None and not loop._mcp_mount_task.done()
-    release.set()
-    await loop.ensure_mcp_servers()
-    assert await loop.slash_mcp("status") == await loop.slash_mcp("")
-    await loop.close()
+    try:
+        await asyncio.wait_for(started.wait(), 10)
+        assert loop._mcp_mount_task is not None and not loop._mcp_mount_task.done()
+        release.set()
+        await loop.ensure_mcp_servers()
+        assert await loop.slash_mcp("status") == await loop.slash_mcp("")
+    finally:
+        release.set()
+        if loop._mcp_mount_task is not None:
+            loop._mcp_mount_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(loop._mcp_mount_task, return_exceptions=True), 10
+            )
+        await loop.close()
 
 
 @pytest.mark.asyncio

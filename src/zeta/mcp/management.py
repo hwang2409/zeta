@@ -507,6 +507,7 @@ class MCPManagementService:
         return tuple(updated)
 
     def _publish(self, candidate: _ManagementCandidate) -> MCPManagerSnapshot:
+        assert self._transaction_gate.locked(), "publication requires transaction gate"
         self._home_path = candidate.home_path
         self._project_path = candidate.project_path
         self._paths_ready = True
@@ -516,10 +517,17 @@ class MCPManagementService:
         )
         return self._snapshot
 
-    async def refresh(self) -> MCPManagerSnapshot:
+    async def _transact_reconcile_publish(
+        self,
+        mutation: Callable[[Path, Path | None, Path], None] | None = None,
+    ) -> MCPManagerSnapshot:
         async with self._transaction_gate:
-            candidate = await asyncio.to_thread(self._transaction)
+            candidate = await asyncio.to_thread(self._transaction, mutation)
+            await self._reconcile(candidate.runtime_config)
             return self._publish(candidate)
+
+    async def refresh(self) -> MCPManagerSnapshot:
+        return await self._transact_reconcile_publish()
 
     def _config_mutation(
         self,
@@ -543,10 +551,7 @@ class MCPManagementService:
     async def _commit(
         self, mutation: Callable[[Path, Path | None, Path], None]
     ) -> MCPManagerSnapshot:
-        async with self._transaction_gate:
-            candidate = await asyncio.to_thread(self._transaction, mutation)
-            await self._reconcile(candidate.runtime_config)
-            return self._publish(candidate)
+        return await self._transact_reconcile_publish(mutation)
 
     async def add(
         self,
@@ -655,8 +660,7 @@ class MCPManagementService:
                 self.credential_store_error = public_credential_store_error(exc)
                 raise
             self._credential_status[item.name] = token_state(credential.token)
-        candidate = await asyncio.to_thread(self._transaction)
-        return self._publish(candidate).entries
+        return (await self._transact_reconcile_publish()).entries
 
     async def runtime_config(self) -> MCPConfig:
         if self._runtime is None:
@@ -665,6 +669,7 @@ class MCPManagementService:
         return self._runtime
 
     async def _reconcile(self, desired: MCPConfig) -> None:
+        assert self._transaction_gate.locked(), "reconciliation requires transaction gate"
         if self.mount is None or getattr(self.mount, "pinned", False):
             return
         configured = desired.configured_servers
@@ -680,9 +685,7 @@ class MCPManagementService:
                 )
 
     async def sync_runtime(self) -> MCPManagerSnapshot:
-        candidate = await asyncio.to_thread(self._transaction)
-        await self._reconcile(candidate.runtime_config)
-        return self._publish(candidate)
+        return await self._transact_reconcile_publish()
 
     def _policy_registry(self) -> ToolRegistry | None:
         return getattr(self.mount, "registry", None)
