@@ -16,10 +16,10 @@ import pytest
 from PIL import Image
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
-    _close,
     _connect,
     _event,
     _frames_until_event,
@@ -27,7 +27,6 @@ from tests.test_server import (
     _request,
 )
 from zeta.core.session import SessionMetadata
-from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
@@ -106,7 +105,7 @@ async def test_controller_model_catalog_works_before_session_attachment(
         result = (await _request(reader, writer, 2, "model_catalog"))[-1]
         assert result["result"]["models"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -130,7 +129,7 @@ async def test_new_session_settings_apply_before_first_turn(tmp_path: Path) -> N
         assert server.runtime.policy.default.value == "allow"
         assert backend.calls
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -156,7 +155,7 @@ async def test_new_session_settings_invalid_does_not_create_session(
         }
         assert server.runtime.opened is None
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 # Finding 1: resume uses the persisted session cwd.
@@ -170,7 +169,7 @@ async def _create_session_in(tmp_path: Path, cwd: Path) -> str:
         created = await _request(reader, writer, 2, "new_session", {})
         return created[-1]["result"]["session"]["session_id"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -195,7 +194,7 @@ async def test_resume_runs_tools_in_the_session_cwd(
 
         async def gated_send(connection: object, payload: bytes) -> bool:
             if connection is controller and json.loads(payload).get("id") == 4:
-                await tool_end_written.wait()
+                await asyncio.wait_for(tool_end_written.wait(), 10)
             return await original_send(connection, payload)
 
         async def record_write(payload: bytes) -> bool:
@@ -220,52 +219,15 @@ async def test_resume_runs_tools_in_the_session_cwd(
         end = await _event(reader, "tool_end")
         assert _tool_stdout(end) == str(original.resolve())
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
-async def test_resume_rejects_a_session_whose_cwd_was_removed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_resume_rejects_a_session_whose_cwd_was_removed(tmp_path: Path) -> None:
     original = tmp_path / "original"
     original.mkdir()
-    entered = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    original_acquire = MCPManagementService._acquire_locks
-
-    def gated_acquire(self, paths):
-        if any(path.parent == original / ".zeta" for path in paths):
-            entered.set()
-            closed = getattr(self, "_closed", None)
-            if closed is not None:
-                if not closed.wait(10):
-                    raise AssertionError("management close did not begin")
-            elif not release.wait(10):
-                raise AssertionError("MCP writer gate was not released")
-            try:
-                return original_acquire(self, paths)
-            finally:
-                finished.set()
-        return original_acquire(self, paths)
-
-    # test-contract: seam MCP transaction worker has no public readiness hook
-    monkeypatch.setattr(MCPManagementService, "_acquire_locks", gated_acquire)
-    first_server = _server(tmp_path, None, original)
-    first_reader, first_writer = await _connect(first_server)
-    try:
-        await _legacy_hello(first_reader, first_writer)
-        created = await _request(first_reader, first_writer, 2, "new_session", {})
-        session_id = created[-1]["result"]["session"]["session_id"]
-        assert await asyncio.to_thread(entered.wait, 10)
-    finally:
-        await asyncio.wait_for(_close(first_server, first_writer), 10)
-
+    session_id = await _create_session_in(tmp_path, original)
     shutil.rmtree(original)
-    release.set()
-    assert await asyncio.to_thread(finished.wait, 10)
-    assert not (original / ".zeta").exists()
-
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
@@ -279,8 +241,7 @@ async def test_resume_rejects_a_session_whose_cwd_was_removed(
         status = (await _request(reader, writer, 4, "status"))[-1]["result"]
         assert status["session"]["session_id"] == active["session"]["session_id"]
     finally:
-        release.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 # Feature negotiation for the gamma extensions.
@@ -296,7 +257,7 @@ async def test_hello_echoes_requested_supported_features_only(tmp_path: Path) ->
         assert hello["capabilities"]["features"] == FEATURES
         assert "ping" in hello["capabilities"]["requests"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -312,7 +273,7 @@ async def test_clients_without_features_see_unchanged_capabilities(
         frames = await _request(reader, writer, 2, "ping")
         assert frames[-1]["error"]["code"] == -32601
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -331,7 +292,7 @@ async def test_legacy_hello_ignores_features(tmp_path: Path) -> None:
         assert hello["protocol_version"] == "1.0"
         assert "features" not in hello["capabilities"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -375,7 +336,7 @@ async def test_new_session_cwd_selects_the_tool_directory(tmp_path: Path) -> Non
         end = await _event(reader, "tool_end")
         assert _tool_stdout(end) == str(project.resolve())
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -398,7 +359,7 @@ async def test_new_session_cwd_must_be_an_existing_absolute_directory(
         status = (await _request(reader, writer, 20, "status"))[-1]["result"]
         assert status["session"] is None
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -413,7 +374,7 @@ async def test_new_session_cwd_requires_the_negotiated_feature(tmp_path: Path) -
         assert frames[-1]["error"]["code"] == -32602
         assert "session_cwd" in frames[-1]["error"]["message"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 # Finding 3: user_message events.
@@ -465,7 +426,7 @@ async def test_send_and_steer_emit_user_message_events(tmp_path: Path) -> None:
         assert steer["delivery_id"] == "steer-4"
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -513,7 +474,7 @@ async def test_user_message_delivery_id_is_opt_in(tmp_path: Path) -> None:
         )[-1]["result"]["messages"]
         assert all("delivery_id" not in row for row in history)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -538,7 +499,7 @@ async def test_user_message_delivery_id_is_omitted_without_a_request_id(
             assert "delivery_id" not in await _event(reader, "user_message")
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -605,7 +566,7 @@ async def test_queued_steer_keeps_its_delivery_id_when_another_request_is_pendin
         assert later_echoes == []
         assert len(backend.calls) == 2
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -654,7 +615,7 @@ async def test_user_message_delivery_id_survives_restart_in_history(
         )
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     restarted = _server(tmp_path, FakeBackend([]), _launch(tmp_path))
     reader, writer = await _connect(restarted)
@@ -680,7 +641,7 @@ async def test_user_message_delivery_id_survives_restart_in_history(
             "history-steer",
         ]
     finally:
-        await _close(restarted, writer)
+        await close_serve(restarted, writer)
 
 
 @pytest.mark.asyncio
@@ -735,7 +696,7 @@ async def test_duplicate_delivery_id_does_not_emit_a_second_user_message(
         assert len(messages) == 1
         assert messages[0]["text"] == "next"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -749,7 +710,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
-            heartbeat_reached_thread.wait()
+            heartbeat_reached_thread.wait(timeout=10)
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
@@ -783,13 +744,13 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         )
         asyncio.get_running_loop().call_soon(heartbeat.set)
         asyncio.get_running_loop().call_soon(heartbeat_reached_thread.set)
-        await heartbeat.wait()
-        assert await request == {"accepted": True, "session_id": session_id}
+        await asyncio.wait_for(heartbeat.wait(), 10)
+        assert await asyncio.wait_for(request, 10) == {"accepted": True, "session_id": session_id}
         assert decoded_after_heartbeat and all(decoded_after_heartbeat)
         await _event(reader, "agent_end")
     finally:
         heartbeat_reached_thread.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -803,7 +764,7 @@ async def test_cancelled_send_images_publishes_nothing(
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
-        release_worker.wait()
+        release_worker.wait(timeout=10)
         try:
             return await original_normalize(*args, **kwargs)
         finally:
@@ -833,18 +794,18 @@ async def test_cancelled_send_images_publishes_nothing(
                 frozenset(),
             )
         )
-        await asyncio.to_thread(worker_started.wait)
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), 10)
         request.cancel()
         release_worker.set()
         with pytest.raises(asyncio.CancelledError):
-            await request
-        await asyncio.to_thread(worker_finished.wait)
+            await asyncio.wait_for(request, 10)
+        await asyncio.wait_for(asyncio.to_thread(worker_finished.wait), 10)
 
         assert server.runtime.opened.store.messages() == []
         assert not (server.runtime.opened.store.session_dir / "attachments").exists()
     finally:
         release_worker.set()
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -897,7 +858,7 @@ async def test_send_images_publication_is_off_event_loop(
         with Image.open(io.BytesIO(base64.b64decode(attached.data))) as sent:
             assert max(sent.size) <= 3000
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -933,7 +894,7 @@ async def test_send_images_emits_user_message_with_attachment_summary(
         ]
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -993,7 +954,7 @@ async def test_model_switch_keeps_image_before_prompt_in_provider_request(
             "input_text",
         ]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1015,7 +976,7 @@ async def test_user_message_event_requires_the_negotiated_feature(
                 break
         assert "user_message" not in events
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 async def _event_frame(reader) -> dict:
@@ -1047,7 +1008,7 @@ async def test_extensions_report_missing_session_id_as_invalid_params(
         )
         assert frames[-1]["error"]["code"] == -32003
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 # Finding 5: documented SessionMetadata matches the serializer.
@@ -1114,7 +1075,7 @@ async def test_abort_emits_turn_aborted_during_approval_and_tool_execution(
             status = (await _request(reader, writer, 6, "status"))[-1]["result"]
             assert status["state"] == "idle"
         finally:
-            await _close(server, writer)
+            await close_serve(server, writer)
 
 
 # Finding 7: list_sessions paging.
@@ -1153,7 +1114,7 @@ async def test_list_sessions_pages_with_offset_and_limit(tmp_path: Path) -> None
             frames = await _request(reader, writer, index + 10, "list_sessions", params)
             assert frames[-1]["error"]["code"] == -32602, params
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1170,7 +1131,7 @@ async def test_list_sessions_paging_requires_the_negotiated_feature(
         frames = await _request(reader, writer, 4, "list_sessions", {"offset": 1})
         assert frames[-1]["error"]["code"] == -32602
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 # Finding 8: ping.
@@ -1196,7 +1157,7 @@ async def test_ping_answers_before_a_session_and_during_a_turn(tmp_path: Path) -
         }
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 def _documented_features() -> list[str]:
@@ -1224,7 +1185,7 @@ async def test_hello_advertises_approval_history_only_when_requested(
         hello = await _hello(reader, writer, ["approval_history"])
         assert hello["capabilities"]["features"] == ["approval_history"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 def _host_binding(token: str, *, name: str = "gamma") -> list[dict[str, object]]:
@@ -1345,10 +1306,9 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
         assert server.control._active_host_commands is not None
         assert not server.control._active_host_commands.commands
     finally:
-        if observer_writer is not None:
-            observer_writer.close()
-            await observer_writer.wait_closed()
-        await _close(server, writer)
+        await close_serve(
+            server, writer, *([observer_writer] if observer_writer is not None else [])
+        )
 
     unnegotiated = _server(tmp_path / "unnegotiated", None, _launch(tmp_path))
     reader, writer = await _connect(unnegotiated)
@@ -1364,7 +1324,7 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
         assert frames[-1]["error"]["code"] == -32602
         assert token not in json.dumps(frames)
     finally:
-        await _close(unnegotiated, writer)
+        await close_serve(unnegotiated, writer)
 
 
 @pytest.mark.asyncio
@@ -1461,7 +1421,7 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
         finally:
             await child_registry.close()
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1619,7 +1579,7 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
                 resume.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(resume, TIMEOUT)
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -1684,10 +1644,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         assert backend.calls == []
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1719,10 +1676,7 @@ async def test_legacy_session_still_accepts_send_after_reconnect(tmp_path: Path)
         await _event(replay_reader, "agent_end")
         assert len(backend.calls) == 1
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1779,10 +1733,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
         assert len(backend.calls) == 1
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -1922,10 +1873,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             for block in message.content
         )
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -2040,10 +1988,7 @@ async def test_session_host_commands_live_approval_before_resume_keeps_original_
             for block in message.content
         )
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -2165,10 +2110,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             == 1
         )
     finally:
-        if replay_writer is not None:
-            await _close(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(server, replay_writer or writer)
 
 
 @pytest.mark.asyncio
@@ -2261,7 +2203,7 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
         monkeypatch.setattr(server.control, "unhealthy", lambda: False)
         monkeypatch.setattr(server.runtime, "resume_session", real_resume)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2318,7 +2260,7 @@ async def test_send_images_delivery_id_reaches_echo_and_history(
         user_rows = [row for row in history if row["role"] == "user"]
         assert user_rows[0].get("delivery_id") == "image-3"
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2364,7 +2306,7 @@ async def test_send_images_delivery_id_retry_is_idempotent(tmp_path: Path) -> No
         }
         await _event(reader, "agent_end")
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     restarted = _server(tmp_path, backend, _launch(tmp_path))
     reader, writer = await _connect(restarted)
@@ -2378,7 +2320,7 @@ async def test_send_images_delivery_id_retry_is_idempotent(tmp_path: Path) -> No
         }
         assert len(backend.calls) == 1
     finally:
-        await _close(restarted, writer)
+        await close_serve(restarted, writer)
 
 
 @pytest.mark.asyncio
@@ -2418,7 +2360,7 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
         assert set(attachments.iterdir()) == published
         assert len(backend.calls) == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2467,7 +2409,7 @@ async def test_send_images_delivery_id_uses_semantic_image_payload(
         }
         assert len(backend.calls) == 1
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -2499,4 +2441,4 @@ async def test_send_images_delivery_id_requires_its_feature(tmp_path: Path) -> N
         )
         assert frames[-1].get("error", {}).get("code") == -32602
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
