@@ -13,6 +13,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
+    TIMEOUT,
     _close,
     _connect,
     _event,
@@ -341,6 +342,165 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
         assert revoked[-1]["result"]["grants"]["session_grants"] == []
     finally:
         await _close_websocket(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
+    tmp_path: Path,
+) -> None:
+    first = ToolCall("call-1", "bash", {"command": "printf first"})
+    pending = ToolCall("call-2", "bash", {"command": "printf pending"})
+    next_call = ToolCall("call-3", "bash", {"command": "printf next"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[first]),
+            ScriptedTurn([TextContent("first done")]),
+            ScriptedTurn(tool_calls=[pending]),
+            ScriptedTurn([TextContent("pending done")]),
+            ScriptedTurn(tool_calls=[next_call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await asyncio.wait_for(_connect(server), TIMEOUT)
+    observer_writer: asyncio.StreamWriter | None = None
+
+    async def observer_request(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> dict[str, Any]:
+        assert observer_writer is not None
+        await asyncio.wait_for(
+            _send_json(
+                observer_writer,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+            ),
+            TIMEOUT,
+        )
+        while True:
+            frame = await asyncio.wait_for(_read_json(observer_reader), TIMEOUT)
+            if frame.get("id") == request_id:
+                return frame
+
+    try:
+        await asyncio.wait_for(_hello_and_create(reader, writer), TIMEOUT)
+        server.runtime.policy.always_ask = ("bash",)
+        observer_reader, observer_writer, status, _headers = await asyncio.wait_for(
+            _connect_websocket(
+                server, token=None, protocol_token=server._websocket.token
+            ),
+            TIMEOUT,
+        )
+        assert status == 101
+        hello = await observer_request(
+            10,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "session_grants"],
+            },
+        )
+        assert "session_grants" in hello["result"]["capabilities"]["features"]
+
+        await asyncio.wait_for(
+            _request(reader, writer, 3, "send", {"text": "create grant"}), TIMEOUT
+        )
+        first_approval = await asyncio.wait_for(
+            _event(reader, "approval_request"), TIMEOUT
+        )
+        assert first_approval["request_id"] == "call-1"
+        await asyncio.wait_for(
+            _request(
+                reader,
+                writer,
+                4,
+                "approve",
+                {"request_id": "call-1", "scope": "always_tool"},
+            ),
+            TIMEOUT,
+        )
+        await asyncio.wait_for(_event(reader, "session_grants_changed"), TIMEOUT)
+        await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
+        await asyncio.wait_for(_wait_idle(reader, writer, 5), TIMEOUT)
+
+        await asyncio.wait_for(
+            _request(reader, writer, 20, "send", {"text": "leave pending"}), TIMEOUT
+        )
+        second_approval = await asyncio.wait_for(
+            _event(reader, "approval_request"), TIMEOUT
+        )
+        assert second_approval["request_id"] == "call-2"
+        revoked = (
+            await asyncio.wait_for(
+                _request(
+                    reader,
+                    writer,
+                    21,
+                    "revoke_session_grants",
+                    {"grant": "bash"},
+                ),
+                TIMEOUT,
+            )
+        )[-1]["result"]
+        assert revoked["removed"] == ["bash"]
+        status_result = (
+            await asyncio.wait_for(_request(reader, writer, 22, "status"), TIMEOUT)
+        )[-1]["result"]
+        assert [item["request_id"] for item in status_result["pending_approvals"]] == [
+            "call-2"
+        ]
+        assert server.runtime.opened.store.approval_resolution_data("call-2") is None
+
+        observer_denied = await observer_request(
+            11,
+            "approve",
+            {"request_id": "call-2", "scope": "once"},
+        )
+        assert observer_denied["error"]["data"]["code"] == "observer_read_only"
+        await asyncio.wait_for(
+            _request(
+                reader,
+                writer,
+                23,
+                "approve",
+                {"request_id": "call-2", "scope": "once"},
+            ),
+            TIMEOUT,
+        )
+        snapshot = (
+            await asyncio.wait_for(
+                _request(reader, writer, 24, "session_grants"), TIMEOUT
+            )
+        )[-1]["result"]
+        assert snapshot["session_grants"] == []
+
+        await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
+        await asyncio.wait_for(_wait_idle(reader, writer, 25), TIMEOUT)
+        await asyncio.wait_for(
+            _request(reader, writer, 30, "send", {"text": "ask again"}), TIMEOUT
+        )
+        approval = await asyncio.wait_for(_event(reader, "approval_request"), TIMEOUT)
+        assert approval["request_id"] == "call-3"
+        await asyncio.wait_for(
+            _request(reader, writer, 31, "deny", {"request_id": "call-3"}), TIMEOUT
+        )
+        await asyncio.wait_for(_frames_until_event(reader, "turn_end"), TIMEOUT)
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await asyncio.wait_for(observer_writer.wait_closed(), TIMEOUT)
+        await asyncio.wait_for(_close(server, writer), TIMEOUT)
 
 
 @pytest.mark.asyncio

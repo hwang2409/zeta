@@ -1790,6 +1790,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         writer.close()
         await writer.wait_closed()
         await _wait_controller_release(server)
+        assert await asyncio.wait_for(reader.read(), TIMEOUT) == b""
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
