@@ -597,6 +597,11 @@ loaded session remains unhealthy and rejects later mutations with `-32000`. If
 an authoritative read finds that the requested decision was durable despite
 the write error, the server completes it once as a normal success.
 
+If a delegated approval-history write fails, the server still emits
+`approval_end` first, then the existing `server_error` event with
+`data.request_id`. The session health becomes `approval_persistence_failed`,
+and the affected turn fails.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
