@@ -688,8 +688,11 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
     for registry in reversed(registries):
@@ -819,11 +822,17 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
+    # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks and closes workspace stores created by tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
+    # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
     for loop in reversed(loops):

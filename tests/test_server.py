@@ -564,22 +564,27 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
         assert hello["protocol_version"] == "1.2"
         assert server._client is not None
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
+            data = {"kind": kind}
+            if kind == "child_question":
+                data["agent_description"] = "nested verifier"
             await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
-                    data={"kind": kind},
+                    data=data,
                 ),
                 session_id="session",
             )
-        events = [
-            (await _read(reader))["params"]["event"]
+        notifications = [
+            (await _read(reader))["params"]
             for _ in (*NOTIFICATION_KINDS, "future_kind")
         ]
 
-        assert events == [
+        assert [item["event"] for item in notifications] == [
             *(NOTIFICATION_WIRE_EVENTS[kind] for kind in NOTIFICATION_KINDS),
             "sub_agent_receipt",
         ]
+        question = notifications[NOTIFICATION_KINDS.index("child_question")]
+        assert question["data"]["agent_description"] == "nested verifier"
     finally:
         await _close(server, writer)
 
@@ -8011,6 +8016,40 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Pa
                 await asyncio.sleep(0)
         assert len(backend.calls) == 1
         assert store.agent_notifications() == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resume_corrupt_transcript_returns_bounded_structured_error(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    path = server.runtime.opened.store.path
+    await _request(reader, writer, 3, "new_session", {"provider": "codex"})
+    with path.open("ab") as stream:
+        stream.write(b'{"private":"must-not-leak"\n')
+    damaged = path.read_bytes()
+    try:
+        response = (
+            await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        )[-1]
+        assert response["error"] == {
+            "code": -32000,
+            "message": f"transcript terminated invalid conversation row at row 2 (session {session_id})",
+            "data": {
+                "code": "corrupt_transcript",
+                "kind": "invalid_row",
+                "row": 2,
+                "repairable": True,
+                "session_id": session_id,
+                "actions": [],
+            },
+        }
+        assert "must-not-leak" not in json.dumps(response)
+        assert str(path) not in json.dumps(response)
+        assert path.read_bytes() == damaged
     finally:
         await _close(server, writer)
 

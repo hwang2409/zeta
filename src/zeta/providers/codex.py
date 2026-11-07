@@ -293,6 +293,8 @@ class CodexBackend(CompletionBackend):
                 owns_client=lease.owned,
                 primary_exception=primary_exception,
                 http_error_type=CodexHTTPError,
+                diagnostics_path=self.diagnostics_path,
+                provider="codex",
             )
             if primary_exception is not None:
                 raise primary_exception
