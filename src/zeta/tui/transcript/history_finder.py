@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
 from prompt_toolkit.buffer import Buffer
@@ -97,18 +97,25 @@ class HistoryFinder:
         self._generation += 1
         return HistoryCandidateRequest(self._generation)
 
-    async def build_finder_candidates(
+    async def build_finder_candidate_batches(
         self, request: HistoryCandidateRequest
-    ) -> HistorySnapshot:
+    ) -> AsyncIterator[tuple[HistorySnapshot, bool]]:
         del request
-        return await asyncio.to_thread(self._load_snapshot)
+        snapshot = await asyncio.to_thread(self._load_snapshot)
+        yield snapshot, True
 
     def _load_snapshot(self) -> HistorySnapshot:
         return build_history_candidates(self._history_snapshot())
 
-    def finder_publish_candidates(
-        self, request: HistoryCandidateRequest, snapshot: HistorySnapshot
+    def finder_publish_candidate_batch(
+        self,
+        request: HistoryCandidateRequest,
+        snapshot: HistorySnapshot,
+        *,
+        complete: bool,
     ) -> bool:
+        if not complete:
+            return False
         if self._finder is None or request.generation != self._generation:
             return False
         self._entries = dict(snapshot.entries)
@@ -117,6 +124,9 @@ class HistoryFinder:
 
     def finder_set_query(self, query: str) -> int | None:
         return None if self._finder is None else self._finder.set_query(query)
+
+    def finder_needs_ranking(self) -> bool:
+        return self._finder is not None and self._finder.needs_ranking
 
     def finder_rank(
         self, *, candidate_limit: int | None = None

@@ -20,13 +20,12 @@ from tests.test_server import (
     _seed_slash_fixtures,
 )
 from zeta.config.settings import load_settings, resolve
-from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, MessageRole, TextContent
 from zeta.runtime.composition import compose_runtime
-from zeta.runtime.loop import RuntimePrompt
+from zeta.runtime.loop import AgentLoop, RuntimePrompt
 from zeta.runtime.prompt_resume import resume_prompt
 from zeta.server.server import ZetaServer
 from zeta.skills import SkillCatalog, discover_session_skills

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -23,19 +22,14 @@ from ...accounts import (
 from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
-from ...core.project_context import discover_project_root
+from ...core.project_context import project_command_view
 from ...core.session import (
     SessionError,
     env_home,
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import (
-    MODEL_CONTEXT_WINDOWS,
-    SlashStatus,
-    compaction_history,
-)
-from ...core.todo import todo_count_tuple
+from ...core.slash import SlashStatus
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -43,6 +37,7 @@ from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
+from ...runtime.status import build_slash_status, capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -106,56 +101,22 @@ class SlashHandlerMixin:
         await controller.resolve_approval(decision, requested_key, always=always)
 
     def slash_status(self) -> SlashStatus:
-        context_assembler = self.loop.context_assembler
-        child_usage = context_assembler.descendant_usage
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
-        items = self.loop.store.todo_items()
-        compaction_history_data = compaction_history(
-            self.loop.store.replay(), context_assembler.token_counter
-        )
-        return SlashStatus(
-            session_id=self.loop.store.session_id,
-            provider=self.provider,
-            model=self.model,
-            retained_tail=context_assembler.retained_tail,
-            tokens_used_this_session=context_assembler.tokens_used_this_session,
-            tokens_in_current_context=context_assembler.token_count,
-            compaction_marker_count=self.loop.store.compaction_marker_count(),
-            pending_approvals=pending,
-            checkpoint_count=self.loop.store.checkpoint_count(),
-            cache_read_input_tokens=context_assembler.cache_read_input_tokens_this_session,
-            cache_creation_input_tokens=context_assembler.cache_creation_input_tokens_this_session,
-            uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
-            output_tokens_this_session=context_assembler.output_tokens_this_session,
-            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage[
-                "cache_creation_input_tokens"
-            ],
-            child_uncached_input_tokens=child_usage["input_tokens"],
-            child_output_tokens_this_session=child_usage["output_tokens"],
-            context_files=self._context_files,
-            vim_mode=self.vim_mode,
-            plan_mode=self.loop.plan_mode,
-            hooks=(() if self._hooks is None else self._hooks.status_entries),
-            todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=self._usage_tracker.history,
-            usage_cost_by_model=self._usage_tracker.cost_by_model,
-            compaction_history=compaction_history_data,
-            model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
-            mcp_summary=self.loop.mcp_summary,
-            explicit_finish=self.loop.explicit_finish,
-            max_agent_depth=self.loop.max_agent_depth,
-            automatic_memory_failure=(
-                self.loop.memory_reconciler.automatic_memory_status
-                if self.loop.memory_reconciler is not None
-                else None
-            ),
-            transcript_index_failure=self.loop.transcript_index_failure(
-                self._viewed_session_path().name
-            ),
+        return build_slash_status(
+            capture_slash_status(
+                self.loop,
+                session_id=self.loop.store.session_id,
+                provider=self.provider,
+                model=self.model,
+                context_files=self._context_files,
+                vim_mode=self.vim_mode,
+                pending_approvals=pending,
+                usage_tracker=self._usage_tracker,
+                transcript_session_id=self._viewed_session_path().name,
+            )
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -231,7 +192,9 @@ class SlashHandlerMixin:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
-            return "accounts unavailable: cannot switch while a turn or approval is active"
+            return (
+                "accounts unavailable: cannot switch while a turn or approval is active"
+            )
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:
@@ -764,54 +727,39 @@ class SlashHandlerMixin:
         registry = self.loop.project_registry
         if registry is None:
             return "project registry unavailable"
-        project = None
-        if args.strip() == "init":
-            root = (
-                discover_project_root(self.loop.store.cwd)
-                or Path(self.loop.store.cwd).resolve()
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                self.loop.store.cwd,
+                self.loop.session_metadata.project_id,
+                initialize=initialize,
             )
-            try:
-                project = registry.find_or_create_for_directory(root)
-                await persist_metadata_change(
-                    self.loop.manager,
-                    self.loop.session_metadata,
-                    lambda candidate: self.loop.manager.associate_project(
-                        candidate, project.project_id
-                    ),
-                )
-                self.loop._set_runtime_project(self.loop.session_metadata)
-            except (ProjectRegistryError, OSError, SessionError) as exc:
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
                 return f"could not initialize project: {exc}"
-        else:
-            if self.loop.session_metadata.project_id:
-                try:
-                    project = registry.show_project(
-                        self.loop.session_metadata.project_id
-                    )
-                except ProjectRegistryError:
-                    project = None
-            if project is None:
-                project = registry.find_for_directory(self.loop.store.cwd)
-        if project is None:
-            return "unassociated (run /project init to associate this directory)"
-        if registry.memory_format(project.project_id) == 2:
-            memory = (
-                ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                self.loop.manager,
+                self.loop.session_metadata,
+                lambda candidate: self.loop.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
             )
-        else:
-            memory = (
-                ", ".join(name for name, _ in registry.load_memory(project.project_id))
-                or "none"
-            )
-        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+            self.loop._set_runtime_project(self.loop.session_metadata)
+        return view.text
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_memory(self, args: str) -> str:
         """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(
+        return await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,
@@ -819,7 +767,7 @@ class SlashHandlerMixin:
             MemoryMutationAuthorization.direct_slash(),
         )
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         registry = self.loop.project_registry
@@ -827,9 +775,12 @@ class SlashHandlerMixin:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)
