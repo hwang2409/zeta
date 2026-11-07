@@ -404,7 +404,7 @@ async def run_command(
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
-    if not text.startswith("/") or text.startswith("//"):
+    if not text.startswith("/"):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "text must start with '/'")
     first_line = text.split("\n", 1)[0]
     parts = first_line[1:].split(maxsplit=1)

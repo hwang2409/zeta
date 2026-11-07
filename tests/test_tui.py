@@ -12919,6 +12919,47 @@ async def test_unknown_slash_command_is_rendered_without_model_request(
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("text", "model_text"),
+    [
+        ("/tmp", "/tmp"),
+        ("/tmp is full", "/tmp is full"),
+        ("/Users/henry/x.py is broken", "/Users/henry/x.py is broken"),
+        ("/this is pasted prose\nsecond line", "/this is pasted prose\nsecond line"),
+        ("//foo", "/foo"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_slash_like_model_text_reaches_model(
+    tmp_path: Path, text: str, model_text: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn()])
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    try:
+        app._submissions.wake()
+        app._submissions.submit(text, steer=False)
+        await wait_until(lambda: not app._submissions.active)
+
+        assert any(
+            any(
+                getattr(block, "text", None) == model_text
+                for message in messages
+                for block in message.content
+            )
+            for messages, _ in backend.calls
+        )
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_background_wake_and_submission_share_one_provider_consumer(
     tmp_path: Path,

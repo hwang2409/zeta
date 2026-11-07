@@ -7831,6 +7831,38 @@ async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
         await _close(server, writer)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/tmp",
+        "/tmp is full",
+        "/Users/henry/x.py is broken",
+        "/this is pasted prose\nsecond line",
+        "//foo",
+    ],
+)
+@pytest.mark.asyncio
+async def test_serve_slash_run_keeps_slash_like_model_text(
+    tmp_path: Path, text: str
+) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader,
+                writer,
+                "slash-model-text",
+                "slash_run",
+                {"session_id": sid, "text": text},
+            )
+        )[-1]["result"]
+        name = text.split("\n", 1)[0][1:].split(maxsplit=1)[0]
+        assert result == {"kind": "unknown", "name": name}
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_serve_does_not_advertise_or_run_tui_approval_commands(
     tmp_path: Path,
