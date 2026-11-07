@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -119,6 +120,29 @@ async def test_wake_tool_schedules_lists_cancels_and_enforces_pending_bound(
 
 
 @pytest.mark.asyncio
+async def test_top_level_external_run_allows_only_eight_root_wakes() -> None:
+    """Mutation: raise the root limit; the ninth passive assertion fails."""
+
+    clock = Clock()
+    scheduler = _scheduler("top_level", clock)
+    try:
+        scheduler.begin_external_run()
+        roots = [
+            scheduler.schedule(after_seconds=10, note=f"root {index}")
+            for index in range(1, 9)
+        ]
+        scheduler.cancel(roots[0].record.wake_id)
+        ninth = scheduler.schedule(after_seconds=10, note="root 9")
+
+        assert all(result.autonomous for result in roots)
+        assert len({result.record.chain_id for result in roots}) == 8
+        assert ninth.autonomous is False
+        assert ninth.reason == "top_level_chain_limit"
+    finally:
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_top_level_wakes_stop_after_three_generations() -> None:
     """Mutation: allow generation 4; the final passive assertion fails."""
 
@@ -216,6 +240,44 @@ async def test_due_wakes_coalesce_and_later_wake_stays_out_of_closed_cohort() ->
         ]
         assert scheduler.admission_count == 2
     finally:
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_timer_rechecks_utc_after_one_sixty_second_slice() -> None:
+    """Mutation: wait for the full UTC delta; the slice assertion fails."""
+
+    clock = Clock()
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    hold_timer = asyncio.Event()
+    fired = asyncio.Event()
+    waits: list[float] = []
+
+    async def controlled_wait(_changed: asyncio.Event, timeout: float) -> None:
+        waits.append(timeout)
+        wait_started.set()
+        async with asyncio.timeout(10):
+            await (release_wait if len(waits) == 1 else hold_timer).wait()
+
+    scheduler = WakeScheduler(
+        "top_level",
+        on_due=fired.set,
+        wall_clock=clock,
+        id_factory=Ids(),
+        wait_for_change=controlled_wait,
+    )
+    try:
+        scheduler.schedule(after_seconds=7 * 24 * 60 * 60, note="after suspend")
+        await asyncio.wait_for(wait_started.wait(), timeout=10)
+        assert waits == [60.0]
+
+        clock.advance(7 * 24 * 60 * 60)
+        release_wait.set()
+        await asyncio.wait_for(fired.wait(), timeout=10)
+        assert scheduler.poll_due() is False
+    finally:
+        release_wait.set()
         await scheduler.close()
 
 
