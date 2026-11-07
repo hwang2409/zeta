@@ -4993,7 +4993,7 @@ def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
     assert all(cell_len(line) <= 72 for line in rendered)
 
 
-def test_agent_card_wraps_long_messages_at_a_separator(tmp_path: Path) -> None:
+def test_agent_card_preserves_hard_wrap_layout(tmp_path: Path) -> None:
     path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
     child = ConversationStore(tmp_path / "agents", session_id="child")
     send = ToolCall(
@@ -5023,8 +5023,8 @@ def test_agent_card_wraps_long_messages_at_a_separator(tmp_path: Path) -> None:
         lines = Text.from_ansi(output.getvalue()).plain.splitlines()
         content = [line.strip("│ ") for line in lines]
 
-        assert path in content
-        assert "verylongfilenamewithoutbreaks" in content
+        assert f"{path}verylongfilenamewitho" in content
+        assert "utbreaks" in content
         assert all(cell_len(line) <= 80 for line in lines)
     finally:
         child.close()

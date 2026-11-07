@@ -88,6 +88,8 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
         pytest.param("ab🙂cd", 4, ["ab🙂", "cd"], id="emoji-boundary"),
         pytest.param("alpha   ", 5, ["alpha"], id="trailing-spaces"),
         pytest.param("a/b", 1, ["a", "/", "b"], id="width-one"),
+        pytest.param("a/\u0301b", 2, ["a/\u0301", "b"], id="combining-after-separator"),
+        pytest.param("a/界b", 2, ["a/", "界", "b"], id="wide-after-separator"),
         pytest.param(
             "/alpha-beta_gamma.delta",
             8,
