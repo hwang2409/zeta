@@ -463,6 +463,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("login cancelled", file=sys.stderr)
         return 1
+    except StorageFormatError:
+        raise
     except Exception as exc:
         print(login_failure_message(exc), file=sys.stderr)
         return 1
@@ -942,7 +944,7 @@ async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
     return await run_fork_stack(app, build_fork)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     original_argv = list(sys.argv[1:] if argv is None else argv)
     entrypoint = sys.argv[0]
     parser = build_parser()
@@ -1118,6 +1120,14 @@ def main(argv: list[str] | None = None) -> int:
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except StorageFormatError as exc:
+        print(f"zeta: {exc}", file=sys.stderr)
+        return 2
 
 
 __all__ = ["build_parser", "main"]

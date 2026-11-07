@@ -4,12 +4,23 @@ import asyncio
 import hashlib
 import json
 import os
+import pty
+import secrets
+import selectors
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from tests.support.processes import read_pty_until, reap_process
+from tests.support.storage_homes import (
+    STORAGE_HOME_SHAPES,
+    StorageHomeShape,
+    prepared_storage_home,
+)
 from zeta.cli.main import main
 from zeta.core.checkpoints import ConversationEntry, ConversationIntegrityError
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
@@ -54,35 +65,220 @@ def _tree_digest(home: Path) -> str:
     return digest.hexdigest()
 
 
-def test_cli_bootstraps_a_truly_empty_home_before_starting(tmp_path: Path) -> None:
-    result = _run_cli(
-        tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
-    )
-
-    assert "stored-format manifest is missing" not in result.stderr
-    assert json.loads((tmp_path / "storage-format.json").read_text()) == {
-        "writer_epoch": WRITER_EPOCH
+def _console_environment(home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("ZETA_TEST_")
     }
+    environment.update(
+        {
+            "ZETA_HOME": str(home),
+            "TERM": "xterm-256color",
+            "COLUMNS": "100",
+            "LINES": "30",
+        }
+    )
+    assert not any(key.startswith("ZETA_TEST_") for key in environment)
+    return environment
 
 
-def test_cli_refuses_one_existing_session_without_changing_home(
-    tmp_path: Path,
+def _storage_error(home: Path, shape: StorageHomeShape) -> str | None:
+    if shape == "empty":
+        return None
+    if shape == "too-new":
+        return (
+            f"stored format {WRITER_EPOCH + 1} is newer than writer capability "
+            f"{WRITER_EPOCH}"
+        )
+    if shape == "invalid":
+        return f"stored-format manifest is invalid at {home}"
+    return (
+        f"stored-format manifest is missing at {home}; run "
+        "zeta storage-format advance --expected-epoch 0 "
+        f"--target-epoch {WRITER_EPOCH}"
+    )
+
+
+def _read_stream_until(
+    stream, marker: bytes, *, process: subprocess.Popen[bytes], timeout: float
+) -> bytes:
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        while marker not in output:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and selector.select(remaining), (
+                f"timed out waiting for {marker!r}; return code: {process.poll()!r}; "
+                f"captured: {bytes(output)!r}"
+            )
+            chunk = os.read(stream.fileno(), 4096)
+            assert chunk, (
+                f"process exited before {marker!r}; return code: {process.poll()!r}; "
+                f"captured: {bytes(output)!r}"
+            )
+            output.extend(chunk)
+    return bytes(output)
+
+
+def _serve_request(file, request_id: str, method: str) -> dict[str, object]:
+    file.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": {"protocol_version": "1.2"} if method == "hello" else {},
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    file.flush()
+    while True:
+        line = file.readline()
+        assert line, f"serve closed before replying to {method}"
+        frame = json.loads(line)
+        if frame.get("id") == request_id:
+            return frame
+
+
+def _exercise_serve(socket_path: Path) -> None:
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(60)
+        client.connect(str(socket_path))
+        with client.makefile("rwb") as file:
+            hello = _serve_request(file, "hello", "hello")
+            created = _serve_request(file, "new", "new_session")
+    assert hello["result"]["server"] == "zeta"
+    assert created["result"]["session"]["session_id"]
+
+
+def _run_console_surface(
+    home: Path, surface: str, *, expect_start: bool
+) -> tuple[bool, str, int]:
+    console = Path(sys.executable).with_name("zeta")
+    assert console.is_file(), f"installed zeta console entry is missing: {console}"
+    socket_path = Path("/tmp") / (
+        f"zeta-storage-{os.getpid()}-{secrets.token_hex(4)}.sock"
+    )
+    commands = {
+        "headless": [
+            str(console),
+            "--provider",
+            "codex",
+            "--model",
+            "offline",
+            "-p",
+            "hello",
+        ],
+        "tui": [str(console), "--provider", "codex", "--model", "offline"],
+        "serve": [
+            str(console),
+            "serve",
+            "--ws",
+            "0",
+            "--socket",
+            str(socket_path),
+            "--provider",
+            "codex",
+            "--model",
+            "offline",
+            "--no-auto-memory",
+        ],
+    }
+    environment = _console_environment(home)
+    if surface == "headless":
+        result = subprocess.run(
+            commands[surface],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        return result.returncode != 2, result.stderr, result.returncode
+
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        commands[surface],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=subprocess.PIPE,
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    if not expect_start:
+        try:
+            _stdout, stderr = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=60)
+            raise
+        finally:
+            os.close(master_fd)
+            socket_path.unlink(missing_ok=True)
+            Path(f"{socket_path}.lock").unlink(missing_ok=True)
+        return False, stderr.decode(errors="replace"), process.returncode
+
+    stderr_prefix = b""
+    try:
+        if surface == "tui":
+            output = bytearray()
+            read_pty_until(
+                master_fd,
+                b" \xe2\x80\xba ",
+                process=process,
+                output=output,
+                timeout=60,
+            )
+        else:
+            assert process.stderr is not None
+            stderr_prefix = _read_stream_until(
+                process.stderr,
+                b"zeta serve: websocket ready:",
+                process=process,
+                timeout=60,
+            )
+            _exercise_serve(socket_path)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        return_code = reap_process(process, timeout=60)
+        _stdout, stderr_tail = process.communicate(timeout=60)
+        os.close(master_fd)
+        socket_path.unlink(missing_ok=True)
+        Path(f"{socket_path}.lock").unlink(missing_ok=True)
+    return True, (stderr_prefix + stderr_tail).decode(errors="replace"), return_code
+
+
+@pytest.mark.parametrize("shape", STORAGE_HOME_SHAPES)
+@pytest.mark.parametrize("surface", ("headless", "tui", "serve"))
+def test_real_console_start_has_one_storage_format_owner(
+    tmp_path: Path, shape: StorageHomeShape, surface: str
 ) -> None:
-    (tmp_path / ".storage-format.lock").touch()
-    (tmp_path / "sessions" / "existing").mkdir(parents=True)
-    before = _tree_digest(tmp_path)
+    home = tmp_path / f"{surface}-{shape}"
+    with prepared_storage_home(home, shape):
+        before = _tree_digest(home)
+        expected_error = _storage_error(home, shape)
+        started, stderr, return_code = _run_console_surface(
+            home, surface, expect_start=expected_error is None
+        )
 
-    result = _run_cli(
-        tmp_path, "--provider", "codex", "--model", "offline", "-p", "hello"
-    )
-
-    assert result.returncode != 0
-    assert (
-        f"zeta storage-format advance --expected-epoch 0 --target-epoch {WRITER_EPOCH}"
-        in result.stderr
-    )
-    assert not (tmp_path / "storage-format.json").exists()
-    assert _tree_digest(tmp_path) == before
+        assert "Traceback" not in stderr
+        if expected_error is None:
+            assert started, stderr
+            assert json.loads((home / "storage-format.json").read_text()) == {
+                "writer_epoch": WRITER_EPOCH
+            }
+        else:
+            assert not started
+            assert return_code == 2
+            assert stderr.splitlines() == [f"zeta: {expected_error}"]
+            assert _tree_digest(home) == before
 
 
 def test_storage_format_advance_defaults_to_writer_epoch(tmp_path: Path) -> None:
@@ -307,7 +503,7 @@ def test_too_new_refusal_is_visible_in_tui_and_server(
 ) -> None:
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":999}\n')
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
-    assert main(["--provider", "codex", "--model", "offline"]) == 1
+    assert main(["--provider", "codex", "--model", "offline"]) == 2
     assert "newer than writer capability" in capsys.readouterr().err
     assert main(["serve", "--provider", "codex", "--model", "offline"]) == 2
     assert "newer than writer capability" in capsys.readouterr().err

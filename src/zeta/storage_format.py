@@ -36,7 +36,7 @@ _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
-class StorageFormatError(ValueError):
+class StorageFormatError(Exception):
     """Raised when a home cannot be accessed by this stored-format version."""
 
 
@@ -151,7 +151,6 @@ def _home_has_gated_state(home: Path) -> bool:
 
 
 def _bootstrap_empty_home(fd: int, home: Path) -> None:
-    fcntl.flock(fd, fcntl.LOCK_UN)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -186,8 +185,9 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
             )
         fd = _open_lock(canonical)
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH)
-            if not (canonical / _MANIFEST).exists():
+            if (canonical / _MANIFEST).exists():
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            else:
                 _bootstrap_empty_home(fd, canonical)
             epoch = _read_manifest(canonical)
             if epoch > capability:
