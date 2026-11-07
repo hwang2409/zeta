@@ -491,7 +491,7 @@ class AgentLoop(
         self,
         *,
         cancel_background: bool = True,
-        background_task_cause: str = "agent loop closed",
+        background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
 
