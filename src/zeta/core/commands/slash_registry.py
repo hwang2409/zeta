@@ -39,19 +39,19 @@ def _never(_args: str) -> bool:
     return False
 
 
+def _always(_args: str) -> bool:
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class ServeSlash:
     """Serve-specific policy for one shared slash command."""
 
-    mutates: Callable[[str], bool] | None = None
+    mutates: Callable[[str], bool] = _always
     runs_while_busy: Callable[[str], bool] = _never
 
     def can_run_while_busy(self, args: str) -> bool:
-        return (
-            self.mutates is not None
-            and self.runs_while_busy(args)
-            and not self.mutates(args)
-        )
+        return self.runs_while_busy(args) and not self.mutates(args)
 
 
 class SlashSurface(StrEnum):
