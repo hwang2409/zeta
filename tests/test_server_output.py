@@ -1097,7 +1097,7 @@ async def test_observer_status_rejects_session_swap_snapshot(
             )
         )["result"]["session"]["session_id"]
         release_projection.set()
-        stale_result = await stale
+        stale_result = await asyncio.wait_for(stale, 10)
         assert stale_result["error"]["code"] == -32003
 
         fresh = (await _rpc(observer_reader, observer_writer, transport, 8, "status"))[
