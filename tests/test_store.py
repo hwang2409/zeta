@@ -2996,3 +2996,58 @@ def test_all_agent_notifications_copy_only_notification_rows(
 
     assert [entry.data["child_instance_id"] for entry in notifications] == ["root:1"]
     assert copied == ["notification"]
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "data"),
+    [
+        (
+            "client_delivery",
+            {
+                "delivery_id": "new-steer",
+                "method": "steer",
+                "status": "queued",
+                "outcome": {"accepted": True},
+                "accepted_message": message(
+                    MessageRole.USER, "keep this steer"
+                ).to_dict(),
+            },
+        ),
+        *(
+            ("turn_end", {"reason": reason})
+            for reason in ("completed", "user_stop", "error", "disconnect")
+        ),
+    ],
+)
+def test_store_accepts_and_reopens_new_history_shapes(
+    tmp_path: Path, entry_type: str, data: dict[str, object]
+) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="history-fidelity")
+    try:
+        store._append_row(entry_type, data)
+    except ValueError:
+        accepted = False
+    else:
+        store.close()
+        reopened = ConversationStore(
+            sessions, session_id="history-fidelity", _must_exist=True
+        )
+        try:
+            accepted = any(
+                row.type == entry_type and row.data == data
+                for row in reopened.active_branch_snapshot()
+            )
+            if entry_type == "client_delivery":
+                reopened.append_client_delivery(
+                    "legacy-steer", "steer", "queued", {"accepted": True}
+                )
+                legacy = reopened.active_branch_snapshot()[-1]
+                assert "accepted_message" not in legacy.data
+            else:
+                for invalid in ({}, {"reason": "unknown"}):
+                    with pytest.raises(ValueError, match="invalid payload"):
+                        reopened._append_row("turn_end", invalid)
+        finally:
+            reopened.close()
+    assert accepted, f"candidate accepted {entry_type} shape"

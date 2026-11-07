@@ -13,6 +13,7 @@ from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -21,7 +22,12 @@ from zeta.protocol.types import (
 from zeta.server import ZetaServer
 
 
-async def _open(tmp_path: Path, backend: FakeBackend | None = None):
+async def _open(
+    tmp_path: Path,
+    backend: FakeBackend | None = None,
+    *,
+    features: list[str] | None = None,
+):
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
@@ -40,7 +46,10 @@ async def _open(tmp_path: Path, backend: FakeBackend | None = None):
         writer,
         1,
         "hello",
-        {"protocol_version": "1.2", "features": ["session_history_fidelity"]},
+        {
+            "protocol_version": "1.2",
+            "features": features or ["session_history_fidelity"],
+        },
     )
     session_id = (await request(
         reader, writer, 2, "new_session", {"provider": "codex"}
@@ -228,13 +237,98 @@ async def test_dropped_steer_is_published_then_replayed_with_terminal_status(
         live = await event(reader, "delivery_status")
         assert live["status"] == "dropped"
         assert live["reason"] == "abort"
-        assert live["content"] == [{"type": "text", "text": "steer dropped: abort"}]
+        assert live["content"] == [
+            {"type": "text", "text": "also inspect tests"}
+        ]
         status = (await request(reader, writer, 6, "status"))[-1]["result"]
         assert status["state"] == "idle"
 
         rows = await _history(reader, writer, session_id)
         replayed = next(row for row in rows if row.get("event") == "delivery_status")
         assert {key: value for key, value in live.items() if key != "session_id"} == replayed
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "segment.txt"
+    target.write_text("ok")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("read-segment", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server, reader, writer, session_id = await _open(
+        tmp_path,
+        backend,
+        features=["session_history_fidelity", "served_turn_end"],
+    )
+    try:
+        await request(reader, writer, 3, "send", {"text": "hello"})
+        await event(reader, "approval_request")
+        await request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": "read-segment", "scope": "once"},
+        )
+        provider_end = await event(reader, "turn_end")
+        assert set(provider_end["data"]) >= {"turn", "tool_calls"}
+        assert "reason" not in provider_end["data"]
+        second_provider_end = await event(reader, "turn_end")
+        assert set(second_provider_end["data"]) >= {"turn", "tool_calls"}
+        await event(reader, "agent_end")
+
+        rows = await _history(reader, writer, session_id)
+        served = [row for row in rows if row.get("event") == "served_turn_end"]
+        assert len(served) == 1
+        assert served[0]["data"] == {"reason": "completed"}
+
+        writer.close()
+        await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        hello = await request(
+            reader,
+            writer,
+            10,
+            "hello",
+            {"protocol_version": "1.2", "features": ["session_history_fidelity"]},
+        )
+        assert "served_turn_end" not in hello[-1]["result"]["capabilities"]["features"]
+        rows = await _history(reader, writer, session_id)
+        assert not any(row.get("event") == "served_turn_end" for row in rows)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_history_projects_all_closed_served_turn_end_reasons(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(
+        tmp_path, features=["served_turn_end"]
+    )
+    try:
+        store = server.runtime.opened.store
+        for reason in ("completed", "user_stop", "error", "disconnect"):
+            try:
+                store._append_row("turn_end", {"reason": reason})
+            except ValueError:
+                pass
+
+        rows = await _history(reader, writer, session_id)
+        assert [
+            row["data"]["reason"]
+            for row in rows
+            if row.get("event") == "served_turn_end"
+        ] == ["completed", "user_stop", "error", "disconnect"]
     finally:
         await _close(server, writer)
 

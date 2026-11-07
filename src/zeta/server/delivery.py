@@ -240,6 +240,7 @@ class DeliveryRequests:
                 "steer",
                 "queued",
                 outcome,
+                accepted_message=message,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -302,14 +303,22 @@ class DeliveryRequests:
             dropped = await state.opened.store.drop_client_steering_async(reason)
             connections = control.server.connections
             if connections is not None:
-                for entry in dropped:
-                    row = event_contract.delivery_status_row(entry)
+                for entry, accepted_message in dropped:
+                    row = event_contract.delivery_status_row(entry, accepted_message)
                     await connections.publish_controller(
                         "delivery_status",
                         session_id,
                         required_feature="session_history_fidelity",
                         **{key: value for key, value in row.items() if key != "event"},
                     )
+        turn_reason = {
+            TurnOutcome.COMPLETED: "completed",
+            TurnOutcome.FOREGROUND_CANCELED: "user_stop",
+            TurnOutcome.SESSION_CANCELED: "user_stop",
+            TurnOutcome.FAILED: "error",
+            TurnOutcome.DISCONNECTED: "disconnect",
+        }[outcome]
+        await state.opened.store.append_turn_end_async(turn_reason)
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()

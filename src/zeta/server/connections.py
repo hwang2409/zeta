@@ -535,7 +535,10 @@ class ConnectionRegistry:
                 target,
                 params,
                 include_delivery_id=include_delivery_id,
-                backward_enabled="session_history_backward" in features, fidelity="session_history_fidelity" in features, content_read="content_read" in features,
+                backward_enabled="session_history_backward" in features,
+                fidelity="session_history_fidelity" in features,
+                content_read="content_read" in features,
+                served_turn_end="served_turn_end" in features,
             ),
             session_id=target[0],
         )
@@ -627,7 +630,10 @@ class ConnectionRegistry:
             connection,
             lambda: perform_read(
                 method, target, params,
-                backward_enabled="session_history_backward" in state.features, fidelity="session_history_fidelity" in state.features, content_read="content_read" in state.features,
+                backward_enabled="session_history_backward" in state.features,
+                fidelity="session_history_fidelity" in state.features,
+                content_read="content_read" in state.features,
+                served_turn_end="served_turn_end" in state.features,
             ),
             session_id=target[0],
         )
@@ -713,6 +719,7 @@ def perform_read(
     backward_enabled: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    served_turn_end: bool = False,
 ) -> object:
     if method == "status":
         return project_status(target[1])
@@ -731,6 +738,7 @@ def perform_read(
             backward_enabled=backward_enabled,
             fidelity=fidelity,
             content_read=content_read,
+            served_turn_end=served_turn_end,
         )
     if method == "content_read":
         return content.read(store, params.get("handle"), offset=params.get("offset", 0), limit=params.get("limit", content.MAX_CONTENT_READ))

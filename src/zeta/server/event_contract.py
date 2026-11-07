@@ -4,11 +4,13 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
-from ..protocol.types import StreamEvent, StreamEventType
+from ..protocol.types import Message, StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, bounded
 
 
-def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
+def delivery_status_row(
+    entry: ConversationEntry, accepted_message: Message | None = None
+) -> dict[str, object]:
     """Project one committed steer terminal transition."""
     data = entry.data
     status = data["status"]
@@ -27,7 +29,19 @@ def delivery_status_row(entry: ConversationEntry) -> dict[str, object]:
         row["content"] = [
             {"type": "text", "text": f"{text}: {data['reason']}"}
         ]
+    if accepted_message is not None:
+        row["content"] = accepted_message.to_dict()["content"]
     return row
+
+
+def served_turn_end_row(entry: ConversationEntry) -> dict[str, object]:
+    """Project one durable served-turn completion fact."""
+    return {
+        "id": entry.id,
+        "role": "system",
+        "event": "served_turn_end",
+        "data": {"reason": entry.data["reason"]},
+    }
 
 
 def image_stub(block: Mapping[str, object]) -> dict[str, object]:

@@ -78,6 +78,7 @@ from ._pending_prompts import (
 )
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
+from ._turn_history import TurnHistoryMixin, validate_turn_end_data
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -116,6 +117,7 @@ class ConversationStore(
     AgentStateMixin,
     CheckpointForkMixin,
     StepDeliveryStoreMixin,
+    TurnHistoryMixin,
     StoreLifecycleMixin,
     ChildRunStoreMixin,
 ):
@@ -584,6 +586,8 @@ class ConversationStore(
                 _validate_approval_reason(decision, entry.data.get("reason"))
             elif entry.type == "approval_history":
                 validate_approval_history_data(entry.data)
+            elif entry.type == "turn_end":
+                validate_turn_end_data(entry.data)
             elif entry.type == "notification":
                 kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 if kind in NOTIFICATION_KINDS:
