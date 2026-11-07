@@ -1137,7 +1137,7 @@ class ContextAssembler(ContextMarkerMixin):
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1166,7 +1166,7 @@ class ContextAssembler(ContextMarkerMixin):
             items.append(_ContextItem(entry, without_client_delivery_marker(message)))
         for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker, active_source_seqs))
+                items.extend(self._marker_items(marker, active_source_seqs, entries))
         return items
 
     @staticmethod

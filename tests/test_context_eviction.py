@@ -82,6 +82,51 @@ def test_invalid_eviction_view_sequences_are_boundaries(
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
 
 
+def test_legacy_pinned_message_uses_original_source_order() -> None:
+    request = text(MessageRole.USER, "request")
+    entries = [
+        ConversationEntry(
+            seq=seq,
+            id=str(seq),
+            parent_id=None,
+            lane="main",
+            type="message",
+            data={"message": message.to_dict()},
+        )
+        for seq, message in (
+            (4616, text(MessageRole.ASSISTANT, "before")),
+            (4798, request),
+            (4799, text(MessageRole.ASSISTANT, "after")),
+        )
+    ]
+    marker = ConversationEntry(
+        seq=5000,
+        id="marker",
+        parent_id=None,
+        lane="main",
+        type="compaction",
+        data={
+            "kind": "evict",
+            "source_seq_start": 4616,
+            "source_seq_end": 4799,
+            "view": [
+                {"seq": 4616, "message": entries[0].data["message"]},
+                {"seq": 4799, "message": entries[2].data["message"]},
+            ],
+            "pinned_message": request.to_dict(),
+        },
+    )
+
+    assembler = object.__new__(ContextAssembler)
+    projected = assembler._visible_items([*entries, marker])
+
+    assert [item.message.content[0].text for item in projected] == [
+        "before",
+        "request",
+        "after",
+    ]
+
+
 def test_view_seq_is_authoritative_over_metadata_source_seq() -> None:
     message = Message(
         MessageRole.ASSISTANT,
