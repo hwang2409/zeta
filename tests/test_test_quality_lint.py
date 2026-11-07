@@ -32,8 +32,8 @@ def _lint(
     source: str,
     added_lines: set[int] | None = None,
     diff: str | None = None,
+    path: str = "tests/test_example.py",
 ):
-    path = "tests/test_example.py"
     target = tmp_path / path
     target.parent.mkdir()
     target.write_text(source)
@@ -214,6 +214,75 @@ def test_internal_contract_rule_rejects_bare_seam_marker(tmp_path: Path) -> None
 
     assert [finding.code for finding in findings] == ["TQ003"]
     assert "seam <reason>" in findings[0].message
+
+
+def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> None:
+    source = 'import os\nos.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"\n'
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 2)]
+    assert findings[0].message == (
+        "global test bootstrap ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT hides production "
+        "startup; use a local fixture and a real subprocess test"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'def test_local(monkeypatch):\n    monkeypatch.setenv("ZETA_LOCAL", "1")\n',
+        'def helper():\n    os.environ["ZETA_LOCAL"] = "1"\n',
+    ],
+)
+def test_tq005_allows_local_environment_setup(tmp_path: Path, source: str) -> None:
+    assert _lint(tmp_path, source) == []
+
+
+def test_tq005_rejects_session_fixture_and_hook(tmp_path: Path) -> None:
+    source = """@pytest.fixture(scope=\"session\")
+def session(monkeypatch):
+    monkeypatch.setenv(\"ZETA_SESSION\", \"1\")
+
+def pytest_configure(config):
+    os.putenv(\"ZETA_CONFIG\", \"1\")
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ005", 3),
+        ("TQ005", 6),
+    ]
+
+
+def test_tq005_reports_expression_names_and_update_keys(tmp_path: Path) -> None:
+    source = """import os
+name = \"ZETA_DYNAMIC\"
+os.environ.setdefault(name, \"1\")
+os.environ.update({\"ZETA_ONE\": \"1\", \"NOPE\": \"1\"})
+MonkeyPatch().setenv(\"ZETA_PATCH\", \"1\")
+"""
+
+    findings = _lint(tmp_path, source, path="tests/sitecustomize.py")
+
+    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
+        (
+            "TQ005",
+            3,
+            "global test bootstrap name hides production startup; use a local fixture and a real subprocess test",
+        ),
+        (
+            "TQ005",
+            4,
+            "global test bootstrap ZETA_ONE hides production startup; use a local fixture and a real subprocess test",
+        ),
+        (
+            "TQ005",
+            5,
+            "global test bootstrap ZETA_PATCH hides production startup; use a local fixture and a real subprocess test",
+        ),
+    ]
 
 
 def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
