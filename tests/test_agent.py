@@ -1083,6 +1083,9 @@ async def test_owned_work_terminal_outcomes_drain_without_model(
 async def test_owned_work_deadlines_transfer_then_kill_before_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    await test_child_finish_gate_model_bound_waits_for_grandchild(
+        tmp_path / "model"
+    )
     await test_child_finish_gate_wait_timeout_adopts(
         tmp_path / "transfer", monkeypatch
     )
@@ -3101,16 +3104,22 @@ async def test_owned_work_cancellation_controls_remain_prompt(
     monkeypatch: pytest.MonkeyPatch,
     control: str,
 ) -> None:
+    await test_child_finish_gate_model_bound_waits_for_grandchild(
+        tmp_path / "model"
+    )
+    control_path = tmp_path / "control"
     if control == "agent_cancel":
-        await test_foreground_cancel_cancels_owned_background_descendant_only(tmp_path)
+        await test_foreground_cancel_cancels_owned_background_descendant_only(
+            control_path
+        )
     elif control == "parent_abort":
-        await test_parent_abort_cancels_background_grandchild(tmp_path)
+        await test_parent_abort_cancels_background_grandchild(control_path)
     else:
         await test_close_cancels_adopted_grandchild_after_child_publication(
-            tmp_path, monkeypatch
+            control_path, monkeypatch
         )
     if control == "close":
-        lifecycle_paths = tuple(tmp_path.rglob("agent_lifecycle.json"))
+        lifecycle_paths = tuple(control_path.rglob("agent_lifecycle.json"))
         assert lifecycle_paths
         assert any(
             json.loads(path.read_text()).get("final_result_is_receipt") is True
