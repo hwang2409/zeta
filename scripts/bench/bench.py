@@ -233,78 +233,80 @@ def context_probe(home: Path, sid: str) -> dict[str, Any]:
         store.close()
 
 
-async def serve_probe(home: Path, sid: str) -> dict[str, Any]:
+async def serve_one(
+    home: Path, sid: str, stub_url: str, repeats: int
+) -> dict[str, Any]:
+    """One `zeta serve` process lifetime: hello, one resume, then history/status."""
+    os.environ["ZETA_OLLAMA_BASE_URL"] = stub_url
     socket = home / "bench.sock"
     server = await asyncio.to_thread(
         lambda: ZetaServer(
             home=home,
             socket_path=socket,
-            provider="codex",
+            provider="ollama",
+            model="bench-stub",
             auto_memory=False,
             approval_reconnect_grace=0,
         )
     )
     await server.start()
+    # Frames (resume, notifications) exceed StreamReader's 64 KiB default line limit.
+    reader, writer = await asyncio.open_unix_connection(str(socket), limit=1 << 26)
+    ident = 0
 
     async def request(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        ident: int,
-        method: str,
-        params: dict[str, Any],
-    ) -> dict[str, Any]:
-        writer.write(
-            (
-                json.dumps(
-                    {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
-                )
-                + "\n"
-            ).encode()
-        )
+        method: str, params: dict[str, Any]
+    ) -> tuple[float, dict[str, Any]]:
+        nonlocal ident
+        ident += 1
+        line = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
+        started = time.perf_counter_ns()
+        writer.write((json.dumps(line) + "\n").encode())
         await writer.drain()
         while True:
-            frame = json.loads(await reader.readline())
+            frame = json.loads(await asyncio.wait_for(reader.readline(), 120))
             if frame.get("id") == ident:
-                return frame
+                if "error" in frame:
+                    raise RuntimeError(f"{method}: {frame['error']}")
+                return (time.perf_counter_ns() - started) / 1e6, frame
 
     try:
-        reader, writer = await asyncio.open_unix_connection(str(socket))
         await request(
-            reader,
-            writer,
-            1,
             "hello",
             {
                 "protocol_version": "1.2",
                 "features": ["session_history_fidelity", "session_host_commands"],
             },
         )
-        timings: dict[str, list[float]] = {"resume": [], "history": [], "status": []}
-        calls = {
-            "resume": ("resume", {"session_id": sid}),
-            "history": (
-                "session_history",
-                {"session_id": sid, "limit": 100, "offset": 0},
-            ),
-            "status": ("status", {}),
-        }
-        ident = 10
-        for _ in range(10):
-            for key, (method, params) in calls.items():
-                ident += 1
-                started = time.perf_counter_ns()
-                await request(reader, writer, ident, method, params)
-                timings[key].append((time.perf_counter_ns() - started) / 1e6)
+        resume, _ = await request("resume", {"session_id": sid})
+        history = [
+            (
+                await request(
+                    "session_history", {"session_id": sid, "limit": 100, "offset": 0}
+                )
+            )[0]
+            for _ in range(repeats)
+        ]
+        status = [(await request("status", {}))[0] for _ in range(repeats)]
+        return {"resume": resume, "history": history, "status": status}
+    finally:
         writer.close()
         await writer.wait_closed()
-        # Only the first resume opens the session; later ones hit the loaded runtime.
-        first = timings["resume"].pop(0)
-        return {
-            "resume_first_ms": first,
-            **{name: summary(values) for name, values in timings.items()},
-        }
-    finally:
         await server.close()
+
+
+def serve_probe(home: Path, sid: str, stub_url: str) -> dict[str, Any]:
+    # A resume can start a wake turn, so a second resume on one server is refused;
+    # each resume sample gets its own server.
+    runs = [
+        asyncio.run(serve_one(home, sid, stub_url, 10 if i == 0 else 0))
+        for i in range(5)
+    ]
+    return {
+        "resume": summary([r["resume"] for r in runs]),
+        "history": summary(runs[0]["history"]),
+        "status": summary(runs[0]["status"]),
+    }
 
 
 class StubOllama:
@@ -840,7 +842,7 @@ def main() -> None:
             if "context" in probes:
                 result["context"] = context_probe(home, sid)
             if "serve" in probes:
-                result["serve"] = asyncio.run(serve_probe(home, sid))
+                result["serve"] = serve_probe(home, sid, stub.url)
             if "tui" in probes:
                 result["tui"] = tui_probe(home, sid, name, cwd, stub, ARGS.idle_seconds)
             if "scaling" in probes and name != "fresh":
