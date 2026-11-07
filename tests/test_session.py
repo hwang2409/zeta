@@ -116,12 +116,11 @@ async def wait_until(check: Callable[[], bool]) -> None:
 
 
 def _append_tool_result_while_holding_lock(
-    root: Path,
+    writer: object,
     tool_call_id: str,
     ready: object,
     duration: float,
 ) -> None:
-    writer = ConversationStore(root, session_id="shared")
     result = ToolResult(tool_call_id, "already completed")
     with writer._append_lock():
         writer._load()
@@ -140,13 +139,11 @@ def _append_tool_result_while_holding_lock(
 
 
 def _allow_approval_while_holding_lock(
-    root: Path,
-    session_id: str,
+    writer: object,
     request_id: str,
     ready: object,
     duration: float,
 ) -> None:
-    writer = ConversationStore(root, session_id=session_id)
     with writer._append_lock():
         writer._load()
         assert writer._resolve_approval_unlocked(request_id, "allow") is not None
@@ -2913,11 +2910,12 @@ async def test_cancel_honors_approval_won_by_other_writer(
     app.abort_active(submission.id)
     await asyncio.sleep(0)
     process.join(timeout=2)
+    writer.close()
     await wait_until(lambda: app._submissions.active_submission_id is None)
     decision = opened.store.approval_states()[call.id][1]
     await app._submissions.close()
 
-    assert process.exitcode == 0
+    assert not process.is_alive()
     assert decision == "allow"
     assert finalized == []
 
@@ -3187,7 +3185,8 @@ async def test_resume_does_not_act_on_stale_state_while_writer_holds_lock(
     result = await loop.resume_pending_tool(call.id)
 
     process.join(timeout=2)
-    assert process.exitcode == 0
+    writer.close()
+    assert not process.is_alive()
     assert result == ToolResult(call.id, "already completed")
     assert executed == []
 
@@ -3283,7 +3282,7 @@ async def test_summary_success_commits_override_before_main_failure(
     app._invalidate_prompt = lambda: None
     await app._consume_turn("new message")
 
-    metadata = manager.open(session_id).metadata
+    metadata = manager.read_metadata(session_id)
     assert metadata.provider == "claude"
     assert metadata.model == "claude-sonnet-4-6"
     assert metadata.override_audit
@@ -3294,7 +3293,7 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
     session_id = opened.store.session_id
     managers = [SessionManager(manager.home), SessionManager(manager.home)]
-    metadata = [item.open(session_id).metadata for item in managers]
+    metadata = [item.read_metadata(session_id) for item in managers]
     barrier = threading.Barrier(2)
     errors: list[Exception] = []
 
@@ -3316,7 +3315,7 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
     first.join()
     second.join()
 
-    current = manager.open(session_id).metadata
+    current = manager.read_metadata(session_id)
     assert len(errors) == 1
     assert isinstance(errors[0], SessionError)
     assert len(current.override_audit) == 1
@@ -3333,14 +3332,14 @@ def test_sequential_overrides_use_latest_snapshot(tmp_path: Path) -> None:
         provider="claude",
         model="claude-sonnet-4-6",
     )
-    latest = SessionManager(home).open(opened.store.session_id).metadata
+    latest = SessionManager(home).read_metadata(opened.store.session_id)
     manager.record_override(
         latest,
         provider="codex",
         model="gpt-5.4",
     )
 
-    current = manager.open(opened.store.session_id).metadata
+    current = manager.read_metadata(opened.store.session_id)
     assert current.provider == "codex"
     assert current.model == "gpt-5.4"
     assert [item["provider"] for item in current.override_audit] == [
@@ -3356,8 +3355,8 @@ def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
     session_id = opened.store.session_id
     override_manager = SessionManager(home)
     touch_manager = SessionManager(home)
-    override_metadata = override_manager.open(session_id).metadata
-    touch_metadata = touch_manager.open(session_id).metadata
+    override_metadata = override_manager.read_metadata(session_id)
+    touch_metadata = touch_manager.read_metadata(session_id)
     barrier = threading.Barrier(2)
 
     def override() -> None:
@@ -3379,7 +3378,7 @@ def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
     first.join()
     second.join()
 
-    current = manager.open(session_id).metadata
+    current = manager.read_metadata(session_id)
     assert current.provider == "claude"
     assert current.model == "claude-sonnet-4-6"
     assert len(current.override_audit) == 1
@@ -3628,7 +3627,8 @@ async def test_model_command_leaves_a_pinned_budget_alone(
 
 def test_model_fallback_persists_and_clears_with_settings(tmp_path):
     manager = SessionManager(tmp_path)
-    metadata = manager.create(provider="claude", model="claude-sonnet-4-6").metadata
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6")
+    metadata = opened.metadata
     fallback = (metadata.provider, metadata.model, metadata.compaction_budget)
     manager.record_session_settings(
         metadata,
@@ -3638,10 +3638,10 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
         budget=200_000,
         model_fallback=fallback,
     )
-    assert manager.open(metadata.session_id).metadata.model_fallback == fallback
+    assert manager.read_metadata(metadata.session_id).model_fallback == fallback
     assert "model_fallback" not in metadata.to_dict()
     assert metadata.to_storage_dict()["model_fallback"] == list(fallback)
-    stale = manager.open(metadata.session_id).metadata
+    stale = manager.read_metadata(metadata.session_id)
     manager.record_session_settings(
         metadata,
         model=metadata.model,
@@ -3649,7 +3649,7 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
         approval_mode="ask",
         budget=metadata.compaction_budget,
     )
-    assert manager.open(metadata.session_id).metadata.model_fallback is None
+    assert manager.read_metadata(metadata.session_id).model_fallback is None
     with pytest.raises(SessionError, match="changed before commit"):
         manager.record_session_settings(
             stale,
@@ -3743,7 +3743,7 @@ def test_session_rename_cli_persists_and_clears(tmp_path, monkeypatch):
     assert main(["session", "rename", sid[:8], "  useful   name "]) == 0
     assert SessionManager(tmp_path).open(sid).metadata.name == "useful name"
     assert main(["session", "rename", sid, "  "]) == 0
-    assert manager.open(sid).metadata.name == ""
+    assert manager.read_metadata(sid).name == ""
     assert main(["session", "rename", "missing", "name"]) == 1
 
 

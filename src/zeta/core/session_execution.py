@@ -132,10 +132,7 @@ class SessionExecutionLease:
         with _REGISTRY_LOCK:
             local = _REGISTRY.get(identity)
             if local is not None:
-                if local.state not in {"owned", "recovery"}:
-                    raise SessionOwnedError(session_id)
-                local.refs += 1
-                return cls(local, local.epoch)
+                raise SessionOwnedError(session_id)
             fd = open_session_file(
                 directory_fd,
                 RUNTIME_LEASE_NAME,
