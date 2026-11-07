@@ -1362,7 +1362,6 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy = server.runtime.policy
     assert policy is not None
-    closed = False
     late: ConversationStore | None = None
     try:
         policy.register_delegated(request, child, child_instance_id="child")
@@ -1373,7 +1372,6 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
             await cleanup
 
         await close_serve(server, writer)
-        closed = True
         late = ConversationStore(tmp_path / "late-child")
         late_call = ToolCall("late-call", "read", {"path": "late"})
         late.append_message_with_approval_requests(
@@ -1389,8 +1387,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
-        if not closed:
-            await close_serve(server, writer)
+        await close_serve(server, writer)
         if late is not None:
             late.close()
         child.close()
@@ -1838,10 +1835,9 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         )
         assert len(backend.calls) == 2
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio

@@ -555,7 +555,6 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
     operation = asyncio.create_task(
         client._dispatch(2, "resume", {"session_id": first.session_id})
     )
-    shutdown = False
     try:
         assert await asyncio.to_thread(compose_started.wait, 2)
         operation.cancel()
@@ -563,7 +562,6 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
             await asyncio.wait_for(operation, 2)
         assert not compose_release.is_set()
         await asyncio.wait_for(server.close(), 2)
-        shutdown = True
         assert any(
             "abandoned session setup task(s) still running at shutdown"
             in record.message
@@ -577,8 +575,7 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
         assert server.runtime.state is None
     finally:
         compose_release.set()
-        if not shutdown:
-            await close_serve(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

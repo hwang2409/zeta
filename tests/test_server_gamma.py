@@ -1644,10 +1644,9 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         assert backend.calls == []
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
@@ -1679,10 +1678,9 @@ async def test_legacy_session_still_accepts_send_after_reconnect(tmp_path: Path)
         await _event(replay_reader, "agent_end")
         assert len(backend.calls) == 1
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
@@ -1739,10 +1737,9 @@ async def test_detached_session_returns_existing_duplicate_delivery(
         assert len(backend.calls) == 1
         assert tuple(server.runtime.opened.store.entries) == durable_rows
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
@@ -1882,10 +1879,9 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             for block in message.content
         )
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
@@ -2000,10 +1996,9 @@ async def test_session_host_commands_live_approval_before_resume_keeps_original_
             for block in message.content
         )
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
@@ -2125,10 +2120,9 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             == 1
         )
     finally:
-        if replay_writer is not None:
-            await close_serve(server, replay_writer)
-        else:
-            await server.close()
+        await close_serve(
+            server, *([replay_writer] if replay_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio

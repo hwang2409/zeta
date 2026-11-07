@@ -221,8 +221,11 @@ async def test_history_cache_is_keyed_by_row_shaping_features(
         else:
             assert attachments[0]["handle"]
     finally:
-        if observer_writer is not None:
-            await close_serve(server, controller_writer, observer_writer)
+        await close_serve(
+            server,
+            controller_writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio
@@ -330,8 +333,11 @@ async def test_content_read_rejects_session_id_for_controller_and_observer(
         }
         assert controller == observer == expected
     finally:
-        if observer_writer is not None:
-            await close_serve(server, controller_writer, observer_writer)
+        await close_serve(
+            server,
+            controller_writer,
+            *([observer_writer] if observer_writer is not None else []),
+        )
 
 
 @pytest.mark.asyncio

@@ -3563,10 +3563,9 @@ async def test_late_approval_after_disconnect_abort_is_rejected(
         )[-1]
         assert error["error"]["code"] == -32006
     finally:
-        if second_writer is None:
-            await close_serve(server, writer)
-        else:
-            await close_serve(server, writer, second_writer)
+        await close_serve(
+            server, writer, *([second_writer] if second_writer is not None else [])
+        )
 
 
 @pytest.mark.asyncio
