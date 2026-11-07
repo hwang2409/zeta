@@ -15,18 +15,19 @@ import pytest
 
 import zeta.mcp.server_actor as server_actor_module
 from tests.support.fake_backend import FakeBackend
+from tests.support.serve_contract import ServeClient
+from tests.support.tui_render import render_full_screen
 from zeta.config.settings import load_settings
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp.client import MCPTool, make_error_result
-from zeta.mcp.commands import render_mcp_status
 from zeta.mcp.config import MCPConfig, MCPServerConfig
 from zeta.mcp.envelope import MCPCallEnvelope, MCPCallLimits, MCPTransientQuotaError
 from zeta.mcp.http import StreamableHTTPMCPClient, _iter_sse_events, _read_json_body
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.mcp.server_actor import MCPServerActor
 from zeta.runtime.loop import AgentLoop
-from zeta.server.slash_commands import run_command
+from zeta.server import ZetaServer
 from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
 from zeta.tools.registry import ToolRegistry
@@ -205,7 +206,7 @@ def mcp_http_server(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_http_deadline_is_absolute_and_keeps_mount_usable(
+async def test_http_deadline_retains_cancellation_resistant_call_until_shutdown(
     mcp_http_server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _MCPHandler.mode = "deadline-sse"
@@ -219,17 +220,11 @@ async def test_http_deadline_is_absolute_and_keeps_mount_usable(
         return loop.time() + clock_offset
 
     if deadline_type is not None:
-        real_wait = deadline_type.wait
-        waits = 0
 
-        async def expire_after_streaming(deadline) -> None:
-            nonlocal waits, clock_offset
-            waits += 1
-            if waits == 1:
-                await asyncio.to_thread(_MCPHandler.deadline_streaming.wait)
-                clock_offset = 301.0
-                return
-            await real_wait(deadline)
+        async def expire_after_streaming(_deadline) -> None:
+            nonlocal clock_offset
+            await asyncio.to_thread(_MCPHandler.deadline_streaming.wait)
+            clock_offset = 301.0
 
         monkeypatch.setattr(deadline_type, "wait", expire_after_streaming)
     else:
@@ -240,19 +235,34 @@ async def test_http_deadline_is_absolute_and_keeps_mount_usable(
 
         abort_on_base = asyncio.create_task(abort_after_streaming())
 
-    cleanup_done = asyncio.Event()
-    if deadline_type is not None:
-        real_cleanup = StreamableHTTPMCPClient._cleanup_deadline_request
+    release_call = asyncio.Event()
+    call_resisted_cancellation = asyncio.Event()
+    resistant_task: asyncio.Task[object] | None = None
+    real_call_tool = StreamableHTTPMCPClient.call_tool
 
-        async def observe_cleanup(client, state) -> None:
-            try:
-                await real_cleanup(client, state)
-            finally:
-                cleanup_done.set()
+    async def cancellation_resistant_call(client, *args, **kwargs):
+        nonlocal resistant_task
+        try:
+            return await real_call_tool(client, *args, **kwargs)
+        except asyncio.CancelledError:
+            resistant_task = asyncio.current_task()
+            resistant_task.uncancel()
+            call_resisted_cancellation.set()
+            await release_call.wait()
+            raise
 
-        monkeypatch.setattr(
-            StreamableHTTPMCPClient, "_cleanup_deadline_request", observe_cleanup
-        )
+    monkeypatch.setattr(
+        StreamableHTTPMCPClient, "call_tool", cancellation_resistant_call
+    )
+    monkeypatch.setattr(server_actor_module, "CLIENT_CLOSE_TIMEOUT_SECONDS", 0)
+    shutdown_joining = asyncio.Event()
+    real_shutdown_children = MCPServerActor._shutdown_children
+
+    async def observe_shutdown_children(actor) -> None:
+        shutdown_joining.set()
+        await real_shutdown_children(actor)
+
+    monkeypatch.setattr(MCPServerActor, "_shutdown_children", observe_shutdown_children)
     limits = MCPCallLimits(
         deadline_seconds=300.0,
         max_wire_bytes=64 * 1024 * 1024,
@@ -271,29 +281,41 @@ async def test_http_deadline_is_absolute_and_keeps_mount_usable(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"local": config}),
     )
+    actor = mount._actors["local"]
+    client = mount._clients["local"]
     if deadline_type is not None:
-        mount._actors["local"]._deadline_clock = clock
+        actor._deadline_clock = clock
+    close_task: asyncio.Task[None] | None = None
     try:
         result = await mount.call_tool("local", "echo", {}, signal)
         assert result == make_error_result(
             "MCP tool local__echo exceeded the 300s deadline"
         )
-        await cleanup_done.wait()
-        client = mount._clients["local"]
+        await call_resisted_cancellation.wait()
+        assert resistant_task is not None
+        assert resistant_task in actor._children
+        assert not resistant_task.done()
+
+        close_task = asyncio.create_task(mount.close())
+        await shutdown_joining.wait()
+        assert not close_task.done()
+        assert resistant_task in actor._children
+
+        release_call.set()
+        _MCPHandler.release_deadline.set()
+        await close_task
+        assert not actor._children
         assert not client._active_requests
         assert not any(not task.done() for task in client._deadline_cleanups)
-
-        clock_offset = 0.0
-        _MCPHandler.release_deadline.set()
-        follow_up = await mount.call_tool("local", "echo", {})
-        assert follow_up["content"][0]["text"] == "ok"
-        assert mount.statuses["local"].state == "mounted"
-        assert not any(not task.done() for task in mount._actors["local"]._children)
     finally:
+        release_call.set()
         _MCPHandler.release_deadline.set()
         if abort_on_base is not None:
             await abort_on_base
-        await mount.close()
+        if close_task is None:
+            await mount.close()
+        elif not close_task.done():
+            await close_task
         await registry.close()
 
 
@@ -660,71 +682,78 @@ async def test_large_http_parse_stays_off_loop(monkeypatch: pytest.MonkeyPatch) 
 
 def _status_mount(tmp_path) -> MCPMount:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    kwargs: dict[str, object] = {}
-    if "mcp_limits" in inspect.signature(ToolRegistry).parameters:
-        kwargs["mcp_limits"] = _limits()
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
-        **kwargs,
     )
     return MCPMount(registry)
 
 
 @pytest.mark.asyncio
-async def test_mcp_status_shows_effective_limits_tui(tmp_path) -> None:
+async def test_mcp_status_shows_effective_limits_in_real_tui_render(tmp_path) -> None:
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path / "sessions"),
         skip_mcp_mount=True,
         skill_catalog=SkillCatalog.empty(),
     )
-    app = TUIApp(loop, provider="codex", model="offline")
     mount = _status_mount(tmp_path / "tools")
-    rendered = []
-    app._presenter.print_unit = rendered.append
+    loop.attach_mcp_mount(mount)
+    app = TUIApp(loop, provider="codex", model="offline")
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
     try:
-        output = render_mcp_status(mount, home=None)
-        app._handle_slash_output(output)
+        await app._handle_prompt_value("/mcp status")
+        screen = render_full_screen(session, 120)
+        visible = "\n".join(
+            "".join(screen.data_buffer[row][column].char for column in range(120))
+            for row in range(24)
+        )
         assert (
-            "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes"
-            in rendered[0].plain
+            "mcp limits: deadline 300s | wire 67108864 bytes | spill 262144 bytes"
+            in visible
         )
     finally:
-        await mount.close()
-        await mount.registry.close()
         await loop.close()
+        await mount.registry.close()
 
 
 @pytest.mark.asyncio
-async def test_mcp_status_shows_effective_limits_serve(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_mcp_status_shows_effective_limits_through_real_serve(tmp_path) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    await server.start()
+    assert server.port is not None
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    client = ServeClient(reader=reader, writer=writer)
     mount = _status_mount(tmp_path / "tools")
-    output = render_mcp_status(mount, home=None)
-
-    class Loop:
-        async def refresh_skills(self) -> None:
-            return None
-
-        async def slash_mcp(self, args: str) -> str:
-            assert args == "status"
-            return output
-
-    runtime = SimpleNamespace(loop=Loop())
-    monkeypatch.setattr(
-        "zeta.server.slash_commands.build_registry",
-        lambda _runtime: SimpleNamespace(notices=()),
-    )
-    response = await run_command(runtime, "/mcp status")
-
     try:
-        assert response == {"kind": "text", "text": output}
+        hello = await client.request(
+            "hello",
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        assert hello["result"]["protocol_version"] == "1.1"
+        created = await client.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        loop = server.runtime.loop
+        assert loop is not None
+        assert loop._mcp_mount is not None
+        await loop._mcp_mount.close()
+        loop._mcp_mount = None
+        loop.attach_mcp_mount(mount)
+        response = await client.request(
+            "status",
+            "slash_run",
+            {"session_id": session_id, "text": "/mcp status"},
+        )
+        assert response["result"]["kind"] == "text"
         assert (
-            "mcp limits: deadline 300s | wire 512 bytes | spill 64 bytes"
-            in response["text"]
+            "mcp limits: deadline 300s | wire 67108864 bytes | spill 262144 bytes"
+            in response["result"]["text"]
         )
     finally:
-        await mount.close()
+        await client.close()
+        await server.close()
         await mount.registry.close()

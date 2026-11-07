@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Literal
-from weakref import WeakKeyDictionary
 
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
@@ -164,9 +163,6 @@ class StdioMCPClient(MCPClient):
         self._generation = 0
         self._active_accumulator: MCPCallEnvelope | None = None
         self._invalidation: _Invalidation | None = None
-        self._invalidation_results: WeakKeyDictionary[
-            asyncio.Task[object], StructuredToolResult
-        ] = WeakKeyDictionary()
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         self._failure_sink = sink
@@ -177,13 +173,6 @@ class StdioMCPClient(MCPClient):
     def _report_failure(self, error: BaseException) -> None:
         if self._failure_sink is not None:
             self._failure_sink(_error_text(error))
-
-    def take_invalidation_result(
-        self, task: asyncio.Task[object]
-    ) -> StructuredToolResult | None:
-        """Return the result fixed before shared transport cleanup began."""
-
-        return self._invalidation_results.pop(task, None)
 
     async def connect(self) -> None:
         if self._process is not None:
@@ -579,14 +568,6 @@ class StdioMCPClient(MCPClient):
         for request_id in deadline_ids or ():
             if request_id in invalidation.pending:
                 invalidation.outcomes[request_id] = "deadline"
-        for request_id, pending in invalidation.pending.items():
-            if pending.owner is None or pending.tool_name is None:
-                continue
-            result, _ = self._outcome_values(
-                invalidation.outcomes[request_id], pending.tool_name
-            )
-            if result is not None:
-                self._invalidation_results[pending.owner] = result
 
     async def _finish_invalidation(self, invalidation: _Invalidation) -> None:
         reader_tasks = [

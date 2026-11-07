@@ -959,13 +959,6 @@ class MCPServerActor(MCPDefinitionPublisher):
     def _handle_call_finished(self, message: _CallFinished) -> None:
         self._children.discard(message.task)
         request = self._requests.pop(message.request.identifier, message.request)
-        take_result = getattr(request.client, "take_invalidation_result", None)
-        if (
-            take_result is not None
-            and (recorded_result := take_result(message.task)) is not None
-        ):
-            _set_result(request.result, recorded_result)
-            return
         if isinstance(message.error, asyncio.CancelledError):
             _set_result(request.result, _unavailable_result(self.name))
             return

@@ -206,6 +206,13 @@ class StreamableHTTPMCPClient(MCPClient):
             self._notification_task.cancel()
             await asyncio.gather(self._notification_task, return_exceptions=True)
             self._notification_task = None
+        await self._drain_active_requests()
+        if self._owns_client:
+            await self._client.aclose()
+        if self._owns_spill_store:
+            self._spill_store.close()
+
+    async def _drain_active_requests(self) -> None:
         active_tasks = tuple(
             state.task
             for state in self._active_requests.values()
@@ -217,10 +224,6 @@ class StreamableHTTPMCPClient(MCPClient):
             await asyncio.gather(
                 *active_tasks, *tuple(self._deadline_cleanups), return_exceptions=True
             )
-        if self._owns_client:
-            await self._client.aclose()
-        if self._owns_spill_store:
-            self._spill_store.close()
 
     def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
         """Close only the timed-out HTTP response and retain cleanup ownership."""

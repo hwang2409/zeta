@@ -14,16 +14,10 @@ import zeta.mcp.server_actor as server_actor_module
 import zeta.mcp.stdio as stdio_module
 from zeta.core.abort import AbortSignal
 from zeta.mcp import MCPConfig, MCPServerConfig, StdioMCPClient
-from zeta.mcp.actors.prompt import CallFinished, CallRequest
 from zeta.mcp.client import canceled_result, make_error_result
 from zeta.mcp.connection import build_mcp_client
 from zeta.mcp.envelope import MCPCallEnvelope, MCPCallLimits
 from zeta.mcp.mount import mount_mcp_servers
-from zeta.mcp.server_actor import (
-    MCPServerActor,
-    MCPServerStatus,
-    _TransportFailure,
-)
 from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
 from zeta.tools.registry import ToolRegistry
@@ -613,59 +607,3 @@ async def test_late_old_generation_frame_cannot_resolve_new_request(
     await client.close()
     with pytest.raises(stdio_module.MCPTransportError):
         await request
-
-
-@pytest.mark.asyncio
-async def test_transport_failure_before_call_finished_preserves_typed_invalidation_outcomes(
-    tmp_path: Path,
-) -> None:
-    class Client:
-        def __init__(self) -> None:
-            self.result = make_error_result(
-                f"MCP tool ordered__echo exceeded the {LIMIT} bytes response limit"
-            )
-
-        def take_invalidation_result(self, _task):
-            result, self.result = self.result, None
-            return result
-
-        def set_failure_sink(self, _sink) -> None:
-            pass
-
-        async def close(self) -> None:
-            pass
-
-    client = Client()
-
-    async def connect_and_list(_client):
-        return []
-
-    actor = MCPServerActor(
-        MCPServerConfig("ordered", "stdio", "unused"),
-        source=tmp_path / "mcp.json",
-        registry=None,
-        publish=lambda *_args: None,
-        build_client=lambda _config: client,
-        connect_and_list=connect_and_list,
-    )
-    actor._client = client
-    actor._status = MCPServerStatus("ordered", "stdio", "mounted")
-    result = asyncio.get_running_loop().create_future()
-    request = CallRequest(1, "echo", {}, AbortSignal(), 0, result, client=client)
-
-    async def completed_call():
-        return client.result
-
-    task = asyncio.create_task(completed_call())
-    await task
-    request.task = task
-    actor._requests[1] = request
-    actor._children.add(task)
-
-    actor._handle_transport_failure(_TransportFailure(None, client, "bounded failure"))
-    actor._handle_call_finished(CallFinished(request, task, client.result, None))
-
-    assert await result == make_error_result(
-        f"MCP tool ordered__echo exceeded the {LIMIT} bytes response limit"
-    )
-    await asyncio.gather(*actor._children, return_exceptions=True)
