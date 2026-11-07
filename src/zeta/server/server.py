@@ -9,7 +9,10 @@ import socket
 import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..runtime.loop import AgentLoop
 
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
@@ -833,19 +836,7 @@ class _Client:
         snapshot = runtime.metadata.to_dict()
         loop = runtime.loop
         if loop is not None:
-            prompt = loop._runtime_prompt.system_prompt
-            if isinstance(prompt, str):
-                snapshot["system_prompt"] = prompt
-            snapshot["prompt_components"] = {
-                key: dict(component)
-                for key, component in loop._runtime_prompt.prompt_components.items()
-            }
-            snapshot["skill_catalog"] = _active_catalog_snapshot(
-                loop._live_skill_catalog_snapshot, snapshot.get("skill_catalog")
-            )
-            snapshot["agent_catalog"] = _active_catalog_snapshot(
-                loop._live_agent_catalog_snapshot, snapshot.get("agent_catalog")
-            )
+            snapshot = _active_runtime_snapshot(snapshot, loop)
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
@@ -975,10 +966,28 @@ class _Client:
             return await finish_frame_write(self.codec, self.writer, payload)
 
 
-def _active_catalog_snapshot(
-    prepared: object | None, persisted: object | None
-) -> object | None:
-    return persisted if prepared is None else prepared
+def _active_runtime_snapshot(
+    persisted: dict[str, object], loop: AgentLoop
+) -> dict[str, object]:
+    snapshot = dict(persisted)
+    prompt = loop._runtime_prompt.system_prompt
+    if isinstance(prompt, str):
+        snapshot["system_prompt"] = prompt
+    snapshot["prompt_components"] = {
+        key: dict(component)
+        for key, component in loop._runtime_prompt.prompt_components.items()
+    }
+    snapshot["skill_catalog"] = (
+        snapshot.get("skill_catalog")
+        if loop._live_skill_catalog_snapshot is None
+        else loop._live_skill_catalog_snapshot
+    )
+    snapshot["agent_catalog"] = (
+        snapshot.get("agent_catalog")
+        if loop._live_agent_catalog_snapshot is None
+        else loop._live_agent_catalog_snapshot
+    )
+    return snapshot
 
 
 def _home() -> Path:

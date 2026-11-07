@@ -4397,27 +4397,25 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_passive_harness_message(
+async def test_session_history_shows_zeta_notice_as_system_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
     monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
         store = server.runtime.opened.store
         expected = []
+        notice_id = ""
         for index in range(9):
             if index == 4:
-                store.append_message(
-                    with_message_origin(
-                        Message(
-                            MessageRole.USER,
-                            [TextContent("hidden inbox status")],
-                            metadata={"zeta_event": "project_inbox_sent_status"},
-                        ),
-                        MessageOrigin.HARNESS_NUDGE,
-                    )
-                )
+                notice = build_nudge_message()
+                assert notice.role is MessageRole.SYSTEM
+                assert notice.content[0].text.startswith("[zeta] empty-turn recovery:")
+                notice_id = store.append_message(notice).id
+                expected.append(notice_id)
             expected.append(
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
@@ -4443,11 +4441,15 @@ async def test_session_history_hides_passive_harness_message(
             )
         )[-1]["result"]
 
-        assert [row["id"] for row in first["messages"]] == expected[:8]
+        rows = [*first["messages"], *second["messages"]]
+        assert [row["id"] for row in rows] == expected
         assert first["next_offset"] == 8
-        assert [row["id"] for row in second["messages"]] == expected[8:]
         assert second["next_offset"] is None
-        assert "hidden inbox status" not in json.dumps([first, second])
+        notice_row = next(row for row in rows if row["id"] == notice_id)
+        assert notice_row["role"] == "system"
+        assert notice_row["content"][0]["text"].startswith(
+            "[zeta] empty-turn recovery:"
+        )
     finally:
         await _close(server, writer)
 
@@ -8841,6 +8843,68 @@ async def test_config_changed_requires_live_config_changed_feature(
         if negotiated:
             config_event = await _event(reader, "config_changed")
             assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_unnegotiated_config_change_preserves_complete_frame_stream(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+
+    async def raw_status_frames() -> bytes:
+        request = json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "status", "params": {}}
+        ).encode() + b"\n"
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), 10)
+        frames: list[bytes] = []
+        while True:
+            frame = await asyncio.wait_for(reader.readline(), 10)
+            assert frame, "server closed before the status response"
+            frames.append(frame)
+            if json.loads(frame).get("id") == 3:
+                return b"".join(frames)
+
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": []},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
+        assert len(prepared_events) == 1
+
+        base_frames = await asyncio.wait_for(raw_status_frames(), 10)
+        await asyncio.wait_for(
+            server.control._event(prepared_events[0], background=True), 10
+        )
+        actual_frames = await asyncio.wait_for(raw_status_frames(), 10)
+
+        assert actual_frames == base_frames
     finally:
         await _close(server, writer)
 

@@ -482,7 +482,8 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
         for block in message["content"]
     )
     assert not any(
-        isinstance(block, TextContent) and block.text.startswith("skills changed:")
+        isinstance(block, TextContent)
+        and block.text.startswith("[zeta] skill refresh:")
         for message in messages
         for block in message.content
     )
@@ -492,11 +493,12 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
         block.text
         for message in store.messages()
         for block in message.content
-        if isinstance(block, TextContent) and block.text.startswith("skills changed:")
+        if isinstance(block, TextContent)
+        and block.text.startswith("[zeta] skill refresh:")
     ]
     assert notices == [
         (
-            "skills changed: added instant\n"
+            "[zeta] skill refresh: skills changed: added instant\n"
             "skills changed, but this session's prompt predates owned skill spans; "
             "restart the session to refresh its skill index"
         )
@@ -565,27 +567,48 @@ async def test_newer_live_config_generation_wins(
         result = original(**kwargs)
         if calls == 1:
             scanned.set()
-            release.wait(timeout=2)
+            assert release.wait(timeout=10)
         return result
+
+    async def newer_generation_started() -> None:
+        while loop._live_config_generation < 2:
+            await asyncio.sleep(0)
 
     monkeypatch.setattr(live_module, "discover_session_skills", delayed_discovery)
     older = asyncio.create_task(loop.refresh_live_config())
-    assert await asyncio.to_thread(scanned.wait, 2)
-    path.write_text(
-        "---\nname: live\ndescription: newest description\n---\n\nnewest\n",
-        encoding="utf-8",
-    )
-    newer = asyncio.create_task(loop.refresh_live_config())
-    while loop._live_config_generation < 2:
-        await asyncio.sleep(0)
-    release.set()
-    await asyncio.gather(older, newer)
+    newer: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+        path.write_text(
+            "---\nname: live\ndescription: newest description\n---\n\nnewest\n",
+            encoding="utf-8",
+        )
+        newer = asyncio.create_task(loop.refresh_live_config())
+        await asyncio.wait_for(newer_generation_started(), 10)
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(older, newer, return_exceptions=True), 10
+        )
 
-    assert calls == 2
-    assert loop.tool_registry.skill_catalog.find("live").description == (
-        "newest description"
-    )
-    await loop.close()
+        assert calls == 2
+        assert loop.tool_registry.skill_catalog.find("live").description == (
+            "newest description"
+        )
+    finally:
+        release.set()
+        tasks = [older, *([newer] if newer is not None else [])]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), 10
+            )
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                loop.store.close()
 
 
 def test_live_slash_skills_replace_added_and_removed_entries(tmp_path: Path) -> None:

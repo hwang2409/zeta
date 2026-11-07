@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -391,7 +392,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         watcher.scan = paused
     task = asyncio.create_task(_refresh(loop))
     try:
-        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
         before = (
             loop.tool_registry.agent_catalog,
             _definition(loop),
@@ -400,7 +401,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         )
         loop._set_runtime_prompt(loop._runtime_prompt)
         release.set()
-        await task
+        await asyncio.wait_for(task, 10)
 
         assert before == (
             loop.tool_registry.agent_catalog,
@@ -410,7 +411,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         )
         with pytest.raises(ValueError, match="unknown agent preset"):
             loop.tool_registry.agent_catalog.find("specialist")
-        await _refresh(loop)
+        await asyncio.wait_for(_refresh(loop), 10)
         assert "specialist" in loop.tool_registry.agent_catalog.names(), (
             "stale discard did not retry the complete live candidate"
         )
@@ -418,8 +419,57 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await loop.close()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 10
+            )
+        finally:
+            await asyncio.wait_for(loop.close(), 10)
+
+
+@pytest.mark.asyncio
+async def test_equal_mcp_schema_refresh_keeps_prepared_live_candidate(
+    tmp_path: Path,
+) -> None:
+    loop, home, _project = _loop(tmp_path, explicit_schemas=True)
+    _write_agent(
+        home / "agents" / "specialist.md",
+        "specialist",
+        "focused specialist",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    watcher = loop._live_config_watcher
+    assert watcher is not None
+    original = watcher.prepare
+
+    def paused(base, *, force: bool = False):
+        candidate = original(base, force=force)
+        entered.set()
+        assert release.wait(timeout=10)
+        return candidate
+
+    watcher.prepare = paused
+    task = asyncio.create_task(loop.refresh_live_config())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        loop._refresh_mcp_tool_schemas(SimpleNamespace(configs={}))
+        release.set()
+        await asyncio.wait_for(task, 10)
+
+        assert "specialist" in loop.tool_registry.agent_catalog.names(), (
+            "an equal MCP schema refresh discarded the prepared live candidate"
+        )
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 10
+            )
+        finally:
+            await asyncio.wait_for(loop.close(), 10)
 
 
 @pytest.mark.asyncio

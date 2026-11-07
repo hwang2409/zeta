@@ -12,14 +12,7 @@ from ...config.live import (
     LiveConfigScope,
     LiveConfigWatcher,
 )
-from ...protocol.types import (
-    Message,
-    MessageOrigin,
-    MessageRole,
-    StreamEvent,
-    StreamEventType,
-    TextContent,
-)
+from ...protocol.types import StreamEvent, StreamEventType, harness_notice
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
 from ..prompt import RuntimePrompt
@@ -167,11 +160,7 @@ class LiveConfigMixin:
         count = len(self._live_config_notices)
         notice = "\n".join(self._live_config_notices[:count])
         await self._append_turn_message(
-            Message(
-                MessageRole.USER,
-                [TextContent(notice)],
-                metadata={"zeta.origin": MessageOrigin.HARNESS_NUDGE.value},
-            )
+            harness_notice("skill refresh", notice, event="skill_refresh")
         )
         del self._live_config_notices[:count]
 

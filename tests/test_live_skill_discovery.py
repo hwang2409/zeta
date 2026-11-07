@@ -215,25 +215,39 @@ async def test_live_live_config_discards_stale_plan_prompt(
     def paused_prepare(base, *, force: bool = False):
         result = original_prepare(base, force=force)
         scanned.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=10)
         return result
 
     loop._live_config_watcher.prepare = paused_prepare
     refresh = asyncio.create_task(loop.refresh_live_config())
-    assert await asyncio.to_thread(scanned.wait, 5)
-    loop.set_plan_mode(True)
-    release.set()
-    await refresh
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+        loop.set_plan_mode(True)
+        release.set()
+        await asyncio.wait_for(refresh, 10)
 
-    assert loop.plan_mode is True
-    assert "live description" not in _runtime_text(loop)
-    assert not any(skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills)
+        assert loop.plan_mode is True
+        assert "live description" not in _runtime_text(loop)
+        assert not any(
+            skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
+        )
 
-    await loop.refresh_live_config()
-    assert loop.plan_mode is True
-    assert "live description" in _runtime_text(loop)
-    await loop.close()
-    loop.store.close()
+        await asyncio.wait_for(loop.refresh_live_config(), 10)
+        assert loop.plan_mode is True
+        assert "live description" in _runtime_text(loop)
+    finally:
+        release.set()
+        if not refresh.done():
+            refresh.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), 10
+            )
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                loop.store.close()
 
 
 @pytest.mark.asyncio
@@ -274,40 +288,54 @@ async def test_live_live_config_discards_stale_memory_prompt(
     def paused_prepare(base, *, force: bool = False):
         result = original_prepare(base, force=force)
         scanned.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=10)
         return result
 
     loop._live_config_watcher.prepare = paused_prepare
     refresh = asyncio.create_task(loop.refresh_live_config())
-    assert await asyncio.to_thread(scanned.wait, 5)
-    changed_memory = "memory changed while refresh prepared"
-    changed_prompt = prompt.replace(memory, changed_memory)
-    changed_offset = changed_prompt.index(changed_memory)
-    loop._set_runtime_prompt(
-        _owned_runtime_prompt(
-            changed_prompt,
-            catalog,
-            {
-                "project_memory": {
-                    "offset": changed_offset,
-                    "length": len(changed_memory),
-                    "digest": hashlib.sha256(changed_memory.encode()).hexdigest(),
-                }
-            },
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+        changed_memory = "memory changed while refresh prepared"
+        changed_prompt = prompt.replace(memory, changed_memory)
+        changed_offset = changed_prompt.index(changed_memory)
+        loop._set_runtime_prompt(
+            _owned_runtime_prompt(
+                changed_prompt,
+                catalog,
+                {
+                    "project_memory": {
+                        "offset": changed_offset,
+                        "length": len(changed_memory),
+                        "digest": hashlib.sha256(changed_memory.encode()).hexdigest(),
+                    }
+                },
+            )
         )
-    )
-    release.set()
-    await refresh
+        release.set()
+        await asyncio.wait_for(refresh, 10)
 
-    assert changed_memory in _runtime_text(loop)
-    assert "live description" not in _runtime_text(loop)
-    assert not any(skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills)
+        assert changed_memory in _runtime_text(loop)
+        assert "live description" not in _runtime_text(loop)
+        assert not any(
+            skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
+        )
 
-    await loop.refresh_live_config()
-    assert changed_memory in _runtime_text(loop)
-    assert "live description" in _runtime_text(loop)
-    await loop.close()
-    loop.store.close()
+        await asyncio.wait_for(loop.refresh_live_config(), 10)
+        assert changed_memory in _runtime_text(loop)
+        assert "live description" in _runtime_text(loop)
+    finally:
+        release.set()
+        if not refresh.done():
+            refresh.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(refresh, return_exceptions=True), 10
+            )
+        finally:
+            try:
+                await asyncio.wait_for(loop.close(), 10)
+            finally:
+                loop.store.close()
 
 
 @pytest.mark.asyncio
