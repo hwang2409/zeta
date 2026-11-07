@@ -32,8 +32,8 @@ def _lint(
     source: str,
     added_lines: set[int] | None = None,
     diff: str | None = None,
+    path: str = "tests/test_example.py",
 ):
-    path = "tests/test_example.py"
     target = tmp_path / path
     target.parent.mkdir()
     target.write_text(source)
@@ -216,6 +216,219 @@ def test_internal_contract_rule_rejects_bare_seam_marker(tmp_path: Path) -> None
     assert "seam <reason>" in findings[0].message
 
 
+def test_tq005_rejects_production_bootstraps_in_conftest(tmp_path: Path) -> None:
+    source = """import os
+
+os.environ[\"ZETA_HOME\"] = \"/tmp/home\"
+os.environ[\"ZETA_TEST_SCRIPTED_PROVIDER\"] = \"1\"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ005", 3),
+        ("TQ005", 4),
+    ]
+
+
+def test_tq005_reasoned_bootstrap_marker_suppresses_finding(tmp_path: Path) -> None:
+    source = """import os
+# test-contract: bootstrap session-wide isolated home is required by the harness
+os.environ["ZETA_HOME"] = "/tmp/home"
+"""
+
+    assert _lint(tmp_path, source, path="tests/conftest.py") == []
+
+
+def test_tq005_bare_or_wrong_marker_does_not_suppress(tmp_path: Path) -> None:
+    for index, marker in enumerate(
+        ("# test-contract: bootstrap", "# test-contract: latency unrelated")
+    ):
+        source = f"""import os
+{marker}
+os.environ["ZETA_HOME"] = "/tmp/home"
+"""
+        case = tmp_path / f"case{index}"
+        case.mkdir()
+        findings = _lint(case, source, path="tests/conftest.py")
+        assert [finding.code for finding in findings] == ["TQ005"]
+
+
+def test_marker_inline_comment_does_not_suppress_next_statement(tmp_path: Path) -> None:
+    source = """async def test_wait():
+    await asyncio.sleep(0.1)  # test-contract: latency real retry delay
+    await asyncio.sleep(0.2)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 3)]
+
+
+def test_marker_comment_line_applies_only_to_next_statement(tmp_path: Path) -> None:
+    source = """async def test_wait():
+    # test-contract: latency real retry delay
+    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 4)]
+
+
+def test_marker_on_multiline_statement_closing_line_applies_to_that_line() -> None:
+    lines = [
+        "call(",
+        "    value,",
+        "    option,",
+        ")  # test-contract: seam real public seam is unavailable",
+    ]
+
+    assert quality._has_marker(lines, 4, {"seam"})
+
+
+def test_tq005_inline_marker_does_not_suppress_next_statement(tmp_path: Path) -> None:
+    source = """import os
+os.environ["ZETA_HOME"] = "/tmp/home"  # test-contract: bootstrap session home
+os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 3)]
+
+
+def test_tq005_comment_marker_applies_only_to_next_statement(tmp_path: Path) -> None:
+    source = """import os
+# test-contract: bootstrap session home
+os.environ["ZETA_HOME"] = "/tmp/home"
+os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 4)]
+
+
+def test_tq005_marker_on_multiline_statement_first_line_suppresses(
+    tmp_path: Path,
+) -> None:
+    source = """import os
+os.environ[  # test-contract: bootstrap session home
+    "ZETA_HOME"
+] = "/tmp/home"
+"""
+
+    assert _lint(tmp_path, source, path="tests/conftest.py") == []
+
+
+def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> None:
+    source = 'import os\nos.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"\n'
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ005", 2)]
+    assert findings[0].message == quality.GLOBAL_BOOTSTRAP_ERROR.format(
+        name="ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'def test_local(monkeypatch):\n    monkeypatch.setenv("ZETA_LOCAL", "1")\n',
+        'def helper():\n    os.environ["ZETA_LOCAL"] = "1"\n',
+    ],
+)
+def test_tq005_allows_local_environment_setup(tmp_path: Path, source: str) -> None:
+    assert _lint(tmp_path, source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """import os
+
+environ = os.environ
+environ[\"ZETA_ALIAS\"] = \"1\"
+""",
+        """from os import environ
+environ[\"ZETA_IMPORTED\"] = \"1\"
+""",
+        """import os
+os.environ |= {\"ZETA_AUGASSIGN\": \"1\"}
+""",
+        """from os import environ
+from pytest import fixture
+
+@fixture(scope=\"session\")
+def session():
+    environ[\"ZETA_IMPORTED_FIXTURE\"] = \"1\"
+""",
+    ],
+)
+def test_tq005_rejects_environment_syntax_variants(tmp_path: Path, source: str) -> None:
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [finding.code for finding in findings] == ["TQ005"]
+
+
+def test_tq005_reports_dynamic_environment_expression(tmp_path: Path) -> None:
+    source = 'import os\nname = input_name\nos.environ[name] = "1"\n'
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert len(findings) == 1
+    assert "global test bootstrap name hides" in findings[0].message
+
+
+def test_tq005_rejects_session_fixture_and_hook(tmp_path: Path) -> None:
+    source = """@pytest.fixture(scope=\"session\")
+def session(monkeypatch):
+    monkeypatch.setenv(\"ZETA_SESSION\", \"1\")
+
+def pytest_configure(config):
+    os.putenv(\"ZETA_CONFIG\", \"1\")
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ005", 3),
+        ("TQ005", 6),
+    ]
+
+
+def test_tq005_reports_expression_names_and_update_keys(tmp_path: Path) -> None:
+    source = """import os
+name = \"ZETA_DYNAMIC\"
+os.environ.setdefault(name, \"1\")
+os.environ.update({\"ZETA_ONE\": \"1\", \"NOPE\": \"1\"})
+MonkeyPatch().setenv(\"ZETA_PATCH\", \"1\")
+"""
+
+    findings = _lint(tmp_path, source, path="tests/sitecustomize.py")
+
+    assert [(finding.code, finding.line, finding.message) for finding in findings] == [
+        (
+            "TQ005",
+            3,
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="name"),
+        ),
+        (
+            "TQ005",
+            4,
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="ZETA_ONE"),
+        ),
+        (
+            "TQ005",
+            5,
+            quality.GLOBAL_BOOTSTRAP_ERROR.format(name="ZETA_PATCH"),
+        ),
+    ]
+
+
 def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
     source = """def test_existing_and_new():
     time.sleep(0.1)
@@ -350,6 +563,17 @@ def test_select_base_uses_first_parent_for_push(monkeypatch) -> None:
     )
 
     assert quality.select_base("push") == "parent"
+    assert commands == [(["git", "rev-parse", "HEAD^"], True)]
+
+
+def test_select_base_uses_first_parent_for_workflow_dispatch(monkeypatch) -> None:
+    commands = []
+    monkeypatch.setattr(
+        "scripts.lint_test_quality.subprocess.check_output",
+        lambda command, text: commands.append((command, text)) or "parent\n",
+    )
+
+    assert quality.select_base("workflow_dispatch") == "parent"
     assert commands == [(["git", "rev-parse", "HEAD^"], True)]
 
 

@@ -4,6 +4,7 @@ import asyncio
 import os
 import pty
 import shlex
+import signal
 import subprocess
 import sys
 from multiprocessing import Pipe, Process
@@ -12,9 +13,11 @@ from pathlib import Path
 
 import pytest
 
+import tests.support.processes as processes_module
 from tests.support.processes import (
     ChildHandshake,
     child_handshake,
+    kill_group_if_present,
     owned_child_process,
     read_pty_until,
     reap_process,
@@ -40,6 +43,20 @@ def _spawn_with_handshake(
         env={**os.environ, **handshake.child_env()},
         pass_fds=handshake.pass_fds,
     )
+
+
+def test_kill_group_if_present_ignores_group_that_exits_before_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def already_gone(pgid: int, signum: int) -> None:
+        assert (pgid, signum) == (123, signal.SIGKILL)
+        raise ProcessLookupError
+
+    # test-contract: seam process-group cleanup has no public existence probe
+    monkeypatch.setattr(processes_module, "_group_exists", lambda _pgid: True)
+    monkeypatch.setattr(os, "killpg", already_gone)
+
+    kill_group_if_present(123)
 
 
 def test_child_handshake_success_restores_file_descriptors() -> None:
