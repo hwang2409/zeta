@@ -552,12 +552,9 @@ class _Client:
                 features=self.features,
             )
         if method == "list_sessions":
-            result, page_ids = await self.connections.run_read(
+            result, _page_ids = await self.connections.run_read(
                 self, lambda: self._list_sessions(request_id, params)
             )
-            if self.role != "observer":
-                # project-link repair writes, so it stays off the read-only worker
-                await asyncio.to_thread(self._reconcile_project_links, page_ids)
             return result
         if method == "new_session":
             try:
@@ -907,9 +904,6 @@ class _Client:
         status.update(suffix)
         return status
 
-    def _reconcile_project_links(self, session_ids: list[str]) -> None:
-        for session_id in session_ids:
-            self.server.runtime.manager._reconcile_project_link(session_id)
 
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
@@ -928,18 +922,26 @@ class _Client:
             available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
-            item.session_id: item.preview
+            item.session_id: item
             for item in self.server.runtime.manager.list_session_previews(
                 limit=len(metadata), sessions=metadata
             )
         }
-        sessions = [
-            {
-                **item.to_catalog_dict(),
-                "first_message_preview": previews.get(item.session_id, ""),
-            }
-            for item in metadata
-        ]
+        sessions = []
+        for item in metadata:
+            preview = previews[item.session_id]
+            sessions.append(
+                {
+                    **item.to_catalog_dict(),
+                    "first_message_preview": preview.preview,
+                    "in_use": preview.in_use,
+                    **(
+                        {"owner_pid": preview.owner_pid}
+                        if preview.owner_pid is not None
+                        else {}
+                    ),
+                }
+            )
         if self.protocol_version == "1.0":
             for item in sessions:
                 item.pop("name", None)

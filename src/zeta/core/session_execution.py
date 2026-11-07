@@ -94,6 +94,27 @@ def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
     return surface, pid, epoch
 
 
+def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
+    """Read the diagnostic owner hint without taking the execution lock."""
+
+    try:
+        fd = open_session_file(directory_fd, RUNTIME_LEASE_NAME, os.O_RDONLY)
+    except FileNotFoundError:
+        return False, None
+    try:
+        _surface, pid, _epoch = _read_owner_hint(fd)
+    finally:
+        os.close(fd)
+    if pid is None or pid <= 0:
+        return False, None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        pass
+    return True, pid
+
 def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     record = json.dumps(
         {
@@ -295,6 +316,10 @@ class SessionExecutionLease:
             if _REGISTRY.get(owned.identity) is owned:
                 del _REGISTRY[owned.identity]
             fd, owned.fd = owned.fd, -1
+        try:
+            os.ftruncate(fd, 0)
+        except OSError:
+            pass
         os.close(fd)
 
 

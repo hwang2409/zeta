@@ -9,7 +9,6 @@ import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -601,20 +600,10 @@ def _saturated_switch_rename_race(home_value: str, results: object) -> None:
         rename_futures: list[object] = []
         writers_ready = threading.Barrier(5)
         writer_manager = SessionManager(context.home)
-        metadata_lock = writer_manager._metadata_lock
-
-        @contextmanager
-        def observed_metadata_lock(*args: object, **kwargs: object):
-            writers_ready.wait(timeout=10)
-            with metadata_lock(*args, **kwargs) as directory_fd:
-                yield directory_fd
-
-        writer_manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
 
         def rename(index: int) -> object:
-            return writer_manager.rename(
-                context.metadata.session_id, f"rename {index}"
-            )
+            writers_ready.wait(timeout=10)
+            return writer_manager.rename(context.metadata.session_id, f"rename {index}")
 
         def queue_renames() -> None:
             event_loop.set_default_executor(executor)

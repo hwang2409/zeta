@@ -30,6 +30,7 @@ from .session_execution import (
     OwnerSurface,
     SessionExecutionLease,
     SessionOwnedError,
+    session_owner_status,
 )
 from .store.prompt_composition import (
     PromptCompositionMixin,
@@ -83,6 +84,8 @@ class SessionPreview:
     updated_at: str
     preview: str
     name: str = ""
+    in_use: bool = False
+    owner_pid: int | None = None
 
 
 def env_home() -> Path:
@@ -463,12 +466,15 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 logger.warning(
                     "Empty session preview for %s: %s", metadata.session_id, exc
                 )
+            in_use, owner_pid = self.session_owner_status(metadata.session_id)
             previews.append(
                 SessionPreview(
                     session_id=metadata.session_id,
                     updated_at=metadata.updated_at,
                     preview=_preview_text(first_message),
                     name=metadata.name,
+                    in_use=in_use,
+                    owner_pid=owner_pid,
                 )
             )
         return previews
@@ -739,6 +745,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     def _touch(metadata: SessionMetadata) -> SessionMetadata:
         metadata.updated_at = _now()
         return metadata
+
+    def session_owner_status(self, session_id: str) -> tuple[bool, int | None]:
+        """Return the live diagnostic owner without taking its execution lock."""
+
+        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+            return session_owner_status(directory_fd)
 
     @contextmanager
     def _execution_owner(

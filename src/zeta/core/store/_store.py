@@ -596,12 +596,17 @@ class ConversationStore(
 
     @contextmanager
     def _append_lock(
-        self, *, deadline: float | None = None, wait: bool = True
+        self,
+        *,
+        deadline: float | None = None,
+        wait: bool = True,
+        observer: bool = False,
     ) -> Iterator[bool]:
         """Lock and synchronize the log before exposing resident state."""
         if self._closed:
             raise ValueError("session store is closed")
-        self.assert_execution_owner()
+        if not observer:
+            self.assert_execution_owner()
         with os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:

@@ -5784,6 +5784,8 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         await _event(reader, "turn_end")
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
+        assert result["sessions"][0]["in_use"] is True
+        assert result["sessions"][0]["owner_pid"] == os.getpid()
         assert "name" not in result["sessions"][0]
     finally:
         await _close(server, writer)
@@ -5799,9 +5801,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
-        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
+        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -5820,17 +5822,26 @@ async def test_list_sessions_page_touches_only_page_rows(
     )
     reader, writer = await _connect(server)
     try:
-        await _request(reader, writer, 1, "hello", {
-            "protocol_version": "1.2", "features": ["list_sessions_paging"],
-        })
-        frame = (await _request(
-            reader, writer, 2, "list_sessions", {"offset": 0, "limit": 1}
-        ))[-1]
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": ["list_sessions_paging"],
+            },
+        )
+        frame = (
+            await _request(
+                reader, writer, 2, "list_sessions", {"offset": 0, "limit": 1}
+            )
+        )[-1]
         assert "result" in frame, frame
         result = frame["result"]
         assert [row["session_id"] for row in result["sessions"]] == [sessions[-1]]
         assert len(preview_reads) == 1
-        assert reconciliations == [sessions[-1]]
+        assert reconciliations == []
     finally:
         await _close(server, writer)
 
@@ -5934,9 +5945,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
-    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
+    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
