@@ -328,21 +328,18 @@ async def test_child_registry_clone_gets_its_own_backend_owner(
 
 
 @pytest.mark.asyncio
-async def test_runtime_reports_backend_close_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from zeta.runtime.loop import backend_owners as backend_owner_module
-
+async def test_runtime_reports_backend_close_failure(tmp_path: Path) -> None:
     failure = RuntimeError("close failed")
     backend = _RecordingBackend()
     backend.client.close_error = failure
-    reports: list[tuple[BaseException, str, str]] = []
+    contexts: list[dict[str, object]] = []
+    event_loop = asyncio.get_running_loop()
+    previous_handler = event_loop.get_exception_handler()
 
-    def report(error: BaseException, *, stage: str, provider: str, **_kwargs) -> None:
-        reports.append((error, stage, provider))
+    def capture_report(_loop, context: dict[str, object]) -> None:
+        contexts.append(context)
 
-    # test-contract: seam capture the p26 reporter handoff without filesystem polling
-    monkeypatch.setattr(backend_owner_module, "_schedule_cleanup_failure", report)
+    event_loop.set_exception_handler(capture_report)
     loop = AgentLoop(
         backend,
         ConversationStore(tmp_path),
@@ -350,8 +347,19 @@ async def test_runtime_reports_backend_close_failure(
     )
     try:
         await _within(loop.close())
-        assert reports == [(failure, "completion_backend_runtime_close", "ollama")]
+        callbacks_flushed = event_loop.create_future()
+        event_loop.call_soon(callbacks_flushed.set_result, None)
+        await _within(callbacks_flushed)
+        assert contexts == [
+            {
+                "exception_type": "builtins.RuntimeError",
+                "stage": "completion_backend_runtime_close",
+                "index": 0,
+                "primary_outcome": "success",
+            }
+        ]
     finally:
+        event_loop.set_exception_handler(previous_handler)
         await _within(loop.close())
         loop.store.close()
 
@@ -368,8 +376,15 @@ async def test_injected_client_is_never_closed_by_runtime(tmp_path: Path) -> Non
     try:
         await _within(_consume(backend))
         await _within(loop.close())
-        assert backend.connection_setup_count == 0
-        assert client.close_count == 0
+        completion_error = None
+        try:
+            await _within(_consume(backend))
+        except RuntimeError as error:
+            completion_error = error
+        assert (str(completion_error), client.close_count) == (
+            "completion backend is retired",
+            0,
+        )
     finally:
         await _within(loop.close())
         loop.store.close()

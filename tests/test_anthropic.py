@@ -3199,6 +3199,8 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         backend = AnthropicBackend(token_store=store)
         closing = None
+        outcome = None
+        close_error = None
         try:
             [event async for event in backend.complete([], [])]
             closing = asyncio.create_task(backend.aclose())
@@ -3212,8 +3214,11 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
                 await asyncio.wait_for(
                     asyncio.gather(closing, return_exceptions=True), 10
                 )
-            outcome = await asyncio.wait_for(backend.aclose(), 10)
-        assert outcome.failures == ()
+            try:
+                outcome = await asyncio.wait_for(backend.aclose(), 10)
+            except asyncio.CancelledError as error:
+                close_error = error
+        assert close_error is None and outcome is not None and outcome.failures == ()
 
 
 @pytest.mark.asyncio
@@ -3285,7 +3290,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
     await cleanup_started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError) as raised:
-        await task
+        await asyncio.wait_for(task, 10)
     assert isinstance(raised.value.__cause__, AnthropicStreamError)
 
 
@@ -3323,6 +3328,8 @@ async def test_owned_client_close_cancellation_is_separate_from_stream_error(
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         backend = AnthropicBackend(token_store=store)
         closing = None
+        outcome = None
+        close_error = None
         try:
             with pytest.raises(AnthropicStreamError):
                 [event async for event in backend.complete([], [])]
@@ -3337,8 +3344,11 @@ async def test_owned_client_close_cancellation_is_separate_from_stream_error(
                 await asyncio.wait_for(
                     asyncio.gather(closing, return_exceptions=True), 10
                 )
-            outcome = await asyncio.wait_for(backend.aclose(), 10)
-        assert outcome.failures == ()
+            try:
+                outcome = await asyncio.wait_for(backend.aclose(), 10)
+            except asyncio.CancelledError as error:
+                close_error = error
+        assert close_error is None and outcome is not None and outcome.failures == ()
 
 
 @pytest.mark.asyncio

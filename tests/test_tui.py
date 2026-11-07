@@ -6345,20 +6345,23 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
     monkeypatch.setattr(
-        app.loop,
+        AgentLoop,
         "connection_setup_counts",
-        lambda: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+        lambda _loop: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+        raising=False,
     )
 
-    lines = tui_app_module._status_card_lines(app.slash_status())
-    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+    try:
+        lines = tui_app_module._status_card_lines(app.slash_status())
+        rendered = "\n".join("".join(text for _style, text in line) for line in lines)
 
-    assert requested == ["child-session"]
-    assert (
-        "transcript_index_failure: disk full; pending changes will retry" in rendered
-    )
-    assert "completion_client_setups: codex/gpt-test=1" in rendered
-    await app.close()
+        assert requested == ["child-session"]
+        assert (
+            "transcript_index_failure: disk full; pending changes will retry" in rendered
+        )
+        assert "completion_client_setups: codex/gpt-test=1" in rendered
+    finally:
+        await app.close()
 
 
 @pytest.mark.parametrize(
