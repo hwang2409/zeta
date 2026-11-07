@@ -92,7 +92,9 @@ class LiveConfigMixin:
     def add_live_config_listener(self, listener: LiveConfigListener) -> None:
         self._live_config_listeners.append(listener)
 
-    async def refresh_live_config(self, force: bool = False) -> None:
+    async def refresh_live_config(
+        self, force: bool = False, *, publish: bool = True
+    ) -> None:
         """Prepare one complete candidate off-loop and commit it if still current."""
 
         watcher = self._live_config_watcher
@@ -136,9 +138,9 @@ class LiveConfigMixin:
                 listener.commit_live_config(prepared)
             self._live_skill_catalog_snapshot = candidate.skill_snapshot
             self._live_agent_catalog_snapshot = candidate.agent_snapshot
-            if candidate.notice:
+            if publish and candidate.notice:
                 self._live_config_notices.append(candidate.notice)
-            if candidate.payload is not None:
+            if publish and candidate.payload is not None:
                 self._publish_background_event(
                     StreamEvent(StreamEventType.CONFIG_CHANGED, data=candidate.payload)
                 )
