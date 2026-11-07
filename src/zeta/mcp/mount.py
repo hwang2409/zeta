@@ -21,6 +21,7 @@ from .config import (
     load_mcp_config,
     tool_prefix,
 )
+from .envelope import MCPCallLimits
 from .resources import ResourceAttachment, fetch_resource
 from .resources import list_resources as fetch_resources
 from .server_actor import (
@@ -49,9 +50,7 @@ class _ActorResourceClient:
             generation=self._actor.generation, abort_signal=self._abort_signal
         )
 
-    async def read_resource(
-        self, uri: str
-    ) -> str | tuple[MCPResourceContent, ...]:
+    async def read_resource(self, uri: str) -> str | tuple[MCPResourceContent, ...]:
         return await self._actor.read_resource(
             uri, generation=self._actor.generation, abort_signal=self._abort_signal
         )
@@ -113,6 +112,14 @@ class MCPMount:
             server_configs = {client.config.name: client.config for client in registry}
         self.configs = server_configs
         self.statuses = dict(statuses or {})
+        self.limits = (
+            registry.mcp_limits
+            if isinstance(registry, ToolRegistry) and registry.mcp_limits is not None
+            else MCPCallLimits()
+        )
+        if isinstance(registry, ToolRegistry) and registry.mcp_limits is None:
+            registry.mcp_limits = self.limits
+            registry.spills.configure_transient_limit(self.limits.max_wire_bytes)
         if self.registry is not None:
             # The session clone copies this pointer; activation still writes only
             # to the registry performing the discovery call.
@@ -291,13 +298,12 @@ class MCPMount:
         return f"mcp: {mounted} mounted, {failed} failed"
 
     def render(self) -> str:
-        limits = self.registry.mcp_limits if self.registry is not None else None
-        lines = [self.summary]
-        if limits is not None:
-            lines.append(
-                f"mcp limits: deadline {limits.deadline_seconds:g}s | "
-                f"wire {limits.max_wire_bytes} bytes | spill {limits.spill_after_bytes} bytes"
-            )
+        limits = self.limits
+        limit_summary = (
+            f"mcp limits: deadline {limits.deadline_seconds:g}s | "
+            f"wire {limits.max_wire_bytes} bytes | spill {limits.spill_after_bytes} bytes"
+        )
+        lines = [self.summary, limit_summary]
         for name in self.configs:
             status = self.statuses.get(name)
             if status is None:
@@ -531,6 +537,7 @@ class MCPMount:
             build_client=_make_build_client(self.home, self.registry),
             connect_and_list=_connect_and_list,
             setup_timeout=SERVER_SETUP_TIMEOUT_SECONDS,
+            limits=self.limits,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
             auto_max_delay=AUTO_RECONNECT_MAX_DELAY_SECONDS,
         )
@@ -566,9 +573,7 @@ class MCPMount:
         )
 
     @staticmethod
-    def _notice_skipped(
-        names: tuple[str, ...], notice_sink: NoticeSink | None
-    ) -> None:
+    def _notice_skipped(names: tuple[str, ...], notice_sink: NoticeSink | None) -> None:
         if notice_sink is not None and names:
             notice_sink("MCP servers skipped by tool policy: " + ", ".join(names))
 
@@ -611,7 +616,11 @@ async def mount_mcp_servers(
         registry,
         enabled_configs,
         {},
-        sources={name: config.sources[name] for name in enabled_configs if name in config.sources},
+        sources={
+            name: config.sources[name]
+            for name in enabled_configs
+            if name in config.sources
+        },
         home=home,
     )
     actors: list[MCPServerActor] = []

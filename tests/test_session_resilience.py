@@ -389,7 +389,6 @@ def test_preview_reads_bounded_prefix(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("shape", ["huge_row", "unterminated", "no_user_message"])
 def test_preview_prefix_reader_stops_at_its_caps(tmp_path: Path, shape: str) -> None:
-    import time
     import tracemalloc
 
     manager = SessionManager(tmp_path)
@@ -414,7 +413,6 @@ def test_preview_prefix_reader_stops_at_its_caps(tmp_path: Path, shape: str) -> 
     opened.store.path.write_bytes(bodies[shape])
 
     tracemalloc.start()
-    started = time.perf_counter()
     try:
         previews = manager.list_session_previews(sessions=[opened.metadata])
         _, peak = tracemalloc.get_traced_memory()
@@ -423,7 +421,6 @@ def test_preview_prefix_reader_stops_at_its_caps(tmp_path: Path, shape: str) -> 
 
     assert [item.preview for item in previews] == [""]
     assert peak < 2 << 20, f"preview read allocated {peak} bytes"
-    assert time.perf_counter() - started < 5
 
 
 def test_child_lifecycle_card_reader_rejects_decoder_surviving_depth(

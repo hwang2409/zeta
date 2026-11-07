@@ -6,7 +6,7 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser,
 # and to 1255 for viewed-session history wiring in the existing TUI modules.
 # Bumped to 1277 for the persistent detached writer merged in PR #676.
-MAX_FILE_LINES = 1277
+MAX_FILE_LINES = 1255
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.
