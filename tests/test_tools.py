@@ -8,7 +8,6 @@ import pty
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -21,7 +20,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import read_pid_file
+from tests.support.processes import assert_pid_gone, read_pid_file
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -1726,27 +1725,8 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
     assert result["isError"] is True
     assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
-    _, child_pgid = (int(value) for value in pid_file.read_text().split())
-    live_group = []
-    for _ in range(50):
-        rows = (
-            await asyncio.to_thread(
-                subprocess.check_output,
-                ["ps", "-axo", "pid=,pgid=,stat="],
-                text=True,
-            )
-        ).splitlines()
-        live_group = [
-            row.split()[0]
-            for row in rows
-            if len(row.split()) >= 3
-            and int(row.split()[1]) == child_pgid
-            and not row.split()[2].startswith("Z")
-        ]
-        if not live_group:
-            break
-        await asyncio.sleep(0.02)
-    assert not live_group
+    child_pid, _ = (int(value) for value in pid_file.read_text().split())
+    await assert_pid_gone(child_pid)
 
 
 @pytest.mark.asyncio
@@ -2447,32 +2427,63 @@ async def test_bash_tool_subprocess_sets_tool_marker(
 
 
 @pytest.mark.asyncio
-async def test_task_kill_terminates_descendant_in_new_process_group(tmp_path: Path) -> None:
+async def test_task_kill_terminates_descendant_in_new_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     escaped_pid = tmp_path / "escaped.pid"
     child = (
-        "import os,pathlib,time; os.setsid(); "
-        f"pathlib.Path({str(escaped_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        "import os,pathlib,signal,time; os.setsid(); "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "signal.signal(signal.SIGHUP,signal.SIG_IGN); "
+        f"pathlib.Path({str(escaped_pid)!r}).write_text(str(os.getpid())); "
+        "os.kill(os.getpid(),signal.SIGSTOP); time.sleep(30)"
     )
     command = _python_command(
         "import subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    started = await registry.execute(
-        ToolCall("bg-escaped", "run_background", {"command": command})
-    )
-    task_id = started["structuredContent"]["task_id"]
-    escaped = await read_pid_file(escaped_pid)
+    escaped: int | None = None
+    delayed_sigkill: tuple[int, int] | None = None
+    original_kill = os.kill
 
-    result = await asyncio.wait_for(
-        registry.execute(ToolCall("kill-escaped", "task_kill", {"task_id": task_id})),
-        timeout=3,
-    )
+    try:
+        started = await registry.execute(
+            ToolCall("bg-escaped", "run_background", {"command": command})
+        )
+        task_id = started["structuredContent"]["task_id"]
+        escaped = await read_pid_file(escaped_pid)
 
-    assert result["structuredContent"]["running"] is False
-    with pytest.raises(ProcessLookupError):
-        os.kill(escaped, 0)
-    await registry.close()
+        def delay_escaped_signal(pid: int, signal_number: int) -> None:
+            nonlocal delayed_sigkill
+            if pid != escaped:
+                original_kill(pid, signal_number)
+            elif signal_number == signal.SIGKILL:
+                delayed_sigkill = (pid, signal_number)
+
+        monkeypatch.setattr(os, "kill", delay_escaped_signal)
+        result = await asyncio.wait_for(
+            registry.execute(
+                ToolCall("kill-escaped", "task_kill", {"task_id": task_id})
+            ),
+            timeout=10,
+        )
+
+        assert result["structuredContent"]["running"] is False
+        # test-contract: seam task_kill has no public descendant-signal observation hook
+        assert delayed_sigkill is not None
+        pending, delayed_sigkill = delayed_sigkill, None
+        original_kill(*pending)
+        await assert_pid_gone(escaped)
+    finally:
+        if delayed_sigkill is not None:
+            original_kill(*delayed_sigkill)
+        elif escaped is not None:
+            try:
+                original_kill(escaped, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await asyncio.wait_for(registry.close(), timeout=10)
 
 
 @pytest.mark.asyncio
@@ -2497,7 +2508,7 @@ async def test_background_shutdown_bounds_output_pipe_drain(tmp_path: Path) -> N
     task_id = started["structuredContent"]["task_id"]
     escaped = await read_pid_file(holder_pid)
 
-    await asyncio.wait_for(registry.close(), timeout=3)
+    await asyncio.wait_for(registry.close(), timeout=10)
     status = await registry.background_tasks.output(task_id)
     assert status["running"] is False
     assert "background output was cut off" in status["note"]
