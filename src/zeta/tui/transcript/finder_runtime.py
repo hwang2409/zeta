@@ -17,6 +17,8 @@ class FinderRuntimeTarget(Protocol):
     @property
     def finder_active(self) -> bool: ...
 
+    def open_finder(self, *args: Any) -> Any: ...
+
     async def build_finder_candidate_batches(
         self, request: Any
     ) -> AsyncIterator[tuple[Any, bool]]: ...
@@ -53,12 +55,14 @@ class FinderRuntimeMixin:
 
     def _finder_open(self) -> None:
         self._active_finder = self._viewed_transcript()
-        request = self._active_finder.open_finder()
+        finder = self._active_finder
+        request = finder.open_finder()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
         self._active_finder = self._history_finder
-        request = self._history_finder.open_finder(buffer)
+        finder = self._history_finder
+        request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
 
     def _start_finder_preparation(self, request: Any) -> None:

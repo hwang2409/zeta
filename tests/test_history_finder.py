@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
@@ -24,6 +27,45 @@ def test_finders_implement_the_runtime_interface() -> None:
             finder.__name__,
             required - set(dir(finder)),
         )
+
+
+def test_runtime_finder_attributes_are_in_the_protocol() -> None:
+    runtime_path = (
+        Path(__file__).parents[1]
+        / "src/zeta/tui/transcript/finder_runtime.py"
+    )
+    tree = ast.parse(runtime_path.read_text())
+    runtime_attributes: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        value = node.value
+        is_finder = isinstance(value, ast.Name) and value.id == "finder"
+        is_finder_target = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "self"
+            and value.func.attr == "_finder_target"
+        )
+        is_active_finder = (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+            and value.attr in {"_active_finder", "_history_finder"}
+        )
+        if is_finder or is_finder_target or is_active_finder:
+            runtime_attributes.add(node.attr)
+
+    protocol_attributes = {
+        name for name in vars(FinderRuntimeTarget) if not name.startswith("_")
+    }
+    missing = runtime_attributes - protocol_attributes
+    assert not missing, (
+        f"missing finder method(s) {sorted(missing)}; "
+        "add them to FinderRuntimeTarget"
+    )
 
 
 def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> HistoryFinder:
