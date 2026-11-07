@@ -60,9 +60,7 @@ class IncrementalValidationMixin:
                 time.sleep(0.0001)
             self._record_active_entry(entry)
 
-    def _accept_incremental_entries(
-        self, entries: list[ConversationEntry]
-    ) -> bool:
+    def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
         staged = copy.copy(self)
         staged._entries = list(self._entries)
@@ -113,9 +111,7 @@ class IncrementalValidationMixin:
         self._active_agent_receipts = staged._active_agent_receipts
         self._notification_ids = staged._notification_ids
         self._active_notifications = staged._active_notifications
-        self._active_completion_notifications = (
-            staged._active_completion_notifications
-        )
+        self._active_completion_notifications = staged._active_completion_notifications
         self._active_notification_presentations = (
             staged._active_notification_presentations
         )
@@ -166,7 +162,10 @@ class IncrementalValidationMixin:
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))
-        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+        if (
+            entry.type == "notification"
+            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+        ):
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)

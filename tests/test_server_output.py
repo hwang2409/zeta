@@ -691,9 +691,7 @@ async def test_overflow_deadline_closes_without_promising_error_frame(
         await server.close()
         for task in tasks:
             task.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
@@ -1075,16 +1073,12 @@ async def test_observer_status_rejects_session_swap_snapshot(
         except TimeoutError:
             release_projection.set()
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
             raise
         if not projection_ready:
             release_projection.set()
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
             pytest.fail("status projection did not start")
         session_b = (
             await _rpc(
@@ -1109,9 +1103,7 @@ async def test_observer_status_rejects_session_swap_snapshot(
         release_projection.set()
         if stale is not None:
             stale.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(stale, return_exceptions=True), 10
-            )
+            await asyncio.wait_for(asyncio.gather(stale, return_exceptions=True), 10)
         controller_writer.close()
         if observer_writer is not None:
             observer_writer.close()
