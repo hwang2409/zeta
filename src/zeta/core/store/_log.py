@@ -868,6 +868,17 @@ class ConversationLogMixin:
             ),
         )
 
+    @staticmethod
+    def _recovery_prefix_for_error(
+        validated_prefix: Callable[[int], ValidatedPrefix] | None,
+        row_offset: int,
+        *,
+        repairable: bool,
+    ) -> ValidatedPrefix | None:
+        if not repairable or validated_prefix is None:
+            return None
+        return validated_prefix(row_offset)
+
     def _iter_physical_rows(
         self: ConversationStore,
         raw: bytes,
@@ -908,10 +919,8 @@ class ConversationLogMixin:
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
-                    validated_prefix=(
-                        validated_prefix(row_offset)
-                        if validated_prefix is not None and index > 0
-                        else None
+                    validated_prefix=self._recovery_prefix_for_error(
+                        validated_prefix, row_offset, repairable=index > 0
                     ),
                 ) from exc
             if not isinstance(value, dict):
@@ -924,10 +933,8 @@ class ConversationLogMixin:
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
-                    validated_prefix=(
-                        validated_prefix(row_offset)
-                        if validated_prefix is not None and index > 0
-                        else None
+                    validated_prefix=self._recovery_prefix_for_error(
+                        validated_prefix, row_offset, repairable=index > 0
                     ),
                 )
             offset += len(line)

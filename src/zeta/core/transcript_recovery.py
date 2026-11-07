@@ -436,24 +436,23 @@ def repair_transcript(
         )
     except BaseException:
         if evidence_published and not active_replaced:
-            try:
-                pending = read_recovery_record(directory_fd, quarantine_id)
-                if pending is not None:
-                    write_json_file(
-                        directory_fd,
-                        state_name,
-                        replace(
-                            pending, state="abandoned", memory_step="not_required"
-                        ).to_dict(),
-                    )
-            except (OSError, TranscriptRecoveryError):
-                pass
+            _abandon_recovery(directory_fd, quarantine_id, state_name)
         raise
     finally:
         os.close(source_fd)
         _unlink_if_present(directory_fd, staged_name)
         if not evidence_published:
             _unlink_if_present(directory_fd, payload_name)
+
+
+def _abandon_recovery(directory_fd: int, quarantine_id: str, state_name: str) -> None:
+    try:
+        pending = read_recovery_record(directory_fd, quarantine_id)
+        if pending is not None:
+            abandoned = replace(pending, state="abandoned", memory_step="not_required")
+            write_json_file(directory_fd, state_name, abandoned.to_dict())
+    except (OSError, TranscriptRecoveryError):
+        pass
 
 
 def read_evidence_manifest(directory_fd: int, quarantine_id: str) -> EvidenceManifest:
@@ -539,21 +538,26 @@ def _read_all_records(
     directory_fd: int, target: RepairTarget
 ) -> tuple[dict[str, EvidenceManifest], dict[str, RecoveryRecord]]:
     names = os.listdir(directory_fd)
-    evidence_names = sorted(
-        name
-        for name in names
-        if name.startswith(_EVIDENCE_PREFIX) and name.endswith(".json")
-    )
-    state_names = sorted(
-        name
-        for name in names
-        if name.startswith(_STATE_PREFIX) and name.endswith(".json")
-    )
+    evidence_names = _recovery_names(names, _EVIDENCE_PREFIX)
+    state_names = _recovery_names(names, _STATE_PREFIX)
     if len(evidence_names) + len(state_names) > _MAX_RECORDS:
         raise TranscriptRecoveryIntegrityError("too many transcript recovery records")
+    manifests = _read_manifests(directory_fd, target, evidence_names)
+    records = _read_recovery_states(directory_fd, target, state_names, manifests)
+    return manifests, records
+
+
+def _recovery_names(names: list[str], prefix: str) -> list[str]:
+    return sorted(
+        name for name in names if name.startswith(prefix) and name.endswith(".json")
+    )
+
+
+def _read_manifests(
+    directory_fd: int, target: RepairTarget, names: list[str]
+) -> dict[str, EvidenceManifest]:
     manifests: dict[str, EvidenceManifest] = {}
-    records: dict[str, RecoveryRecord] = {}
-    for name in evidence_names:
+    for name in names:
         item = parse_evidence_manifest(
             _mapping(_read_record(directory_fd, name), "quarantine manifest")
         )
@@ -565,23 +569,38 @@ def _read_all_records(
         if item.quarantine_id in manifests:
             raise TranscriptRecoveryIntegrityError("duplicate quarantine manifest")
         manifests[item.quarantine_id] = item
-    for name in state_names:
+    return manifests
+
+
+def _read_recovery_states(
+    directory_fd: int,
+    target: RepairTarget,
+    names: list[str],
+    manifests: Mapping[str, EvidenceManifest],
+) -> dict[str, RecoveryRecord]:
+    records: dict[str, RecoveryRecord] = {}
+    for name in names:
         item = parse_recovery_record(
             _mapping(_read_record(directory_fd, name), "recovery record")
         )
         if item.target != target or name != _state_name(item.quarantine_id):
             raise TranscriptRecoveryIntegrityError("recovery record target mismatch")
-        manifest = manifests.get(item.quarantine_id)
-        if manifest is not None and (
-            item.expected_source_digest != manifest.source_digest
-            or item.repaired_digest != manifest.repaired_digest
-            or item.cutoff_sequence != manifest.retained_last_sequence
-        ):
-            raise TranscriptRecoveryIntegrityError("recovery record evidence mismatch")
+        _validate_record_manifest(item, manifests.get(item.quarantine_id))
         if item.quarantine_id in records:
             raise TranscriptRecoveryIntegrityError("duplicate recovery record")
         records[item.quarantine_id] = item
-    return manifests, records
+    return records
+
+
+def _validate_record_manifest(
+    record: RecoveryRecord, manifest: EvidenceManifest | None
+) -> None:
+    if manifest is not None and (
+        record.expected_source_digest != manifest.source_digest
+        or record.repaired_digest != manifest.repaired_digest
+        or record.cutoff_sequence != manifest.retained_last_sequence
+    ):
+        raise TranscriptRecoveryIntegrityError("recovery record evidence mismatch")
 
 
 def _validate_payload(directory_fd: int, manifest: EvidenceManifest) -> None:
