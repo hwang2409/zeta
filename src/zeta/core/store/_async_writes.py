@@ -6,6 +6,7 @@ import asyncio
 import copy
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from ..checkpoints import ConversationIntegrityError
@@ -45,6 +46,21 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 
+class _MutationCancellation:
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.write_started = threading.Event()
+
+    def set(self) -> None:
+        self.cancelled.set()
+
+    def is_set(self) -> bool:
+        return self.cancelled.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.cancelled.wait(timeout)
+
+
 class AsyncDurableWritesMixin:
     """Commit typed mutations off-loop and install only their deltas."""
 
@@ -74,21 +90,21 @@ class AsyncDurableWritesMixin:
                 "resident generation changed before committed delta installation"
             )
         entries = list(copy.deepcopy(delta.entries_to_install))
-        if entries:
+        if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
-            if delta._resident_patch.values:
-                previous = self._entries[-1] if self._entries else None
-                for entry in entries:
-                    expected_seq = previous.seq + 1 if previous is not None else 1
-                    assert entry.seq == expected_seq and entry.id not in self._entry_ids
-                    self._entries.append(entry)
-                    self._entry_ids.add(entry.id)
-                    previous = entry
+            self._entries = entries
+            self._entry_ids = {entry.id for entry in entries}
+        elif entries:
+            self._before_incremental_state_install()
+            if delta._resident_patch.raw_entries:
+                self._entries.extend(entries)
+                self._entry_ids.update(entry.id for entry in entries)
             else:
                 self._install_validated_linear_entries(entries)
                 self._record_client_delivery_entries(entries)
         for field, value in delta._resident_patch.values.items():
-            setattr(self, field, copy.deepcopy(value))
+            if getattr(self, field) == delta._resident_patch.expected[field]:
+                setattr(self, field, copy.deepcopy(value))
         cursor = delta.log_cursor
         self._entry_prefix_digest = cursor.entry_prefix_digest
         self._log_identity = cursor.identity
@@ -106,7 +122,9 @@ class AsyncDurableWritesMixin:
         self._assert_owner_thread()
         with self._mutation_lock:
             delta = execute_mutation(self, command, expected_generation)
-        if delta.entries_to_install:
+        if delta._resident_patch.replace_entries:
+            self._publish_entries_installed("reset")
+        elif delta.entries_to_install:
             self._publish_entries_installed(delta.entries_to_install)
         return delta
 
@@ -117,7 +135,7 @@ class AsyncDurableWritesMixin:
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
-        cancelled_before_write: threading.Event,
+        cancelled_before_write: _MutationCancellation,
     ) -> tuple[CommittedDelta[Any], Any]:
         writer: ConversationStore | None = None
         try:
@@ -128,8 +146,11 @@ class AsyncDurableWritesMixin:
             self._before_committed_mutation()
             if cancelled_before_write.is_set():
                 raise asyncio.CancelledError
+            cancelled_before_write.write_started.set()
             delta = execute_mutation(writer, command, expected_generation)
             return delta, writer.take_persisted_appends()
+        except ConversationGenerationConflict:
+            raise
         except BaseException:
             if writer is not None:
                 writer.close()
@@ -146,7 +167,7 @@ class AsyncDurableWritesMixin:
         self: ConversationStore,
         command: ConversationMutation[Any],
         expected_generation: int,
-        cancelled_before_write: threading.Event,
+        cancelled_before_write: _MutationCancellation,
     ) -> asyncio.Future[Any]:
         with self._durable_write_condition:
             if self._closing or self._closed:
@@ -168,7 +189,9 @@ class AsyncDurableWritesMixin:
 
     @staticmethod
     async def _await_started_worker(
-        worker: asyncio.Future[Any], on_cancel: Callable[[], None] | None = None
+        worker: asyncio.Future[Any],
+        on_cancel: Callable[[], None] | None = None,
+        can_abandon: Callable[[], bool] | None = None,
     ) -> tuple[Any, bool]:
         cancelled = False
         while True:
@@ -178,6 +201,8 @@ class AsyncDurableWritesMixin:
                 cancelled = True
                 if on_cancel is not None:
                     on_cancel()
+                if can_abandon is not None and can_abandon():
+                    raise
                 if worker.done():
                     return worker.result(), cancelled
 
@@ -187,22 +212,33 @@ class AsyncDurableWritesMixin:
         expected_generation: int,
     ) -> CommittedDelta[Any]:
         async with self._async_write_lock:
-            cancelled_before_write = threading.Event()
-            worker = self._start_committed_mutation(
-                command, expected_generation, cancelled_before_write
-            )
-            (delta, receipts), cancelled = await self._await_started_worker(
-                worker, cancelled_before_write.set
-            )
-            with self._durable_write_condition:
-                if not self._closing and not self._closed:
-                    self._install_committed_delta(delta)
-                self._accept_persisted_appends(receipts)
-            if delta.entries_to_install:
-                self._publish_prepared_entries_installed(delta.entries_to_install)
-            if cancelled:
-                raise asyncio.CancelledError
-            return delta
+            return await self._commit_async_unlocked(command, expected_generation)
+
+    async def _commit_async_unlocked(
+        self: ConversationStore,
+        command: ConversationMutation[Any],
+        expected_generation: int,
+    ) -> CommittedDelta[Any]:
+        cancelled_before_write = _MutationCancellation()
+        worker = self._start_committed_mutation(
+            command, expected_generation, cancelled_before_write
+        )
+        (delta, receipts), cancelled = await self._await_started_worker(
+            worker,
+            cancelled_before_write.set,
+            lambda: not cancelled_before_write.write_started.is_set(),
+        )
+        with self._durable_write_condition:
+            if not self._closing and not self._closed:
+                self._install_committed_delta(delta)
+            self._accept_persisted_appends(receipts)
+        if delta._resident_patch.replace_entries:
+            self._publish_entries_installed("reset")
+        elif delta.entries_to_install:
+            self._publish_prepared_entries_installed(delta.entries_to_install)
+        if cancelled:
+            raise asyncio.CancelledError
+        return delta
 
     async def _commit_method_async(
         self: ConversationStore,
@@ -222,29 +258,49 @@ class AsyncDurableWritesMixin:
         _method_accepts_store: bool | None = None,
         **kwargs: Any,
     ) -> Any:
-        is_bound_method = getattr(method, "__self__", None) is not None
-        unbound = getattr(method, "__func__", method)
-        command = _MethodMutation(
-            method=unbound,
-            method_accepts_store=(
-                is_bound_method
-                if _method_accepts_store is None
-                else _method_accepts_store
-            ),
-            args=args,
-            kwargs=kwargs,
-            patch_fields=_patch_fields,
-            persisted_callback=_on_persisted,
-            accept_external_generation=_accept_external_generation,
-        )
-        try:
-            delta = await self.commit_async(command, self.conversation_generation)
-        except ConversationGenerationConflict:
-            if _accept_external_generation:
-                raise
-            await self._refresh_off_loop()
-            delta = await self.commit_async(command, self.conversation_generation)
-        return delta.result
+        async with self._async_write_lock:
+            is_bound_method = getattr(method, "__self__", None) is not None
+            unbound = getattr(method, "__func__", method)
+            command = _MethodMutation(
+                method=unbound,
+                method_accepts_store=(
+                    is_bound_method
+                    if _method_accepts_store is None
+                    else _method_accepts_store
+                ),
+                args=args,
+                kwargs=kwargs,
+                patch_fields=_patch_fields,
+                persisted_callback=_on_persisted,
+                accept_external_generation=_accept_external_generation,
+                baseline_count=len(self._entries),
+                baseline_digest=self._entry_prefix_digest,
+                baseline_patch={
+                    field: copy.deepcopy(getattr(self, field))
+                    for field in _patch_fields
+                },
+            )
+            resident_generation = self.conversation_generation
+            try:
+                delta = await self._commit_async_unlocked(command, resident_generation)
+            except ConversationGenerationConflict:
+                if _accept_external_generation:
+                    raise
+                if self.conversation_generation != resident_generation:
+                    command = replace(
+                        command,
+                        baseline_count=len(self._entries),
+                        baseline_digest=self._entry_prefix_digest,
+                        baseline_patch={
+                            field: copy.deepcopy(getattr(self, field))
+                            for field in command.patch_fields
+                        },
+                    )
+                command = replace(command, accept_external_generation=True)
+                delta = await self._commit_async_unlocked(
+                    command, self.conversation_generation
+                )
+            return delta.result
 
     async def _refresh_off_loop(self: ConversationStore) -> None:
         await self._commit_method_async(

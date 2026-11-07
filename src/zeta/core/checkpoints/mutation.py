@@ -69,6 +69,9 @@ class CommittedLogCursor:
 @dataclass(frozen=True, slots=True)
 class _ResidentPatch:
     values: Mapping[str, object]
+    expected: Mapping[str, object]
+    replace_entries: bool = False
+    raw_entries: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +130,9 @@ class _MethodMutation[ResultT]:
     patch_fields: tuple[str, ...] = ()
     persisted_callback: Callable[[], None] | None = None
     accept_external_generation: bool = False
+    baseline_count: int | None = None
+    baseline_digest: bytes | None = None
+    baseline_patch: Mapping[str, object] | None = None
 
 
 _TARGETS_LOCK = threading.RLock()
@@ -262,7 +268,7 @@ def _execute_append[ResultT](
                     generation_after=generation_before,
                     committed_entries=copy.deepcopy(committed),
                     entries_to_install=(),
-                    _resident_patch=_ResidentPatch({}),
+                    _resident_patch=_ResidentPatch({}, {}),
                     result=command.result,
                     log_cursor=_cursor(store),
                     dedupe_key=key,
@@ -329,7 +335,7 @@ def _execute_append[ResultT](
             generation_after=generation_after,
             committed_entries=committed,
             entries_to_install=committed,
-            _resident_patch=_ResidentPatch({}),
+            _resident_patch=_ResidentPatch({}, {}),
             result=command.result,
             log_cursor=_cursor(store),
             dedupe_key=key,
@@ -349,9 +355,21 @@ def _execute_method[ResultT](
         raise ConversationGenerationConflict(
             expected_generation, store.conversation_generation
         )
-    baseline_count = len(store._entries)
-    baseline_digest = store._entry_prefix_digest
-    before_patch = _snapshot_patch(store, command.patch_fields)
+    baseline_count = (
+        len(store._entries)
+        if command.baseline_count is None
+        else command.baseline_count
+    )
+    baseline_digest = (
+        store._entry_prefix_digest
+        if command.baseline_digest is None
+        else command.baseline_digest
+    )
+    baseline_patch = (
+        _snapshot_patch(store, command.patch_fields)
+        if command.baseline_patch is None
+        else command.baseline_patch
+    )
     result = (
         command.method(store, *command.args, **dict(command.kwargs))
         if command.method_accepts_store
@@ -366,21 +384,23 @@ def _execute_method[ResultT](
         if command.accept_external_generation
         else store._owned_installed_delta(tuple(store._entries[baseline_count:]))
     )
-    if entries == "reset":
-        raise ConversationIntegrityError(
-            "typed mutation produced a nonlinear transcript"
-        )
+    replace_entries = entries == "reset"
+    if replace_entries:
+        entries = tuple(store._entries)
     changed_patch = {
         field: copy.deepcopy(getattr(store, field))
-        for field, old in before_patch.items()
-        if command.accept_external_generation or getattr(store, field) != old
+        for field, old in baseline_patch.items()
+        if getattr(store, field) != old
     }
+    expected_patch = {field: baseline_patch[field] for field in changed_patch}
     return CommittedDelta(
         generation_before=expected_generation,
         generation_after=store.conversation_generation,
         committed_entries=copy.deepcopy(entries),
         entries_to_install=copy.deepcopy(entries),
-        _resident_patch=_ResidentPatch(changed_patch),
+        _resident_patch=_ResidentPatch(
+            changed_patch, expected_patch, replace_entries, True
+        ),
         result=result,
         log_cursor=_cursor(store),
         dedupe_key=None,
