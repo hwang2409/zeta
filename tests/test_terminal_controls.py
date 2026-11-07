@@ -2,6 +2,8 @@ import random
 import re
 import sys
 
+from rich.text import Text
+
 from zeta.tui.cards.base import UNSAFE_CONTROL_RE, safe_text, strip_terminal_controls
 
 # Reference: the implementation before the clean-text fast path, kept verbatim.
@@ -106,11 +108,29 @@ def test_safe_text_clean_card_lines_skip_ansi_parser(monkeypatch) -> None:
     assert calls == 0
 
 
-def test_safe_text_preserves_ansi_card_output() -> None:
-    rendered = safe_text("\x1b[31mfailed\x1b[0m", style="body")
-
-    assert rendered.plain == strip_terminal_controls("\x1b[31mfailed\x1b[0m")
-    assert rendered.style == "body"
+def test_safe_text_matches_ansi_decoder_for_card_text_corpus() -> None:
+    values = (
+        "plain",
+        "\x1b[31mfailed\x1b[0m",
+        "carriage\rreturn",
+        "windows\r\nline",
+        "trailing\n",
+        "vertical\x0btab\x0cform",
+        "record\x1cseparator\x1dseparator\x1eseparator",
+        "next\x85line\u2028line\u2029line",
+        "tabs\tand unicode 漢字",
+        "",
+    )
+    for value in values:
+        for wrap in (False, True):
+            actual = safe_text(value, style="body", wrap=wrap)
+            expected = Text.from_ansi(
+                strip_terminal_controls(value),
+                style="body",
+                overflow="fold" if wrap else "ellipsis",
+                no_wrap=not wrap,
+            )
+            assert actual == expected, (repr(value), wrap)
 
 
 def test_clean_text_skips_the_character_loop() -> None:
