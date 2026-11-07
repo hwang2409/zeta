@@ -405,7 +405,6 @@ class AgentLoop(
         reason: Literal["abort", "disconnect", "turn_end", "failed"],
     ) -> int:
         return self.store.drop_client_steering(reason)
-
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
