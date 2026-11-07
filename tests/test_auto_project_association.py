@@ -296,12 +296,15 @@ def test_git_discovery_timeout_is_bounded_and_warns(
     from zeta.core import project_context
 
     timeouts: list[float] = []
+    clock_values = iter((100.0, 100.0))
 
     def time_out(command: list[str], *args: object, **kwargs: object):
         timeout = float(kwargs["timeout"])
         timeouts.append(timeout)
         raise subprocess.TimeoutExpired(command, timeout)
 
+    # test-contract: seam no public project-discovery clock injection exists
+    monkeypatch.setattr(project_context, "_monotonic", lambda: next(clock_values))
     # test-contract: latency project discovery must use one bounded git deadline
     monkeypatch.setattr(project_context.subprocess, "run", time_out)
     plain = tmp_path / "plain"
