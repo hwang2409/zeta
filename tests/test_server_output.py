@@ -227,7 +227,7 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
             claim_attempted.set()
         original_claim(connection, role, protocol_version, features)
 
-    # test-contract: seam hold real disconnect cleanup before registry release
+    # test-contract: seam hold real disconnect cleanup after physical release
     monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
     # test-contract: seam observe raw transport writes around the replacement fence
     monkeypatch.setattr(_Client, "_write_physical", gated_write)

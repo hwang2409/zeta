@@ -356,6 +356,7 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._controller_release: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
@@ -367,6 +368,7 @@ class _Client:
             while True:
                 line = await self._read_frame()
                 if not line:
+                    self._release_dead_connection()
                     break
                 await self.connections.wait_until_settled(self)
                 try:
@@ -489,16 +491,24 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
+    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+        if self._controller_release is not None:
+            return self._controller_release
+        if self.role == "controller" and self.connections.is_controller(self):
+            self._controller_release = self.server.control.begin_controller_release(
+                reconnect="approval_reconnect" in self.features
+            )
+        return self._controller_release
+
+    def _release_dead_connection(self) -> None:
+        self._begin_controller_release()
+        self.connections.release(self)
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
-            release = None
-            if self.role == "controller" and self.connections.is_controller(self):
-                release = self.server.control.begin_controller_release(
-                    reconnect="approval_reconnect" in self.features
-                )
-            self.connections.release(self)
+            release = self._begin_controller_release()
             if release is not None:
                 await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
@@ -506,6 +516,7 @@ class _Client:
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.connections.release(self)
             self._closed = True
 
     async def _route_request(
