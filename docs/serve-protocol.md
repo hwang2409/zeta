@@ -1328,8 +1328,11 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
-`/vim`. Runnable user commands also include prompt macros
+`/inbox`, `/init`, `/memory`, `/model`, `/project`, `/project-instructions`,
+`/status`, and `/vim`. `/project` shows the current association, and `/project
+init` discovers the working directory and associates the session. The mutating
+form is rejected while a turn, child, or approval is active. Runnable user
+commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
 plus skills. Argless `/model` reports the current model, while `/model <name>`
 dispatches server-side through the shared settings-apply path. TUI-owned

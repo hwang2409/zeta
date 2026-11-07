@@ -12,7 +12,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -25,6 +25,7 @@ from ...core.session_files import (
     write_session_file,
 )
 from ...storage_format import WriterLease
+from . import process_output
 from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
@@ -41,6 +42,7 @@ from .background_task_types import (
     BackgroundTaskNoticeSinkValue,
     BackgroundTaskShutdownNotice,
     TaskExitInput,
+    _BackgroundRecord,
 )
 from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
@@ -55,36 +57,6 @@ BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 BACKGROUND_OUTPUT_DRAIN_TIMEOUT = 0.25
 OUTPUT_CUTOFF_NOTE = "background output was cut off because a process outside the task still held its output"
-
-
-@dataclass(slots=True)
-class _BackgroundRecord:
-    task_id: str
-    command: str
-    pid: int
-    process: asyncio.subprocess.Process | None = None
-    stdin: asyncio.StreamWriter | None = None
-    stdin_lock: asyncio.Lock | None = None
-    stdin_closed: bool = False
-    output: bytearray | None = None
-    total_bytes: int = 0
-    total_lines: int = 0
-    base_cursor: int = 0
-    started_at: float | None = None
-    ended_at: float | None = None
-    running: bool = True
-    exit_code: int | None = None
-    note: str | None = None
-    log_path: str | None = None
-    remove_log_on_archive: bool = False
-    log_fd: int | None = None
-    storage_lock: asyncio.Lock | None = None
-    notify_on_exit: bool = True
-    owner: str = "run_background"
-    terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (
-        None
-    )
-    monitor: asyncio.Task[None] | None = None
 
 
 class BackgroundTaskRegistry:
@@ -121,7 +93,7 @@ class BackgroundTaskRegistry:
         self.command_niceness = command_niceness
         self._notice_sink = notice_sink
         self._notification_sink = notification_sink
-        self._pending_recovery: dict[str, str] = {}
+        self._pending_recovery: dict[str, TaskExitInput] = {}
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
@@ -143,7 +115,7 @@ class BackgroundTaskRegistry:
         self._task_start_generation = 0
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
-        self._closing_for_shutdown = False
+        self._shutdown_cause: str | None = None
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
@@ -209,17 +181,7 @@ class BackgroundTaskRegistry:
         self._notification_sink = sink
         if sink is None:
             return ()
-        recovered = tuple(
-            TaskExitInput(
-                task_id=task_id,
-                command=command_headline(command),
-                exit_code=None,
-                note="exit not observed (zeta restarted)",
-            )
-            for task_id, command in self._pending_recovery.items()
-        )
-        self._pending_recovery.clear()
-        return recovered
+        return tuple(self._pending_recovery.values())
 
     def bind_session_dir(
         self,
@@ -559,23 +521,21 @@ class BackgroundTaskRegistry:
                 "retry": False,
             }
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self, cause: str = "session shutdown") -> None:
         """Mark cancellations caused by session teardown as shutdown kills."""
+        self._shutdown_cause = self._shutdown_cause or cause
 
-        self._closing_for_shutdown = True
-
-    async def kill(self, task_id: str) -> dict[str, Any]:
+    async def kill(self, task_id: str, *, cause: str, tui_presented: bool = False) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
             phase: Literal["task_kill", "session_shutdown"] = (
-                "session_shutdown" if self._closing_for_shutdown else "task_kill"
+                "session_shutdown" if self._shutdown_cause else "task_kill"
             )
             await self._terminate(
                 record,
-                reason="task killed on session exit"
-                if phase == "session_shutdown"
-                else "task killed",
+                reason=self._shutdown_cause or cause,
                 phase=phase,
+                tui_presented=tui_presented,
             )
         return self._status(record)
 
@@ -650,13 +610,9 @@ class BackgroundTaskRegistry:
             ]
             records = [record for record, _ in entries]
             killed = [record.task_id for record in records]
-            # Whole-session and child-completion shutdown kills silently; callers
-            # surface the ids (child receipt) instead. Prepare every record before
-            # signaling so that monitors cannot emit notifications during shutdown.
-            for record in records:
-                record.notify_on_exit = False
-                record.terminal_phase = "session_shutdown"
-                record.note = "task killed on session exit"
+            notified_records = [record for record in records if record.notify_on_exit]
+            if records:
+                await finish(self._prepare_shutdown_records(records))
             await finish(
                 asyncio.gather(*(self._close_stdin(record) for record in records))
             )
@@ -728,6 +684,9 @@ class BackgroundTaskRegistry:
             )
             async with self._transition_lock:
                 await self._commit_notice(shutdown_notice)
+            for record in notified_records:
+                record.notify_on_exit = True
+                await finish(self._notify_terminal_exit(record))
             if self._start_cleanup_error is not None:
                 raise self._start_cleanup_error
             self._closing = False
@@ -746,6 +705,15 @@ class BackgroundTaskRegistry:
         if cancelled:
             raise asyncio.CancelledError
         return shutdown_result
+
+    async def _prepare_shutdown_records(self, records: Sequence[_BackgroundRecord]) -> None:
+        async with self._transition_lock:
+            for record in records:
+                record.receipt_pending = record.notify_on_exit
+                record.notify_on_exit = False
+                record.terminal_phase = "task_kill"
+                record.note = self._shutdown_cause or "background task registry closed"
+            await self._commit_notice(None)
 
     def _close_storage(self) -> None:
         self.release_directory()
@@ -893,6 +861,7 @@ class BackgroundTaskRegistry:
                 exit_code=exit_code,
                 ended_at=time.monotonic(),
                 process=None,
+                receipt_pending=record.receipt_pending or record.notify_on_exit,
                 terminal_phase=record.terminal_phase or "natural_exit",
             )
             rows = self._persistence_rows(
@@ -902,8 +871,7 @@ class BackgroundTaskRegistry:
                 )
             )
             notice = BackgroundTaskNotice(
-                f"background task {record.task_id} exited ({candidate.exit_code}): "
-                f"{command_headline(record.command)}",
+                process_output.task_exit_headline(record.task_id, candidate.exit_code, record.command, candidate.note),
                 record.task_id,
                 candidate.terminal_phase,
                 record.owner,
@@ -929,6 +897,7 @@ class BackgroundTaskRegistry:
         record.exit_code = candidate.exit_code
         record.ended_at = candidate.ended_at
         record.process = candidate.process
+        record.receipt_pending = candidate.receipt_pending
         record.terminal_phase = candidate.terminal_phase
 
     async def _retry_pending_terminals(self) -> None:
@@ -1009,14 +978,21 @@ class BackgroundTaskRegistry:
         *,
         reason: str,
         phase: Literal["task_kill", "session_shutdown"],
+        tui_presented: bool,
     ) -> None:
-        process = record.process
-        if process is None:
-            return
-        # Set the phase before signaling: the monitor commonly wins the race to
-        # finalize the record and must preserve the initiating lifecycle event.
-        record.terminal_phase = phase
-        record.note = reason
+        async with self._transition_lock:
+            process = record.process
+            if process is None or not record.running:
+                return
+            previous = record.terminal_phase, record.note, record.tui_presented
+            record.terminal_phase, record.note, record.tui_presented = (
+                phase, reason, tui_presented
+            )
+            try:
+                await self._commit_notice(None)
+            except Exception:
+                record.terminal_phase, record.note, record.tui_presented = previous
+                raise
         await _terminate_process(
             process, self.term_grace, close_stdin=lambda: self._close_stdin(record)
         )
@@ -1109,6 +1085,7 @@ class BackgroundTaskRegistry:
             record.note,
             owner=record.owner,
             phase=record.terminal_phase or "natural_exit",
+            tui_presented=record.tui_presented,
         )
 
     async def _notify_exit(
@@ -1122,21 +1099,37 @@ class BackgroundTaskRegistry:
         *,
         owner: str = "run_background",
         phase: str = "natural_exit",
+        tui_presented: bool = False,
     ) -> None:
         if self._notification_sink is None:
             return
-        await self._notification_sink(
-            TaskExitInput(
-                task_id=task_id,
-                command=command_headline(command),
-                exit_code=exit_code,
-                output_tail=output_tail,
-                log_path=str(log_path) if log_path is not None else None,
-                note=note,
-                owner=owner,
-                phase=phase,
-            )
+        item = TaskExitInput(
+            task_id=task_id,
+            command=command_headline(command),
+            exit_code=exit_code,
+            output_tail=output_tail,
+            log_path=str(log_path) if log_path is not None else None,
+            note=note,
+            owner=owner,
+            phase=phase,
+            tui_presented=tui_presented,
         )
+        try:
+            await self._notification_sink(item)
+        except ValueError as exc:
+            if str(exc) != "session store is closed":
+                raise
+            return
+        record = self._records.get(task_id)
+        if record is not None and record.receipt_pending:
+            async with self._transition_lock:
+                record.receipt_pending = False
+                try:
+                    await self._commit_notice(None)
+                except BaseException:
+                    record.receipt_pending = True
+                    raise
+        self._pending_recovery.pop(task_id, None)
 
     def _load_previous(self) -> None:
         if self._directory_fd is None:
@@ -1167,7 +1160,12 @@ class BackgroundTaskRegistry:
                 continue
             was_running = row.get("running") is True
             archived_length = self._archived_lengths.get(task_id, 0)
-            self._records[task_id] = _BackgroundRecord(
+            note = row.get("note")
+            phase = row.get("terminal_phase")
+            receipt_pending = row.get("receipt_pending") is True
+            tui_presented = row.get("tui_presented") is True
+            owner = row.get("owner")
+            record = _BackgroundRecord(
                 task_id=task_id,
                 command=command,
                 pid=pid,
@@ -1178,11 +1176,31 @@ class BackgroundTaskRegistry:
                 exit_code=row.get("exit_code")
                 if type(row.get("exit_code")) is int
                 else None,
-                note="task exited when the previous session ended",
+                note=note if type(note) is str else "task exited when the previous session ended",
+                receipt_pending=receipt_pending,
+                tui_presented=tui_presented,
+                owner=owner if type(owner) is str else "run_background",
+                terminal_phase=phase if phase in {"natural_exit", "task_kill", "session_shutdown"} else None,
                 storage_lock=asyncio.Lock(),
             )
+            self._records[task_id] = record
             if was_running:
-                self._pending_recovery[task_id] = command
+                self._pending_recovery[task_id] = TaskExitInput(
+                    task_id=task_id,
+                    command=command_headline(command),
+                    exit_code=None,
+                    note="exit not observed (zeta restarted)",
+                )
+            elif receipt_pending:
+                self._pending_recovery[task_id] = TaskExitInput(
+                    task_id=task_id,
+                    command=command_headline(command),
+                    exit_code=record.exit_code,
+                    note=record.note,
+                    owner=record.owner,
+                    phase=record.terminal_phase or "natural_exit",
+                    tui_presented=record.tui_presented,
+                )
 
     async def _commit_notice(
         self, notice: BackgroundTaskNoticeSinkValue | None
@@ -1209,20 +1227,14 @@ class BackgroundTaskRegistry:
         if cancelled:
             raise asyncio.CancelledError
 
-    def _persistence_rows(
-        self, records: Sequence[_BackgroundRecord] | None = None
-    ) -> tuple[dict[str, object], ...]:
+    def _persistence_rows(self, records: Sequence[_BackgroundRecord] | None = None) -> tuple[dict[str, object], ...]:
         return tuple(
-            {
-                "task_id": record.task_id,
-                "command": record.command,
-                "pid": record.pid,
-                "running": record.running,
-                "exit_code": record.exit_code,
-                "started_at": record.started_at,
-                "ended_at": record.ended_at,
-            }
-            for record in (self._records.values() if records is None else records)
+            {"task_id": r.task_id, "command": r.command, "pid": r.pid,
+             "running": r.running, "exit_code": r.exit_code, "started_at": r.started_at,
+             "ended_at": r.ended_at, "note": r.note, "terminal_phase": r.terminal_phase,
+             "receipt_pending": r.receipt_pending, "tui_presented": r.tui_presented,
+             "owner": r.owner}
+            for r in (self._records.values() if records is None else records)
         )
 
     def _persist(self, rows: Sequence[dict[str, object]] | None = None) -> None:
