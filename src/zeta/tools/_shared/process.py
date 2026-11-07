@@ -255,8 +255,8 @@ class BackgroundTaskRegistry:
         command: str,
         cwd: str | Path,
         *,
-        cwd_fd: int | None = None, log_path: str | Path | None = None,
-        log_handle: IO[bytes] | None = None,
+        cwd_fd: int | None = None,
+        log_path: str | Path | None = None,
         notify_on_exit: bool = True,
         owner: str = "run_background",
         environment: Mapping[str, str] | None = None,
@@ -269,7 +269,8 @@ class BackgroundTaskRegistry:
             return await self._start(
                 command,
                 cwd,
-                cwd_fd=cwd_fd, log_path=log_path, log_handle=log_handle,
+                cwd_fd=cwd_fd,
+                log_path=log_path,
                 notify_on_exit=notify_on_exit,
                 owner=owner,
                 environment=environment,
@@ -288,8 +289,8 @@ class BackgroundTaskRegistry:
         command: str,
         cwd: str | Path,
         *,
-        cwd_fd: int | None, log_path: str | Path | None,
-        log_handle: IO[bytes] | None,
+        cwd_fd: int | None,
+        log_path: str | Path | None,
         notify_on_exit: bool,
         owner: str,
         environment: Mapping[str, str] | None,
@@ -299,11 +300,12 @@ class BackgroundTaskRegistry:
             Path(log_path) if log_path is not None else self._default_log_path(task_id)
         )
         with ExitStack() as cleanup:
-            if log_handle is None:
-                opener = (lambda: self._open_task_log(task_id)) if log_path is None else (
-                    lambda: self.open_log(effective_log_path)
-                )
-                log_handle = await open_log_off_loop(opener)
+            opener = (
+                (lambda: self._open_task_log(task_id))
+                if log_path is None
+                else (lambda: self.open_log(effective_log_path))
+            )
+            log_handle = await open_log_off_loop(opener)
             log_handle = cleanup.enter_context(log_handle)
             self._require_open()
             try:

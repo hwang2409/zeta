@@ -16,7 +16,7 @@ from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
 from .._shared.background_spawn import _kill_and_reap
-from .._shared.log_open import open_log_off_loop
+from .._shared.log_open import create_log_off_loop, open_log_off_loop
 from .._shared.process import (
     create_subprocess_shell_in_fd,
     spawn_background,
@@ -183,32 +183,25 @@ async def _bash(
         raise ValueError(f"max_output must be an integer from 1 to {MAX_OUTPUT_BYTES}")
     log_path = arguments.get("_log_path")
     shell_command = _extract_command(arguments)
-    log_handle = (
-        await open_log_off_loop(lambda: registry.background_tasks.open_log(log_path))
-        if log_path is not None
-        else None
-    )
     if arguments.get("_background") is True:
+        if log_path is not None:
+            await create_log_off_loop(
+                lambda: registry.background_tasks.open_log(log_path)
+            )
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
-        try:
-            start_cwd, cwd_fd = await bind_shell_cwd_async(
-                registry, arguments.get("cwd"), approved_cwd
-            )
-            owned_log, log_handle = log_handle, None
-            task_id, pid = await registry.background_tasks.start(
-                shell_command,
-                start_cwd,
-                cwd_fd=cwd_fd,
-                log_path=log_path,
-                log_handle=owned_log,
-                notify_on_exit=False,
-                owner="background_macro",
-                environment=_shell_environment(execution_context, start_cwd),
-            )
-        finally:
-            if log_handle is not None:
-                log_handle.close()
+        start_cwd, cwd_fd = await bind_shell_cwd_async(
+            registry, arguments.get("cwd"), approved_cwd
+        )
+        task_id, pid = await registry.background_tasks.start(
+            shell_command,
+            start_cwd,
+            cwd_fd=cwd_fd,
+            log_path=log_path,
+            notify_on_exit=False,
+            owner="background_macro",
+            environment=_shell_environment(execution_context, start_cwd),
+        )
         message = f"background task {task_id} started (pid {pid})"
         return _success_result(
             text_block(message),
@@ -221,6 +214,11 @@ async def _bash(
             },
         )
 
+    log_handle = (
+        await open_log_off_loop(lambda: registry.background_tasks.open_log(log_path))
+        if log_path is not None
+        else None
+    )
     try:
         start_cwd, cwd_fd = await bind_shell_cwd_async(
             registry, arguments.get("cwd"), approved_cwd

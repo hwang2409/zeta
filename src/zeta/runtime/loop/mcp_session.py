@@ -58,7 +58,7 @@ class MCPSession:
             return
         if (
             self._mcp_management.project_dir == self.tool_registry.cwd
-            and not self.tool_registry.cwd.is_dir()
+            and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
         ):
             self._mcp_management.project_dir = None
         if self._mcp_mount_task is None:
