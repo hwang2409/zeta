@@ -89,6 +89,7 @@ if os.environ.get("ZETA_BENCH_TREE") != str(TREE_SRC):
     os.execve(sys.executable, [sys.executable, *sys.argv], env)
 
 from sandbox import (
+    CP_CLONE,
     STUB_MODEL,
     STUB_PROVIDER,
     Sandbox,
@@ -139,7 +140,7 @@ def conversation_stats(session: Path) -> tuple[int, int]:
 def clone(source: Path, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / source.name
-    subprocess.run(["cp", "-cR", str(source), str(target)], check=True)
+    subprocess.run([*CP_CLONE, str(source), str(target)], check=True)
     return target
 
 
@@ -149,9 +150,7 @@ def make_home(path: Path, sessions: list[Path]) -> Path:
     advance(path, expected_epoch=0)
     for name in ("AGENTS.md", "skills", "agents"):
         if (SOURCE_HOME / name).exists():
-            subprocess.run(
-                ["cp", "-cR", str(SOURCE_HOME / name), str(path / name)], check=True
-            )
+            clone(SOURCE_HOME / name, path)
     # No mcp.json: MCP servers would be real external processes.
     (path / "settings.toml").write_text(
         'theme = "gruvbox-dark"\ntoken_budget = 400000\n\n[agents]\nexplicit_finish = true\n'

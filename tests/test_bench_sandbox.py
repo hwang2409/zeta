@@ -203,7 +203,7 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
     assert {
         "outside": [line for line in lines if line != "loopback connect"],
         "reached_loopback": "loopback connect" in lines,
-    } == {"outside": [], "reached_loopback": True}
+    } == {"outside": [], "reached_loopback": True}, stderr
     assert returncode == 0, stderr
     assert run is not None
     decoder, text, results = json.JSONDecoder(), run.stdout, {}

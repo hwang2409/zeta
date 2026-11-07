@@ -33,6 +33,8 @@ STUB_MODEL = "bench-stub"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 CREDENTIAL_MARKERS = ("ANTHROPIC", "OPENAI", "CLAUDE", "CODEX")
 CREDENTIAL_SUFFIXES = ("API_KEY", "_TOKEN", "_SECRET", "PASSWORD")
+# Copy-on-write clone on APFS; GNU cp reads -c as --preserve=context and fails.
+CP_CLONE = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-R"]
 
 # Runs in-process (exec) and in every child (as sitecustomize). Any connect or name
 # lookup to a non-local host, or a keychain read, is logged and refused, so no

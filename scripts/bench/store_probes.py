@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from sandbox import (
+    CP_CLONE,
     STUB_MODEL,
     STUB_PROVIDER,
     Sandbox,
@@ -398,13 +399,13 @@ def make_home(name: str, fraction: float = 1.0) -> tuple[Path, str]:
 
 def _clone_session(source: Path, home: Path, fraction: float) -> str:
     target = home / "sessions" / source.name
-    subprocess.run(["cp", "-cR", str(source), str(target)], check=True)
+    subprocess.run([*CP_CLONE, str(source), str(target)], check=True)
     # Metadata comes from the copy, never the live source.
     project_id = pin_stub_provider(target).get("project_id")
     if project_id:
         project = Path.home() / ".zeta/projects" / project_id
         subprocess.run(
-            ["cp", "-cR", str(project), str(home / "projects" / project_id)],
+            [*CP_CLONE, str(project), str(home / "projects" / project_id)],
             check=True,
         )
     conversation = target / "conversation.jsonl"
