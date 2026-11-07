@@ -1537,6 +1537,7 @@ def test_quarantine_handles_max_length_filename(
     invalid_name = "x" * 255
     (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
 
+    # test-contract: seam Fix scan order to exercise the invalid-name boundary.
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",
@@ -1583,6 +1584,7 @@ def test_transient_read_error_keeps_intent_and_retries(
 
     # Fix the scan order so the test proves that the transient failure stops the
     # pass before a later, otherwise valid intent can be published.
+    # test-contract: seam Fix scan order at the production scanner boundary.
     monkeypatch.setattr(
         session_links,
         "_scan_pending_entries",

@@ -336,7 +336,8 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         prepare_calls += 1
         if index == 0:
             prepare_entered.set()
-            prepare_release.wait()
+            if not prepare_release.wait(30):
+                raise TimeoutError("project-context prepare was not released")
         try:
             return original_load(**kwargs)
         finally:
@@ -374,7 +375,9 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         assert "RECOVERED-SKILL" in fourth_prompt
         assert "RECOVERED-MEMORY" not in fourth_prompt
         prepare_release.set()
-        await asyncio.to_thread(prepare_done[0].wait)
+        assert await asyncio.wait_for(
+            asyncio.to_thread(prepare_done[0].wait), timeout=30
+        )
 
         await turn("fifth")
         for index in range(3):
@@ -407,9 +410,11 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
 
         def held_close_projection(operation):
             close_read_entered.set()
-            close_read_release.wait()
+            if not close_read_release.wait(30):
+                raise TimeoutError("project-context close read was not released")
             return original_close_projection(operation)
 
+        # test-contract: seam Hold the production projection read during close.
         monkeypatch.setattr(
             closing_app.loop.project_registry,
             "_read_context_projection",
@@ -417,7 +422,9 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         )
         await _collect_turn(closing_app.loop, "close")
         close_task = asyncio.create_task(closing_app.close())
-        await asyncio.to_thread(close_read_entered.wait)
+        assert await asyncio.wait_for(
+            asyncio.to_thread(close_read_entered.wait), timeout=30
+        )
         # test-contract: seam Prove close joins the held projection read.
         assert not close_task.done()
         close_read_release.set()

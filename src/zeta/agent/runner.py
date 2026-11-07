@@ -47,7 +47,6 @@ from .budget import child_depth as next_agent_depth
 from .child_context import (
     _child_base_system_prompt,
     _compose_child_project_context,
-    _compose_child_system_prompt,  # noqa: F401 - retained test seam
     _load_child_project_context,
 )
 from .conversation_channel import has_follow_up_loop

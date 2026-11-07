@@ -16,7 +16,12 @@ from ..core.session import env_home
 from ..path_identity import same_physical_path
 from ..project_context.projection import ProjectContextProjection
 from ..protocol.types import Message, MessageRole, TextContent
-from ..runtime.prompt import RuntimePrompt
+from ..runtime.prompt import (
+    PromptFragment,
+    RuntimePrompt,
+    owned_fragment,
+    replace_owned_fragment,
+)
 from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry
 from .presets import AgentPreset, compose_system_prompt
@@ -104,12 +109,12 @@ def _child_base_system_prompt(
             projected.system_prompt, projected.prompt_components
         )
         replacement = (
-            projected_prompt.owned_fragment("project_memory")
+            owned_fragment(projected_prompt, "project_memory")
             if "project_memory" in projected.prompt_components
-            else ""
+            else PromptFragment("", {})
         )
-        runtime_prompt = runtime_prompt.replace_component(
-            "project_memory", replacement
+        runtime_prompt = replace_owned_fragment(
+            runtime_prompt, "project_memory", replacement
         )
         prompt = runtime_prompt.system_prompt
     components = (

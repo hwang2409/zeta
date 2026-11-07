@@ -36,6 +36,7 @@ from zeta.agent.background import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.child_context import _compose_child_system_prompt
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.finish_gate import (
     FinishGateControl,
@@ -47,10 +48,7 @@ from zeta.agent.presets import (
     GENERAL_PRESET,
     AgentPreset,
 )
-from zeta.agent.runner import (
-    _child_base_system_prompt,
-    _compose_child_system_prompt,
-)
+from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -85,6 +83,7 @@ from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import cleanup_transport
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
+from zeta.runtime.prompt import RuntimePrompt
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
@@ -11606,6 +11605,83 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
     assert any("repository AGENTS.md" in notice for notice in context.notices) is (ignored_project == "project-b")
     backend.release_child.set()
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_same_cwd_child_starts_with_owned_project_memory(
+    tmp_path: Path,
+) -> None:
+    from zeta.core.project_context import load_project_context
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "zeta-home"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.find_or_create_for_directory(workspace)
+    registry._replace_entry_kind(project.project_id, "state", "PROJECT MEMORY")
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        session_project=project,
+        cwd_project=project,
+        inbox_enabled=False,
+    )
+    assert "project_memory" in context.prompt_components
+    store = ConversationStore(tmp_path / "sessions", cwd=workspace)
+    tools = ToolRegistry(
+        workspace,
+        project_id=project.project_id,
+        project_registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    backend = BackgroundBackend(
+        [
+            ToolCall(
+                "child-1",
+                "agent",
+                {
+                    "prompt": "inspect the task",
+                    "description": "same project child",
+                    "background": True,
+                },
+            )
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=tools,
+        max_turns=1,
+        runtime_prompt=RuntimePrompt(
+            context.system_prompt,
+            context.prompt_components,
+        ),
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project.project_id,
+        project_registry=registry,
+    )
+    loop.set_mcp_scope(home=home, project_dir=workspace)
+    loop._runtime_prompt = RuntimePrompt(
+        context.system_prompt, context.prompt_components
+    )
+
+    try:
+        events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        result = next(
+            event.tool_result.content
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_result is not None
+            and event.tool_result.tool_call_id == "child-1"
+        )
+        assert "agent error" not in result
+        await asyncio.wait_for(backend.child_started.wait(), timeout=10)
+    finally:
+        backend.release_child.set()
+        await loop.close()
 
 
 @pytest.mark.asyncio
