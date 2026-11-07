@@ -16,13 +16,7 @@ import pytest
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.core.session_files import atomic_publish_file
 from zeta.core.slash import create_slash_registry
-from zeta.mcp.management import ManagedServer
-from zeta.mcp.oauth_store import (
-    MCPOAuthToken,
-    delete_token,
-    save_token,
-    token_store_path,
-)
+from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_path
 from zeta.memory.reconciliation_state import ReconciliationState
 from zeta.project_inbox import (
     SENT_HISTORY_LIMIT,
@@ -35,7 +29,6 @@ from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.storage_format import CLOSED_VARIANTS, SetValue, open_writer
-from zeta.tui.cards.mcp_manager import MCPManager
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -291,7 +284,8 @@ def test_account_registry_preserves_unknown_root_fields(tmp_path: Path) -> None:
     assert _read(registry)["future-field"] == {"kept": True}
 
 
-def test_mcp_oauth_token_preserves_unknown_fields(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_mcp_oauth_token_preserves_unknown_fields(tmp_path: Path) -> None:
     token = MCPOAuthToken(
         access_token="first",
         refresh_token="refresh",
@@ -306,13 +300,14 @@ def test_mcp_oauth_token_preserves_unknown_fields(tmp_path: Path) -> None:
         redirect_uri="http://127.0.0.1/callback",
         resource="https://example.test/resource",
     )
-    save_token("server", token, home=tmp_path)
+    store = MCPCredentialStore(home=tmp_path)
+    await store.save_login("server", token)
     path = token_store_path("server", tmp_path)
     value = _read(path)
     value["future-field"] = {"kept": True}
     _write(path, value)
 
-    save_token("server", token, home=tmp_path)
+    await store.save_login("server", token)
 
     assert _read(path)["future-field"] == {"kept": True}
 
@@ -336,7 +331,8 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
         redirect_uri="http://127.0.0.1/callback",
         resource="https://example.test/resource",
     )
-    save_token("server", token, home=tmp_path)
+    store = MCPCredentialStore(home=tmp_path)
+    asyncio.run(store.save_login("server", token))
     entered = threading.Event()
     release = threading.Event()
     original_replace = oauth_store.os.replace
@@ -349,7 +345,7 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
 
     monkeypatch.setattr(oauth_store.os, "replace", paused_replace)
     refresh = threading.Thread(
-        target=save_token, args=("server", token), kwargs={"home": tmp_path}
+        target=asyncio.run, args=(store.save_login("server", token),)
     )
     refresh.start()
     entered.wait()
@@ -357,7 +353,7 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
 
     def logout() -> None:
         logout_started.set()
-        delete_token("server", home=tmp_path)
+        asyncio.run(store.delete("server"))
 
     logout_thread = threading.Thread(target=logout)
     logout_thread.start()
@@ -369,7 +365,7 @@ def test_mcp_oauth_logout_during_refresh_leaves_no_token(
     refresh.join()
     logout_thread.join()
 
-    assert not token_store_path("server", tmp_path).exists()
+    assert asyncio.run(store.load("server")).token is None
 
 
 def test_project_and_account_keyed_records_preserve_future_records(
@@ -682,27 +678,23 @@ async def test_tui_project_dispatch_reads_storage_off_loop(
 
 
 @pytest.mark.asyncio
-async def test_mcp_manager_logout_runs_off_loop() -> None:
+async def test_mcp_credential_logout_runs_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     loop_thread = threading.get_ident()
     calls: list[int] = []
-    server = ManagedServer(
-        name="server",
-        scope="user",
-        config={"transport": "streamable-http"},
-        enabled=True,
-        trusted=True,
-    )
+    store = MCPCredentialStore(home=tmp_path)
+    original = store._delete_transaction
 
-    class ManagementStub:
-        def list(self, *, scope: str = "effective") -> list[ManagedServer]:
-            del scope
-            return [server]
+    def observed_delete(name: str):
+        calls.append(threading.get_ident())
+        return original(name)
 
-        def logout(self, name: str, *, scope: str) -> None:
-            assert (name, scope) == ("server", "user")
-            calls.append(threading.get_ident())
+    # test-contract: seam observes the public delete interface at its transaction
+    monkeypatch.setattr(store, "_delete_transaction", observed_delete)
 
-    assert await MCPManager(ManagementStub()).dispatch("o") == "logged out"  # type: ignore[arg-type]
+    await store.delete("server")
+
     assert len(calls) == 1
     assert calls[0] != loop_thread
 

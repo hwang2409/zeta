@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import httpx
 
 from .config import RESERVED_AUTHORIZATION_PARAMS
-from .oauth_store import MCPOAuthToken, save_token
+from .oauth_store import MCPOAuthToken
 
 logger = logging.getLogger(__name__)
 
@@ -747,7 +747,6 @@ async def authorize(
     *,
     server_name: str,
     server_url: str,
-    home: str | None = None,
     client_id: str | None = None,
     client_secret: str | None = None,
     callback_port: int = 0,
@@ -760,7 +759,7 @@ async def authorize(
     browser_opener: BrowserOpener | None = None,
     listen_timeout: float = OAUTH_LISTEN_TIMEOUT_SECONDS,
 ) -> MCPOAuthToken:
-    """Drive the full browser flow and persist the resulting token."""
+    """Drive the full browser flow and return the resulting token candidate."""
 
     owns_client = http_client is None
     if http_client is None:
@@ -813,7 +812,7 @@ async def authorize(
         else:
             opener = browser_opener or _default_browser_opener
             try:
-                opener(url)
+                await asyncio.to_thread(opener, url)
             except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
                 logger.warning(
                     "MCP OAuth: browser opener failed for %s: %s", server_name, exc
@@ -847,7 +846,6 @@ async def authorize(
             redirect_uri=redirect_uri,
             resource=resource_meta.resource,
         )
-        await asyncio.to_thread(save_token, server_name, token, home=home)
         return token
     finally:
         if listener is not None:

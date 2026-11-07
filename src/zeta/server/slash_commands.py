@@ -52,6 +52,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "inbox",
         "init",
         "memory",
+        "mcp",
         "model",
         "project",
         "project-instructions",
@@ -294,6 +295,11 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
+
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
+        if self._runtime.loop is None:
+            raise RuntimeError(_UNAVAILABLE_NOTICE)
+        return await self._runtime.loop.slash_mcp(args)
 
     async def slash_inbox(self, args: str) -> str:
         if args.strip():
