@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import CompletionBackend, Message, StreamEvent
-from ...providers.completion import CompletionControl, CompletionRun
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -92,8 +91,8 @@ class SessionRequestAdmission:
         backend: CompletionBackend,
         request: AdmittedSessionRequest,
         *,
-        control: CompletionControl,
-    ) -> CompletionRun:
+        control: Any,
+    ) -> Any:
         """Dispatch only an admitted request and record its exact estimate."""
 
         self._begin_attempt(request.messages, request.estimated_tokens)
@@ -111,7 +110,7 @@ class SessionRequestAdmission:
         messages: Sequence[Message],
         tool_schemas: Sequence[Mapping[str, Any]],
         *,
-        control: CompletionControl,
+        control: Any,
     ) -> AsyncIterator[StreamEvent]:
         """Admit and dispatch one compaction request through this object."""
 

@@ -385,7 +385,7 @@ async def test_public_migration_end_to_end_with_real_content(
         + "\n"
     )
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         return json.dumps(
             {
                 "operations": [
@@ -631,7 +631,7 @@ async def test_inflight_format_one_reconciliation_during_migration(
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str, budget) -> str:
         provider_started.set()
         await release_provider.wait()
         return json.dumps(
@@ -1072,7 +1072,7 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             + "\n"
         )
 
-        async def invoke(prompt: str) -> str:
+        async def invoke(prompt: str, budget) -> str:
             expected = json.loads(
                 prompt.split("Current digest: ", 1)[1].splitlines()[0]
             )

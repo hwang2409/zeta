@@ -329,7 +329,12 @@ class IteratorProviderAttempt:
             await asyncio.gather(self._producer, return_exceptions=True)
         close = getattr(self._source, "aclose", None)
         if close is not None:
-            await close()
+            try:
+                await close()
+            except asyncio.CancelledError as error:
+                if self._producer_error is not None:
+                    raise error from self._producer_error
+                raise
         if (
             self._producer_error is not None
             and not self._error_delivered
@@ -774,8 +779,12 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await attempt.aclose()
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
+            if primary_error is not None and is_control_exception(cleanup_error):
+                raise cleanup_error from primary_error
             if primary is not None and primary_error is None:
                 if is_control_exception(cleanup_error):
+                    cleanup_error.__cause__ = primary
+                    cleanup_error.__context__ = primary
                     raise
             else:
                 selected = merge_exception(primary_error, cleanup_error)
