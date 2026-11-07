@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.processes import assert_pid_gone
 from zeta.tools._shared import tool_spawn
 from zeta.tools._shared.tool_spawn import create_tool_subprocess_shell
 
@@ -116,8 +117,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
         )
 
     assert child_pid is not None
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    await assert_pid_gone(child_pid)
     with pytest.raises(ChildProcessError):
         await asyncio.to_thread(os.waitpid, child_pid, os.WNOHANG)
     assert len(os.listdir("/dev/fd")) == baseline_fds
