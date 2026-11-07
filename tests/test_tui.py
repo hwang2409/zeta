@@ -6627,6 +6627,63 @@ async def test_status_card_wraps_complete_project_context_health(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("width", [40, 80, 160])
+async def test_status_card_wraps_long_path_at_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    path = "/Users/henry/zeta/wrap-word-boundary/long-token"
+    status = SlashStatus(
+        session_id="status-wrap",
+        provider="codex",
+        model="offline",
+        retained_tail=0,
+        tokens_used_this_session=0,
+        tokens_in_current_context=None,
+        compaction_marker_count=0,
+        pending_approvals=(),
+        context_files=(path,),
+    )
+    monkeypatch.setattr(app, "slash_status", lambda: status)
+
+    try:
+        app.slash_status_command("")
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        rendered_lines = [
+            "".join(screen.data_buffer[row][column].char for column in range(width)).rstrip()
+            for row in range(60)
+        ]
+        path_lines = [
+            line.strip(" │")
+            for line in rendered_lines
+            if any(part in line for part in ("Users", "projects", "zeta", "worktrees", "long-token"))
+        ]
+
+        assert path_lines
+        assert "long-token" in "".join(path_lines)
+        if width == 40:
+            assert path_lines[0] == "context_files: /Users/henry/zeta/"
+        else:
+            assert path_lines == [f"context_files: {path}"]
+        assert all(cell_len(line) <= width for line in rendered_lines)
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
 async def test_status_card_renders_viewed_session_transcript_index_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
