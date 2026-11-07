@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Collection
-from contextlib import contextmanager, suppress
+from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
@@ -10424,51 +10424,89 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
 
 
 @pytest.mark.asyncio
-async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failure", ["oserror", "cancelled"])
+async def test_delegated_history_failure_orders_exact_child_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    target = tmp_path / "input.txt"
-    target.write_text("approved")
-    call = ToolCall("backpressured-call", "read", {"path": str(target)})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
-    )
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer = await _ready(server)
-    write_started = asyncio.Event()
-    release_write = asyncio.Event()
-    controller = server.connections.controller_metadata()
-    assert controller is not None
-    connection = controller.connection
-    original_write = connection._write_physical
-    original_notify = server.control._notify
-    tool_end_started = asyncio.Event()
+    async with AsyncExitStack() as cleanup:
+        target = tmp_path / "forced-input.txt"
+        target.write_text("data")
+        agent = ToolCall(
+            "forced-agent",
+            "agent",
+            {"prompt": "read", "description": "child", "background": True},
+        )
+        child_call = ToolCall("forced-history-call", "read", {"path": str(target)})
+        backend = DelegatedApprovalBackend(agent, child_call, child_prompt="read")
+        server = ZetaServer(
+            provider="codex",
+            home=tmp_path,
+            socket_path=_socket_path(tmp_path),
+            backend_factory=lambda provider, model, home: (backend, model or "offline"),
+        )
+        history_started = asyncio.Event()
+        history_release = asyncio.Event()
+        child_notify_started = asyncio.Event()
+        terminal_order_waiting = asyncio.Event()
+        cleanup.callback(history_release.set)
+        original_append = ConversationStore.append_approval_history_async
 
-    async def gated_write(payload: bytes) -> bool:
-        frame = json.loads(payload)
-        if frame.get("params", {}).get("event") == "approval_end":
-            write_started.set()
-            await asyncio.wait_for(release_write.wait(), timeout=10)
-        return await original_write(payload)
+        async def gated_history(self, payload):
+            if payload.get("event") == "approval_end":
+                history_started.set()
+                await asyncio.wait_for(history_release.wait(), timeout=10)
+                if failure == "oserror":
+                    raise OSError("forced delegated history failure")
+            return await original_append(self, payload)
 
-    async def record_tool_end(event, *args, **kwargs):
-        if event == "tool_end":
-            tool_end_started.set()
-        return await original_notify(event, *args, **kwargs)
+        # test-contract: seam the durable store has no deterministic failure hook
+        monkeypatch.setattr(
+            ConversationStore, "append_approval_history_async", gated_history
+        )
+        original_notify = server.control._notify
 
-    # test-contract: seam the transport has no public physical-write backpressure hook
-    monkeypatch.setattr(connection, "_write_physical", gated_write)
-    # test-contract: seam wire output cannot expose an admitted frame behind backpressure
-    monkeypatch.setattr(server.control, "_notify", record_tool_end)
-    frames: list[dict[str, Any]] = []
-    try:
-        await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
+        async def observe_child_notify(event, session_id=None, **fields):
+            tool_call = fields.get("tool_call") or {}
+            if event == "tool_end" and tool_call.get("id") == child_call.id:
+                child_notify_started.set()
+            return await original_notify(event, session_id, **fields)
+
+        # test-contract: seam no public event exposes controller admission order
+        monkeypatch.setattr(server.control, "_notify", observe_child_notify)
+        original_order = getattr(
+            server.control._approvals, "wait_for_terminal_order", None
+        )
+        if original_order is not None:
+
+            async def observe_terminal_order(key):
+                terminal_order_waiting.set()
+                await original_order(key)
+
+            monkeypatch.setattr(
+                server.control._approvals,
+                "wait_for_terminal_order",
+                observe_terminal_order,
+            )
+
+        reader, writer = await _ready(server)
+
+        async def close_server() -> None:
+            await asyncio.wait_for(_close(server, writer), timeout=10)
+
+        cleanup.push_async_callback(close_server)
+        frames: list[dict[str, Any]] = []
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        async with asyncio.timeout(10):
+            while True:
+                frame = await _read(reader)
+                frames.append(frame)
+                params = frame.get("params", {})
+                if (
+                    params.get("event") == "approval_request"
+                    and params.get("tool_call", {}).get("id") == child_call.id
+                ):
+                    approval = params
+                    break
         writer.write(
             (
                 json.dumps(
@@ -10483,19 +10521,211 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             ).encode()
         )
         await writer.drain()
-        async with asyncio.timeout(10):
-            await write_started.wait()
-            await tool_end_started.wait()
-            release_write.set()
-            while not _named_events(frames, "turn_end"):
-                frames.append(await _read(reader))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
+        await asyncio.wait_for(history_started.wait(), timeout=10)
+
+        notify_wait = asyncio.create_task(child_notify_started.wait())
+        order_wait = asyncio.create_task(terminal_order_waiting.wait())
+        cleanup.callback(notify_wait.cancel)
+        cleanup.callback(order_wait.cancel)
+        done, pending = await asyncio.wait(
+            {notify_wait, order_wait},
+            timeout=10,
+            return_when=asyncio.FIRST_COMPLETED,
         )
-    finally:
+        assert done, "child terminal did not reach the wire-order seam"
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        settlement = None
+        if failure == "cancelled":
+            record = server.control._approvals.state.records[
+                (approval["agent_instance_id"], child_call.id)
+            ]
+            settlement = record.settlement
+            assert settlement is not None
+            settlement.cancel()
+        history_release.set()
+
+        def owner_position(kind: str, identifier: str | int) -> int | None:
+            for index, frame in enumerate(frames):
+                params = frame.get("params", {})
+                if params.get("event") != kind:
+                    continue
+                if kind == "approval_end" and params.get("request_id") == identifier:
+                    return index
+                if (
+                    kind == "tool_end"
+                    and params.get("tool_call", {}).get("id") == identifier
+                ):
+                    return index
+                if kind == "turn_end" and params.get("data", {}).get("turn") == identifier:
+                    return index
+            return None
+
+        async with asyncio.timeout(10):
+            while any(
+                position is None
+                for position in (
+                    owner_position("approval_end", approval["request_id"]),
+                    owner_position("tool_end", child_call.id),
+                )
+            ):
+                frames.append(await _read(reader))
+        approval_end = owner_position("approval_end", approval["request_id"])
+        tool_end = owner_position("tool_end", child_call.id)
+        assert approval_end is not None
+        assert tool_end is not None
+        assert approval_end < tool_end
+        if settlement is not None:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(settlement, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with AsyncExitStack() as cleanup:
+        target = tmp_path / "input.txt"
+        target.write_text("approved")
+        call = ToolCall("backpressured-call", "read", {"path": str(target)})
+        backend = FakeBackend(
+            [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+        )
+        server = ZetaServer(
+            provider="codex",
+            home=tmp_path,
+            socket_path=_socket_path(tmp_path),
+            backend_factory=lambda provider, model, home: (backend, model or "offline"),
+        )
+        release_write = asyncio.Event()
+        release_settlement = asyncio.Event()
+        cleanup.callback(release_write.set)
+        cleanup.callback(release_settlement.set)
+        reader, writer = await _ready(server)
+
+        async def close_server() -> None:
+            await asyncio.wait_for(_close(server, writer), timeout=10)
+
+        cleanup.push_async_callback(close_server)
+        controller = server.connections.controller_metadata()
+        assert controller is not None
+        connection = controller.connection
+        original_write = connection._write_physical
+        original_notify = server.control._notify
+        original_finish = server.control._approvals._finish_record
+        write_started = asyncio.Event()
+        tool_end_started = asyncio.Event()
+        first_finish_started = asyncio.Event()
+        duplicate_finish_started = asyncio.Event()
+        finish_calls = 0
+
+        async def gated_write(payload: bytes) -> bool:
+            frame = json.loads(payload)
+            if frame.get("params", {}).get("event") == "approval_end":
+                write_started.set()
+                await asyncio.wait_for(release_write.wait(), timeout=10)
+            return await original_write(payload)
+
+        async def record_tool_end(event, *args, **kwargs):
+            if (
+                event == "tool_end"
+                and (kwargs.get("tool_call") or {}).get("id") == call.id
+            ):
+                tool_end_started.set()
+            return await original_notify(event, *args, **kwargs)
+
+        async def gate_first_finish(record, resolution):
+            nonlocal finish_calls
+            finish_calls += 1
+            if finish_calls == 1:
+                first_finish_started.set()
+                await asyncio.wait_for(release_settlement.wait(), timeout=10)
+            else:
+                duplicate_finish_started.set()
+            await original_finish(record, resolution)
+
+        # test-contract: seam the transport has no public physical-write backpressure hook
+        monkeypatch.setattr(connection, "_write_physical", gated_write)
+        # test-contract: seam wire output cannot expose an admitted frame behind backpressure
+        monkeypatch.setattr(server.control, "_notify", record_tool_end)
+        # test-contract: seam settlement ownership has no public scheduling hook
+        monkeypatch.setattr(
+            server.control._approvals, "_finish_record", gate_first_finish
+        )
+        frames = await _request(reader, writer, 3, "send", {"text": "read it"})
+        async with asyncio.timeout(10):
+            while True:
+                frame = await _read(reader)
+                frames.append(frame)
+                params = frame.get("params", {})
+                if (
+                    params.get("event") == "approval_request"
+                    and params.get("tool_call", {}).get("id") == call.id
+                ):
+                    approval = params
+                    break
+        turn_start = next(
+            frame["params"]
+            for frame in reversed(frames)
+            if frame.get("params", {}).get("event") == "turn_start"
+        )
+        turn_id = turn_start["data"]["turn"]
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "deny",
+                        "params": {"request_id": approval["request_id"]},
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(first_finish_started.wait(), timeout=10)
+        await asyncio.wait_for(duplicate_finish_started.wait(), timeout=10)
+        release_settlement.set()
+        await asyncio.wait_for(write_started.wait(), timeout=10)
+        tool_wait = asyncio.create_task(tool_end_started.wait())
+        cleanup.callback(tool_wait.cancel)
+        done, _ = await asyncio.wait({tool_wait}, timeout=10)
+        assert done, "tool_end waited for the approval_end transport write"
         release_write.set()
-        await _close(server, writer)
+
+        def owner_position(kind: str, identifier: str | int) -> int | None:
+            for index, frame in enumerate(frames):
+                params = frame.get("params", {})
+                if params.get("event") != kind:
+                    continue
+                if kind == "approval_end" and params.get("request_id") == identifier:
+                    return index
+                if (
+                    kind == "tool_end"
+                    and params.get("tool_call", {}).get("id") == identifier
+                ):
+                    return index
+                if kind == "turn_end" and params.get("data", {}).get("turn") == identifier:
+                    return index
+            return None
+
+        async with asyncio.timeout(10):
+            while any(
+                position is None
+                for position in (
+                    owner_position("approval_end", approval["request_id"]),
+                    owner_position("tool_end", call.id),
+                    owner_position("turn_end", turn_id),
+                )
+            ):
+                frames.append(await _read(reader))
+        approval_end = owner_position("approval_end", approval["request_id"])
+        tool_end = owner_position("tool_end", call.id)
+        turn_end = owner_position("turn_end", turn_id)
+        assert approval_end is not None
+        assert tool_end is not None
+        assert turn_end is not None
+        assert approval_end < tool_end < turn_end
