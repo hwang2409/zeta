@@ -80,7 +80,7 @@ def _observe_delegated_registration(
         register_delegated(*args, **kwargs)  # type: ignore[arg-type]
         registered.set()
 
-    # test-contract: signal only after the public delegated request is published.
+    # test-contract: seam no public post-registration readiness event
     monkeypatch.setattr(parent_policy, "register_delegated", publish)
     return registered
 
@@ -531,7 +531,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
 
         asyncio.create_task(publish())
 
-    # test-contract: hold the public delegated publication at a deterministic gate.
+    # test-contract: seam no public registration-publication gate
     monkeypatch.setattr(parent_policy, "register_delegated", publish_after_release)
     execution = asyncio.create_task(registry.execute(call))
     waiting = asyncio.Event()
