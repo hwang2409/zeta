@@ -14,6 +14,7 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
+from ..storage_format import ACCEPTED_KEY_SETS
 from . import (
     RemoteSyncError,
     _append_resume_hint,
@@ -237,6 +238,14 @@ def _project_install_script() -> str:
     if None in {schema_filename, migration_filename, publisher_filename}:
         raise RemoteSyncError("project publication module source is unavailable")
     schema_source = Path(schema_filename).read_text(encoding="utf-8")
+    accepted = sorted(ACCEPTED_KEY_SETS["project_registry_record"])
+    dependency_free_registry = (
+        "\ndef reject_unknown_keys(payload, shape):\n"
+        f"    accepted = {accepted!r} if shape == 'project_registry_record' else None\n"
+        "    if accepted is None or set(payload) - set(accepted):\n"
+        "        raise ValueError(f'unknown keys for {shape}')\n"
+    )
+    schema_source = dependency_free_registry + schema_source
     migration_source = Path(migration_filename).read_text(encoding="utf-8").replace(
         "from __future__ import annotations\n\n", "", 1
     )

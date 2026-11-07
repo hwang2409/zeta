@@ -16,7 +16,7 @@ PROBE_PATHS = ("src/zeta/storage_format.py", "tests/compatibility/storage_probe.
 CLASSIFIER_PREFIXES = ("src/zeta/", "tests/compatibility/", ".github/workflows/", "scripts/")
 CLASSIFIER_FILES = {"pyproject.toml", "uv.lock"}
 
-def _git(*args: str, check: bool = True) -> str:
+def _git(*args: str) -> str:
     return subprocess.check_output(("git", *args), text=True, stderr=subprocess.STDOUT).strip()
 
 def qualifying(commit: str) -> bool:
@@ -79,7 +79,7 @@ def main() -> int:
     if not has_probe(predecessor):
         if any(has_probe(commit) for commit in earlier[1:] if qualifying(commit)):
             raise RuntimeError(f"selected predecessor {predecessor} is missing the compatibility probe")
-        print(f"::notice::bootstrap predecessor {predecessor}: skipped registry comparison and old-writer round trips")
+        print(f"::notice::bootstrap predecessor {predecessor}: registry comparison starts with this predecessor")
         return 0
     with tempfile.TemporaryDirectory(prefix="storage-format-predecessor-") as temporary:
         source = Path(temporary)

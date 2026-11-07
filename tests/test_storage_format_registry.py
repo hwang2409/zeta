@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from zeta.core.store._client_delivery import validate_client_delivery_data
@@ -25,6 +28,24 @@ def _assert_exact(validator, payload: dict[str, object], declared: str, *, requi
                 validator(missing)
 
 
+def test_every_registry_name_has_one_production_owner() -> None:
+    names: dict[str, int] = {name: 0 for name in ACCEPTED_KEY_SETS}
+    for path in Path("src").rglob("*.py"):
+        if path.name in {"storage_format.py", "ssh.py"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in names
+            ):
+                names[node.value] += 1
+    assert all(count == 1 for count in names.values()), {
+        name: count for name, count in names.items() if count != 1
+    }
+
+
 def test_strict_production_validators_are_bound_to_registry() -> None:
     todo = [{"content": "ship", "status": "pending"}]
     parse_todo_items(todo)
@@ -36,47 +57,26 @@ def test_strict_production_validators_are_bound_to_registry() -> None:
     _assert_exact(
         validate_child_idle_notification_data,
         {
-            "origin": "notification",
-            "kind": "child_idle",
-            "child_instance_id": "child",
-            "child_session_path": "/sessions/child",
-            "description": "waiting",
-            "status": "child_idle",
-            "text": "waiting",
-            "ask_parent_question_id": None,
+            "origin": "notification", "kind": "child_idle", "child_instance_id": "child",
+            "child_session_path": "/sessions/child", "description": "waiting",
+            "status": "child_idle", "text": "waiting", "ask_parent_question_id": None,
             "display_only": True,
         },
-        "child_idle_notification",
-        required=False,
+        "child_idle_notification", required=False,
     )
-    _assert_exact(
-        validate_terminal_transition_data,
-        {"action": "cancel"},
-        "response_action",
-    )
+    _assert_exact(validate_terminal_transition_data, {"action": "cancel"}, "response_action")
     _assert_exact(
         validate_terminal_transition_data,
         {"action": "finish", "report": {"status": "done", "summary": "ok"}},
         "response_action_report",
     )
     validate_client_delivery_data(
-        {
-            "delivery_id": "d" * 32,
-            "method": "steer",
-            "status": "queued",
-            "outcome": {"accepted": True},
-        },
+        {"delivery_id": "d" * 32, "method": "steer", "status": "queued", "outcome": {"accepted": True}},
         "session",
     )
     with pytest.raises(ValueError):
         validate_client_delivery_data(
-            {
-                "delivery_id": "d" * 32,
-                "method": "steer",
-                "status": "queued",
-                "outcome": {"accepted": True},
-                "_registry_probe_extra": True,
-            },
+            {"delivery_id": "d" * 32, "method": "steer", "status": "queued", "outcome": {"accepted": True}, "_registry_probe_extra": True},
             "session",
         )
 
