@@ -18,7 +18,7 @@ def __getattr__(name: str):
         module_name, attribute = _LAZY_EXPORTS[name]
     except KeyError:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    value = getattr(import_module(module_name, __name__), attribute)
+    value = getattr(import_module(module_name, __name__), attribute)  # import-boundary: lazy-load one of runtime's declared exports  # fmt: skip
     globals()[name] = value
     return value
 
