@@ -20,10 +20,12 @@ import httpx
 import pytest
 
 from zeta.core.store import ConversationStore
-from zeta.mcp.client import translate_call_result
+from zeta.mcp.client import MCPResourceContent, translate_call_result
+from zeta.mcp.resources import fetch_resource
 from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import _spill as spill_module
 from zeta.tools import fetch as fetch_tool
 from zeta.tools._spill import SpillStore
 
@@ -40,6 +42,12 @@ def _store(tmp_path: Path, name: str = "session") -> ConversationStore:
     return ConversationStore(
         tmp_path / "sessions", session_id=name, cwd=cwd, bash_cwd=cwd
     )
+
+
+async def _next_loop_turn() -> None:
+    resumed = asyncio.Event()
+    asyncio.get_running_loop().call_soon(resumed.set)
+    await asyncio.wait_for(resumed.wait(), 10)
 
 
 class _ByteStream(httpx.AsyncByteStream):
@@ -425,18 +433,13 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         async with fetch_tool._temporary_file(Spills()):
             raise AssertionError("cancelled acquisition yielded a handle")
 
-    async def next_loop_turn() -> None:
-        resumed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(resumed.set)
-        await asyncio.wait_for(resumed.wait(), 10)
-
     task = asyncio.create_task(use_temporary_file())
     try:
         assert await asyncio.to_thread(started.wait, 10)
         task.cancel()
-        await next_loop_turn()
+        await _next_loop_turn()
         task.cancel()
-        await next_loop_turn()
+        await _next_loop_turn()
         release.set()
         assert await asyncio.to_thread(entered.wait, 10)
         with pytest.raises(asyncio.CancelledError):
@@ -834,6 +837,591 @@ async def test_bash_large_output_spills(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_closed_child_spills_are_reclaimed_for_a_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = first.clone_for_session(second_store)
+        first.spills.max_bytes = shared_cap
+        second.spills.max_bytes = shared_cap
+        try:
+            old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
+            await first.close()
+
+            new_path = second.spills.write_bytes("tool", "second", 0, b"b" * 60)
+            total = sum(
+                path.stat().st_size
+                for store in (first, second)
+                if store.spills.root.exists()
+                for path in store.spills.root.iterdir()
+                if not path.name.startswith(".")
+            )
+
+            assert new_path.read_bytes() == b"b" * 60
+            assert not old_path.exists()
+            assert total <= shared_cap
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_tiny_mcp_resources_have_a_bounded_shared_artifact_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    minimum = getattr(spill_module, "SPILL_MIN_ARTIFACT_CHARGE", 4 * 1024)
+    tree_cap = minimum * 4
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", tree_cap, raising=False
+    )
+
+    class TinyResourceClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read_resource(
+            self, uri: str
+        ) -> tuple[MCPResourceContent, ...]:
+            del uri
+            self.calls += 1
+            return (MCPResourceContent(b"x" if self.calls % 2 else b""),)
+
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        client = TinyResourceClient()
+        paths: list[Path] = []
+        try:
+            for index in range(12):
+                attachment = await fetch_resource(
+                    client,  # type: ignore[arg-type]
+                    server="tiny",
+                    uri=f"mcp://tiny/{index}",
+                    spill_store=(first if index % 2 else second).spills,
+                )
+                paths.extend(attachment.spill_paths)
+
+            assert all(not path.exists() for path in paths[:-4])
+            assert all(path.exists() for path in paths[-4:])
+            retained = first.spills.retained_paths() + second.spills.retained_paths()
+            assert len(retained) <= tree_cap // minimum
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_store_reclaim_removes_owner_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    minimum = getattr(spill_module, "SPILL_MIN_ARTIFACT_CHARGE", None)
+    tree_cap = minimum or 1
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", tree_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        try:
+            old_path = first.spills.write_bytes("tool", "old", 0, b"x")
+            sibling_path = second.spills.write_bytes("tool", "sibling", 0, b"y")
+            retained_paths = getattr(first.spills, "retained_paths", None)
+            if retained_paths is None:
+                retained_paths = lambda: tuple(
+                    first.spills.root / name for name in first.spills._retained
+                )
+
+            assert not old_path.exists()
+            assert retained_paths() == ()
+
+            newest_path = first.spills.write_bytes("tool", "new", 0, b"z")
+            assert not sibling_path.exists()
+            assert retained_paths() == (newest_path,)
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+def test_cross_store_reclaim_cannot_deadlock_two_writers(tmp_path: Path) -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    budget = spill_module.SpillByteBudget(max_bytes=minimum * 3)
+    with _store(tmp_path, "first") as first_store, _store(
+        tmp_path, "second"
+    ) as second_store:
+        first = SpillStore(
+            session_dir=first_store.session_dir,
+            directory_fd=first_store.directory_fd,
+            byte_budget=budget,
+        )
+        second = SpillStore(
+            session_dir=second_store.session_dir,
+            directory_fd=second_store.directory_fd,
+            byte_budget=budget,
+        )
+        second.write_bytes("tool", "old-second", 0, b"b")
+        first.write_bytes("tool", "old-first-1", 0, b"a")
+        first.write_bytes("tool", "old-first-2", 0, b"a")
+
+        second_has_lock = threading.Event()
+        resume_second = threading.Event()
+        first_selected_second = threading.Event()
+        resume_first_reclaim = threading.Event()
+        second_selected_first = threading.Event()
+        real_second_write_staged = second._write_staged
+        real_reopen_and_unlink = budget._reopen_and_unlink
+
+        def gated_second_write_staged(*args: object, **kwargs: object) -> None:
+            second_has_lock.set()
+            assert resume_second.wait(timeout=10)
+            real_second_write_staged(*args, **kwargs)  # type: ignore[arg-type]
+
+        def gated_reopen_and_unlink(
+            artifact: spill_module._RetainedArtifact,
+        ) -> None:
+            if artifact.directory == second._directory():
+                first_selected_second.set()
+                assert resume_first_reclaim.wait(timeout=10)
+            elif artifact.directory == first._directory():
+                second_selected_first.set()
+            real_reopen_and_unlink(artifact)
+
+        second._write_staged = gated_second_write_staged  # type: ignore[method-assign]
+        budget._reopen_and_unlink = gated_reopen_and_unlink  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+
+        def write_first() -> None:
+            try:
+                first.write_bytes("tool", "new-first", 0, b"x")
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                failures.append(exc)
+
+        def write_second() -> None:
+            try:
+                second.write_group(
+                    "tool", "new-second", {"0": [b"x"], "1": [b"y"]}
+                )
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                failures.append(exc)
+
+        second_thread = threading.Thread(target=write_second, daemon=True)
+        first_thread = threading.Thread(target=write_first, daemon=True)
+        second_thread.start()
+        assert second_has_lock.wait(timeout=10)
+        first_thread.start()
+        assert first_selected_second.wait(timeout=10)
+        resume_second.set()
+        assert second_selected_first.wait(timeout=10)
+        resume_first_reclaim.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+
+        # The timeout is only a deadlock guard; completion is the behavior under test.
+        finished = not first_thread.is_alive() and not second_thread.is_alive()
+        try:
+            assert finished
+            assert failures == []
+            retained = first.retained_paths() + second.retained_paths()
+            expected = sum(
+                max(path.stat().st_size, minimum) for path in retained if path.exists()
+            )
+            assert budget._used_bytes == expected <= budget.max_bytes
+        finally:
+            if finished:
+                first.close()
+                second.close()
+
+
+@pytest.mark.asyncio
+async def test_read_after_cross_store_reclaim_reports_artifact_gone_and_repairs_view(
+    tmp_path: Path,
+) -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            tool_allow=["read"],
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        budget = first.spills._byte_budget
+        budget.max_bytes = minimum
+        victim = first.spills.write_bytes("tool", "victim", 0, b"victim")
+        reader_fd = first.spills.open_read(victim)
+        reclaim_unlinked = threading.Event()
+        release_reclaim = threading.Event()
+        real_forget = budget.forget
+        reclaim_thread_id: list[int] = []
+
+        def gated_forget(
+            directory: spill_module._SpillDirectory, name: str
+        ) -> None:
+            if name == victim.name and not reclaim_thread_id:
+                reclaim_thread_id.append(threading.get_ident())
+                reclaim_unlinked.set()
+                assert release_reclaim.wait(timeout=10)
+            real_forget(directory, name)
+
+        budget.forget = gated_forget  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+
+        def reclaim() -> None:
+            try:
+                second.spills.write_bytes("tool", "replacement", 0, b"new")
+            except (AssertionError, OSError, RuntimeError, ValueError) as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=reclaim)
+        thread.start()
+        try:
+            assert reclaim_unlinked.wait(timeout=10)
+            assert not victim.exists()
+            assert os.read(reader_fd, 6) == b"victim"
+            assert first.spills.retained_paths() == (victim,)
+
+            result = await first.execute(
+                ToolCall("read-gone", "read", {"path": str(victim)})
+            )
+
+            assert result["isError"] is True
+            assert "spill artifact is gone" in result["content"][0]["text"]
+            assert first.spills.retained_paths() == ()
+        finally:
+            os.close(reader_fd)
+            release_reclaim.set()
+            thread.join(timeout=10)
+            await second.close()
+            await first.close()
+            await root.close()
+        assert not thread.is_alive()
+        assert failures == []
+        assert budget._used_bytes == minimum
+
+
+@pytest.mark.asyncio
+async def test_child_spills_share_one_root_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE + 50
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+        second.spills.max_bytes = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+        try:
+            old_path = first.spills.write_bytes("tool", "duplicate", 0, b"a" * 100)
+            sibling_path = second.spills.write_bytes(
+                "tool", "duplicate", 0, b"a" * 100
+            )
+            assert not old_path.exists()
+
+            newest_path = first.spills.write_bytes("tool", "new", 0, b"c" * 100)
+            assert not sibling_path.exists()
+            second.spills.reserve_transient(50)
+            second.spills.reserve_transient(1)
+            second.spills.release_transient(51)
+            assert not newest_path.exists()
+
+            def broken_parts() -> Iterator[bytes]:
+                yield b"x" * 50
+                raise OSError("source failed")
+
+            with pytest.raises(OSError, match="source failed"):
+                second.spills.write_parts("tool", "broken", 0, broken_parts())
+            other_path = second.spills.write_bytes("tool", "other", 0, b"d" * 50)
+            assert other_path.read_bytes() == b"d" * 50
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_call_limit_reservations_reclaim_retained_spills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call_limit = 64
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE + call_limit
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="retained-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as retained_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-call",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_call_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-call",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_call_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        retained = root.clone_for_session(retained_store)
+        first_call = root.clone_for_session(first_call_store)
+        second_call = root.clone_for_session(second_call_store)
+        retained.spills.max_bytes = 100
+        retained_path = retained.spills.write_bytes(
+            "tool", "retained", 0, b"r" * 100
+        )
+        ready = threading.Barrier(3)
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        def reserve_call(registry: ToolRegistry) -> None:
+            try:
+                registry.spills.reserve_transient(call_limit)
+                ready.wait(timeout=30)
+                assert release.wait(timeout=30)
+                registry.spills.release_transient(call_limit)
+            except (
+                AssertionError,
+                RuntimeError,
+                ValueError,
+                threading.BrokenBarrierError,
+            ) as exc:
+                failures.append(exc)
+                ready.abort()
+
+        threads = [
+            threading.Thread(target=reserve_call, args=(registry,))
+            for registry in (first_call, second_call)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            ready.wait(timeout=30)
+            assert failures == []
+            assert not retained_path.exists()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=30)
+            await second_call.close()
+            await first_call.close()
+            await retained.close()
+            await root.close()
+        assert not any(thread.is_alive() for thread in threads)
+        assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_transient_bytes_alone_raise_typed_shared_spill_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", 100, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.configure_transient_limit(100)
+        second.spills.configure_transient_limit(100)
+        try:
+            first.spills.reserve_transient(60)
+            with pytest.raises(RuntimeError, match="spill budget is full") as error:
+                second.spills.reserve_transient(41)
+            assert type(error.value).__name__ == "SpillFullError"
+            first.spills.release_transient(60)
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_reclaimed_file_returns_its_charge_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = shared_cap
+        second.spills.max_bytes = shared_cap
+        try:
+            missing = first.spills.write_bytes("tool", "missing", 0, b"a" * 100)
+            missing.unlink()
+            live = second.spills.write_bytes("tool", "live", 0, b"b" * 100)
+
+            first.spills.configure_transient_limit(shared_cap)
+            first.spills.reserve_transient(shared_cap)
+            assert not live.exists()
+            first.spills.release_transient(shared_cap)
+            assert second.spills.write_bytes(
+                "tool", "after", 0, b"c" * 100
+            ).read_bytes() == b"c" * 100
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_large_result_spills(tmp_path: Path) -> None:
     value = "mcp" * 20_000
     with _store(tmp_path) as store:
@@ -971,6 +1559,56 @@ async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
                     await write
             holder.join(timeout=10)
             spill.close()
+
+
+@pytest.mark.asyncio
+async def test_async_spill_double_cancel_joins_worker_before_close() -> None:
+    minimum = spill_module.SPILL_MIN_ARTIFACT_CHARGE
+    budget = spill_module.SpillByteBudget(max_bytes=minimum)
+    spill = SpillStore(byte_budget=budget)
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class GatedPart:
+        def __init__(self) -> None:
+            self._read = False
+
+        def seek(self, _offset: int) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            read_started.set()
+            assert release_read.wait(timeout=10)
+            return b"complete"
+
+    write = asyncio.create_task(spill.awrite_parts("async", "call", 0, [GatedPart()]))
+    try:
+        assert await asyncio.to_thread(read_started.wait, 10)
+        write.cancel()
+        await _next_loop_turn()
+        write.cancel()
+        await _next_loop_turn()
+
+        assert not write.done()
+        release_read.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(write, timeout=10)
+
+        retained = spill.retained_paths()
+        assert len(retained) == 1
+        assert retained[0].read_bytes() == b"complete"
+        assert budget._used_bytes == minimum
+        spill.close()
+        assert budget._used_bytes == 0
+    finally:
+        release_read.set()
+        if not write.done():
+            write.cancel()
+        await asyncio.gather(write, return_exceptions=True)
+        spill.close()
 
 
 @pytest.mark.asyncio

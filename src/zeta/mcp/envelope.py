@@ -6,8 +6,10 @@ import asyncio
 import json
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import BinaryIO
 
+from ..core.thread_call import run_owned_thread_call
 from ..tools._spill import SpillStore
 
 _SPILL_WRITE_SIZE = 64 * 1024
@@ -68,25 +70,40 @@ class MCPCallEnvelope:
             self._parts.append(chunk)
             return
         if self._handle is None:
+            reservation = self.total
             try:
-                self.spill_store.reserve_transient(self.total)
+                await run_owned_thread_call(
+                    partial(self.spill_store.reserve_transient, reservation),
+                    lambda _result: self._record_reservation(reservation),
+                )
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
-            self._reserved = self.total
-            self._temporary = self.spill_store.temporary_file()
-            self._handle = await asyncio.to_thread(self._temporary.__enter__)
+            temporary = self.spill_store.temporary_file()
+            await run_owned_thread_call(
+                temporary.__enter__,
+                lambda handle: self._record_temporary(temporary, handle),
+            )
             self._spill_buffer.extend(b"".join(self._parts))
             self._parts.clear()
         extra = self.total - self._reserved
         if extra:
             try:
-                self.spill_store.reserve_transient(extra)
+                await run_owned_thread_call(
+                    partial(self.spill_store.reserve_transient, extra),
+                    lambda _result: self._record_reservation(extra),
+                )
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
-            self._reserved += extra
         self._spill_buffer.extend(chunk)
         if len(self._spill_buffer) >= _SPILL_WRITE_SIZE:
             await self._flush_spill()
+
+    def _record_reservation(self, byte_count: int) -> None:
+        self._reserved += byte_count
+
+    def _record_temporary(self, temporary: object, handle: BinaryIO) -> None:
+        self._temporary = temporary
+        self._handle = handle
 
     async def _flush_spill(self) -> None:
         if self._handle is None or not self._spill_buffer:

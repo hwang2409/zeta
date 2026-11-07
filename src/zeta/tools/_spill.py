@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import fcntl
 import os
 import re
@@ -14,13 +13,17 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import BinaryIO
 
-from ..core.session_files import child_directory, open_session_file
+from ..core.session_files import SessionFileReplaced, child_directory, open_session_file
+from ..core.thread_call import run_owned_thread_call
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
+SPILL_SESSION_MAX_BYTES = 256 * 1024 * 1024
+SPILL_MIN_ARTIFACT_CHARGE = 4 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 _LOCK_FILE = ".spill.lock"
 
@@ -29,6 +32,177 @@ _LOCK_FILE = ".spill.lock"
 class SpillArtifact:
     path: Path
     byte_size: int
+
+
+class SpillFullError(RuntimeError):
+    """The root session has no spill capacity left."""
+
+
+@dataclass(frozen=True)
+class _SpillDirectory:
+    path: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _RetainedArtifact:
+    directory: _SpillDirectory
+    name: str
+    charged_size: int
+    group: object | None
+
+
+class SpillByteBudget:
+    """Bound and reclaim spill bytes for one registry tree."""
+
+    def __init__(self, max_bytes: int | None = None) -> None:
+        self.max_bytes = SPILL_SESSION_MAX_BYTES if max_bytes is None else max_bytes
+        self._used_bytes = 0
+        self._retained: dict[tuple[_SpillDirectory, str], _RetainedArtifact] = {}
+        self._reclaiming: set[tuple[_SpillDirectory, str]] = set()
+        self._protected_groups: set[object] = set()
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+
+    def reserve(
+        self,
+        byte_count: int,
+        *,
+        directory: _SpillDirectory | None = None,
+        directory_fd: int | None = None,
+    ) -> None:
+        while True:
+            artifact = self._reserve_or_select_oldest(
+                byte_count, directory=directory
+            )
+            if artifact is None:
+                return
+            self._reclaim(artifact, directory=directory, directory_fd=directory_fd)
+
+    def release(self, byte_count: int) -> None:
+        with self._lock:
+            if byte_count > self._used_bytes:
+                raise ValueError("spill release exceeds its reservation")
+            self._used_bytes -= byte_count
+
+    def retain(
+        self,
+        directory: _SpillDirectory,
+        artifacts: Mapping[str, int],
+        *,
+        group: object | None = None,
+    ) -> None:
+        with self._lock:
+            if group is not None:
+                self._protected_groups.add(group)
+            for name, charged_size in artifacts.items():
+                key = (directory, name)
+                if key in self._retained:
+                    raise ValueError("spill artifact is already retained")
+                self._retained[key] = _RetainedArtifact(
+                    directory, name, charged_size, group
+                )
+
+    def unprotect(self, group: object) -> None:
+        with self._lock:
+            self._protected_groups.discard(group)
+
+    def forget(self, directory: _SpillDirectory, name: str) -> None:
+        key = (directory, name)
+        with self._lock:
+            artifact = self._retained.pop(key, None)
+            self._reclaiming.discard(key)
+            if artifact is not None:
+                self._used_bytes -= artifact.charged_size
+            self._condition.notify_all()
+
+    def forget_directory(self, directory: _SpillDirectory) -> None:
+        with self._lock:
+            keys = [key for key in self._retained if key[0] == directory]
+            for key in keys:
+                artifact = self._retained.pop(key)
+                self._reclaiming.discard(key)
+                self._used_bytes -= artifact.charged_size
+            self._condition.notify_all()
+
+    def retained_names(self, directory: _SpillDirectory) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(
+                artifact.name
+                for artifact in self._retained.values()
+                if artifact.directory == directory
+            )
+
+    def _reserve_or_select_oldest(
+        self, byte_count: int, *, directory: _SpillDirectory | None
+    ) -> _RetainedArtifact | None:
+        with self._condition:
+            while self._used_bytes + byte_count > self.max_bytes:
+                artifact, in_progress = self._oldest_reclaimable()
+                if artifact is None:
+                    raise SpillFullError("spill budget is full")
+                if not in_progress or artifact.directory == directory:
+                    return artifact
+                self._condition.wait()
+            self._used_bytes += byte_count
+            return None
+
+    def _oldest_reclaimable(
+        self,
+    ) -> tuple[_RetainedArtifact | None, bool]:
+        for key, artifact in self._retained.items():
+            if artifact.group in self._protected_groups:
+                continue
+            if key in self._reclaiming:
+                return artifact, True
+            self._reclaiming.add(key)
+            return artifact, False
+        return None, False
+
+    def _reclaim(
+        self,
+        artifact: _RetainedArtifact,
+        *,
+        directory: _SpillDirectory | None,
+        directory_fd: int | None,
+    ) -> None:
+        if directory == artifact.directory and directory_fd is not None:
+            self._unlink_if_safe(directory_fd, artifact.name)
+        else:
+            self._reopen_and_unlink(artifact)
+        self.forget(artifact.directory, artifact.name)
+
+    def _reopen_and_unlink(self, artifact: _RetainedArtifact) -> None:
+        try:
+            directory_fd = os.open(
+                artifact.directory.path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError:
+            return
+        try:
+            info = os.fstat(directory_fd)
+            if (info.st_dev, info.st_ino) != (
+                artifact.directory.device,
+                artifact.directory.inode,
+            ):
+                return
+            self._unlink_if_safe(directory_fd, artifact.name)
+        except OSError:
+            return
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _unlink_if_safe(directory_fd: int, name: str) -> None:
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            return
 
 
 class SpillStore:
@@ -40,11 +214,14 @@ class SpillStore:
         session_dir: Path | None = None,
         directory_fd: int | None = None,
         max_bytes: int = SPILL_MAX_BYTES,
+        byte_budget: SpillByteBudget | None = None,
     ) -> None:
         self.max_bytes = max_bytes
+        self._byte_budget = byte_budget or SpillByteBudget()
         self._lock = threading.Lock()
         self._transient_lock = threading.Lock()
         self._directory_fd: int | None = None
+        self._directory_identity: _SpillDirectory | None = None
         self._parent_fd: int | None = None
         self._temporary_root: Path | None = None
         if session_dir is None:
@@ -74,6 +251,7 @@ class SpillStore:
         with self._transient_lock:
             if self._transient_bytes + byte_count > self._transient_max_bytes:
                 raise RuntimeError("transient spill budget is full")
+            self._byte_budget.reserve(byte_count)
             self._transient_bytes += byte_count
 
     def release_transient(self, byte_count: int) -> None:
@@ -83,7 +261,7 @@ class SpillStore:
             if byte_count > self._transient_bytes:
                 raise ValueError("transient spill release exceeds its reservation")
             self._transient_bytes -= byte_count
-
+            self._byte_budget.release(byte_count)
 
     async def awrite_text_group(
         self,
@@ -93,14 +271,9 @@ class SpillStore:
     ) -> dict[str, SpillArtifact]:
         """Encode and publish one text result group in a worker thread."""
 
-        worker = asyncio.create_task(
-            asyncio.to_thread(self.write_text_group, tool, call_id, named_strings)
+        return await run_owned_thread_call(
+            partial(self.write_text_group, tool, call_id, named_strings)
         )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            await worker
-            raise
 
     async def awrite_bytes(
         self, tool: str, call_id: str, index: int, data: bytes
@@ -129,21 +302,13 @@ class SpillStore:
     ) -> dict[str, Path]:
         """Publish one complete result group without blocking the event loop.
 
-        Cancellation stops only the await. The worker keeps the advisory lock
-        until every artifact is published and eviction is complete, then
-        releases it normally.
+        Cancellation waits for the worker to publish or roll back every artifact
+        and release the advisory lock before it propagates.
         """
 
-        worker = asyncio.create_task(
-            asyncio.to_thread(self.write_group, tool, call_id, artifacts)
+        return await run_owned_thread_call(
+            partial(self.write_group, tool, call_id, artifacts)
         )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            # Keep caller-owned source files alive and keep the publication
-            # transaction indivisible before cancellation leaves this method.
-            await worker
-            raise
 
     def write_text(self, tool: str, call_id: str, index: int, text: str) -> Path:
         artifacts = self.write_text_group(tool, call_id, {str(index): text})
@@ -205,51 +370,137 @@ class SpillStore:
         }
         with self._lock:
             directory_fd = self._ensure_directory()
+            directory = self._directory()
             with self._advisory_lock(directory_fd):
+                reserved: dict[str, int] = {}
                 published: list[str] = []
+                group = object()
+                protected = False
                 try:
-                    for name, temporary, parts in publications.values():
-                        fd = open_session_file(
-                            directory_fd,
-                            temporary,
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        )
-                        with os.fdopen(fd, "wb") as destination:
-                            for part in parts:
-                                if isinstance(part, bytes):
-                                    destination.write(part)
-                                    continue
-                                part.seek(0)
-                                shutil.copyfileobj(part, destination)
-                            destination.flush()
-                            os.fsync(destination.fileno())
-                    for name, temporary, _parts in publications.values():
-                        os.replace(
-                            temporary,
-                            name,
-                            src_dir_fd=directory_fd,
-                            dst_dir_fd=directory_fd,
-                        )
-                        published.append(name)
-                    os.fsync(directory_fd)
+                    self._write_staged(
+                        directory_fd, directory, publications, reserved
+                    )
+                    self._publish_staged(directory_fd, publications, published)
+                    retained = {
+                        name: reserved[temporary]
+                        for name, temporary, _parts in publications.values()
+                    }
+                    self._byte_budget.retain(directory, retained, group=group)
+                    protected = True
                 except BaseException:
-                    for name in published:
-                        try:
-                            os.unlink(name, dir_fd=directory_fd)
-                        except OSError:
-                            pass
+                    self._rollback_group(
+                        directory_fd, directory, publications, published, reserved
+                    )
                     raise
+                try:
+                    self._evict_before(directory_fd, set(published))
                 finally:
-                    for _name, temporary, _parts in publications.values():
-                        try:
-                            os.unlink(temporary, dir_fd=directory_fd)
-                        except FileNotFoundError:
-                            pass
-                self._evict_before(directory_fd, set(published))
+                    if protected:
+                        self._byte_budget.unprotect(group)
         return {
             artifact: (self.root / name).absolute()
             for artifact, (name, _temporary, _parts) in publications.items()
         }
+
+    def _write_staged(
+        self,
+        directory_fd: int,
+        directory: _SpillDirectory,
+        publications: Mapping[str, tuple[str, str, Iterable[bytes | BinaryIO]]],
+        reserved: dict[str, int],
+    ) -> None:
+        for name, temporary, parts in publications.values():
+            fd = open_session_file(
+                directory_fd,
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            )
+            reserved[temporary] = 0
+            with os.fdopen(fd, "wb") as destination:
+                self._byte_budget.reserve(
+                    SPILL_MIN_ARTIFACT_CHARGE,
+                    directory=directory,
+                    directory_fd=directory_fd,
+                )
+                reserved[temporary] = SPILL_MIN_ARTIFACT_CHARGE
+                written = 0
+                for part in parts:
+                    chunks = self._chunks(part)
+                    for chunk in chunks:
+                        charged_size = max(
+                            SPILL_MIN_ARTIFACT_CHARGE, written + len(chunk)
+                        )
+                        additional_charge = charged_size - reserved[temporary]
+                        self._byte_budget.reserve(
+                            additional_charge,
+                            directory=directory,
+                            directory_fd=directory_fd,
+                        )
+                        try:
+                            destination.write(chunk)
+                        except BaseException:
+                            self._byte_budget.release(additional_charge)
+                            raise
+                        written += len(chunk)
+                        reserved[temporary] = charged_size
+                destination.flush()
+                os.fsync(destination.fileno())
+
+    @staticmethod
+    def _chunks(part: bytes | BinaryIO) -> Iterable[bytes]:
+        if isinstance(part, bytes):
+            return (part,)
+        part.seek(0)
+        return iter(lambda: part.read(1024 * 1024), b"")
+
+    @staticmethod
+    def _publish_staged(
+        directory_fd: int,
+        publications: Mapping[str, tuple[str, str, Iterable[bytes | BinaryIO]]],
+        published: list[str],
+    ) -> None:
+        for name, temporary, _parts in publications.values():
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            published.append(name)
+        os.fsync(directory_fd)
+
+    def _rollback_group(
+        self,
+        directory_fd: int,
+        directory: _SpillDirectory,
+        publications: Mapping[str, tuple[str, str, Iterable[bytes | BinaryIO]]],
+        published: list[str],
+        reserved: dict[str, int],
+    ) -> None:
+        temporary_by_name = {
+            name: temporary for name, temporary, _parts in publications.values()
+        }
+        retained: dict[str, int] = {}
+        for name in published:
+            temporary = temporary_by_name[name]
+            if not self._try_unlink(directory_fd, name):
+                retained[name] = reserved.get(temporary, 0)
+        for _name, temporary, _parts in publications.values():
+            if not self._try_unlink(directory_fd, temporary):
+                retained[temporary] = reserved.get(temporary, 0)
+        if retained:
+            self._byte_budget.retain(directory, retained)
+        self._byte_budget.release(sum(reserved.values()) - sum(retained.values()))
+
+    @staticmethod
+    def _try_unlink(directory_fd: int, name: str) -> bool:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
 
     @contextmanager
     def temporary_file(self) -> Iterator[BinaryIO]:
@@ -278,9 +529,12 @@ class SpillStore:
         if not self.contains(path):
             raise ValueError("path is not in this session's spill directory")
         with self._lock:
-            return open_session_file(
-                self._ensure_directory(), path.name, os.O_RDONLY
-            )
+            directory_fd = self._ensure_directory()
+            try:
+                return open_session_file(directory_fd, path.name, os.O_RDONLY)
+            except (FileNotFoundError, SessionFileReplaced) as exc:
+                self._byte_budget.forget(self._directory(), path.name)
+                raise ValueError("spill artifact is gone") from exc
 
     def _name(self, tool: str, call_id: str, artifact: str) -> str:
         if self._closed:
@@ -301,6 +555,20 @@ class SpillStore:
             self._parent_fd = None
             if self._temporary_root is not None:
                 shutil.rmtree(self._temporary_root, ignore_errors=True)
+                if self._directory_identity is not None and not self.root.exists():
+                    self._byte_budget.forget_directory(self._directory_identity)
+        with self._transient_lock:
+            self._byte_budget.release(self._transient_bytes)
+            self._transient_bytes = 0
+
+    def retained_paths(self) -> tuple[Path, ...]:
+        """List retained artifacts from the shared root ledger."""
+
+        with self._lock:
+            if self._directory_identity is None:
+                return ()
+            names = self._byte_budget.retained_names(self._directory_identity)
+            return tuple(self.root / name for name in names)
 
     def _ensure_directory(self) -> int:
         if self._closed:
@@ -319,21 +587,22 @@ class SpillStore:
                 self.root,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
             )
+        if self._directory_identity is None:
+            info = os.fstat(self._directory_fd)
+            self._directory_identity = _SpillDirectory(
+                self.root, info.st_dev, info.st_ino
+            )
         return self._directory_fd
+
+    def _directory(self) -> _SpillDirectory:
+        if self._directory_identity is None:
+            raise RuntimeError("spill directory is not open")
+        return self._directory_identity
 
     @contextmanager
     def _advisory_lock(self, directory_fd: int) -> Iterator[None]:
-        lock_fd = open_session_file(
-            directory_fd,
-            _LOCK_FILE,
-            os.O_RDWR | os.O_CREAT,
-        )
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        with _spill_advisory_lock(directory_fd):
             yield
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
 
     def _evict_before(self, directory_fd: int, newest: set[str]) -> None:
         """Delete oldest files while retaining every file in the newest group."""
@@ -350,8 +619,9 @@ class SpillStore:
                     continue
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     continue
-                total += info.st_size
-                entries.append((info.st_mtime_ns, name, info.st_size))
+                charged_size = max(info.st_size, SPILL_MIN_ARTIFACT_CHARGE)
+                total += charged_size
+                entries.append((info.st_mtime_ns, name, charged_size))
             for _mtime, name, size in sorted(entries):
                 if total <= self.max_bytes or name in newest:
                     continue
@@ -360,8 +630,24 @@ class SpillStore:
                 except OSError:
                     continue
                 total -= size
+                self._byte_budget.forget(self._directory(), name)
         except OSError:
             return
+
+
+@contextmanager
+def _spill_advisory_lock(directory_fd: int) -> Iterator[None]:
+    lock_fd = open_session_file(
+        directory_fd,
+        _LOCK_FILE,
+        os.O_RDWR | os.O_CREAT,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def _safe_component(value: str, fallback: str) -> str:
