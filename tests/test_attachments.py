@@ -1157,7 +1157,7 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
     monkeypatch.setattr(Path, "resolve", resolve)
 
     submission = asyncio.create_task(
-        app._handle_prompt_value(f"use @./prompt.txt {token}")
+        app._handle_prompt_value(f"use {token} then @./prompt.txt")
     )
     entered = asyncio.create_task(resolve_entered.wait())
     done, _ = await asyncio.wait(
@@ -1184,7 +1184,7 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
         if isinstance(block, (ImageContent, TextContent)) and block.path is not None
     ]
     resolved_source = real_resolve(source)
-    assert paths == [str(resolved_source), str(staged.absolute())]
+    assert paths == [str(staged.absolute()), str(resolved_source)]
     assert read_counts == {resolved_source: 1, staged.absolute(): 1}
     assert encoded == [PNG]
     assert entered in done

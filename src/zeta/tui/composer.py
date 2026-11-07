@@ -60,7 +60,7 @@ from .key_bindings import (
     VimCursorShapeConfig,
     build_key_bindings,
 )
-from .paste_runtime import PasteRuntime, StagedImage
+from .paste_runtime import StagedImage
 from .render import is_retryable_error, render_event
 from .user import displayed_user_text, user_message
 
@@ -523,12 +523,7 @@ class ComposerAttachmentMixin:
         self._paste_runtime.start(buffer)
 
     def _delete_staged_attachment(self, path: Path) -> None:
-        runtime = getattr(self, "_paste_runtime", None)
-        if runtime is None:
-            store = self.loop.store
-            PasteRuntime._delete_staged(path, store.session_dir, store.directory_fd)
-            return
-        runtime.delete(path)
+        self._paste_runtime.delete(path)
 
     def _pending_paths_for(
         self,
@@ -536,7 +531,7 @@ class ComposerAttachmentMixin:
         *,
         pending_attachments: list[Path] | None = None,
         pending_attachment_tokens: dict[str, Path] | None = None,
-    ) -> tuple[list[Path], tuple[Path, ...]]:
+    ) -> tuple[list[Path], tuple[Path, ...], dict[str, Path]]:
         attachments = (
             self._pending_attachments
             if pending_attachments is None
@@ -569,7 +564,7 @@ class ComposerAttachmentMixin:
         selected_paths.extend(
             path for path in attachments if path not in remaining_mapped_paths
         )
-        return selected_paths, discarded_paths
+        return selected_paths, discarded_paths, dict(tokens)
 
     async def _prepare_user_message(
         self,
@@ -580,7 +575,7 @@ class ComposerAttachmentMixin:
         attachment_value: str | None = None,
     ) -> Message | None:
         source = value if attachment_value is None else attachment_value
-        pending_paths, discarded_paths = self._pending_paths_for(
+        pending_paths, discarded_paths, pending_tokens = self._pending_paths_for(
             source,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
@@ -611,6 +606,7 @@ class ComposerAttachmentMixin:
                 session_store=store,
                 image_policy=image_policy_for_provider(self.provider),
                 prepared_paths=prepared_paths,
+                pending_tokens=pending_tokens,
             )
 
         prepared = await asyncio.to_thread(prepare)
