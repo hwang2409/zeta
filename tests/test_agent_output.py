@@ -3,8 +3,10 @@ import json
 import multiprocessing
 import os
 import threading
+from collections.abc import Callable
 from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -1362,6 +1364,31 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         )
 
 
+def _stop_process(process: multiprocessing.Process, pipe: Connection) -> int | None:
+    errors: list[BaseException] = []
+
+    def attempt(operation: Callable[[], object]) -> object | None:
+        try:
+            return operation()
+        except BaseException as error:  # noqa: BLE001 - finish cleanup before raising
+            errors.append(error)
+            return None
+
+    attempt(lambda: pipe.send("close") if not pipe.closed else None)
+    attempt(lambda: process.join(10))
+    attempt(lambda: process.terminate() if process.is_alive() else None)
+    attempt(lambda: process.join(10) if process.is_alive() else None)
+    attempt(lambda: process.kill() if process.is_alive() else None)
+    attempt(lambda: process.join(10) if process.is_alive() else None)
+    exitcode = cast("int | None", attempt(lambda: process.exitcode))
+    attempt(pipe.close)
+    attempt(process.close)
+
+    if errors:
+        raise errors[0]
+    return exitcode
+
+
 def _create_nested_child_in_process(
     root_dir: str, ready: Connection
 ) -> None:
@@ -1410,6 +1437,7 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
     )
     process.start()
     child_pipe.close()
+    loop: AgentLoop | None = None
     try:
         ready = await asyncio.to_thread(parent_pipe.poll, 10)
         if not ready:
@@ -1428,26 +1456,23 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
         assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
         assert "cross-process answer" in output["content"][0]["text"]
     finally:
-        try:
-            if not parent_pipe.closed:
-                try:
-                    parent_pipe.send("close")
-                except (BrokenPipeError, EOFError, OSError):
-                    pass
-            await asyncio.to_thread(process.join, 10)
-            if process.is_alive():
-                process.terminate()
-                await asyncio.to_thread(process.join, 10)
-            if process.is_alive():
-                process.kill()
-                await asyncio.to_thread(process.join, 10)
-            process_exitcode = process.exitcode
-        finally:
-            parent_pipe.close()
+        cleanup_errors: list[BaseException] = []
+        if loop is not None:
             try:
-                process.close()
-            finally:
-                root.close()
+                await asyncio.wait_for(loop.close(), 10)
+            except BaseException as error:  # noqa: BLE001 - finish cleanup first
+                cleanup_errors.append(error)
+        try:
+            process_exitcode = _stop_process(process, parent_pipe)
+        except BaseException as error:  # noqa: BLE001 - finish cleanup first
+            cleanup_errors.append(error)
+            process_exitcode = None
+        try:
+            root.close()
+        except BaseException as error:  # noqa: BLE001 - finish cleanup first
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            raise cleanup_errors[0]
     assert process_exitcode == 0
 
 
