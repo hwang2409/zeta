@@ -793,3 +793,132 @@ async def test_address_transient_waiter_retries_after_owner_release(
         ]
     finally:
         await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_transient_waiter_cancellation_does_not_release_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    created = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (created.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    await asyncio.to_thread(created.close)
+    entered = threading.Event()
+    release = threading.Event()
+    original = ConversationStore.commit
+    calls = 0
+
+    def hold_owner(self: ConversationStore, command: object, generation: int) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10)
+        return original(self, command, generation)
+
+    monkeypatch.setattr(ConversationStore, "commit", hold_owner)
+    address = ConversationAddress("project", "root", "root")
+    owner = asyncio.create_task(
+        commit_conversation_async(address, AppendConversationRows((_warning("owner"),)))
+    )
+    waiter = asyncio.create_task(
+        commit_conversation_async(
+            address, AppendConversationRows((_warning("cancelled"),))
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 10)
+        third = asyncio.create_task(
+            commit_conversation_async(
+                address, AppendConversationRows((_warning("third"),))
+            )
+        )
+        await asyncio.sleep(0)
+        assert not third.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(owner, third), 20)
+    finally:
+        release.set()
+        for task in (owner, waiter):
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(owner, waiter, return_exceptions=True), 10
+        )
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+            "owner",
+            "third",
+        ]
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
+@pytest.mark.asyncio
+async def test_transient_owner_failure_wakes_waiter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    created = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (created.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    await asyncio.to_thread(created.close)
+    entered = threading.Event()
+    release = threading.Event()
+    original = ConversationStore.commit
+    calls = 0
+
+    def fail_owner(self: ConversationStore, command: object, generation: int) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10)
+            raise ConversationIntegrityError("forced owner failure")
+        return original(self, command, generation)
+
+    monkeypatch.setattr(ConversationStore, "commit", fail_owner)
+    address = ConversationAddress("project", "root", "root")
+    owner = asyncio.create_task(
+        commit_conversation_async(
+            address, AppendConversationRows((_warning("failed"),))
+        )
+    )
+    waiter = asyncio.create_task(
+        commit_conversation_async(
+            address, AppendConversationRows((_warning("survivor"),))
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        release.set()
+        with pytest.raises(ConversationIntegrityError, match="forced owner failure"):
+            await asyncio.wait_for(owner, 10)
+        await asyncio.wait_for(waiter, 20)
+    finally:
+        release.set()
+        for task in (owner, waiter):
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(owner, waiter, return_exceptions=True), 10
+        )
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert [entry.data["message"] for entry in reopened.entries] == ["survivor"]
+    finally:
+        await asyncio.to_thread(reopened.close)
