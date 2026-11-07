@@ -27,10 +27,7 @@ from ...core.session_files import (
     session_directory,
 )
 from ...core.store import ConversationStore, TranscriptLoadError
-from ...protocol.types import (
-    is_passive_harness_message,
-    is_visible_harness_notice,
-)
+from ...protocol.types import is_passive_harness_message
 from ..todo import TodoSnapshot
 from .agent_shutdown import SHUTDOWN_BUDGET_SECONDS, finish_cleanup_or_handoff
 
@@ -516,9 +513,7 @@ class AgentTranscriptSource:
             message = entry.data.get("message")
             if not isinstance(message, dict):
                 continue
-            if is_passive_harness_message(message) and not is_visible_harness_notice(
-                message
-            ):
+            if is_passive_harness_message(message):
                 continue
             retained = previous_by_id.get(entry.id)
             messages.append(
