@@ -36,6 +36,7 @@ from ..transcript_recovery import (
     RepairTarget,
     TranscriptSourceFacts,
     ValidatedPrefix,
+    reconcile_pending,
     repair_transcript,
 )
 from ._startup_facts import sent_message_receipts
@@ -946,6 +947,12 @@ class ConversationLogMixin:
 
     def _load_full(self: ConversationStore) -> None:
         self._full_reload_count += 1
+        if not self._read_only and self._storage_lease.observed_epoch == WRITER_EPOCH:
+            reconcile_pending(
+                self.directory_fd,
+                RepairTarget(self.session_id),
+                strict_reopen=self._strict_reopen_repaired_transcript,
+            )
         baseline = (len(self._entries), self._entry_prefix_digest)
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:

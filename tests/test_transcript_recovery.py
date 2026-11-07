@@ -207,14 +207,13 @@ def test_fault_boundaries_keep_original_or_leave_reconcilable_state(
         active = (root / step / "conversation.jsonl").read_bytes()
         if active_replaced:
             assert active != damaged
-            resolved = recovery.reconcile_pending(
-                directory_fd,
-                target,
-                strict_reopen=lambda: _strict_reopen(root, step),
-            )
-            assert resolved[0].state == "committed"
+            reopened = ConversationStore(root, session_id=step)
+            reopened.close()
         else:
             assert active == damaged
+            with pytest.raises(TranscriptLoadError):
+                reopened = ConversationStore(root, session_id=step)
+                reopened.close()
         evidence_files = list((root / step).glob("conversation.quarantine.*.json"))
         payload_files = list((root / step).glob("conversation.quarantine.*.jsonl"))
         assert bool(evidence_files) is evidence_published

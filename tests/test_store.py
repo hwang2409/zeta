@@ -1924,6 +1924,7 @@ async def test_async_batch_is_never_partially_visible_in_memory(
         notification.id, presented=True, acknowledged=True
     )
     observer.join(timeout=2)
+    assert not observer.is_alive(), "observer thread did not finish"
 
     markers = {"notification_tui_presented", "notification_ack"}
     assert not (visible_during_install & markers) or markers <= visible_during_install
@@ -2562,6 +2563,7 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
         finally:
             release_fsync.set()
             close_thread.join(timeout=2)
+            assert not close_thread.is_alive(), "close thread did not finish"
 
     assert close_finished.is_set()
 
@@ -2595,6 +2597,7 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(
         finally:
             release_fsync.set()
             release.join(timeout=2)
+            assert not release.is_alive(), "release timer did not finish"
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
     assert [item.content[0].text for item in reopened.messages()] == ["durable"]

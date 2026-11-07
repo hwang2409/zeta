@@ -1001,6 +1001,7 @@ async def test_write_race_reports_overwrite(
             creator = threading.Thread(target=lambda: target.write_bytes(b"concurrent"))
             creator.start()
             creator.join(timeout=10)
+            assert not creator.is_alive(), "creator thread did not finish"
         original_link(
             source,
             destination,
@@ -1064,6 +1065,7 @@ async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> 
     finally:
         stop.set()
         swapper.join(timeout=10)
+        assert not swapper.is_alive(), "swapper thread did not finish"
         if target.is_symlink():
             target.unlink()
         if not target.exists():
@@ -1162,6 +1164,7 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
     finally:
         stop.set()
         swapper.join(timeout=10)
+        assert not swapper.is_alive(), "swapper thread did not finish"
 
 
 @pytest.mark.asyncio

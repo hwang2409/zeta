@@ -1,4 +1,4 @@
-"""Dormant, descriptor-safe transcript recovery transaction and records."""
+"""Descriptor-safe transcript recovery transactions and records."""
 
 from __future__ import annotations
 
@@ -13,6 +13,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from ..storage_format import (
+    CLOSED_VARIANTS,
+    RECOVERY_STATE_MEMORY_PAIRS,
+    STRICT_PAYLOAD_KEYS,
+)
 from .checkpoints import ConversationEntry, load_session_json
 from .session_files import (
     child_directory,
@@ -198,16 +203,7 @@ class RecoveryStatus:
 
 
 StrictReopen = Callable[[], None]
-_ALLOWED_STATE_MEMORY_STEPS: frozenset[tuple[RepairState, MemoryStep]] = frozenset(
-    {
-        ("pending", "not_required"),
-        ("pending", "review_pending"),
-        ("committed", "not_required"),
-        ("committed", "review_pending"),
-        ("committed", "resumed"),
-        ("abandoned", "not_required"),
-    }
-)
+_ALLOWED_STATE_MEMORY_STEPS = RECOVERY_STATE_MEMORY_PAIRS
 
 
 def _after_recovery_step(_step: FaultStep) -> None:
@@ -216,21 +212,7 @@ def _after_recovery_step(_step: FaultStep) -> None:
 
 def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
     """Strictly parse one immutable quarantine manifest."""
-    keys = {
-        "schema",
-        "quarantine_id",
-        "target",
-        "source_digest",
-        "source_size",
-        "first_bad_row",
-        "first_bad_offset",
-        "valid_prefix_end",
-        "retained_last_sequence",
-        "repaired_digest",
-        "diagnosed_at",
-        "payload_digest",
-        "payload_size",
-    }
+    keys = STRICT_PAYLOAD_KEYS["transcript_recovery.evidence"]
     if set(value) != keys or value.get("schema") != _EVIDENCE_SCHEMA:
         raise TranscriptRecoveryIntegrityError("invalid quarantine manifest shape")
     manifest = EvidenceManifest(
@@ -266,24 +248,14 @@ def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
 
 def parse_recovery_record(value: Mapping[str, Any]) -> RecoveryRecord:
     """Strictly parse one mutable recovery-state record."""
-    keys = {
-        "schema",
-        "quarantine_id",
-        "target",
-        "state",
-        "expected_source_digest",
-        "repaired_digest",
-        "cutoff_sequence",
-        "diagnosis_timestamp",
-        "memory_step",
-    }
+    keys = STRICT_PAYLOAD_KEYS["transcript_recovery.state"]
     if set(value) != keys or value.get("schema") != _STATE_SCHEMA:
         raise TranscriptRecoveryIntegrityError("invalid recovery record shape")
     state = value.get("state")
     memory_step = value.get("memory_step")
-    if state not in {"pending", "committed", "abandoned"}:
+    if state not in CLOSED_VARIANTS["transcript_recovery.state"]:
         raise TranscriptRecoveryIntegrityError("invalid recovery state")
-    if memory_step not in {"not_required", "review_pending", "resumed"}:
+    if memory_step not in CLOSED_VARIANTS["transcript_recovery.memory_step"]:
         raise TranscriptRecoveryIntegrityError("invalid recovery memory step")
     if (state, memory_step) not in _ALLOWED_STATE_MEMORY_STEPS:
         raise TranscriptRecoveryIntegrityError("invalid recovery state and memory step")
@@ -331,7 +303,7 @@ def repair_transcript(
     strict_reopen: StrictReopen,
     memory_review_required: bool,
 ) -> RepairResult:
-    """Run one already-owned repair transaction; no production caller exists yet."""
+    """Run one already-owned repair transaction."""
     quarantine_id = uuid.uuid4().hex
     payload_name = _payload_name(quarantine_id)
     evidence_name = _evidence_name(quarantine_id)
