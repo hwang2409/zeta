@@ -1293,13 +1293,17 @@ async def test_agent_output_reads_and_fits_off_event_loop(
         )
     )
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 10)
         assert read_threads[0] != event_loop_thread
         assert not task.done()
+        release.set()
+        result = await asyncio.wait_for(task, 10)
+        assert result["isError"] is False
     finally:
         release.set()
-    result = await task
-    assert result["isError"] is False
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1341,13 +1345,17 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         loop.tool_registry.execute(ToolCall("status-thread", "agent_status", {}))
     )
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 10)
         assert projection_threads[0] != event_loop_thread
         assert not task.done()
+        release.set()
+        result = await asyncio.wait_for(task, 10)
+        assert result["isError"] is False
     finally:
         release.set()
-    result = await task
-    assert result["isError"] is False
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def _create_nested_child_in_process(

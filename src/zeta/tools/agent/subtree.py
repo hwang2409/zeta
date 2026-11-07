@@ -86,160 +86,195 @@ def _direct_child(parent: str, child: str) -> bool:
     return _logical_parent(child) == parent
 
 
-def _discover(
-    store: ConversationStore, requested_handle: str | None
-) -> dict[str, Path]:
-    caller = _caller_handle(store)
-    root_id = caller.split(":", 1)[0]
-    root_path = _root_path(store, caller)
-    requested_segments = (
-        _segments(root_id, requested_handle) if requested_handle else None
-    )
-    caller_segments = _segments(root_id, caller) or ()
-    if requested_handle is not None and (
-        requested_segments is None
-        or len(requested_segments) <= len(caller_segments)
-        or requested_segments[: len(caller_segments)] != caller_segments
+def _authenticated_marker_call(
+    marker: object, calls: dict[str, ToolCall]
+) -> ToolCall | None:
+    if not isinstance(marker, dict):
+        return None
+    raw_call = marker.get("tool_call")
+    if not isinstance(raw_call, dict):
+        return None
+    try:
+        call = ToolCall.from_dict(raw_call)
+    except ValueError:
+        return None
+    if call.name.casefold() != "agent" or calls.get(call.id) != call:
+        return None
+    return call
+
+
+def _started_child_handle(entry: ConversationEntry, *, parent: str) -> str | None:
+    if entry.type != "child_run_started":
+        return None
+    handle = entry.data.get("run_id")
+    expected_parent = parent if ":" in parent else None
+    if (
+        type(handle) is not str
+        or not _direct_child(parent, handle)
+        or entry.data.get("parent_run_id") != expected_parent
     ):
-        raise ValueError("unknown child handle")
+        return None
+    return handle
 
-    found: dict[str, Path] = {}
-    opened: dict[str, ConversationStore] = {}
-    pending = [caller]
 
-    def snapshot(handle: str) -> ConversationStore | None:
-        existing = opened.get(handle)
+class _SubtreeDiscovery:
+    def __init__(self, store: ConversationStore, requested_handle: str | None) -> None:
+        self.store = store
+        self.requested_handle = requested_handle
+        self.caller = _caller_handle(store)
+        self.root_id = self.caller.split(":", 1)[0]
+        self.root_path = _root_path(store, self.caller)
+        self.found: dict[str, Path] = {}
+        self.opened: dict[str, ConversationStore] = {}
+        self.pending = [self.caller]
+
+    def discover(self) -> dict[str, Path]:
+        self._validate_request()
+        try:
+            while self.pending:
+                parent = self.pending.pop()
+                parent_store = (
+                    self.store if parent == self.caller else self._snapshot(parent)
+                )
+                if parent_store is not None:
+                    self._visit(parent, parent_store)
+        finally:
+            for opened_store in self.opened.values():
+                opened_store.close()
+
+        if self.requested_handle is None:
+            return self.found
+        path = self.found.get(self.requested_handle)
+        if path is None:
+            raise ValueError("unknown child handle")
+        return {self.requested_handle: path}
+
+    def _validate_request(self) -> None:
+        if self.requested_handle is None:
+            return
+        requested = _segments(self.root_id, self.requested_handle)
+        caller = _segments(self.root_id, self.caller) or ()
+        if (
+            requested is None
+            or len(requested) <= len(caller)
+            or requested[: len(caller)] != caller
+        ):
+            raise ValueError("unknown child handle")
+
+    def _snapshot(self, handle: str) -> ConversationStore | None:
+        existing = self.opened.get(handle)
         if existing is not None:
             return existing
-        path = _path_for(root_path, root_id, handle)
+        path = _path_for(self.root_path, self.root_id, handle)
         if path is None:
             return None
         try:
-            existing = _open_snapshot(path)
+            snapshot = _open_snapshot(path)
         except (OSError, ValueError):
             return None
-        opened[handle] = existing
-        return existing
+        self.opened[handle] = snapshot
+        return snapshot
 
-    def add(handle: object, stored_path: object, *, parent: str) -> None:
-        if type(handle) is not str or type(stored_path) is not str:
-            return
-        path = _path_for(root_path, root_id, handle)
-        if path is None or Path(stored_path).absolute() != path:
-            return
-        if not handle.startswith(f"{caller}:"):
-            return
-        if requested_handle is not None and not (
-            requested_handle == handle
-            or requested_handle.startswith(f"{handle}:")
-            or handle.startswith(f"{requested_handle}:")
-        ):
-            return
-        if handle not in found:
-            found[handle] = path
-            if _direct_child(parent, handle):
-                pending.append(handle)
+    def _visit(self, parent: str, parent_store: ConversationStore) -> None:
+        entries = parent_store.replay()
+        calls = _active_agent_calls(entries)
+        self._add_receipt_edges(parent, parent_store)
+        self._add_started_edges(parent, entries, calls)
+        self._add_marker_edges(parent, parent_store, calls)
 
-    try:
-        resident_entries = store.replay()
-        resident_calls = _active_agent_calls(resident_entries)
-        for handle, stored_path_value in store.active_agent_receipts():
-            stored_path = Path(stored_path_value).absolute()
-            if _segments(root_id, handle) is not None and _direct_child(caller, handle):
-                add(handle, str(stored_path), parent=caller)
-            elif (
-                requested_handle is None
-                and stored_path.parent == store.session_dir.absolute() / "agents"
+    def _add_receipt_edges(self, parent: str, parent_store: ConversationStore) -> None:
+        parent_path = _path_for(self.root_path, self.root_id, parent)
+        for handle, stored_path in parent_store.active_agent_receipts():
+            if _segments(self.root_id, handle) is not None and _direct_child(
+                parent, handle
             ):
-                found[handle] = stored_path
-        for marker in store.agent_children().values():
+                self._add_edge(handle, stored_path, parent=parent)
+                continue
+            stored = Path(stored_path).absolute()
+            if (
+                self.requested_handle is None
+                and parent_path is not None
+                and stored.parent == parent_path / "agents"
+            ):
+                self.found[handle] = stored
+
+    def _add_started_edges(
+        self,
+        parent: str,
+        entries: list[ConversationEntry],
+        calls: dict[str, ToolCall],
+    ) -> None:
+        for entry in entries:
+            handle = _started_child_handle(entry, parent=parent)
+            if handle is None:
+                continue
+            child_store = self._snapshot(handle)
+            marker = (
+                getattr(child_store, "_agent_parent", None) if child_store else None
+            )
+            if not isinstance(marker, dict) or marker.get("tool_call_id") not in calls:
+                continue
+            child_path = _path_for(self.root_path, self.root_id, handle)
+            if child_path is not None:
+                self._add_edge(handle, str(child_path), parent=parent)
+
+    def _add_marker_edges(
+        self,
+        parent: str,
+        parent_store: ConversationStore,
+        parent_calls: dict[str, ToolCall],
+    ) -> None:
+        for marker in parent_store.agent_children().values():
             if not isinstance(marker, dict):
                 continue
-            raw_call = marker.get("tool_call")
-            try:
-                marker_call = ToolCall.from_dict(raw_call) if isinstance(raw_call, dict) else None
-            except ValueError:
-                marker_call = None
-            if (
-                marker_call is not None
-                and resident_calls.get(marker_call.id) == marker_call
-            ):
-                add(
-                    marker.get("child_instance_id"),
-                    marker.get("child_session_path"),
-                    parent=caller,
-                )
-
-        while pending:
-            parent = pending.pop()
-            parent_store = snapshot(parent)
-            if parent_store is None:
+            handle = marker.get("child_instance_id")
+            if type(handle) is not str:
                 continue
-            entries = parent_store.replay()
-            calls = _active_agent_calls(entries)
-
-            for handle, stored_path in parent_store.active_agent_receipts():
-                if _segments(root_id, handle) is not None and _direct_child(parent, handle):
-                    add(handle, stored_path, parent=parent)
-                elif requested_handle is None:
-                    parent_path = _path_for(root_path, root_id, parent)
-                    stored = Path(stored_path).absolute()
-                    if parent_path is not None and stored.parent == parent_path / "agents":
-                        found[handle] = stored
-
-            for entry in entries:
-                if entry.type != "child_run_started":
-                    continue
-                handle = entry.data.get("run_id")
-                if type(handle) is not str or not _direct_child(parent, handle):
-                    continue
-                expected_parent = parent if ":" in parent else None
-                if entry.data.get("parent_run_id") != expected_parent:
-                    continue
-                child_path = _path_for(root_path, root_id, handle)
-                child_store = snapshot(handle)
-                marker = (
-                    getattr(child_store, "_agent_parent", None) if child_store else None
+            logical_parent = _logical_parent(handle)
+            logical_store = (
+                parent_store
+                if logical_parent == parent
+                else self._snapshot(logical_parent)
+            )
+            if logical_store is None:
+                continue
+            calls = (
+                parent_calls
+                if logical_store is parent_store
+                else _active_agent_calls(logical_store.replay())
+            )
+            if _authenticated_marker_call(marker, calls) is not None:
+                self._add_edge(
+                    handle,
+                    marker.get("child_session_path"),
+                    parent=logical_parent,
                 )
-                call_id = (
-                    marker.get("tool_call_id") if isinstance(marker, dict) else None
-                )
-                if child_path is not None and call_id in calls:
-                    add(handle, str(child_path), parent=parent)
 
-            for marker in parent_store.agent_children().values():
-                if not isinstance(marker, dict):
-                    continue
-                handle = marker.get("child_instance_id")
-                if type(handle) is not str:
-                    continue
-                logical_parent = _logical_parent(handle)
-                logical_store = snapshot(logical_parent)
-                if logical_store is None:
-                    continue
-                raw_call = marker.get("tool_call")
-                if not isinstance(raw_call, dict):
-                    continue
-                try:
-                    marker_call = ToolCall.from_dict(raw_call)
-                except ValueError:
-                    continue
-                if marker_call.name.casefold() != "agent":
-                    continue
-                logical_calls = _active_agent_calls(logical_store.replay())
-                if logical_calls.get(marker_call.id) != marker_call:
-                    continue
-                add(handle, marker.get("child_session_path"), parent=logical_parent)
-    finally:
-        for opened_store in opened.values():
-            opened_store.close()
+    def _add_edge(self, handle: object, stored_path: object, *, parent: str) -> None:
+        if type(handle) is not str or type(stored_path) is not str:
+            return
+        path = _path_for(self.root_path, self.root_id, handle)
+        if path is None or Path(stored_path).absolute() != path:
+            return
+        if not handle.startswith(f"{self.caller}:"):
+            return
+        requested = self.requested_handle
+        if requested is not None and not (
+            requested == handle
+            or requested.startswith(f"{handle}:")
+            or handle.startswith(f"{requested}:")
+        ):
+            return
+        if handle not in self.found:
+            self.found[handle] = path
+            if _direct_child(parent, handle):
+                self.pending.append(handle)
 
-    if requested_handle is not None:
-        path = found.get(requested_handle)
-        if path is None:
-            raise ValueError("unknown child handle")
-        return {requested_handle: path}
-    return found
+
+def _discover(
+    store: ConversationStore, requested_handle: str | None
+) -> dict[str, Path]:
+    return _SubtreeDiscovery(store, requested_handle).discover()
 
 
 def read_output_result(
