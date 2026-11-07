@@ -332,6 +332,7 @@ async def test_session_grant_flow_over_authenticated_websocket(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("call-1", "bash", {"command": "printf observer"})
     backend = FakeBackend(
@@ -356,17 +357,44 @@ async def test_observer_reads_events_cannot_revoke_and_reconnects_from_snapshot(
         )
         await _request(reader, writer, 3, "send", {"text": "run"})
         await _event(reader, "approval_request")
-        await _request(
-            reader,
-            writer,
-            4,
-            "approve",
-            {
-                "request_id": "call-1",
-                "scope": "always_tool",
-            },
+        assert server.connections is not None
+        observer_connection = server.connections._observers[0].connection
+        original_send = server.connections.send
+        observer_blocked = asyncio.Event()
+        release_observer = asyncio.Event()
+
+        async def block_observer(connection: Any, payload: bytes) -> bool:
+            if (
+                connection is observer_connection
+                and b"session_grants_changed" in payload
+            ):
+                observer_blocked.set()
+                await release_observer.wait()
+            return await original_send(connection, payload)
+
+        monkeypatch.setattr(server.connections, "send", block_observer)
+        writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "approve",
+                        "params": {
+                            "request_id": "call-1",
+                            "scope": "always_tool",
+                        },
+                    }
+                )
+                + "\n"
+            ).encode()
         )
+        await writer.drain()
+        await observer_blocked.wait()
         controller_event = await _event(reader, "session_grants_changed")
+        release_observer.set()
+        while (await _read(reader)).get("id") != 4:
+            pass
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
         assert (await _request(observer_reader, observer_writer, 11, "session_grants"))[
@@ -723,10 +751,23 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
             )
         )[-1]["result"]
         assert "session_grants" in hello["capabilities"]["features"]
-        snapshot = (
-            await _request(replacement_reader, replacement_writer, 11, "session_grants")
-        )[-1]["result"]
-        assert snapshot["session_grants"] == ["bash"]
+        replacement_writer.write(
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 11,
+                        "method": "session_grants",
+                        "params": {},
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await replacement_writer.drain()
+        snapshot_response = await _read(replacement_reader)
+        assert snapshot_response["id"] == 11
+        assert snapshot_response["result"]["session_grants"] == ["bash"]
     finally:
         if replacement_writer is not None:
             replacement_writer.close()
