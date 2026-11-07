@@ -452,7 +452,12 @@ def _notification_identity(
     identities: AgentIdentityIndex,
 ) -> AgentIdentity | None:
     handle = event.data.get("child_instance_id")
-    description = event.data.get("description")
+    description = event.data.get("agent_description")
+    if not isinstance(description, str) and event.data.get("kind") not in {
+        "child_question",
+        "child_question_withdrawn",
+    }:
+        description = event.data.get("description")
     if not isinstance(handle, str):
         if isinstance(description, str) and description:
             return AgentIdentity(_identity_description(description), "")

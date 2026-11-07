@@ -637,14 +637,13 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
     )
     transcript.set_tool_child_session_path(lead.id, str(root))
     lead_unit = transcript._tools[(None, lead.id)]
-    assert lead_unit.card.apply_transcript_snapshot(snapshot) is True
-    lead_unit.refresh()
     question = StreamEvent(
         StreamEventType.AGENT_NOTIFICATION,
         data={
             "kind": "child_question",
             "child_instance_id": worker_handle,
             "description": "child question",
+            "agent_description": worker_name,
             "question_id": "q-nested-1234567890",
             "question": (
                 "May I change the durable record format, or must I preserve backward "
@@ -653,7 +652,10 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
             "options": ["preserve format", "bump format epoch"],
         },
     )
+    # Live delivery can publish the durable question before the recursive card refresh.
     presenter.print_unit(presenter.render_event(question))
+    assert lead_unit.card.apply_transcript_snapshot(snapshot) is True
+    lead_unit.refresh()
 
     output = Text.from_ansi(transcript.render(width)).plain
 
@@ -667,6 +669,128 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
     assert "May I change the durable record format" in output
     assert "preserve backward" in output
     assert "readability?" in output
+    assert presenter._agent_identities._identities[worker_handle].description == "child"
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_replayed_question_uses_description_from_stored_payload(
+    tmp_path: Path, width: int
+) -> None:
+    from zeta.core.store import ConversationStore
+
+    store = ConversationStore(tmp_path, session_id="stored-question")
+    store._append_row(
+        "notification",
+        {
+            "origin": "notification",
+            "kind": "child_question",
+            "child_instance_id": f"{HANDLE}:1",
+            "question_id": QUESTION_ID,
+            "question": "Does the replay keep my name?",
+            "description": "child question",
+            "agent_description": "nested verifier",
+            "status": "pending",
+            "text": "stored child question",
+        },
+    )
+    store.close()
+    reopened = ConversationStore(tmp_path, session_id="stored-question")
+    entry = reopened.agent_notifications()[0]
+
+    output = _render(
+        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=entry.data), width
+    )
+
+    assert "ask ← nested verifier :159:1 · pending" in output
+    assert "Does the replay keep my name?" in output
+    reopened.close()
+
+
+@pytest.mark.parametrize("width", [80, 160])
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            " ".join(f"long-word-{index}" for index in range(500)),
+            id="long-single-line",
+        ),
+        pytest.param(
+            "\n".join(f"message line {index}" for index in range(80)),
+            id="multiline",
+        ),
+    ],
+)
+def test_recursive_agent_send_is_bounded_after_wrapping(
+    width: int, message: str
+) -> None:
+    from zeta.tui.cards.agent import MAX_TAIL_LINES, AgentCard
+    from zeta.tui.cards.agent_sync import (
+        AgentTranscriptSnapshot,
+        AgentTranscriptTreeSnapshot,
+    )
+
+    root = Path("/sessions/root/agents/159")
+    send = ToolCall(
+        "send-worker",
+        "agent_send",
+        {"child_instance_id": f"{HANDLE}:1", "message": message},
+    )
+    snapshot = AgentTranscriptTreeSnapshot(
+        root,
+        (
+            (
+                root,
+                AgentTranscriptSnapshot(
+                    ("send", "send-result"),
+                    (
+                        (
+                            "send",
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "tool_use", "tool_call": send.to_dict()}
+                                ],
+                            },
+                        ),
+                        (
+                            "send-result",
+                            {
+                                "role": "tool_result",
+                                "content": [{"type": "text", "text": "queued"}],
+                                "tool_result": {
+                                    "tool_call_id": send.id,
+                                    "content": "queued a follow-up",
+                                    "structured_content": {
+                                        "child_instance_id": f"{HANDLE}:1"
+                                    },
+                                },
+                            },
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    panel = AgentCard._expanded_panel(
+        ToolCall("lead", "agent", {"description": "storage lead"}),
+        AgentCard._tail_lines(snapshot, root, MAX_TAIL_LINES),
+        elapsed_seconds=1.0,
+        turns_used=1,
+        depth=1,
+    )
+    assert panel is not None
+    output = StringIO()
+    Console(
+        file=output,
+        width=width,
+        force_terminal=False,
+        color_system=None,
+    ).print(panel)
+    rendered_lines = output.getvalue().splitlines()
+
+    # Two panel borders and one card header sit outside the tail budget.
+    assert len(rendered_lines) <= MAX_TAIL_LINES + 3
+    assert "… +" in output.getvalue()
 
 
 def test_unknown_identity_snapshot_is_cached_until_observed() -> None:

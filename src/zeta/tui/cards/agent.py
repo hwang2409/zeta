@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from rich import box
-from rich.console import Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.panel import Panel
 from rich.text import Text
 
@@ -28,6 +28,7 @@ from .agent_sync import (
     AgentTranscriptTreeSnapshot,
 )
 from .base import compact_tool_card
+from .shared import wrap_by_cells
 
 if TYPE_CHECKING:
     from .agent_message import AgentIdentityIndex
@@ -45,6 +46,48 @@ class _TailLine(str):
         line = super().__new__(cls, text)
         line.wrap = wrap
         return line
+
+
+class _BoundedTail:
+    def __init__(self, lines: Sequence[_TailLine]) -> None:
+        self._lines = lines
+
+    @property
+    def plain(self) -> str:
+        return "\n".join(self._lines)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        del console
+        projected: list[str] = []
+        for line in self._lines:
+            projected.extend(
+                wrap_by_cells(str(line), options.max_width) if line.wrap else (str(line),)
+            )
+        omitted = (
+            len(projected) - MAX_TAIL_LINES + 1
+            if len(projected) > MAX_TAIL_LINES
+            else 0
+        )
+        if omitted:
+            projected = [
+                *projected[: MAX_TAIL_LINES - 1],
+                f"… +{omitted} lines",
+            ]
+        for line in projected:
+            yield Text(line, style=theme.BODY, overflow="ellipsis", no_wrap=True)
+
+
+def _trim_tail(lines: list[_TailLine], limit: int) -> list[_TailLine]:
+    if len(lines) <= limit:
+        return lines
+    previous = re.fullmatch(r"… \+(\d+) lines", lines[0])
+    omitted = len(lines) - limit + (0 if previous else 1)
+    if previous is not None:
+        omitted += int(previous.group(1))
+    retained = lines[-(limit - 1) :] if limit > 1 else []
+    return [_TailLine(f"… +{omitted} lines"), *retained]
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -80,12 +123,49 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     return resident if resident is not None else {}
 
 
+def _project_tool_result(
+    name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+    identities: AgentIdentityIndex,
+) -> tuple[tuple[_TailLine, ...], Path | None]:
+    """Project one paired tool result and return its recursive child path."""
+
+    from .agent_message import agent_send_tail_lines
+
+    result_data = result.get("structured_content")
+    if name.casefold() == AGENT_TOOL_NAME and isinstance(result_data, dict):
+        identity = dict(result_data)
+        identity.setdefault("description", arguments.get("description"))
+        identity.setdefault("agent_type", arguments.get("agent_type"))
+        identity.setdefault("model", arguments.get("model"))
+        identities.observe_item(identity)
+    if name.casefold() == "agent_send":
+        send_lines = agent_send_tail_lines(arguments, result, identities)
+        lines = tuple(_TailLine(line, wrap=True) for line in send_lines or ())
+    else:
+        exit_code = (
+            result_data.get("exit_code") if isinstance(result_data, dict) else None
+        )
+        if type(exit_code) is int:
+            status = f"exit {exit_code}"
+        elif result.get("is_error") is True:
+            status = "failed"
+        else:
+            status = "done"
+        lines = (_TailLine(f"{name}: {status}"),)
+    child_path = (
+        result_data.get("child_session_path")
+        if isinstance(result_data, dict)
+        else None
+    )
+    return lines, Path(child_path) if isinstance(child_path, str) and child_path else None
+
+
 class AgentCard:
     """Own one agent card's rendering state, including its bounded tail."""
 
-    def __init__(
-        self, call: ToolCall, agent_identities: AgentIdentityIndex | None = None
-    ) -> None:
+    def __init__(self, call: ToolCall) -> None:
         self.call = call
         self._supported = call.name.casefold() == "agent"
         self._disclosure_supported = not self._supported
@@ -103,10 +183,6 @@ class AgentCard:
         self._transcript_source: AgentTranscriptSource | None = None
         self._final_tail_pending = False
         self._lifecycle_projection: dict[str, Any] = {}
-        self._agent_identities = agent_identities
-
-    def set_agent_identity_index(self, identities: AgentIdentityIndex) -> None:
-        self._agent_identities = identities
 
     @property
     def supported(self) -> bool:
@@ -222,14 +298,14 @@ class AgentCard:
         path: Path,
         limit: int,
         seen: set[Path] | None = None,
-        agent_identities: AgentIdentityIndex | None = None,
+        identities: AgentIdentityIndex | None = None,
     ) -> list[_TailLine]:
         """Project a bounded recursive card tail from immutable snapshots."""
 
-        from .agent_message import AgentIdentityIndex
+        from .agent_message import AgentIdentityIndex, agent_send_tail_lines
 
         seen = set() if seen is None else seen
-        identities = agent_identities or AgentIdentityIndex()
+        identities = identities or AgentIdentityIndex()
         if path in seen or limit < 1:
             return []
         seen.add(path)
@@ -238,7 +314,6 @@ class AgentCard:
             return []
         if snapshot.unavailable_reason is not None:
             return [_TailLine(snapshot.unavailable_reason)]
-        from .agent_message import agent_send_tail_lines
 
         lines: list[_TailLine] = []
         tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -256,8 +331,10 @@ class AgentCard:
                     and role != "tool_result"
                     and isinstance(block.get("text"), str)
                 ):
-                    for text_line in block["text"].splitlines() or [""]:
-                        lines.append(_TailLine(f"{role}: {text_line}"))
+                    lines.extend(
+                        _TailLine(f"{role}: {text_line}")
+                        for text_line in block["text"].splitlines() or [""]
+                    )
                 elif block_type == "tool_use" and isinstance(
                     block.get("tool_call"), dict
                 ):
@@ -279,41 +356,14 @@ class AgentCard:
                     tool_calls.pop(call_id, None) if isinstance(call_id, str) else None
                 )
                 name, arguments = call_details or ("tool", {})
-                result_data = tool_result.get("structured_content")
-                if name.casefold() == AGENT_TOOL_NAME and isinstance(result_data, dict):
-                    identity = dict(result_data)
-                    identity.setdefault("description", arguments.get("description"))
-                    identity.setdefault("agent_type", arguments.get("agent_type"))
-                    identity.setdefault("model", arguments.get("model"))
-                    identities.observe_item(identity)
-                if name.casefold() == "agent_send":
-                    send_lines = agent_send_tail_lines(
-                        arguments, tool_result, identities
-                    )
-                    if send_lines is not None:
-                        lines.extend(_TailLine(line, wrap=True) for line in send_lines)
-                else:
-                    exit_code = (
-                        result_data.get("exit_code")
-                        if isinstance(result_data, dict)
-                        else None
-                    )
-                    if type(exit_code) is int:
-                        status = f"exit {exit_code}"
-                    elif tool_result.get("is_error") is True:
-                        status = "failed"
-                    else:
-                        status = "done"
-                    lines.append(_TailLine(f"{name}: {status}"))
-                nested_path = (
-                    result_data.get("child_session_path")
-                    if isinstance(result_data, dict)
-                    else None
+                projected, nested_path = _project_tool_result(
+                    name, arguments, tool_result, identities
                 )
-                if isinstance(nested_path, str) and nested_path:
+                lines.extend(projected)
+                if nested_path is not None:
                     nested_tail = cls._tail_lines(
                         tree,
-                        Path(nested_path),
+                        nested_path,
                         max(1, limit - len(lines)),
                         seen,
                         identities,
@@ -321,15 +371,14 @@ class AgentCard:
                     lines.extend(
                         _TailLine(f"  {line}", line.wrap) for line in nested_tail
                     )
-            if len(lines) > limit:
-                lines = lines[-limit:]
+            lines = _trim_tail(lines, limit)
         for name, arguments in tool_calls.values():
             if name.casefold() != "agent_send":
                 continue
             send_lines = agent_send_tail_lines(arguments, None, identities)
             if send_lines is not None:
                 lines.extend(_TailLine(line, wrap=True) for line in send_lines)
-        return lines[-limit:]
+        return _trim_tail(lines, limit)
 
     @classmethod
     def _expanded_panel(
@@ -344,17 +393,7 @@ class AgentCard:
         if call.name.casefold() != "agent":
             return None
         body: RenderableType = (
-            Group(
-                *(
-                    Text(
-                        line,
-                        style=theme.BODY,
-                        overflow="fold" if line.wrap else "ellipsis",
-                        no_wrap=not line.wrap,
-                    )
-                    for line in tail
-                )
-            )
+            _BoundedTail(tail)
             if tail
             else Text("child transcript unavailable", style=theme.DIM)
         )
@@ -593,7 +632,6 @@ class AgentCard:
                 snapshot,
                 snapshot.root,
                 MAX_TAIL_LINES,
-                agent_identities=self._agent_identities,
             )
         )
         usage = idle_resource_usage(snapshot.lifecycles)

@@ -5423,10 +5423,11 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     transcript.finish_tool(call.id, render_event(event), event)
 
     rendered = Text.from_ansi(transcript.render(120)).plain
-    assert "child line 4" not in rendered
-    assert "child line 5" in rendered
+    assert "child line 5" not in rendered
+    assert "… +6 lines" in rendered
+    assert "child line 6" in rendered
     assert "child line 24" in rendered
-    assert rendered.count("child line ") == 20
+    assert rendered.count("child line ") == 19
 
 
 def test_agent_cards_remain_in_sequential_order() -> None:

@@ -163,6 +163,10 @@ async def test_child_finish_and_cancel_withdraw_pending_questions(
         "child_question_withdrawn",
         "child_question_withdrawn",
     ]
+    assert [entry.data["agent_description"] for entry in pending] == [
+        "worker",
+        "worker",
+    ]
     assert [entry.data["text"] for entry in pending] == [
         "question withdrawn: child finished",
         "question withdrawn: child canceled",
@@ -299,6 +303,7 @@ async def test_grandchild_question_wakes_direct_parent_then_routes_to_live_ances
     )
     routed = root.agent_notifications()
     assert [entry.data["question_id"] for entry in routed] == ["adopted"]
+    assert routed[0].data["agent_description"] == "background task"
     assert "next live ancestor" in routed[0].data["routing_note"]
     child_task.cancel()
 
@@ -322,6 +327,7 @@ def _setup_without_loop(tmp_path: Path):
         lambda: None,
         None,  # type: ignore[arg-type] - watcher state is not used by this store test
         parent_store=parent,
+        description="worker",
         active_store=child,
     )
     channel = owner.conversation_channel

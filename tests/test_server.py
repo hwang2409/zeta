@@ -563,22 +563,27 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
         assert hello["protocol_version"] == "1.2"
         assert server._client is not None
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
+            data = {"kind": kind}
+            if kind == "child_question":
+                data["agent_description"] = "nested verifier"
             await server.control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
-                    data={"kind": kind},
+                    data=data,
                 ),
                 session_id="session",
             )
-        events = [
-            (await _read(reader))["params"]["event"]
+        notifications = [
+            (await _read(reader))["params"]
             for _ in (*NOTIFICATION_KINDS, "future_kind")
         ]
 
-        assert events == [
+        assert [item["event"] for item in notifications] == [
             *(NOTIFICATION_WIRE_EVENTS[kind] for kind in NOTIFICATION_KINDS),
             "sub_agent_receipt",
         ]
+        question = notifications[NOTIFICATION_KINDS.index("child_question")]
+        assert question["data"]["agent_description"] == "nested verifier"
     finally:
         await _close(server, writer)
 
