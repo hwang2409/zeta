@@ -33,6 +33,7 @@ pytest_plugins = (
 )
 _ORIGINAL_ASYNCIO_WAIT = asyncio.wait
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
+# test-contract: bootstrap storage-format tests need the harness setting before collection
 os.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"
 
 
