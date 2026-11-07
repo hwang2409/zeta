@@ -596,7 +596,16 @@ def render_agent_notification(
         style = theme.RECEIPT if code == 0 else theme.ERROR
         message = f"⏺ task {task_id} exited ({code}) · {headline}"
         return Text(message, style=style, overflow="ellipsis", no_wrap=True)
-    if kind in {"child_question", "child_idle", "child_question_withdrawn"}:
+    readable_completion = (
+        kind == "agent_completion"
+        and event.data.get("background_owner") != "background_macro"
+        and (
+            isinstance(event.data.get("child_instance_id"), str)
+            or isinstance(event.data.get("summary"), str)
+            or isinstance(event.data.get("verdict"), str)
+        )
+    )
+    if kind in {"child_question", "child_idle", "child_question_withdrawn"} or readable_completion:
         rendered = render_agent_notification_message(event, identity_index)
         if rendered is not None:
             return rendered

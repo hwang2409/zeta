@@ -17,13 +17,7 @@ from rich.text import Text
 
 from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_usage
-from ...agent.presets import GENERAL_PRESET, get_agent_preset
-from ...agent.receipt import (
-    agent_stats,
-    ensure_agent_receipt_text,
-    has_agent_receipt_suffix,
-    terminal_state,
-)
+from ...agent.receipt import has_agent_receipt_suffix, terminal_state
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType, ToolCall
@@ -111,10 +105,20 @@ class AgentCard:
 
     @classmethod
     def _agent_type(cls, call: ToolCall) -> str:
-        preset = get_agent_preset(call.arguments.get("agent_type"))
-        if preset is None or preset.name == GENERAL_PRESET.name:
+        value = call.arguments.get("agent_type")
+        return value if isinstance(value, str) and value else ""
+
+    @classmethod
+    def _model(cls, call: ToolCall) -> str:
+        value = call.arguments.get("model")
+        return value if isinstance(value, str) and value else ""
+
+    @staticmethod
+    def _short_handle(handle: object) -> str:
+        if not isinstance(handle, str):
             return ""
-        return preset.name
+        separator = handle.find(":")
+        return handle[separator:] if separator >= 0 else handle
 
     @classmethod
     def _turns_from_content(cls, content: str) -> int:
@@ -145,10 +149,18 @@ class AgentCard:
         depth: int = 1,
     ) -> Text:
         agent_type = cls._agent_type(call)
-        prefix = f"{agent_type} · " if agent_type else ""
+        fields = [cls._description(call)]
+        if agent_type:
+            fields.insert(0, agent_type)
+        fields.extend(
+            (f"{elapsed_seconds:.1f}s", f"{turns_used} turns", f"depth {depth}")
+        )
+        model = cls._model(call)
+        if model:
+            fields.append(model)
+        fields.append("running")
         return Text(
-            f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
-            f"{turns_used} turns · depth {depth}",
+            " · ".join(fields),
             style=theme.COMMAND,
             no_wrap=True,
             overflow="ellipsis",
@@ -395,38 +407,35 @@ class AgentCard:
                 else None
             ),
         )
-        status = (
-            structured_status
-            if structured_status in {"completed", "error", "canceled"}
-            else "canceled"
-            if receipt_status == "canceled"
-            else "fail"
-            if receipt_status == "failed"
-            else "ok"
+        canonical_receipt = has_agent_receipt_suffix(result.content)
+        receipt_answer = (
+            result.content.rsplit(" · ", 5)[0]
+            if canonical_receipt
+            else result.content
         )
-        stats = agent_stats(
-            lifecycle,
-            status=receipt_status,
-            turns_used=turns,
-        )
-        receipt_text = ensure_agent_receipt_text(
-            result.content,
-            receipt_status,
-            stats,
-        )
-        if has_agent_receipt_suffix(result.content):
-            return Text(
-                receipt_text,
-                style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
-                no_wrap=True,
-                overflow="ellipsis",
-            )
         agent_type = cls._agent_type(call)
-        prefix = f"{agent_type} · " if agent_type else ""
+        description = structured.get("description", cls._description(call))
+        fields = [str(description)]
+        if agent_type:
+            fields.insert(0, agent_type)
+        handle = cls._short_handle(structured.get("child_instance_id"))
+        if handle:
+            fields[1 if agent_type else 0] += f" {handle}"
+        fields.extend(
+            (
+                f"{turns} turns",
+                f"{max(0.0, elapsed or 0.0):.1f}s",
+                receipt_status,
+                f"depth {display_depth}",
+            )
+        )
+        model = structured.get("model", cls._model(call))
+        if isinstance(model, str) and model:
+            fields.append(model)
+        if receipt_answer:
+            fields.append(receipt_answer)
         return Text(
-            f"{prefix}{cls._description(call)} · {turns} turns · "
-            f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
-            f"depth {display_depth} · {receipt_text}",
+            " · ".join(fields),
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",

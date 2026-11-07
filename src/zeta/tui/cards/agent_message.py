@@ -11,6 +11,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ...agent.receipt import has_agent_receipt_suffix, terminal_state
 from ...protocol.types import StreamEvent, ToolCall
 from .. import theme
 from .agent import AGENT_TOOL_NAME
@@ -29,7 +30,7 @@ class AgentIdentity:
 
     @property
     def label(self) -> str:
-        return f"{self.description} {self.short_handle}"
+        return " ".join(value for value in (self.description, self.short_handle) if value)
 
 
 class AgentIdentityIndex:
@@ -72,11 +73,14 @@ class AgentIdentityIndex:
             or not description
         ):
             return
+        previous = self._identities.get(handle)
         self._identities[handle] = AgentIdentity(
             _identity_description(description),
             short_agent_handle(handle),
-            _optional_text(item.get("agent_type")),
-            _optional_text(item.get("model")),
+            _optional_text(item.get("agent_type"))
+            or (previous.agent_type if previous is not None else None),
+            _optional_text(item.get("model"))
+            or (previous.model if previous is not None else None),
         )
 
     def resolve(self, handle: str) -> AgentIdentity:
@@ -263,6 +267,24 @@ def _control_handle(event: StreamEvent) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _agent_status_row(
+    child: Mapping[str, Any], identities: AgentIdentityIndex
+) -> str | None:
+    handle = child.get("handle")
+    if not isinstance(handle, str):
+        return None
+    identity = identities.resolve(handle)
+    fields = [identity.label]
+    for value in (
+        child.get("agent_type") or identity.agent_type,
+        child.get("model") or identity.model,
+        child.get("state"),
+    ):
+        if isinstance(value, str) and value:
+            fields.append(value)
+    return " · ".join(fields)
+
+
 def _render_agent_status(
     event: StreamEvent,
     running: bool,
@@ -281,26 +303,29 @@ def _render_agent_status(
             result=result.content if result is not None and result.is_error else None,
             state=state,
         )
-    rows: list[str] = []
-    for child in children:
-        if not isinstance(child, Mapping):
-            continue
-        handle = child.get("handle")
-        if not isinstance(handle, str):
-            continue
-        identity = identities.resolve(handle)
-        fields = [identity.label]
-        for value in (
-            child.get("agent_type", identity.agent_type),
-            child.get("model", identity.model),
-            child.get("state"),
-        ):
-            if isinstance(value, str) and value:
-                fields.append(value)
-        rows.append(" · ".join(fields))
+    rows = [
+        row
+        for child in children
+        if isinstance(child, Mapping)
+        and (row := _agent_status_row(child, identities)) is not None
+    ]
     noun = "child" if len(rows) == 1 else "children"
     header = Text(f"agent_status · {len(rows)} {noun}", style=theme.AGENT_MAIN)
-    return render_agent_message(header, body="\n".join(rows) or "no children")
+    total = structured.get("total")
+    pagination: list[str] = []
+    if type(total) is int and total >= 0 and (
+        structured.get("truncated") is True or total != len(rows)
+    ):
+        pagination.append(f"showing {len(rows)} of {total}")
+    next_offset = structured.get("next_offset")
+    if type(next_offset) is int and next_offset >= 0:
+        pagination.append(f"next offset {next_offset}")
+    finished_omitted = structured.get("finished_omitted")
+    if type(finished_omitted) is int and finished_omitted > 0:
+        pagination.append(f"{finished_omitted} finished omitted")
+    body_rows = ([" · ".join(pagination)] if pagination else []) + rows
+    body = "\n".join(body_rows) or "no children"
+    return render_agent_message(header, body=body)
 
 
 def _render_agent_output(
@@ -376,6 +401,8 @@ def render_agent_notification_message(
         return _render_child_question_withdrawn(event, identities)
     if kind == "child_idle":
         return _render_child_idle(event, identities)
+    if kind == "agent_completion":
+        return _render_child_completion(event, identities)
     return None
 
 
@@ -384,10 +411,12 @@ def _notification_identity(
     identities: AgentIdentityIndex,
 ) -> AgentIdentity | None:
     handle = event.data.get("child_instance_id")
+    description = event.data.get("description")
     if not isinstance(handle, str):
+        if isinstance(description, str) and description:
+            return AgentIdentity(_identity_description(description), "")
         return None
     resolved = identities.resolve(handle)
-    description = event.data.get("description")
     if resolved.description == "child" and isinstance(description, str) and description:
         return AgentIdentity(
             _identity_description(description),
@@ -455,6 +484,82 @@ def _render_child_idle(
         body=report,
         state="idle",
     )
+
+
+def _notification_stats(data: Mapping[str, Any]) -> list[str]:
+    stats = data.get("stats")
+    if not isinstance(stats, Mapping):
+        return []
+    parts: list[str] = []
+    elapsed = stats.get("elapsed")
+    if type(elapsed) in {int, float} and elapsed >= 0:
+        seconds = round(float(elapsed), 1)
+        if seconds >= 3600:
+            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
+        elif seconds >= 60:
+            minutes, remainder = divmod(int(seconds), 60)
+            parts.append(f"{minutes}m{remainder:02d}s")
+        else:
+            parts.append(f"{seconds:.1f}s")
+    turns = stats.get("turns_used")
+    if type(turns) is int and turns >= 0:
+        noun = "turn" if turns == 1 else "turns"
+        parts.append(f"{turns} {noun}")
+    return parts
+
+
+def _completion_state(data: Mapping[str, Any]) -> tuple[str, bool]:
+    status = data.get("status")
+    if not isinstance(status, str):
+        raise TypeError
+    state = terminal_state(status=status)
+    stats = data.get("stats")
+    if not isinstance(stats, Mapping) or not ({"error", "canceled"} & stats.keys()):
+        return state, False
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    conflict = (
+        type(error) is not bool
+        or type(canceled) is not bool
+        or (error and canceled)
+        or error != (state == "failed")
+        or canceled != (state == "canceled")
+    )
+    return ("failed" if conflict else state), conflict
+
+
+def _render_child_completion(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    if identity is None:
+        return _unavailable_notification()
+    try:
+        state, state_conflict = _completion_state(event.data)
+    except (TypeError, ValueError):
+        return _unavailable_notification()
+    header = agent_header("complete", "←", identity, state=state)
+    for stat in _notification_stats(event.data):
+        header.append(f" · {stat}", style=theme.NOTICE)
+    text = event.data.get("text")
+    if isinstance(text, str) and has_agent_receipt_suffix(text):
+        text = text.rsplit(" · ", 5)[0]
+    if state in {"failed", "canceled"}:
+        reason = "conflicting completion state" if state_conflict else text
+        body = f"reason: {reason}" if isinstance(reason, str) and reason else None
+    else:
+        lines: list[str] = []
+        verdict = event.data.get("verdict")
+        summary = event.data.get("summary")
+        if isinstance(verdict, str) and verdict:
+            lines.append(f"verdict: {verdict}")
+        if isinstance(summary, str) and summary:
+            lines.append(f"summary: {summary}")
+        elif isinstance(text, str) and text:
+            lines.append(text)
+        body = "\n".join(lines) or None
+    return render_agent_message(header, body=body, state=state)
 
 
 def render_agent_message(

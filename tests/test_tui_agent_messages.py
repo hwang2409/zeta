@@ -244,7 +244,7 @@ def test_long_agent_message_is_bounded(width: int) -> None:
 
 
 @pytest.mark.parametrize("width", [80, 160])
-def test_agent_notifications_keep_receipts_compact_and_show_idle_report(width: int) -> None:
+def test_agent_notifications_show_identity_verdict_and_summary(width: int) -> None:
     summary = "the shutdown path preserves writer ownership until close completes"
     idle_report = "waiting for the parent to choose the storage cutover window"
     failure_reason = "child transcript ended before the required review completed"
@@ -292,9 +292,15 @@ def test_agent_notifications_keep_receipts_compact_and_show_idle_report(width: i
     failed_output = _render(failed, width, markers=_markers())
     idle_output = _render(idle, width, markers=_markers())
 
-    assert f"⏺ {DESCRIPTION} · completed · 42.1s · 3 turns" in completion_output
-    assert summary not in completion_output
-    assert f"⏺ {DESCRIPTION} · failed · 4.2s · 1 turns" in failed_output
+    assert all(
+        value in completion_output
+        for value in (DESCRIPTION, ":159", "completed", "3 turns", summary)
+    )
+    assert "verdict: merge-ready" in completion_output
+    assert all(
+        value in failed_output
+        for value in (DESCRIPTION, ":159", "failed", failure_reason)
+    )
     assert "reason:" in failed_output
     assert all(
         value in idle_output
@@ -304,8 +310,84 @@ def test_agent_notifications_keep_receipts_compact_and_show_idle_report(width: i
 
 
 @pytest.mark.parametrize("width", [80, 160])
+def test_completion_summary_is_bounded(width: int) -> None:
+    summary = "\n".join(f"summary line {index}" for index in range(200))
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "agent_completion",
+            "child_instance_id": HANDLE,
+            "description": DESCRIPTION,
+            "status": "completed",
+            "text": "done",
+            "summary": summary,
+            "verdict": "pass",
+        },
+    )
+
+    output = _render(event, width, markers=_markers())
+
+    assert "summary: summary line 0" in output
+    assert "summary line 13" in output
+    assert "summary line 14" not in output
+    assert "… +186 lines" in output
+
+
+@pytest.mark.parametrize("width", [80, 160])
+def test_completion_without_handle_uses_description(width: int) -> None:
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "agent_completion",
+            "description": "legacy worker",
+            "status": "completed",
+            "text": "done",
+            "summary": "legacy payload completed normally",
+            "verdict": "pass",
+        },
+    )
+
+    output = _render(event, width)
+
+    assert "legacy worker" in output
+    assert "completed" in output
+    assert "verdict: pass" in output
+    assert "legacy payload completed normally" in output
+    assert "unavailable" not in output
+
+
+@pytest.mark.parametrize("width", [80, 160])
 def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
     nested_handle = f"{HANDLE}:1"
+    spawn_start = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START,
+        tool_call=ToolCall(
+            "agent-start",
+            "agent",
+            {
+                "description": "storage worker",
+                "agent_type": "general",
+                "model": "gpt-5.6-luna",
+            },
+        ),
+    )
+    spawn = _tool_result_event(
+        "agent",
+        {
+            "description": "storage worker",
+            "agent_type": "general",
+            "model": "gpt-5.6-luna",
+        },
+        "agent completed",
+        {
+            "child_instance_id": HANDLE,
+            "description": "storage worker",
+            "agent_type": "general",
+            "status": "completed",
+            "turns_used": 2,
+            "depth": 1,
+        },
+    )
     status = _tool_result_event(
         "agent_status",
         {},
@@ -316,8 +398,15 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
                     "handle": HANDLE,
                     "description": DESCRIPTION,
                     "agent_type": "planner",
-                    "model": "gpt-5.6-luna",
                     "state": "running",
+                    "started_at": "2026-11-06T10:00:00+00:00",
+                    "finished_at": None,
+                    "elapsed": 2.5,
+                    "turns_used": 1,
+                    "tool_calls": 1,
+                    "current_step": "thinking",
+                    "depth": 1,
+                    "cwd": "/repo",
                 },
                 {
                     "handle": "root:160",
@@ -334,7 +423,10 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
                     "state": "completed",
                 },
             ],
-            "total": 3,
+            "total": 42,
+            "truncated": True,
+            "next_offset": 10,
+            "finished_omitted": 4,
         },
     )
     output = _tool_result_event(
@@ -355,12 +447,29 @@ def test_agent_control_cards_render_named_structured_rows(width: int) -> None:
         {"handle": nested_handle, "status": "cancellation_confirmed"},
     )
 
-    controls_output = _render_sequence([status, output, cancel], width)
+    spawn_start_output = _render(spawn_start, width)
+    spawn_output = _render(spawn, width)
+    controls_output = _render_sequence([spawn, status, output, cancel], width)
 
+    assert all(
+        value in spawn_start_output
+        for value in ("storage worker", "general", "gpt-5.6-luna", "running")
+    )
+    assert all(
+        value in spawn_output
+        for value in (
+            "storage worker",
+            "general",
+            "gpt-5.6-luna",
+            ":159",
+            "completed",
+        )
+    )
     assert all(
         value in controls_output
         for value in (
             f"{DESCRIPTION} :159 · planner · gpt-5.6-luna · running",
+            "showing 3 of 42 · next offset 10 · 4 finished omitted",
             "shutdown reviewer :160 · reviewer · claude-sonnet-5 · idle",
             "nested verifier :159:1 · worker · gpt-5.6-luna · completed",
             "output ← nested verifier :159:1",
