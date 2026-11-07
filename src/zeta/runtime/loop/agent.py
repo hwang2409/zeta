@@ -86,7 +86,6 @@ from ..backend_state import (
     effective_backend_budget,
     prepare_backend_state,
 )
-from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
@@ -115,7 +114,7 @@ from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
 from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
-from .skill_refresh import SkillRefreshMixin
+from .skill_refresh import RuntimePrompt, SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
@@ -185,6 +184,7 @@ class AgentLoop(
         parent_session_id: str | None = None,
         root_session_dir: Any = None,
         project_registry: Any = None,
+        child_lineage_publisher: ChildLineagePublisher | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         skill_home: Path | None = None,
@@ -210,11 +210,15 @@ class AgentLoop(
         self._configure_project_context_recovery(
             registry=None, project_id=None, health=None, prepare=None
         )
-        self._child_lineage_publisher = (
-            ChildLineagePublisher(project_registry, self.root_session_dir)
-            if root_project_id is not None and project_registry is not None
-            else None
-        )
+        self._child_lineage_publisher = child_lineage_publisher
+        if (
+            self._child_lineage_publisher is None
+            and root_project_id is not None
+            and project_registry is not None
+        ):
+            self._child_lineage_publisher = ChildLineagePublisher(
+                project_registry, self.root_session_dir
+            )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
@@ -317,7 +321,7 @@ class AgentLoop(
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_policy = PLAN_MODE_POLICY
-        self._plan_mode_prior_prompt: RuntimePrompt | None = None
+        self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
