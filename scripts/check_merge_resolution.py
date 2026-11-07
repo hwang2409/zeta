@@ -20,27 +20,52 @@ class Item:
     value: str = ""
 
 
-def git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL)
+def git(*args: str, input: str | None = None) -> str:
+    return subprocess.check_output(
+        ["git", *args], text=True, input=input, stderr=subprocess.DEVNULL
+    )
 
 
-def files(commit: str) -> set[str]:
-    out = git("ls-tree", "-r", "--name-only", commit)
-    return {p for p in out.splitlines() if p.endswith(".py") and p.startswith(ROOTS)}
-
-
-def source(commit: str, path: str) -> str | None:
+def source(revision: str, path: str) -> str | None:
     try:
-        return git("show", f"{commit}:{path}")
+        return git("show", f"{revision}:{path}")
     except subprocess.CalledProcessError:
         return None
 
 
-def items(path: str, text: str) -> list[Item]:
-    try:
-        tree = ast.parse(text, filename=path)
-    except SyntaxError:
-        return []
+def load_sources(
+    revisions: list[str], paths: set[str]
+) -> dict[tuple[str, str], str | None]:
+    specs = [f"{revision}:{path}" for revision in revisions for path in sorted(paths)]
+    if not specs:
+        return {}
+    output = subprocess.check_output(
+        ["git", "cat-file", "--batch"],
+        input=("\n".join(specs) + "\n").encode(),
+        stderr=subprocess.DEVNULL,
+    )
+    result: dict[tuple[str, str], str | None] = {}
+    offset = 0
+    for revision in revisions:
+        for path in sorted(paths):
+            header_end = output.index(b"\n", offset)
+            header = output[offset:header_end].split()
+            offset = header_end + 1
+            if len(header) != 3:
+                result[(revision, path)] = None
+                continue
+            _object_id, kind, size_text = header
+            size = int(size_text)
+            body = output[offset : offset + size]
+            offset += size
+            result[(revision, path)] = body.decode() if kind != b"missing" else None
+            if offset < len(output) and output[offset] == ord("\n"):
+                offset += 1
+    return result
+
+
+def parse_items(path: str, text: str) -> list[Item]:
+    tree = ast.parse(text, filename=path)
     result: list[Item] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -105,8 +130,58 @@ def items(path: str, text: str) -> list[Item]:
 
 
 def marker(line: str, finding: Item) -> bool:
-    prefix = f"merge-resolution: {finding.path} {finding.kind} {finding.name} ->"
-    return line.startswith(prefix)
+    return line.startswith(
+        f"merge-resolution: {finding.path} {finding.kind} {finding.name} ->"
+    )
+
+
+def resolve_parent(
+    commit: str, parents: list[str], requested: int | None
+) -> tuple[str, str, str] | None:
+    p1, p2 = parents
+    print(f"parents: 1={p1} 2={p2}")
+    if requested:
+        main, branch = (p1, p2) if requested == 1 else (p2, p1)
+        reason = f"explicit --main-parent {requested}"
+    else:
+        try:
+            chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
+        except subprocess.CalledProcessError:
+            chain = set()
+        matches = [index for index, parent in enumerate(parents, 1) if parent in chain]
+        if len(matches) != 1:
+            print(
+                f"cannot identify exactly one main parent for {commit}; "
+                "use --main-parent 1 or --main-parent 2",
+                file=sys.stderr,
+            )
+            return None
+        index = matches[0]
+        main, branch = (p1, p2) if index == 1 else (p2, p1)
+        reason = "the selected parent is on origin/main first-parent ancestry"
+    print(f"main parent: {main} ({reason})")
+    return main, branch, reason
+
+
+def parse_revisions(
+    revisions: list[str], paths: set[str], sources: dict[tuple[str, str], str | None]
+) -> tuple[
+    dict[str, dict[tuple[str, str, str], Item]], tuple[str, str, SyntaxError] | None
+]:
+    parsed = {revision: {} for revision in revisions}
+    for revision in revisions:
+        for path in sorted(paths):
+            text = sources[(revision, path)]
+            if text is None:
+                continue
+            try:
+                found = parse_items(path, text)
+            except SyntaxError as error:
+                return parsed, (revision, path, error)
+            parsed[revision].update(
+                {(path, item.kind, item.name): item for item in found}
+            )
+    return parsed, None
 
 
 def main() -> int:
@@ -121,50 +196,39 @@ def main() -> int:
     if len(parents) != 2:
         print(f"{commit} is not a two-parent merge; nothing to check")
         return 0
-    p1, p2 = parents
-    base = git("merge-base", p1, p2).strip()
-    if args.main_parent:
-        main, branch = (p1, p2) if args.main_parent == 1 else (p2, p1)
-    else:
-        chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
-        main, branch = (
-            (p1, p2) if p1 in chain else ((p2, p1) if p2 in chain else (p1, p2))
-        )
+    resolved = resolve_parent(commit, parents, args.main_parent)
+    if resolved is None:
+        return 2
+    main, branch, _reason = resolved
+    base = git("merge-base", main, branch).strip()
     text = "\n".join(
         [git("log", "-1", "--format=%B", commit)]
         + ([args.allow.read()] if args.allow else [])
         + ([args.pr_body_file.read()] if args.pr_body_file else [])
     )
     changed = set(git("diff", "--name-only", base, main).splitlines())
-    # A loss can only occur in a path touched by one side or by the merge.
     all_paths = set()
     for left, right in ((base, main), (base, branch), (commit, main)):
         all_paths.update(git("diff", "--name-only", left, right).splitlines())
     all_paths = {p for p in all_paths if p.endswith(".py") and p.startswith(ROOTS)}
-    main_items: dict[tuple[str, str, str], Item] = {}
-    old_items: dict[tuple[str, str, str], Item] = {}
-    branch_items: dict[tuple[str, str, str], Item] = {}
-    merge_items: dict[tuple[str, str, str], Item] = {}
-    for path in all_paths:
-        for label, rev, target in (
-            ("old", base, old_items),
-            ("main", main, main_items),
-            ("branch", branch, branch_items),
-            ("merge", commit, merge_items),
-        ):
-            content = source(rev, path)
-            if content is not None:
-                for item in items(path, content):
-                    target[(path, item.kind, item.name)] = item
+    revisions = [base, main, branch, commit]
+    sources = load_sources(revisions, all_paths)
+    parsed, error = parse_revisions(revisions, all_paths, sources)
+    if error:
+        revision, path, syntax = error
+        print(
+            f"merge does not parse: {revision}:{path}:{syntax.lineno} (conflict marker?)",
+            file=sys.stderr,
+        )
+        return 2
+    old_items, main_items, branch_items, merge_items = (
+        parsed[revision] for revision in revisions
+    )
     findings: list[Item] = []
     for key, item in main_items.items():
         path, _kind, _name = key
-        # Main additions matter in untouched modules; any symbol in a changed module
-        # is part of the module-level merge contract.
         candidate = key not in old_items or path in changed
         if candidate and key not in merge_items:
-            # If the branch removed an item that was already in B, that is an
-            # intentional branch-side deletion rather than a merge loss.
             if key not in branch_items and key in old_items:
                 continue
             findings.append(item)
@@ -178,22 +242,23 @@ def main() -> int:
             findings.append(
                 Item(item.path, item.kind, item.name, item.line, item.value)
             )
+    lines = text.splitlines()
     findings = [
         f
         for i, f in enumerate(findings)
-        if f not in findings[:i]
-        and not any(marker(line, f) for line in text.splitlines())
+        if f not in findings[:i] and not any(marker(line, f) for line in lines)
     ]
     if findings:
-        for f in findings:
-            branch_line = branch_items.get((f.path, f.kind, f.name))
-            merged = merge_items.get((f.path, f.kind, f.name))
-            where = f"main parent line {f.line}; branch parent line {branch_line.line if branch_line else 'absent'}; merge absent"
-            if f.kind == "constant" and merged is not None:
-                where = f"main parent line {f.line}; branch parent line {branch_line.line if branch_line else 'absent'}; merged value {merged.value!r}"
-            print(f"{f.path}: {f.kind} {f.name}: {where}")
+        for finding in findings:
+            key = (finding.path, finding.kind, finding.name)
+            branch_item = branch_items.get(key)
+            merged = merge_items.get(key)
+            where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merge absent"
+            if finding.kind == "constant" and merged is not None:
+                where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merged value {merged.value!r}"
+            print(f"{finding.path}: {finding.kind} {finding.name}: {where}")
             print(
-                f"  add: merge-resolution: {f.path} {f.kind} {f.name} -> explain intended drop"
+                f"  add: merge-resolution: {finding.path} {finding.kind} {finding.name} -> explain intended drop"
             )
         return 1
     print(

@@ -118,3 +118,110 @@ def test_non_merge_is_clean(tmp_path: Path):
     commit(r, "one")
     assert run(r).returncode == 0
     assert "not a two-parent merge" in run(r).stdout
+
+
+def make_merge(r: Path, *, into: str, from_branch: str) -> tuple[str, str, str]:
+    subprocess.run(["git", "checkout", "-q", into], cwd=r, check=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", from_branch], cwd=r, check=True
+    )
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    parents = subprocess.check_output(
+        ["git", "rev-list", "--parents", "-n", "1", merge], cwd=r, text=True
+    ).split()
+    return merge, parents[1], parents[2]
+
+
+def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def kept(): pass\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def branch(): pass\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def main(): pass\n")
+    commit(r, "main")
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(
+        "def main(): pass\n<<<<<<< HEAD\ndef branch(): pass\n>>>>>>> branch\n"
+    )
+    commit(r, "unresolved")
+    merge = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    result = run(r, merge, "--main-parent", "1")
+    assert result.returncode == 2
+    assert "merge does not parse:" in result.stderr
+    assert "src/a.py:" in result.stderr
+    assert "main:" not in result.stdout
+
+
+def test_parent_selection_reports_pr_merge(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/base.py").write_text("x = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
+    (r / "src/main.py").write_text("x = 2\n")
+    commit(r, "main change")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    (r / "src/branch.py").write_text("x = 3\n")
+    commit(r, "branch change")
+    merge, p1, _p2 = make_merge(r, into="main", from_branch="branch")
+    result = run(r, merge)
+    assert result.returncode == 0
+    assert f"main parent: {p1}" in result.stdout
+    assert "origin/main first-parent ancestry" in result.stdout
+
+
+def test_parent_selection_reports_main_into_branch(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/base.py").write_text("x = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
+    (r / "src/main.py").write_text("x = 2\n")
+    commit(r, "main change")
+    main = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    (r / "src/branch.py").write_text("x = 3\n")
+    commit(r, "branch change")
+    merge, p1, _p2 = make_merge(r, into="branch", from_branch="main")
+    result = run(r, merge)
+    assert result.returncode == 0
+    assert f"main parent: {main}" in result.stdout
+    assert f"1={p1}" in result.stdout
+
+
+def test_parent_selection_requires_flag_when_ambiguous(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/base.py").write_text("x = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
+    (r / "src/main.py").write_text("x = 2\n")
+    commit(r, "main change")
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    (r / "src/branch.py").write_text("x = 3\n")
+    commit(r, "branch change")
+    merge, _p1, _p2 = make_merge(r, into="branch", from_branch="main")
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD~2"], cwd=r, check=True
+    )
+    result = run(r, merge)
+    assert result.returncode == 2
+    assert "use --main-parent" in result.stderr
