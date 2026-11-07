@@ -442,7 +442,7 @@ def _create_app_with_root(
             context_loader=_app.load_project_context,
             project_features_enabled=registry is not None,
             registry=registry,
-            projection=projection,
+            project_projection=projection,
         )
         project_context = resumed_prompt.context
         skill_catalog = resumed_prompt.skill_catalog
@@ -465,7 +465,7 @@ def _create_app_with_root(
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
             registry=registry,
-            projection=projection,
+            project_projection=projection,
         )
     recency: _SessionRecency | None = None
     pending_override = None

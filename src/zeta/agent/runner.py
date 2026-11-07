@@ -1198,7 +1198,7 @@ def _child_base_system_prompt(
         cwd_project=cwd_project,
         inbox_enabled=False,
         registry=registry,
-        projection=projection,
+        project_projection=projection,
     )
     return context.system_prompt
 

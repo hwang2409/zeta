@@ -753,7 +753,7 @@ def load_project_context(
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
     registry: ProjectRegistry | None = None,
-    projection: ProjectContextProjection | None = None,
+    project_projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -863,8 +863,8 @@ def load_project_context(
                 else:
                     try:
                         context_entries = (
-                            projection.memory
-                            if projection is not None
+                            project_projection.memory
+                            if project_projection is not None
                             else registry.load_memory_for_context(project.project_id)
                         )
                     except UnsupportedMemoryFormatError:
@@ -993,7 +993,9 @@ def load_project_context(
         has_override=has_override,
         prompt_recipe="custom" if has_override else "default",
         prompt_components=components,
-        health=projection.health if projection is not None else None,
+        health=(
+            project_projection.health if project_projection is not None else None
+        ),
     )
 
 

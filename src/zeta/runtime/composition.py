@@ -321,7 +321,7 @@ def compose_runtime(
                 cwd_project=cwd_project,
                 inbox_enabled=config.inbox_enabled,
                 registry=project_registry,
-                projection=projection,
+                project_projection=projection,
             )
 
         loop._configure_project_context_recovery(

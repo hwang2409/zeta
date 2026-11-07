@@ -33,7 +33,7 @@ async def _inspect_project(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
-        state = registry.project_registry_state
+        state = getattr(registry, "project_registry_state", None)
         if state is not None and state.unavailable is not None:
             return _error(
                 "project registry is temporarily unavailable; try again later",

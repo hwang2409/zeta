@@ -257,14 +257,14 @@ def _resume_composition(
             cwd_project=cwd_project,
             inbox_enabled=inbox_enabled,
             registry=registry,
-            projection=projection,
+            project_projection=projection,
         )
     else:
         context = _conservative_context(
             current,
             home=home,
             project_features_enabled=project_features_enabled,
-            projection=projection,
+            project_projection=projection,
         )
         if current.prompt_recipe is not None:
             context = _replace_context_skill_index(context, skills)
@@ -338,7 +338,7 @@ def resume_prompt(
         explicit_custom=explicit_custom,
         project_features_enabled=project_features_enabled,
         registry=registry,
-        projection=projection,
+        project_projection=projection,
     )
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
