@@ -757,7 +757,12 @@ async def reconcile_entry_range(
     budget = CompletionRetryBudget()
     for attempt in range(cas_retries):
         snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
-        request = _prepare_request(transcript, snapshot.state, as_of=as_of)
+        request = _prepare_request(
+            transcript,
+            snapshot.state,
+            as_of=as_of,
+            snapshot_digest=snapshot.digest,
+        )
         selected_start = min(int(row["seq"]) for row in request.transcript.rows)
         selected_end = max(int(row["seq"]) for row in request.transcript.rows)
         key = (

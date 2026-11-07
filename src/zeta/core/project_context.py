@@ -670,6 +670,18 @@ def resolve_project_context_from_projects(
     )
 
 
+def project_context_projection_for_discovery(
+    discovery: ProjectDiscovery, registry: ProjectRegistry
+) -> ProjectContextProjection:
+    """Select cwd context from tolerant identities, then read its memory."""
+
+    identities = registry.project_context_projection(None)
+    project = resolve_project_context_from_projects(discovery, identities.projects)
+    if project is None:
+        return identities
+    return registry.project_context_projection(project.project_id)
+
+
 def resolve_project_context(
     discovery: ProjectDiscovery, registry: ProjectRegistry
 ) -> Project | None:
@@ -1190,6 +1202,7 @@ __all__ = [
     "discover_repo_root",
     "initialize_project_for_directory",
     "load_project_context",
+    "project_context_projection_for_discovery",
     "resolve_project_context",
     "resolve_prompt_argument",
 ]
