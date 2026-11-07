@@ -128,7 +128,6 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(tmp_p
         await asyncio.sleep(0)
         _press(app, "1")
         await asyncio.sleep(0)
-        await asyncio.wait_for(wake_event.wait(), 10)
         await asyncio.wait_for(
             asyncio.to_thread(_wait_for_records, tmp_path, owner.store.session_id, {r.id for r in records}),
             10,
@@ -154,6 +153,8 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(tmp_pat
     )
     answer = await asyncio.to_thread(_request, owner, project.project_id, "Status", kind="answer")
     app = await _make_app(tmp_path, owner, owner.store.session_id)
+    wakes: list[bool] = []
+    app._schedule_background_wake = lambda: wakes.append(True)
     try:
         _press(app, "1")
         await asyncio.sleep(0)
@@ -179,6 +180,7 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(tmp_pat
         assert AttentionStore(owner.store.session_dir).get(records[2].id).status == "open"
         inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
         assert len(inbox.new_ids(project.project_id, session_id=owner.store.session_id)) == 1
+        assert len(wakes) == 1
     finally:
         owner.store.close()
         answerer.store.close()
