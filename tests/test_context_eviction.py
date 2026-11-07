@@ -3031,9 +3031,11 @@ async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
 
     assert "latest request verbatim" in rendered_text(context.messages)
     marker = next(entry for entry in store.replay() if entry.type == "compaction")
-    assert marker.data["pinned_message"] == text(
+    expected_pinned = text(
         MessageRole.USER, "latest request verbatim"
     ).to_dict()
+    expected_pinned["metadata"]["source_seq"] = 4
+    assert marker.data["pinned_message"] == expected_pinned
 
 
 @pytest.mark.asyncio
