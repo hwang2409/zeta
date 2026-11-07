@@ -39,29 +39,41 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
             continue
         ancestors: list[ast.AST] = []
         parent = parents.get(node)
+        function: ast.AST | None = None
         while parent is not None:
             ancestors.append(parent)
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function = parent
+                break
             parent = parents.get(parent)
+        if function is None:
+            lines.add(node.lineno)
+            continue
+        try_ancestor = next(
+            (
+                ancestor
+                for ancestor in ancestors
+                if isinstance(ancestor, ast.Try)
+                and any(node in ast.walk(statement) for statement in ancestor.finalbody)
+            ),
+            None,
+        )
+        if try_ancestor is None:
+            lines.add(node.lineno)
+            continue
+        try_index = ancestors.index(try_ancestor)
+        other_ancestors = ancestors[try_index + 1 :]
         if any(
-            isinstance(ancestor, (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While))
-            for ancestor in ancestors
+            isinstance(ancestor, (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith))
+            for ancestor in other_ancestors
         ):
             lines.add(node.lineno)
             continue
-        finally_ancestors = {
-            ancestor
-            for ancestor in ancestors
-            if isinstance(ancestor, ast.Try)
-            and any(
-                node is descendant
-                for statement in ancestor.finalbody
-                for descendant in ast.walk(statement)
-            )
-        }
         if any(
-            isinstance(ancestor, ast.Try) and ancestor not in finally_ancestors
-            for ancestor in ancestors
-        ) and not finally_ancestors:
+            isinstance(ancestor, ast.Try)
+            and not any(node in ast.walk(statement) for statement in ancestor.finalbody)
+            for ancestor in other_ancestors
+        ):
             lines.add(node.lineno)
     return lines
 
@@ -75,9 +87,23 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
         pytest.param("async def test():\n    try:\n        close_serve(s)\n    finally:\n        pass\n", True, id="try-body"),
         pytest.param("async def test():\n    try:\n        pass\n    except Exception:\n        close_serve(s)\n", True, id="except-handler"),
         pytest.param("async def test():\n    if ready:\n        try:\n            pass\n        finally:\n            close_serve(s)\n", True, id="if-around-finally"),
+        pytest.param("async def test():\n    close_serve(s)\n", True, id="top-level-after-assert"),
+        pytest.param("async def test():\n    async with resource:\n        close_serve(s)\n", True, id="async-with-without-helper"),
+        pytest.param("async def test():\n    try:\n        if ready:\n            try:\n                pass\n            finally:\n                close_serve(s)\n    finally:\n        pass\n", True, id="unreachable-nested-finally"),
         pytest.param("async def test():\n    try:\n        pass\n    finally:\n        close_serve(s)\n", False, id="finally"),
-        pytest.param("async def test():\n    close_serve(s)\n", False, id="function-top-level"),
-        pytest.param("async def test():\n    async with resource:\n        close_serve(s)\n", False, id="async-with"),
+        pytest.param(
+            "async def test():\n"
+            "    @asynccontextmanager\n"
+            "    async def serving(server):\n"
+            "        try:\n"
+            "            yield\n"
+            "        finally:\n"
+            "            await close_serve(server)\n"
+            "    async with serving(s):\n"
+            "        pass\n",
+            False,
+            id="helper",
+        ),
     ],
 )
 def test_close_serve_guard_shapes(source: str, expected_offender: bool) -> None:
@@ -88,6 +114,8 @@ def test_close_serve_guard_shapes(source: str, expected_offender: bool) -> None:
 def test_close_serve_is_never_called_under_a_condition() -> None:
     offenders: list[str] = []
     for path in sorted(_TESTS_ROOT.rglob("*.py")):
+        if path.name == "test_serve_close.py":
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         root = _TESTS_ROOT.parent
         offenders.extend(
