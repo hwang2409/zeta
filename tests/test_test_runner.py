@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -32,6 +33,40 @@ def test_repository_pytest_rejects_external_import(tmp_path: Path) -> None:
         probe.unlink()
     assert result.returncode == 2
     assert "wrong zeta import:" in result.stdout
+
+
+def test_repository_pytest_rejects_external_import_with_external_rootdir(
+    tmp_path: Path,
+) -> None:
+    decoy = tmp_path / "decoy" / "zeta"
+    shutil.copytree(ROOT / "src" / "zeta", decoy)
+    probe = ROOT / "tests" / "test_import_guard_rootdir_probe.py"
+    probe.write_text("def test_probe():\n    assert True\n")
+    rootdir = tmp_path / "rootdir"
+    rootdir.mkdir()
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                str(probe),
+                "--rootdir",
+                str(rootdir),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(decoy.parent)},
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        probe.unlink()
+    output = result.stdout + result.stderr
+    assert result.returncode == 2
+    assert "wrong zeta import:" in output
 
 
 def test_runner_refuses_wrong_import(tmp_path: Path) -> None:
