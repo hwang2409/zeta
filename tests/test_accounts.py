@@ -1868,7 +1868,7 @@ def test_migrate_never_sweeps_registered_account_during_login(
         with real_registry_guard(store, home_fd):
             yield
 
-    # test-contract: observe migration waiting behind live account ownership.
+    # test-contract: seam observe migration waiting behind live account ownership.
     monkeypatch.setattr(AccountStore, "_registry_guard", observed_registry_guard)
 
     def migrate() -> None:

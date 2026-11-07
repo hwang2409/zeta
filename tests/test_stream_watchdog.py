@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -124,13 +126,6 @@ class _StubError(RuntimeError):
         self.is_stall = is_stall
 
 
-async def _drip(items, delays):
-    for item, delay in zip(items, delays, strict=True):
-        if delay:
-            await asyncio.sleep(delay)
-        yield item
-
-
 async def test_stall_watchdog_raises_when_source_is_silent() -> None:
     async def source():
         yield "first"
@@ -170,8 +165,22 @@ async def test_stall_watchdog_resets_timer_on_each_item(
             now += advance
             yield value
 
-    monkeypatch.setattr(transport_module.time, "monotonic", lambda: now)
-    monkeypatch.setattr(transport_module.asyncio, "wait_for", manual_wait_for)
+    real_monotonic = time.monotonic
+    real_wait_for = asyncio.wait_for
+    monkeypatch.setattr(
+        transport_module,
+        "time",
+        SimpleNamespace(**(vars(time) | {"monotonic": lambda: now})),
+    )
+    monkeypatch.setattr(
+        transport_module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"wait_for": manual_wait_for})),
+    )
+    assert transport_module.time is not time
+    assert transport_module.asyncio is not asyncio
+    assert time.monotonic is real_monotonic
+    assert asyncio.wait_for is real_wait_for
     watched = stall_watchdog(
         source(),
         seconds=10.0,
@@ -188,9 +197,11 @@ async def test_stall_watchdog_resets_timer_on_each_item(
 
 
 async def test_stall_watchdog_disabled_when_seconds_nonpositive() -> None:
-    source = _drip(["only"], [0])
+    async def source():
+        yield "only"
+
     watched = stall_watchdog(
-        source,
+        source(),
         seconds=0.0,
         on_stall=lambda elapsed: _StubError("stalled", is_stall=True),
     )

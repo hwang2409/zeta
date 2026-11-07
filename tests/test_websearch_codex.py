@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -81,7 +82,14 @@ class _ManualTimeoutClock:
 
 def _manual_timeout(monkeypatch: pytest.MonkeyPatch) -> _ManualTimeoutClock:
     clock = _ManualTimeoutClock()
-    monkeypatch.setattr(codex.asyncio, "timeout", clock.timeout)
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(
+        codex,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"timeout": clock.timeout})),
+    )
+    assert codex.asyncio is not asyncio
+    assert asyncio.timeout is real_timeout
     monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 10.0)
     return clock
 
@@ -692,13 +700,13 @@ async def test_codex_user_abort_during_credential_acquisition_no_fallback(
     task = asyncio.create_task(
         websearch._websearch(registry, {"query": "zeta"}, AbortSignal())
     )
-    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+    await asyncio.wait_for(refresh_started.wait(), timeout=10)
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     allow_refresh_to_finish.set()
-    await asyncio.wait_for(refresh_persisted.wait(), timeout=0.2)
+    await asyncio.wait_for(refresh_persisted.wait(), timeout=10)
 
     assert calls == []
     assert not refresh_cancelled

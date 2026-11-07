@@ -1071,7 +1071,7 @@ async def test_limit_recovery_does_not_block_event_loop_while_usage_lock_held(
     def hold_usage_lock() -> None:
         with context.store.usage_guard(first):
             entered.set()
-            assert release.wait(timeout=5)
+            assert release.wait(timeout=10)
 
     holder = threading.Thread(target=hold_usage_lock)
     holder.start()

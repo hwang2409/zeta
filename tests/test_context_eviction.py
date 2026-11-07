@@ -1965,7 +1965,7 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         finally:
             planning_finished.set()
 
-    # test-contract: hold pure eviction planning before any commit can occur.
+    # test-contract: seam hold pure eviction planning before any commit can occur.
     with patch.object(assembler, planner_name, side_effect=blocked_plan):
         assembly = asyncio.create_task(assembler.assemble_context())
         assert await asyncio.to_thread(planning_started.wait, 10)
