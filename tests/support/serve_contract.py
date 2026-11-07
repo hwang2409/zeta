@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import sys
 from collections import deque
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -15,6 +17,30 @@ from websockets.asyncio.client import ClientConnection, connect
 
 Transport = Literal["unix", "websocket"]
 Role = Literal["controller", "observer"]
+CleanupStep = tuple[str, Callable[[], object | Awaitable[object]]]
+
+
+async def _run_cleanup(
+    steps: Iterable[CleanupStep], primary: BaseException | None = None
+) -> None:
+    errors: list[tuple[str, BaseException]] = []
+    for name, step in steps:
+        try:
+            result = step()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:  # noqa: BLE001
+            errors.append((name, error))
+
+    if primary is not None:
+        for name, error in errors:
+            primary.add_note(f"{name} failed during cleanup: {error!r}")
+        return
+    if errors:
+        (_name, error), *additional_errors = errors
+        for name, additional_error in additional_errors:
+            error.add_note(f"{name} also failed during cleanup: {additional_error!r}")
+        raise error
 
 
 class ServeClient:
@@ -140,21 +166,19 @@ class ServeContract:
                 if line.startswith(b"zeta serve: websocket ready:"):
                     break
         except BaseException as error:
-            if process.returncode is None:
-                try:
+
+            def kill() -> None:
+                if process.returncode is None:
                     process.kill()
-                except ProcessLookupError:
-                    pass
-            try:
-                await process.communicate()
-            except BaseException as cleanup_error:  # noqa: BLE001
-                error.add_note(f"process reap failed during cleanup: {cleanup_error!r}")
-            try:
-                socket_path.unlink(missing_ok=True)
-            except BaseException as cleanup_error:  # noqa: BLE001
-                error.add_note(
-                    f"socket removal failed during cleanup: {cleanup_error!r}"
-                )
+
+            await _run_cleanup(
+                (
+                    ("process kill", kill),
+                    ("process reap", process.communicate),
+                    ("socket removal", lambda: socket_path.unlink(missing_ok=True)),
+                ),
+                error,
+            )
             raise
         return cls(process, home, socket_path, transport)
 
@@ -174,47 +198,27 @@ class ServeContract:
         return client
 
     async def close(self) -> None:
-        try:
-            for client in reversed(self._clients):
-                await client.close()
-        except BaseException as error:
-            await self._cleanup_process(error)
-            raise
-        await self._cleanup_process()
+        stdout = stderr = b""
 
-    async def _cleanup_process(
-        self, original_error: BaseException | None = None
-    ) -> None:
-        cleanup_errors: list[BaseException] = []
-        try:
+        def terminate() -> None:
             if self._process.returncode is None:
                 self._process.terminate()
-        except BaseException as error:  # noqa: BLE001
-            cleanup_errors.append(error)
 
-        stdout = stderr = b""
-        try:
+        async def reap() -> None:
+            nonlocal stdout, stderr
             stdout, stderr = await self._process.communicate()
-        except BaseException as error:  # noqa: BLE001
-            cleanup_errors.append(error)
 
-        try:
+        def validate_shutdown() -> None:
             assert self._process.returncode == 0, (stdout + stderr).decode(
                 errors="replace"
             )
-        except BaseException as error:  # noqa: BLE001
-            cleanup_errors.append(error)
-        try:
             assert not self._socket_path.exists(), "serve left its Unix socket behind"
-        except BaseException as error:  # noqa: BLE001
-            cleanup_errors.append(error)
 
-        if original_error is not None:
-            for error in cleanup_errors:
-                original_error.add_note(f"server cleanup failed: {error!r}")
-            return
-        if cleanup_errors:
-            error, *additional_errors = cleanup_errors
-            for additional_error in additional_errors:
-                error.add_note(f"additional cleanup failure: {additional_error!r}")
-            raise error
+        await _run_cleanup(
+            (
+                *(("client close", client.close) for client in reversed(self._clients)),
+                ("process termination", terminate),
+                ("process reap", reap),
+                ("server shutdown validation", validate_shutdown),
+            )
+        )

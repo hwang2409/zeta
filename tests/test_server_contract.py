@@ -95,6 +95,39 @@ async def test_failed_start_reaps_process_and_removes_socket(
 
 
 @pytest.mark.asyncio
+async def test_failed_start_preserves_error_when_kill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+    real_kill = asyncio.subprocess.Process.kill
+
+    def fail_after_kill(process: asyncio.subprocess.Process) -> None:
+        real_kill(process)
+        raise PermissionError("forced process kill failure")
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "kill", fail_after_kill)
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker") as raised:
+            await ServeContract.start(tmp_path, "unix")
+
+        process, socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+        assert any(
+            "forced process kill failure" in note for note in raised.value.__notes__
+        )
+    finally:
+        if spawned:
+            process, socket_path = spawned[0]
+            if process.returncode is None:
+                real_kill(process)
+            await process.communicate()
+            socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_failed_start_preserves_error_when_socket_removal_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -122,6 +155,38 @@ async def test_failed_start_preserves_error_when_socket_removal_fails(
     finally:
         if spawned:
             await _remove_spawned_process(*spawned[0], unlink=real_unlink)
+
+
+@pytest.mark.asyncio
+async def test_failed_client_close_still_cleans_up_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = await ServeContract.start(tmp_path, "unix")
+    client = await contract.connect()
+    process = contract._process
+    socket_path = contract._socket_path
+    close_error = RuntimeError("forced client close failure")
+    real_close = ServeClient.close
+
+    async def fail_client_close(_client: ServeClient) -> None:
+        raise close_error
+
+    monkeypatch.setattr(ServeClient, "close", fail_client_close)
+    try:
+        with pytest.raises(RuntimeError, match="forced client close failure") as raised:
+            await contract.close()
+
+        assert raised.value is close_error
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+    finally:
+        await real_close(client)
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        socket_path.unlink(missing_ok=True)
 
 
 async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, object]:
