@@ -1112,6 +1112,7 @@ Event fields are:
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
+| `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is

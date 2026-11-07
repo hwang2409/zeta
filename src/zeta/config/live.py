@@ -139,15 +139,14 @@ def _retained_skills(current: SkillCatalog, discovered: SkillCatalog) -> SkillCa
 
 def _retained_agents(current: AgentCatalog, discovered: AgentCatalog) -> AgentCatalog:
     discovered_paths = {agent.path for agent in discovered.agents}
-    discovered_names = {agent.name for agent in discovered.agents}
     retained = tuple(
         agent
         for agent in current.agents
         if (
-            agent.path is None
-            and agent.name not in discovered_names
+            agent.path is not None
+            and agent.path not in discovered_paths
+            and agent.source != "packaged"
         )
-        or (agent.path not in discovered_paths and agent.source != "packaged")
     )
     combined = (*discovered.agents, *retained)
     missing_notices = tuple(

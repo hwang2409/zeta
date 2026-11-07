@@ -481,6 +481,7 @@ async def _build_child_loop(
             usage_sink=record_child_usage,
             live_config_home=child_home,
             live_config_project_dir=child_project_dir,
+            freeze_live_config=getattr(loop, "_live_config_scope", None) is None,
         )
         await child_loop.refresh_live_config(publish=False)
         child_loop.explicit_finish = explicit_finish
@@ -505,7 +506,6 @@ async def _build_child_loop(
         cleanup.result()
         raise
     except BaseException:
-        
         await close_construction(background_task_cause="child spawn setup failed")
         raise
 

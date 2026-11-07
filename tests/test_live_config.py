@@ -26,7 +26,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.skills.agent_catalog import discover_session_agents
+from zeta.skills.agent_catalog import AgentCatalog, AgentPreset, discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tui import theme
 from zeta.tui.app import TUIApp
@@ -100,6 +100,30 @@ async def _refresh(loop: AgentLoop) -> None:
     if refresher is None:
         refresher = loop.refresh_skills
     await refresher()
+
+
+@pytest.mark.asyncio
+async def test_live_refresh_removes_pathless_injected_profile_for_new_spawn(
+    tmp_path: Path,
+) -> None:
+    loop, _home, _project = _loop(tmp_path)
+    try:
+        injected = AgentPreset(
+            name="injected",
+            tool_names=None,
+            preamble="child",
+            selection_guidance="injected profile",
+            source="injected",
+        )
+        catalog = AgentCatalog((injected,))
+        loop.tool_registry.agent_catalog = catalog
+        loop.agent_catalog = catalog
+
+        await _refresh(loop)
+
+        assert "injected" not in loop.tool_registry.agent_catalog.names()
+    finally:
+        await loop.close()
 
 
 def _definition(loop: AgentLoop):
