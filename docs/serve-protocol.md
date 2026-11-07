@@ -12,8 +12,9 @@ newline. Messages are limited to 1 MiB on every transport.
 - `1.1` adds the session extensions and optional feature negotiation below.
 - `1.0` is the legacy base protocol.
 
-The server accepts one client. A second connection receives a JSON-RPC error
-with code `-32001`, then closes. The limit is shared by all enabled transports.
+The server accepts one controller plus up to eight negotiated read-only
+observers. A second controller or ninth observer receives a JSON-RPC error with
+code `-32001`, then closes. The limits are shared by all enabled transports.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
@@ -836,18 +837,21 @@ Error responses use standard JSON-RPC codes where applicable:
 | ---: | --- |
 | `-32700` | invalid JSON or invalid UTF-8 frame |
 | `-32600` | invalid JSON-RPC request or duplicate handshake |
-| `-32601` | method is not supported |
-| `-32602` | params have the wrong shape or value |
-| `-32000` | unexpected server failure |
-| `-32001` | another client owns the socket |
-| `-32002` | handshake missing or protocol version mismatch |
-| `-32003` | no active session, or a detached host-bound session cannot start a turn |
-| `-32004` | a turn is already running |
-| `-32005` | no turn is running for steering |
-| `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
+| `-32601` | method or negotiated feature is not supported |
+| `-32602` | params have the wrong shape, value, or negotiated capability |
+| `-32000` | unexpected server or storage failure |
+| `-32001` | requested controller or observer connection role is at capacity |
+| `-32002` | handshake is missing or the protocol version does not match |
+| `-32003` | no active session, or the active session requires a host binding |
+| `-32004` | operation is blocked by active turn, tool, or background-agent work |
+| `-32005` | requested turn or account state is unavailable |
+| `-32006` | approval request is missing, resolved, or reserved |
 | `-32007` | outbound frame exceeds the size limit |
-| `-32008` | the selected account lock is held by another process |
-| `-32010` | delivery ID was accepted but its full details were evicted |
+| `-32008` | request is not allowed for this connection or account state |
+| `-32009` | session history snapshot is stale |
+| `-32010` | delivery ID details were evicted |
+| `-32011` | connection output queue overflowed |
+| `-32012` | content handle was not found |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -960,6 +964,7 @@ Event fields are:
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
 | `account_limit` | `event`, `data: object` | `session_id` |
+| `account_state_unknown` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
@@ -974,6 +979,7 @@ Event fields are:
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
+| `delivery_status` (features `delivery_id` and `session_history_fidelity`) | `event`, `id: string`, `role: "system"`, `delivery_id: string`, `method: "steer"`, `status: "dropped"`, `content: array[ContentBlock]` | `session_id`, `reason: string` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |

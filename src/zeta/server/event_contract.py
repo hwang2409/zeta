@@ -88,6 +88,7 @@ def notification_wire_event(kind: object, protocol_version: str) -> str:
 
 
 class AuxiliaryEvent(Enum):
+    DELIVERY_STATUS = auto()
     MEMORY_UPDATED = auto()
     TURN_ABORTED = auto()
     USAGE = auto()
@@ -95,6 +96,7 @@ class AuxiliaryEvent(Enum):
 
 
 AUXILIARY_WIRE_EVENTS = {
+    AuxiliaryEvent.DELIVERY_STATUS: "delivery_status",
     AuxiliaryEvent.MEMORY_UPDATED: "memory_updated",
     AuxiliaryEvent.TURN_ABORTED: "turn_aborted",
     AuxiliaryEvent.USAGE: "usage",
@@ -214,3 +216,10 @@ STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.AGENT_END: "agent_end",
     StreamEventType.ERROR: "error",
 }
+
+# Derived from every runtime-to-wire map so adding an event also requires docs.
+WIRE_EVENT_NAMES = frozenset(
+    (set(STREAM_EVENT_WIRE_EVENTS.values()) - {"notification_by_kind"})
+    | set(AUXILIARY_WIRE_EVENTS.values())
+    | set(NOTIFICATION_WIRE_EVENTS.values())
+)

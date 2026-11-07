@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import content, ergonomics
-from .protocol import FrameWriteCancelled, ProtocolError
+from . import content, ergonomics, event_contract
+from .protocol import FrameCodec, FrameWriteCancelled, ProtocolError
 
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history", "content_read",
@@ -119,7 +118,7 @@ class ConnectionRegistry:
             self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
-                raise ProtocolError(-32004, "observer limit reached") from exc
+                raise ProtocolError(-32001, "observer limit reached") from exc
             raise ProtocolError(-32001, "another client is already connected") from exc
         connection.role = role
         if role == "controller":
@@ -164,6 +163,11 @@ class ConnectionRegistry:
         required_feature: str | None = None,
         **fields: object,
     ) -> bool:
+        if event not in event_contract.WIRE_EVENT_NAMES:
+            raise ValueError(
+                f"undocumented serve event {event!r}; add it to event_contract "
+                "and docs/serve-protocol.md"
+            )
         state = self._controller
         if state is None or (
             required_feature is not None and required_feature not in state.features
@@ -395,14 +399,9 @@ class ConnectionRegistry:
 
     @staticmethod
     def _overflow_frame(role: str) -> bytes:
-        return json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32011, "message": f"{role} output overflow"},
-            },
-            separators=(",", ":"),
-        ).encode() + b"\n"
+        return FrameCodec().error_response(
+            None, -32011, f"{role} output overflow"
+        )
 
     @staticmethod
     async def _write_physical(

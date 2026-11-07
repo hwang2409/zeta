@@ -219,7 +219,7 @@ async def test_observer_disconnects_keep_controller_approval(
         rejected = (await _request(rejected_reader, rejected_writer, 40, "hello", {
             "protocol_version": "1.2", "role": "observer", "features": ["serve_observers"],
         }))[-1]
-        assert rejected["error"]["code"] == -32004
+        assert rejected["error"]["code"] == -32001
         released.clear()
         rejected_writer.close()
         await rejected_writer.wait_closed()

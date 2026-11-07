@@ -305,7 +305,9 @@ class DeliveryRequests:
                 for entry in dropped:
                     row = event_contract.delivery_status_row(entry)
                     await connections.publish_controller(
-                        "delivery_status",
+                        event_contract.AUXILIARY_WIRE_EVENTS[
+                            event_contract.AuxiliaryEvent.DELIVERY_STATUS
+                        ],
                         session_id,
                         required_feature="session_history_fidelity",
                         **{key: value for key, value in row.items() if key != "event"},

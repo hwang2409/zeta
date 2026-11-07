@@ -7,6 +7,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from ..protocol.types import PROTOCOL_ERROR_CODES
+
 PROTOCOL_VERSION = "1.2"
 SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # Optional 1.1 features. A client opts in through ``hello.features``; the
@@ -134,6 +136,14 @@ def _observe_write(task: asyncio.Future[bool]) -> None:
         task.exception()
 
 
+def _check_error_code(code: int) -> None:
+    if code not in PROTOCOL_ERROR_CODES:
+        raise ValueError(
+            f"undocumented serve error code {code}; add it to "
+            "PROTOCOL_ERROR_CODES and docs/serve-protocol.md"
+        )
+
+
 class ProtocolError(Exception):
     """A JSON-RPC error that can be returned to the client."""
 
@@ -145,6 +155,7 @@ class ProtocolError(Exception):
         *,
         request_id: str | int | None = None,
     ) -> None:
+        _check_error_code(code)
         super().__init__(message)
         self.code = code
         self.message = message
@@ -272,6 +283,7 @@ class FrameCodec:
         message: str,
         data: object | None = None,
     ) -> bytes:
+        _check_error_code(code)
         error: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
             error["data"] = data
@@ -348,6 +360,7 @@ class FrameCodec:
     def _minimal_error(
         self, request_id: str | int | None, code: int, message: str
     ) -> bytes:
+        _check_error_code(code)
         safe_id = _safe_request_id(request_id)
         value = {
             "jsonrpc": "2.0",
