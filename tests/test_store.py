@@ -129,6 +129,7 @@ def test_non_indexed_store_avoids_receipt_prewrite_fstat(
             write_fstats += 1
         return real_fstat(fd)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(os, "fstat", count_fstat)
     store.append_message(message(MessageRole.USER, "one"))
 
@@ -403,6 +404,7 @@ def test_live_lifecycle_updates_do_not_write_and_finish_persists_final_stats(
         writes.append(name)
         write_session_file(directory_fd, name, value)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(agent_state, "write_session_file", record_write)
 
     store.update_agent_lifecycle(current_step="turn 2: running")
@@ -442,6 +444,7 @@ def test_child_turn_progress_does_not_write_parent_state(
     def fail_write(*args: object, **kwargs: object) -> None:
         raise AssertionError("progress must not write session_state.json")
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(store, "_write_session_state", fail_write)
 
     store.update_agent_child_turns(call.id, 4)
@@ -709,6 +712,7 @@ def test_installed_hook_emits_after_durable_resident_single_append(
         assert (durable["seq"], durable["id"]) == (delta[-1].seq, delta[-1].id)
         observed.append(delta)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(store, "_write_bytes", tracked_write_bytes)
     store.on_entries_installed = installed
 
@@ -776,6 +780,7 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
         assert gate.acquire(blocking=False), "callback re-entered before flock release"
         real_flock(fd, operation)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr("zeta.core.store._store.fcntl.flock", gated_flock)
     observed: list[str] = []
 
@@ -931,6 +936,7 @@ async def test_async_appends_encode_only_new_rows(
         encoded_rows += 1
         return original_encode(entry)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_encoded_entry_line", staticmethod(tracked_encode)
     )
@@ -977,6 +983,7 @@ async def test_installed_hook_async_failure_keeps_receipt_bookkeeping(
         assert receipts_accepted
         raise RuntimeError("observer failed")
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(store, "_accept_persisted_appends", accept)
     store.on_entries_installed = fail
 
@@ -1012,6 +1019,7 @@ async def test_installed_hook_async_writer_publishes_on_owner_thread(
         assert delta != "reset"
         delta[0].data["message"]["content"][0]["text"] = "corrupted"
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(type(store), "_owned_installed_delta", staticmethod(tracked_copy))
     store.on_entries_installed = installed
 
@@ -1218,6 +1226,7 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
         load_threads.append(threading.get_ident())
         original_load_full(candidate)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
     if foreign_change == "branch":
         foreign = ConversationStore(tmp_path, session_id=store.session_id)
@@ -1323,6 +1332,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         active_rows_by_thread[thread] = active_rows_by_thread.get(thread, 0) + 1
         original_record_active_entry(candidate, entry)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_record_active_entry", observed_record_active_entry
     )
@@ -1334,6 +1344,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
             state = replace(state, entries=ObservedEntries(state.entries))
         return state
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_detach_log_state", observed_detach)
     original_install = ConversationStore._install_committed_delta
 
@@ -1341,6 +1352,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         install_threads.append(threading.get_ident())
         return original_install(candidate, delta)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_install_committed_delta", observed_install)
     # Guard the outgoing resident branch too: the loop detaches it during install.
     store._entries = ObservedEntries(store._entries)
@@ -1383,6 +1395,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
             assert release_snapshot.wait(timeout=5)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_run_committed_mutation", block_first_worker_snapshot
     )
@@ -1415,6 +1428,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
         assert release_worker.wait(timeout=5)
         return original_write(candidate, *args)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
@@ -1450,6 +1464,7 @@ async def test_async_publish_matches_fresh_load_after_each_owner_worker_race(
         assert release_worker.wait(timeout=5)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
     for index in range(20):
         block_before_commit = index % 2 == 0
@@ -1487,6 +1502,7 @@ async def test_durable_publish_preserves_newer_owner_state(
         assert release_commit.wait(timeout=5)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
@@ -1541,6 +1557,7 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
         assert release_snapshot.wait(timeout=5)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_load)
     refresh = asyncio.create_task(store._refresh_off_loop())
     assert await asyncio.to_thread(snapshot_ready.wait, 2)
@@ -1599,6 +1616,7 @@ async def test_off_loop_refresh_is_bounded_under_owner_writes(
         assert changed.wait(timeout=2)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_run_committed_mutation", load_during_owner_write
     )
@@ -1642,6 +1660,7 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
         assert changed.wait(timeout=2)
         return outcome
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_run_committed_mutation", blocked_write)
     write = asyncio.create_task(
         store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
@@ -1678,6 +1697,7 @@ async def test_off_loop_refresh_cancellation_is_prompt(
         assert release.wait(timeout=5)
         original_before(candidate)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_before_committed_mutation", blocked_load)
     refresh = asyncio.create_task(store._refresh_off_loop())
     assert await asyncio.to_thread(started.wait, 2)
@@ -1707,6 +1727,7 @@ async def test_async_writes_reuse_one_detached_store_open(
             open_count += 1
         original_init(instance, *args, **kwargs)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "__init__", count_open)
 
     await asyncio.gather(
@@ -1737,6 +1758,7 @@ async def test_async_write_failure_discards_writer_before_next_write(
         open_count += 1
         return original_open()
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(store, "_new_persistent_durable_writer", count_open)
     real_fsync = os.fsync
     failed = True
@@ -1887,6 +1909,7 @@ async def test_async_batch_is_never_partially_visible_in_memory(
         visible_during_install.update(entry.type for entry in store.entries)
         release_install.set()
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(store, "_before_incremental_state_install", block_before_install)
     observer = threading.Thread(target=observe_while_blocked)
     observer.start()
@@ -2708,6 +2731,7 @@ def test_approval_states_snapshot_uses_resident_indexes(
     ) -> ConversationEntry:
         raise AssertionError(f"approval snapshot parsed {value!r}")
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationEntry, "from_dict", classmethod(fail_if_parsed)
     )
@@ -3028,6 +3052,7 @@ def test_append_message_with_approvals_copies_only_new_entry(
         copied.append(entry.type)
         return snapshot(entry)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_snapshot_entry", staticmethod(counting_snapshot)
     )
@@ -3062,6 +3087,7 @@ def test_all_agent_notifications_copy_only_notification_rows(
         copied.append(entry.type)
         return snapshot(entry)
 
+    # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
         ConversationStore, "_snapshot_entry", staticmethod(counting_snapshot)
     )
@@ -3142,24 +3168,14 @@ async def test_async_store_dispatches_a_typed_mutation(
 ) -> None:
     store = ConversationStore(tmp_path)
     observed: list[object] = []
-    if hasattr(store, "_run_committed_mutation"):
-        original = store._run_committed_mutation
+    original = store._run_committed_mutation
 
-        def capture(command: object, *args: object, **kwargs: object) -> object:
-            observed.append(command)
-            return original(command, *args, **kwargs)
+    def capture(command: object, *args: object, **kwargs: object) -> object:
+        observed.append(command)
+        return original(command, *args, **kwargs)
 
-        # test-contract: seam records the typed worker command
-        monkeypatch.setattr(store, "_run_committed_mutation", capture)
-    else:
-        original = store._run_durable_write
-
-        def capture(method_name: str, *args: object, **kwargs: object) -> object:
-            observed.append(method_name)
-            return original(method_name, *args, **kwargs)
-
-        # test-contract: seam records the legacy string dispatch on the base
-        monkeypatch.setattr(store, "_run_durable_write", capture)
+    # test-contract: seam records the typed worker command
+    monkeypatch.setattr(store, "_run_committed_mutation", capture)
     try:
         await store.append_message_async(message(MessageRole.ASSISTANT, "typed"))
 

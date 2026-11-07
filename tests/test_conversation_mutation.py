@@ -5,7 +5,7 @@ import gc
 import json
 import multiprocessing
 import threading
-from multiprocessing.synchronize import Event as ProcessEvent
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import pytest
@@ -27,15 +27,14 @@ from zeta.core.store import (
 def _hold_conversation_owner(
     sessions: str,
     session_id: str,
-    ready: ProcessEvent,
-    release: ProcessEvent,
+    control: Connection,
 ) -> None:
     store = ConversationStore(
         Path(sessions), session_id=session_id, _owner_surface="tui"
     )
-    ready.set()
+    control.send("ready")
     try:
-        assert release.wait(10)
+        assert control.recv() == "release"
     finally:
         store.close()
 
@@ -328,15 +327,16 @@ async def test_address_commit_owner_refusal_writes_nothing(
     await asyncio.to_thread(created.close)
     before = (created.path.read_bytes(), created.path.stat().st_mtime_ns)
     context = multiprocessing.get_context("spawn")
-    ready = context.Event()
-    release = context.Event()
+    parent_control, child_control = context.Pipe()
     process = context.Process(
         target=_hold_conversation_owner,
-        args=(str(sessions), "root", ready, release),
+        args=(str(sessions), "root", child_control),
     )
     process.start()
     try:
-        assert await asyncio.wait_for(asyncio.to_thread(ready.wait, 10), 11)
+        assert await asyncio.wait_for(
+            asyncio.to_thread(parent_control.recv), 11
+        ) == "ready"
         with pytest.raises(ConversationTargetOwned) as raised:
             await commit_conversation_async(
                 ConversationAddress("project", "root", "root"),
@@ -345,13 +345,15 @@ async def test_address_commit_owner_refusal_writes_nothing(
         assert raised.value.owner_surface == "tui"
         assert (created.path.read_bytes(), created.path.stat().st_mtime_ns) == before
     finally:
-        release.set()
+        parent_control.send("release")
         await asyncio.wait_for(asyncio.to_thread(process.join, 10), 11)
         if process.is_alive():
             process.terminate()
             await asyncio.to_thread(process.join, 10)
         process.close()
-        del process, ready, release
+        child_control.close()
+        parent_control.close()
+        del process, child_control, parent_control
         gc.collect()
 
 
@@ -379,3 +381,144 @@ async def test_address_commit_without_resident_replays_on_later_open(
         assert [entry.data["message"] for entry in reopened.entries] == ["transient"]
     finally:
         await asyncio.to_thread(reopened.close)
+
+
+def test_sync_and_async_adapters_have_the_same_typed_delta(tmp_path: Path) -> None:
+    sync = ConversationStore(tmp_path / "sync")
+    async_store = ConversationStore(tmp_path / "async")
+    try:
+        command = AppendConversationRows((_warning("same"),), result="ok")
+        sync_delta = sync.commit(command, sync.conversation_generation)
+        async_store.bind_owner_thread()
+        async_delta = asyncio.run(
+            async_store.commit_async(command, async_store.conversation_generation)
+        )
+        assert async_delta.result == sync_delta.result == "ok"
+        assert (
+            async_delta.committed_entries[0].data
+            == sync_delta.committed_entries[0].data
+        )
+        assert (
+            async_delta.entries_to_install[0].data
+            == sync_delta.entries_to_install[0].data
+        )
+        assert async_delta.generation_after == sync_delta.generation_after
+    finally:
+        sync.close()
+        async_store.close()
+
+
+def test_dedupe_scope_includes_namespace_and_conversation(tmp_path: Path) -> None:
+    key = ConversationDedupeKey("scope", "same-id")
+    first = ConversationStore(tmp_path / "first")
+    second = ConversationStore(tmp_path / "second")
+    try:
+        first.commit(
+            AppendConversationRows((_warning("first"),), key),
+            first.conversation_generation,
+        )
+        other = second.commit(
+            AppendConversationRows((_warning("second"),), key),
+            second.conversation_generation,
+        )
+        assert other.duplicate is False
+        different = first.commit(
+            AppendConversationRows(
+                (_warning("different"),), ConversationDedupeKey("other", "same-id")
+            ),
+            first.conversation_generation,
+        )
+        assert different.duplicate is False
+        assert [entry.data["message"] for entry in first.entries] == [
+            "first",
+            "different",
+        ]
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_address_commit_cancellation_after_resident_durable_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    sessions = home / "sessions"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    store = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    (store.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": "project"}), encoding="utf-8"
+    )
+    store.bind_owner_thread()
+    committed = threading.Event()
+    release = threading.Event()
+    original = store._run_committed_mutation
+
+    def pause_after_commit(
+        command: object, generation: int, cancelled: threading.Event
+    ) -> object:
+        result = original(command, generation, cancelled)
+        committed.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(store, "_run_committed_mutation", pause_after_commit)
+    task = asyncio.create_task(
+        commit_conversation_async(
+            ConversationAddress("project", "root", "root"),
+            AppendConversationRows((_warning("address durable"),)),
+        )
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(committed.wait, 10), 11)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert [entry.data["message"] for entry in store.entries] == ["address durable"]
+        generation = store.conversation_generation
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(store.close)
+    reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
+    try:
+        assert reopened.conversation_generation == generation
+        assert [entry.data["message"] for entry in reopened.entries] == [
+            "address durable"
+        ]
+    finally:
+        await asyncio.to_thread(reopened.close)
+
+
+def test_typed_mutation_deletion_gate(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    try:
+        assert not hasattr(store, "_run_durable_write")
+        assert not hasattr(store, "_to_thread_durable")
+        delta = store.commit(
+            AppendConversationRows((_warning("public"),), result="public"),
+            store.conversation_generation,
+        )
+        assert delta.result == "public"
+    finally:
+        store.close()
+
+
+def test_append_validation_matches_replay_validation(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    try:
+        before = store.path.read_bytes()
+        with pytest.raises(ConversationIntegrityError, match="invalid payload"):
+            store.commit(
+                AppendConversationRows((ConversationRow("warning", {"message": 3}),)),
+                store.conversation_generation,
+            )
+        assert store.path.read_bytes() == before
+        with pytest.raises(ValueError, match="invalid payload"):
+            store._append_row("warning", {"message": 3})
+        assert store.path.read_bytes() == before
+    finally:
+        store.close()
