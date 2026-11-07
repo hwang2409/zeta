@@ -99,7 +99,13 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(tmp_p
     )
     app = await _make_app(tmp_path, owner, owner.store.session_id)
     wakes: list[bool] = []
-    app._schedule_background_wake = lambda: wakes.append(True)
+    wake_event = asyncio.Event()
+
+    def record_wake() -> None:
+        wakes.append(True)
+        wake_event.set()
+
+    app._schedule_background_wake = record_wake
     try:
         app._active_session.app.output = _FixedOutput()
         screen = Screen()
@@ -122,6 +128,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(tmp_p
         await asyncio.sleep(0)
         _press(app, "1")
         await asyncio.sleep(0)
+        await asyncio.wait_for(wake_event.wait(), 10)
         await asyncio.wait_for(
             asyncio.to_thread(_wait_for_records, tmp_path, owner.store.session_id, {r.id for r in records}),
             10,
