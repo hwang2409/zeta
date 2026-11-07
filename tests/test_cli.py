@@ -3,20 +3,21 @@ from __future__ import annotations
 import argparse
 import os
 import pty
-import select
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
 
+from tests.support.processes import read_pty_until, reap_process
 from zeta.cli.main import build_parser, main
 from zeta.core.commands.completion import completion_script
 from zeta.project_registry import ProjectRegistry
 
 
-def test_removed_fake_provider_has_clear_cli_error(capsys: pytest.CaptureFixture[str]) -> None:
+def test_removed_fake_provider_has_clear_cli_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit, match="2"):
         build_parser().parse_args(["--provider", "fake"])
 
@@ -52,7 +53,9 @@ class _TTYOutput:
         pass
 
 
-def _seed_cli_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ProjectRegistry, str, Path]:
+def _seed_cli_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ProjectRegistry, str, Path]:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
@@ -71,7 +74,9 @@ def _seed_cli_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[P
     return registry, project.project_id, repo
 
 
-def test_cli_memory_accept_refuses_non_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_memory_accept_refuses_non_interactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
     assert main(["project", "memory", "accept", "state.md"]) != 0
     error = capsys.readouterr().err
@@ -79,7 +84,9 @@ def test_cli_memory_accept_refuses_non_interactive(tmp_path: Path, monkeypatch: 
     assert registry.memory_log(project_id)[-1]["provenance"] != {"accepted_by": "user"}
 
 
-def test_cli_memory_accept_refuses_inside_tool_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_memory_accept_refuses_inside_tool_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
     monkeypatch.setenv("ZETA_TOOL_SUBPROCESS", "1")
     stdin = _TTYInput("accept\n")
@@ -90,7 +97,9 @@ def test_cli_memory_accept_refuses_inside_tool_subprocess(tmp_path: Path, monkey
     assert registry.memory_log(project_id)[-1]["provenance"] != {"accepted_by": "user"}
 
 
-def test_cli_memory_accept_interactive_confirmation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_memory_accept_interactive_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
     stdin = _TTYInput("state.md\n")
     stdout = _TTYOutput()
@@ -165,26 +174,6 @@ def _parser_options(parser: argparse.ArgumentParser) -> set[str]:
     }
 
 
-def _read_pty(
-    fd: int, timeout: float = 2.0, *, until: bytes | None = None
-) -> bytes:
-    output = b""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([fd], [], [], deadline - time.monotonic())
-        if not ready:
-            break
-        try:
-            output += os.read(fd, 4096)
-        except OSError:
-            break
-        if until is not None and until in output:
-            return output
-    if until is not None:
-        raise AssertionError(f"PTY did not emit {until!r} within {timeout}s: {output!r}")
-    return output
-
-
 def _run_zsh_completion(
     script: str, line: bytes, tmp_path: Path, *, cwd: Path | None = None
 ) -> bytes:
@@ -218,16 +207,22 @@ def _run_zsh_completion(
         )
         os.close(slave)
         slave = -1
-        _read_pty(master, timeout=30, until=b"ZETA_READY> ")
+        output = bytearray()
+        read_pty_until(master, b"ZETA_READY> ", process=process, output=output)
+        start = len(output)
         os.write(master, line + b"\t")
-        output = _read_pty(master, timeout=30, until=b"\x1eZETA_COMPLETE\x1f")
-        process.kill()
-        process.wait(timeout=5)
-        return output
+        read_pty_until(
+            master,
+            b"\x1eZETA_COMPLETE\x1f",
+            process=process,
+            output=output,
+            start=start,
+        )
+        reap_process(process, timeout=0)
+        return bytes(output[start:])
     finally:
         if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
+            reap_process(process, timeout=0)
         if slave >= 0:
             os.close(slave)
         os.close(master)
@@ -237,26 +232,53 @@ def _run_bash_completion(script: Path, line: bytes, tmp_path: Path) -> bytes:
     tmp_path.mkdir()
     master, slave = pty.openpty()
     process = None
+    ready_marker = b"\x1eZETA_BASH_READY\x1f"
+    sourced_marker = b"\x1eZETA_BASH_SOURCED\x1f"
+    complete_marker = b"\x1eZETA_BASH_COMPLETE\x1f"
     try:
         process = subprocess.Popen(
             ["bash", "--noprofile", "--norc", "-i"],
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "HOME": str(tmp_path)},
+            env={
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PS1": ready_marker.decode(),
+            },
             cwd=tmp_path,
         )
         os.close(slave)
         slave = -1
-        _read_pty(master)
-        os.write(master, f"source {script}\n".encode())
-        _read_pty(master)
-        os.write(master, line + b"\t\t")
-        return _read_pty(master)
+        output = bytearray()
+        read_pty_until(master, ready_marker, process=process, output=output)
+        start = len(output)
+        os.write(
+            master,
+            (
+                f"source {script}; "
+                # test-contract: seam wrap real completion to emit candidates and done.
+                "_zeta_definition=$(declare -f _zeta_completions); "
+                'eval "${_zeta_definition/_zeta_completions/'
+                '_zeta_test_completions}"; '
+                "_zeta_completions() { _zeta_test_completions; "
+                "printf '\\n%s\\n\\036ZETA_BASH_COMPLETE\\037' "
+                '"${COMPREPLY[*]}"; }; '
+                "printf '\\036ZETA_BASH_SOURCED\\037'\n"
+            ).encode(),
+        )
+        read_pty_until(
+            master, sourced_marker, process=process, output=output, start=start
+        )
+        start = len(output)
+        os.write(master, line + b"\t")
+        read_pty_until(
+            master, complete_marker, process=process, output=output, start=start
+        )
+        return bytes(output[start:])
     finally:
         if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
+            reap_process(process, timeout=0)
         if slave >= 0:
             os.close(slave)
         os.close(master)
@@ -277,17 +299,10 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
     )
     mcp = _run_zsh_completion(script, b"zeta mcp ", tmp_path / "mcp")
     mcp_add = _run_zsh_completion(script, b"zeta mcp add --", tmp_path / "mcp-add")
-    mcp_show = _run_zsh_completion(
-        script, b"zeta mcp show --", tmp_path / "mcp-show"
-    )
+    mcp_show = _run_zsh_completion(script, b"zeta mcp show --", tmp_path / "mcp-show")
 
     assert b"bad substitution" not in (
-        top_level
-        + session
-        + provider
-        + mcp
-        + mcp_add
-        + mcp_show
+        top_level + session + provider + mcp + mcp_add + mcp_show
     )
     assert b"login" in top_level and b"completion" in top_level
     assert b"list" in session and b"rename" in session
@@ -295,7 +310,6 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
     assert b"add" in mcp and b"login" in mcp and b"logout" in mcp
     assert b"--scope" in mcp_add and b"--url" in mcp_add and b"--oauth" in mcp_add
     assert b"--scope" in mcp_show and b"--json" in mcp_show
-
 
 
 def test_bash_completion_runs_live_for_global_options(tmp_path) -> None:
@@ -332,7 +346,6 @@ probe zeta mcp show --
     assert "add" in lines[3] and "login" in lines[3] and "logout" in lines[3]
     assert "--scope" in lines[4] and "--url" in lines[4] and "--oauth" in lines[4]
     assert "--scope" in lines[5] and "--json" in lines[5]
-
 
 
 def test_bash_completion_routes_split_equals_options_in_a_live_shell(tmp_path) -> None:

@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TypeVar
 
@@ -63,6 +63,7 @@ MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
+MAX_SSE_EVENT_ID_BYTES = 8192
 NOTIFICATION_RECONNECT_INITIAL_SECONDS = 0.1
 NOTIFICATION_RECONNECT_MAX_SECONDS = 5.0
 NOTIFICATION_STREAM_HEALTHY_SECONDS = 5.0
@@ -71,6 +72,12 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
 
 T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class _ActiveRequest:
+    task: asyncio.Task[dict[str, object]] | None = None
+    response: httpx.Response | None = None
 
 
 class StreamableHTTPMCPClient(MCPClient):
@@ -87,6 +94,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
         self._owns_client = client is None
         self._session_id: str | None = None
+        self._notification_event_id: bytes | None = None
         self.protocol_version: str | None = None
         self.capabilities: dict[str, object] = {}
         self._next_id = 0
@@ -94,6 +102,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
+        self._active_requests: dict[asyncio.Task[object], _ActiveRequest] = {}
+        self._deadline_cleanups: set[asyncio.Task[None]] = set()
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._limits = limits or MCPCallLimits()
@@ -196,10 +206,55 @@ class StreamableHTTPMCPClient(MCPClient):
             self._notification_task.cancel()
             await asyncio.gather(self._notification_task, return_exceptions=True)
             self._notification_task = None
+        await self._drain_active_requests()
         if self._owns_client:
             await self._client.aclose()
         if self._owns_spill_store:
             self._spill_store.close()
+
+    async def _drain_active_requests(self) -> None:
+        active_tasks = tuple(
+            state.task
+            for state in self._active_requests.values()
+            if state.task is not None
+        )
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks or self._deadline_cleanups:
+            await asyncio.gather(
+                *active_tasks, *tuple(self._deadline_cleanups), return_exceptions=True
+            )
+
+    def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
+        """Close only the timed-out HTTP response and retain cleanup ownership."""
+
+        state = self._active_requests.get(owner)
+        if state is None or state.task is None:
+            return
+        cleanup = asyncio.create_task(self._cleanup_deadline_request(state))
+        self._deadline_cleanups.add(cleanup)
+        cleanup.add_done_callback(self._deadline_cleanups.discard)
+
+    async def _cleanup_deadline_request(self, state: _ActiveRequest) -> None:
+        task = state.task
+        if task is None:
+            return
+        task.cancel()
+        response = state.response
+        if response is not None:
+            try:
+                await asyncio.wait_for(response.aclose(), HTTP_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning(
+                    "failed to close an MCP HTTP deadline response", exc_info=True
+                )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(task, return_exceptions=True)),
+                HTTP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("timed out joining an MCP HTTP deadline request")
 
     async def _request(
         self,
@@ -217,9 +272,20 @@ class StreamableHTTPMCPClient(MCPClient):
             "method": method,
             "params": dict(params),
         }
-        request_task = asyncio.create_task(self._send_with_auth(payload, request_id))
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("MCP HTTP request requires an asyncio task")
+        state = _ActiveRequest()
+        request_task = asyncio.create_task(
+            self._send_with_auth(payload, request_id, state)
+        )
+        state.task = request_task
+        self._active_requests[owner] = state
         if abort_signal is None:
-            return await request_task
+            try:
+                return await request_task
+            finally:
+                self._active_requests.pop(owner, None)
         abort_task = asyncio.create_task(abort_signal.wait())
         try:
             done, _ = await asyncio.wait(
@@ -230,15 +296,23 @@ class StreamableHTTPMCPClient(MCPClient):
                 await asyncio.gather(request_task, return_exceptions=True)
                 raise MCPCanceled()
             return await request_task
+        except asyncio.CancelledError:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            raise
         finally:
+            self._active_requests.pop(owner, None)
             if not abort_task.done():
                 abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
 
     async def _send_with_auth(
-        self, payload: Mapping[str, object], request_id: int
+        self,
+        payload: Mapping[str, object],
+        request_id: int,
+        state: _ActiveRequest,
     ) -> dict[str, object]:
-        return await self._with_auth(lambda: self._send(payload, request_id))
+        return await self._with_auth(lambda: self._send(payload, request_id, state))
 
     async def _with_auth(self, send: Callable[[], Awaitable[T]]) -> T:
         if self.config.auth_type != "oauth":
@@ -330,7 +404,10 @@ class StreamableHTTPMCPClient(MCPClient):
         )
 
     async def _send(
-        self, payload: Mapping[str, object], request_id: int
+        self,
+        payload: Mapping[str, object],
+        request_id: int,
+        state: _ActiveRequest,
     ) -> dict[str, object]:
         headers = self._auth_headers()
         headers.update(
@@ -347,9 +424,11 @@ class StreamableHTTPMCPClient(MCPClient):
             async with self._client.stream(
                 "POST", self.config.url, headers=headers, json=dict(payload)
             ) as response:
+                state.response = response
                 session_id = response.headers.get("mcp-session-id")
-                if session_id is not None:
+                if session_id is not None and session_id != self._session_id:
                     self._session_id = session_id
+                    self._notification_event_id = None
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -373,6 +452,8 @@ class StreamableHTTPMCPClient(MCPClient):
                 return parse_rpc_response(value, request_id)
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
+        finally:
+            state.response = None
 
     async def _listen_notifications(self) -> None:
         if self._session_id is None:
@@ -404,29 +485,41 @@ class StreamableHTTPMCPClient(MCPClient):
             delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
 
     async def _listen_notification_stream(self) -> bool:
-        if self._session_id is None:
+        session_id = self._session_id
+        if session_id is None:
             return False
+        last_event_id = self._notification_event_id
         headers = self._auth_headers()
         headers["accept"] = "text/event-stream"
-        headers["mcp-session-id"] = self._session_id
+        headers["mcp-session-id"] = session_id
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
+        request_headers = httpx.Headers(headers)
+        if last_event_id:
+            request_headers = httpx.Headers(
+                [*request_headers.raw, (b"last-event-id", last_event_id)]
+            )
         try:
             async with self._client.stream(
-                "GET", self.config.url, headers=headers
+                "GET", self.config.url, headers=request_headers
             ) as response:
                 if response.status_code >= 400:
                     detail = await _response_detail(response)
-                    raise MCPHTTPError(
-                        response.status_code, detail or "request failed"
-                    )
+                    raise MCPHTTPError(response.status_code, detail or "request failed")
                 started = asyncio.get_running_loop().time()
                 delivered = False
-                async for value in _iter_sse_events(
+                async for event in _iter_sse_event_records(
                     response, self._spill_store, self._limits
                 ):
+                    if self._session_id != session_id:
+                        return delivered
+                    if event.event_id and event.event_id == last_event_id:
+                        continue
                     delivered = True
-                    _dispatch_sse_notification(value, self._notification_sink)
+                    if event.event_id is not None:
+                        last_event_id = event.event_id
+                        self._notification_event_id = event.event_id
+                    _dispatch_sse_notification(event.value, self._notification_sink)
                 return delivered or (
                     asyncio.get_running_loop().time() - started
                     >= NOTIFICATION_STREAM_HEALTHY_SECONDS
@@ -480,9 +573,7 @@ class StreamableHTTPMCPClient(MCPClient):
 
             return _ENV_PATTERN.sub(replace, value)
 
-        headers = {
-            name: resolve(value) for name, value in self.config.headers.items()
-        }
+        headers = {name: resolve(value) for name, value in self.config.headers.items()}
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         elif self.config.auth_type == "oauth" and self._current_token is not None:
@@ -492,14 +583,22 @@ class StreamableHTTPMCPClient(MCPClient):
 
 
 async def _drain_pages(
-    request, method: str, parser, label: str,
-    *, abort_signal: AbortSignal | None = None,
+    request,
+    method: str,
+    parser,
+    label: str,
+    *,
+    abort_signal: AbortSignal | None = None,
 ) -> list:
     if abort_signal is not None:
         request = partial(request, abort_signal=abort_signal)
     return await drain_pages(
-        request, method, parser, label,
-        max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+        request,
+        method,
+        parser,
+        label,
+        max_pages=MAX_LIST_PAGES,
+        max_items=MAX_LIST_ITEMS,
     )
 
 
@@ -580,6 +679,12 @@ def _dispatch_sse_notification(
         notification_sink(method)
 
 
+@dataclass(frozen=True)
+class _SSEEvent:
+    value: object
+    event_id: bytes | None
+
+
 async def _iter_sse_events(
     response: httpx.Response,
     spill_store: SpillStore,
@@ -587,10 +692,24 @@ async def _iter_sse_events(
     *,
     aggregate_call: bool = False,
 ) -> AsyncIterator[object]:
-    """Parse SSE JSON events without materializing oversized data fields."""
+    async for event in _iter_sse_event_records(
+        response, spill_store, limits, aggregate_call=aggregate_call
+    ):
+        yield event.value
+
+
+async def _iter_sse_event_records(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    limits: MCPCallLimits,
+    *,
+    aggregate_call: bool = False,
+) -> AsyncIterator[_SSEEvent]:
+    """Parse SSE JSON events without materializing oversized fields."""
 
     envelope = MCPCallEnvelope(limits, spill_store)
     has_data_line = False
+    event_id: bytes | None = None
     event_wire_bytes = 0
     call_wire_bytes = 0
 
@@ -616,17 +735,23 @@ async def _iter_sse_events(
         if data:
             await envelope.append(data)
 
-    async def parse_event() -> object:
-        nonlocal envelope, has_data_line
+    async def parse_event() -> _SSEEvent:
+        nonlocal envelope, event_id, has_data_line
         value = await envelope.finish_json()
+        parsed = _SSEEvent(value, event_id)
         envelope = MCPCallEnvelope(limits, spill_store)
         has_data_line = False
-        return value
+        event_id = None
+        return parsed
 
     line_prefix = bytearray()
     line_is_data = False
+    line_is_id = False
     line_ignored = False
     stripping_whitespace = True
+    id_value = bytearray()
+    id_valid = True
+    id_at_start = True
 
     async def feed_data(data: bytes) -> None:
         nonlocal stripping_whitespace
@@ -639,13 +764,30 @@ async def _iter_sse_events(
                 stripping_whitespace = False
         await append_data(data)
 
+    def feed_id(data: bytes) -> None:
+        nonlocal id_at_start, id_valid
+        if id_at_start:
+            id_at_start = False
+            if data.startswith(b" "):
+                data = data[1:]
+        if b"\x00" in data or len(id_value) + len(data) > MAX_SSE_EVENT_ID_BYTES:
+            id_valid = False
+            return
+        if id_valid:
+            id_value.extend(data)
+
     async def feed_line(data: bytes, *, end_line: bool) -> bool:
-        nonlocal line_is_data, line_ignored, stripping_whitespace
-        if not line_is_data and not line_ignored:
+        nonlocal event_id, line_is_data, line_is_id, line_ignored
+        nonlocal stripping_whitespace
+        if not line_is_data and not line_is_id and not line_ignored:
             needed = 5 - len(line_prefix)
             line_prefix.extend(data[:needed])
             data = data[needed:]
-            if len(line_prefix) == 5:
+            if len(line_prefix) >= 3 and line_prefix[:3] == b"id:":
+                line_is_id = True
+                data = bytes(line_prefix[3:]) + data
+                line_prefix.clear()
+            elif len(line_prefix) == 5:
                 if line_prefix == b"data:":
                     line_is_data = True
                     stripping_whitespace = True
@@ -654,16 +796,32 @@ async def _iter_sse_events(
                     line_ignored = True
         if line_is_data:
             await feed_data(data)
+        elif line_is_id:
+            feed_id(data)
         if not end_line:
             return False
-        return not line_is_data and not line_ignored and not line_prefix
+        if line_is_id and id_valid:
+            try:
+                id_value.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                event_id = bytes(id_value)
+        return (
+            not line_is_data and not line_is_id and not line_ignored and not line_prefix
+        )
 
     def reset_line() -> None:
-        nonlocal line_is_data, line_ignored, stripping_whitespace
+        nonlocal id_at_start, id_valid, line_is_data, line_is_id, line_ignored
+        nonlocal stripping_whitespace
         line_prefix.clear()
         line_is_data = False
+        line_is_id = False
         line_ignored = False
         stripping_whitespace = True
+        id_value.clear()
+        id_valid = True
+        id_at_start = True
 
     pending_cr = False
     pending_blank = False

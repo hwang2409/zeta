@@ -300,7 +300,7 @@ def test_tui_replays_start_row_through_real_renderer(tmp_path: Path) -> None:
         store.close()
 
 
-def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
+def test_agent_card_receipt_shows_identity_and_clean_state(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path, session_id="child")
     lifecycle = {
         "handle": "parent:1",
@@ -318,7 +318,16 @@ def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
         "final_result": "done",
     }
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
-    call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "child"})
+    call = ToolCall(
+        "agent-1",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "child",
+            "agent_type": "general",
+            "model": "gpt-5.6-luna",
+        },
+    )
     rendered = AgentCard.render_receipt(
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
@@ -327,6 +336,7 @@ def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
                 call.id,
                 "done",
                 structured_content={
+                    "child_instance_id": "parent:1",
                     "child_session_path": str(child.session_dir),
                     "status": "completed",
                     "turns_used": 2,
@@ -337,8 +347,7 @@ def test_agent_card_render_bytes_are_unchanged(tmp_path: Path) -> None:
     )
     assert rendered is not None
     assert rendered.plain == (
-        "child · 2 turns · 1.5s · completed · depth 1 · "
-        "done · 2 turns · 1.5s · 3 tool calls · error=false · canceled=false"
+        "general · child :1 · 2 turns · 1.5s · completed · depth 1 · 3 tool calls · gpt-5.6-luna · done"
     )
     child.close()
 
