@@ -24,6 +24,7 @@ from zeta.mcp.client import translate_call_result
 from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import _spill as spill_module
 from zeta.tools import fetch as fetch_tool
 from zeta.tools._spill import SpillStore
 
@@ -759,6 +760,71 @@ async def test_bash_large_output_spills(tmp_path: Path) -> None:
         assert spilled.read_text() == f"stdout:\n{output}\nstderr:\n"
         assert result["structuredContent"]["stdout"].startswith("line\n")
         await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_child_spills_share_one_root_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = 150
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = 100
+        second.spills.max_bytes = 100
+        try:
+            old_path = first.spills.write_bytes(
+                "tool", "first", 0, b"a" * 100
+            )
+            spill_full = None
+            try:
+                second.spills.write_bytes("tool", "second", 0, b"b" * 100)
+            except RuntimeError as exc:
+                spill_full = exc
+
+            total = sum(
+                path.stat().st_size
+                for store in (first, second)
+                if store.spills.root.exists()
+                for path in store.spills.root.iterdir()
+                if not path.name.startswith(".")
+            )
+            assert total <= shared_cap
+            assert spill_full is not None
+            assert "spill budget is full" in str(spill_full)
+
+            new_path = first.spills.write_bytes("tool", "new", 0, b"b" * 100)
+            other_path = second.spills.write_bytes("tool", "other", 0, b"c" * 50)
+            assert not old_path.exists()
+            assert new_path.read_bytes() == b"b" * 100
+            assert other_path.read_bytes() == b"c" * 50
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
 
 
 @pytest.mark.asyncio
