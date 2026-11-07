@@ -42,7 +42,11 @@ def login_failure_message(exc: Exception) -> str:
         )
     if isinstance(exc, ValueError):
         return prefix + "invalid login settings; check the provider and account label"
-    return prefix + f"unexpected {type(exc).__name__}; check zeta logs and retry"
+    return (
+        prefix
+        + f"unexpected {type(exc).__name__}; retry from a fresh terminal and report "
+        "this error type"
+    )
 
 
 def login_named_account(
