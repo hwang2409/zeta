@@ -400,7 +400,6 @@ class AgentLoop(
         reason: Literal["clear", "turn_end"] = "clear",
     ) -> int:
         return self.store.drop_client_steering(reason)
-
     def drop_pending_steering(
         self,
         reason: Literal["abort", "disconnect", "turn_end", "failed"],
