@@ -127,7 +127,9 @@ def save_token(
         target = token_store_path(name, root)
         values = asdict(token)
         values.pop("client_secret", None)
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_fd = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
         try:
             lease.publish_json(
                 directory_fd,
