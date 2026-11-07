@@ -389,6 +389,47 @@ async def test_same_tick_approval_reservation_winner(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_first_settlement_can_retry_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        store = server.runtime.opened.store
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_write = store._to_thread_durable
+        first = True
+
+        async def blocked_write(*args: object, **kwargs: object) -> object:
+            nonlocal first
+            if first:
+                first = False
+                entered.set()
+                await release.wait()
+            return await original_write(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_to_thread_durable", blocked_write)
+        settlement = asyncio.create_task(
+            server.control.resolve_approval("approve", call.id)
+        )
+        await asyncio.wait_for(entered.wait(), 10)
+        settlement.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await settlement
+        retry = server.control._terminate_pending_approvals()
+        assert retry is not None
+        async with asyncio.timeout(10):
+            await retry
+        assert store.approval_resolution_data(call.id)["decision"] == "abort"
+        assert call.id not in server.control._approvals.state.records
+    finally:
+        release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_always_tool_grant_waits_for_durable_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
