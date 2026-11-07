@@ -3450,17 +3450,14 @@ async def test_account_warning_waits_for_successful_hello(tmp_path: Path) -> Non
         await writer.wait_closed()
         await asyncio.sleep(0)
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-        try:
-            hello = await _request(
-                reader, writer, 1, "hello", {"protocol_version": "1.0"}
-            )
-            assert hello[-1]["result"]["notices"] == [
-                "could not clean up account directory /secret"
-            ]
-        finally:
-            await close_serve(server, writer)
+        hello = await _request(
+            reader, writer, 1, "hello", {"protocol_version": "1.0"}
+        )
+        assert hello[-1]["result"]["notices"] == [
+            "could not clean up account directory /secret"
+        ]
     finally:
-        await server.close()
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,23 +27,62 @@ def _is_close_serve_call(node: ast.AST) -> bool:
 
 
 def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
-    """Line numbers of close_serve calls nested in an if/elif/else body.
-
-    close_serve owns serve-test cleanup; gating it behind a condition is the
-    recurring bug where an early failure skips the server/writer close and
-    leaks descriptors into the next test (PR #881 rounds 1-2). The guard has no
-    exemptions: a call that needs a condition is rewritten to the unconditional
-    form instead.
-    """
+    """Line numbers of close_serve calls that are not unconditional cleanup."""
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
     lines: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.If):
-            for branch in (node.body, node.orelse):
-                for statement in branch:
-                    for inner in ast.walk(statement):
-                        if _is_close_serve_call(inner):
-                            lines.add(inner.lineno)
+        if not _is_close_serve_call(node):
+            continue
+        ancestors: list[ast.AST] = []
+        parent = parents.get(node)
+        while parent is not None:
+            ancestors.append(parent)
+            parent = parents.get(parent)
+        if any(
+            isinstance(ancestor, (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While))
+            for ancestor in ancestors
+        ):
+            lines.add(node.lineno)
+            continue
+        finally_ancestors = {
+            ancestor
+            for ancestor in ancestors
+            if isinstance(ancestor, ast.Try)
+            and any(
+                node is descendant
+                for statement in ancestor.finalbody
+                for descendant in ast.walk(statement)
+            )
+        }
+        if any(
+            isinstance(ancestor, ast.Try) and ancestor not in finally_ancestors
+            for ancestor in ancestors
+        ) and not finally_ancestors:
+            lines.add(node.lineno)
     return lines
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_offender"),
+    [
+        pytest.param("async def test():\n    close_serve(s) if ready else None\n", True, id="ternary"),
+        pytest.param("async def test():\n    for _ in ():\n        close_serve(s)\n", True, id="for"),
+        pytest.param("async def test():\n    while ready:\n        close_serve(s)\n", True, id="while"),
+        pytest.param("async def test():\n    try:\n        close_serve(s)\n    finally:\n        pass\n", True, id="try-body"),
+        pytest.param("async def test():\n    try:\n        pass\n    except Exception:\n        close_serve(s)\n", True, id="except-handler"),
+        pytest.param("async def test():\n    if ready:\n        try:\n            pass\n        finally:\n            close_serve(s)\n", True, id="if-around-finally"),
+        pytest.param("async def test():\n    try:\n        pass\n    finally:\n        close_serve(s)\n", False, id="finally"),
+        pytest.param("async def test():\n    close_serve(s)\n", False, id="function-top-level"),
+        pytest.param("async def test():\n    async with resource:\n        close_serve(s)\n", False, id="async-with"),
+    ],
+)
+def test_close_serve_guard_shapes(source: str, expected_offender: bool) -> None:
+    offenders = _conditional_close_serve_lines(ast.parse(source))
+    assert bool(offenders) is expected_offender
 
 
 def test_close_serve_is_never_called_under_a_condition() -> None:
@@ -175,23 +215,20 @@ async def test_close_serve_cleanup_outcomes(
         for index in range(writer_count)
     ]
 
-    outcome: BaseException | None = None
-    try:
+    expected_error = (
+        "writer close failed" if writer_failure else "server close failed" if server_failure else ""
+    )
+    context = (
+        pytest.raises(RuntimeError, match=expected_error)
+        if expected_error
+        else nullcontext()
+    )
+    with context:
         await close_serve(server, *writers)
-    except RuntimeError as error:
-        outcome = error
 
     assert server.closed
     assert all(writer.closed for writer in writers)
     assert all(writer.wait_started_with_server_shutdown for writer in writers)
-    if writer_failure:
-        assert isinstance(outcome, RuntimeError)
-        assert str(outcome) == "writer close failed"
-    elif server_failure:
-        assert isinstance(outcome, RuntimeError)
-        assert str(outcome) == "server close failed"
-    else:
-        assert outcome is None
 
 
 @pytest.mark.asyncio

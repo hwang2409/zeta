@@ -1053,30 +1053,29 @@ def test_documented_session_metadata_matches_the_serializer() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["approval", "tool"])
 async def test_abort_emits_turn_aborted_during_approval_and_tool_execution(
-    tmp_path: Path,
+    tmp_path: Path, stage: str,
 ) -> None:
-    for stage in ("approval", "tool"):
-        call = ToolCall(f"sleep-{stage}", "bash", {"command": "sleep 5"})
-        backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-        server = _server(tmp_path / stage, backend, _launch(tmp_path))
-        reader, writer = await _connect(server)
-        try:
-            await _legacy_hello(reader, writer)
-            await _request(reader, writer, 2, "new_session", {})
-            await _request(reader, writer, 3, "send", {"text": "wait"})
-            await _event(reader, "approval_request")
-            if stage == "tool":
-                await _request(reader, writer, 4, "approve", {"request_id": call.id})
-                await _event(reader, "tool_start")
-            frames = await _request(reader, writer, 5, "abort")
-            assert frames[-1]["result"] == {"aborted": True}
-            await _event(reader, "turn_aborted")
-            status = (await _request(reader, writer, 6, "status"))[-1]["result"]
-            assert status["state"] == "idle"
-        finally:
-            await close_serve(server, writer)
-
+    call = ToolCall(f"sleep-{stage}", "bash", {"command": "sleep 5"})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = _server(tmp_path / stage, backend, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        await _request(reader, writer, 2, "new_session", {})
+        await _request(reader, writer, 3, "send", {"text": "wait"})
+        await _event(reader, "approval_request")
+        if stage == "tool":
+            await _request(reader, writer, 4, "approve", {"request_id": call.id})
+            await _event(reader, "tool_start")
+        frames = await _request(reader, writer, 5, "abort")
+        assert frames[-1]["result"] == {"aborted": True}
+        await _event(reader, "turn_aborted")
+        status = (await _request(reader, writer, 6, "status"))[-1]["result"]
+        assert status["state"] == "idle"
+    finally:
+        await close_serve(server, writer)
 
 # Finding 7: list_sessions paging.
 
