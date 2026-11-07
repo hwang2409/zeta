@@ -17,7 +17,11 @@ from typing import Any, Literal, TypeVar
 
 from ...agent import recovery_lease
 from ...agent.background import BackgroundAgentOwner
-from ...agent.budget import DEFAULT_MAX_AGENT_DEPTH, HARD_MAX_AGENT_DEPTH
+from ...agent.budget import (
+    DEFAULT_MAX_AGENT_DEPTH,
+    HARD_MAX_AGENT_DEPTH,
+    agent_tool_available,
+)
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.pending_delivery import (
@@ -337,6 +341,8 @@ class AgentLoop(
             schemas = plan_mode_tool_schemas(
                 self.backend, schemas, policy=self._plan_mode_policy
             )
+        if not agent_tool_available(self.agent_depth, self.max_agent_depth):
+            schemas = [schema for schema in schemas if schema.get("name") != "agent"]
         return canonical_tool_schemas(schemas)
 
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:

@@ -6111,6 +6111,43 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("explicit_tool_schemas", [False, True])
+@pytest.mark.asyncio
+async def test_root_at_depth_cap_hides_agent_schema_and_rejects_forged_call(
+    tmp_path: Path, explicit_tool_schemas: bool
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("blocked")]),
+            ScriptedTurn([TextContent("complete")]),
+        ]
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path / "session"),
+        registry=registry,
+        tool_schemas=registry.schemas if explicit_tool_schemas else None,
+        max_agent_depth=0,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+    assert "agent" not in {
+        schema["name"] for schema in backend.calls[0][1]
+    }
+    refused_result = next(
+        message.tool_result
+        for message in backend.calls[1][0]
+        if message.tool_result and message.tool_result.tool_call_id == "blocked"
+    )
+    assert refused_result.is_error
+    assert refused_result.content.startswith(
+        "agent error: maximum agent nesting depth is 0"
+    )
+
+
 @pytest.mark.asyncio
 async def test_default_depth_allows_three_delegations_and_stops_there(
     tmp_path: Path,
