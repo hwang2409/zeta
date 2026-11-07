@@ -23,21 +23,26 @@ permissions:
 
 jobs:
   test:
-    name: pytest (${{ matrix.os }})
+    name: pytest (${{ matrix.os }}${{ matrix.python-version != '3.12' && format(', py{0}', matrix.python-version) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        include: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"}]') }}
     # Main keeps one running macOS job and only the newest pending commit.
     # Other matrix jobs use a unique group and cannot replace it.
     concurrency:
-      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}', github.workflow, github.sha, matrix.os) }}
+      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}-{3}', github.workflow, github.sha, matrix.os, matrix.python-version) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/pytest
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: ./.github/workflows/pytest
+        if: matrix.os == 'macos-latest'
 
   lint:
     name: ruff
