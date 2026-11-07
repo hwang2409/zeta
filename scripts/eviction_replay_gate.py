@@ -46,10 +46,13 @@ def _pointer_diff(left: Any, right: Any, pointer: str = "") -> str | None:
     return None if left == right else (pointer or "/")
 
 
-def _normalize_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ids: dict[str, str] = {}
-    for index, entry in enumerate(entries, 1):
-        ids[entry["id"]] = f"generated-{index:04d}"
+def _normalize_entries(
+    entries: list[dict[str, Any]], ids: dict[str, str], next_id: list[int]
+) -> list[dict[str, Any]]:
+    for entry in entries:
+        if entry["id"] not in ids:
+            next_id[0] += 1
+            ids[entry["id"]] = f"generated-{next_id[0]:04d}"
     def replace(value: Any) -> Any:
         if isinstance(value, dict):
             return {key: replace(ids.get(item, item) if key in {"id", "parent_id"} else item)
@@ -102,7 +105,16 @@ def _fixture_store(store_dir: Path) -> None:
         for index in range(48):
             name = names[index % len(names)]
             call_id = f"fixture-call-{index:03d}"
-            user = with_message_origin(Message(MessageRole.USER, [TextContent(f"fixture request {index}")]), MessageOrigin.USER)
+            user = with_message_origin(
+                Message(
+                    MessageRole.USER,
+                    [TextContent(
+                        f"fixture request {index} PR #{index + 1} verdict=pass "
+                        f"child fixture-{index} status=completed"
+                    )],
+                ),
+                MessageOrigin.USER,
+            )
             call = with_message_origin(Message(MessageRole.ASSISTANT, [ToolUseContent(ToolCall(call_id, name, {"index": index}))]), MessageOrigin.AGENT_PROMPT)
             result = with_message_origin(Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult(call_id, "fixture result " + ("x" * 500), is_error=index % 11 == 0)), MessageOrigin.AUTOMATION_RECEIPT)
             store.append_message(user)
@@ -137,6 +149,8 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
         records: list[dict[str, Any]] = []
         previous_count = len(store.replay())
         stable = 0
+        normalized_ids: dict[str, str] = {}
+        next_normalized_id = [0]
         for invocation in range(1, 9):
             before = {entry.id for entry in store.replay()}
             store.enable_persisted_append_tracking()
@@ -145,7 +159,7 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
             after_entries = store.replay()
             appended = [entry.to_dict() for entry in after_entries if entry.id not in before]
             store.take_persisted_appends()
-            normalized = _normalize_entries(appended)
+            normalized = _normalize_entries(appended, normalized_ids, next_normalized_id)
             readback_store = await asyncio.to_thread(ConversationStore, session_dir.parent, session_id=store.session_id, _read_only=True, _must_exist=True)
             try:
                 readback_assembler = ContextAssembler(readback_store, token_budget=budget, retained_tail=tail, system_prompt=meta.get("system_prompt", ""), backend=None)
@@ -154,7 +168,32 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
                 readback_store.close()
             context_data = [message.to_dict() for message in context.messages]
             readback_data = [message.to_dict() for message in readback.messages]
-            trace = {"invocation": invocation, "appended": len(normalized), "token_count": context.token_count, "compacted": context.compacted, "marker_count": store.compaction_marker_count(), "retained_floor": (assembler.last_compaction_telemetry or {}).get("retained_floor")}
+            floor_metrics: list[dict[str, int]] = []
+            from zeta.context_eviction._fact_floor import (
+                FACT_FLOOR_CHAR_CAP,
+                FACT_FLOOR_TOKEN_CAP,
+                render_fact_floor,
+                validate_fact_floor,
+            )
+            for row in normalized:
+                floor = row.get("data", {}).get("fact_floor")
+                if floor is None:
+                    continue
+                if not validate_fact_floor(floor):
+                    raise RuntimeError("retained-floor bound check failed: invalid floor")
+                assert isinstance(floor, dict)
+                oldest = floor["oldest"]
+                newest = floor["newest"]
+                rendered = render_fact_floor(floor)
+                chars = len(rendered.content[0].text) if rendered else 0
+                tokens = 0 if rendered is None else __import__("zeta.context_accounting", fromlist=["message_token_count"]).message_token_count(rendered)
+                if len(oldest) > 8 or len(newest) > 16 or chars > FACT_FLOOR_CHAR_CAP or tokens > FACT_FLOOR_TOKEN_CAP:
+                    raise RuntimeError(
+                        "retained-floor bound check failed: "
+                        f"oldest={len(oldest)} newest={len(newest)} chars={chars} tokens={tokens}"
+                    )
+                floor_metrics.append({"oldest": len(oldest), "newest": len(newest), "chars": chars, "tokens": tokens})
+            trace = {"invocation": invocation, "appended": len(normalized), "token_count": context.token_count, "compacted": context.compacted, "marker_count": store.compaction_marker_count(), "retained_floor": (assembler.last_compaction_telemetry or {}).get("retained_floor"), "floor_metrics": floor_metrics}
             artifacts = {"context.json": context_data, "wire.json": _wire(list(context.messages), provider), "appends.json": normalized, "readback.json": readback_data, "scalar.json": trace}
             invocation_dir = artifact_dir / str(invocation)
             invocation_dir.mkdir(parents=True)
@@ -185,7 +224,7 @@ def run(args: argparse.Namespace) -> int:
         if root is None:
             raise SystemExit("--session is required")
         _copy_session(root, session_dir)
-        manifest = session_root / "storage-format.json"
+        manifest = session_root.parent / "storage-format.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path.home() / ".zeta" / "storage-format.json", manifest)
         meta = json.loads((session_dir / "meta.json").read_text())
@@ -211,14 +250,19 @@ def compare(args: argparse.Namespace) -> int:
         rows: list[dict[str, Any]] = []
         for label, worktree in (("base", args.base), ("head", args.head)):
             artifact_dir = Path(tempfile.mkdtemp(prefix=f"eviction-{label}-"))
-            command = ["uv", "run", "--directory", worktree, "python", str(Path(worktree) / "scripts/eviction_replay_gate.py"), "run", "--artifact-dir", str(artifact_dir)]
+            runner = Path(worktree) / "scripts/eviction_replay_gate.py"
+            if not runner.exists():
+                runner = Path(__file__).resolve()
+            command = [sys.executable, str(runner), "run", "--artifact-dir", str(artifact_dir)]
+            environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
             if session == "fixture":
                 command.append("--fixture")
             else:
                 command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
-            result = subprocess.run(command, capture_output=True, text=True, timeout=620, check=False)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=620, check=False, env=environment)
             if result.returncode:
-                print(f"FAIL {session} {label}: runner failed", file=sys.stderr)
+                detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "runner failed"
+                print(f"FAIL {session} {label}: {detail}", file=sys.stderr)
                 return 1
             record = json.loads(result.stdout.strip().splitlines()[-1])
             expected = str(Path(worktree).resolve())
