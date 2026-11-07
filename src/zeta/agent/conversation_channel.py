@@ -62,6 +62,7 @@ class ConversationChannel:
         self._root_store = root_store
         self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
         self._delivery_targets: dict[str | None, _DeliveryTarget] = {}
+        self._pending_questions: dict[str, set[str]] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
@@ -143,6 +144,9 @@ class ConversationChannel:
             loop, event = target
             loop.call_soon_threadsafe(event.set)
 
+    def has_pending_question(self, child_instance_id: str) -> bool:
+        return bool(self._pending_questions.get(child_instance_id))
+
     async def publish_idle(
         self,
         *,
@@ -155,48 +159,21 @@ class ConversationChannel:
 
         from .pending_delivery import NotificationInput
 
-        parent_store, parent_id = self._live_parent(child_instance_id)
-        question_id = next(
-            (
-                entry.data.get("question_id")
-                for entry in reversed(parent_store.agent_notifications())
-                if entry.data.get("kind") == "child_question"
-                and entry.data.get("child_instance_id") == child_instance_id
-            ),
-            None,
-        )
-
-        def data_for(*, display_only: bool) -> dict[str, Any]:
-            data: dict[str, Any] = {
-                "origin": "notification",
-                "kind": "child_idle",
-                "child_instance_id": child_instance_id,
-                "child_session_path": child_session_path,
-                "description": description,
-                "status": "child_idle",
-                "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
-            }
-            if isinstance(question_id, str):
-                data["ask_parent_question_id"] = question_id
-            if display_only:
-                data["display_only"] = True
-            return data
-
-        if self._root_store is parent_store:
-            result = await self.produce_to(
-                parent_id,
-                NotificationInput("child_idle", data_for(display_only=False)),
-            )
-            return result.entries[0] if result.entries else None
-        root_result = await self.produce_to(
-            None,
-            NotificationInput("child_idle", data_for(display_only=True)),
-        )
-        await self.produce_to(
+        _parent_store, parent_id = self._live_parent(child_instance_id)
+        data: dict[str, Any] = {
+            "origin": "notification",
+            "kind": "child_idle",
+            "child_instance_id": child_instance_id,
+            "child_session_path": child_session_path,
+            "description": description,
+            "status": "child_idle",
+            "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+        }
+        result = await self.produce_to(
             parent_id,
-            NotificationInput("child_idle", data_for(display_only=False)),
+            NotificationInput("child_idle", data),
         )
-        return root_result.entries[0] if root_result.entries else None
+        return result.entries[0] if result.entries else None
 
     async def publish_completion(
         self,
@@ -284,9 +261,7 @@ class ConversationChannel:
         from .pending_delivery import NotificationInput
 
         parent_store, parent_id = self._live_parent(child_instance_id)
-        routed = parent_id != self._owner.original_parent_instance_id(
-            child_instance_id
-        )
+        routed = parent_id != self._owner.original_parent_instance_id(child_instance_id)
         data: dict[str, Any] = {
             "origin": "notification",
             "kind": "child_question",
@@ -312,6 +287,7 @@ class ConversationChannel:
             parent_id,
             NotificationInput("child_question", data, dedupe_key=question_id),
         )
+        self._pending_questions.setdefault(child_instance_id, set()).add(question_id)
         return parent_store
 
     async def reroute_questions_from(self, dead_parent: ConversationStore) -> int:
@@ -353,16 +329,24 @@ class ConversationChannel:
             moved += 1
         return moved
 
+    def question_answered(self, child_instance_id: str, question_id: str) -> None:
+        questions = self._pending_questions.get(child_instance_id)
+        if questions is None:
+            return
+        questions.discard(question_id)
+        if not questions:
+            self._pending_questions.pop(child_instance_id, None)
+
     async def close_questions(self, child_instance_id: str, *, reason: str) -> int:
         from .pending_delivery import NotificationInput
 
+        self._pending_questions.pop(child_instance_id, None)
         item = NotificationInput(
             "child_question_close",
             {"child_instance_id": child_instance_id, "reason": reason},
         )
         targets_by_store = {
-            id(target.flow.store): target
-            for target in self._delivery_targets.values()
+            id(target.flow.store): target for target in self._delivery_targets.values()
         }
         targets = tuple(
             target
@@ -370,8 +354,7 @@ class ConversationChannel:
             if (target := targets_by_store.get(id(store))) is not None
         )
         reservations = tuple(
-            (target, asyncio.get_running_loop().create_future())
-            for target in targets
+            (target, asyncio.get_running_loop().create_future()) for target in targets
         )
         for target, reservation in reservations:
             target.accepted.add(reservation)
@@ -395,9 +378,7 @@ class ConversationChannel:
     def _live_parent(
         self, child_instance_id: str
     ) -> tuple[ConversationStore, str | None]:
-        store, parent_id = self._owner.parent_edge(
-            child_instance_id, self._root_store
-        )
+        store, parent_id = self._owner.parent_edge(child_instance_id, self._root_store)
         visited = {child_instance_id}
         while parent_id is not None and parent_id not in self._wakes:
             if parent_id in visited:
