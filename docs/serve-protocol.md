@@ -603,6 +603,62 @@ If a delegated approval-history write fails, the server still emits
 `data.request_id`. The session health becomes `approval_persistence_failed`,
 and the affected turn fails.
 
+### session grants (`session_grants` feature)
+
+A client that negotiates `session_grants` can inspect the active approval
+policy and remove session-only grants created by `approve` with
+`scope: "always_tool"`. `ApprovalPolicy` remains the only authority. These
+requests only project or mutate that policy; they do not add a second grant
+store. `/permissions` remains a local TUI command and is not exposed through
+`slash_run`.
+
+`session_grants` takes no params and requires an active session. It returns:
+
+```json
+{
+  "session_id": "abc123",
+  "default": "ask",
+  "precedence": ["deny", "ask", "allow", "default"],
+  "rules": {
+    "deny": ["bash(rm *)"],
+    "ask": ["bash(git push*)"],
+    "allow": ["bash"]
+  },
+  "session_grants": ["bash"]
+}
+```
+
+All rule arrays contain canonical strings in sorted order. `rules.allow` is
+the effective union of configured allow rules and session grants;
+`session_grants` isolates only the removable session entries. The response is
+a fresh projection, so a replacement controller or a reconnected observer
+must read it again instead of reusing a client cache.
+
+`revoke_session_grants` is controller-only. Params are exactly one of
+`{"grant":"<exact canonical string>"}` or `{"clear":true}`. A grant string
+is matched exactly against the current canonical strings; it is never parsed
+into new authority. The response is `removed` plus a fresh snapshot under
+`grants`. Clearing an already-empty set succeeds with `removed: []` and does
+not emit an event. A missing exact grant returns `-32602` with data
+`{"code":"session_grant_not_found","grant":"..."}`. Any other params return
+`-32602` with data `{"code":"invalid_session_grants_revoke"}`. Params on the
+read request return `-32602` with data
+`{"code":"invalid_session_grants_params"}`. Without the negotiated feature,
+both requests return `-32601`; without an active session they return `-32003`.
+An observer can call `session_grants`, but mutation returns the existing
+`-32008` `observer_read_only` error.
+
+A real grant, revoke, clear, or session reset emits `session_grants_changed`
+to every live connection that negotiated the feature. Its data is
+`change` (`grant`, `revoke`, `clear`, or `reset`), sorted `changed` strings,
+and a fresh snapshot under `grants`. Duplicate grants, missing-grant errors,
+and empty clears emit no event. The event is queued before the matching
+request response. Session grants authorize future parent and delegated-child
+calls through the same policy; revocation affects future calls from both,
+while pending or already authorized calls are unchanged. A controller handoff
+or observer reconnect gets no replay: the client reads `session_grants` for
+the current state.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -915,10 +971,13 @@ Error descriptors are:
 | `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
 | `host_binding_required` | `-32003` | `host_binding_required` | the session requires a host binding |
 | `invalid_content_read` | `-32602` | `invalid_content_read` | content_read parameters are invalid |
+| `invalid_session_grants_params` | `-32602` | `invalid_session_grants_params` | session_grants parameters are invalid |
+| `invalid_session_grants_revoke` | `-32602` | `invalid_session_grants_revoke` | revoke_session_grants parameters are invalid |
 | `login_in_progress` | `-32005` | `login_in_progress` | a login is already pending |
 | `observer_read_only` | `-32008` | `observer_read_only` | a read-only observer requested a write method |
 | `project_not_found` | `-32602` | `project_not_found` | the requested project does not exist |
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
+| `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 
 Error objects have `code` and `message`, and may have a method-specific
@@ -1053,6 +1112,7 @@ Event fields are:
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
+| `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1344,7 +1404,10 @@ implementation for the frontend client. Two RPCs cover the surface.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
-  - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `output`: `text` is the composed notice to render as a quiet receipt. For
+    `/status`, this is the same operational view as the TUI, including configured
+    hooks, recent cache-hit history, and model-attributed estimated cost. The
+    shared view omits terminal-only navigation key hints.
   - `text`: `text` is the MCP status output to render as normal text.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
@@ -1414,6 +1477,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
+| `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
@@ -1438,7 +1502,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

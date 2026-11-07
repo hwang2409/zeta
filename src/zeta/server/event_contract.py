@@ -121,6 +121,7 @@ class AuxiliaryEvent(Enum):
     TURN_ABORTED = auto()
     USAGE = auto()
     USER_MESSAGE = auto()
+    SESSION_GRANTS_CHANGED = auto()
 
 
 AUXILIARY_WIRE_EVENTS = {
@@ -129,6 +130,7 @@ AUXILIARY_WIRE_EVENTS = {
     AuxiliaryEvent.TURN_ABORTED: EventDescriptor.TURN_ABORTED,
     AuxiliaryEvent.USAGE: EventDescriptor.USAGE,
     AuxiliaryEvent.USER_MESSAGE: EventDescriptor.USER_MESSAGE,
+    AuxiliaryEvent.SESSION_GRANTS_CHANGED: EventDescriptor.SESSION_GRANTS_CHANGED,
 }
 
 
