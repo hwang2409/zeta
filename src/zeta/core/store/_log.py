@@ -30,7 +30,7 @@ from ..checkpoints import (
     _now,
     load_session_json,
 )
-from ..session_files import open_session_file, read_session_file
+from ..session_files import open_session_file
 from ._diagnosis import TranscriptFailureKind, TranscriptLoadError
 from ._startup_facts import sent_message_receipts
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
@@ -530,48 +530,26 @@ class ConversationLogMixin:
             prefix_digest=hashlib.sha256(raw[:prefix_end]).hexdigest(),
         )
 
-    def _first_invalid_link(self: ConversationStore) -> tuple[int, str]:
-        entries = self._entries
-        try:
-            for count in range(1, len(entries) + 1):
-                self._entries = entries[:count]
-                try:
-                    self._validate_entries()
-                except ConversationIntegrityError as exc:
-                    message = str(exc)
-                    reason_code = (
-                        "missing_parent"
-                        if "missing prior parent" in message
-                        else "duplicate_id"
-                        if "duplicate conversation id" in message
-                        else "orphaned_root"
-                        if "orphaned root" in message
-                        else "invalid_sequence"
-                        if "non-monotonic conversation sequence" in message
-                        else "invalid_links"
-                    )
-                    return count + 1, reason_code
-        finally:
-            self._entries = entries
-        return len(entries) + 1, "invalid_links"
-
     def _load_full(self: ConversationStore) -> None:
         self._full_reload_count += 1
         baseline = (len(self._entries), self._entry_prefix_digest)
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
+            raw = self._read_fd(fd, stat.st_size)
         finally:
             os.close(fd)
-        raw = read_session_file(self.directory_fd, "conversation.jsonl")
         lines = raw.splitlines(keepends=True)
-        valid_rows: list[dict[str, Any]] = []
-        row_offsets: list[int] = []
+        entries: list[ConversationEntry] = []
+        entry_ids: set[str] = set()
         torn_offset: int | None = None
         offset = 0
+        header_seen = False
         for index, line in enumerate(lines):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
+            row_number = index + 1
+            row_offset = offset
             try:
                 row = load_session_json(line)
             except ConversationIntegrityError as exc:
@@ -592,83 +570,65 @@ class ConversationLogMixin:
                 )
                 raise self._transcript_error(
                     kind=kind,
-                    row_number=index + 1,
-                    byte_offset=offset,
-                    valid_prefix_end=None if index == 0 else offset,
+                    row_number=row_number,
+                    byte_offset=row_offset,
+                    valid_prefix_end=None if index == 0 else row_offset,
                     reason_code="invalid_json",
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
                 ) from exc
             if not isinstance(row, dict):
-                kind = "unrecoverable_header" if index == 0 else "invalid_row"
                 raise self._transcript_error(
-                    kind=kind,
-                    row_number=index + 1,
-                    byte_offset=offset,
-                    valid_prefix_end=None if index == 0 else offset,
+                    kind="unrecoverable_header" if index == 0 else "invalid_row",
+                    row_number=row_number,
+                    byte_offset=row_offset,
+                    valid_prefix_end=None if index == 0 else row_offset,
                     reason_code="row_not_object",
                     repairable=index > 0,
                     raw=raw,
                     stat=stat,
                 )
-            valid_rows.append(row)
-            row_offsets.append(offset)
             offset += len(line)
+            if index == 0:
+                header_seen = True
+                try:
+                    self._validate_header(row)
+                except ConversationIntegrityError as exc:
+                    header_data = row.get("data")
+                    schema_is_unsupported = (
+                        row.get("type") == "header"
+                        and type(header_data) is dict
+                        and type(header_data.get("schema")) is str
+                        and header_data.get("schema") != SCHEMA
+                    )
+                    session_id_mismatch = (
+                        type(header_data) is dict
+                        and header_data.get("schema") == SCHEMA
+                        and header_data.get("session_id") != self.session_id
+                    )
+                    raise self._transcript_error(
+                        kind=(
+                            "unsupported_format"
+                            if schema_is_unsupported
+                            else "unrecoverable_header"
+                        ),
+                        row_number=1,
+                        byte_offset=0,
+                        valid_prefix_end=None,
+                        reason_code=(
+                            "unsupported_schema"
+                            if schema_is_unsupported
+                            else "header_session_mismatch"
+                            if session_id_mismatch
+                            else "invalid_header"
+                        ),
+                        repairable=False,
+                        raw=raw,
+                        stat=stat,
+                    ) from exc
+                continue
 
-        if not valid_rows:
-            raise self._transcript_error(
-                kind="unrecoverable_header",
-                row_number=1 if lines else None,
-                byte_offset=0 if lines else None,
-                valid_prefix_end=None,
-                reason_code="missing_header",
-                repairable=False,
-                raw=raw,
-                stat=stat,
-            )
-        try:
-            self._validate_header(valid_rows[0])
-        except ConversationIntegrityError as exc:
-            header_data = valid_rows[0].get("data")
-            schema_is_unsupported = (
-                valid_rows[0].get("type") == "header"
-                and type(header_data) is dict
-                and type(header_data.get("schema")) is str
-                and header_data.get("schema") != SCHEMA
-            )
-            session_id_mismatch = (
-                type(header_data) is dict
-                and header_data.get("schema") == SCHEMA
-                and header_data.get("session_id") != self.session_id
-            )
-            raise self._transcript_error(
-                kind=(
-                    "unsupported_format"
-                    if schema_is_unsupported
-                    else "unrecoverable_header"
-                ),
-                row_number=1,
-                byte_offset=0,
-                valid_prefix_end=None,
-                reason_code=(
-                    "unsupported_schema"
-                    if schema_is_unsupported
-                    else "header_session_mismatch"
-                    if session_id_mismatch
-                    else "invalid_header"
-                ),
-                repairable=False,
-                raw=raw,
-                stat=stat,
-            ) from exc
-
-        self._entries = []
-        for index, row in enumerate(valid_rows[1:], start=1):
-            if index and index % 64 == 0:
-                time.sleep(0.0001)
-            row_number = index + 1
-            row_offset = row_offsets[index]
             entry_type = row.get("type")
             if type(entry_type) is str and entry_type not in CONVERSATION_ENTRY_TYPES:
                 try:
@@ -702,7 +662,20 @@ class ConversationLogMixin:
             try:
                 self._validate_entry_payload(entry)
                 if entry.type == "fork":
-                    self._validate_fork_entry(entry)
+                    source = next(
+                        (
+                            candidate
+                            for candidate in entries
+                            if candidate.id == entry.data["from_entry_id"]
+                        ),
+                        None,
+                    )
+                    if (
+                        source is None
+                        or entry.parent_id != source.id
+                        or entry.data["from_seq"] != source.seq
+                    ):
+                        raise ConversationIntegrityError("fork source is not its parent")
             except ConversationIntegrityError as exc:
                 raise self._transcript_error(
                     kind="invalid_row",
@@ -714,24 +687,43 @@ class ConversationLogMixin:
                     raw=raw,
                     stat=stat,
                 ) from (exc.__cause__ or exc)
-            self._entries.append(entry)
 
-        try:
-            self._validate_entries()
-        except ConversationIntegrityError as exc:
-            row_number, reason_code = self._first_invalid_link()
-            row_offset = row_offsets[row_number - 1]
+            reason_code = None
+            if entry.seq != row_number - 1:
+                reason_code = "invalid_sequence"
+            elif entry.id in entry_ids:
+                reason_code = "duplicate_id"
+            elif entries and entry.parent_id is None:
+                reason_code = "orphaned_root"
+            elif entry.parent_id is not None and entry.parent_id not in entry_ids:
+                reason_code = "missing_parent"
+            if reason_code is not None:
+                raise self._transcript_error(
+                    kind="broken_links",
+                    row_number=row_number,
+                    byte_offset=row_offset,
+                    valid_prefix_end=row_offset,
+                    reason_code=reason_code,
+                    repairable=True,
+                    raw=raw,
+                    stat=stat,
+                )
+            entries.append(entry)
+            entry_ids.add(entry.id)
+
+        if not header_seen:
             raise self._transcript_error(
-                kind="broken_links",
-                row_number=row_number,
-                byte_offset=row_offset,
-                valid_prefix_end=row_offset,
-                reason_code=reason_code,
-                repairable=True,
+                kind="unrecoverable_header",
+                row_number=1 if lines else None,
+                byte_offset=0 if lines else None,
+                valid_prefix_end=None,
+                reason_code="missing_header",
+                repairable=False,
                 raw=raw,
                 stat=stat,
-            ) from exc
+            )
 
+        self._entries = entries
         self._entry_prefix_digest = b""
         for entry in self._entries:
             self._record_entry_prefix(entry)

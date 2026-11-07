@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -1276,7 +1277,6 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     owner_thread = threading.get_ident()
     heavy_threads: dict[str, list[int]] = {
         "load": [],
-        "validate": [],
         "rebuild": [],
     }
     active_rows_by_thread: dict[int, int] = {}
@@ -1310,7 +1310,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         original = getattr(ConversationStore, name)
 
         def observed(candidate: ConversationStore, *args: object, **kwargs: object):
-            heavy_threads[{"_load_full": "load", "_validate_entries": "validate", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
+            heavy_threads[{"_load_full": "load", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
                 threading.get_ident()
             )
             return original(candidate, *args, **kwargs)
@@ -1319,7 +1319,6 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     for method_name in (
         "_load_full",
-        "_validate_entries",
         "_rebuild_incremental_validation_state",
     ):
         observe_heavy(method_name)
@@ -2077,6 +2076,13 @@ def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
     )
     assert error.valid_prefix_end == expected_offset
     assert error.reason_code == reason_code
+    stat = path.stat()
+    assert (error.source_device, error.source_inode, error.source_size) == (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+    )
+    assert error.prefix_digest == hashlib.sha256(damaged[:expected_offset]).hexdigest()
     assert "must-not-leak" not in str(error)
     assert str(path) not in str(error)
     assert path.read_bytes() == damaged
@@ -2097,6 +2103,7 @@ def test_transcript_compatibility_classification_precedes_corruption(
         row["type"] = "future_entry"
         row["data"] = {"message": "not validated for a future type"}
     lines[row_index] = json.dumps(row).encode() + b"\n"
+    lines.append(b'{"later":"corruption"\n')
     store.path.write_bytes(b"".join(lines))
 
     with pytest.raises(ConversationIntegrityError) as raised:
@@ -2554,53 +2561,27 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
-def test_appends_do_not_reread_the_full_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_appends_do_not_reread_the_full_log(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="incremental")
     for index in range(200):
         store.append_message(with_message_origin(message(MessageRole.USER, f"seed-{index}"), MessageOrigin.USER))
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    full_reloads = store._full_reload_count
     for index in range(20):
         store.append_message(with_message_origin(message(MessageRole.USER, f"new-{index}"), MessageOrigin.USER))
 
-    assert conversation_reads <= 1
+    assert store._full_reload_count == full_reloads
 
 
-def test_live_store_tail_syncs_external_append_without_full_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_tail_syncs_external_append_without_full_read(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path, session_id="shared-tail")
     second = ConversationStore(tmp_path, session_id="shared-tail")
     second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    full_reloads = first._full_reload_count
     first.append_message(message(MessageRole.ASSISTANT, "local"))
 
-    assert conversation_reads == 0
+    assert first._full_reload_count == full_reloads
     assert [item.content[0].text for item in first.messages()] == [
         "external",
         "local",
@@ -2845,9 +2826,7 @@ def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> 
     ]
 
 
-def test_live_store_full_reloads_after_file_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_full_reloads_after_file_replacement(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="replaced")
     store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     replacement = store.path.with_suffix(".replacement")
@@ -2855,21 +2834,10 @@ def test_live_store_full_reloads_after_file_replacement(
     store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     replacement.replace(store.path)
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    reloads = store._full_reload_count
     store.append_message(message(MessageRole.ASSISTANT, "after"))
 
-    assert conversation_reads == 1
+    assert store._full_reload_count == reloads + 1
     assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
 
 
@@ -2929,29 +2897,16 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
     ]
 
 
-def test_live_store_full_reloads_after_truncation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_full_reloads_after_truncation(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="truncated")
     header = store.path.read_bytes()
     store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     store.path.write_bytes(header)
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    reloads = store._full_reload_count
     store.append_message(with_message_origin(message(MessageRole.USER, "after"), MessageOrigin.USER))
 
-    assert conversation_reads == 1
+    assert store._full_reload_count == reloads + 1
     assert [item.content[0].text for item in store.messages()] == ["after"]
 
 
