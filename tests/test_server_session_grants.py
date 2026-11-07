@@ -303,7 +303,7 @@ async def test_session_grant_approval_publishes_after_concurrent_install(
         async def gated_durable(job: Any, *args: Any, **kwargs: Any) -> Any:
             if getattr(job, "__name__", "") == "resolve_approval":
                 persist_started.set()
-                await release_persist.wait()
+                await asyncio.wait_for(release_persist.wait(), TIMEOUT)
             return await original_durable(job, *args, **kwargs)
 
         store._to_thread_durable = gated_durable  # type: ignore[method-assign]
