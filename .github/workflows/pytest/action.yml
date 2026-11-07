@@ -1,6 +1,12 @@
 name: Run pytest suite
 description: Install the pinned test environment and run the full suite
 
+inputs:
+  python-version:
+    description: Python version used by uv
+    required: false
+    default: "3.12"
+
 runs:
   using: composite
   steps:
@@ -20,8 +26,8 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/uv
-        key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-        restore-keys: uv-${{ runner.os }}-
+        key: uv-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('uv.lock') }}
+        restore-keys: uv-${{ runner.os }}-py${{ inputs.python-version }}-
 
     # --frozen pins the resolution to uv.lock so a transitive bump cannot
     # turn main red without a lockfile change in the diff.
@@ -29,4 +35,4 @@ runs:
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
       shell: bash
-      run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=25
+      run: uv run --python "${{ inputs.python-version }}" --frozen pytest -q -n 4 --dist worksteal --durations=25
