@@ -3376,23 +3376,47 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 
 
 @pytest.mark.asyncio
-async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
+async def test_late_approval_after_disconnect_abort_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    server = ZetaServer(provider="codex",
+    server = ZetaServer(
+        provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    second_reader, second_writer = await asyncio.open_unix_connection(str(server.socket_path))
+    assert server.connections is not None
+    controller = server.connections.controller_metadata()
+    assert controller is not None
+    first_client_released = asyncio.Event()
+    release = server.connections.release
+
+    def record_release(connection: object) -> None:
+        release(connection)
+        if connection is controller.connection:
+            first_client_released.set()
+
+    monkeypatch.setattr(server.connections, "release", record_release)
+    second_writer = None
     try:
-        await _request(second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(first_client_released.wait(), 10)
+        second_reader, second_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
+        await _request(
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
+        )
         error = (
             await _request(
                 second_reader,
@@ -3404,7 +3428,12 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         )[-1]
         assert error["error"]["code"] == -32006
     finally:
-        await _close(server, second_writer)
+        writer.close()
+        await writer.wait_closed()
+        if second_writer is None:
+            await server.close()
+        else:
+            await _close(server, second_writer)
 
 
 @pytest.mark.asyncio
