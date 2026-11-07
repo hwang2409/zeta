@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from functools import wraps
 from io import StringIO
@@ -6403,6 +6404,299 @@ async def test_profile_max_child_depth_only_lowers_the_parent_limit(
 
     assert "agent" not in await child_agent_schemas("lower", 3)
     assert "agent" not in await child_agent_schemas("raise", 1)
+
+
+@pytest.mark.parametrize("tool_name", ["ask_parent", "finish", "agent_handoff"])
+@pytest.mark.asyncio
+async def test_loop_bound_handler_is_rebound_or_absent_in_child_registry(
+    tmp_path: Path, tool_name: str
+) -> None:
+    async with AsyncExitStack() as stack:
+        parent_store = ConversationStore(tmp_path / "parent")
+        stack.callback(parent_store.close)
+        child_store = ConversationStore(tmp_path / "child")
+        stack.callback(child_store.close)
+        parent_registry = ToolRegistry(
+            tmp_path,
+            register_builtin=False,
+            session_store=parent_store,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        stack.push_async_callback(parent_registry.close)
+        writes: list[str] = []
+
+        async def parent_handler(
+            _registry: ToolRegistry, _arguments: dict[str, object]
+        ) -> str:
+            writes.append(parent_store.session_id)
+            return "parent"
+
+        parent_registry.register_session_tool(
+            tool_name,
+            parent_handler,
+            loop_bound=True,
+            requires_approval=False,
+        )
+        child_registry = parent_registry.clone_for_session(child_store)
+        stack.push_async_callback(child_registry.close)
+        assert tool_name not in child_registry.definitions_by_name
+
+        async def child_handler(
+            _registry: ToolRegistry, _arguments: dict[str, object]
+        ) -> str:
+            writes.append(child_store.session_id)
+            return "child"
+
+        child_registry.register_session_tool(
+            tool_name,
+            child_handler,
+            loop_bound=True,
+            requires_approval=False,
+        )
+        result = await child_registry.execute(ToolCall("call", tool_name, {}))
+        assert result["content"][0]["text"] == "child"
+        assert writes == [child_store.session_id]
+
+
+class NestedLoopBoundHandlerBackend(CompletionBackend):
+    def __init__(self, *, child_a_profile: str) -> None:
+        self.child_a_profile = child_a_profile
+        self.child_a_schemas: set[str] = set()
+        self.child_a_started = asyncio.Event()
+        self.child_a_finished = asyncio.Event()
+        self.child_a_id: str | None = None
+        self.child_a_path: Path | None = None
+        self.release_child_b = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        prompt = _last_user_prompt(messages)
+        results = {
+            message.tool_result.tool_call_id: message.tool_result
+            for message in messages
+            if message.tool_result is not None
+        }
+        if prompt == "root":
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "lead",
+                        "agent",
+                        {
+                            "prompt": "lead",
+                            "description": "lead",
+                            "preset": "nested-lead",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif prompt == "lead" and "child-a" not in results:
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "child-a",
+                        "agent",
+                        {
+                            "prompt": "child-a",
+                            "description": "child a",
+                            "preset": self.child_a_profile,
+                            "background": True,
+                        },
+                    )
+                ),
+                ToolUseContent(
+                    ToolCall(
+                        "child-b",
+                        "agent",
+                        {
+                            "prompt": "child-b",
+                            "description": "child b",
+                            "preset": "nested-plain",
+                            "background": True,
+                        },
+                    )
+                ),
+            ]
+        elif prompt == "lead":
+            blocks = [TextContent("lead remains available")]
+        elif prompt == "child-a":
+            self.child_a_schemas = {schema["name"] for schema in tool_schemas}
+            self.child_a_started.set()
+            if self.child_a_profile == "nested-plain" and "handoff-a" not in results:
+                if "agent_handoff" in self.child_a_schemas:
+                    blocks = [
+                        ToolUseContent(
+                            ToolCall(
+                                "handoff-a",
+                                "agent_handoff",
+                                {"reason": "done", "outputs": "none"},
+                            )
+                        )
+                    ]
+                else:
+                    blocks = [TextContent("child a done")]
+            elif "finish-a" not in results:
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "finish-a",
+                            "finish",
+                            {"status": "done", "summary": "child a done"},
+                        )
+                    )
+                ]
+            else:
+                blocks = [TextContent("child a done")]
+        elif prompt == "child-b":
+            await self.release_child_b.wait()
+            blocks = [TextContent("child b done")]
+        else:
+            blocks = [TextContent("done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _nested_handler_catalog() -> AgentCatalog:
+    return AgentCatalog(
+        (
+            AgentPreset(
+                name="nested-lead",
+                preamble="lead",
+                selection_guidance="test lead",
+                tool_names=None,
+                accepts_follow_ups=True,
+                explicit_finish=True,
+            ),
+            AgentPreset(
+                name="nested-plain",
+                preamble="child",
+                selection_guidance="test unrestricted child",
+                tool_names=None,
+                accepts_follow_ups=True,
+                explicit_finish=False,
+            ),
+            AgentPreset(
+                name="nested-finisher",
+                preamble="child",
+                selection_guidance="test explicit finisher",
+                tool_names=None,
+                accepts_follow_ups=True,
+                explicit_finish=True,
+            ),
+        )
+    )
+
+
+async def _run_nested_loop_bound_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stack: AsyncExitStack,
+    *,
+    child_a_profile: str,
+) -> tuple[AgentLoop, ConversationStore, NestedLoopBoundHandlerBackend]:
+    backend = NestedLoopBoundHandlerBackend(child_a_profile=child_a_profile)
+    store = ConversationStore(tmp_path, cwd=tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=_nested_handler_catalog(),
+    )
+    loop.explicit_finish = True
+    stack.push_async_callback(loop.close)
+    stack.callback(backend.release_child_b.set)
+    original_unregister = loop._background_owner.unregister
+
+    def observe_unregister(instance_id: str) -> None:
+        if loop._background_owner._descriptions.get(instance_id) == "child a":
+            backend.child_a_id = instance_id
+            backend.child_a_path = loop._background_owner._active_stores[instance_id][0].session_dir
+            backend.child_a_finished.set()
+        original_unregister(instance_id)
+
+    monkeypatch.setattr(loop._background_owner, "unregister", observe_unregister)
+    await _collect(loop.run_turn("root", origin=MessageOrigin.USER))
+    await asyncio.wait_for(backend.child_a_started.wait(), 10)
+    return loop, store, backend
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with AsyncExitStack() as stack:
+        loop, store, backend = await _run_nested_loop_bound_case(
+            tmp_path, monkeypatch, stack, child_a_profile="nested-plain"
+        )
+
+        assert {"finish", "agent_handoff"}.isdisjoint(backend.child_a_schemas)
+        await asyncio.wait_for(backend.child_a_finished.wait(), 10)
+        lead_id = next(
+            instance_id
+            for instance_id, description in loop._background_owner._descriptions.items()
+            if description == "lead"
+        )
+        child_b_id = next(
+            instance_id
+            for instance_id, description in loop._background_owner._descriptions.items()
+            if description == "child b"
+        )
+        assert lead_id in loop._background_owner._cancellers
+        assert loop._background_owner._parent_ids[child_b_id] == lead_id
+        lead_path = Path(store.agent_children()[lead_id]["child_session_path"])
+        lead_store = ConversationStore(lead_path.parent, session_id=lead_path.name)
+        stack.callback(lead_store.close)
+        assert (
+            await asyncio.to_thread(lead_store.pending_prompt_queue.terminal_transition)
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_nested_explicit_finisher_does_not_see_lead_sibling_as_owned_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with AsyncExitStack() as stack:
+        loop, _store, backend = await _run_nested_loop_bound_case(
+            tmp_path, monkeypatch, stack, child_a_profile="nested-finisher"
+        )
+
+        assert {"finish", "agent_handoff"} <= backend.child_a_schemas
+        await asyncio.wait_for(backend.child_a_finished.wait(), 10)
+        assert backend.child_a_id is not None
+        assert backend.child_a_path is not None
+        lead_id = next(
+            instance_id
+            for instance_id, description in loop._background_owner._descriptions.items()
+            if description == "lead"
+        )
+        child_b_id = next(
+            instance_id
+            for instance_id, description in loop._background_owner._descriptions.items()
+            if description == "child b"
+        )
+        child_a_store = ConversationStore(
+            backend.child_a_path.parent, session_id=backend.child_a_path.name
+        )
+        stack.callback(child_a_store.close)
+        finish_result = next(
+            message.tool_result
+            for message in child_a_store.messages()
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == "finish-a"
+        )
+        assert finish_result.content == "finish accepted; no more work or prose is needed"
+        assert loop._background_owner._parent_ids[child_b_id] == lead_id
 
 
 @pytest.mark.asyncio

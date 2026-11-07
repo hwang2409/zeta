@@ -485,6 +485,7 @@ async def _build_child_loop(
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)
+            child_registry.mark_loop_bound("agent_handoff")
         loop._background_owner.conversation_channel.register_loop(child_instance_id)
         await child_loop._ensure_step_delivery()
         if loop.plan_mode:

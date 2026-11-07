@@ -156,6 +156,7 @@ class ToolDefinition:
     parameters: dict[str, Any]
     handler: ToolHandler
     handler_factory: ToolHandlerFactory | None = None
+    loop_bound: bool = False
     parallel_safe: bool = False
     validate_arguments: bool = True
     requires_approval: bool = True
@@ -493,6 +494,7 @@ class ToolRegistry:
         requires_approval: bool = True,
         actions: Mapping[str, ToolAction] | None = None,
         handler_factory: ToolHandlerFactory | None = None,
+        loop_bound: bool = False,
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
     ) -> ToolDefinition:
@@ -558,6 +560,7 @@ class ToolRegistry:
             parameters=normalized,
             handler=handler,
             handler_factory=handler_factory,
+            loop_bound=loop_bound,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
@@ -621,6 +624,11 @@ class ToolRegistry:
             handler_factory=partial(_bind_handler, handler),
             **kwargs,
         )
+
+    def mark_loop_bound(self, name: str) -> None:
+        """Prevent a handler bound to this loop from entering child clones."""
+
+        self._tools[name] = replace(self._tools[name], loop_bound=True)
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
@@ -719,7 +727,7 @@ class ToolRegistry:
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
-            if name not in exclude_names
+            if name not in exclude_names and not definition.loop_bound
         }
         clone._mcp_hidden = self._mcp_hidden.intersection(clone._tools)
         clone._mcp_owned = {

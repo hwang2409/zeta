@@ -98,4 +98,5 @@ def register_ask_parent(
         },
         requires_approval=False,
         parallel_safe=True,
+        loop_bound=True,
     )

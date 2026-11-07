@@ -104,6 +104,7 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         },
         requires_approval=False,
         parallel_safe=False,
+        loop_bound=True,
     )
 
 
