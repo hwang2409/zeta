@@ -1012,14 +1012,16 @@ def test_ci_runs_quality_lint_for_pull_requests_and_main_pushes() -> None:
 
 
 def test_merge_resolution_passes_pull_request_body() -> None:
-    workflow = Path(".github/workflows/ci.yml").read_text()
-    step = workflow.split("- name: Check merge resolutions", 1)[1]
-    step = step.split("\n  browser:", 1)[0]
+    workflow = Path(".github/workflows/merge-resolution.yml").read_text()
 
-    assert "PR_BODY: ${{ github.event.pull_request.body }}" in step
-    assert 'printf \'%s\' "$PR_BODY" > "$body_file"' in step
-    assert 'args+=(--pr-body-file "$body_file")' in step
-    assert '"${args[@]}"' in step
+    assert "types: [opened, synchronize, reopened, edited]" in workflow
+    assert "name: merge resolution" in workflow
+    assert "github.event.changes.body != null" in workflow
+    assert "PR_BODY: ${{ github.event.pull_request.body }}" not in workflow
+    script = Path("scripts/ci_merge_resolution.sh").read_text()
+    assert 'gh pr view "$PR_NUMBER" --json body -q .body' in script
+    assert 'args+=(--pr-body-file "$body_file")' in script
+    assert '"${args[@]}"' in script
 
 
 def test_non_test_python_files_are_ignored(tmp_path: Path) -> None:
