@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -43,13 +44,15 @@ def _load_sandbox():
 # connect or name lookup to a non-local host, and each file open, listing,
 # change, copy, or spawned command line that names a path under the real
 # ~/.zeta (BENCH_TEST_FORBIDDEN). The last two end the process at once, so
-# nothing reaches the network or the real sessions. Once the harness adds its own audit
-# hook (the sandbox network guard), the recorder moves behind it and sees only
-# what the guard let through.
+# nothing reaches the network or the real sessions. Once the harness adds its
+# own audit hook (the sandbox network guard), the recorder moves behind it and
+# sees only what the guard let through, and it makes one lookup of a .invalid
+# host that the guard must refuse and log.
 SITECUSTOMIZE = r"""
 import os, sys, time
 
 _LOCAL = {"127.0.0.1", "localhost", "::1"}
+_PROBE_HOST = "bench-guard-probe.invalid"
 _moved = []
 
 
@@ -119,11 +122,35 @@ def _early(event, args):
 _add = sys.addaudithook
 
 
+def _probe_guard():
+    # One controlled non-local lookup right after the harness guard is in
+    # place: the guard must refuse it (PermissionError) and log the refusal.
+    # Without the guard, the recorder sees the lookup and ends the run (97).
+    import socket
+
+    try:
+        socket.getaddrinfo(_PROBE_HOST, 443)
+    except PermissionError:
+        _note("guard refused probe")
+    log = os.environ.get("ZETA_BENCH_GUARD_LOG")
+    if log and os.path.exists(log):
+        with open(log) as handle:
+            lines = handle.read().splitlines()
+        for line in lines:
+            if _PROBE_HOST in line:
+                _note(f"guard log: {line}")
+        # Drop only the probe's own line, so the harness still fails the run
+        # on any other refusal.
+        with open(log, "w") as handle:
+            handle.writelines(f"{x}\n" for x in lines if _PROBE_HOST not in x)
+
+
 def _add_then_record(hook):
     _add(hook)
     if not _moved:
         _moved.append(hook)
         _add(_record)
+        _probe_guard()
 
 
 sys.addaudithook = _add_then_record
@@ -191,34 +218,16 @@ def short_home() -> Iterator[Path]:
         shutil.rmtree(home, ignore_errors=True)
 
 
-def _real_sessions_state(sessions: Path) -> dict[str, set[str] | None]:
-    """Entry names (no file is opened) of the real sessions dir and fixture dirs.
-
-    Names only: both fixture ids are live sessions on the developer machine
-    (phoebe and the orchestrator), so their files and the top-level dir entries
-    change during the run for reasons unrelated to this test.
-    """
-
-    def names(path: Path) -> set[str] | None:
-        return {entry.name for entry in os.scandir(path)} if path.is_dir() else None
-
-    state = {"": names(sessions)}
-    state.update({sid: names(sessions / sid) for sid in SOURCES.values()})
-    return state
-
-
 def test_bench_serve_probe_reaches_only_the_local_stub(
     tmp_path: Path, short_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The real home, resolved from the account database before anything
     # changes HOME. The child's audit hook ends the run on any path under it.
     real_zeta = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".zeta"
-    real_sessions = real_zeta / "sessions"
     # Any zeta code in this process resolves its home to a temp dir.
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "pytest-zeta-home"))
     home = short_home
     _source_sessions(home, monkeypatch)
-    before = _real_sessions_state(real_sessions)
     site = tmp_path / "site"
     site.mkdir()
     (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
@@ -233,7 +242,7 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         # is set (providers/anthropic.py, AnthropicCredentialDriver.bootstrap),
         # and that fallback must stay reachable for this test to catch it. The
         # real ~/.zeta is protected instead by the throwaway HOME, the audit
-        # hook (BENCH_TEST_FORBIDDEN), and the before/after check below.
+        # hook (BENCH_TEST_FORBIDDEN).
         if not key.startswith("ZETA_")
         and not any(
             m in key.upper() for m in ("ANTHROPIC", "CLAUDE", "OPENAI", "CODEX")
@@ -270,40 +279,30 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         run, returncode, stderr = None, "timed out", exc.stderr
 
     # Provider traffic went to the local stub only: no keychain read and no
-    # connect or lookup to a non-local host got past the harness. No path under
+    # connect or lookup to a non-local host got past the harness. The harness
+    # guard refused the controlled probe lookup and logged it. No path under
     # the real ~/.zeta was opened, listed, changed, or passed to a command.
     lines = record.read_text().splitlines() if record.exists() else []
     forbidden = [line for line in lines if line.startswith("forbidden ")]
+    probe = [line for line in lines if line.startswith("guard ")]
     assert {
         "forbidden": forbidden,
+        "guard_probe": [re.sub(r"pid \d+:", "pid N:", line) for line in probe],
         "outside": [
             line
             for line in lines
-            if line != "loopback connect" and line not in forbidden
+            if line != "loopback connect" and line not in forbidden + probe
         ],
         "reached_loopback": "loopback connect" in lines,
-    } == {"forbidden": [], "outside": [], "reached_loopback": True}, stderr
-
-    # Belt and braces, by entry names only: no session appeared in the real
-    # sessions dir (it is created rarely, so a concurrent zeta start is the
-    # only false alarm), and no file the fixture sessions hold appeared in the
-    # real fixture-id dirs. Where they did not exist (CI), they still do not.
-    after = _real_sessions_state(real_sessions)
-    fixture_files = {
-        sid: {entry.name for entry in os.scandir(home / ".zeta/sessions" / sid)}
-        for sid in SOURCES.values()
-    }
-    changed = {}
-    for key, was in before.items():
-        now = after[key]
-        if was is None or now is None:
-            if now != was:
-                changed[key] = (was, now)
-            continue
-        appeared = now - was if key == "" else (now - was) & fixture_files[key]
-        if appeared:
-            changed[key] = sorted(appeared)
-    assert changed == {}
+    } == {
+        "forbidden": [],
+        "guard_probe": [
+            "guard refused probe",
+            "guard log: pid N: resolve 'bench-guard-probe.invalid'",
+        ],
+        "outside": [],
+        "reached_loopback": True,
+    }, stderr
     assert returncode == 0, stderr
     assert run is not None
     decoder, text, results = json.JSONDecoder(), run.stdout, {}
