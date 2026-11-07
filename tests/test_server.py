@@ -1839,9 +1839,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             agent_ended.set()
         return published
 
-    monkeypatch.setattr(
-        server.control._approvals, "_publish", delay_delegated_approval_end
-    )
+    monkeypatch.setattr(server.control._approvals, "_publish", delay_delegated_approval_end)
     monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
