@@ -21,7 +21,11 @@ from ..core.project_context import (
     resolve_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
-from ..core.slash import effective_budget_for_model, resolve_session_budget
+from ..core.slash import (
+    UsageTracker,
+    effective_budget_for_model,
+    resolve_session_budget,
+)
 from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..protocol.types import (
     CompletionBackend,
@@ -122,7 +126,13 @@ class SessionState:
     loop: AgentLoop
     policy: ApprovalPolicy
     usage: dict[str, Any] = field(default_factory=dict)
+    usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
+
+    def __post_init__(self) -> None:
+        self.usage_tracker = UsageTracker(
+            self.loop.context_assembler, provider=self.provider
+        )
 
     @classmethod
     def from_composition(cls, composition: RuntimeComposition) -> SessionState:
