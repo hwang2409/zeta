@@ -10,6 +10,7 @@ import shutil
 import signal
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -57,6 +59,30 @@ def _descendant_command(child_pid: Path | None = None) -> str:
         + "time.sleep(5)"
     )
     return _python_command(parent)
+
+
+@asynccontextmanager
+async def _owned_descendant(pid_file: Path):
+    try:
+        yield
+    finally:
+        try:
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                os.kill(pid, signal.SIGKILL)
+                await wait_pid_exited(pid)
+        except BaseException as error:
+            active_error = sys.exc_info()[1]
+            if active_error is not None:
+                active_error.add_note(
+                    f"descendant cleanup error: {type(error).__name__}: {error}"
+                )
+            else:
+                raise
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
@@ -424,29 +450,31 @@ async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Pa
     child_pid = tmp_path / "child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-abort",
-                "bash",
-                {"cmd": _descendant_command(child_pid=child_pid)},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"cmd": _descendant_command(child_pid=child_pid)},
+                )
             )
         )
-    )
 
-    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
-    abort_signal.abort()
-    result = await asyncio.wait_for(task, 10)
-    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
+        child_pid_value = await read_pid_file(child_pid)
+        abort_signal.abort()
+        result = await asyncio.wait_for(task, 10)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    child_pid = tmp_path / "cancel-child.pid"
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
@@ -462,22 +490,24 @@ async def test_bash_task_cancellation_kills_process_group(
 
     monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command()})
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(child_pid)})
+            )
         )
-    )
 
-    await asyncio.wait_for(spawned.wait(), timeout=2)
-    task.cancel()
-    release_spawn.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
+        await asyncio.wait_for(spawned.wait(), timeout=2)
+        await read_pid_file(child_pid)
+        task.cancel()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
 
-    assert spawned_process is not None
-    assert spawned_process.returncode is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(spawned_process.pid, 0)
+        assert spawned_process is not None
+        assert spawned_process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(spawned_process.pid, 0)
 
 
 @pytest.mark.asyncio
@@ -1578,7 +1608,7 @@ skill_catalog=SkillCatalog.empty(),
 
     abort_task = asyncio.create_task(abort_soon())
     result = await registry.execute(ToolCall("read-abort", "read", {"path": "large.txt"}))
-    await abort_task
+    await await_or_fail(abort_task, what="read abort task")
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
@@ -1589,27 +1619,28 @@ async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     child_pid = tmp_path / "timeout-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    execution = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-timeout",
-                "bash",
-                {
-                    "command": _descendant_command(child_pid=child_pid),
-                    "timeout": 0.5,
-                },
+    async with _owned_descendant(child_pid):
+        execution = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-timeout",
+                    "bash",
+                    {
+                        "command": _descendant_command(child_pid=child_pid),
+                        "timeout": 0.5,
+                    },
+                )
             )
         )
-    )
-    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
-    result = await asyncio.wait_for(execution, 10)
-    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
+        child_pid_value = await read_pid_file(child_pid)
+        result = await asyncio.wait_for(execution, 10)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert "timed out after" in result["content"][0]["text"]
-    assert result["structuredContent"]["timed_out"] is True
-    assert result["structuredContent"]["error"]["tool"] == "bash"
-    assert result["structuredContent"]["error"]["kind"] == "timeout"
+        assert result["isError"] is True
+        assert "timed out after" in result["content"][0]["text"]
+        assert result["structuredContent"]["timed_out"] is True
+        assert result["structuredContent"]["error"]["tool"] == "bash"
+        assert result["structuredContent"]["error"]["kind"] == "timeout"
 
 
 
@@ -1798,23 +1829,24 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
     child_pid = tmp_path / "cancel-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-cancel",
-                "bash",
-                {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-cancel",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    # The pid file is written by the descendant itself, so this is real process readiness.
-    await read_pid_file(child_pid)
-    task.cancel()
+        # The pid file is written by the descendant itself, so this is real process readiness.
+        await read_pid_file(child_pid)
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
-    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
-    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
 
 
@@ -1825,24 +1857,25 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     child_pid = tmp_path / "abort-child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-abort",
-                "bash",
-                {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    await read_pid_file(child_pid)
-    abort_signal.abort()
+        await read_pid_file(child_pid)
+        abort_signal.abort()
 
-    result = await asyncio.wait_for(task, timeout=10)
-    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
-    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
+        result = await asyncio.wait_for(task, timeout=10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
