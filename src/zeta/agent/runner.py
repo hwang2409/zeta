@@ -243,10 +243,9 @@ async def consume_child(
                 delivering_prompt_id,
             )
             if gate_result.outcome == "task_safety_expired":
-                child_loop.tool_registry.background_tasks.begin_shutdown(
-                    "finish-gate task safety bound expired after "
-                    f"{child_loop._background_owner.finish_gate_task_timeout:g} seconds"
-                )
+                timeout = child_loop._background_owner.finish_gate_task_timeout
+                cause = f"finish-gate task safety bound expired after {timeout:g} seconds"
+                child_loop.tool_registry.background_tasks.begin_shutdown(cause)
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
                 final_message = Message(
@@ -659,6 +658,7 @@ async def run_agent_tool(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
+            _storage_lease=loop.store._storage_lease,
         )
     )
     try:
@@ -703,7 +703,9 @@ async def run_agent_tool(
             # index (directory-fsynced) BEFORE the registry append, so the root's
             # reconciliation can recover this child link after a crash or a
             # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(loop.root_session_dir, link)
+            persist_pending_child_link(
+                loop.root_session_dir, link, loop.store._storage_lease
+            )
             loop.project_registry.record_session(
                 loop.root_project_id,
                 session_id=child_instance_id,
@@ -1062,7 +1064,7 @@ async def run_agent_tool(
             loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
-            return tuple(await child_loop.close(cancel_background=False, background_task_cause=cause))
+            return tuple(await child_loop.close(background_task_cause=cause, cancel_background=False))
 
         async def finish_background() -> None:
             await finish_background_child(

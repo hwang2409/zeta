@@ -271,9 +271,11 @@ class TUIApp(
         self._resuming_tool = False
         self._session = session
         self._prompt_history = SessionPromptHistory()
+        storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
             directory_fd=self.loop.store.directory_fd if draft_path is None else None,
+            storage_lease=storage_lease,
             notice_sink=lambda message: app._handle_background_notice(message),
         )
         self._draft_session: PromptSession[str] | None = None
