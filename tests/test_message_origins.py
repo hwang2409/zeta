@@ -348,7 +348,7 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
         "MCP prompt": "/server:prompt value",
         "MCP resource": "/mcp resources server mcp://doc/1",
         "escaped slash": "//status",
-        "unknown slash": "/not-a-command",
+        "unknown slash": "//not-a-command",
         "attachments/images": "inspect @note.txt",
         "paste expansion": "inspect [Image #1]",
         "steer/queued input": "steer now",

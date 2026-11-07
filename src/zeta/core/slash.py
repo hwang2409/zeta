@@ -41,12 +41,14 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
-from .slash_errors import unknown_slash_command
 from .project_context import (
     discover_project_root,
     project_instructions_command,
 )
+from .slash_errors import unknown_slash_command
 from .store import ConversationEntry
+
+
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
     uncached_input_tokens_this_session: int
@@ -142,7 +144,6 @@ class UsageTracker:
                 else None
             ),
         )
-
     def _counters(self) -> dict[str, int]:
         return {
             "input_tokens": self.source.uncached_input_tokens_this_session,
@@ -159,7 +160,6 @@ class CompactionSummary:
     turn: int
     entries_folded: int
     tokens_saved: int
-
 
 @dataclass(frozen=True, slots=True)
 class ModelPricing:
