@@ -281,7 +281,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_first: bool
 ) -> None:
     server, _reader, writer, _foreground = await _approval_server(tmp_path)
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "child")
+    store = ConversationStore(tmp_path / "child")
     call = ToolCall("child-call", "read", {"path": "input"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
@@ -431,7 +431,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _reader, writer, _foreground = await _approval_server(tmp_path)
-    child = await asyncio.to_thread(ConversationStore, tmp_path / "child-history-race")
+    child = ConversationStore(tmp_path / "child-history-race")
     call = ToolCall("child-history-call", "read", {"path": "input"})
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
@@ -508,7 +508,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
                 capability=object(),  # type: ignore[arg-type]
             )
         else:
-            child = await asyncio.to_thread(ConversationStore, tmp_path / "guard-child")
+            child = ConversationStore(tmp_path / "guard-child")
             call = ToolCall("guard-child-call", "read", {"path": "input"})
             child.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -577,7 +577,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             authorizer = policy
             key: str | tuple[str, str] = call.id
         else:
-            child = await asyncio.to_thread(ConversationStore, tmp_path / "recover-child")
+            child = ConversationStore(tmp_path / "recover-child")
             call = ToolCall("recover-child-call", "bash", {"command": "true"})
             authorizer = ChildApprovalPolicy(policy, child, "child", "child")
             store = child
@@ -1087,7 +1087,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         assert old_state.loop.step_delivery is None
         mount_task = old_state.loop._mcp_mount_task
         assert mount_task is None or mount_task.done()
-        reopened = await asyncio.to_thread(server.runtime.manager.open, old_state.session_id)
+        reopened = server.runtime.manager.open(old_state.session_id)
         try:
             assert reopened.metadata.session_id == old_state.session_id
         finally:
@@ -1227,7 +1227,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
         for index in range(4):
             child_id = f"child-{index}"
             call = ToolCall(f"child-call-{index}", "read", {"path": "input"})
-            store = await asyncio.to_thread(ConversationStore, tmp_path / child_id)
+            store = ConversationStore(tmp_path / child_id)
             stores.append(store)
             store.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -1341,7 +1341,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
     tmp_path: Path,
 ) -> None:
     server, _reader, writer, _call = await _approval_server(tmp_path)
-    child = await asyncio.to_thread(ConversationStore, tmp_path / "child")
+    child = ConversationStore(tmp_path / "child")
     call = ToolCall("child-call", "read", {"path": "input"})
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
@@ -1361,7 +1361,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
 
         await _close(server, writer)
         closed = True
-        late = await asyncio.to_thread(ConversationStore, tmp_path / "late-child")
+        late = ConversationStore(tmp_path / "late-child")
         late_call = ToolCall("late-call", "read", {"path": "late"})
         late.append_message_with_approval_requests(
             Message(MessageRole.ASSISTANT, [ToolUseContent(late_call)]),
@@ -1484,7 +1484,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             await server.control._event(_start_event(call))
             request_id = call.id
         else:
-            child = await asyncio.to_thread(ConversationStore, tmp_path / "matrix-child")
+            child = ConversationStore(tmp_path / "matrix-child")
             call = ToolCall("matrix-child-call", "read", {"path": "input"})
             child.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -1582,7 +1582,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
     tmp_path: Path,
 ) -> None:
     server, _reader, writer, _foreground = await _approval_server(tmp_path)
-    child = await asyncio.to_thread(ConversationStore, tmp_path / "session-child")
+    child = ConversationStore(tmp_path / "session-child")
     call = ToolCall("session-child-call", "read", {"path": "input"})
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
@@ -1620,7 +1620,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
 async def test_concurrent_delegated_history_uses_store_durable_writer(
     tmp_path: Path,
 ) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "concurrent-history")
+    store = ConversationStore(tmp_path / "concurrent-history")
     tool_call = ToolCall("concurrent-call", "read", {"path": "input"})
 
     async def write_pair(request_id: str) -> None:
@@ -1695,7 +1695,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _reader, writer, _foreground = await _approval_server(tmp_path)
-    child = await asyncio.to_thread(ConversationStore, tmp_path / "failed-start-child")
+    child = ConversationStore(tmp_path / "failed-start-child")
     call = ToolCall("failed-start-call", "read", {"path": "input"})
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]

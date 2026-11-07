@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import io
 import json
 import os
@@ -70,7 +69,7 @@ async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int,
 async def test_headless_thinking_only_max_tokens_is_an_error(tmp_path: Path) -> None:
     loop = AgentLoop(
         FakeBackend([ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]),
-        await asyncio.to_thread(ConversationStore, tmp_path),
+        ConversationStore(tmp_path),
         skill_catalog=SkillCatalog.empty(),
     )
     code, _stdout, stderr = await _drive(loop, "hello", "text")
@@ -414,7 +413,7 @@ def test_headless_waits_for_cross_model_agent(
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("hello world")])])
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
 
@@ -426,7 +425,7 @@ async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> 
 
 
 async def test_json_mode_streams_documented_lifecycle(tmp_path: Path) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     backend = FakeBackend(
         [
             ScriptedTurn(
@@ -462,7 +461,7 @@ async def test_json_mode_records_tool_call_and_result(tmp_path: Path) -> None:
             ScriptedTurn(content=[TextContent("finished")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("echo", lambda arguments: f"got {arguments['value']}")
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
@@ -493,7 +492,7 @@ async def test_json_mode_bounds_large_tool_result(tmp_path: Path) -> None:
             ScriptedTurn(content=[TextContent("done")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     big = "a" * 20_000
     registry.register("spam", lambda arguments: big)
@@ -518,7 +517,7 @@ async def test_json_mode_tool_result_bound_is_byte_based(tmp_path: Path) -> None
             ScriptedTurn(content=[TextContent("done")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     # Four-byte UTF-8 emoji: char count is well under the limit, byte count is
     # well over it. Char-based bounds would silently ship the whole payload.
@@ -546,7 +545,7 @@ async def test_json_mode_bounds_large_tool_call_arguments(tmp_path: Path) -> Non
             ScriptedTurn(content=[TextContent("done")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("sink", lambda arguments: "ok")
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
@@ -570,7 +569,7 @@ async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -
             ScriptedTurn(content=[TextContent("recovered")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("vetoed", lambda arguments: "must not run")
     registry.set_pre_execute_hook(lambda name, arguments: False)
@@ -792,7 +791,7 @@ async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -
             ScriptedTurn(content=[TextContent("recovered")]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("danger", lambda arguments: "must not run")
@@ -815,7 +814,7 @@ async def test_max_turns_error_returns_exit_one(tmp_path: Path) -> None:
             ScriptedTurn(tool_calls=[ToolCall("call-2", "loop", {})]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("loop", lambda arguments: "again")
     loop = AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -834,7 +833,7 @@ async def test_json_mode_surfaces_error_event(tmp_path: Path) -> None:
             ScriptedTurn(tool_calls=[ToolCall("call-2", "loop", {})]),
         ]
     )
-    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("loop", lambda arguments: "again")
     loop = AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty())

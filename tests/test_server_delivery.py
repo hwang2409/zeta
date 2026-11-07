@@ -118,7 +118,7 @@ async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
 async def test_delivery_id_cancel_after_append_finishes_effects(
     tmp_path: Path, method: str
 ) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path / method, session_id="session-1")
+    store = ConversationStore(tmp_path / method, session_id="session-1")
     effects: list[str] = []
     append_started = asyncio.Event()
     release_append = asyncio.Event()
@@ -182,7 +182,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
 async def test_delivery_id_cancel_before_append_commits_does_nothing(
     tmp_path: Path, method: str
 ) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path / method, session_id="session-1")
+    store = ConversationStore(tmp_path / method, session_id="session-1")
     append_started = asyncio.Event()
     original_append = store.append_client_delivery_async
 
@@ -553,7 +553,7 @@ async def test_delivery_status_unknown_and_feature_gate(tmp_path: Path) -> None:
 async def test_delivery_effect_callback_only_runs_after_durable_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions")
+    store = ConversationStore(tmp_path / "sessions")
     callback_observations: list[bool] = []
     original_write_bytes = ConversationStore._write_bytes
 
@@ -937,9 +937,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
     session_id = created[-1]["result"]["session"]["session_id"]
     await _close(first, writer)
 
-    store = await asyncio.to_thread(
-        ConversationStore, tmp_path / "sessions", session_id=session_id
-    )
+    store = ConversationStore(tmp_path / "sessions", session_id=session_id)
     accepted_message = with_message_origin(
         Message(MessageRole.USER, [TextContent("resume this exact steer")]),
         MessageOrigin.USER,

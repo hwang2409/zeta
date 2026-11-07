@@ -48,7 +48,6 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
-from tests.support.stores import open_test_store
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -1655,7 +1654,8 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
         store = server.runtime.opened.store
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
-        assert "reason" not in store.entries[-1].data
+        reopened = SessionManager(tmp_path).open(session_id).store
+        assert "reason" not in reopened.entries[-1].data
 
         history = (
             await _request(
@@ -1857,7 +1857,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             for message in server.runtime.opened.store.messages()
             for block in message.content
         )
-        child_store = await open_test_store(
+        child_store = ConversationStore(
             server.runtime.opened.store.session_dir / "agents",
             session_id="1",
             _read_only=True,
@@ -3518,11 +3518,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    reopened = await asyncio.to_thread(
-        server.runtime.manager.open, session_id, _read_only=True
-    )
-    messages = reopened.store.messages()
-    reopened.store.close()
+    messages = server.runtime.manager.open(session_id).store.messages()
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -3563,8 +3559,8 @@ def test_delegated_approval_wire_keys_are_unique(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_reused_core_key_gets_fresh_wire_id_after_end(tmp_path: Path) -> None:
-    approvals = await asyncio.to_thread(_bare_approval_lifecycle, tmp_path)
-    store = await asyncio.to_thread(ConversationStore, tmp_path / "child")
+    approvals = _bare_approval_lifecycle(tmp_path)
+    store = ConversationStore(tmp_path / "child")
     tool_call = ToolCall("same", "read", {"path": "x"})
     request = ApprovalRequest("same", tool_call, child_instance_id="child")
     store.append_message_with_approval_requests(
@@ -3736,7 +3732,7 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
-    policy = ApprovalPolicy(store=await asyncio.to_thread(ConversationStore, tmp_path))
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
         SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
     )
@@ -6034,7 +6030,6 @@ async def test_session_listing_includes_real_and_removed_provider_sessions(
             manager.create, provider=provider, model=model, cwd=tmp_path
         )
         sessions[provider] = opened.metadata.session_id
-        opened.store.close()
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -6173,9 +6168,9 @@ async def test_list_sessions_page_touches_only_page_rows(
         opened = await asyncio.to_thread(
             manager.create, provider="codex", model="offline", cwd=tmp_path
         )
+        opened.store.close()
         opened.metadata.updated_at = f"2030-01-01T00:00:0{index}+00:00"
         await asyncio.to_thread(manager._write, opened.metadata)
-        opened.store.close()
         sessions.append(opened.metadata.session_id)
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
@@ -6322,9 +6317,9 @@ async def test_catalog_row_bounds_system_prompt(tmp_path: Path) -> None:
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="offline", cwd=tmp_path
     )
+    opened.store.close()
     opened.metadata.system_prompt = "x" * 100_000
     await asyncio.to_thread(manager._write, opened.metadata)
-    opened.store.close()
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -6449,7 +6444,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         )
         assert detail in failure["error"]["message"]
         await _event(reader, "agent_end")
-        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+        metadata = SessionManager(tmp_path).open(sid).metadata
         assert (metadata.provider, metadata.model) == (start_provider, start_model)
         assert metadata.model_fallback is None
         assert metadata.compaction_budget == old_budget
@@ -6730,8 +6725,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
                 },
             )
         assert server.runtime.metadata.model_fallback is None
-        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
-        assert metadata.model_fallback is None
+        assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
         await _request(reader, writer, 4, "send", {"text": "try returned selection"})
         failure = (await _event(reader, "error"))["error"]
         assert failure == {"code": "model_access_error", "message": "Access denied"}
@@ -6899,7 +6893,7 @@ async def test_stream_access_error_restores_model_over_wire(
         assert failure["code"] == "model_reverted"
         await _event(reader, "agent_end")
         assert server.runtime.model == original
-        metadata = await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+        metadata = SessionManager(tmp_path).open(sid).metadata
         assert (metadata.provider, metadata.model) == (provider, original)
         assert metadata.model_fallback is None
         await _request(reader, writer, 5, "send", {"text": "try fallback"})
