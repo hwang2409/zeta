@@ -16,6 +16,7 @@ from zeta.core.checkpoints import ConversationIntegrityError
 from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
 from zeta.core.store import ConversationStore
 from zeta.storage_format import (
+    GATED_HOME_PATHS,
     DeleteValue,
     ReplaceSubtree,
     SetValue,
@@ -26,6 +27,24 @@ from zeta.storage_format import (
     verify,
 )
 from zeta.tools._shared.process import BackgroundTaskRegistry
+
+
+def _first_open(home: str, connection) -> None:
+    lease = None
+    try:
+        if not connection.poll(10):
+            return
+        connection.recv()
+        try:
+            lease = open_writer(home)
+            connection.send("opened")
+            connection.poll(10) and connection.recv()
+        except StorageFormatError as exc:
+            connection.send(str(exc))
+    finally:
+        if lease is not None:
+            lease.close()
+        connection.close()
 
 
 def _try_exclusive_lock(home: str, result: multiprocessing.Queue[str]) -> None:
@@ -95,15 +114,92 @@ def _assert_closed_owner_allows_exclusive_lock(tmp_path: Path, owner: str) -> No
     process.close()
 
 
-def test_writer_refuses_missing_and_too_new_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_writer_bootstraps_empty_home_and_refuses_too_new_manifest(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.delenv("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT")
-    with pytest.raises(StorageFormatError, match="manifest is missing"):
-        open_writer(tmp_path)
+    lease = open_writer(tmp_path)
+    lease.close()
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
+
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":3}\n')
     with pytest.raises(StorageFormatError, match="newer than writer capability"):
         open_writer(tmp_path)
+
+
+def test_writer_bootstraps_home_with_empty_sessions_directory(tmp_path: Path) -> None:
+    (tmp_path / "sessions").mkdir()
+
+    with open_writer(tmp_path):
+        pass
+
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
+
+
+@pytest.mark.parametrize(("pattern", "owner"), GATED_HOME_PATHS)
+def test_writer_refuses_each_gated_home_shape_without_a_manifest(
+    tmp_path: Path, pattern: str, owner: str
+) -> None:
+    del owner
+    path = tmp_path / pattern.replace("*", "stored")
+    if path.suffix == ".json":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+    else:
+        path.mkdir(parents=True)
+
+    with pytest.raises(StorageFormatError) as raised:
+        open_writer(tmp_path)
+
+    assert (
+        "zeta storage-format advance --expected-epoch 0 "
+        f"--target-epoch {storage_format.WRITER_EPOCH}"
+    ) in str(raised.value)
+    assert not (tmp_path / "storage-format.json").exists()
+
+
+def test_two_processes_can_race_to_bootstrap_one_empty_home(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    connections = [context.Pipe() for _ in range(2)]
+    processes = [
+        context.Process(target=_first_open, args=(str(tmp_path), child))
+        for (_parent, child) in connections
+    ]
+    outcomes: list[str] = []
+    exitcodes: list[int | None] = []
+    try:
+        for process in processes:
+            process.start()
+        for _parent, child in connections:
+            child.close()
+        for parent, _child in connections:
+            parent.send("start")
+        for parent, _child in connections:
+            assert parent.poll(15), "first-open process did not report an outcome"
+            outcomes.append(parent.recv())
+    finally:
+        for parent, _child in connections:
+            try:
+                parent.send("release")
+            except (BrokenPipeError, OSError):
+                pass
+        for process in processes:
+            process.join(15)
+            if process.is_alive():
+                process.terminate()
+                process.join(15)
+        for parent, _child in connections:
+            parent.close()
+        exitcodes = [process.exitcode for process in processes]
+        for process in processes:
+            process.close()
+
+    assert all(exitcode == 0 for exitcode in exitcodes)
+    assert outcomes.count("opened") in {1, 2}
+    assert all(
+        outcome == "opened" or "stored-format manifest is missing" in outcome
+        for outcome in outcomes
+    )
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
 
 
 def test_advance_is_exclusive_across_processes(tmp_path: Path) -> None:

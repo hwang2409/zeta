@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import _print_exit_hint, build_parser, main
 from zeta.core.session import (
     SESSION_NAME_MAX_LENGTH,
@@ -76,24 +77,24 @@ async def test_slash_name_persists_label_and_shows_current(
     app = await asyncio.to_thread(create_app, _args())
 
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name"
+        )
         == "session name: (unnamed)"
     )
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name  planning  ")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name  planning  "
+        )
         == "session name: planning"
     )
     assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
         "planning"
     )
     assert (
-        await create_slash_registry(
-            skill_catalog=SkillCatalog.empty()
-        ).dispatch_async(app, "/name")
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/name"
+        )
         == "session name: planning"
     )
 
@@ -213,7 +214,9 @@ def test_session_list_shows_id_name_age_preview(
 
     first = create_app(_args())
     first.loop.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("first prompt")]), MessageOrigin.USER
+        )
     )
     manager = SessionManager(home)
     manager.record_name(
@@ -295,7 +298,11 @@ def test_session_export_writes_portable_jsonl(
 
     app = create_app(_args())
     session_id = app.loop.store.session_id
-    app.loop.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi world")]), MessageOrigin.USER))
+    app.loop.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("hi world")]), MessageOrigin.USER
+        )
+    )
 
     exit_code = main(["session", "export", session_id])
     output = capsys.readouterr().out
@@ -542,7 +549,7 @@ def test_session_delete_rejects_ambiguous_prefix(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    home = tmp_path / "zeta-home"
+    home = initialize_storage_home(tmp_path / "zeta-home")
     sessions_dir = home / "sessions"
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "abc111").mkdir()
