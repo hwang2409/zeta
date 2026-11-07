@@ -356,6 +356,7 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._local_close = False
         self._controller_release: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -501,6 +502,8 @@ class _Client:
         return self._controller_release
 
     def _release_dead_connection(self) -> None:
+        if self._local_close:
+            return
         self._begin_controller_release()
         self.connections.release(self)
 
@@ -513,6 +516,7 @@ class _Client:
                 await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
+            self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
