@@ -584,10 +584,12 @@ class _Client:
                 ErrorDescriptor.METHOD_NOT_FOUND, f"{method} requires protocol 1.1"
             )
         if descriptor.feature is not None and descriptor.feature not in self.features:
-            raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                f"{method} requires the negotiated {descriptor.feature} feature",
+            feature_message = (
+                "session grants require the negotiated session_grants feature"
+                if descriptor.feature == "session_grants"
+                else f"{method} requires the negotiated {descriptor.feature} feature"
             )
+            raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, feature_message)
         self._current_method = method
         return await HANDLERS[descriptor](self, request_id, params)
 
