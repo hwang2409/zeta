@@ -52,8 +52,11 @@ def _descendant_command(
     delay: float = 0.3,
     started: Path | None = None,
     release: Path | None = None,
+    child_pid: Path | None = None,
 ) -> str:
-    child = "import pathlib,time\n"
+    child = "import os,pathlib,time\n"
+    if child_pid:
+        child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
     if release:
         child += (
             f"deadline=time.monotonic()+5\n"
@@ -1656,7 +1659,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     command_finished = tmp_path / "timeout-command-finished"
     command = (
         "import pathlib,time; "
-        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
+        f"pathlib.Path({str(command_started)!r}).write_text('1'); time.sleep(0.1); "
         f"pathlib.Path({str(command_finished)!r}).touch()"
     )
     original_spawn = bash_module.create_tool_subprocess_shell
@@ -1664,8 +1667,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     async def spawn_after_command_started(*args, **kwargs):
         process = await original_spawn(*args, **kwargs)
         assert launcher_ready.exists()
-        while not command_started.exists():
-            await asyncio.sleep(0.01)
+        await read_pid_file(command_started)
         return process
 
     monkeypatch.setattr(
@@ -1677,7 +1679,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
         ToolCall(
             "bash-launcher-timeout",
             "bash",
-            {"command": _python_command(command), "timeout": 2.0},
+            {"command": _python_command(command), "timeout": 0.5},
         )
     )
 
@@ -1840,27 +1842,24 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "cancel-child-alive"
-    started = tmp_path / "cancel-child-started"
+    child_pid = tmp_path / "cancel-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
                 "bash-cancel",
                 "bash",
-                {"command": _descendant_command(marker, started=started), "timeout": 5},
+                {"command": _descendant_command(marker, child_pid=child_pid), "timeout": 5},
             )
         )
     )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert started.exists()
+    # The pid file is written by the descendant itself, so this is real process readiness.
+    await read_pid_file(child_pid)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(0.4)
+    await wait_pid_exited(await read_pid_file(child_pid))
 
     assert not marker.exists()
 
@@ -1870,6 +1869,7 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "abort-child-alive"
+    child_pid = tmp_path / "abort-child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
@@ -1877,15 +1877,15 @@ async def test_bash_abort_kills_process_group_and_returns_canceled_result(
             ToolCall(
                 "bash-abort",
                 "bash",
-                {"command": _descendant_command(marker), "timeout": 5},
+                {"command": _descendant_command(marker, child_pid=child_pid), "timeout": 5},
             )
         )
     )
-    await asyncio.sleep(0.05)
+    await read_pid_file(child_pid)
     abort_signal.abort()
 
     result = await asyncio.wait_for(task, timeout=0.5)
-    await asyncio.sleep(0.4)
+    await wait_pid_exited(await read_pid_file(child_pid))
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
