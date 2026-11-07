@@ -848,6 +848,10 @@ class _Client:
     async def _ergonomics(
         self, descriptor: MethodDescriptor, params: dict[str, Any]
     ) -> object:
+        if isinstance(descriptor, str):
+            descriptor = MethodDescriptor.for_wire(descriptor)
+            if descriptor is None:
+                raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
         runtime = self.server.runtime
         method = descriptor.wire
         if descriptor in {
