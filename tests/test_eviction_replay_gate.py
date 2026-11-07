@@ -148,6 +148,8 @@ def test_compare_records_exact_identity_for_each_worktree(tmp_path: Path) -> Non
     subprocess.run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
     try:
         subprocess.run(["git", "worktree", "add", "--detach", str(head), "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(head), "config", "user.email", "test@example.invalid"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(head), "config", "user.name", "test"], check=True, capture_output=True, text=True)
         subprocess.run(["git", "-C", str(head), "commit", "--allow-empty", "-m", "identity test"], check=True, capture_output=True, text=True)
         result = _compare(base, head, tmp_path)
         assert result.returncode == 0, result.stderr
