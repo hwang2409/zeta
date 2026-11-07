@@ -15,7 +15,6 @@ from ..core.project_context import (
     refresh_project_memory,
 )
 from ..core.session import SessionManager, SessionMetadata
-from ..core.session_files import SessionError
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
 from ..project_registry import Project
@@ -299,15 +298,10 @@ def resume_prompt(
     )
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
-    if not composition.agent_catalog.bodies_committed:
-        raise SessionError(
-            "session agent profiles were saved by an older runtime; "
-            "close the other runtime and resume again"
-        )
     context = _adopted_context(metadata, composition.notices)
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)
-    return ResumedPrompt(context, skills, composition.agent_catalog)
+    return ResumedPrompt(context, skills, agents)
 
 
 __all__ = ["ResumedPrompt", "resume_prompt"]

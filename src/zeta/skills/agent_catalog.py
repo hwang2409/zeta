@@ -34,7 +34,6 @@ class AgentCatalog:
 
     agents: tuple[AgentPreset, ...]
     notices: tuple[str, ...] = ()
-    bodies_committed: bool = True
 
     @classmethod
     def empty(cls) -> AgentCatalog:
@@ -57,10 +56,8 @@ class AgentCatalog:
         return f"Choose one of: {choices}." if choices else "No agent presets are available."
 
     def to_snapshot(self) -> list[dict[str, object]]:
-        """Return complete agent definitions from one catalog generation."""
+        """Return agent metadata without embedding prompt bodies."""
 
-        if not self.bodies_committed:
-            raise ValueError("agent catalog does not contain committed profile bodies")
         snapshots = []
         for agent in self.agents:
             snapshot = snapshot_metadata(
@@ -78,7 +75,6 @@ class AgentCatalog:
                     else None,
                     "model": agent.model,
                     "preamble": agent.preamble,
-                    "prompt_suffix": agent.prompt_suffix,
                     "allow_delegation": agent.allow_delegation,
                     "accepts_follow_ups": agent.accepts_follow_ups,
                     "explicit_finish": agent.explicit_finish,
@@ -92,7 +88,6 @@ class AgentCatalog:
         if type(value) is not list:
             raise ValueError("agent catalog snapshot must be a list")
         agents: list[AgentPreset] = []
-        bodies_committed = True
         for item in value:
             if type(item) is not dict:
                 raise ValueError("agent catalog snapshot entries must be mappings")
@@ -101,11 +96,6 @@ class AgentCatalog:
             tools = item.get("tools")
             model = item.get("model")
             preamble = item.get("preamble", "")
-            if "prompt_suffix" in item:
-                prompt_suffix = item["prompt_suffix"]
-            else:
-                prompt_suffix = ""
-                bodies_committed = False
             allow_delegation = item.get("allow_delegation", True)
             accepts_follow_ups = item.get("accepts_follow_ups", False)
             explicit_finish = item.get("explicit_finish", False)
@@ -126,7 +116,6 @@ class AgentCatalog:
                 )
                 or (model is not None and type(model) is not str)
                 or type(preamble) is not str
-                or type(prompt_suffix) is not str
                 or type(allow_delegation) is not bool
                 or type(accepts_follow_ups) is not bool
                 or type(explicit_finish) is not bool
@@ -140,7 +129,7 @@ class AgentCatalog:
                     name=name,
                     tool_names=frozenset(tools) if tools is not None else None,
                     preamble=preamble,
-                    prompt_suffix=prompt_suffix,
+                    prompt_suffix="",
                     selection_guidance=description,
                     model=model,
                     source=source,
@@ -151,7 +140,7 @@ class AgentCatalog:
                     explicit_finish=explicit_finish,
                 )
             )
-        return cls(tuple(agents), bodies_committed=bodies_committed)
+        return cls(tuple(agents))
 
 
 def _agents_dir(root: Path) -> Path:
