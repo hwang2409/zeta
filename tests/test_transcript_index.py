@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import queue
 import sqlite3
 import threading
+import traceback
 from pathlib import Path
 
 import pytest
 
 import zeta.transcript_search.index as index_module
+from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
 from zeta.project_registry import ProjectRegistry
@@ -61,18 +64,28 @@ def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
 
 
 def _construct_index_process(project_dir: str, start, results) -> None:
-    start.wait()
-    TranscriptIndex(Path(project_dir), PROJECT_A)
-    results.put(None)
+    results.put(("ready",))
+    try:
+        start.wait()
+        TranscriptIndex(Path(project_dir), PROJECT_A)
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put(("error", traceback.format_exc()))
+    else:
+        results.put(("ok",))
 
 
 def _append_index_process(
     project_dir: str, session_dir: str, session_id: str, start, results
 ) -> None:
-    start.wait()
-    index = TranscriptIndex(Path(project_dir), PROJECT_A)
-    index.append(TranscriptSource(session_id, Path(session_dir)))
-    results.put(None)
+    results.put(("ready",))
+    try:
+        start.wait()
+        index = TranscriptIndex(Path(project_dir), PROJECT_A)
+        index.append(TranscriptSource(session_id, Path(session_dir)))
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put(("error", traceback.format_exc()))
+    else:
+        results.put(("ok",))
 
 
 def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
@@ -83,13 +96,48 @@ def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
         context.Process(target=target, args=(*items, start, results))
         for items in arguments
     ]
-    for process in processes:
-        process.start()
-    start.set()
-    for process in processes:
-        process.join(10)
-    assert all(process.exitcode == 0 for process in processes)
-    return [results.get(timeout=2) for _ in processes]
+    messages: list[tuple | None] = [None] * len(processes)
+
+    def diagnostics() -> str:
+        return "\n".join(
+            f"child {number}: exitcode={process.exitcode}, message={message!r}"
+            for number, (process, message) in enumerate(zip(processes, messages))
+        )
+
+    try:
+        for process in processes:
+            process.start()
+
+        for _ in processes:
+            try:
+                message = results.get(timeout=60)
+            except queue.Empty:
+                raise AssertionError(
+                    "timed out waiting 60s for all children to report ready;\n"
+                    + diagnostics()
+                ) from None
+            assert message == ("ready",), (
+                f"expected ready message, got {message!r};\n{diagnostics()}"
+            )
+        start.set()
+
+        for number in range(len(processes)):
+            try:
+                messages[number] = results.get(timeout=60)
+            except queue.Empty:
+                raise AssertionError(
+                    "timed out waiting 60s for all children to finish;\n"
+                    + diagnostics()
+                ) from None
+        for process in processes:
+            process.join(60)
+
+        assert all(message == ("ok",) for message in messages), diagnostics()
+        assert all(process.exitcode == 0 for process in processes), diagnostics()
+        return [None] * len(processes)
+    finally:
+        for process in processes:
+            reap_process(process, timeout=60)
 
 
 def test_concurrent_processes_initialize_one_valid_database(tmp_path: Path) -> None:
