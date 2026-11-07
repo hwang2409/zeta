@@ -586,9 +586,6 @@ async def test_stdio_large_tools_list_line_mounts(tmp_path: Path, monkeypatch: p
 async def test_mcp_stdio_oversized_line_spills_not_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     description = "x" * 4096
     source = _stdio_source().replace(
@@ -615,9 +612,6 @@ async def test_mcp_stdio_oversized_line_spills_not_errors(
 async def test_mcp_stdio_malformed_oversized_line_does_not_wedge_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '    elif method == "tools/list":\n        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}\n',
@@ -675,10 +669,7 @@ async def test_mcp_stdio_oversized_line_memory_is_bounded(
 ) -> None:
     import tracemalloc
 
-    import zeta.mcp.stdio as stdio_module
-
     payload_size = 4 * 1024 * 1024
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 64 * 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '"name": "echo", "description": "echo text",',
@@ -711,9 +702,6 @@ async def test_mcp_stdio_oversized_line_memory_is_bounded(
 async def test_stdio_write_after_server_exit_preserves_protocol_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
     client = StdioMCPClient(
@@ -726,7 +714,6 @@ async def test_stdio_write_after_server_exit_preserves_protocol_error(
         source,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        limit=stdio_module.MCP_STDIO_LINE_LIMIT,
     )
     client._process = process
     reader_task = asyncio.create_task(client._read_stdout())
@@ -786,12 +773,9 @@ async def test_stdio_connect_clears_reader_error_for_reconnect(
 
 
 @pytest.mark.asyncio
-async def test_stdio_rejects_unterminated_line_beyond_named_limit(
+async def test_stdio_rejects_malformed_unterminated_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.mcp.stdio as stdio_module
-
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
     client = StdioMCPClient(

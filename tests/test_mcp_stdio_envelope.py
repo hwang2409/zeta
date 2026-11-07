@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import io
 import json
@@ -100,23 +101,69 @@ async def test_constructed_stdio_client_uses_resolved_wire_limit(
         await registry.close()
 
 
+def _sized_frame_server_source(frame_size: int, *, terminated: bool) -> str:
+    return _server_source(
+        f"""        value = {{"jsonrpc": "2.0", "id": request["id"], "result": {{"content": [{{"type": "text", "text": ""}}]}}}}
+        encoded = json.dumps(value, separators=(",", ":")).encode()
+        padding = {frame_size} - len(encoded) - {int(terminated)}
+        assert padding >= 0
+        value["result"]["content"][0]["text"] = "x" * padding
+        encoded = json.dumps(value, separators=(",", ":")).encode()
+        assert len(encoded) + {int(terminated)} == {frame_size}
+        sys.stdout.buffer.write(encoded + (b"\\n" if {terminated!r} else b""))
+        sys.stdout.buffer.flush()"""
+    )
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame_size", "terminated", "over_limit"),
+    [
+        pytest.param(LIMIT, True, False, id="exact-limit"),
+        pytest.param(LIMIT + 1, True, True, id="terminated-over-limit"),
+        pytest.param(LIMIT + 1, False, True, id="unterminated-over-limit"),
+    ],
+)
 async def test_stdio_prebuffer_frame_cap_is_hard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    frame_size: int,
+    terminated: bool,
+    over_limit: bool,
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    body = """        value = {"jsonrpc": "2.0", "id": request["id"], "result": {"content": [{"type": "text", "text": "x" * FRAME_LIMIT}]}}
-        print(json.dumps(value, separators=(",", ":")), flush=True)"""
-    source = _server_source(body.replace("FRAME_LIMIT", str(LIMIT)))
-    client = _client("frame-cap", source)
+    spill = SpillStore()
+    client = _client(
+        "frame-cap",
+        _sized_frame_server_source(frame_size, terminated=terminated),
+        spill_store=spill,
+    )
+    retained: list[tuple[int, int]] = []
+    real_append = MCPCallEnvelope.append
+
+    async def observe_append(envelope: MCPCallEnvelope, chunk: bytes) -> None:
+        try:
+            await real_append(envelope, chunk)
+        finally:
+            retained.append((envelope.total, spill._transient_bytes))
+
+    monkeypatch.setattr(MCPCallEnvelope, "append", observe_append)
     try:
         await client.connect()
         result = await client.call_tool("echo", {}, AbortSignal())
-        assert result == make_error_result(
-            f"MCP tool frame-cap__echo exceeded the {LIMIT} bytes response limit"
-        )
+        if over_limit:
+            assert result == make_error_result(
+                f"MCP tool frame-cap__echo exceeded the {LIMIT} bytes response limit"
+            )
+        else:
+            assert result["isError"] is False
+            assert result["content"][0]["text"]
+        assert retained
+        assert max(total for total, _ in retained) <= LIMIT
+        assert max(transient for _, transient in retained) <= LIMIT
     finally:
         await client.close()
+        spill.close()
 
 
 @pytest.mark.asyncio
@@ -365,7 +412,6 @@ class _CountingTemporary:
 async def test_tiny_stdio_reads_keep_spill_writes_and_frame_accounting_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 64)
     spill = SpillStore()
     temporary = _CountingTemporary()
     monkeypatch.setattr(spill, "temporary_file", lambda: temporary)
@@ -386,6 +432,69 @@ async def test_tiny_stdio_reads_keep_spill_writes_and_frame_accounting_bounded(
     finally:
         await client.close()
         spill.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_stdio_invalidation_observes_pending_future_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, object]] = []
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+    async def cancel_during_cleanup() -> None:
+        client = _client(
+            "cancel-cleanup",
+            _server_source("""        continue"""),
+        )
+        request_written = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        write_request = client._write_request
+        real_kill = stdio_module._kill_and_reap
+
+        async def observe_write(*args) -> None:
+            await write_request(*args)
+            if args[1].get("method") == "tools/call":
+                request_written.set()
+
+        async def blocked_cleanup(process, tasks) -> None:
+            cleanup_entered.set()
+            await allow_cleanup.wait()
+            await real_kill(process, tasks)
+
+        client._write_request = observe_write
+        stdio_module._kill_and_reap = blocked_cleanup
+        try:
+            await client.connect()
+            signal = AbortSignal()
+            call = asyncio.create_task(client.call_tool("echo", {}, signal))
+            await request_written.wait()
+            signal.abort()
+            await cleanup_entered.wait()
+            call.cancel()
+            allow_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        finally:
+            allow_cleanup.set()
+            await client.close()
+            stdio_module._kill_and_reap = real_kill
+            del client._write_request
+
+    try:
+        await cancel_during_cleanup()
+        gc.collect()
+        await asyncio.sleep(0)
+        assert [
+            context.get("message")
+            for context in unhandled
+            if "Future exception was never retrieved" in str(context.get("message"))
+        ] == []
+    finally:
+        loop.set_exception_handler(old_handler)
 
 
 @pytest.mark.asyncio
