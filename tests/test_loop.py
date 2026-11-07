@@ -103,21 +103,100 @@ def ollama_request_bytes(
         ),
     ],
 )
-@pytest.mark.parametrize(
-    "request_serializer",
-    [anthropic_request_bytes, codex_request_bytes, ollama_request_bytes],
-)
-def test_harness_guidance_has_non_user_authorship_in_provider_request(
-    notice: Message,
-    request_serializer,
-) -> None:
-    request = request_serializer([notice], []).decode()
-
+def test_harness_guidance_has_non_user_authorship(notice: Message) -> None:
     assert notice.role is MessageRole.SYSTEM
     assert notice.content[0].text.startswith("[zeta] ")
     assert "user asked" not in notice.content[0].text.casefold()
-    assert HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER in request
-    assert notice.content[0].text in request
+
+
+def _harness_notice_conversation() -> list[Message]:
+    call = ToolCall("call-1", "read", {"path": "README.md"})
+    return [
+        Message(MessageRole.SYSTEM, [TextContent("stable system prompt")]),
+        Message(MessageRole.USER, [TextContent("inspect the readme")]),
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "readme contents"),
+        ),
+        build_nudge_message(),
+        Message(MessageRole.ASSISTANT, [TextContent("inspection complete")]),
+    ]
+
+
+def _assert_harness_notice_wire_text(text: str) -> None:
+    assert text.startswith(f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n[zeta] ")
+
+
+def test_anthropic_request_keeps_context_around_harness_notice() -> None:
+    messages = _harness_notice_conversation()
+    baseline = json.loads(anthropic_request_bytes(messages[:1], []))
+    payload = json.loads(anthropic_request_bytes(messages, []))
+
+    assert json.dumps(payload["system"], separators=(",", ":")).encode() == json.dumps(
+        baseline["system"], separators=(",", ":")
+    ).encode()
+    assert [message["role"] for message in payload["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "user",
+        "assistant",
+    ]
+    assert payload["messages"][1]["content"][0]["type"] == "tool_use"
+    assert payload["messages"][2]["content"][0] == {
+        "content": "readme contents",
+        "is_error": False,
+        "tool_use_id": "call-1",
+        "type": "tool_result",
+    }
+    _assert_harness_notice_wire_text(payload["messages"][3]["content"][0]["text"])
+    assert payload["messages"][4]["content"][0]["text"] == "inspection complete"
+
+
+def test_codex_request_keeps_context_around_harness_notice() -> None:
+    messages = _harness_notice_conversation()
+    baseline = json.loads(codex_request_bytes(messages[:1], []))
+    payload = json.loads(codex_request_bytes(messages, []))
+
+    assert payload["instructions"].encode() == baseline["instructions"].encode()
+    assert [
+        item["role"] if "role" in item else item["type"]
+        for item in payload["input"]
+    ] == [
+        "user",
+        "function_call",
+        "function_call_output",
+        "user",
+        "assistant",
+    ]
+    assert payload["input"][1]["call_id"] == "call-1"
+    assert payload["input"][2]["call_id"] == "call-1"
+    _assert_harness_notice_wire_text(payload["input"][3]["content"][0]["text"])
+    assert payload["input"][4]["content"][0]["text"] == "inspection complete"
+
+
+def test_ollama_request_keeps_context_around_harness_notice() -> None:
+    messages = _harness_notice_conversation()
+    baseline = json.loads(ollama_request_bytes(messages[:1], []))
+    payload = json.loads(ollama_request_bytes(messages, []))
+    wire_messages = payload["messages"]
+
+    assert json.dumps(wire_messages[0], separators=(",", ":")).encode() == json.dumps(
+        baseline["messages"][0], separators=(",", ":")
+    ).encode()
+    assert [message["role"] for message in wire_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
+    assert wire_messages[2]["tool_calls"][0]["function"]["name"] == "read"
+    assert wire_messages[3]["tool_name"] == "read"
+    _assert_harness_notice_wire_text(wire_messages[4]["content"])
+    assert wire_messages[5]["content"] == "inspection complete"
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:

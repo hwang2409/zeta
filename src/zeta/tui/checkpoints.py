@@ -86,6 +86,14 @@ def _age(created_at: str) -> str:
     return f"{seconds // 86_400}d ago"
 
 
+def _visible_harness_notice_text(message: Message) -> str | None:
+    if not is_visible_harness_notice(message):
+        return None
+    return "\n".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+
+
 def _parse_force(args: str) -> tuple[str, bool]:
     """Return ``(remainder, forced)`` after peeling any force flag."""
 
@@ -675,6 +683,16 @@ class CheckpointTranscriptMixin:
                 )
                 yield
                 continue
+            if entry.type == "turn_end":
+                text = {
+                    "user_stop": "turn stopped by the user",
+                    "error": "turn ended with an error",
+                    "disconnect": "turn ended when the controller disconnected",
+                }.get(entry.data["reason"])
+                if text is not None:
+                    self._print_system(text)
+                yield
+                continue
             if entry.type != "message":
                 if (
                     entry.type == "notification"
@@ -694,14 +712,9 @@ class CheckpointTranscriptMixin:
             if message is None:
                 raise RuntimeError("TUI message projection is missing its message")
             if is_passive_harness_message(message):
-                if is_visible_harness_notice(message):
-                    self._print_system(
-                        "\n".join(
-                            block.text
-                            for block in message.content
-                            if isinstance(block, TextContent)
-                        )
-                    )
+                notice_text = _visible_harness_notice_text(message)
+                if notice_text is not None:
+                    self._print_system(notice_text)
                 yield
                 continue
             if message.role is MessageRole.USER:

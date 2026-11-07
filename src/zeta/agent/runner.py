@@ -44,8 +44,8 @@ from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
+from . import budget
 from .background import CancellationRequest, finish_background_child
-from .budget import child_depth as next_agent_depth
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
@@ -90,7 +90,6 @@ async def consume_child(
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
-
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
@@ -99,10 +98,11 @@ async def consume_child(
     def terminal_result(
         *, state: TerminalState, text: str, **result_options: object
     ) -> dict[str, object]:
+        stats = finish_lifecycle(state, text)
         return child_result(
             text,
             state=state,
-            stats=finish_lifecycle(state, text),
+            stats=stats,
             **result_options,
         )
 
@@ -199,7 +199,8 @@ async def consume_child(
             events = child_loop.run_harness_notice_turn(harness_notice_message)
         else:
             events = child_loop.run_turn(
-                "" if delivering_prompt_id is not None else prompt, origin=origin,
+                "" if delivering_prompt_id is not None else prompt,
+                origin=origin,
                 persist_user_message=delivering_prompt_id is None,
             )
         try:
@@ -209,7 +210,9 @@ async def consume_child(
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
-            state: TerminalState = "failed" if report_status == "failed" else "completed"
+            state: TerminalState = (
+                "failed" if report_status == "failed" else "completed"
+            )
             text = f"{report_status}: {summary}"
             finish_lifecycle(state, text)
             structured_content = {
@@ -223,8 +226,7 @@ async def consume_child(
                 "structuredContent": structured_content,
                 "explicitFinishReport": explicit_report,
             }
-        children = owned_children()
-        tasks = owned_tasks()
+        children, tasks = owned_children(), owned_tasks()
         if (
             not child_loop.explicit_finish
             and final_message is not None
@@ -273,8 +275,7 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        text = f"agent error: {failure_message}"
-        return terminal_result(state="failed", text=text)
+        return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
@@ -304,7 +305,6 @@ async def consume_run(
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume one child run through its follow-up and idle lifecycle."""
-
     return await consume_follow_up_run(
         consume_child,
         child_loop,
@@ -390,7 +390,6 @@ async def _build_child_loop(
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
         excluded_names, profile_tool_allow = resolve_child_profile_tools(
-            child_depth=child_depth,
             preset=preset,
             policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
             runtime_tool_names=policy_allowed_runtime_names,
@@ -467,6 +466,7 @@ async def _build_child_loop(
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
+            max_agent_depth=budget.depth_limit(loop.max_agent_depth, preset.max_child_depth),
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -597,7 +597,7 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
+    child_depth, nesting_error = budget.child_depth(loop.agent_depth, loop.max_agent_depth, background)
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,

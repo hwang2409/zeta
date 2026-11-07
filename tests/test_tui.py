@@ -8601,6 +8601,33 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
+def test_rebuild_renders_closed_turn_end_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    replay = tuple(
+        SimpleNamespace(
+            type="turn_end", data={"turn_id": "0" * 32, "reason": reason}, id=reason
+        )
+        for reason in ("user_stop", "completed", "error", "disconnect")
+    )
+    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "turn stopped by the user" in rendered
+    assert "turn ended with an error" in rendered
+    assert "turn ended when the controller disconnected" in rendered
+    assert "completed" not in rendered
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
@@ -12948,11 +12975,17 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
 
 
 
-def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("do the thing")]), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("do the thing")]),
+            MessageOrigin.USER,
+        )
+    )
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
@@ -12971,12 +13004,15 @@ def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
         console=Console(file=output, force_terminal=False),
     )
 
-    app._rebuild_transcript()
+    try:
+        app._rebuild_transcript()
 
-    rendered = Text.from_ansi(output.getvalue()).plain
-    assert "here is the answer" in rendered
-    assert "[zeta] empty-turn recovery:" in rendered
-    assert rendered.count("do the thing") == 1
+        rendered = Text.from_ansi(output.getvalue()).plain
+        assert "here is the answer" in rendered
+        assert "[zeta] empty-turn recovery:" in rendered
+        assert rendered.count("do the thing") == 1
+    finally:
+        await app.loop.close()
 
 
 @pytest.mark.asyncio

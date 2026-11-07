@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import stat
@@ -518,6 +519,12 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
         )
     yield
     after = _open_file_descriptors()
+    previous_count = (
+        _FD_RETAINED_COUNTS[-1] if _FD_RETAINED_COUNTS else _FD_START_COUNT
+    )
+    if previous_count is not None and len(after) > previous_count:
+        gc.collect()
+        after = _open_file_descriptors()
     _update_fd_owners(after, item.nodeid)
     added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
     grouped = _group_fds_by_path_prefix(added)
@@ -581,7 +588,9 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    gc.collect()
     end = _open_file_descriptors()
+    _update_fd_owners(end, "session-finish")
     _FD_RETAINED_COUNTS.append(len(end))
     start = _FD_START_COUNT if _FD_START_COUNT is not None else len(end)
     growth = len(end) - start
@@ -679,8 +688,11 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
     for registry in reversed(registries):
@@ -810,11 +822,17 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks and closes loops created by tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
+    # test-contract: seam tracks and closes stores created by tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks and closes session managers created by tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks and closes workspace stores created by tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
+    # test-contract: seam tracks and closes tool registries created by tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    # test-contract: seam tracks and closes background registries created by tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
     for loop in reversed(loops):

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 1
+WRITER_EPOCH: Final = 2
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
@@ -85,7 +85,9 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         if absent_epoch is not None:
             return absent_epoch
         raise StorageFormatError(
-            f"stored-format manifest is missing at {home}; run the offline format advance"
+            f"stored-format manifest is missing at {home}; run "
+            "zeta storage-format advance --expected-epoch 0 "
+            f"--target-epoch {WRITER_EPOCH}"
         ) from None
     try:
         decoder = json.JSONDecoder()
