@@ -11460,7 +11460,7 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
     )
 
     try:
-        await backend.child_turn_paused.wait()
+        await asyncio.wait_for(backend.child_turn_paused.wait(), 10)
         assert deadlines.started == []
         owner.finish_gate_task_timeout = 0.08
         backend.release_child_turn.set()
@@ -11471,7 +11471,7 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         assert configured_timeout == 0.08
 
         deadlines.expire(state)
-        await run
+        await asyncio.wait_for(run, 10)
         notification = await _completion_after_publication(store, completion_published)
         assert "finish-gate task safety bound expired" in notification.data["text"]
         assert notification.data.get("killed_task_ids")
