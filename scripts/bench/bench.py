@@ -297,7 +297,12 @@ async def serve_probe(home: Path, sid: str) -> dict[str, Any]:
                 timings[key].append((time.perf_counter_ns() - started) / 1e6)
         writer.close()
         await writer.wait_closed()
-        return {name: summary(values) for name, values in timings.items()}
+        # Only the first resume opens the session; later ones hit the loaded runtime.
+        first = timings["resume"].pop(0)
+        return {
+            "resume_first_ms": first,
+            **{name: summary(values) for name, values in timings.items()},
+        }
     finally:
         await server.close()
 
