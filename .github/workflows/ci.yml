@@ -98,3 +98,49 @@ jobs:
           enable-cache: false
       - name: Start installed zeta on old home
         run: python scripts/smoke_old_home.py
+
+  merge-resolution:
+    name: merge resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check merge resolutions
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base="$BASE_SHA"
+            head="$HEAD_SHA"
+            commits=$(git rev-list --merges "$base..$head")
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+              commits="$commits $(git rev-parse HEAD)"
+            fi
+          else
+            commits="$(git rev-parse HEAD)"
+          fi
+          commits=$(printf '%s\n' "$commits" | sed '/^$/d' | sort -u)
+          failed=0
+          for commit in $commits; do
+            echo "checking merge resolution: $commit"
+            set +e
+            output=$(python scripts/check_merge_resolution.py "$commit" 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -eq 0 ]; then
+              continue
+            fi
+            if [ "$status" -eq 2 ] && printf '%s\n' "$output" | grep -q 'cannot identify exactly one main parent'; then
+              echo "::warning title=merge resolution::skipping $commit because the main parent is ambiguous"
+              continue
+            fi
+            echo "::error title=merge resolution::$commit failed (exit $status)"
+            failed=1
+          done
+          exit "$failed"
