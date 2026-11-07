@@ -11,7 +11,6 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
-from ...agent.receipt import terminal_state
 from ...protocol.types import StreamEvent, ToolCall
 from .. import theme
 from .agent import AGENT_TOOL_NAME
@@ -377,8 +376,6 @@ def render_agent_notification_message(
         return _render_child_question_withdrawn(event, identities)
     if kind == "child_idle":
         return _render_child_idle(event, identities)
-    if kind == "agent_completion":
-        return _render_child_completion(event, identities)
     return None
 
 
@@ -459,79 +456,6 @@ def _render_child_idle(
         state="idle",
     )
 
-
-def _notification_stats(data: Mapping[str, Any]) -> list[str]:
-    stats = data.get("stats")
-    if not isinstance(stats, Mapping):
-        return []
-    parts: list[str] = []
-    elapsed = stats.get("elapsed")
-    if type(elapsed) in {int, float} and elapsed >= 0:
-        seconds = round(float(elapsed), 1)
-        if seconds >= 3600:
-            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
-        elif seconds >= 60:
-            minutes, remainder = divmod(int(seconds), 60)
-            parts.append(f"{minutes}m{remainder:02d}s")
-        else:
-            parts.append(f"{seconds:.1f}s")
-    turns = stats.get("turns_used")
-    if type(turns) is int and turns >= 0:
-        noun = "turn" if turns == 1 else "turns"
-        parts.append(f"{turns} {noun}")
-    return parts
-
-
-def _completion_state(data: Mapping[str, Any]) -> tuple[str, bool]:
-    status = data.get("status")
-    if not isinstance(status, str):
-        raise TypeError
-    state = terminal_state(status=status)
-    stats = data.get("stats")
-    if not isinstance(stats, Mapping) or not ({"error", "canceled"} & stats.keys()):
-        return state, False
-    error = stats.get("error")
-    canceled = stats.get("canceled")
-    conflict = (
-        type(error) is not bool
-        or type(canceled) is not bool
-        or (error and canceled)
-        or error != (state == "failed")
-        or canceled != (state == "canceled")
-    )
-    return ("failed" if conflict else state), conflict
-
-
-def _render_child_completion(
-    event: StreamEvent,
-    identities: AgentIdentityIndex,
-) -> Panel | Text:
-    identity = _notification_identity(event, identities)
-    if identity is None:
-        return _unavailable_notification()
-    try:
-        state, state_conflict = _completion_state(event.data)
-    except TypeError:
-        return _unavailable_notification()
-    header = agent_header("complete", "←", identity, state=state)
-    for stat in _notification_stats(event.data):
-        header.append(f" · {stat}", style=theme.NOTICE)
-    text = event.data.get("text")
-    if state in {"failed", "canceled"}:
-        reason = "conflicting completion state" if state_conflict else text
-        body = f"reason: {reason}" if isinstance(reason, str) and reason else None
-    else:
-        lines: list[str] = []
-        verdict = event.data.get("verdict")
-        summary = event.data.get("summary")
-        if isinstance(verdict, str) and verdict:
-            lines.append(f"verdict: {verdict}")
-        if isinstance(summary, str) and summary:
-            lines.append(f"summary: {summary}")
-        elif isinstance(text, str) and text:
-            lines.append(text)
-        body = "\n".join(lines) or None
-    return render_agent_message(header, body=body, state=state)
 
 def render_agent_message(
     header: RenderableType,
