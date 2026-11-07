@@ -75,7 +75,6 @@ from .composer import (
 from .fork_session import ForkRuntimeMixin, RuntimeResult
 from .layout import (
     CONTENT_MARGIN,
-    STATUS_CARD_MAX_WIDTH,
     content_width,
     detach_completion_menus,
     full_screen_content,
@@ -118,25 +117,34 @@ from .transcript.history_finder import HistoryFinder
 from .user import displayed_user_text
 
 
-def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
-    body: list[overlay.FragmentLine] = []
-    width = STATUS_CARD_MAX_WIDTH - 2
-    for line in _format_status(status).splitlines():
-        if cell_len(line) <= width:
-            body.append([overlay.value(line)])
-            continue
-        label, separator, value = line.partition(": ")
-        prefix = f"{label}{separator}" if separator else line[: -len(line.lstrip())]
-        wrapped = wrap_by_cells(
-            value if separator else line.lstrip(), width - cell_len(prefix)
-        )
-        body.extend(
-            [
-                overlay.value(prefix if index == 0 else " " * len(prefix)),
-                overlay.value(text),
-            ]
-            for index, text in enumerate(wrapped)
-        )
+def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
+    if cell_len(line) <= width:
+        return [[overlay.value(line)]]
+    label, separator, value = line.partition(": ")
+    prefix = f"{label}{separator}" if separator else line[: -len(line.lstrip())]
+    if cell_len(prefix) >= width:
+        return [[overlay.value(text)] for text in wrap_by_cells(line, width)]
+    wrapped = wrap_by_cells(
+        value if separator else line.lstrip(), width - cell_len(prefix)
+    )
+    return [
+        [
+            overlay.value(prefix if index == 0 else " " * len(prefix)),
+            overlay.value(text),
+        ]
+        for index, text in enumerate(wrapped)
+    ]
+
+
+def _status_card_lines(
+    status: SlashStatus, width: int | None = None
+) -> list[overlay.FragmentLine]:
+    formatted = _format_status(status).splitlines()
+    body = (
+        [[overlay.value(line)] for line in formatted]
+        if width is None
+        else [row for line in formatted for row in _wrap_status_line(line, width)]
+    )
     return [
         overlay.title("Status"),
         overlay.rule(),
@@ -689,7 +697,11 @@ class TUIApp(
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
-        self._status_card.set_lines(_status_card_lines(self.slash_status()))
+        status = self.slash_status()
+        self._status_card.set_lines(
+            _status_card_lines(status),
+            line_factory=lambda width: _status_card_lines(status, width),
+        )
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()

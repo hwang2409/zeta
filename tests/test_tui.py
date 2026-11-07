@@ -6462,7 +6462,7 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("width", [80, 160])
+@pytest.mark.parametrize("width", [40, 80, 160])
 async def test_status_card_wraps_complete_project_context_health(
     tmp_path: Path, width: int
 ) -> None:
@@ -6489,10 +6489,12 @@ async def test_status_card_wraps_complete_project_context_health(
     try:
         app.slash_status_command("")
         screen = render_full_screen(session, width, height=60)
-        screen.draw_all_floats()
+        with set_app(session.app):
+            screen.draw_all_floats()
         app._status_card.bottom()
         screen = render_full_screen(session, width, height=60)
-        screen.draw_all_floats()
+        with set_app(session.app):
+            screen.draw_all_floats()
         rendered_lines = [
             "".join(
                 screen.data_buffer[row][column].char for column in range(width)
