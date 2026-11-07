@@ -11,12 +11,12 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from ..core.session import env_home
+from ..storage_format import mapping_mutations, open_writer
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +61,7 @@ def token_store_path(name: str, home: str | Path | None = None) -> Path:
     return token_store_dir(home) / f"{_safe_slug(name)}.json"
 
 
-def load_token(
-    name: str, *, home: str | Path | None = None
-) -> MCPOAuthToken | None:
+def load_token(name: str, *, home: str | Path | None = None) -> MCPOAuthToken | None:
     """Load one server's persisted token bundle, or None if absent or corrupt."""
 
     path = token_store_path(name, home)
@@ -118,41 +116,63 @@ def save_token(
 ) -> Path:
     """Atomically persist a token bundle under mode 0600."""
 
-    directory = token_store_dir(home)
-    directory.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    target = token_store_path(name, home)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".mcp-token.", suffix=".json.tmp", dir=str(directory)
-    )
-    tmp_path = Path(tmp_name)
-    values = asdict(token)
-    values.pop("client_secret", None)
-    payload = json.dumps(values, indent=2, sort_keys=True) + "\n"
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    try:
-        os.chmod(target, 0o600)
-    except OSError:
-        pass
+    root = Path(home).expanduser() if home is not None else env_home()
+    with open_writer(root) as lease:
+        directory = token_store_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        target = token_store_path(name, root)
+        values = asdict(token)
+        values.pop("client_secret", None)
+        directory_fd = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        try:
+            lease.publish_json(
+                directory_fd,
+                target.name,
+                mapping_mutations(values, delete=("client_secret",)),
+                _publish_token,
+            )
+        finally:
+            os.close(directory_fd)
     return target
 
 
 def delete_token(name: str, *, home: str | Path | None = None) -> None:
     """Remove one server's token file, if it exists."""
 
-    token_store_path(name, home).unlink(missing_ok=True)
+    root = Path(home).expanduser() if home is not None else env_home()
+    with open_writer(root):
+        token_store_path(name, root).unlink(missing_ok=True)
+
+
+def _publish_token(directory_fd: int, name: str, payload: bytes) -> None:
+    temporary = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 def token_is_expired(

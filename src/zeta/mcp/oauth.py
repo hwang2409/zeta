@@ -83,28 +83,27 @@ def _validate_oauth_url(value: str, label: str) -> None:
             f"MCP OAuth: {label} must be at most {_MAX_OAUTH_URL_LENGTH} characters"
         )
     if any(
-        character.isspace()
-        or ord(character) < 32
-        or 127 <= ord(character) <= 159
+        character.isspace() or ord(character) < 32 or 127 <= ord(character) <= 159
         for character in value
     ):
         raise MCPOAuthError(
             f"MCP OAuth: {label} must not contain control or whitespace characters"
         )
     parsed = urlparse(value)
-    if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise MCPOAuthError(
             f"MCP OAuth: {label} must be a complete URL without credentials"
         )
     if parsed.fragment:
         raise MCPOAuthError(f"MCP OAuth: {label} must not contain a fragment")
     if parsed.scheme != "https" and not (
-        parsed.scheme == "http"
-        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     ):
-        raise MCPOAuthError(
-            f"MCP OAuth: {label} must use https (except loopback)"
-        )
+        raise MCPOAuthError(f"MCP OAuth: {label} must use https (except loopback)")
 
 
 _ENCODED_DOT = re.compile(r"%2e", re.IGNORECASE)
@@ -125,8 +124,7 @@ def _has_ambiguous_url_parts(value: str) -> bool:
     if "\\" in path or "//" in path or _ENCODED_SEPARATOR.search(path):
         return True
     return any(
-        _ENCODED_DOT.sub(".", segment) in {".", ".."}
-        for segment in path.split("/")
+        _ENCODED_DOT.sub(".", segment) in {".", ".."} for segment in path.split("/")
     )
 
 
@@ -260,9 +258,7 @@ async def discover_auth_server(
     _validate_oauth_url(authorization_server_url, "authorization server URL")
     parsed = urlparse(authorization_server_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    metadata_url = (
-        f"{base}/.well-known/oauth-authorization-server{parsed.path}"
-    )
+    metadata_url = f"{base}/.well-known/oauth-authorization-server{parsed.path}"
     try:
         response = await http_client.get(metadata_url, timeout=10.0)
     except httpx.HTTPError as exc:
@@ -313,9 +309,7 @@ async def discover_auth_server(
     registration = data.get("registration_endpoint")
     if registration is not None:
         if type(registration) is not str:
-            raise MCPOAuthError(
-                "MCP OAuth: registration_endpoint must be a URL"
-            )
+            raise MCPOAuthError("MCP OAuth: registration_endpoint must be a URL")
         _validate_oauth_url(registration, "registration_endpoint")
     scopes = data.get("scopes_supported") or ()
     scope_tuple: tuple[str, ...] = ()
@@ -367,14 +361,10 @@ async def register_client(
     try:
         data = response.json()
     except ValueError as exc:
-        raise MCPOAuthError(
-            "MCP OAuth: registration response was not JSON"
-        ) from exc
+        raise MCPOAuthError("MCP OAuth: registration response was not JSON") from exc
     client_id = data.get("client_id")
     if type(client_id) is not str or not client_id:
-        raise MCPOAuthError(
-            "MCP OAuth: registration response missing client_id"
-        )
+        raise MCPOAuthError("MCP OAuth: registration response missing client_id")
     secret = data.get("client_secret")
     return client_id, secret if type(secret) is str else None
 
@@ -578,9 +568,7 @@ def _validate_callback_url(
             _terminal_safe_server_text(description) if description else ""
         )
         detail = f": {safe_description}" if safe_description else ""
-        raise MCPOAuthError(
-            f"MCP OAuth: authorization denied: {safe_error}{detail}"
-        )
+        raise MCPOAuthError(f"MCP OAuth: authorization denied: {safe_error}{detail}")
     code = _single_callback_param(params, "code")
     assert code is not None
     return code
@@ -784,14 +772,18 @@ async def authorize(
             http_client=http_client,
             resource_metadata_url=resource_metadata_url,
         )
-        auth_server = authorization_server_url or resource_meta.authorization_server or server_url
+        auth_server = (
+            authorization_server_url or resource_meta.authorization_server or server_url
+        )
         metadata = await discover_auth_server(auth_server, http_client=http_client)
         (
             listener,
             redirect_uri,
             payload,
             signal,
-        ) = await start_redirect_listener(**({"port": callback_port} if callback_port else {}))
+        ) = await start_redirect_listener(
+            **({"port": callback_port} if callback_port else {})
+        )
         if client_id is None:
             client_id, client_secret = await register_client(
                 metadata, redirect_uri, http_client=http_client
@@ -855,7 +847,7 @@ async def authorize(
             redirect_uri=redirect_uri,
             resource=resource_meta.resource,
         )
-        save_token(server_name, token, home=home)
+        await asyncio.to_thread(save_token, server_name, token, home=home)
         return token
     finally:
         if listener is not None:

@@ -177,7 +177,7 @@ class _FakeAuthServer:
 
 def _monkey_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     home = tmp_path / "zeta-home"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     monkeypatch.setenv("ZETA_HOME", str(home))
     return home
 

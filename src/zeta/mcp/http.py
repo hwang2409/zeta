@@ -261,7 +261,7 @@ class StreamableHTTPMCPClient(MCPClient):
             if token is not token_at_send:
                 return True
             if token is None or token.refresh_token is None:
-                self._record_refresh_failure(token, str(exc))
+                await self._record_refresh_failure(token, str(exc))
                 return False
             try:
                 response = await refresh_access_token(
@@ -273,11 +273,11 @@ class StreamableHTTPMCPClient(MCPClient):
                     http_client=self._client,
                 )
             except MCPOAuthError as refresh_exc:
-                self._record_refresh_failure(token, str(refresh_exc))
+                await self._record_refresh_failure(token, str(refresh_exc))
                 return False
             access = response.get("access_token")
             if type(access) is not str or not access:
-                self._record_refresh_failure(
+                await self._record_refresh_failure(
                     token, "refresh response missing access_token"
                 )
                 return False
@@ -307,16 +307,22 @@ class StreamableHTTPMCPClient(MCPClient):
                 else token.token_type,
                 refresh_error=None,
             )
-            save_token(self.config.name, new_token, home=self._home)
+            await asyncio.to_thread(
+                save_token, self.config.name, new_token, home=self._home
+            )
             self._current_token = new_token
             return True
 
-    def _record_refresh_failure(self, token: MCPOAuthToken | None, reason: str) -> None:
+    async def _record_refresh_failure(
+        self, token: MCPOAuthToken | None, reason: str
+    ) -> None:
         if token is None:
             return
         marked = replace(token, refresh_error=reason)
         try:
-            save_token(self.config.name, marked, home=self._home)
+            await asyncio.to_thread(
+                save_token, self.config.name, marked, home=self._home
+            )
         except OSError:
             logger.warning("could not persist refresh failure for %s", self.config.name)
         self._current_token = marked
@@ -416,9 +422,7 @@ class StreamableHTTPMCPClient(MCPClient):
             ) as response:
                 if response.status_code >= 400:
                     detail = await _response_detail(response)
-                    raise MCPHTTPError(
-                        response.status_code, detail or "request failed"
-                    )
+                    raise MCPHTTPError(response.status_code, detail or "request failed")
                 started = asyncio.get_running_loop().time()
                 delivered = False
                 async for value in _iter_sse_events(
@@ -479,9 +483,7 @@ class StreamableHTTPMCPClient(MCPClient):
 
             return _ENV_PATTERN.sub(replace, value)
 
-        headers = {
-            name: resolve(value) for name, value in self.config.headers.items()
-        }
+        headers = {name: resolve(value) for name, value in self.config.headers.items()}
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         elif self.config.auth_type == "oauth" and self._current_token is not None:
@@ -491,14 +493,22 @@ class StreamableHTTPMCPClient(MCPClient):
 
 
 async def _drain_pages(
-    request, method: str, parser, label: str,
-    *, abort_signal: AbortSignal | None = None,
+    request,
+    method: str,
+    parser,
+    label: str,
+    *,
+    abort_signal: AbortSignal | None = None,
 ) -> list:
     if abort_signal is not None:
         request = partial(request, abort_signal=abort_signal)
     return await drain_pages(
-        request, method, parser, label,
-        max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+        request,
+        method,
+        parser,
+        label,
+        max_pages=MAX_LIST_PAGES,
+        max_items=MAX_LIST_ITEMS,
     )
 
 

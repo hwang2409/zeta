@@ -12,16 +12,25 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..providers.stream_diagnostics import write_stream_diagnostic
+from ..storage_format import PatchRecords, SetValue, WriterLease
 
 MAX_SCHEDULED_ATTEMPTS = 3
 _MAX_RECENT_TERMINAL_RECEIPTS = 100
 _MAX_RECEIPT_ARCHIVE_BYTES = 4 * 1024 * 1024
+
+
+def _reconciliation_record_id(name: str, item: dict[str, Any]) -> str:
+    if name == "completed_ranges":
+        return json.dumps((item["seq_start"], item["seq_end"]), separators=(",", ":"))
+    return str(item["key"])
+
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
@@ -89,13 +98,19 @@ class ReconciliationState:
         project_id: str,
         session_id: str,
         diagnostics_path: Path,
+        storage_lease: WriterLease,
     ) -> None:
         self.path = path
         self.project_id = project_id
         self.session_id = session_id
         self.diagnostics_path = diagnostics_path
         self.receipts_path = path.with_name("memory-reconcile-receipts.jsonl")
+        self._storage_lease = storage_lease
         self._value = self._read()
+        self._published_record_ids = {
+            name: {_reconciliation_record_id(name, item) for item in self._value[name]}
+            for name in ("pending_failures", "completed_ranges", "terminal_receipts")
+        }
         self._bound_loaded_receipts()
 
     @property
@@ -173,7 +188,9 @@ class ReconciliationState:
             if float(item["retry_after"]) <= current
         )
 
-    def next_retry_after(self, *, exclude: frozenset[str] = frozenset()) -> float | None:
+    def next_retry_after(
+        self, *, exclude: frozenset[str] = frozenset()
+    ) -> float | None:
         values = [
             float(item["retry_after"])
             for item in self._value["pending_failures"]
@@ -185,7 +202,10 @@ class ReconciliationState:
         """Return archived and recent receipts, newest record winning by key."""
         records = {
             str(item["key"]): item
-            for item in (*self._read_receipt_archive(), *self._value["terminal_receipts"])
+            for item in (
+                *self._read_receipt_archive(),
+                *self._value["terminal_receipts"],
+            )
         }
         return tuple(self._parse_terminal(item) for item in records.values())
 
@@ -284,8 +304,7 @@ class ReconciliationState:
 
         def matches(item: Mapping[str, Any]) -> bool:
             return item["key"] == key or (
-                int(item["seq_start"]) == seq_start
-                and int(item["seq_end"]) == seq_end
+                int(item["seq_start"]) == seq_start and int(item["seq_end"]) == seq_end
             )
 
         self._value["pending_failures"] = [
@@ -294,9 +313,7 @@ class ReconciliationState:
         self._value["terminal_receipts"] = [
             item for item in self._value["terminal_receipts"] if not matches(item)
         ]
-        self._remove_archived_receipt(
-            key, seq_start=seq_start, seq_end=seq_end
-        )
+        self._remove_archived_receipt(key, seq_start=seq_start, seq_end=seq_end)
         self._complete_unit(
             {
                 "seq_start": seq_start,
@@ -348,7 +365,9 @@ class ReconciliationState:
         cursor = original_start
         for outcome in outcomes:
             if outcome.seq_start != cursor or outcome.seq_end < outcome.seq_start:
-                raise ValueError("retry outcomes do not exactly cover the durable range")
+                raise ValueError(
+                    "retry outcomes do not exactly cover the durable range"
+                )
             cursor = outcome.seq_end + 1
         if cursor != original_end + 1:
             raise ValueError("retry outcomes do not exactly cover the durable range")
@@ -395,8 +414,7 @@ class ReconciliationState:
                 "validation_summary": self._sanitize_summary(
                     outcome.validation_summary
                 ),
-                "retry_after": now
-                + retry_backoff_seconds * (2 ** (attempt_count - 1)),
+                "retry_after": now + retry_backoff_seconds * (2 ** (attempt_count - 1)),
                 "reason": reason,
                 "usage": usage,
                 "end_offset": outcome.end_offset,
@@ -663,25 +681,63 @@ class ReconciliationState:
         self._value["project_id"] = self.project_id
         self._value["reason"] = reason
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self._value, sort_keys=True).encode()
-        fd, temporary = tempfile.mkstemp(prefix=".memory-reconcile-", dir=self.path.parent)
+        record_names = ("pending_failures", "completed_ranges", "terminal_receipts")
+        mutations = [
+            SetValue((name,), value)
+            for name, value in self._value.items()
+            if name not in record_names
+        ]
+        for name in record_names:
+            current_ids = {
+                _reconciliation_record_id(name, item) for item in self._value[name]
+            }
+            identity: str | tuple[str, ...] = (
+                ("seq_start", "seq_end") if name == "completed_ranges" else "key"
+            )
+            mutations.append(
+                PatchRecords(
+                    (name,),
+                    tuple(self._value[name]),
+                    identity,
+                    tuple(self._published_record_ids[name] - current_ids),
+                )
+            )
+            self._published_record_ids[name] = current_ids
+        directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self._storage_lease.publish_json(
+                directory_fd,
+                self.path.name,
+                mutations,
+                self._publish_bytes,
+            )
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _publish_bytes(directory_fd: int, name: str, payload: bytes) -> None:
+        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, payload)
             os.fsync(fd)
             os.close(fd)
             fd = -1
-            os.replace(temporary, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.replace(
+                temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+            )
+            os.fsync(directory_fd)
         finally:
             if fd >= 0:
                 os.close(fd)
             try:
-                os.unlink(temporary)
+                os.unlink(temporary, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
 
@@ -719,7 +775,9 @@ class ReconciliationState:
             "terminal_receipts",
         ):
             candidate = value.get(name, [])
-            if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+            if isinstance(candidate, list) and all(
+                isinstance(item, dict) for item in candidate
+            ):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
         scanner_failure = value.get("scanner_failure")
@@ -825,9 +883,7 @@ class ReconciliationState:
             or type(terminal) is not bool
         ):
             return None
-        return ReconciliationFailure(
-            occurred_at, message, seq_start, seq_end, terminal
-        )
+        return ReconciliationFailure(occurred_at, message, seq_start, seq_end, terminal)
 
     @staticmethod
     def _parse_work(value: Mapping[str, Any]) -> ReconciliationWork:

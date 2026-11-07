@@ -29,6 +29,7 @@ from ..protocol.types import (
     MessageOrigin,
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from ..storage_format import WriterLease, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
 from .reconciler import (
@@ -163,6 +164,7 @@ class AutoMemoryReconciler:
         clock: Clock = time.monotonic,
         idle_wait: IdleWait = _wait_for_idle,
         retry_clock: Clock = time.time,
+        storage_lease: WriterLease | None = None,
     ) -> None:
         self.registry = registry
         self.project_id = project_id
@@ -176,11 +178,15 @@ class AutoMemoryReconciler:
         self._retry_clock = retry_clock
         self.position_path = self.session_dir / "memory-reconcile.json"
         self.failure_log_path = self.session_dir / "memory-reconcile-errors.jsonl"
+        self._storage_lease = storage_lease or open_writer(registry.root.parent)
         self.state = ReconciliationState(
             self.position_path,
             project_id=project_id,
             session_id=session_id,
-            diagnostics_path=registry.root.parent / "logs" / "memory-reconciliation.jsonl",
+            diagnostics_path=registry.root.parent
+            / "logs"
+            / "memory-reconciliation.jsonl",
+            storage_lease=self._storage_lease,
         )
         self._pending: list[_PendingRange] = []
         self._wake = asyncio.Event()
@@ -305,15 +311,15 @@ class AutoMemoryReconciler:
         self._wake.set()
         task = self._worker_task
         if task is None:
+            await asyncio.to_thread(self._storage_lease.close)
             return
-        done, _ = await asyncio.wait(
-            {task}, timeout=self.config.shutdown_grace_seconds
-        )
+        done, _ = await asyncio.wait({task}, timeout=self.config.shutdown_grace_seconds)
         if done:
             await asyncio.gather(task, return_exceptions=True)
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        else:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(self._storage_lease.close)
 
     def catch_up(self) -> None:
         """Queue durable transcript content left behind by an earlier shutdown."""
@@ -334,8 +340,7 @@ class AutoMemoryReconciler:
         return tuple(
             work
             for work in self.state.ready_retries(self._retry_clock())
-            if self._retry_attempts_in_cycle.get(work.key, 0)
-            < MAX_SCHEDULED_ATTEMPTS
+            if self._retry_attempts_in_cycle.get(work.key, 0) < MAX_SCHEDULED_ATTEMPTS
         )
 
     def _ensure_worker(self) -> None:
@@ -421,11 +426,17 @@ class AutoMemoryReconciler:
                     )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
-                latest_seq, _transcript_bytes, transcript_tokens = await self._scan_state()
+                (
+                    latest_seq,
+                    _transcript_bytes,
+                    transcript_tokens,
+                ) = await self._scan_state()
                 self._seen_activity_generation = generation
                 growth = max(0, transcript_tokens - self._last_reconciled_tokens)
                 if growth >= self.config.token_threshold:
-                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
+                    self._add_pending(
+                        self.last_reconciled_seq + 1, latest_seq, "tokens"
+                    )
                 early_turn = await asyncio.to_thread(
                     self._completed_direct_user_turn, latest_seq
                 )
@@ -517,7 +528,9 @@ class AutoMemoryReconciler:
                 timeout = max(0.0, self._idle_deadline - self._clock())
             if self._early_deadline is not None:
                 early_timeout = max(0.0, self._early_deadline - self._clock())
-                timeout = early_timeout if timeout is None else min(timeout, early_timeout)
+                timeout = (
+                    early_timeout if timeout is None else min(timeout, early_timeout)
+                )
             exhausted_retry_keys = frozenset(
                 key
                 for key, attempts in self._retry_attempts_in_cycle.items()
@@ -526,7 +539,9 @@ class AutoMemoryReconciler:
             retry_after = self.state.next_retry_after(exclude=exhausted_retry_keys)
             if retry_after is not None:
                 retry_timeout = max(0.0, retry_after - self._retry_clock())
-                timeout = retry_timeout if timeout is None else min(timeout, retry_timeout)
+                timeout = (
+                    retry_timeout if timeout is None else min(timeout, retry_timeout)
+                )
             try:
                 await self._idle_wait(self._wake, timeout)
             except TimeoutError:
@@ -602,9 +617,9 @@ class AutoMemoryReconciler:
                                 invoke=self.invoke,
                                 cas_retries=self.config.cas_retries,
                                 as_of=today,
-                                now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
-                                    "+00:00", "Z"
-                                ),
+                                now=datetime.now(UTC)
+                                .isoformat(timespec="microseconds")
+                                .replace("+00:00", "Z"),
                             )
                         except EntryReconciliationFailure as exc:
                             usage = dict(exc.usage)
@@ -629,7 +644,9 @@ class AutoMemoryReconciler:
                                     ),
                                     "seq_start": selected_start,
                                     "seq_end": selected_end,
-                                    "rejected_groups": len(entry_result.rejected_groups),
+                                    "rejected_groups": len(
+                                        entry_result.rejected_groups
+                                    ),
                                     "reasons": dict(sorted(reasons.items())),
                                 },
                             )
@@ -796,9 +813,7 @@ class AutoMemoryReconciler:
         return raw, {}
 
     @staticmethod
-    def _sum_usage(
-        total: dict[str, int], addition: dict[str, int]
-    ) -> dict[str, int]:
+    def _sum_usage(total: dict[str, int], addition: dict[str, int]) -> dict[str, int]:
         result = dict(total)
         for key, value in addition.items():
             if type(value) is int and value >= 0:
@@ -927,9 +942,7 @@ class AutoMemoryReconciler:
                 continue
             message_data = row.get("data")
             message = (
-                message_data.get("message")
-                if isinstance(message_data, dict)
-                else None
+                message_data.get("message") if isinstance(message_data, dict) else None
             )
             if not isinstance(message, dict):
                 continue
@@ -975,8 +988,13 @@ class AutoMemoryReconciler:
         if evidence is None or evidence.offset > stat.st_size:
             return False
         identity = (stat.st_dev, stat.st_ino)
-        current = cls._transcript_evidence(handle, identity, stat.st_size, evidence.offset)
-        return current.identity == evidence.identity and current.prefix_tail == evidence.prefix_tail
+        current = cls._transcript_evidence(
+            handle, identity, stat.st_size, evidence.offset
+        )
+        return (
+            current.identity == evidence.identity
+            and current.prefix_tail == evidence.prefix_tail
+        )
 
     @staticmethod
     def _row_seq(raw: bytes) -> int | None:
@@ -998,7 +1016,10 @@ class AutoMemoryReconciler:
         entry_type = value.get("type")
         if entry_type == "header":
             header = value.get("data")
-            if not isinstance(header, dict) or header.get("schema") != "zeta.conversation.v1":
+            if (
+                not isinstance(header, dict)
+                or header.get("schema") != "zeta.conversation.v1"
+            ):
                 raise _TranscriptScanError("unsupported conversation header")
         elif entry_type not in CONVERSATION_ENTRY_TYPES:
             raise _TranscriptScanError("unsupported conversation entry type")
@@ -1033,7 +1054,9 @@ class AutoMemoryReconciler:
                         value = self._parse_transcript_row(raw)
                     except _TranscriptScanError as exc:
                         self._transcript_scan_error = str(exc)
-                        self._transcript_scan_error_seq = self._row_seq(raw) or latest + 1
+                        self._transcript_scan_error_seq = (
+                            self._row_seq(raw) or latest + 1
+                        )
                         break
                     offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None
@@ -1041,8 +1064,14 @@ class AutoMemoryReconciler:
                         latest = max(latest, seq)
                         tokens += estimated_text_tokens(raw.decode("utf-8"))
                 identity = (stat.st_dev, stat.st_ino)
-                evidence = self._transcript_evidence(handle, identity, stat.st_size, offset)
-                if incremental and durable is None and self._last_reconciled_bytes <= offset:
+                evidence = self._transcript_evidence(
+                    handle, identity, stat.st_size, offset
+                )
+                if (
+                    incremental
+                    and durable is None
+                    and self._last_reconciled_bytes <= offset
+                ):
                     durable = self._transcript_evidence(
                         handle, identity, stat.st_size, self._last_reconciled_bytes
                     )
@@ -1088,7 +1117,9 @@ class AutoMemoryReconciler:
                         value = self._parse_transcript_row(raw)
                     except _TranscriptScanError as exc:
                         self._transcript_scan_error = str(exc)
-                        self._transcript_scan_error_seq = self._row_seq(raw) or scanned_end + 1
+                        self._transcript_scan_error_seq = (
+                            self._row_seq(raw) or scanned_end + 1
+                        )
                         break
                     offset = handle.tell()
                     seq = value.get("seq") if isinstance(value, dict) else None

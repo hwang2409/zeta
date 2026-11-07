@@ -27,6 +27,7 @@ from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
+from ..storage_format import open_writer
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
@@ -325,6 +326,7 @@ def compose_runtime(
                 return await complete_reconciliation(memory_backend, prompt)
 
             assert project_registry is not None
+            memory_storage_lease = open_writer(home)
             memory_reconciler = AutoMemoryReconciler(
                 registry=project_registry,
                 project_id=metadata.project_id,
@@ -338,6 +340,7 @@ def compose_runtime(
                     idle_seconds=config.memory_idle_minutes * 60,
                 ),
                 notice=memory_notice,
+                storage_lease=memory_storage_lease,
             )
             loop.memory_reconciler = memory_reconciler
             loop.context_assembler.on_before_eviction = (
@@ -353,6 +356,7 @@ def compose_runtime(
             if callback is not None
         ]
         if activity_callbacks:
+
             def persisted_activity(seq: int) -> None:
                 for callback in activity_callbacks:
                     callback(seq)

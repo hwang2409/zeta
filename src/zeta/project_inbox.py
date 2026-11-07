@@ -26,11 +26,11 @@ from .core.session_files import (
     open_session_file,
     read_session_file,
     session_root,
-    write_json_file,
 )
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
+from .storage_format import mapping_mutations, open_writer, require_closed_variant
 
 SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
@@ -120,6 +120,7 @@ class SentMessageTracker:
         self.sessions_root = Path(sessions_root)
         self.session_id = _id(session_id, "session id")
         self._lock = threading.RLock()
+        self._deleted_ids: set[str] = set()
         self._records = self._load()
         self._pending = {
             record["id"] for record in self._records if "done" not in record["reported"]
@@ -205,16 +206,13 @@ class SentMessageTracker:
     def _prune(self) -> None:
         while len(self._records) > SENT_HISTORY_LIMIT:
             terminal = next(
-                (
-                    record
-                    for record in self._records
-                    if "done" in record["reported"]
-                ),
+                (record for record in self._records if "done" in record["reported"]),
                 None,
             )
             removed = terminal or self._records[0]
             self._records.remove(removed)
             self._pending.discard(removed["id"])
+            self._deleted_ids.add(removed["id"])
 
     def _load(self) -> list[dict[str, Any]]:
         try:
@@ -230,8 +228,11 @@ class SentMessageTracker:
             value = json.loads(payload)
         except (ValueError, RecursionError) as exc:
             raise InboxError("invalid sent-message tracking ledger") from exc
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
-            raise InboxError("invalid sent-message tracking ledger")
+        try:
+            version = value.get("schema_version") if isinstance(value, dict) else None
+            require_closed_variant("sent_message_ledger.schema_version", version)
+        except ValueError as exc:
+            raise InboxError("invalid sent-message tracking ledger") from exc
         records = value.get("records")
         if not isinstance(records, list):
             raise InboxError("invalid sent-message tracking ledger")
@@ -272,12 +273,23 @@ class SentMessageTracker:
 
     def _persist(self) -> None:
         try:
-            with self._session_directory(create=True) as session_fd:
-                write_json_file(
+            with (
+                open_writer(self.sessions_root.parent) as lease,
+                self._session_directory(create=True) as session_fd,
+            ):
+                lease.publish_records(
                     session_fd,
                     _SENT_TRACKING_FILE,
-                    {"schema_version": 1, "records": self._records},
+                    self._records,
+                    identity="id",
+                    delete_ids=self._deleted_ids,
+                    path=("records",),
+                    initial={"schema_version": 1, "records": []},
+                    publish=lambda fd, name, data: atomic_publish_file(
+                        fd, name, data, sync_directory=True
+                    ),
                 )
+            self._deleted_ids.clear()
         except (OSError, SessionError, ValueError) as exc:
             raise InboxError("sent-message tracking is unsafe or unavailable") from exc
 
@@ -329,7 +341,9 @@ class ProjectInboxScanner:
             return ()
         source = self.inbox._resolve_project(self.project_id)
         return tuple(
-            self.inbox._resolve_tracked_sent(source.project_id, self.session_id, pending)
+            self.inbox._resolve_tracked_sent(
+                source.project_id, self.session_id, pending
+            )
         )
 
     def mark_reported(self, statuses: Iterator[tuple[str, str]]) -> None:
@@ -425,7 +439,7 @@ class ProjectInbox:
                     continue
                 break
             if existing is None:
-                self._publish_once(new_fd, name, self._encode(record))
+                self._publish_record(new_fd, name, record)
             else:
                 immutable_fields = {
                     "schema_version",
@@ -716,9 +730,7 @@ class ProjectInbox:
                 raise InboxError("could not claim message") from exc
             record["claimer_session"] = session_id
             record["claimed_at"] = _now()
-            atomic_publish_file(
-                claimed_fd, name, self._encode(record), sync_directory=True
-            )
+            self._publish_record(claimed_fd, name, record)
             os.fsync(new_fd)
             return self._read_record(claimed_fd, name, bodies_fd)
 
@@ -768,9 +780,7 @@ class ProjectInbox:
                 record["reply"] = reply
                 record["reply_id"] = reply_id
                 record["done_at"] = _now()
-                atomic_publish_file(
-                    claimed_fd, name, self._encode(record), sync_directory=True
-                )
+                self._publish_record(claimed_fd, name, record)
                 try:
                     os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=done_fd)
                 except OSError as exc:
@@ -871,11 +881,23 @@ class ProjectInbox:
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
-    @staticmethod
-    def _encode(record: dict[str, Any]) -> bytes:
-        return (
-            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
+    def _publish_record(
+        self,
+        directory_fd: int,
+        name: str,
+        record: dict[str, Any],
+        *,
+        delete: Iterable[str] = (),
+    ) -> None:
+        with open_writer(self.registry.root.parent) as lease:
+            lease.publish_json(
+                directory_fd,
+                name,
+                mapping_mutations(record, delete=delete),
+                lambda fd, filename, data: atomic_publish_file(
+                    fd, filename, data, sync_directory=True
+                ),
+            )
 
     @staticmethod
     def _publish_once(directory_fd: int, name: str, data: bytes) -> None:
@@ -940,12 +962,10 @@ class ProjectInbox:
         if not isinstance(value, dict):
             raise InboxError(f"unknown inbox schema: {name}")
         schema_version = value.get("schema_version")
-        if (
-            not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version != SCHEMA_VERSION
-        ):
-            raise InboxError(f"unknown inbox schema: {name}")
+        try:
+            require_closed_variant("inbox.schema_version", schema_version)
+        except ValueError as exc:
+            raise InboxError(f"unknown inbox schema: {name}") from exc
         message_id = _id(value.get("id"))
         if name != f"{message_id}.json":
             raise InboxError("message id does not match filename")
@@ -1119,8 +1139,11 @@ class ProjectInbox:
             record["recovery_note"] = (
                 f"Returned from stale claim{f' made at {claimed_at}' if claimed_at else ''}."
             )
-            atomic_publish_file(
-                claimed_fd, name, self._encode(record), sync_directory=True
+            self._publish_record(
+                claimed_fd,
+                name,
+                record,
+                delete=("claimer_session", "claimed_at"),
             )
             os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=new_fd)
             os.fsync(new_fd)

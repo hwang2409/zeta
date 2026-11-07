@@ -25,6 +25,7 @@ from zeta.project_registry import (
 )
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools import ToolRegistry
 
 
@@ -202,8 +203,11 @@ def test_project_record_publish_rejects_oversized_data_without_replacing(
     monkeypatch.setattr(registry_module, "MAX_RECORD_SIZE", len(original) - 1)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(ProjectRegistryError, match="too large"):
-            registry._publish(directory_fd, "project.json", registry._encode(project))
+        with (
+            pytest.raises(ProjectRegistryError, match="too large"),
+            open_writer(tmp_path) as lease,
+        ):
+            registry._publish(lease, directory_fd, "project.json", registry._encode(project))
     finally:
         os.close(directory_fd)
 
@@ -218,7 +222,8 @@ def test_project_record_publish_preserves_legacy_surrogate_text(tmp_path: Path) 
     value["scope"] = "legacy" + chr(0xD800)
     directory_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        registry._publish(directory_fd, "project.json", value)
+        with open_writer(tmp_path) as lease:
+            registry._publish(lease, directory_fd, "project.json", value)
     finally:
         os.close(directory_fd)
 

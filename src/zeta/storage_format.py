@@ -16,12 +16,57 @@ from pathlib import Path
 from typing import Any, Final, Self
 
 WRITER_EPOCH: Final = 1
+
+BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
+    "memory-current.json": frozenset({("history",)}),
+    "meta.json": frozenset({("prompt_components",)}),
+    "workspace.json": frozenset({("snapshots",)}),
+}
+
+CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "account_registry.version": frozenset({1}),
+    "conversation.entry_type": frozenset(
+        {
+            "message",
+            "child_run_started",
+            "compaction",
+            "client_delivery",
+            "warning",
+            "checkpoint",
+            "fork",
+            "approval_resolution",
+            "approval_history",
+            "notification",
+            "notification_ack",
+            "notification_tui_presented",
+            "pending_prompt",
+            "pending_prompt_ack",
+            "pending_queue_closed",
+            "terminal_transition",
+        }
+    ),
+    "inbox.schema_version": frozenset({1}),
+    "memory.format": frozenset({1, 2}),
+    "project.schema_version": frozenset({1}),
+    "sent_message_ledger.schema_version": frozenset({1}),
+}
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
 
 class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
+
+
+def require_closed_variant(shape: str, value: object) -> object:
+    """Return a registered stored variant or fail closed."""
+
+    accepted = CLOSED_VARIANTS.get(shape)
+    if accepted is None:
+        raise StorageFormatError(f"stored variant shape is not registered: {shape}")
+    if value not in accepted:
+        raise StorageFormatError(f"unsupported stored variant for {shape}: {value!r}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +93,17 @@ class ReplaceSubtree:
     value: Any
 
 
-type Mutation = SetValue | DeleteValue | ReplaceSubtree
+@dataclass(frozen=True, slots=True)
+class PatchRecords:
+    """Upsert and explicitly delete object records at one owned path."""
+
+    path: tuple[str, ...]
+    upserts: tuple[Mapping[str, Any], ...]
+    identity: str | tuple[str, ...]
+    delete_ids: tuple[str, ...] = ()
+
+
+type Mutation = SetValue | DeleteValue | ReplaceSubtree | PatchRecords
 PublishBytes = Callable[[int, str, bytes], None]
 
 
@@ -260,6 +315,14 @@ def apply_mutations(raw: object, mutations: Iterable[Mutation]) -> dict[str, Any
             parent.pop(key, None)
         elif isinstance(mutation, ReplaceSubtree):
             parent[key] = copy.deepcopy(mutation.value)
+        elif isinstance(mutation, PatchRecords):
+            parent[key] = _apply_record_mutations(
+                parent.get(key, []),
+                mutation.upserts,
+                identity=mutation.identity,
+                delete_ids=mutation.delete_ids,
+                name=".".join(mutation.path),
+            )
         else:
             current = parent.get(key)
             if type(mutation.value) is dict and type(current) is dict:
@@ -293,11 +356,24 @@ def _require_record_id(value: object, name: str) -> str:
     return value
 
 
+def _record_id(
+    record: Mapping[str, Any], identity: str | tuple[str, ...], name: str
+) -> str:
+    if isinstance(identity, str):
+        return _require_record_id(record.get(identity), name)
+    values = tuple(record.get(field) for field in identity)
+    if not identity or any(
+        not isinstance(value, (str, int)) or isinstance(value, bool) for value in values
+    ):
+        raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
+    return json.dumps(values, separators=(",", ":"))
+
+
 def _apply_record_mutations(
     raw: object,
     upserts: Iterable[Mapping[str, Any]],
     *,
-    identity: str,
+    identity: str | tuple[str, ...],
     delete_ids: Iterable[str],
     name: str,
 ) -> list[dict[str, Any]]:
@@ -307,7 +383,7 @@ def _apply_record_mutations(
     output = copy.deepcopy(raw)
     positions: dict[str, int] = {}
     for index, record in enumerate(output):
-        record_id = _require_record_id(record.get(identity), name)
+        record_id = _record_id(record, identity, name)
         if record_id in positions:
             raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
         positions[record_id] = index
@@ -315,7 +391,7 @@ def _apply_record_mutations(
     deleted = {_require_record_id(record_id, name) for record_id in delete_ids}
     seen: set[str] = set()
     for record in upserts:
-        record_id = _require_record_id(record.get(identity), name)
+        record_id = _record_id(record, identity, name)
         if record_id in seen or record_id in deleted:
             raise StorageFormatError(f"stored JSON record identity is invalid: {name}")
         seen.add(record_id)
@@ -327,7 +403,9 @@ def _apply_record_mutations(
             _merge_mapping(current, record)
             output.append(current)
 
-    return [record for record in output if record[identity] not in deleted]
+    return [
+        record for record in output if _record_id(record, identity, name) not in deleted
+    ]
 
 
 class WriterLease:
@@ -384,6 +462,8 @@ class WriterLease:
         identity: str,
         delete_ids: Iterable[str],
         publish: PublishBytes,
+        path: tuple[str, ...] = (),
+        initial: object | None = None,
     ) -> list[dict[str, Any]]:
         """Patch and explicitly delete object records by identity."""
 
@@ -392,22 +472,31 @@ class WriterLease:
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
         except FileNotFoundError:
-            raw: object = []
+            raw: object = ([] if not path else {}) if initial is None else initial
         else:
             try:
                 with os.fdopen(fd, "rb") as stream:
                     raw = json.load(stream)
             except (OSError, ValueError) as exc:
                 raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+        records = raw
+        if path:
+            if type(raw) is not dict:
+                raise StorageFormatError("stored JSON root must be an object")
+            parent, key = _mapping_at(raw, path, create=True)
+            records = parent.get(key, [])
         output = _apply_record_mutations(
-            raw,
+            records,
             upserts,
             identity=identity,
             delete_ids=delete_ids,
             name=name,
         )
+        published: object = output
+        if path:
+            published = apply_mutations(raw, (ReplaceSubtree(path, output),))
         encoded = (
-            json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
+            json.dumps(published, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode()
         publish(directory_fd, name, encoded)
         return output
