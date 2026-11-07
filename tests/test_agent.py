@@ -10673,19 +10673,65 @@ async def test_agent_cancel_mixed_child_and_task_terminal_result(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_child_finish_gate_task_handoff_kills_task(tmp_path: Path) -> None:
-    backend = _TaskFinishGateBackend(
-        _python("import time; time.sleep(30)"), action="handoff"
-    )
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        (
+            _python("import time; time.sleep(30)")
+            + " 'Authorization: Bearer auth-secret-123'",
+            "auth-secret-123",
+        ),
+        (
+            "TOKEN=token-secret-456 " + _python("import time; time.sleep(30)"),
+            "token-secret-456",
+        ),
+        (
+            _python("import time; time.sleep(30)") + " --password=password-secret-789",
+            "password-secret-789",
+        ),
+        ("<'/tmp/password-secret' cat; sleep 30", "password-secret"),
+        (
+            "3<'url-user:url-pass@example.com' cat; sleep 30",
+            "url-user:url-pass@example.com",
+        ),
+        (
+            "<<'heredoc-secret' cat\nbody\nheredoc-secret\nsleep 30",
+            "heredoc-secret",
+        ),
+    ],
+)
+async def test_child_finish_gate_task_handoff_kills_task_without_command_secrets(
+    tmp_path: Path, command: str, secret: str
+) -> None:
+    backend = _TaskFinishGateBackend(command, action="handoff")
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(run, timeout=5)
-    notification = await _completion_after_publication(store, completion_published)
-    assert "Handed off running background work" in notification.data["text"]
-    assert "CI can finish outside this worker." in notification.data["text"]
-    assert "background tasks killed on child completion" in notification.data["text"]
-    assert notification.data["killed_task_count"] == 1
-    await loop.close()
+    try:
+        await asyncio.wait_for(run, timeout=5)
+        notification = await _completion_after_publication(store, completion_published)
+        notifications = store.agent_notifications(pending_only=False)
+        # test-contract: durability secret filtering preserves one completion receipt.
+        assert len(notifications) == 1
+        assert notifications[0] == notification
+        killed_task_ids = notification.data.get("killed_task_ids")
+        assert isinstance(killed_task_ids, list) and len(killed_task_ids) == 1
+        text = notification.data["text"]
+        assert "Handed off running background work" in text
+        assert "CI can finish outside this worker." in text
+        assert "background tasks killed on child completion" in text
+        task_id = killed_task_ids[0]
+        assert task_id in text
+        assert secret not in text
+        assert "background command" in text
+        assert (
+            "archive: "
+            + str(loop.store.session_dir / "agents/1/background-output.archive")
+            in text
+        )
+        assert "command unavailable" not in text
+        assert notification.data["killed_task_count"] == 1
+    finally:
+        await loop.close()
 
 
 @pytest.mark.asyncio
