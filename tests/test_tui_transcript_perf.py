@@ -1512,39 +1512,60 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
 async def test_corrupt_child_transcript_renders_diagnosis_without_breaking_parent(
     tmp_path: Path,
 ) -> None:
-    from zeta.tui.cards.agent import AgentCard
-
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     root.append_message(Message(MessageRole.ASSISTANT, [TextContent("parent healthy")]))
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
-    child.close()
+    corrupt = ConversationStore(root.session_dir / "agents", session_id="1")
+    corrupt.append_message(Message(MessageRole.ASSISTANT, [TextContent("corrupt child")]))
+    sibling = ConversationStore(root.session_dir / "agents", session_id="2")
+    sibling.append_message(Message(MessageRole.ASSISTANT, [TextContent("sibling healthy")]))
+    for call, child in (
+        (ToolCall("nested-corrupt", "agent", {"prompt": "corrupt"}), corrupt),
+        (ToolCall("nested-sibling", "agent", {"prompt": "sibling"}), sibling),
+    ):
+        root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        root.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={"child_session_path": str(child.session_dir)},
+                ),
+            )
+        )
+    corrupt.close()
+    sibling.close()
+    root.close()
     child_path = root.session_dir / "agents" / "1" / "conversation.jsonl"
     with child_path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
     damaged = child_path.read_bytes()
 
-    source = agent_sync_module.AgentTranscriptSource(root.session_dir / "agents" / "1")
-    with pytest.raises(Exception) as raised:
-        source.refresh()
-    snapshot = source._failed_snapshot(raised.value)
-    card = AgentCard(ToolCall("agent-corrupt", "agent", {"prompt": "inspect"}))
-    card.set_child_session_path(str(source.path))
-    card.apply_transcript_snapshot(snapshot)
-    console = Console(record=True, width=100)
-    console.print(card.current())
-    rendered = console.export_text()
-
-    assert (
-        "transcript terminated invalid conversation row at row 3 (session 1)"
-        in rendered
+    transcript = TranscriptWidget()
+    transcript.append(Text("top-level parent usable"))
+    call = ToolCall("agent-parent", "agent", {"prompt": "inspect parent"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(root.session_dir)},
+        ),
     )
+
+    await transcript.refresh_agent_transcripts()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+
+    assert "top-level parent usable" in rendered
+    assert "parent healthy" in rendered
+    assert "sibling healthy" in rendered
+    assert "transcript terminated invalid conversation row at row 3 (session 1)" in rendered
     assert "must-not-leak" not in rendered
-    assert root.messages()[0].content[0].text == "parent healthy"
     assert child_path.read_bytes() == damaged
-    card.release_transcript_source()
-    source.close()
-    root.close()
 
 
 @pytest.mark.asyncio

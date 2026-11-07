@@ -32,11 +32,9 @@ class TranscriptLoadError(ConversationIntegrityError):
         source_inode: int,
         source_size: int,
         prefix_digest: str,
-        child_run_id: str | None = None,
     ) -> None:
         self.kind = kind
         self.session_id = session_id
-        self.child_run_id = child_run_id
         self.row_number = row_number
         self.byte_offset = byte_offset
         self.valid_prefix_end = valid_prefix_end
@@ -53,6 +51,7 @@ class TranscriptLoadError(ConversationIntegrityError):
             "duplicate_id": "duplicate conversation id",
             "orphaned_root": "orphaned root",
             "invalid_sequence": "non-monotonic conversation sequence",
+            "unlinked_approval_resolution": "approval resolution is not linked",
             "header_session_mismatch": "conversation header session id mismatch",
             "invalid_json": (
                 "terminated invalid conversation row"
@@ -71,11 +70,6 @@ class TranscriptLoadError(ConversationIntegrityError):
             "row": self.row_number,
             "repairable": self.repairable,
             "session_id": self.session_id,
-            **(
-                {"child_run_id": self.child_run_id}
-                if self.child_run_id is not None
-                else {}
-            ),
             # Diagnosis-only PR: no repair request exists yet.
             "actions": [],
         }

@@ -448,7 +448,12 @@ class AgentTranscriptSource:
             if path in seen:
                 continue
             seen.add(path)
-            snapshot = self._refresh_path(path)
+            try:
+                snapshot = self._refresh_path(path)
+            except Exception as error:  # isolate nested transcripts
+                if path == self.path:
+                    raise
+                snapshot = self._failed_path_snapshot(path, error)
             projected.append((path, snapshot))
             if recursive:
                 pending.extend(
@@ -560,7 +565,21 @@ class AgentTranscriptSource:
             )
         self._refresh_error_logged = True
 
-    def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
+    def _failed_path_snapshot(
+        self, path: Path, error: Exception
+    ) -> AgentTranscriptSnapshot:
+        if not isinstance(error, TranscriptLoadError):
+            try:
+                ConversationStore(
+                    path.parent,
+                    session_id=path.name,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                error = diagnosis
+            except Exception:  # noqa: BLE001,S110 - preserve original failure
+                pass
         self._log_refresh_error(error, traceback=True)
         reason = (
             str(error)
@@ -568,7 +587,11 @@ class AgentTranscriptSource:
             else _REFRESH_UNAVAILABLE
         )
         snapshot = AgentTranscriptSnapshot((), (), reason)
-        self._snapshots[self.path] = snapshot
+        self._snapshots[path] = snapshot
+        return snapshot
+
+    def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
+        snapshot = self._failed_path_snapshot(self.path, error)
         return AgentTranscriptTreeSnapshot(self.path, ((self.path, snapshot),))
 
 

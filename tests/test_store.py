@@ -1275,11 +1275,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     foreign.close()
 
     owner_thread = threading.get_ident()
-    heavy_threads: dict[str, list[int]] = {
-        "load": [],
-        "validate": [],
-        "rebuild": [],
-    }
+    load_threads: list[int] = []
     active_rows_by_thread: dict[int, int] = {}
     install_threads: list[int] = []
     loop_entry_accesses = 0
@@ -1307,23 +1303,13 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
             self._record_loop_access(len(self))
             return super().copy()
 
-    def observe_heavy(name: str):
-        original = getattr(ConversationStore, name)
+    original_load_full = ConversationStore._load_full
 
-        def observed(candidate: ConversationStore, *args: object, **kwargs: object):
-            heavy_threads[{"_load_full": "load", "_validate_entries": "validate", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
-                threading.get_ident()
-            )
-            return original(candidate, *args, **kwargs)
+    def observed_load_full(candidate: ConversationStore) -> None:
+        load_threads.append(threading.get_ident())
+        original_load_full(candidate)
 
-        monkeypatch.setattr(ConversationStore, name, observed)
-
-    for method_name in (
-        "_load_full",
-        "_validate_entries",
-        "_rebuild_incremental_validation_state",
-    ):
-        observe_heavy(method_name)
+    monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
 
     original_record_active_entry = ConversationStore._record_active_entry
 
@@ -1359,12 +1345,8 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
     observe_loop_access = False
 
-    assert all(heavy_threads.values())
-    assert all(
-        thread != owner_thread
-        for threads in heavy_threads.values()
-        for thread in threads
-    )
+    assert load_threads
+    assert all(thread != owner_thread for thread in load_threads)
     assert active_rows_by_thread.get(owner_thread, 0) == 0
     assert sum(active_rows_by_thread.values()) >= len(rows)
     assert install_threads == [owner_thread]
@@ -2044,6 +2026,7 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
         ("parse", "invalid_row", "invalid_json"),
         ("payload", "invalid_row", "invalid_payload"),
         ("links", "broken_links", "missing_parent"),
+        ("approval", "broken_links", "unlinked_approval_resolution"),
     ],
 )
 def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
@@ -2061,8 +2044,12 @@ def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
     elif damage == "payload":
         row["data"] = {"private": "must-not-leak"}
         lines[2] = json.dumps(row).encode() + b"\n"
-    else:
+    elif damage == "links":
         row["parent_id"] = "must-not-leak"
+        lines[2] = json.dumps(row).encode() + b"\n"
+    else:
+        row["type"] = "approval_resolution"
+        row["data"] = {"request_id": "must-not-leak", "decision": "deny"}
         lines[2] = json.dumps(row).encode() + b"\n"
     damaged = b"".join(lines)
     path.write_bytes(damaged)
@@ -2071,6 +2058,13 @@ def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
         ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
 
     error = raised.value
+    expected_label = {
+        "parse": "terminated invalid conversation row",
+        "payload": "invalid payload for conversation entry",
+        "links": "missing prior parent",
+        "approval": "approval resolution is not linked",
+    }[damage]
+    assert str(error) == f"transcript {expected_label} at row 3 (session diagnose-{damage})"
     assert (error.kind, error.row_number, error.byte_offset) == (
         kind,
         3,
@@ -2111,6 +2105,10 @@ def test_transcript_compatibility_classification_precedes_corruption(
     with pytest.raises(ConversationIntegrityError) as raised:
         ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
 
+    assert str(raised.value) == (
+        f"transcript unsupported format at row {row_index + 1} "
+        f"(session diagnose-{damage})"
+    )
     assert raised.value.kind == "unsupported_format"
     assert raised.value.row_number == row_index + 1
     assert raised.value.repairable is False
