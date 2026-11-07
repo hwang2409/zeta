@@ -474,19 +474,15 @@ class BackgroundTaskRegistry:
 
     async def wait(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
         """Wait for one background process and return its terminal status."""
-
         record = self._record(task_id)
         if record.monitor is not None:
             try:
-                if timeout is None:
-                    await asyncio.shield(record.monitor)
-                else:
+                if timeout is not None:
                     await asyncio.wait((record.monitor,), timeout=timeout)
-                    if record.monitor.done():
-                        await asyncio.shield(record.monitor)
+                if timeout is None or record.monitor.done():
+                    await asyncio.shield(record.monitor)
             except asyncio.CancelledError:
-                caller = asyncio.current_task()
-                if caller is None or caller.cancelling() or record.running:
+                if asyncio.current_task().cancelling() or record.running:
                     raise
         return self._status(record)
 
