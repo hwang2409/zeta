@@ -15,7 +15,12 @@ from ..config.settings import ResolvedConfig
 from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
-from ..core.project_context import ProjectContext, ProjectDiscovery
+from ..core.project_context import (
+    ProjectContext,
+    ProjectDiscovery,
+    load_project_context,
+    resolve_project_context_from_projects,
+)
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..mcp.envelope import MCPCallLimits
@@ -31,6 +36,7 @@ from ..storage_format import open_writer
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
+from .project_registry_state import ProjectRegistryState
 from .prompt import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
@@ -296,6 +302,55 @@ def compose_runtime(
         )
         loop.explicit_finish = config.agents_explicit_finish
         loop.post_stream_provider_retry = post_stream_provider_retry
+
+        def prepare_project_context(projection: Any) -> ProjectContext:
+            cwd_project = (
+                resolve_project_context_from_projects(
+                    project_discovery, projection.projects
+                )
+                if project_discovery is not None
+                else None
+            )
+            return load_project_context(
+                cwd=cwd,
+                repo_root=(
+                    project_discovery.primary_root or project_discovery.cwd
+                    if project_discovery is not None
+                    else cwd
+                ),
+                zeta_home=home,
+                catalog=loop.tool_registry.skill_catalog,
+                session_project=projection.session_project,
+                cwd_project=cwd_project,
+                inbox_enabled=config.inbox_enabled,
+                registry=project_registry,
+                project_projection=projection,
+            )
+
+        conservative_recovery = (
+            resuming
+            and project_context.prompt_recipe != "default"
+            and "project_memory" in project_context.prompt_components
+        )
+        loop._configure_project_context_recovery(
+            registry=project_registry,
+            project_id=metadata.project_id,
+            health=project_context.health,
+            prepare=(
+                prepare_project_context
+                if project_context.prompt_recipe == "default" or conservative_recovery
+                else None
+            ),
+            replace_component=("project_memory" if conservative_recovery else None),
+        )
+        if project_registry is not None and (
+            project_context.health is None
+            or project_context.health.code != "project_registry_unavailable"
+        ):
+            manager.project_registry_unavailable = None
+            registry.project_registry_state = manager.project_registry_state = (
+                ProjectRegistryState(project_registry)
+            )
         loop.manager = manager
         loop.session_metadata = metadata
         loop.account_context = account_context

@@ -138,6 +138,11 @@ class ServerSlashSession:
             vim_mode=opened.metadata.vim_mode,
             pending_approvals=pending,
             usage_tracker=state.usage_tracker,
+            project_context_health=(
+                loop.project_context_health.summary
+                if loop.project_context_health is not None
+                else None
+            ),
         )
 
     def slash_status(self) -> SlashStatus:
