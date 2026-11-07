@@ -285,10 +285,14 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    origin_main = base
     if newer:
         (r / "src/newer.py").write_text("def newer(): pass\n")
         commit(r, "newer main")
         pr_base = "main"
+        origin_main = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
     else:
         subprocess.run(
             ["git", "checkout", "-qb", "pr-side", initial], cwd=r, check=True
@@ -296,7 +300,6 @@ def _train_case(r: Path, *, newer: bool, depth: int = 1) -> tuple[str, str, str,
         (r / "src/pr.py").write_text("def pr(): pass\n")
         commit(r, "older pr")
         pr_base = "pr-side"
-    origin_main = base
     subprocess.run(
         ["git", "update-ref", "refs/remotes/origin/main", origin_main],
         cwd=r,
@@ -353,6 +356,7 @@ import pytest
         ("train-1", 0, False),
         ("train-older", 0, False),
         ("train-newer", 0, False),
+        ("train-newer-wrong", None, True),
         ("both", None, True),
         ("neither", None, True),
         ("wrong", None, True),
@@ -366,7 +370,9 @@ def test_parent_selection_table(
     if shape.startswith("train"):
         r = repo(tmp_path)
         merge, p1, p2, loss = _train_case(
-            r, newer=shape == "train-newer", depth=1 if shape == "train-1" else 2
+            r,
+            newer=shape in {"train-newer", "train-newer-wrong"},
+            depth=1 if shape == "train-1" else 2,
         )
     else:
         r = repo(tmp_path)
@@ -401,7 +407,10 @@ def test_parent_selection_table(
         subprocess.run(
             ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
         )
-    if shape == "wrong":
+    if shape == "train-newer-wrong":
+        args = ("--main-sha", p2)
+    elif shape == "wrong":
+        # guard: this direct-shape refusal already held on 707549ed.
         args = ("--main-sha", p1)
         expected = None
         refusal = True
@@ -412,6 +421,9 @@ def test_parent_selection_table(
         assert result.returncode == 2
         if shape == "wrong":
             assert f"disagrees with the identified main parent {p2}" in result.stderr
+            assert "main parent:" not in result.stdout
+        elif shape == "train-newer-wrong":
+            assert f"disagrees with the identified main parent {p1}" in result.stderr
             assert "main parent:" not in result.stdout
         else:
             assert "cannot identify exactly one main parent" in result.stderr
