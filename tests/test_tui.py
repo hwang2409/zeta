@@ -718,7 +718,7 @@ async def test_live_notification_presentation_survives_tui_resume(
     try:
         resumed_app._rebuild_transcript()
         visible = output.getvalue() + resumed_output.getvalue()
-        assert visible.count("child · completed") == 1
+        assert visible.count("child child-presentation · completed") == 1
     finally:
         await resumed_app.loop.close()
         reopened.close()
@@ -773,7 +773,10 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
     )
     try:
         await rendered_output.wait()
-        assert output.getvalue().count("child · completed") == 1
+        assert (
+            output.getvalue().count("child child-canceled-presentation · completed")
+            == 1
+        )
         assert not store.is_agent_notification_presented_to_tui(notification.id)
         presentation.cancel()
         await asyncio.sleep(0)
@@ -798,7 +801,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
             resumed_app._rebuild_transcript()
             visible = output.getvalue() + resumed_output.getvalue()
-            assert visible.count("child · completed") == 1
+            assert (
+                visible.count("child child-canceled-presentation · completed") == 1
+            )
         finally:
             await resumed_app.loop.close()
             reopened.close()
@@ -4993,12 +4998,11 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
         data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
-    assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
+    assert "2 turns · 1.5s · completed" in render_agent_receipt(success).plain
     canceled_plain = render_agent_receipt(canceled).plain
     assert "0 turns · 0.4s · canceled" in canceled_plain
-    assert "error=false" in canceled_plain
-    assert "canceled=true" in canceled_plain
-    assert "error=true" not in canceled_plain
+    assert "error=" not in canceled_plain
+    assert "canceled=" not in canceled_plain
     assert "depth 2" in canceled_plain
 
 
@@ -5055,8 +5059,9 @@ def test_unstructured_agent_error_renders_as_error() -> None:
 
     rendered = render_agent_receipt(event)
 
-    assert "error=true" in rendered.plain
-    assert "canceled=false" in rendered.plain
+    assert "failed" in rendered.plain
+    assert "error=" not in rendered.plain
+    assert "canceled=" not in rendered.plain
 
 
 def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:
@@ -5678,7 +5683,7 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
         ),
     )
     transcript.finish_tool(call.id, render_event(event), event)
-    assert "1 turns · 0.0s · ok" in transcript.render(120)
+    assert "1 turns · 0.0s · completed" in transcript.render(120)
     assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "expand: ctrl+x ctrl+o" not in rendered

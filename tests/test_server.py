@@ -6170,6 +6170,39 @@ async def test_resume_does_not_bump_updated_at(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_retains_registry_after_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="codex")
+    await runtime.create_session()
+    state = runtime.state
+    registry = runtime.loop.tool_registry.background_tasks
+    original_shutdown = registry._shutdown
+    failure = OSError("registry close failed")
+    attempts = 0
+
+    async def flaky_shutdown() -> tuple[str, ...]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise failure
+        return await original_shutdown()
+
+    monkeypatch.setattr(registry, "_shutdown", flaky_shutdown)
+
+    with pytest.raises(OSError) as raised:
+        await runtime.close()
+    assert raised.value is failure
+    assert runtime.state is state
+    assert attempts == 2
+
+    await runtime.close()
+    assert runtime.state is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["close", "replace-close", "activate", "resume-compose"])
 async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch, failure):
     from zeta.server.runtime import ServerRuntime
