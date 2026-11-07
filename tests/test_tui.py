@@ -77,6 +77,8 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
+from zeta.attention_decisions import DecisionItem
+from zeta.attention_records import AttentionRecord
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -100,6 +102,7 @@ from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskInfo
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -159,6 +162,8 @@ from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.cards import markdown as markdown_module
 from zeta.tui.cards.base import compact_tool_card, failure_status
+from zeta.tui.cards.decisions import DecisionsPanel
+from zeta.tui.cards.tasks_panel import BackgroundTasksPanel
 from zeta.tui.cards.tool import TOOL_CARD_REGISTRY
 from zeta.tui.layout import (
     QueuedPanel,
@@ -168,6 +173,7 @@ from zeta.tui.layout import (
     queued_lines,
     queued_panel,
 )
+from zeta.tui.overlay import OverlayControl
 from zeta.tui.render import (
     STREAM_EVENTS_HANDLED_ELSEWHERE,
     STREAM_EVENTS_HIDDEN,
@@ -4915,6 +4921,112 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     assert isinstance(start, Panel)
     progress = render_tool_progress(call, "task research: thinking")
     assert isinstance(progress, Panel)
+
+
+def _render_overlay_at_80(lines: list[list[tuple[str, str]]]) -> list[str]:
+    control = OverlayControl()
+    control.set_lines(lines)
+    content = control.create_content(width=72, height=30)
+    return [
+        "".join(fragment[1] for fragment in content.get_line(index)).rstrip()
+        for index in range(content.line_count)
+    ]
+
+
+def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    record = AttentionRecord(
+        id="a" * 32,
+        created_at="2026-01-01T00:00:00Z",
+        session_id="1" * 32,
+        project_id="p_test",
+        entry_id=None,
+        entry_seq=None,
+        lane="orchestrator",
+        title="Choose path",
+        why=f"{path}verylongfilenamewithoutbreaks",
+        options=(),
+        recommendation=None,
+        status="open",
+    )
+    panel = DecisionsPanel()
+    panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert f"Why: {path}" in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
+def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    panel = BackgroundTasksPanel()
+    panel.set_tasks(
+        [
+            BackgroundTaskInfo(
+                task_id="task-path",
+                command=f"python {path}verylongfilenamewithoutbreaks",
+                pid=42,
+                owner="run_background",
+                running=True,
+                exit_code=None,
+                note=None,
+                terminal_phase=None,
+                started_at=0.0,
+                ended_at=None,
+                output_bytes=0,
+                output_lines=0,
+            )
+        ],
+        now=1.0,
+    )
+    assert panel.open_details() is not None
+
+    rendered = _render_overlay_at_80(panel.render_lines())
+    content = [line.strip("│ ") for line in rendered]
+
+    assert path in content
+    assert "verylongfilenamewithoutbreaks" in content
+    assert all(cell_len(line) <= 72 for line in rendered)
+
+
+def test_agent_card_wraps_long_messages_at_a_separator(tmp_path: Path) -> None:
+    path = "/Users/henry/me/fun/zeta/.worktrees/wrap-word-boundary/"
+    child = ConversationStore(tmp_path / "agents", session_id="child")
+    send = ToolCall(
+        "send-path",
+        "agent_send",
+        {
+            "child_instance_id": "root:1",
+            "message": f"{path}verylongfilenamewithoutbreaks",
+        },
+    )
+    try:
+        child.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(send)]))
+        call = ToolCall(
+            "agent-path",
+            "agent",
+            {"prompt": "inspect", "description": "child"},
+        )
+
+        rendered = AgentCard.render_expanded(
+            call,
+            elapsed_seconds=1.0,
+            turns_used=1,
+            child_session_path=str(child.session_dir),
+        )
+        output = StringIO()
+        _test_console(output, width=80).print(rendered)
+        lines = Text.from_ansi(output.getvalue()).plain.splitlines()
+        content = [line.strip("│ ") for line in lines]
+
+        assert path in content
+        assert "verylongfilenamewithoutbreaks" in content
+        assert all(cell_len(line) <= 80 for line in lines)
+    finally:
+        child.close()
 
 
 def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
