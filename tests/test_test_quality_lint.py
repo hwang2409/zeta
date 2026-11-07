@@ -777,6 +777,165 @@ async def test_idle():
     ] == [("TQ006", 2), ("TQ006", 7)]
 
 
+def test_tq006_rejects_direct_return_helper_when_caller_does_not_own_it(
+    tmp_path: Path,
+) -> None:
+    source = """def _open_store(tmp_path):
+    return ConversationStore(tmp_path)
+
+def test_store(tmp_path):
+    store = _open_store(tmp_path)
+    assert store.messages() == []
+"""
+
+    findings = _lint(tmp_path, source, added_lines={6})
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 5)]
+
+
+def test_tq006_rejects_reassignment_inside_cleaning_try(tmp_path: Path) -> None:
+    source = """async def test_store(tmp_path):
+    try:
+        store = ConversationStore(tmp_path / "one")
+        store = ConversationStore(tmp_path / "two")
+        await run(store)
+    finally:
+        store.close()
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 3)]
+
+
+def test_tq006_rejects_owner_method_on_unbound_object(tmp_path: Path) -> None:
+    source = """async def test_store(tmp_path):
+    accidental.store(ConversationStore(tmp_path))
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 2)]
+
+
+def test_tq006_accepts_resource_owner_from_fixture(tmp_path: Path) -> None:
+    source = """@pytest.fixture(name="owner")
+async def resource_owner():
+    async with owned_resources() as owner:
+        yield owner
+
+async def test_store(tmp_path, owner):
+    owner.store(ConversationStore(tmp_path))
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+@pytest.mark.parametrize(
+    "drain",
+    [
+        "await task",
+        "await asyncio.gather(task)",
+        "await asyncio.wait_for(task, 10)",
+    ],
+)
+def test_tq006_accepts_immediately_drained_task(tmp_path: Path, drain: str) -> None:
+    source = f"""async def test_task():
+    task = asyncio.create_task(run())
+    {drain}
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_immediate_transfer_to_resource_owner(tmp_path: Path) -> None:
+    source = """async def test_task():
+    async with owned_resources() as owner:
+        task = asyncio.create_task(run())
+        owner.task(task)
+        await ready.wait()
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_task_transferred_to_owned_app_owner(tmp_path: Path) -> None:
+    source = """async def test_task(app):
+    async with owned_app(app) as owner:
+        task = asyncio.create_task(run())
+        owner.task(task)
+        await ready.wait()
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_prebound_app_and_its_nested_resources(tmp_path: Path) -> None:
+    source = """async def test_app(tmp_path):
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store)
+    app = TUIApp(loop)
+    async with owned_app(app):
+        await run(app)
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_cleaning_context_manager_helper(tmp_path: Path) -> None:
+    source = """@contextmanager
+def _store(tmp_path):
+    store = ConversationStore(tmp_path)
+    try:
+        yield store
+    finally:
+        store.close()
+
+def test_store(tmp_path):
+    with _store(tmp_path) as store:
+        assert store.messages() == []
+"""
+
+    assert [
+        finding for finding in _lint(tmp_path, source) if finding.code == "TQ006"
+    ] == []
+
+
+def test_tq006_accepts_task_transferred_to_cancellation_owner(tmp_path: Path) -> None:
+    source = """async def test_cancel():
+    owner = BackgroundAgentOwner(store)
+    watcher = asyncio.create_task(watch())
+
+    def cancel():
+        return CancellationRequest(asyncio.create_task(confirm()), watcher)
+
+    owner.register("child", cancel, watcher)
+    await owner.cancel_and_wait("child")
+"""
+
+    findings = _lint(tmp_path, source)
+
+    assert [
+        (finding.code, finding.line) for finding in findings if finding.code == "TQ006"
+    ] == [("TQ006", 3)]
+
+
 def test_tq006_accepts_local_helper_without_risk_before_return(tmp_path: Path) -> None:
     source = """def _open_store(tmp_path):
     store = ConversationStore(tmp_path)

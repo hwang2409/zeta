@@ -54,10 +54,11 @@ CLEANUP_OWNERS = {
 
 
 @dataclass(frozen=True)
-class HelperResource:
+class ResourceOpen:
+    name: str | None
     kind: str
-    open_call: ast.Call
-    hazardous_after_open: bool
+    owner_call: str
+    node: ast.Call
 
 
 @dataclass(frozen=True)
@@ -620,95 +621,25 @@ def _cleanup_kind(node: ast.Call) -> str | None:
     return None
 
 
+def _enclosing_function(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    return next(
+        (
+            ancestor
+            for ancestor in _enclosing_nodes(node, parents)
+            if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ),
+        None,
+    )
+
+
 def _owned_by_function(
     node: ast.AST,
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     parents: dict[ast.AST, ast.AST],
 ) -> bool:
-    return (
-        next(
-            (
-                ancestor
-                for ancestor in _enclosing_nodes(node, parents)
-                if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef))
-            ),
-            None,
-        )
-        is function
-    )
-
-
-def _local_resource_helpers(tree: ast.AST) -> dict[str, list[HelperResource]]:
-    helpers: dict[str, list[HelperResource]] = {}
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
-    for function in ast.walk(tree):
-        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        members = [
-            node
-            for node in ast.walk(function)
-            if _owned_by_function(node, function, parents)
-        ]
-        returns = [
-            node
-            for node in members
-            if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
-        ]
-        for call in members:
-            if not isinstance(call, ast.Call) or (kind := _cleanup_kind(call)) is None:
-                continue
-            bound_name = _bound_name(call, parents)
-            matching_returns = [
-                node
-                for node in returns
-                if node.lineno > call.lineno
-                and bound_name is not None
-                and _contains_name(node, bound_name)
-            ]
-            for returned in matching_returns:
-                hazardous = any(
-                    isinstance(node, (ast.Await, ast.Raise))
-                    and call.end_lineno < node.lineno < returned.lineno
-                    for node in members
-                )
-                helpers.setdefault(function.name, []).append(
-                    HelperResource(kind, call, hazardous)
-                )
-                break
-    return helpers
-
-
-def _helper_resources(
-    node: ast.Call, helpers: dict[str, list[HelperResource]]
-) -> list[HelperResource]:
-    return helpers.get(_name(node.func).rsplit(".", 1)[-1], [])
-
-
-def _owner_call_matches(node: ast.Call, kind: str) -> bool:
-    function = _name(node.func)
-    terminal = function.rsplit(".", 1)[-1]
-    expected = {
-        "app": {"owned_app"},
-        "store": {"store"},
-        "async resource": {"async_resource"},
-        "task": {"task"},
-        "process": {"owned_child_process"},
-    }[kind]
-    return terminal in expected
-
-
-def _inside_owner_call(
-    node: ast.Call, kind: str, parents: dict[ast.AST, ast.AST]
-) -> bool:
-    return any(
-        isinstance(ancestor, ast.Call) and _owner_call_matches(ancestor, kind)
-        for ancestor in _enclosing_nodes(node, parents)
-        if not isinstance(ancestor, ast.stmt)
-    )
+    return _enclosing_function(node, parents) is function
 
 
 def _bound_name(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str | None:
@@ -722,7 +653,7 @@ def _bound_name(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str | None:
             names = [target.id for target in targets if isinstance(target, ast.Name)]
             return names[0] if len(names) == 1 else None
         if isinstance(ancestor, ast.stmt):
-            return None
+            break
     return None
 
 
@@ -730,6 +661,192 @@ def _contains_name(node: ast.AST, name: str) -> bool:
     return any(
         isinstance(child, ast.Name) and child.id == name for child in ast.walk(node)
     )
+
+
+def _direct_value(value: ast.AST, target: ast.AST | str) -> bool:
+    value = _unwrap_transparent(value)
+    if isinstance(target, str) and isinstance(value, ast.Name):
+        return value.id == target
+    if isinstance(target, ast.AST) and value is target:
+        return True
+    if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        return any(_direct_value(item, target) for item in value.elts)
+    if isinstance(value, ast.Dict):
+        return any(
+            item is not None and _direct_value(item, target) for item in value.values
+        )
+    return isinstance(value, ast.Starred) and _direct_value(value.value, target)
+
+
+def _returned_at(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> ast.Return | ast.Yield | ast.YieldFrom | None:
+    function = _enclosing_function(resource.node, parents)
+    if function is None:
+        return None
+    for node in ast.walk(function):
+        if not isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+            continue
+        if not _owned_by_function(node, function, parents) or node.value is None:
+            continue
+        if _direct_value(node.value, resource.node):
+            return node
+        if (
+            resource.name
+            and node.lineno > resource.node.lineno
+            and _direct_value(node.value, resource.name)
+        ):
+            return node
+    return None
+
+
+def _transfer_is_immediate(
+    resource: ResourceOpen,
+    returned: ast.Return | ast.Yield | ast.YieldFrom,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    function = _enclosing_function(resource.node, parents)
+    if function is None:
+        return False
+    for node in ast.walk(function):
+        if not _owned_by_function(node, function, parents):
+            continue
+        if not hasattr(node, "lineno") or not (
+            resource.node.end_lineno < node.lineno < returned.lineno
+        ):
+            continue
+        if isinstance(node, (ast.Await, ast.Raise)):
+            return False
+        if (
+            resource.name
+            and isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id == resource.name
+        ):
+            return False
+    return True
+
+
+def _resource_flow(
+    tree: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> list[ResourceOpen]:
+    records = [
+        ResourceOpen(_bound_name(node, parents), kind, CLEANUP_OWNERS[kind], node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and (kind := _cleanup_kind(node)) is not None
+    ]
+    transfers = [
+        (function.name, resource)
+        for resource in records
+        if (function := _enclosing_function(resource.node, parents)) is not None
+        and _returned_at(resource, parents) is not None
+    ]
+    for call in [node for node in ast.walk(tree) if isinstance(node, ast.Call)]:
+        called_name = _name(call.func).rsplit(".", 1)[-1]
+        records.extend(
+            ResourceOpen(
+                _bound_name(call, parents), resource.kind, resource.owner_call, call
+            )
+            for helper_name, resource in transfers
+            if helper_name == called_name
+        )
+    return list(dict.fromkeys(records))
+
+
+def _fixture_name(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> str | None:
+    for decorator in function.decorator_list:
+        fixture = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if _name(fixture) not in {"fixture", "pytest.fixture"}:
+            continue
+        if isinstance(decorator, ast.Call):
+            for keyword in decorator.keywords:
+                if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                    return keyword.value.value
+        return function.name
+    return None
+
+
+def _resource_owner_target(item: ast.withitem) -> str | None:
+    call = _unwrap_transparent(item.context_expr)
+    if not isinstance(call, ast.Call) or not isinstance(item.optional_vars, ast.Name):
+        return None
+    if _name(call.func).rsplit(".", 1)[-1] not in {"owned_resources", "owned_app"}:
+        return None
+    return item.optional_vars.id
+
+
+def _with_items(function: ast.AST) -> list[ast.withitem]:
+    return [
+        item
+        for node in ast.walk(function)
+        if isinstance(node, (ast.With, ast.AsyncWith))
+        for item in node.items
+    ]
+
+
+def _resource_owner_fixtures(tree: ast.AST) -> set[str]:
+    return {
+        fixture_name
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (fixture_name := _fixture_name(function)) is not None
+        and any(
+            target
+            and any(
+                isinstance(node, (ast.Yield, ast.YieldFrom))
+                and node.value is not None
+                and _contains_name(node.value, target)
+                for node in ast.walk(function)
+            )
+            for item in _with_items(function)
+            if (target := _resource_owner_target(item)) is not None
+        )
+    }
+
+
+def _resource_owner_names(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, fixtures: set[str]
+) -> set[str]:
+    return {
+        argument.arg for argument in function.args.args if argument.arg in fixtures
+    } | {
+        target
+        for item in _with_items(function)
+        if (target := _resource_owner_target(item)) is not None
+    }
+
+
+def _registered_with_owner(
+    resource: ResourceOpen,
+    owner_names: dict[ast.AST, set[str]],
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    expected = {"store": "store", "async resource": "async_resource", "task": "task"}
+    if resource.kind not in expected:
+        terminal = {"app": "owned_app", "process": "owned_child_process"}[resource.kind]
+        return any(
+            isinstance(node, ast.Call)
+            and _name(node.func).rsplit(".", 1)[-1] == terminal
+            for node in _enclosing_nodes(resource.node, parents)
+            if not isinstance(node, ast.stmt)
+        )
+    function = _enclosing_function(resource.node, parents)
+    if function is None:
+        return False
+    owners = owner_names.get(function, set())
+    for node in _enclosing_nodes(resource.node, parents):
+        if isinstance(node, ast.stmt):
+            break
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if (
+            node.func.attr == expected[resource.kind]
+            and _name(node.func.value) in owners
+        ):
+            return True
+    return False
 
 
 def _is_cleanup_call(node: ast.Call, kind: str, bound_name: str) -> bool:
@@ -754,19 +871,9 @@ def _cleanup_postdominates(
     if not statements:
         return False
     first = statements[0]
-    if isinstance(first, ast.Try) and _cleanup_postdominates(
-        first.finalbody, kind, bound_name
-    ):
-        return True
+    if isinstance(first, ast.Try):
+        return _cleanup_postdominates(first.finalbody, kind, bound_name)
     return _statement_has_cleanup(first, kind, bound_name)
-
-
-def _is_fixture(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    return any(
-        _name(decorator.func if isinstance(decorator, ast.Call) else decorator)
-        in {"fixture", "pytest.fixture"}
-        for decorator in function.decorator_list
-    )
 
 
 def _statement_block(
@@ -774,20 +881,46 @@ def _statement_block(
 ) -> tuple[list[ast.stmt], int] | None:
     for node in ast.walk(function):
         for _field, value in ast.iter_fields(node):
-            if not isinstance(value, list) or statement not in value:
-                continue
-            if all(isinstance(item, ast.stmt) for item in value):
+            if (
+                isinstance(value, list)
+                and statement in value
+                and all(isinstance(item, ast.stmt) for item in value)
+            ):
                 return value, value.index(statement)
     return None
 
 
-def _reassigns_name(statement: ast.stmt, bound_name: str) -> bool:
+def _open_statement(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> ast.stmt | None:
+    return next(
+        (
+            node
+            for node in _enclosing_nodes(resource.node, parents)
+            if isinstance(node, ast.stmt)
+        ),
+        None,
+    )
+
+
+def _reassigned_in_try(name: str, open_statement: ast.stmt, candidate: ast.Try) -> bool:
     return any(
         isinstance(node, ast.Name)
         and isinstance(node.ctx, ast.Store)
-        and node.id == bound_name
-        for node in ast.walk(statement)
+        and node.id == name
+        and node.lineno > (open_statement.end_lineno or open_statement.lineno)
+        for node in ast.walk(candidate)
     )
+
+
+def _try_cleans_resource(
+    resource: ResourceOpen, candidate: ast.Try, open_statement: ast.stmt
+) -> bool:
+    if resource.name is None:
+        return False
+    if not _cleanup_postdominates(candidate.finalbody, resource.kind, resource.name):
+        return False
+    return not _reassigned_in_try(resource.name, open_statement, candidate)
 
 
 def _cannot_raise_or_await(statement: ast.stmt) -> bool:
@@ -802,144 +935,267 @@ def _cannot_raise_or_await(statement: ast.stmt) -> bool:
     return False
 
 
-def _safe_pre_try_cleanup(
-    node: ast.Call,
-    kind: str,
-    bound_name: str,
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-    parents: dict[ast.AST, ast.AST],
+def _cleaned_in_finally(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
 ) -> bool:
-    open_statement = next(
-        (
-            ancestor
-            for ancestor in _enclosing_nodes(node, parents)
-            if isinstance(ancestor, ast.stmt)
-        ),
-        None,
-    )
-    if (
-        open_statement is None
-        or (block := _statement_block(function, open_statement)) is None
-    ):
+    function = _enclosing_function(resource.node, parents)
+    open_statement = _open_statement(resource, parents)
+    if function is None or open_statement is None or resource.name is None:
+        return False
+    for candidate in _enclosing_nodes(resource.node, parents):
+        if (
+            isinstance(candidate, ast.Try)
+            and open_statement in candidate.body
+            and _try_cleans_resource(resource, candidate, open_statement)
+        ):
+            return True
+    block = _statement_block(function, open_statement)
+    if block is None:
         return False
     statements, index = block
     for candidate_index in range(index + 1, len(statements)):
         candidate = statements[candidate_index]
         between = statements[index + 1 : candidate_index]
-        if isinstance(candidate, ast.Try) and _cleanup_postdominates(
-            candidate.finalbody, kind, bound_name
-        ):
-            return all(
-                not _reassigns_name(statement, bound_name)
-                and _cannot_raise_or_await(statement)
-                for statement in between
+        if isinstance(candidate, ast.Try):
+            return all(_cannot_raise_or_await(item) for item in between) and (
+                _try_cleans_resource(resource, candidate, open_statement)
             )
-        if _reassigns_name(candidate, bound_name) or not _cannot_raise_or_await(
-            candidate
-        ):
+        if not _cannot_raise_or_await(candidate):
             return False
     return False
 
 
-def _manual_cleanup_is_safe(
-    node: ast.Call,
-    kind: str,
-    bound_name: str,
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
+def _await_drains(value: ast.AST, name: str) -> bool:
+    value = _unwrap_transparent(value)
+    if isinstance(value, ast.Name):
+        return value.id == name
+    if not isinstance(value, ast.Call):
+        return False
+    terminal = _name(value.func).rsplit(".", 1)[-1]
+    return terminal in {"gather", "wait_for"} and any(
+        _contains_name(argument, name) for argument in value.args
+    )
+
+
+def _immediately_drained(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if resource.kind != "task":
+        return False
+    for ancestor in _enclosing_nodes(resource.node, parents):
+        if isinstance(ancestor, ast.Await):
+            return _cleanup_kind(resource.node) == "task"
+        if isinstance(ancestor, ast.stmt):
+            break
+    if resource.name is None:
+        return False
+    function = _enclosing_function(resource.node, parents)
+    statement = _open_statement(resource, parents)
+    if function is None or statement is None:
+        return False
+    block = _statement_block(function, statement)
+    if block is None or block[1] + 1 >= len(block[0]):
+        return False
+    following = block[0][block[1] + 1]
+    return (
+        isinstance(following, ast.Expr)
+        and isinstance(following.value, ast.Await)
+        and (_await_drains(following.value.value, resource.name))
+    )
+
+
+def _transferred_to_resource_owner(
+    resource: ResourceOpen,
+    owner_names: dict[ast.AST, set[str]],
     parents: dict[ast.AST, ast.AST],
 ) -> bool:
-    enclosing_tries = [
-        ancestor
-        for ancestor in _enclosing_nodes(node, parents)
-        if isinstance(ancestor, ast.Try)
-    ]
-    if any(
-        _cleanup_postdominates(candidate.finalbody, kind, bound_name)
-        for candidate in enclosing_tries
-    ) or _safe_pre_try_cleanup(node, kind, bound_name, function, parents):
-        return True
-    if not _is_fixture(function):
+    expected = {"store": "store", "async resource": "async_resource", "task": "task"}
+    function = _enclosing_function(resource.node, parents)
+    statement = _open_statement(resource, parents)
+    if function is None or statement is None or resource.name is None:
         return False
+    if resource.kind not in expected:
+        return False
+    block = _statement_block(function, statement)
+    if block is None or block[1] + 1 >= len(block[0]):
+        return False
+    following = block[0][block[1] + 1]
+    owners = owner_names.get(function, set())
     return any(
-        candidate.lineno > node.lineno
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == expected[resource.kind]
+        and _name(node.func.value) in owners
+        and any(_direct_value(argument, resource.name) for argument in node.args)
+        for node in ast.walk(following)
+    )
+
+
+def _transferred_to_context_owner(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    terminal = {"app": "owned_app", "process": "owned_child_process"}.get(resource.kind)
+    function = _enclosing_function(resource.node, parents)
+    statement = _open_statement(resource, parents)
+    if (
+        terminal is None
+        or function is None
+        or statement is None
+        or resource.name is None
+    ):
+        return False
+    block = _statement_block(function, statement)
+    if block is None or block[1] + 1 >= len(block[0]):
+        return False
+    following = block[0][block[1] + 1]
+    return any(
+        isinstance(node, ast.Call)
+        and _name(node.func).rsplit(".", 1)[-1] == terminal
+        and any(_direct_value(argument, resource.name) for argument in node.args)
+        for node in ast.walk(following)
+    )
+
+
+def _used_as_context_manager(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if _cleanup_kind(resource.node) is not None:
+        return False
+    for node in _enclosing_nodes(resource.node, parents):
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            return any(
+                resource.node in ast.walk(item.context_expr) for item in node.items
+            )
+        if isinstance(node, ast.stmt):
+            return False
+    return False
+
+
+def _transferred_to_cancellation_owner(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    if resource.kind != "task":
+        return False
+    callback = _enclosing_function(resource.node, parents)
+    if callback is None:
+        return False
+    outer = _enclosing_function(callback, parents)
+    if outer is None:
+        return False
+    inside_request = any(
+        isinstance(node, ast.Call)
+        and _name(node.func).rsplit(".", 1)[-1] == "CancellationRequest"
+        for node in _enclosing_nodes(resource.node, parents)
+        if not isinstance(node, ast.stmt)
+    )
+    if not inside_request:
+        return False
+    owners = {
+        _name(node.func.value)
+        for node in ast.walk(outer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "register"
         and any(
-            isinstance(child, (ast.Yield, ast.YieldFrom))
-            for child in ast.walk(candidate)
+            isinstance(arg, ast.Name) and arg.id == callback.name for arg in node.args
         )
-        and _cleanup_postdominates(candidate.finalbody, kind, bound_name)
-        for candidate in ast.walk(function)
-        if isinstance(candidate, ast.Try)
+    }
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cancel_and_wait"
+        and _name(node.func.value) in owners
+        for node in ast.walk(outer)
+    )
+
+
+def _returned_by_helper(
+    resource: ResourceOpen, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    returned = _returned_at(resource, parents)
+    return returned is not None and _transfer_is_immediate(resource, returned, parents)
+
+
+def _resource_is_safe(
+    resource: ResourceOpen,
+    resources: list[ResourceOpen],
+    owner_names: dict[ast.AST, set[str]],
+    parents: dict[ast.AST, ast.AST],
+    checked: frozenset[ResourceOpen] = frozenset(),
+) -> bool:
+    if resource in checked:
+        return False
+    if (
+        _registered_with_owner(resource, owner_names, parents)
+        or _cleaned_in_finally(resource, parents)
+        or _returned_by_helper(resource, parents)
+        or _immediately_drained(resource, parents)
+        or _transferred_to_resource_owner(resource, owner_names, parents)
+        or _transferred_to_context_owner(resource, parents)
+        or _used_as_context_manager(resource, parents)
+        or _transferred_to_cancellation_owner(resource, parents)
+    ):
+        return True
+    return any(
+        (
+            resource.node in ast.walk(parent.node)
+            or (
+                resource.name is not None
+                and parent.node.lineno >= resource.node.lineno
+                and _contains_name(parent.node, resource.name)
+            )
+        )
+        and _resource_is_safe(
+            parent, resources, owner_names, parents, checked | {resource}
+        )
+        for parent in resources
+        if parent is not resource
     )
 
 
 def _cleanup_finding(
     path: Path,
-    node: ast.Call,
-    kind: str,
+    resource: ResourceOpen,
+    resources: list[ResourceOpen],
+    owner_names: dict[ast.AST, set[str]],
     parents: dict[ast.AST, ast.AST],
-    *,
-    helper_hazard: bool,
 ) -> Finding | None:
-    if not helper_hazard and _inside_owner_call(node, kind, parents):
+    if _resource_is_safe(resource, resources, owner_names, parents):
         return None
-    function = next(
-        (
-            ancestor
-            for ancestor in _enclosing_nodes(node, parents)
-            if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ),
-        None,
-    )
-    bound_name = _bound_name(node, parents)
-    if (
-        not helper_hazard
-        and function is not None
-        and bound_name is not None
-        and _manual_cleanup_is_safe(node, kind, bound_name, function, parents)
-    ):
-        return None
-    owner = CLEANUP_OWNERS[kind]
     return Finding(
         path,
-        node.lineno,
-        node.col_offset + 1,
+        resource.node.lineno,
+        resource.node.col_offset + 1,
         CLEANUP_CODE,
-        f"closeable {kind} is not failure-safe; open it with {owner} "
-        "so timeout, cancellation, and assertion paths always clean up",
+        f"closeable {resource.kind} is not failure-safe; open it with "
+        f"{resource.owner_call} so timeout, cancellation, and assertion paths "
+        "always clean up",
     )
 
 
 def _cleanup_findings(
     path: Path,
-    nodes: list[ast.AST],
+    tree: ast.AST,
     parents: dict[ast.AST, ast.AST],
-    helpers: dict[str, list[HelperResource]] | None = None,
+    records: list[ResourceOpen] | None = None,
 ) -> list[Finding]:
     if path == Path("tests/support/owned.py"):
         return []
-    findings: list[Finding] = []
-    for node in nodes:
-        if not isinstance(node, ast.Call):
-            continue
-        explicit_kind = _cleanup_kind(node)
-        resources = _helper_resources(node, helpers or {})
-        kinds = ({explicit_kind} if explicit_kind is not None else set()) | {
-            resource.kind for resource in resources
-        }
-        for kind in kinds:
-            finding = _cleanup_finding(
-                path,
-                node,
-                kind,
-                parents,
-                helper_hazard=any(
-                    resource.kind == kind and resource.hazardous_after_open
-                    for resource in resources
-                ),
-            )
-            if finding is not None:
-                findings.append(finding)
-    return findings
+    resources = _resource_flow(tree, parents) if records is None else records
+    fixtures = _resource_owner_fixtures(tree)
+    owner_names = {
+        function: _resource_owner_names(function, fixtures)
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    return [
+        finding
+        for resource in resources
+        if (
+            finding := _cleanup_finding(path, resource, resources, owner_names, parents)
+        )
+        is not None
+    ]
 
 
 def _scan_added_nodes(
@@ -1004,21 +1260,32 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         path, added_nodes, lines, literal_names, serialized_names
     )
     findings.extend(_scan_deadline_nodes(path, changed_function_nodes, lines, parents))
-    helpers = _local_resource_helpers(tree)
-    called_helpers = {
-        _name(node.func).rsplit(".", 1)[-1]
-        for node in changed_function_nodes
-        if isinstance(node, ast.Call)
+    records = _resource_flow(tree, parents)
+    changed_functions = {
+        _enclosing_function(node, parents) for node in changed_function_nodes
     }
-    helper_open_nodes = [
-        resource.open_call
-        for name in called_helpers
-        for resource in helpers.get(name, [])
-        if resource.hazardous_after_open
+    changed_calls = {
+        node for node in changed_function_nodes if isinstance(node, ast.Call)
+    }
+    cleanup_records = [
+        resource
+        for resource in records
+        if _enclosing_function(resource.node, parents) in changed_functions
+        or resource.node in changed_calls
     ]
-    cleanup_nodes = list(dict.fromkeys([*changed_function_nodes, *helper_open_nodes]))
-    findings.extend(_cleanup_findings(path, cleanup_nodes, parents, helpers))
-    return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
+    called_helpers = {_name(call.func).rsplit(".", 1)[-1] for call in changed_calls}
+    cleanup_records.extend(
+        resource
+        for resource in records
+        if (function := _enclosing_function(resource.node, parents)) is not None
+        and function.name in called_helpers
+        and not _returned_by_helper(resource, parents)
+    )
+    findings.extend(_cleanup_findings(path, tree, parents, cleanup_records))
+    return sorted(
+        set(findings),
+        key=lambda item: (item.line, item.column, item.code, item.message),
+    )
 
 
 def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
@@ -1033,7 +1300,14 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
                 lint_source(path, source_path.read_text(encoding="utf-8"), added)
             )
     return sorted(
-        findings, key=lambda item: (str(item.path), item.line, item.column, item.code)
+        findings,
+        key=lambda item: (
+            item.path.as_posix(),
+            item.line,
+            item.column,
+            item.code,
+            item.message,
+        ),
     )
 
 
@@ -1053,7 +1327,7 @@ def _function_at_line(tree: ast.AST, line: int) -> str:
 
 def finding_ratchet_key(root: Path, finding: Finding) -> str:
     tree = ast.parse((root / finding.path).read_text(encoding="utf-8"))
-    return f"{finding.path}::{_function_at_line(tree, finding.line)}"
+    return f"{finding.path.as_posix()}::{_function_at_line(tree, finding.line)}"
 
 
 def _scan_deadline_findings(
@@ -1090,21 +1364,14 @@ def _scan_cleanup_findings(root: Path) -> tuple[list[Finding], dict[Path, ast.AS
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        findings.extend(
-            _cleanup_findings(
-                path,
-                list(ast.walk(tree)),
-                parents,
-                _local_resource_helpers(tree),
-            )
-        )
+        findings.extend(_cleanup_findings(path, tree, parents))
     return findings, trees
 
 
 def cleanup_ratchet_key(finding: Finding, trees: dict[Path, ast.AST]) -> str:
     tree = trees[finding.path]
     kind = finding.message.split("closeable ", 1)[1].split(" is ", 1)[0]
-    return f"{finding.path}::{_function_at_line(tree, finding.line)}::{kind}"
+    return f"{finding.path.as_posix()}::{_function_at_line(tree, finding.line)}::{kind}"
 
 
 def _read_ratchet(root: Path, path: Path = RATCHET_PATH) -> set[str]:
@@ -1126,10 +1393,11 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
         return sorted(
             [*deadline_findings, *cleanup_findings],
             key=lambda finding: (
-                str(finding.path),
+                finding.path.as_posix(),
                 finding.line,
                 finding.column,
                 finding.code,
+                finding.message,
             ),
         )
     deadline_ratchet = _read_ratchet(root)
@@ -1140,7 +1408,7 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
     findings = [
         finding
         for finding in deadline_findings
-        if f"{finding.path}::{_function_at_line(deadline_trees[finding.path], finding.line)}"
+        if f"{finding.path.as_posix()}::{_function_at_line(deadline_trees[finding.path], finding.line)}"
         not in deadline_ratchet
     ]
     findings.extend(
@@ -1161,10 +1429,11 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
     return sorted(
         findings,
         key=lambda finding: (
-            str(finding.path),
+            finding.path.as_posix(),
             finding.line,
             finding.column,
             finding.code,
+            finding.message,
         ),
     )
 

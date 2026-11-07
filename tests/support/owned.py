@@ -141,14 +141,17 @@ class ResourceOwner:
 
 async def _finish_cleanup(owner: ResourceOwner) -> None:
     cleanup = asyncio.create_task(owner.close(), name="owned-resource-cleanup")
-    try:
-        # test-contract: complexity cleanup shields its own bounded resource closes
-        await asyncio.shield(cleanup)
-    except asyncio.CancelledError:
-        # A second cancellation must not strand resources midway through cleanup.
-        # test-contract: complexity cleanup must finish after caller cancellation
-        await asyncio.shield(cleanup)
-        raise
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup.done():
+        try:
+            # test-contract: complexity cleanup shields its bounded resource closes
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+    if cancellation is not None:
+        if error := cleanup.exception():
+            cancellation.add_note(f"cleanup error: {type(error).__name__}: {error}")
+        raise cancellation
 
 
 @asynccontextmanager

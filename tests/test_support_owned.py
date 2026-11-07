@@ -222,8 +222,9 @@ async def test_owned_resources_cleans_every_resource_on_each_body_exit(
 
 
 @pytest.mark.asyncio
-async def test_owned_resources_finishes_cleanup_when_cancelled_at_cleanup_await(
-    tmp_path,
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_owned_resources_finishes_cleanup_after_repeated_cancellation(
+    tmp_path, cancel_count: int
 ) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -243,7 +244,10 @@ async def test_owned_resources_finishes_cleanup_when_cancelled_at_cleanup_await(
     async with owned_resources() as outer_owner:
         task = outer_owner.task(asyncio.create_task(run()))
         await asyncio.wait_for(entered.wait(), 10)
-        task.cancel()
+        for _ in range(cancel_count):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
