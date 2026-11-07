@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
+from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
     MCPClient,
     MCPPrompt,
@@ -28,7 +29,21 @@ from .client import (
     unavailable_result as _unavailable_result,
 )
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
+from .envelope import MCPCallLimits, _format_deadline
 from .definition_publisher import MCPDefinitionPublisher
+from .server_status import (
+    MCPServerState,
+    MCPServerStatus,
+    unavailable_status as _unavailable_status,
+)
+from .actors.lifecycle import (
+    CancelOperation as _CancelOperation,
+    ChildFinished as _ChildFinished,
+    Close as _Close,
+    Remove as _Remove,
+    RemoveWhenIdle as _RemoveWhenIdle,
+    TransportFailure as _TransportFailure,
+)
 from .actors.resource import (
     ResourceFinished as _ResourceFinished,
     ResourceRequest as _ResourceRequest,
@@ -69,29 +84,7 @@ AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
 
-MCPServerState = Literal[
-    "mounted",
-    "degraded",
-    "failed",
-    "skipped-missing-env",
-    "skipped-policy",
-    "timed-out",
-    "malformed",
-]
 NoticeSink = Callable[[str], None]
-
-
-@dataclass(frozen=True, slots=True)
-class MCPServerStatus:
-    """Current connection state for one configured MCP server."""
-
-    name: str
-    transport: str
-    state: MCPServerState
-    tool_count: int = 0
-    reason: str | None = None
-    stderr_log_path: str = ""
-    next_retry_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,39 +129,6 @@ class _SetupFinished:
     outcome: _SetupOutcome | None
 
 
-@dataclass(frozen=True, slots=True)
-class _TransportFailure:
-    operation: int | None
-    client: MCPClient
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class _ChildFinished:
-    task: asyncio.Task[object]
-
-
-@dataclass(frozen=True, slots=True)
-class _CancelOperation:
-    identifier: int
-    acknowledged: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _Remove:
-    result: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _RemoveWhenIdle:
-    result: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _Close:
-    result: asyncio.Future[None]
-
-
 PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None], None]
 
 
@@ -187,6 +147,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         setup_timeout: float = SERVER_SETUP_TIMEOUT_SECONDS,
         auto_base_delay: float = AUTO_RECONNECT_BASE_DELAY_SECONDS,
         auto_max_delay: float = AUTO_RECONNECT_MAX_DELAY_SECONDS,
+        deadline_clock: Callable[[], float] | None = None,
+        limits: MCPCallLimits | None = None,
     ) -> None:
         self.config = config
         self.source = source
@@ -201,6 +163,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._build_client = build_client
         self._connect_and_list = connect_and_list
         self._setup_timeout = setup_timeout
+        resolved_limits = limits or MCPCallLimits()
+        self._call_deadline_seconds = resolved_limits.deadline_seconds
+        self._deadline_clock = deadline_clock
         self._auto_base_delay = auto_base_delay
         self._auto_max_delay = auto_max_delay
         self._queue: asyncio.Queue[object] = asyncio.Queue()
@@ -664,9 +629,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             stderr_log_path=str(mcp_log_path(self.name)),
         )
         _notice(notice_sink, f"mcp · {self.name} mounted ({len(tools)} tools)")
-        if not tools and (
-            config.allowed_tools is not None or config.disallowed_tools
-        ):
+        if not tools and (config.allowed_tools is not None or config.disallowed_tools):
             _notice(notice_sink, f"mcp · {self.name} mounted with zero tools")
         failure_reason = failure_future.result() if failure_future.done() else None
         return _SetupOutcome(status, client, tuple(tools), prompts, failure_reason)
@@ -927,10 +890,53 @@ class MCPServerActor(MCPDefinitionPublisher):
         request: _CallRequest,
         client: MCPClient,
     ) -> StructuredToolResult:
-        return await client.call_tool(
-            request.tool_name,
-            request.arguments,
-            request.abort_signal,
+        call_deadline = MCPCallDeadline.start(
+            self._call_deadline_seconds, clock=self._deadline_clock
+        )
+        call = asyncio.create_task(
+            client.call_tool(
+                request.tool_name,
+                request.arguments,
+                request.abort_signal,
+            )
+        )
+        self._children.add(call)
+        call.add_done_callback(self._queue_child_finished)
+        deadline = asyncio.create_task(call_deadline.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (call, deadline), return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            call.cancel()
+            deadline.cancel()
+            await asyncio.gather(call, deadline, return_exceptions=True)
+            raise
+        if call in done and not call_deadline.expired:
+            deadline.cancel()
+            await asyncio.gather(deadline, return_exceptions=True)
+            return call.result()
+
+        deadline.cancel()
+        await asyncio.gather(deadline, return_exceptions=True)
+        deadline_exceeded = getattr(client, "deadline_exceeded", None)
+        if deadline_exceeded is not None:
+            deadline_exceeded(call)
+        call.cancel()
+        cleanup = asyncio.create_task(
+            finish_call_cleanup(
+                call,
+                timeout=CLIENT_CLOSE_TIMEOUT_SECONDS,
+                server_name=self.name,
+            )
+        )
+        self._children.add(cleanup)
+        cleanup.add_done_callback(
+            lambda done: self._queue.put_nowait(_ChildFinished(done))
+        )
+        return make_error_result(
+            f"MCP tool {self.name}__{request.tool_name} exceeded the "
+            f"{_format_deadline(self._call_deadline_seconds)} deadline"
         )
 
     def _queue_call_result(
@@ -953,12 +959,6 @@ class MCPServerActor(MCPDefinitionPublisher):
     def _handle_call_finished(self, message: _CallFinished) -> None:
         self._children.discard(message.task)
         request = self._requests.pop(message.request.identifier, message.request)
-        take_result = getattr(request.client, "take_invalidation_result", None)
-        if take_result is not None and (
-            recorded_result := take_result(message.task)
-        ) is not None:
-            _set_result(request.result, recorded_result)
-            return
         if isinstance(message.error, asyncio.CancelledError):
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -1206,7 +1206,9 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._children.discard(message.task)
                 if message.outcome is not None and message.outcome.client is not None:
                     self._schedule_close(message.outcome.client)
-            elif isinstance(message, (_CallFinished, _PromptFinished, _ResourceFinished)):
+            elif isinstance(
+                message, (_CallFinished, _PromptFinished, _ResourceFinished)
+            ):
                 self._children.discard(message.task)
                 self._resolve_message(message)
             elif isinstance(message, _ChildFinished):
@@ -1231,16 +1233,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             _set_result(operation.request, status)
         if self._operation is operation:
             self._operation = None
-
-
-def _unavailable_status(name: str, config: MCPServerConfig) -> MCPServerStatus:
-    return MCPServerStatus(
-        name,
-        config.transport,
-        "failed",
-        reason="MCP mount is closed",
-        stderr_log_path=str(mcp_log_path(name)),
-    )
 
 
 __all__ = [
