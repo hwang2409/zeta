@@ -119,6 +119,32 @@ class ReconciliationState:
         return int(self._value["seq"])
 
     @property
+    def generation(self) -> int:
+        return int(self._value.get("generation", 0))
+
+    def reset_for_recovery(
+        self, *, generation: int, retained_last_sequence: int = 0
+    ) -> None:
+        """Forget byte evidence and rescan the repaired transcript from byte zero."""
+        if type(generation) is not int or generation < 1:
+            raise ValueError("invalid recovery generation")
+        if type(retained_last_sequence) is not int or retained_last_sequence < 0:
+            raise ValueError("invalid recovery cutoff")
+        self._value["generation"] = generation
+        self._value["seq"] = retained_last_sequence
+        self._value["transcript_bytes"] = 0
+        self._value["transcript_tokens"] = 0
+        self._value["early_trigger_seq"] = min(
+            self.early_trigger_seq, retained_last_sequence
+        )
+        self._value["pending_failures"] = []
+        self._value["completed_ranges"] = []
+        self._value["terminal_receipts"] = []
+        self._value["last_failure"] = None
+        self._value["scanner_failure"] = None
+        self._publish("transcript-recovery")
+
+    @property
     def transcript_bytes(self) -> int:
         return int(self._value["transcript_bytes"])
 
@@ -745,6 +771,7 @@ class ReconciliationState:
     def _read(self) -> dict[str, Any]:
         empty: dict[str, Any] = {
             "seq": 0,
+            "generation": 0,
             "transcript_bytes": 0,
             "transcript_tokens": 0,
             "early_trigger_seq": 0,
@@ -781,6 +808,9 @@ class ReconciliationState:
             ):
                 empty[name] = candidate
         empty["last_failure"] = value.get("last_failure")
+        for key, item in value.items():
+            if key not in empty:
+                empty[key] = item
         scanner_failure = value.get("scanner_failure")
         if isinstance(scanner_failure, dict):
             seq = scanner_failure.get("seq")
