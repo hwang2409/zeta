@@ -160,7 +160,9 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             nonlocal checks
             checks += 1
 
+        # test-contract: seam seal a second journal immediately before serve dismiss locks
         monkeypatch.setattr(AttentionReplies, "dismiss", dismiss_after_concurrent_seal)
+        # test-contract: seam count the real serve adapter's inbox checks
         monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         dismissed = (
             await _request(
