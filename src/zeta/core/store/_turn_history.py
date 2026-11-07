@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
 
 TurnEndReason = Literal["completed", "user_stop", "error", "disconnect"]
@@ -26,6 +27,10 @@ def validate_turn_end_data(data: Mapping[str, object]) -> None:
 
 
 class TurnHistoryMixin:
+    def last_turn_end(self: ConversationStore) -> ConversationEntry | None:
+        entry = self._active_last_turn_end
+        return self._snapshot_entry(entry) if entry is not None else None
+
     async def append_turn_end_async(
         self: ConversationStore, turn_id: str, reason: TurnEndReason
     ) -> None:
