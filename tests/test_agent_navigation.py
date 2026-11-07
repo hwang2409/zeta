@@ -1096,6 +1096,7 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
     )
     await delivery_flow.initialize()
     channel.register_delivery_flow("root:worker", delivery_flow)
+    # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     app.loop._background_owner.register(
         "root:worker", watcher.cancel, watcher, parent_store=store
@@ -1400,6 +1401,7 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
             wake_sink=lambda _source: channel.wake("root:worker"),
         ),
     )
+    # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     app.loop._background_owner.register(
         "root:worker", watcher.cancel, watcher, parent_store=app.loop.store

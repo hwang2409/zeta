@@ -134,7 +134,7 @@ async def test_agent_control_tools_execute_through_registry(
         owner.unregister("child")
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await registry.close()
 
 

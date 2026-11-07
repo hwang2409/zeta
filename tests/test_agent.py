@@ -11464,8 +11464,8 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         assert deadlines.started == []
         owner.finish_gate_task_timeout = 0.08
         backend.release_child_turn.set()
-        await backend.task_started.wait()
-        await backend.gate_seen.wait()
+        await asyncio.wait_for(backend.task_started.wait(), 10)
+        await asyncio.wait_for(backend.gate_seen.wait(), 10)
         assert len(deadlines.started) == 1
         state, configured_timeout = deadlines.started[0]
         assert configured_timeout == 0.08
@@ -11479,7 +11479,7 @@ async def test_finish_gate_task_deadline_starts_when_gate_starts(
         try:
             await loop.close()
         finally:
-            await asyncio.gather(run, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
@@ -11509,8 +11509,8 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
     )
 
     try:
-        await backend.task_started.wait()
-        await backend.gate_seen.wait()
+        await asyncio.wait_for(backend.task_started.wait(), 10)
+        await asyncio.wait_for(backend.gate_seen.wait(), 10)
         assert len(deadlines.started) == 1
         state, configured_timeout = deadlines.started[0]
         assert configured_timeout == 1
@@ -11525,7 +11525,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
             channel=owner.conversation_channel,
         ) is None
 
-        await backend.follow_up_processed.wait()
+        await asyncio.wait_for(backend.follow_up_processed.wait(), 10)
         assert state.task_deadline == original_deadline
         deadlines.expire(state)
         notification = await _completion_after_publication(store, completion_published)
@@ -11535,7 +11535,7 @@ async def test_finish_gate_follow_up_keeps_original_task_deadline(
         try:
             await loop.close()
         finally:
-            await asyncio.gather(run, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(run, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio

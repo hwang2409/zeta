@@ -415,11 +415,14 @@ def test_recovery_and_send_release_borrowed_child_stores(
         flow = StepDeliveryFlow(resident_child)
         await flow.initialize()
         channel.register_delivery_flow("child", flow)
+        # test-contract: seam placeholder task models a live child watcher
         watcher = asyncio.create_task(asyncio.Event().wait())
         loop._background_owner.register(
             "child", watcher.cancel, watcher, parent_store=opened.store
         )
+        # test-contract: seam verifies replacement construction in this test
         monkeypatch.setattr(ConversationStore, "__init__", record)
+        # test-contract: seam verifies send_to_run store replacement behavior
         assert await send_to_run(
             opened.store,
             "child",
