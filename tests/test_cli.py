@@ -21,7 +21,7 @@ def test_cli_import_does_not_import_tui_app() -> None:
         [
             sys.executable,
             "-c",
-            "import sys; import zeta.cli.main; print('zeta.tui.app' in sys.modules)",
+            "import sys; from zeta.cli.main import build_parser; build_parser().parse_args(['-p', 'hello']); build_parser().parse_args(['serve', '--port', '0']); print('zeta.tui.app' in sys.modules)",
         ],
         check=True,
         capture_output=True,
