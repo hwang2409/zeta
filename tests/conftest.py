@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import stat
@@ -504,6 +505,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
             for descriptor, description in before.items()
         )
     yield
+    gc.collect()
     after = _open_file_descriptors()
     _update_fd_owners(after, item.nodeid)
     added = tuple(after[fd] for fd in sorted(after.keys() - before.keys()))
@@ -571,7 +573,9 @@ def _fd_summary() -> str:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     del exitstatus
+    gc.collect()
     end = _open_file_descriptors()
+    _update_fd_owners(end, "session-finish")
     _FD_RETAINED_COUNTS.append(len(end))
     start = _FD_START_COUNT if _FD_START_COUNT is not None else len(end)
     growth = len(end) - start
