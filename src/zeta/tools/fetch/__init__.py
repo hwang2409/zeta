@@ -10,6 +10,7 @@ import socket
 import zlib
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
+from functools import partial
 from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from typing import Any, BinaryIO
@@ -18,6 +19,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from ...core.abort import AbortSignal
+from ...core.thread_call import run_owned_thread_call
 from ...protocol.types import StructuredToolResult
 from ..registry import (
     ToolExecutionContext,
@@ -62,25 +64,28 @@ class _DecompressionFailed(Exception):
         self.original = original
 
 
-async def _run_worker(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        await worker
-        raise
+async def _run_worker(
+    function: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    return await run_owned_thread_call(partial(function, *args, **kwargs))
 
 
 @asynccontextmanager
 async def _temporary_file(spills: Any) -> AsyncIterator[BinaryIO]:
     manager = spills.temporary_file()
-    entry = asyncio.create_task(asyncio.to_thread(manager.__enter__))
+    handle: BinaryIO | None = None
+
+    def adopt(acquired: BinaryIO) -> None:
+        nonlocal handle
+        handle = acquired
+
     try:
-        handle = await asyncio.shield(entry)
+        await run_owned_thread_call(manager.__enter__, adopt)
     except asyncio.CancelledError:
-        await entry
         await _run_worker(manager.__exit__, None, None, None)
         raise
+    if handle is None:
+        raise RuntimeError("temporary file context did not return a handle")
     try:
         yield handle
     finally:
@@ -130,7 +135,9 @@ async def _target_addresses(
         except TimeoutError as exc:
             raise ValueError("request failed: request timed out") from exc
         except socket.gaierror as exc:
-            raise ValueError(f"request failed: could not resolve host {hostname}") from exc
+            raise ValueError(
+                f"request failed: could not resolve host {hostname}"
+            ) from exc
         return tuple(_normalize_address(ip_address(info[4][0])) for info in infos)
 
 
@@ -354,9 +361,7 @@ class _BodyDecoder:
         self.received_destination = received_destination
         self.max_bytes = max_bytes
         self.decoder = (
-            zlib.decompressobj(wbits=47)
-            if encoding in {"gzip", "deflate"}
-            else None
+            zlib.decompressobj(wbits=47) if encoding in {"gzip", "deflate"} else None
         )
         self.compressed_prefix = bytearray() if encoding == "deflate" else None
         self.received = 0
@@ -460,9 +465,7 @@ async def _decode_body_to_file(
         if encoding.strip()
     )
     if len(encodings) > 1:
-        raise ValueError(
-            "request failed: multiple content encodings are not supported"
-        )
+        raise ValueError("request failed: multiple content encodings are not supported")
     decoder = _BodyDecoder(
         encoding=encodings[0] if encodings else "identity",
         destination=destination,
@@ -524,32 +527,34 @@ class _NormalizedTextWriter:
 
 
 class _ReadableHTMLParser(HTMLParser):
-    _block_tags = frozenset({
-        "address",
-        "article",
-        "aside",
-        "blockquote",
-        "br",
-        "div",
-        "footer",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "header",
-        "li",
-        "main",
-        "nav",
-        "ol",
-        "p",
-        "pre",
-        "section",
-        "table",
-        "tr",
-        "ul",
-    })
+    _block_tags = frozenset(
+        {
+            "address",
+            "article",
+            "aside",
+            "blockquote",
+            "br",
+            "div",
+            "footer",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "header",
+            "li",
+            "main",
+            "nav",
+            "ol",
+            "p",
+            "pre",
+            "section",
+            "table",
+            "tr",
+            "ul",
+        }
+    )
 
     def __init__(self, base_url: str, writer: _NormalizedTextWriter) -> None:
         super().__init__(convert_charrefs=True)
@@ -778,9 +783,7 @@ async def _fetch(
             await _run_worker(readable_body.flush)
 
             notices: list[str] = []
-            partial_notice = response.extensions.get(
-                _PARTIAL_BODY_NOTICE_EXTENSION
-            )
+            partial_notice = response.extensions.get(_PARTIAL_BODY_NOTICE_EXTENSION)
             if isinstance(partial_notice, str) and partial_notice:
                 notices.append(f"notice: {partial_notice}")
             if urlsplit(final_url).scheme == "http":
@@ -837,10 +840,7 @@ async def _fetch(
                         "notice: all body bytes received before the safety ceiling "
                         f"are saved at {raw_path}"
                     )
-                    if (
-                        len("\n".join(notices)) + len(raw_notice) + 3
-                        < effective_limit
-                    ):
+                    if len("\n".join(notices)) + len(raw_notice) + 3 < effective_limit:
                         notices.append(raw_notice)
 
             notice = "\n".join(notices)
@@ -851,9 +851,7 @@ async def _fetch(
                 readable_body,
                 offset=offset,
                 char_limit=max(0, effective_limit - len(notice)),
-                byte_limit=max(
-                    0, effective_limit - len(notice.encode("utf-8"))
-                ),
+                byte_limit=max(0, effective_limit - len(notice.encode("utf-8"))),
             )
 
     block = text_block(notice + page, full_size=full_size)

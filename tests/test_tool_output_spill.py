@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import gzip
 import io
@@ -11,7 +12,7 @@ import sys
 import threading
 import tracemalloc
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -315,9 +316,7 @@ async def test_restricted_spill_reads_are_session_anchored(tmp_path: Path) -> No
             ToolCall(
                 "dotdot",
                 "read",
-                {
-                    "path": str(spill_path.parent / ".." / "conversation.jsonl")
-                },
+                {"path": str(spill_path.parent / ".." / "conversation.jsonl")},
             )
         )
 
@@ -380,6 +379,81 @@ async def test_restricted_spill_reads_are_session_anchored(tmp_path: Path) -> No
         await other_registry.close()
         await restricted.close()
         await producer.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_temporary_file_closes_after_repeated_cancellation(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    entered = threading.Event()
+    descriptors: list[int] = []
+    handles: list[io.FileIO] = []
+    exit_calls = 0
+
+    class GatedTemporaryFile:
+        def __enter__(self) -> io.FileIO:
+            descriptor = os.open(
+                tmp_path / "fetch-private", os.O_RDWR | os.O_CREAT, 0o600
+            )
+            descriptors.append(descriptor)
+            handle = io.FileIO(descriptor, "r+", closefd=False)
+            handles.append(handle)
+            started.set()
+            assert release.wait(timeout=5)
+            entered.set()
+            return handle
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object,
+        ) -> None:
+            del exc_type, exc_value, traceback
+            nonlocal exit_calls
+            exit_calls += 1
+            handles[0].close()
+            os.close(descriptors[0])
+
+    class Spills:
+        def temporary_file(self) -> GatedTemporaryFile:
+            return GatedTemporaryFile()
+
+    async def use_temporary_file() -> None:
+        async with fetch_tool._temporary_file(Spills()):
+            raise AssertionError("cancelled acquisition yielded a handle")
+
+    task = asyncio.create_task(use_temporary_file())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        resumed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(resumed.set)
+        await resumed.wait()
+        task.cancel()
+        resumed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(resumed.set)
+        await resumed.wait()
+        release.set()
+        assert await asyncio.to_thread(entered.wait, 5)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+        assert exit_calls == 1
+        with pytest.raises(OSError) as error:
+            os.fstat(descriptors[0])
+        assert error.value.errno == errno.EBADF
+    finally:
+        release.set()
+        with suppress(BaseException):
+            await asyncio.wait_for(task, timeout=5)
+        for handle in handles:
+            handle.close()
+        for descriptor in descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 @pytest.mark.asyncio
@@ -518,9 +592,7 @@ async def test_fetch_large_page_succeeds_and_spills(
             max_output_chars=2_000,
             skill_catalog=SkillCatalog.empty(),
         )
-        result = await registry.execute(
-            ToolCall("fetch-large", "fetch", {"url": url})
-        )
+        result = await registry.execute(ToolCall("fetch-large", "fetch", {"url": url}))
         block = result["content"][0]
         spilled = Path(block["spill_path"])
 
@@ -780,9 +852,7 @@ async def test_mcp_large_result_spills(tmp_path: Path) -> None:
             generation=1,
         )
 
-        result = await registry.execute(
-            ToolCall("mcp-large", "server__large", {})
-        )
+        result = await registry.execute(ToolCall("mcp-large", "server__large", {}))
 
         assert Path(result["content"][0]["spill_path"]).read_text() == value
         await registry.close()
@@ -817,9 +887,7 @@ def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None
 
         def write_second() -> None:
             try:
-                second_paths.append(
-                    second.write_bytes("second", "call", 0, b"b" * 100)
-                )
+                second_paths.append(second.write_bytes("second", "call", 0, b"b" * 100))
             except OSError as exc:
                 failures.append(exc)
             finally:
@@ -917,9 +985,7 @@ async def test_spill_dir_bounded_evicts_oldest(tmp_path: Path) -> None:
         registry.spills.max_bytes = 150
         registry.register("large", lambda arguments: arguments["value"])
 
-        first = await registry.execute(
-            ToolCall("first", "large", {"value": "a" * 100})
-        )
+        first = await registry.execute(ToolCall("first", "large", {"value": "a" * 100}))
         second = await registry.execute(
             ToolCall("second", "large", {"value": "b" * 100})
         )
