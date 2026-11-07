@@ -60,12 +60,7 @@ def test_teardown_guard_defaults_to_collection_home(live_home_write_guard) -> No
 
 @pytest.mark.parametrize(
     ("leak_path", "during_collection"),
-    [
-        (None, False),
-        ("unexpected", False),
-        (".zeta/history", False),
-        ("import-leak", True),
-    ],
+    [(None, False), ("unexpected", False), (".zeta/history", False), ("import-leak", True)],
 )
 def test_session_home_guard_ignores_external_writes_and_catches_home_leaks(
     tmp_path: Path, leak_path: str | None, during_collection: bool
@@ -186,7 +181,9 @@ def test_fd_guard_rejects_cumulative_small_leaks(
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_first(): pass\ndef test_second(): pass\ndef test_third(): pass\n",
+        "def test_first(): pass\n"
+        "def test_second(): pass\n"
+        "def test_third(): pass\n",
         encoding="utf-8",
     )
 
@@ -237,7 +234,9 @@ def test_fd_guard_counts_only_reachable_owners(tmp_path: Path, reachable: bool) 
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_first(): pass\ndef test_second(): pass\ndef test_third(): pass\n",
+        "def test_first(): pass\n"
+        "def test_second(): pass\n"
+        "def test_third(): pass\n",
         encoding="utf-8",
     )
 
@@ -323,7 +322,8 @@ def test_fd_guard_propagates_worker_breach_to_xdist_controller(
         encoding="utf-8",
     )
     (probe / "test_probe.py").write_text(
-        "def test_leaker(): pass\ndef test_other_worker(): pass\n",
+        "def test_leaker(): pass\n"
+        "def test_other_worker(): pass\n",
         encoding="utf-8",
     )
 
@@ -841,7 +841,9 @@ def test_fd_guard_tolerates_crashed_xdist_worker(tmp_path: Path) -> None:
     for name in ("conftest.py", "sitecustomize.py"):
         shutil.copyfile(Path(__file__).with_name(name), probe / name)
     (probe / "test_probe.py").write_text(
-        "import os\ndef test_crash(): os._exit(17)\ndef test_other_worker(): pass\n",
+        "import os\n"
+        "def test_crash(): os._exit(17)\n"
+        "def test_other_worker(): pass\n",
         encoding="utf-8",
     )
 
