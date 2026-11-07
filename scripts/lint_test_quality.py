@@ -106,27 +106,39 @@ def _added_lines(diff: str) -> dict[Path, set[int]]:
     return changed
 
 
+def _file_diff_lines(diff: str, path: Path) -> list[str] | None:
+    selected: list[str] | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if selected is not None:
+                break
+            continue
+        if line.startswith("+++ "):
+            selected = [] if _diff_header_path(line[4:]) == path else None
+        elif selected is not None:
+            selected.append(line)
+    return selected
+
+
+def _destination_cursor(match: re.Match[str]) -> int:
+    start = int(match.group(1))
+    count = int(match.group(2) or 1)
+    return start if count == 0 else start - 1
+
+
 def _base_source(diff: str, path: Path, source: str) -> str | None:
+    file_diff = _file_diff_lines(diff, path)
+    if file_diff is None:
+        return None
+
     current = source.splitlines()
     previous: list[str] = []
     cursor = 0
-    selected = False
     in_hunk = False
-    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-    for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            if selected:
-                break
-            in_hunk = False
-            continue
-        if line.startswith("+++ "):
-            selected = _diff_header_path(line[4:]) == path
-            continue
-        if not selected:
-            continue
-        match = hunk.match(line)
-        if match:
-            next_cursor = int(match.group(1)) - 1
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+    for line in file_diff:
+        if match := hunk.match(line):
+            next_cursor = _destination_cursor(match)
             previous.extend(current[cursor:next_cursor])
             cursor = next_cursor
             in_hunk = True
@@ -137,10 +149,8 @@ def _base_source(diff: str, path: Path, source: str) -> str | None:
             cursor += 1
         elif in_hunk and line.startswith("-"):
             previous.append(line[1:])
-    if not selected and not previous:
-        return None
     previous.extend(current[cursor:])
-    ending = "\n" if source.endswith("\n") else ""
+    ending = "\n" if previous and source.endswith("\n") else ""
     return "\n".join(previous) + ending
 
 
@@ -393,20 +403,22 @@ def _private_patch_identity(node: ast.Call) -> str:
     return ast.dump(node, include_attributes=False)
 
 
-def _new_private_patch_nodes(tree: ast.AST, base_source: str | None) -> set[int]:
-    previous: Counter[str] = Counter()
-    if base_source is not None:
-        try:
-            base_tree = ast.parse(base_source)
-        except SyntaxError:
-            base_tree = None
-        if base_tree is not None:
-            previous.update(
-                _private_patch_identity(node)
-                for node in ast.walk(base_tree)
-                if isinstance(node, ast.Call) and _private_patch(node)
-            )
+def _private_patch_counts(source: str | None) -> Counter[str]:
+    if source is None:
+        return Counter()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return Counter()
+    return Counter(
+        _private_patch_identity(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _private_patch(node)
+    )
 
+
+def _new_private_patch_nodes(tree: ast.AST, base_source: str | None) -> set[int]:
+    previous = _private_patch_counts(base_source)
     new_nodes: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not _private_patch(node):
