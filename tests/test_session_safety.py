@@ -681,7 +681,7 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from tests.support.fake_backend import FakeBackend
-    from zeta.core.loop import AgentLoop
+    from zeta.runtime.loop import AgentLoop
     from zeta.runtime.loop.persistence import DraftPersistence
     from zeta.skills import SkillCatalog
     from zeta.tui import composer
