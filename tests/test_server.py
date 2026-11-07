@@ -6257,6 +6257,14 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
         "---\ndescription: greet\n---\nSay hi to $ARGUMENTS\n",
         encoding="utf-8",
     )
+    (project / ".zeta" / "commands" / "local.md").write_text(
+        "---\ndescription: inspect locally\nkind: exec\n---\nprintf local\n",
+        encoding="utf-8",
+    )
+    (project / ".zeta" / "commands" / "shell.md").write_text(
+        "---\ndescription: inspect the branch\n---\nBranch: !`git branch --show-current`\n",
+        encoding="utf-8",
+    )
     home = tmp_path / "home"
     skill_dir = home / "skills" / "greet"
     skill_dir.mkdir(parents=True)
@@ -6269,42 +6277,82 @@ def _seed_slash_fixtures(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path) -> None:
+async def test_slash_list_advertises_only_commands_the_real_transport_can_run(
+    tmp_path: Path,
+) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        result = (
+        runnable = (
             await _request(
-                reader, writer, 5, "slash_list", {"session_id": sid}
+                reader, writer, "runnable", "slash_list", {"session_id": sid}
             )
         )[-1]["result"]
-        commands = {entry["name"]: entry for entry in result["commands"]}
-        assert "restart" not in commands  # TUI process lifecycle is not a serve command.
-        # Runnable built-ins the server drives directly. `/init` and `/help`
-        # live at the scope floor — the menu depends on them appearing here
-        # or the ZETA-130 lane loses two anchor commands.
-        for name in ("status", "compact", "model", "help", "init"):
-            assert name in commands
-            assert commands[name]["client_only"] is False
-        # Client-only built-ins still appear so the menu can render them.
-        for name in ("theme", "fork"):
-            assert commands[name]["client_only"] is True
-        assert commands["vim"]["client_only"] is False
-        # Prompt macros advertise their source directory.
-        assert commands["review"]["kind"] == "macro-prompt"
-        assert commands["review"]["source"] == "project"
-        # The named skill from `~/.zeta/skills/greet/` must be present and
-        # tagged as a skill so a frontend client can source-badge it.
-        assert commands["greet"]["kind"] == "skill"
-        assert commands["greet"]["client_only"] is False
-        # session_id must match the active session.
-        error = (
+        complete = (
             await _request(
-                reader, writer, 6, "slash_list", {"session_id": "other"}
+                reader,
+                writer,
+                "complete",
+                "slash_list",
+                {"session_id": sid, "include_unavailable": True},
+            )
+        )[-1]["result"]
+        runnable_by_name = {entry["name"]: entry for entry in runnable["commands"]}
+        complete_by_name = {entry["name"]: entry for entry in complete["commands"]}
+        unavailable = set(complete_by_name) - set(runnable_by_name)
+
+        assert {"status", "compact", "model", "help", "init", "review", "greet"} <= set(
+            runnable_by_name
+        )
+        assert {"keys", "mcp", "plan", "fork", "theme", "local", "shell"} <= unavailable
+        assert all(entry["unavailable"] is None for entry in runnable_by_name.values())
+        assert all(
+            complete_by_name[name]["unavailable"] == "requires_tui"
+            and complete_by_name[name]["client_only"] is True
+            for name in unavailable
+        )
+        assert runnable_by_name["review"]["source"] == "project"
+        assert runnable_by_name["greet"]["kind"] == "skill"
+
+        arguments = {"model": "not-a-real-model"}
+        for number, name in enumerate(runnable_by_name, 10):
+            text = f"/{name}"
+            if argument := arguments.get(name):
+                text += f" {argument}"
+            response = (
+                await _request(
+                    reader,
+                    writer,
+                    number,
+                    "slash_run",
+                    {"session_id": sid, "text": text},
+                )
+            )[-1]
+            assert "result" in response, (name, response)
+            result = response["result"]
+            assert result["kind"] not in {"client_only", "error", "unknown"}, (
+                name,
+                result,
+            )
+            assert "unsupported" not in str(result).lower()
+
+        invalid = (
+            await _request(
+                reader,
+                writer,
+                "invalid",
+                "slash_list",
+                {"session_id": sid, "include_unavailable": "yes"},
             )
         )[-1]["error"]
-        assert error["code"] == -32003
+        assert invalid["code"] == -32602
+        wrong_session = (
+            await _request(
+                reader, writer, "wrong", "slash_list", {"session_id": "other"}
+            )
+        )[-1]["error"]
+        assert wrong_session["code"] == -32003
     finally:
         await _close(server, writer)
 
@@ -6540,12 +6588,8 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/theme"))["result"]
         assert result == {"kind": "client_only", "name": "theme"}
 
-        # Client-only notices are frontend-neutral.
         result = (await run("/fork"))["result"]
         assert result == {"kind": "client_only", "name": "fork"}
-        assert ServerSlashSession(server.runtime)._client_only("fork") == (
-            "/fork: runs client-side; open the command in your frontend client"
-        )
 
         # Unknown commands are rejected structurally, never posted to the model.
         result = (await run("/nosuchcommand"))["result"]
