@@ -54,6 +54,7 @@ from tests.support.server_client import (
 from tests.support.server_client import (
     request as _buffered_request,
 )
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.accounts import AccountId, AccountStore, AccountUsage
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -106,6 +107,8 @@ from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 # A hang guard for waits on real frames, not a speed limit: a loaded CI
 # runner can take more than a few seconds between frames.
@@ -706,17 +709,6 @@ def test_delegated_approval_payload_includes_execution_context() -> None:
             "resolved_path": "/worktree/src/file.py",
         }
     }
-
-
-def _socket_path(tmp_path: Path) -> Path:
-    # macOS limits Unix socket paths to 104 bytes; pytest's tmp_path is longer.
-    return Path("/tmp") / f"zeta-{tmp_path.name}.sock"
-
-
-@pytest.fixture(autouse=True)
-def _remove_test_socket_lock(tmp_path: Path):
-    yield
-    Path(f"{_socket_path(tmp_path)}.lock").unlink(missing_ok=True)
 
 
 async def _connect(server: ZetaServer):
@@ -3507,7 +3499,9 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 
 
 @pytest.mark.asyncio
-async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
+async def test_late_approval_after_disconnect_abort_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     server = ZetaServer(
@@ -3517,17 +3511,34 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
-    await asyncio.sleep(0.05)
-    second_reader, second_writer = await asyncio.open_unix_connection(
-        str(server.socket_path)
-    )
+    assert server.connections is not None
+    controller = server.connections.controller_metadata()
+    assert controller is not None
+    first_client_released = asyncio.Event()
+    release = server.connections.release
+
+    def record_release(connection: object) -> None:
+        release(connection)
+        if connection is controller.connection:
+            first_client_released.set()
+
+    monkeypatch.setattr(server.connections, "release", record_release)
+    second_writer = None
     try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(first_client_released.wait(), 10)
+        second_reader, second_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
         await _request(
-            second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"}
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
         )
         error = (
             await _request(
@@ -3540,7 +3551,12 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         )[-1]
         assert error["error"]["code"] == -32006
     finally:
-        await _close(server, second_writer)
+        writer.close()
+        await writer.wait_closed()
+        if second_writer is None:
+            await server.close()
+        else:
+            await _close(server, second_writer)
 
 
 @pytest.mark.asyncio
