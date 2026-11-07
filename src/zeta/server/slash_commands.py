@@ -396,7 +396,7 @@ async def list_commands(runtime: ServerRuntime) -> dict[str, object]:
     """Enumerate every command the shared registry knows about."""
 
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     registry = await asyncio.to_thread(build_registry, runtime)
     entries = _entries_from_registry(registry)
     return {
@@ -441,7 +441,7 @@ async def run_command(
         # dispatches server-side through the shared apply-settings path.
         return {"kind": "client_only", "name": name}
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     registry = await asyncio.to_thread(build_registry, runtime)
     if name == "mcp" and tail.strip() == "status":
         if runtime.loop is None:

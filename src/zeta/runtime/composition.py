@@ -231,8 +231,8 @@ def compose_runtime(
             "retained_tail": metadata.retained_tail,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
-            "skill_home": home,
-            "skill_project_dir": (
+            "live_config_home": home,
+            "live_config_project_dir": (
                 project_discovery.primary_root
                 if project_discovery is not None
                 and project_discovery.primary_root is not None
@@ -372,7 +372,7 @@ def compose_runtime(
             project_dir=repo_root / ".zeta",
             allow_external_tools=config.allow_external_tools,
         )
-        loop.tool_schemas = list(loop.tool_registry.schemas)
+        loop.tool_schemas = tuple(loop.tool_registry.schemas)
         if background_event_sink is not None:
             loop.set_background_event_sink(background_event_sink)
         composition = RuntimeComposition(

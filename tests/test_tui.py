@@ -1810,6 +1810,10 @@ def test_scrollback_stream_events_render() -> None:
             StreamEventType.AGENT_NOTIFICATION,
             data=_notification_payloads()["agent_completion"],
         ),
+        StreamEventType.CONFIG_CHANGED: StreamEvent(
+            StreamEventType.CONFIG_CHANGED,
+            data={"message": "agent profiles changed: added specialist"},
+        ),
         StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
             StreamEventType.CHILD_MESSAGE_DELIVERED,
             data={"child_label": "root:1", "preview": "check the retry"},

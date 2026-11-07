@@ -795,6 +795,7 @@ class StreamEventType(StrEnum):
     TOOL_EXECUTION_UPDATE = "tool_execution_update"
     TOOL_EXECUTION_END = "tool_execution_end"
     AGENT_NOTIFICATION = "agent_notification"
+    CONFIG_CHANGED = "config_changed"
     CHILD_MESSAGE_DELIVERED = "child_message_delivered"
     ACCOUNT_LIMIT = "account_limit"
     ACCOUNT_STATE_UNKNOWN = "account_state_unknown"

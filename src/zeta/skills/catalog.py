@@ -140,114 +140,7 @@ class SkillCatalog:
         return cls(tuple(skills))
 
 
-type SkillRootsSignature = tuple[
-    tuple[str, tuple[int, int, int, int] | None], ...
-]
-
-
-@dataclass(frozen=True, slots=True)
-class SkillRefresh:
-    """One changed skill snapshot and its user-visible delta."""
-
-    catalog: SkillCatalog
-    added: tuple[str, ...]
-    removed: tuple[str, ...]
-    updated: tuple[str, ...]
-    notices: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SkillScan:
-    """One immutable filesystem scan awaiting an event-loop commit."""
-
-    signature: SkillRootsSignature
-    catalog: SkillCatalog | None = None
-    failure: str | None = None
-
-
-class SkillCatalogWatcher:
-    """Rediscover session skills only when their filesystem signature changes."""
-
-    def __init__(
-        self,
-        catalog: SkillCatalog,
-        *,
-        home: str | Path,
-        project_dir: str | Path,
-    ) -> None:
-        self.catalog = catalog
-        self.home = Path(home)
-        self.project_dir = Path(project_dir)
-        self.signature = skill_roots_signature(
-            home=self.home, project_dir=self.project_dir
-        )
-        self.failed_signature: SkillRootsSignature | None = None
-
-    def scan(self, *, force: bool = False) -> SkillScan | None:
-        """Read one changed filesystem snapshot without mutating watcher state."""
-
-        signature = skill_roots_signature(
-            home=self.home, project_dir=self.project_dir
-        )
-        if signature == self.failed_signature:
-            return None
-        if not force and signature == self.signature:
-            return None
-        try:
-            discovered = discover_session_skills(
-                home=self.home, project_dir=self.project_dir
-            )
-        except (OSError, ValueError) as exc:
-            detail = " ".join(str(exc).split())
-            if len(detail) > 400:
-                detail = f"{detail[:397]}..."
-            return SkillScan(signature, failure=f"skill discovery failed: {detail}")
-        current_by_path = {skill.path: skill for skill in self.catalog.skills}
-        discovered_paths = {skill.path for skill in discovered.skills}
-        retained = tuple(
-            skill
-            for path, skill in current_by_path.items()
-            if path not in discovered_paths and _document_path(path).is_file()
-        )
-        return SkillScan(
-            signature,
-            SkillCatalog((*discovered.skills, *retained), discovered.notices),
-        )
-
-    def commit(self, scan: SkillScan) -> SkillRefresh | None:
-        """Commit one scan after the coordinator accepts its generation."""
-
-        if scan.failure is not None:
-            self.failed_signature = scan.signature
-            return SkillRefresh(self.catalog, (), (), (), (scan.failure,))
-        catalog = scan.catalog
-        assert catalog is not None
-        old_by_name = {skill.name: skill for skill in self.catalog.skills}
-        new_by_name = {skill.name: skill for skill in catalog.skills}
-        old_names = set(old_by_name)
-        new_names = set(new_by_name)
-        notices = tuple(
-            notice for notice in catalog.notices if notice not in self.catalog.notices
-        )
-        self.signature = scan.signature
-        self.failed_signature = None
-        changed = catalog.skills != self.catalog.skills or bool(notices)
-        self.catalog = catalog
-        if not changed:
-            return None
-        return SkillRefresh(
-            catalog,
-            tuple(sorted(new_names - old_names)),
-            tuple(sorted(old_names - new_names)),
-            tuple(
-                sorted(
-                    name
-                    for name in old_names & new_names
-                    if old_by_name[name] != new_by_name[name]
-                )
-            ),
-            notices,
-        )
+type SkillRootsSignature = tuple[tuple[str, tuple[int, int, int, int] | None], ...]
 
 
 def _skills_dir(home: Path) -> Path:
@@ -398,9 +291,7 @@ def load_skill_prompt(meta: SkillMeta) -> str:
 __all__ = [
     "SKILL_INDEX_BYTE_LIMIT",
     "SkillCatalog",
-    "SkillCatalogWatcher",
     "SkillMeta",
-    "SkillRefresh",
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",

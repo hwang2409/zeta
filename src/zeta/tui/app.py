@@ -309,7 +309,9 @@ class TUIApp(
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             extra_commands=_tui_slash_commands(),
         )
-        self.loop.add_skill_catalog_listener(self._slash_commands.register_skills)
+        self.loop.add_live_config_listener(
+            lambda skills, _agents: self._slash_commands.register_skills(skills)
+        )
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -824,6 +826,10 @@ class TUIApp(
 
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
+        if event.type is StreamEventType.CONFIG_CHANGED:
+            self._print_unit(self._presenter.render_event(event))
+            self._invalidate_stream_prompt()
+            return
         if event.type is StreamEventType.CHILD_MESSAGE_DELIVERED:
             self._print_unit(self._presenter.render_event(event))
             self._invalidate_stream_prompt()

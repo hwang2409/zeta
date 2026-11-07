@@ -19,6 +19,7 @@ FEATURES = (
     "send_images_delivery_id",
     "list_sessions_paging",
     "memory_updated",
+    "live_config_changed",
     "ping",
     "assistant_reset",
     "model_input_ids",

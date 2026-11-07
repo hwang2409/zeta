@@ -45,6 +45,16 @@ def image_stub(block: Mapping[str, object]) -> dict[str, object]:
     return stub
 
 
+def config_changed_wire_fields(event: StreamEvent) -> dict[str, object]:
+    """Project one bounded live-config event for the serve wire."""
+
+    data, truncated = project_tool_value(event.data)
+    fields: dict[str, object] = {"data": data}
+    if truncated:
+        fields["truncated"] = True
+    return fields
+
+
 def project_tool_value(value: object) -> tuple[object, bool]:
     """Bound string leaves in tool wire data."""
     if isinstance(value, str):
@@ -207,6 +217,7 @@ STREAM_EVENT_WIRE_EVENTS = {
     StreamEventType.TOOL_EXECUTION_UPDATE: "tool_output",
     StreamEventType.TOOL_EXECUTION_END: "tool_end",
     StreamEventType.AGENT_NOTIFICATION: "notification_by_kind",
+    StreamEventType.CONFIG_CHANGED: "config_changed",
     StreamEventType.CHILD_MESSAGE_DELIVERED: "child_message_delivered",
     StreamEventType.ACCOUNT_LIMIT: "account_limit",
     StreamEventType.ACCOUNT_STATE_UNKNOWN: "account_state_unknown",

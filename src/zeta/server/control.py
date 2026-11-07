@@ -628,12 +628,27 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if kind is StreamEventType.CONFIG_CHANGED:
+            controller = (
+                self.server.connections.controller_metadata()
+                if self.server.connections is not None
+                else None
+            )
+            if controller is None or "live_config_changed" not in controller.features:
+                return
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
             await self._end_stale_approvals(session_id)
+        if kind is StreamEventType.CONFIG_CHANGED:
+            await self._notify(
+                wire_event,
+                session_id,
+                **event_contract.config_changed_wire_fields(event),
+            )
+            return
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"

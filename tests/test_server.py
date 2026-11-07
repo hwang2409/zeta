@@ -8561,3 +8561,108 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
         assert backend.calls == []
     finally:
         await _close(server, writer)
+@pytest.mark.parametrize("negotiated", [False, True], ids=["legacy", "feature"])
+async def test_config_changed_requires_live_config_changed_feature(
+    tmp_path: Path, negotiated: bool
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        features = ["live_config_changed"] if negotiated else []
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": features},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+
+        prepared_events: list[StreamEvent] = []
+        server.runtime.loop.set_background_event_sink(prepared_events.append)
+        refresher = getattr(server.runtime.loop, "refresh_live_config", None)
+        if refresher is None:
+            refresher = server.runtime.loop.refresh_skills
+        await refresher()
+        assert len(prepared_events) == 1
+        notifications: list[str] = []
+        original_notify = server.control._notify
+
+        async def record_notify(event: str, *args: object, **kwargs: object) -> None:
+            notifications.append(event)
+            await original_notify(event, *args, **kwargs)
+
+        server.control._notify = record_notify
+        await server.control._event(prepared_events[0], background=True)
+        await _request(reader, writer, 3, "status", {})
+
+        assert ("config_changed" in notifications) is negotiated
+        if negotiated:
+            config_event = await _event(reader, "config_changed")
+            assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_active_status_overlays_live_config_without_persisting_metadata(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["live_config_changed"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server.runtime.loop is not None
+        persisted = server.runtime.metadata.agent_catalog
+        profile = tmp_path / "agents" / "specialist.md"
+        profile.parent.mkdir(parents=True)
+        profile.write_text(
+            "---\nname: specialist\ndescription: focused specialist\n"
+            "---\nprofile body\n",
+            encoding="utf-8",
+        )
+        refresher = getattr(server.runtime.loop, "refresh_live_config", None)
+        if refresher is None:
+            refresher = server.runtime.loop.refresh_skills
+        await refresher()
+
+        status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
+
+        assert "specialist" in {
+            item["name"] for item in status["session"]["agent_catalog"]
+        }
+        assert server.runtime.metadata.agent_catalog is persisted
+        assert "specialist" not in {item["name"] for item in (persisted or [])}
+    finally:
+        await _close(server, writer)

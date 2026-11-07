@@ -449,6 +449,10 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_discovery = discover_project(
+            child_registry.cwd, user_home=child_home.parent
+        )
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -473,6 +477,10 @@ async def _build_child_loop(
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            live_config_home=child_home,
+            live_config_project_dir=(
+                child_discovery.primary_root or child_discovery.cwd
+            ),
         )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)

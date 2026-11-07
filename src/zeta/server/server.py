@@ -825,6 +825,17 @@ class _Client:
         if runtime.opened is None:
             return None
         snapshot = runtime.metadata.to_dict()
+        loop = runtime.loop
+        if loop is not None:
+            prompt = loop._runtime_prompt.system_prompt
+            if isinstance(prompt, str):
+                snapshot["system_prompt"] = prompt
+            snapshot["prompt_components"] = {
+                key: dict(component)
+                for key, component in loop._runtime_prompt.prompt_components.items()
+            }
+            snapshot["skill_catalog"] = loop.tool_registry.skill_catalog.to_snapshot()
+            snapshot["agent_catalog"] = loop.tool_registry.agent_catalog.to_snapshot()
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
