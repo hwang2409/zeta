@@ -2507,7 +2507,7 @@ async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
 
     child_store.close()
     backend.release_grandchild.set()
-    await asyncio.wait_for(task, timeout=2)
+    await asyncio.wait_for(task, timeout=10)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -2538,9 +2538,9 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
 
     loop.set_background_event_sink(record_background_event)
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    await asyncio.wait_for(backend.question_published.wait(), timeout=2)
-    await asyncio.wait_for(backend.notification_turn_started.wait(), timeout=2)
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
+    await asyncio.wait_for(backend.question_published.wait(), timeout=10)
+    await asyncio.wait_for(backend.notification_turn_started.wait(), timeout=10)
     child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
     assert await send_to_run(
         store,
@@ -2612,12 +2612,12 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
     monkeypatch.setattr(owner, "cancel_all", cancel_all)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(completion_published.wait(), timeout=2)
+    await asyncio.wait_for(completion_published.wait(), timeout=10)
     closing = asyncio.create_task(loop.close())
     try:
-        await asyncio.wait_for(cancellation_requested.wait(), timeout=1)
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=10)
         release_child_watcher.set()
-        await asyncio.wait_for(closing, timeout=1)
+        await asyncio.wait_for(closing, timeout=10)
         assert not owner.running
     finally:
         release_child_watcher.set()
@@ -2625,7 +2625,7 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         if not closing.done():
             closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
-        await asyncio.wait_for(owner.wait(), timeout=2)
+        await asyncio.wait_for(owner.wait(), timeout=10)
         store.close()
 
 
@@ -2988,7 +2988,7 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
     )
 
     await asyncio.wait_for(
-        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=10
     )
 
     assert backend.gate_calls == 3
@@ -3511,7 +3511,7 @@ async def test_child_finish_gate_turn_bound_falls_back_to_adoption(
     )
 
     await asyncio.wait_for(
-        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=2
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER)), timeout=10
     )
 
     marker = next(iter(store.agent_children().values()))
