@@ -54,11 +54,6 @@ def pytest_collection_modifyitems(
             and path.name != "test_test_environment.py"
         ):
             item.fixturenames.append("close_direct_test_runtime_owners")
-        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
-            "test_test_environment.py",
-            "test_tui.py",
-        }:
-            item.fixturenames.append("close_direct_test_agent_loops")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -702,21 +697,31 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
-    """Close stores and registries constructed directly by repository tests."""
+    """Close runtime owners constructed during repository tests."""
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
     from zeta.core.store import ConversationStore
+    from zeta.runtime.loop import AgentLoop
     from zeta.storage_format import StorageFormatError, advance, open_writer
     from zeta.tools import ToolRegistry
     from zeta.tools._shared.process import BackgroundTaskRegistry
 
+    loops: list[AgentLoop] = []
     stores: list[ConversationStore] = []
     managers: list[SessionManager] = []
     workspaces: list[WorkspaceSnapshotStore] = []
     registries: list[ToolRegistry] = []
     test_home_leases = {}
+    loop_init = AgentLoop.__init__
+    loop_close = AgentLoop.close
     store_init = ConversationStore.__init__
     manager_init = SessionManager.__init__
+
+    @wraps(loop_init)
+    def tracked_loop_init(loop, *args, **kwargs):
+        loop_init(loop, *args, **kwargs)
+        loops.append(loop)
+
     workspace_init = WorkspaceSnapshotStore.__init__
     registry_init = ToolRegistry.__init__
     background_init = BackgroundTaskRegistry.__init__
@@ -758,9 +763,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
             home = home.parent
         ensure_format(home.parent if home.name == "sessions" else root.parent)
         store_init(store, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
-            stores.append(store)
+        stores.append(store)
 
     @wraps(manager_init)
     def tracked_manager_init(manager, *args, **kwargs):
@@ -801,12 +804,19 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
+    for loop in reversed(loops):
+        if not loop._closed:
+            try:
+                await loop_close(loop)
+            except Exception:  # noqa: BLE001,S110 - test cleanup is best effort
+                pass
     for registry in reversed(registries):
         if not registry._closed:
             try:
@@ -832,7 +842,7 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
-    """Close every AgentLoop constructed during a repository test."""
+    """Close AgentLoops whose constructor caller is test code, never src/zeta."""
     from zeta.runtime.loop import AgentLoop
     from zeta.tools import ToolRegistry
 
@@ -844,7 +854,9 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
     @wraps(loop_init)
     def tracked_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
-        loops.append(loop)
+        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
+        if _is_repository_test_path(caller):
+            loops.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
     yield
