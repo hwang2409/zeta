@@ -1499,43 +1499,79 @@ async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
 
 
 @pytest.mark.asyncio
-async def test_shutdown_waits_for_inflight_archive_commit(
+async def test_wait_publishes_terminal_state_only_after_archive_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with ConversationStore(tmp_path / "sessions", session_id="archive-shutdown") as store:
+    notices = []
+    notifications = []
+
+    async def notify(item: TaskExitInput) -> None:
+        notifications.append(item)
+
+    with ConversationStore(tmp_path / "sessions", session_id="archive-wait") as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             output_limit=4,
+            notice_sink=notices.append,
+            notification_sink=notify,
         )
         archive = tasks._archive
         assert archive is not None
         real_append = archive.append
-        entered = threading.Event()
-        release = threading.Event()
+        archive_started = threading.Event()
+        release_archive = threading.Event()
 
-        def slow_append(task_id: str, source_fd: int, length: int) -> None:
-            entered.set()
-            assert release.wait(timeout=10)
+        def blocked_append(task_id: str, source_fd: int, length: int) -> None:
+            archive_started.set()
+            assert release_archive.wait(timeout=10)
             real_append(task_id, source_fd, length)
 
-        monkeypatch.setattr(archive, "append", slow_append)
-        task_id, _ = await tasks.start("printf shutdown-output", tmp_path)
-        assert await asyncio.to_thread(entered.wait, 10)
-        close_task = asyncio.create_task(tasks.close())
-        await asyncio.sleep(0.05)
-        assert not close_task.done()
-        release.set()
-        await close_task
+        # test-contract: durability gates the archive commit before terminal publication
+        monkeypatch.setattr(archive, "append", blocked_append)
+        task_id, _ = await tasks.start("printf archived-output", tmp_path)
+        assert await asyncio.to_thread(archive_started.wait, 10)
 
-        resumed = BackgroundTaskRegistry(
-            session_dir=store.session_dir,
-            directory_fd=store.directory_fd,
-            output_limit=4,
-        )
-        result = await resumed.output(task_id, since=0)
-        assert result["output"] == "shutdown-output"
-        await resumed.close()
+        wait_started = asyncio.Event()
+
+        async def wait_for_terminal() -> dict[str, object]:
+            wait_started.set()
+            return await tasks.wait(task_id)
+
+        waiting = asyncio.create_task(wait_for_terminal())
+        await wait_started.wait()
+
+        try:
+            persisted = json.loads(
+                (store.session_dir / "background_tasks.json").read_text(encoding="utf-8")
+            )
+            assert not waiting.done()
+            assert tasks.snapshot()[0].running is True
+            assert persisted[0]["running"] is True
+            assert task_id not in tasks._archived_lengths
+            assert [notice.phase for notice in notices] == ["started"]
+            assert notifications == []
+            process = tasks.records[0].process
+            assert process is not None
+            assert process.returncode == 0
+
+            release_archive.set()
+            result = await asyncio.wait_for(waiting, timeout=10)
+
+            persisted = json.loads(
+                (store.session_dir / "background_tasks.json").read_text(encoding="utf-8")
+            )
+            assert result == {"task_id": task_id, "running": False, "exit_code": 0}
+            assert tasks.snapshot()[0].running is False
+            assert persisted[0]["running"] is False
+            assert tasks._archived_lengths[task_id] == len("archived-output")
+            assert [notice.phase for notice in notices] == ["started", "natural_exit"]
+            assert [item.task_id for item in notifications] == [task_id]
+            assert (await tasks.output(task_id, since=0))["output"] == "archived-output"
+        finally:
+            release_archive.set()
+            await asyncio.gather(waiting, return_exceptions=True)
+            await tasks.close()
 
 
 @pytest.mark.asyncio
@@ -1705,7 +1741,9 @@ async def test_task_output_reads_archive_not_replaceable_path(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_output_beyond_ring_recoverable_active_and_finished(tmp_path: Path) -> None:
+async def test_output_beyond_ring_recoverable_active_and_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with ConversationStore(tmp_path / "sessions", session_id="concurrent-output") as store:
         tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
@@ -1715,23 +1753,19 @@ async def test_output_beyond_ring_recoverable_active_and_finished(tmp_path: Path
         )
         payloads = (b"alpha-0123456789", b"beta-ABCDEFGHIJ", b"gamma-uvwxyz")
         task_ids = []
-        for payload in payloads:
-            code = (
-                "import sys,time; data="
-                + repr(payload)
-                + "; sys.stdout.buffer.write(data[:8]); sys.stdout.flush(); "
-                + "time.sleep(0.4); sys.stdout.buffer.write(data[8:]); sys.stdout.flush()"
-            )
-            task_id, _ = await tasks.start(_python(code), tmp_path)
+        for _ in payloads:
+            task_id, _ = await tasks.start("cat", tmp_path)
             task_ids.append(task_id)
 
-        async def wait_for_prefix(task_id: str) -> None:
-            for _ in range(100):
-                record = next(item for item in tasks.records if item.task_id == task_id)
-                if record.total_bytes >= 8:
-                    return
-                await asyncio.sleep(0.01)
-            raise AssertionError("task did not produce its active prefix")
+        output_ready = {task_id: asyncio.Event() for task_id in task_ids}
+        original_append = tasks._append
+
+        def signal_output(record: _BackgroundRecord, chunk: bytes) -> None:
+            original_append(record, chunk)
+            output_ready[record.task_id].set()
+
+        # test-contract: seam BackgroundTaskRegistry has no public output-ready event
+        monkeypatch.setattr(tasks, "_append", signal_output)
 
         async def read_exact(task_id: str, length: int) -> bytes:
             cursor = 0
@@ -1743,12 +1777,27 @@ async def test_output_beyond_ring_recoverable_active_and_finished(tmp_path: Path
                 cursor = result["cursor"]
             return bytes(output)
 
-        await asyncio.gather(*(wait_for_prefix(task_id) for task_id in task_ids))
+        await asyncio.gather(
+            *(
+                tasks.input(task_id, payload[:8].decode())
+                for task_id, payload in zip(task_ids, payloads, strict=True)
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in output_ready.values())),
+            timeout=10,
+        )
         active = await asyncio.gather(
             *(read_exact(task_id, 8) for task_id in task_ids)
         )
         assert active == [payload[:8] for payload in payloads]
 
+        await asyncio.gather(
+            *(
+                tasks.input(task_id, payload[8:].decode(), eof=True)
+                for task_id, payload in zip(task_ids, payloads, strict=True)
+            )
+        )
         await asyncio.gather(*(_wait_for_exit(tasks, task_id) for task_id in task_ids))
         finished = await asyncio.gather(
             *(read_exact(task_id, len(payload)) for task_id, payload in zip(task_ids, payloads, strict=True))
@@ -2076,10 +2125,6 @@ async def test_task_kill_cancellation_still_kills_escaped_descendant(
         with pytest.raises(asyncio.CancelledError):
             await killing
         await tasks.close()
-        for _ in range(200):
-            if not _group_exists(child_pid):
-                break
-            await asyncio.sleep(0.01)
         assert not _group_exists(child_pid)
     finally:
         release_second_snapshot.set()
@@ -2293,10 +2338,6 @@ async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path)
     command = wait_for_path_command(gate)
     task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
     assert len(task_ids) == 12
-    for _ in range(1000):
-        if tasks.running_count == 12:
-            break
-        await asyncio.sleep(0.01)
     assert tasks.running_count == 12
 
     try:

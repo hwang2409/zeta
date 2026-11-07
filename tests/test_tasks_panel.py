@@ -338,21 +338,24 @@ def test_snapshot_reports_status_and_line_count() -> None:
     assert registry.snapshot() == ()
 
 
-async def _wait_output(registry: BackgroundTaskRegistry, task_id: str, size: int) -> None:
-    for _ in range(500):
-        if registry.snapshot()[0].output_bytes >= size:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("timed out waiting for output")
-
-
 @pytest.mark.asyncio
-async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
+async def test_output_tail_reads_only_new_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = BackgroundTaskRegistry()
     task_id, _ = await registry.start("cat", tmp_path)
+    output_ready = asyncio.Event()
+    original_append = registry._append
+
+    def signal_output(record: Any, chunk: bytes) -> None:
+        original_append(record, chunk)
+        output_ready.set()
+
+    # test-contract: seam BackgroundTaskRegistry has no public output-ready event
+    monkeypatch.setattr(registry, "_append", signal_output)
     try:
         await registry.input(task_id, "x" * 5000 + "\n")
-        await _wait_output(registry, task_id, 5001)
+        await asyncio.wait_for(output_ready.wait(), timeout=10)
         # Drain the backlog fully, tracking the cursor as the panel does.
         cursor = 0
         while True:
@@ -362,8 +365,9 @@ async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
                 break
         # Appending more and reading *from the last cursor* returns only the
         # new bytes, never a re-read of the 5 KB backlog.
+        output_ready.clear()
         await registry.input(task_id, "DELTA\n", eof=True)
-        await _wait_output(registry, task_id, cursor + 6)
+        await asyncio.wait_for(output_ready.wait(), timeout=10)
         tail = await registry.output(task_id, since=cursor)
         assert tail["output"] == "DELTA\n"
     finally:
