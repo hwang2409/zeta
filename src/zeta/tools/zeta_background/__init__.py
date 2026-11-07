@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, TypedDict
 
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
-from .._shared.sandbox import resolve_shell_cwd
+from .._shared.shell_cwd import bind_shell_cwd
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
@@ -26,26 +25,26 @@ async def _run_background(
     *,
     execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
-    start_cwd = Path(
-        resolve_shell_cwd(registry.bash_cwd, arguments.get("cwd"))
-    )
     approved_execution = (
         execution_context.approved_execution
         if execution_context is not None
         else None
     )
-    registry.verify_cwd_identity()
-    cwd_fd = None
-    if isinstance(approved_execution, ApprovedCwdExecution):
-        start_cwd = Path(approved_execution.cwd)
-        cwd_fd = registry.open_verified_directory(
-            start_cwd, approved_execution.identity
-        )
+    approved_cwd = (
+        approved_execution
+        if isinstance(approved_execution, ApprovedCwdExecution)
+        else None
+    )
+    start_cwd, cwd_fd = bind_shell_cwd(
+        registry, arguments.get("cwd"), approved_cwd
+    )
+    environment = dict(execution_context.host_environment) if execution_context else {}
+    environment["PWD"] = start_cwd
     task_id, pid = await registry.background_tasks.start(
         arguments["command"],
         start_cwd,
         cwd_fd=cwd_fd,
-        environment=execution_context.host_environment if execution_context else None,
+        environment=environment,
     )
     return _result(
         f"started background task {task_id} (pid {pid})",
