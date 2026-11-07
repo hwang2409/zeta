@@ -4243,7 +4243,6 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
@@ -4347,7 +4346,6 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(
     )
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
-        "agent",
         "agent_output",
         "agent_status",
         "fetch",
