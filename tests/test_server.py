@@ -4123,7 +4123,6 @@ async def test_session_swap_reserves_child_completion_during_setup(
             await asyncio.wait_for(notification_captured.wait(), TIMEOUT)
         release_setup.set()
         swap_frames = await asyncio.wait_for(swap, TIMEOUT)
->>>>>>> origin/main
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id
         release_notification.set()
