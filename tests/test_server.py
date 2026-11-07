@@ -9054,6 +9054,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     history_write_started = asyncio.Event()
+    history_release = asyncio.Event()
     original_append = ConversationStore.append_approval_history_async
 
     async def fail_terminal_history(self, payload):
@@ -9061,7 +9062,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             history_write_started.set()
             if failure == "oserror":
                 raise OSError("forced delegated history failure")
-            raise asyncio.CancelledError
+            await history_release.wait()
         return await original_append(self, payload)
 
     # test-contract: seam the durable store has no deterministic failure hook
@@ -9090,9 +9091,16 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             )
             await writer.drain()
             await history_write_started.wait()
+            settlement = None
+            if failure == "cancelled":
+                record = server.control._approvals.state.records[
+                    (approval["agent_instance_id"], child_call.id)
+                ]
+                settlement = record.settlement
+                assert settlement is not None
+                settlement.cancel()
             while not (
-                _named_events(frames, "tool_end")
-                and _named_events(frames, "turn_end")
+                _named_events(frames, "tool_end") and _named_events(frames, "turn_end")
             ):
                 frames.append(await _read(reader))
             names = [frame.get("params", {}).get("event") for frame in frames]
@@ -9101,9 +9109,12 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             assert names.index("approval_end") < names.index("turn_end")
             while not any(frame.get("id") == 4 for frame in frames):
                 frames.append(await _read(reader))
+            if settlement is not None:
+                await settlement
         response = next(frame for frame in frames if frame.get("id") == 4)
         assert response["result"]["decision"] == "deny"
     finally:
+        history_release.set()
         await asyncio.wait_for(_close(server, writer), timeout=10)
 
 
