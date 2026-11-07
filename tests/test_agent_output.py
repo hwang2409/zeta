@@ -1,17 +1,17 @@
 import asyncio
+import contextlib
 import json
 import multiprocessing
 import os
 import threading
-from collections.abc import Callable
-from multiprocessing.connection import Connection
+from multiprocessing.connection import Connection, wait
 from pathlib import Path
-from typing import cast
 
 import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.processes import owned_child_process
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.receipt import (
     build_agent_receipt,
@@ -1364,31 +1364,6 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         )
 
 
-def _stop_process(process: multiprocessing.Process, pipe: Connection) -> int | None:
-    errors: list[BaseException] = []
-
-    def attempt(operation: Callable[[], object]) -> object | None:
-        try:
-            return operation()
-        except BaseException as error:  # noqa: BLE001 - finish cleanup before raising
-            errors.append(error)
-            return None
-
-    attempt(lambda: pipe.send("close") if not pipe.closed else None)
-    attempt(lambda: process.join(10))
-    attempt(lambda: process.terminate() if process.is_alive() else None)
-    attempt(lambda: process.join(10) if process.is_alive() else None)
-    attempt(lambda: process.kill() if process.is_alive() else None)
-    attempt(lambda: process.join(10) if process.is_alive() else None)
-    exitcode = cast("int | None", attempt(lambda: process.exitcode))
-    attempt(pipe.close)
-    attempt(process.close)
-
-    if errors:
-        raise errors[0]
-    return exitcode
-
-
 def _create_nested_child_in_process(
     root_dir: str, ready: Connection
 ) -> None:
@@ -1420,32 +1395,41 @@ def _create_nested_child_in_process(
 async def test_resident_root_discovers_descendant_created_by_second_process(
     tmp_path: Path,
 ) -> None:
-    root = ConversationStore(tmp_path, session_id="root")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
-    _record_running_child(
-        root,
-        child,
-        call=ToolCall("process-child", "agent", {"prompt": "child"}),
-        handle="root:1",
-        depth=1,
-    )
-    child.close()
-    parent_pipe, child_pipe = multiprocessing.get_context("spawn").Pipe()
-    process = multiprocessing.get_context("spawn").Process(
-        target=_create_nested_child_in_process,
-        args=(str(tmp_path), child_pipe),
-    )
-    process.start()
-    child_pipe.close()
-    loop: AgentLoop | None = None
-    try:
+    async with contextlib.AsyncExitStack() as stack:
+        root = ConversationStore(tmp_path, session_id="root")
+        stack.callback(root.close)
+        child = ConversationStore(root.session_dir / "agents", session_id="1")
+        stack.callback(child.close)
+        _record_running_child(
+            root,
+            child,
+            call=ToolCall("process-child", "agent", {"prompt": "child"}),
+            handle="root:1",
+            depth=1,
+        )
+        child.close()
+        parent_pipe, child_pipe = multiprocessing.get_context("spawn").Pipe()
+        stack.callback(child_pipe.close)
+        process = multiprocessing.get_context("spawn").Process(
+            target=_create_nested_child_in_process,
+            args=(str(tmp_path), child_pipe),
+        )
+        process.start()
+        child_pipe.close()
+        loop = AgentLoop(
+            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        await stack.enter_async_context(
+            owned_child_process(
+                process,
+                endpoints=(parent_pipe,),
+                close=loop.close,
+            )
+        )
         ready = await asyncio.to_thread(parent_pipe.poll, 10)
         if not ready:
             pytest.fail("child process did not become ready within 10 seconds")
         assert parent_pipe.recv() == "ready"
-        loop = AgentLoop(
-            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
-        )
         status = await loop.tool_registry.execute(
             ToolCall("process-status", "agent_status", {"handle": "root:1:1"})
         )
@@ -1455,25 +1439,10 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
 
         assert status["structuredContent"]["children"][0]["handle"] == "root:1:1"
         assert "cross-process answer" in output["content"][0]["text"]
-    finally:
-        cleanup_errors: list[BaseException] = []
-        if loop is not None:
-            try:
-                await asyncio.wait_for(loop.close(), 10)
-            except BaseException as error:  # noqa: BLE001 - finish cleanup first
-                cleanup_errors.append(error)
-        try:
-            process_exitcode = _stop_process(process, parent_pipe)
-        except BaseException as error:  # noqa: BLE001 - finish cleanup first
-            cleanup_errors.append(error)
-            process_exitcode = None
-        try:
-            root.close()
-        except BaseException as error:  # noqa: BLE001 - finish cleanup first
-            cleanup_errors.append(error)
-        if cleanup_errors:
-            raise cleanup_errors[0]
-    assert process_exitcode == 0
+        parent_pipe.send("close")
+        await asyncio.to_thread(wait, [process.sentinel], 10)
+        process_exitcode = process.exitcode
+        assert process_exitcode == 0
 
 
 @pytest.mark.parametrize(
