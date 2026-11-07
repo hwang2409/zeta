@@ -302,6 +302,7 @@ def test_git_discovery_timeout_is_bounded_and_warns(
         timeouts.append(timeout)
         raise subprocess.TimeoutExpired(command, timeout)
 
+    # test-contract: latency project discovery must use one bounded git deadline
     monkeypatch.setattr(project_context.subprocess, "run", time_out)
     plain = tmp_path / "plain"
     plain.mkdir()
@@ -309,6 +310,7 @@ def test_git_discovery_timeout_is_bounded_and_warns(
     with caplog.at_level(logging.WARNING):
         opened = manager(tmp_path).create(provider="codex", model="test", cwd=plain)
 
+    # test-contract: latency project discovery has one shared two-second deadline
     assert timeouts == [pytest.approx(2.0)]
     assert opened.metadata.project_id is None
     assert "git project discovery timed out" in caplog.text
@@ -451,6 +453,7 @@ def test_hanging_git_frontend_startup_has_one_bounded_warning(
         calls += 1
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
+    # test-contract: latency frontend startup must not retry timed-out git discovery
     monkeypatch.setattr(project_context.subprocess, "run", time_out)
     cwd = tmp_path / "plain"
     cwd.mkdir()
@@ -465,7 +468,9 @@ def test_hanging_git_frontend_startup_has_one_bounded_warning(
         app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         warnings = [r for r in caplog.records if "git project discovery" in r.message]
+        # test-contract: latency timed-out git discovery must make one attempt
         assert calls == 1
+        # test-contract: latency one timeout attempt must emit one warning
         assert len(warnings) == 1
     finally:
         asyncio.run(app.close())
@@ -493,6 +498,7 @@ def test_hanging_git_registered_project_one_warning_one_deadline(
         calls += 1
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
+    # test-contract: latency registered-project startup shares one git deadline
     monkeypatch.setattr(project_context.subprocess, "run", time_out)
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -502,7 +508,9 @@ def test_hanging_git_registered_project_one_warning_one_deadline(
         app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         warnings = [r for r in caplog.records if "git project discovery" in r.message]
+        # test-contract: latency timed-out registered-project discovery makes one attempt
         assert calls == 1
+        # test-contract: latency one registered-project timeout emits one warning
         assert len(warnings) == 1
         assert app.loop.session_metadata.project_id is None
         assert "PRIVATE-MUST-NOT-LOAD" not in app.loop.context_assembler.system_prompt.content[0].text

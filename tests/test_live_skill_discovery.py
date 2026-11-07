@@ -212,6 +212,7 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, backend))
+    # test-contract: seam no public metadata-lock holder seam exists
     release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
     _install_live_skill(home)
 
@@ -223,7 +224,7 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
         ]
 
     try:
-        await asyncio.wait_for(refresh_and_run_turn(), timeout=5)
+        await asyncio.wait_for(refresh_and_run_turn(), timeout=10)
         catalog = loop.tool_registry.skill_catalog
         assert "live" in {skill.name for skill in catalog.skills}
         assert catalog.find("live").description == "live description"

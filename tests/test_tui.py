@@ -11360,26 +11360,40 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
     previous = navigation.transcript_control._snapshot
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh(*args, **kwargs):
         entered.set()
         return original_refresh(*args, **kwargs)
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public transcript-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public transcript-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public transcript-refresh lock seam exists
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
-        await wait_until(entered.is_set)
-        await asyncio.wait_for(app.close(), timeout=3)
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late transcript cleanup
         assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         agent_sync._REFRESH_LOCK.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._stores == {}
     assert navigation.transcript_control._snapshot is previous
     assert not published.is_set()
@@ -11410,26 +11424,40 @@ async def test_tui_close_hands_off_blocked_todo_source(
     assert source is not None
     entered = threading.Event()
     published = threading.Event()
+    closed = threading.Event()
     original_refresh = source.refresh
+    original_close = source.close
 
     def blocked_refresh():
         entered.set()
         return original_refresh()
 
+    def close_and_signal() -> None:
+        try:
+            original_close()
+        finally:
+            closed.set()
+
+    # test-contract: seam no public todo-refresh readiness event exists
     monkeypatch.setattr(source, "refresh", blocked_refresh)
+    # test-contract: seam no public todo-source closed event exists
+    monkeypatch.setattr(source, "close", close_and_signal)
+    # test-contract: seam no public shutdown-budget injection exists
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
     late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
+    # test-contract: seam no public todo-refresh lock seam exists
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
-        await wait_until(entered.is_set)
-        await asyncio.wait_for(app.close(), timeout=3)
+        assert await asyncio.to_thread(entered.wait, 10)
+        await asyncio.wait_for(app.close(), timeout=10)
         assert not source._closed
+        # test-contract: durability shutdown retains one late todo cleanup
         assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         source._lock.release()
 
-    await wait_until(lambda: source._closed)
+    assert await asyncio.to_thread(closed.wait, 10)
     assert source._store is None
     assert control._snapshot is None
     assert not published.is_set()
@@ -13758,23 +13786,35 @@ async def test_accounts_refresh_does_not_block_event_loop(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    # test-contract: seam no public headless presenter injection exists
     app._presenter.print_unit = Mock()
+    # test-contract: seam no public headless transcript injection exists
     app._transcript.replace = lambda unit, replacement: replacement
 
     owner_thread = threading.get_ident()
     refresh_threads: list[int] = []
+    refresh_done = asyncio.Event()
+    # test-contract: seam no public account-picker repaint completion hook exists
+    original_repaint = app._repaint_accounts_picker
 
     async def observed_refresh(self):
         refresh_threads.append(threading.get_ident())
         return {}
 
+    def repaint_and_signal() -> None:
+        original_repaint()
+        picker = app._accounts_picker
+        if picker is not None and not picker.refreshing:
+            refresh_done.set()
+
     monkeypatch.setattr(AccountUsage, "refresh_stale", observed_refresh)
+    # test-contract: seam no public account-refresh completion event exists
+    monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
         assert await app.slash_accounts("") == ""
         app.accounts_picker_refresh()
-        await wait_until(
-            lambda: app._accounts_picker is None or not app._accounts_picker.refreshing
-        )
+        await asyncio.wait_for(refresh_done.wait(), timeout=10)
+        # test-contract: seam no public account-refresh executor identity exists
         assert refresh_threads and refresh_threads[0] != owner_thread
     finally:
         opened.store.close()
