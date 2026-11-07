@@ -188,10 +188,28 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
     )
     cleanup_entered = asyncio.Event()
     cleanup_release = asyncio.Event()
+    old_output_entered = asyncio.Event()
+    old_output_release = asyncio.Event()
     claim_attempted = asyncio.Event()
     new_writer: asyncio.StreamWriter | None = None
+    old_publish: asyncio.Task[bool] | None = None
+    fenced = False
+    raw_after_fence: list[tuple[object, dict[str, Any]]] = []
     original_cancel = accounts_module.cancel_owned_switch
     original_claim = server.connections._claim
+    original_write = _Client._write_physical
+
+    async def gated_write(client: _Client, payload: bytes) -> bool:
+        frame = json.loads(payload)
+        if (
+            client is old_state.connection
+            and frame.get("params", {}).get("delta") == "old-controller"
+        ):
+            old_output_entered.set()
+            await asyncio.wait_for(old_output_release.wait(), 10)
+        if fenced:
+            raw_after_fence.append((client, frame))
+        return await original_write(client, payload)
 
     async def gated_cancel(owner: object) -> None:
         if owner is old_state.connection:
@@ -211,10 +229,20 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
 
     # test-contract: seam hold real disconnect cleanup before registry release
     monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
+    # test-contract: seam observe raw transport writes around the replacement fence
+    monkeypatch.setattr(_Client, "_write_physical", gated_write)
     # test-contract: seam observe the replacement claim without timing assumptions
     monkeypatch.setattr(server.connections, "_claim", tracked_claim)
     hello: asyncio.Task[dict[str, Any]] | None = None
     try:
+        old_publish = asyncio.create_task(
+            server.connections.publish_controller(
+                EventDescriptor.ASSISTANT_DELTA,
+                "session",
+                delta="old-controller",
+            )
+        )
+        await asyncio.wait_for(old_output_entered.wait(), 10)
         old_writer.close()
         await old_writer.wait_closed()
         await asyncio.wait_for(cleanup_entered.wait(), 10)
@@ -237,13 +265,25 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         response = await asyncio.wait_for(hello, 10)
         assert response["result"]["server"] == "zeta"
 
+        fenced = True
+        old_output_release.set()
+        assert old_publish is not None
+        assert not await asyncio.wait_for(old_publish, 10)
         assert await server.connections.publish_controller(
             EventDescriptor.ASSISTANT_DELTA, "session", delta="new-controller"
         )
         event = await _read_json(new_reader, transport)
         assert event["params"]["delta"] == "new-controller"
+        assert [
+            (client, frame["params"]["delta"]) for client, frame in raw_after_fence
+        ] == [(server._client, "new-controller")]
     finally:
         cleanup_release.set()
+        old_output_release.set()
+        if old_publish is not None and not old_publish.done():
+            old_publish.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(old_publish, 10)
         if hello is not None and not hello.done():
             hello.cancel()
             with pytest.raises(asyncio.CancelledError):

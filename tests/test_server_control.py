@@ -382,7 +382,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 
 @pytest.mark.asyncio
-async def test_controller_release_completes_queued_frames_like_base() -> None:
+async def test_controller_release_fences_queued_frames() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop())
     connection = _ControllerConnection()
     registry.register(connection)
@@ -405,7 +405,7 @@ async def test_controller_release_completes_queued_frames_like_base() -> None:
     registry.release(connection)
     release_write.set()
 
-    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [True, True]
+    assert await asyncio.wait_for(asyncio.gather(head, tail), 10) == [False, False]
 
 
 @pytest.mark.asyncio

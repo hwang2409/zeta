@@ -602,15 +602,24 @@ class ConnectionRegistry:
         self._cancel_overflow_deadline(output)
         if role == "observer":
             self._clear_output(output)
-            if output.writer_task is not None:
+            if (
+                output.writer_task is not None
+                and output.writer_task is not asyncio.current_task()
+            ):
                 output.writer_task.cancel()
             return
+        self._clear_output(output, result=False)
+        writer_task = output.writer_task
+        current_task = asyncio.current_task()
         if (
-            output.current_frame is None
-            and not output.queue
-            and output.writer_task is not None
+            writer_task is None
+            or writer_task is current_task
+            or output.current_write is current_task
         ):
-            output.writer_task.cancel()
+            return
+        if output.current_frame is not None:
+            self._finish_future(output.current_frame.future, False)
+        writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
         while output.queue:
