@@ -40,30 +40,29 @@ def test_repository_pytest_rejects_external_import_with_external_rootdir(
 ) -> None:
     decoy = tmp_path / "decoy" / "zeta"
     shutil.copytree(ROOT / "src" / "zeta", decoy)
-    probe = ROOT / "tests" / "test_import_guard_rootdir_probe.py"
+    probe = tmp_path / "test_import_guard_rootdir_probe.py"
     probe.write_text("def test_probe():\n    assert True\n")
     rootdir = tmp_path / "rootdir"
     rootdir.mkdir()
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                str(probe),
-                "--rootdir",
-                str(rootdir),
-            ],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(decoy.parent)},
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    finally:
-        probe.unlink()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "tests.conftest",
+            str(probe),
+            "--rootdir",
+            str(rootdir),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(decoy.parent)},
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
     output = result.stdout + result.stderr
     assert result.returncode == 2
     assert "wrong zeta import:" in output
