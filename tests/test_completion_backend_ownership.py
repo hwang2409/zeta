@@ -10,6 +10,7 @@ import pytest
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, SessionAccountContext
 from zeta.agent import runner as agent_runner
+from zeta.agent.presets import GENERAL_PRESET
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
@@ -267,27 +268,39 @@ async def test_child_registry_clone_gets_its_own_backend_owner(
         "build_backend",
         lambda *_args, **_kwargs: (child, child.model),
     )
-    resolved, error = agent_runner.resolve_child_backend(parent_loop, None)
-    assert error is None
-    assert resolved is child
-    child_loop = AgentLoop(
-        child,
-        ConversationStore(tmp_path / "child"),
-        skill_catalog=SkillCatalog.empty(),
-        agent_depth=1,
-        agent_instance_id="child",
-        background_owner=parent_loop._background_owner,
-    )
+    child_store = ConversationStore(tmp_path / "child")
+    child_loop = None
     try:
+        resolved, error = agent_runner.resolve_child_backend(parent_loop, None)
+        assert error is None
+        child_loop, policy = await _within(
+            agent_runner._build_child_loop(
+                parent_loop,
+                child_backend=resolved,
+                child_store=child_store,
+                child_instance_id="child",
+                child_depth=1,
+                preset=GENERAL_PRESET,
+                model=None,
+                cwd_override=None,
+                follow_up_loop=False,
+                description="test child",
+                child_account_context=None,
+            )
+        )
+        assert policy is None
+        assert child_loop.backend is child
+        assert child_loop.tool_registry is not parent_loop.tool_registry
         await _within(child_loop.close())
         assert child.client.close_count == 1
         assert parent.client.close_count == 0
         await _within(parent_loop.close())
         assert parent.client.close_count == 1
     finally:
-        await _within(child_loop.close())
+        if child_loop is not None:
+            await _within(child_loop.close())
         await _within(parent_loop.close())
-        child_loop.store.close()
+        child_store.close()
         parent_loop.store.close()
 
 
