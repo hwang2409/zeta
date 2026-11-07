@@ -8446,6 +8446,7 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     worker_errors: list[BaseException] = []
     shutdown_started = asyncio.Event()
     closing: asyncio.Task[None] | None = None
+    request_task: asyncio.Task[None] | None = None
     loop_closed = False
     status_worker: threading.Thread | None = None
 
@@ -8500,6 +8501,15 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await close_control()
 
     monkeypatch.setattr(server.control, "close", track_shutdown)
+    writer_wait_closed = writer.wait_closed
+
+    async def wait_closed_after_server_shutdown() -> None:
+        assert shutdown_started.is_set(), (
+            "server shutdown must start before the test waits for the peer close"
+        )
+        await asyncio.wait_for(writer_wait_closed(), 10)
+
+    monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
     try:
         writer.write(
             json.dumps(
@@ -8513,10 +8523,21 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             + b"\n"
         )
         await writer.drain()
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(entered.wait, 10), (
+            "status transcript worker did not start"
+        )
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
 
         writer.close()
-        await writer.wait_closed()
         closing = asyncio.create_task(server.close())
         await asyncio.wait_for(shutdown_started.wait(), 10)
         loop_closed = True
@@ -8524,18 +8545,24 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await asyncio.wait_for(worker_completed.wait(), 10)
         assert not worker_errors
         loop_closed = False
-        await asyncio.wait_for(closing, 10)
+        await asyncio.wait_for(asyncio.shield(closing), 10)
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(request_task), 10)
+        assert request_task.done(), "serve request task remained after cancellation"
     finally:
         loop_closed = False
         release.set()
-        if closing is not None and not closing.done():
-            closing.cancel()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
             with suppress(asyncio.CancelledError):
-                await closing
+                await asyncio.wait_for(asyncio.shield(request_task), 10)
+        if closing is None:
+            closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(asyncio.shield(closing), 10)
         writer.close()
         with suppress(Exception):
-            await writer.wait_closed()
-        await server.close()
+            await asyncio.wait_for(writer.wait_closed(), 10)
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])
