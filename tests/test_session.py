@@ -1680,7 +1680,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
     first = await asyncio.to_thread(create_app, _args())
     session_id = first.loop.store.session_id
     transcript_path = first.loop.store.path
-    first.loop.store.close()
+    await first.close()
     fixture = Path(__file__).parent / "fixtures" / "legacy_browser_transcript.jsonl"
     with transcript_path.open("ab") as transcript:
         transcript.write(fixture.read_bytes())
