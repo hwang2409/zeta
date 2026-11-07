@@ -132,21 +132,6 @@ AGENT_PRESETS: dict[AgentType, AgentPreset] = {
 }
 
 
-def get_agent_preset(agent_type: object) -> AgentPreset | None:
-    """Return a built-in preset, without defaulting unknown values."""
-
-    if type(agent_type) is not str:
-        return None
-    return next(
-        (preset for preset in AGENT_PRESETS.values() if preset.name == agent_type),
-        None,
-    )
-
-
-
-
-
-
 def compose_system_prompt(
     system_prompt: str | Message,
     preamble: str,
