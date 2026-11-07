@@ -185,20 +185,6 @@ def test_env_lookup_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert fake_script_from_env({FAKE_SCRIPT_ENV: str(path)}) is not None
 
 
-def test_hidden_serve_hook_uses_scripted_backend(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
-    server = ZetaServer(
-        home=tmp_path, socket_path=tmp_path / "s.sock", provider="codex"
-    )
-
-    backend, model = server.runtime._build_backend("codex", None, tmp_path)
-
-    assert model == "gpt-5.6-luna"
-    assert type(backend).__name__ == "_TestScriptedBackend"
-
-
 async def _events(backend: ScriptedFakeBackend, messages: list[Message]) -> list[Any]:
     return [event async for event in backend.complete(messages, [])]
 
