@@ -304,6 +304,9 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         features=["session_history_fidelity", "served_turn_end"],
     )
     try:
+        status = (await request(reader, writer, 2, "status"))[-1]["result"]
+        assert "last_turn_outcome" in status
+        assert status["last_turn_outcome"] is None
         await request(reader, writer, 3, "send", {"text": "hello"})
         first_start = await event(reader, "turn_start")
         await event(reader, "approval_request")
@@ -390,9 +393,14 @@ async def test_legacy_turn_start_omits_turn_id(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     server, reader, writer, _ = await _open(tmp_path, backend, features=[])
     try:
+        before = (await request(reader, writer, 20, "status"))[-1]["result"]
+        assert "last_turn_outcome" not in before
         await request(reader, writer, 3, "send", {"text": "hello"})
         started = await event(reader, "turn_start")
         assert started["data"].get("turn_id") is None
+        await event(reader, "agent_end")
+        after = (await request(reader, writer, 21, "status"))[-1]["result"]
+        assert "last_turn_outcome" not in after
     finally:
         await _close(server, writer)
 
@@ -457,15 +465,22 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
             await event(reader, terminal)
         await finalized.wait()
 
-        if reason == "disconnect":
-            reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
-            await request(
-                reader,
-                writer,
-                13,
-                "hello",
-                {"protocol_version": "1.2", "features": ["served_turn_end"]},
-            )
+        if reason != "disconnect":
+            writer.close()
+            await writer.wait_closed()
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        await request(
+            reader,
+            writer,
+            13,
+            "hello",
+            {"protocol_version": "1.2", "features": ["served_turn_end"]},
+        )
+        status = (await request(reader, writer, 14, "status"))[-1]["result"]
+        assert status["last_turn_outcome"] == {
+            "turn_id": live_turn_id,
+            "reason": reason,
+        }
         rows = await _history(reader, writer, session_id)
         served = [row for row in rows if row.get("event") == "served_turn_end"]
         assert [row["data"]["reason"] for row in served] == [reason]
