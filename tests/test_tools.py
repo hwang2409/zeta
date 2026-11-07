@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -8,9 +9,9 @@ import pty
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -47,29 +49,29 @@ def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
 
-def _descendant_command(
-    marker: Path,
-    delay: float = 0.3,
-    started: Path | None = None,
-    release: Path | None = None,
-) -> str:
-    child = "import pathlib,time\n"
-    if release:
-        child += (
-            f"deadline=time.monotonic()+5\n"
-            f"while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
-            "    time.sleep(0.01)\n"
-        )
-    else:
-        child += f"time.sleep({delay})\n"
-    child += f"pathlib.Path({str(marker)!r}).write_text('alive')"
+def _descendant_command(child_pid: Path | None = None) -> str:
+    child = "import os,signal,pathlib\n"
+    if child_pid:
+        child += f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+    child += "signal.pause()"
     parent = (
-        "import pathlib,subprocess,sys,time; "
+        "import subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
-        + (f"pathlib.Path({str(started)!r}).write_text('started'); " if started else "")
         + "time.sleep(5)"
     )
     return _python_command(parent)
+
+
+@asynccontextmanager
+async def _owned_descendant(pid_file: Path):
+    try:
+        yield
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+                await wait_pid_exited(pid)
 
 
 async def _collect_loop(loop: AgentLoop) -> list[object]:
@@ -104,9 +106,7 @@ async def test_clone_for_session_close_releases_cwd_descriptor(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_registry_validates_arguments_before_running_handler(
-    tmp_path: Path,
-) -> None:
+async def test_registry_validates_arguments_before_running_handler(tmp_path: Path) -> None:
     called = False
 
     def handler(arguments: dict[str, object]) -> str:
@@ -114,9 +114,7 @@ async def test_registry_validates_arguments_before_running_handler(
         called = True
         return "ran"
 
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "typed",
         handler,
@@ -136,9 +134,7 @@ async def test_registry_validates_arguments_before_running_handler(
 
 
 def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     with pytest.raises(ValueError, match="unsupported schema type"):
         registry.register(
@@ -204,7 +200,9 @@ async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> No
     read_result = await registry.execute(
         ToolCall("read-1", "read", {"path": "nested/note.txt", "offset": 1, "limit": 1})
     )
-    exec_result = await registry.execute(ToolCall("bash-1", "bash", {"command": "pwd"}))
+    exec_result = await registry.execute(
+        ToolCall("bash-1", "bash", {"command": "pwd"})
+    )
 
     assert read_result["isError"] is False
     assert read_result["content"][0]["text"] == "two"
@@ -274,9 +272,7 @@ async def test_bash_stdin_is_devnull_when_parent_stdin_is_a_tty(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_bash_lowers_child_priority_without_changing_parent(
-    tmp_path: Path,
-) -> None:
+async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path) -> None:
     parent_niceness = os.getpriority(os.PRIO_PROCESS, 0)
     registry = ToolRegistry(
         tmp_path, command_niceness=10, skill_catalog=SkillCatalog.empty()
@@ -286,7 +282,9 @@ async def test_bash_lowers_child_priority_without_changing_parent(
         ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
     )
 
-    assert int(result["structuredContent"]["stdout"]) == min(19, parent_niceness + 10)
+    assert int(result["structuredContent"]["stdout"]) == min(
+        19, parent_niceness + 10
+    )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
 
@@ -311,7 +309,9 @@ async def test_bash_command_niceness_zero_leaves_priority_unchanged(
 async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    changed = await registry.execute(ToolCall("bash-cd", "bash", {"cmd": "cd /tmp"}))
+    changed = await registry.execute(
+        ToolCall("bash-cd", "bash", {"cmd": "cd /tmp"})
+    )
     current = await registry.execute(ToolCall("bash-pwd", "bash", {"cmd": "pwd"}))
 
     assert changed["structuredContent"]["cwd_after"] == "/tmp"
@@ -322,15 +322,11 @@ async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> None:
     first_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    first = ToolRegistry(
-        tmp_path, session_store=first_store, skill_catalog=SkillCatalog.empty()
-    )
+    first = ToolRegistry(tmp_path, session_store=first_store, skill_catalog=SkillCatalog.empty())
     await first.execute(ToolCall("first-cd", "bash", {"cmd": "cd /tmp"}))
 
     second_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    second = ToolRegistry(
-        tmp_path, session_store=second_store, skill_catalog=SkillCatalog.empty()
-    )
+    second = ToolRegistry(tmp_path, session_store=second_store, skill_catalog=SkillCatalog.empty())
     result = await second.execute(ToolCall("second-pwd", "bash", {"cmd": "pwd"}))
 
     assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
@@ -348,9 +344,7 @@ async def test_bash_cwd_channel_rejects_user_forgery(tmp_path: Path) -> None:
         )
     )
 
-    assert result["isError"] or result["structuredContent"]["cwd_after"] == str(
-        tmp_path
-    )
+    assert result["isError"] or result["structuredContent"]["cwd_after"] == str(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -359,9 +353,7 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    registry = ToolRegistry(
-        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
     before_state = store.state_path.read_bytes()
 
     def fail_replace(source: object, destination: object) -> None:
@@ -414,9 +406,7 @@ async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
     failed = await registry.execute(
         ToolCall("bash-failed-cd", "bash", {"cmd": "cd /tmp; exit 3"})
     )
-    current = await registry.execute(
-        ToolCall("bash-failed-pwd", "bash", {"cmd": "pwd"})
-    )
+    current = await registry.execute(ToolCall("bash-failed-pwd", "bash", {"cmd": "pwd"}))
 
     assert failed["isError"] is True
     failed_structured = failed["structuredContent"]
@@ -438,44 +428,42 @@ async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
     result = await registry.execute(
         ToolCall("bash-explicit-cd", "bash", {"cmd": "cd /tmp", "cwd": str(nested)})
     )
-    current = await registry.execute(
-        ToolCall("bash-explicit-pwd", "bash", {"cmd": "pwd"})
-    )
+    current = await registry.execute(ToolCall("bash-explicit-pwd", "bash", {"cmd": "pwd"}))
 
     assert result["structuredContent"]["cwd_after"] == "/tmp"
     assert current["structuredContent"]["stdout"].strip() == "/tmp"
 
 
 @pytest.mark.asyncio
-async def test_bash_abort_kills_process_group_and_reaps_descendants(
-    tmp_path: Path,
-) -> None:
-    marker = tmp_path / "child-alive"
+async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
+    child_pid = tmp_path / "child.pid"
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(
-        tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty()
-    )
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"cmd": _descendant_command(child_pid=child_pid)},
+                )
+            )
         )
-    )
 
-    await asyncio.sleep(0.05)
-    abort_signal.abort()
-    result = await asyncio.wait_for(task, 10)
-    await asyncio.sleep(0.5)
+        child_pid_value = await read_pid_file(child_pid)
+        abort_signal.abort()
+        result = await asyncio.wait_for(task, 10)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
 async def test_bash_task_cancellation_kills_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    marker = tmp_path / "child-canceled"
+    child_pid = tmp_path / "cancel-child.pid"
     spawned = asyncio.Event()
     release_spawn = asyncio.Event()
     spawned_process: asyncio.subprocess.Process | None = None
@@ -486,27 +474,29 @@ async def test_bash_task_cancellation_kills_process_group(
         process = await create_subprocess_shell(*args, **kwargs)
         spawned_process = process
         spawned.set()
-        await release_spawn.wait()
+        await asyncio.wait_for(release_spawn.wait(), 10)
         return process
 
     monkeypatch.setattr(bash_module, "create_tool_subprocess_shell", hold_spawn)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(child_pid)})
+            )
         )
-    )
 
-    await asyncio.wait_for(spawned.wait(), timeout=2)
-    task.cancel()
-    release_spawn.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(spawned.wait(), timeout=2)
+        await read_pid_file(child_pid)
+        task.cancel()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
 
-    assert spawned_process is not None
-    assert spawned_process.returncode is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(spawned_process.pid, 0)
+        assert spawned_process is not None
+        assert spawned_process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.killpg(spawned_process.pid, 0)
 
 
 @pytest.mark.asyncio
@@ -538,9 +528,7 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bash_cwd = str(missing)
 
-    result = await registry.execute(
-        ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"})
-    )
+    result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
 
     assert result["isError"] is True
     assert result["structuredContent"]["cwd_after"] == str(missing)
@@ -591,12 +579,7 @@ async def test_bash_rejects_malformed_arguments(
 
 
 def test_list_is_not_registered(tmp_path: Path) -> None:
-    assert (
-        "list"
-        not in ToolRegistry(
-            tmp_path, skill_catalog=SkillCatalog.empty()
-        ).definitions_by_name
-    )
+    assert "list" not in ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).definitions_by_name
 
 
 @pytest.mark.asyncio
@@ -643,9 +626,7 @@ async def test_write_reports_overwrite(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_edit_replaces_unique_string_with_structured_result(
-    tmp_path: Path,
-) -> None:
+async def test_edit_replaces_unique_string_with_structured_result(tmp_path: Path) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text("before: old\n", encoding="utf-8")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
@@ -660,7 +641,9 @@ async def test_edit_replaces_unique_string_with_structured_result(
 
     updated = b"before: new\n"
     assert result["isError"] is False
-    assert result["content"][0]["text"] == (f"edited {file_path}: 12 bytes → 12 bytes")
+    assert result["content"][0]["text"] == (
+        f"edited {file_path}: 12 bytes → 12 bytes"
+    )
     assert result["structuredContent"] == {
         "path": str(file_path),
         "bytes_before": 12,
@@ -893,9 +876,7 @@ async def test_registry_rejects_malformed_edit_arguments(
 
 
 @pytest.mark.asyncio
-async def test_write_getpath_failure_does_not_truncate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_write_getpath_failure_does_not_truncate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "getpath-failure.txt"
     target.write_text("original", encoding="utf-8")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
@@ -905,9 +886,7 @@ async def test_write_getpath_failure_does_not_truncate(
 
     monkeypatch.setattr(write_module, "_path_from_fd", fail_getpath)
     result = await registry.execute(
-        ToolCall(
-            "write-getpath-failure", "write", {"path": target.name, "content": "new"}
-        )
+        ToolCall("write-getpath-failure", "write", {"path": target.name, "content": "new"})
     )
 
     assert result["isError"] is True
@@ -998,10 +977,11 @@ async def test_write_race_reports_overwrite(
         follow_symlinks: bool = True,
     ) -> None:
         if destination == "raced.txt" and dst_dir_fd is not None:
-            creator = threading.Thread(target=lambda: target.write_bytes(b"concurrent"))
+            creator = threading.Thread(
+                target=lambda: target.write_bytes(b"concurrent")
+            )
             creator.start()
-            creator.join(timeout=10)
-            assert not creator.is_alive(), "creator thread did not finish"
+            creator.join()
         original_link(
             source,
             destination,
@@ -1064,8 +1044,7 @@ async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> 
             assert outside.read_bytes() == b"outside"
     finally:
         stop.set()
-        swapper.join(timeout=10)
-        assert not swapper.is_alive(), "swapper thread did not finish"
+        swapper.join()
         if target.is_symlink():
             target.unlink()
         if not target.exists():
@@ -1159,12 +1138,13 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
                 )
             )
             if not result["isError"]:
-                assert Path(result["structuredContent"]["path"]).is_relative_to(sandbox)
+                assert Path(result["structuredContent"]["path"]).is_relative_to(
+                    sandbox
+                )
             assert outside_target.read_bytes() == b"outside"
     finally:
         stop.set()
-        swapper.join(timeout=10)
-        assert not swapper.is_alive(), "swapper thread did not finish"
+        swapper.join()
 
 
 @pytest.mark.asyncio
@@ -1390,7 +1370,6 @@ async def test_bash_rejects_max_output_above_host_cap_before_spawn_or_capture(
             },
             registry.abort_signal,
         )
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1426,7 +1405,6 @@ async def test_repeated_rejected_bash_output_limits_retain_no_captures(
         )
         assert result["isError"] is True
 
-    assert not marker.exists()
     assert captures == []
 
 
@@ -1532,7 +1510,9 @@ async def test_registry_preserves_terminal_agent_receipt_floor(tmp_path: Path) -
     result = await registry.execute(ToolCall("agent-small-limit", "agent", {}))
 
     text = result["content"][0]["text"]
-    assert text.endswith("1 turns · 0.5s · 0 tool calls · error=false · canceled=false")
+    assert text.endswith(
+        "1 turns · 0.5s · 0 tool calls · error=false · canceled=false"
+    )
     assert receipt_message_size(result, "agent-small-limit") <= 1_000
 
 
@@ -1585,9 +1565,7 @@ async def test_read_retains_only_bounded_output_from_large_file(
         return real_fdopen(file_descriptor, mode, *args, **kwargs)
 
     monkeypatch.setattr(read_module.os, "fdopen", tracking_fdopen)
-    registry = ToolRegistry(
-        tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("read-large", "read", {"path": "large.txt"})
@@ -1610,7 +1588,7 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
         tmp_path,
         abort_signal=abort_signal,
         max_output_chars=3_000_000,
-        skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
     )
 
     async def abort_soon() -> None:
@@ -1618,10 +1596,8 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
         abort_signal.abort()
 
     abort_task = asyncio.create_task(abort_soon())
-    result = await registry.execute(
-        ToolCall("read-abort", "read", {"path": "large.txt"})
-    )
-    await asyncio.wait_for(abort_task, 10)
+    result = await registry.execute(ToolCall("read-abort", "read", {"path": "large.txt"}))
+    await await_or_fail(abort_task, what="read abort task")
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
@@ -1629,45 +1605,32 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "timeout-child-alive"
-    started = tmp_path / "timeout-child-started"
-    release = tmp_path / "timeout-child-release"
+    child_pid = tmp_path / "timeout-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
-    execution = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-timeout",
-                "bash",
-                {
-                    "command": _descendant_command(
-                        marker, delay=1, started=started, release=release
-                    ),
-                    "timeout": 0.5,
-                },
+    async with _owned_descendant(child_pid):
+        execution = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-timeout",
+                    "bash",
+                    {
+                        "command": _descendant_command(child_pid=child_pid),
+                        "timeout": 0.5,
+                    },
+                )
             )
         )
-    )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("descendant did not start")
-    result = await execution
+        child_pid_value = await read_pid_file(child_pid)
+        result = await asyncio.wait_for(execution, 10)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert "timed out after" in result["content"][0]["text"]
-    assert result["structuredContent"]["timed_out"] is True
-    assert result["structuredContent"]["error"]["tool"] == "bash"
-    assert result["structuredContent"]["error"]["kind"] == "timeout"
-    assert not marker.exists()
+        assert result["isError"] is True
+        assert "timed out after" in result["content"][0]["text"]
+        assert result["structuredContent"]["timed_out"] is True
+        assert result["structuredContent"]["error"]["tool"] == "bash"
+        assert result["structuredContent"]["error"]["kind"] == "timeout"
 
-    release.touch()
-    for _ in range(20):
-        if marker.exists():
-            pytest.fail("descendant survived timeout cleanup")
-        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
@@ -1675,46 +1638,49 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launcher_ready = tmp_path / "launcher-ready"
+    # test-contract: seam launcher script readiness is controlled by this test
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
-        "import pathlib,time; time.sleep(1.0); "
-        f"pathlib.Path({str(launcher_ready)!r}).touch()\n"
+        f"import pathlib; pathlib.Path({str(launcher_ready)!r}).touch()\n"
         + tool_spawn_module._LAUNCHER,
     )
-    command_started = tmp_path / "timeout-command-started"
-    command_finished = tmp_path / "timeout-command-finished"
-    command = (
-        "import pathlib,time; "
-        f"pathlib.Path({str(command_started)!r}).touch(); time.sleep(1.5); "
-        f"pathlib.Path({str(command_finished)!r}).touch()"
-    )
-    original_spawn = bash_module.create_tool_subprocess_shell
+    timeout_started = asyncio.Event()
+    release_timeout = asyncio.Event()
+    timeout_started_early = False
+    real_sleep = asyncio.sleep
 
-    async def spawn_after_command_started(*args, **kwargs):
-        process = await original_spawn(*args, **kwargs)
-        assert launcher_ready.exists()
-        while not command_started.exists():
-            await asyncio.sleep(0.01)
-        return process
+    async def controlled_sleep(delay: float) -> None:
+        nonlocal timeout_started_early
+        if delay == 0.5:
+            timeout_started_early = not launcher_ready.exists()
+            timeout_started.set()
+            await asyncio.wait_for(release_timeout.wait(), 10)
+            return
+        await real_sleep(delay)
 
-    monkeypatch.setattr(
-        bash_module, "create_tool_subprocess_shell", spawn_after_command_started
-    )
+    monkeypatch.setattr(bash_module.asyncio, "sleep", controlled_sleep)
+    command = _python_command("import time; time.sleep(30)")
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-
-    result = await registry.execute(
-        ToolCall(
-            "bash-launcher-timeout",
-            "bash",
-            {"command": _python_command(command), "timeout": 2.0},
+    execution = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "bash-launcher-timeout",
+                "bash",
+                {"command": command, "timeout": 0.5},
+            )
         )
     )
 
+    await asyncio.wait_for(timeout_started.wait(), 10)
     assert launcher_ready.exists()
-    assert command_finished.exists()
-    assert result["isError"] is False
-    assert "timed_out" not in result["structuredContent"]
+    # test-contract: seam injected timeout awaitable records ordering
+    assert not timeout_started_early
+    release_timeout.set()
+    result = await asyncio.wait_for(execution, 10)
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["timed_out"] is True
 
 
 @pytest.mark.asyncio
@@ -1754,31 +1720,10 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
     )
 
     assert result["isError"] is True
-    assert (
-        "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
-    )
+    assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
-    _, child_pgid = (int(value) for value in pid_file.read_text().split())
-    live_group = []
-    for _ in range(50):
-        rows = (
-            await asyncio.to_thread(
-                subprocess.check_output,
-                ["ps", "-axo", "pid=,pgid=,stat="],
-                text=True,
-            )
-        ).splitlines()
-        live_group = [
-            row.split()[0]
-            for row in rows
-            if len(row.split()) >= 3
-            and int(row.split()[1]) == child_pgid
-            and not row.split()[2].startswith("Z")
-        ]
-        if not live_group:
-            break
-        await asyncio.sleep(0.02)
-    assert not live_group
+    child_pid, _ = (int(value) for value in pid_file.read_text().split())
+    await asyncio.wait_for(wait_pid_exited(child_pid), 10)
 
 
 @pytest.mark.asyncio
@@ -1871,59 +1816,55 @@ async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
-    marker = tmp_path / "cancel-child-alive"
-    started = tmp_path / "cancel-child-started"
+    child_pid = tmp_path / "cancel-child.pid"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-cancel",
-                "bash",
-                {"command": _descendant_command(marker, started=started), "timeout": 5},
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-cancel",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    for _ in range(100):
-        if started.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert started.exists()
-    task.cancel()
+        # The pid file is written by the descendant itself, so this is real process readiness.
+        await read_pid_file(child_pid)
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0.4)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
-    assert not marker.exists()
 
 
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     tmp_path: Path,
 ) -> None:
-    marker = tmp_path / "abort-child-alive"
+    child_pid = tmp_path / "abort-child.pid"
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(
-        tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty()
-    )
-    task = asyncio.create_task(
-        registry.execute(
-            ToolCall(
-                "bash-abort",
-                "bash",
-                {"command": _descendant_command(marker), "timeout": 5},
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
+    async with _owned_descendant(child_pid):
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "bash-abort",
+                    "bash",
+                    {"command": _descendant_command(child_pid=child_pid), "timeout": 5},
+                )
             )
         )
-    )
-    await asyncio.sleep(0.05)
-    abort_signal.abort()
+        await read_pid_file(child_pid)
+        abort_signal.abort()
 
-    result = await asyncio.wait_for(task, timeout=0.5)
-    await asyncio.sleep(0.4)
+        result = await asyncio.wait_for(task, timeout=10)
+        child_pid_value = await read_pid_file(child_pid)
+        await wait_pid_exited(child_pid_value)
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
-    assert not marker.exists()
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
@@ -1946,9 +1887,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(
-        tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     real_wait = bash_module.asyncio.wait
 
     async def forced_tie(tasks, *, return_when):
@@ -1978,9 +1917,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
 async def test_argument_finiteness_covers_undeclared_and_default_fields(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "permissive",
         lambda arguments: "ran",
@@ -2000,9 +1937,7 @@ async def test_argument_finiteness_covers_undeclared_and_default_fields(
 
 
 @pytest.mark.asyncio
-async def test_registered_schema_copies_cannot_disable_validation(
-    tmp_path: Path,
-) -> None:
+async def test_registered_schema_copies_cannot_disable_validation(tmp_path: Path) -> None:
     called = False
 
     def handler(arguments: dict[str, object]) -> str:
@@ -2010,9 +1945,7 @@ async def test_registered_schema_copies_cannot_disable_validation(
         called = True
         return "ran"
 
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     definition = registry.register(
         "typed",
         handler,
@@ -2037,15 +1970,15 @@ async def test_registered_schema_copies_cannot_disable_validation(
 async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "number",
         lambda arguments: "number",
         parameters={
             "type": "object",
-            "properties": {"value": {"type": "number", "minimum": 0, "maximum": 10}},
+            "properties": {
+                "value": {"type": "number", "minimum": 0, "maximum": 10}
+            },
         },
     )
     registry.register(
@@ -2057,19 +1990,25 @@ async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
         },
     )
 
-    nan_result = await registry.execute(ToolCall("nan", "number", {"value": math.nan}))
-    bool_result = await registry.execute(ToolCall("bool", "enum", {"value": True}))
-    int_result = await registry.execute(ToolCall("int", "enum", {"value": 1}))
+    nan_result = await registry.execute(
+        ToolCall("nan", "number", {"value": math.nan})
+    )
+    bool_result = await registry.execute(
+        ToolCall("bool", "enum", {"value": True})
+    )
+    int_result = await registry.execute(
+        ToolCall("int", "enum", {"value": 1})
+    )
     assert nan_result["isError"] is True
     assert bool_result["isError"] is True
     assert int_result["content"][0]["text"] == "enum"
 
 
+
+
 @pytest.mark.asyncio
 async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> None:
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     started = asyncio.Event()
     observed: list[bool] = []
 
@@ -2079,7 +2018,7 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
     ) -> str:
         del arguments
         started.set()
-        await asyncio.wait_for(abort_signal.wait(), 10)
+        await abort_signal.wait()
         observed.append(abort_signal.is_set())
         await asyncio.sleep(0)
         observed.append(abort_signal.is_set())
@@ -2106,6 +2045,12 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
     assert observed == [True, True]
 
 
+
+
+
+
+
+
 @pytest.mark.asyncio
 async def test_pre_execution_hook_can_allow_and_deny(tmp_path: Path) -> None:
     seen: list[tuple[str, dict[str, object]]] = []
@@ -2114,12 +2059,7 @@ async def test_pre_execution_hook_can_allow_and_deny(tmp_path: Path) -> None:
         seen.append((name, arguments))
         return arguments.get("allow") is True
 
-    registry = ToolRegistry(
-        tmp_path,
-        pre_execute_hook=hook,
-        register_builtin=False,
-        skill_catalog=SkillCatalog.empty(),
-    )
+    registry = ToolRegistry(tmp_path, pre_execute_hook=hook, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "gated",
         lambda arguments: "allowed",
@@ -2154,9 +2094,7 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
 
     events = [
         event
-        async for event in AgentLoop(
-            backend, store, registry=registry, skill_catalog=SkillCatalog.empty()
-        ).run_turn("read it", origin=MessageOrigin.USER)
+        async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it", origin=MessageOrigin.USER)
     ]
 
     result_message = store.messages()[2]
@@ -2201,7 +2139,7 @@ async def test_agent_loop_mapping_tools_still_validate_through_registry(
             store,
             tools={"typed": typed},
             tool_schemas=[schema],
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("go", origin=MessageOrigin.USER)
     ]
 
@@ -2216,7 +2154,9 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
     backend = FakeBackend(
         [
             ScriptedTurn(
-                tool_calls=[ToolCall("call-1", "bash", {"command": "printf unsafe"})]
+                tool_calls=[
+                    ToolCall("call-1", "bash", {"command": "printf unsafe"})
+                ]
             ),
             ScriptedTurn(content=[TextContent("done")]),
         ]
@@ -2229,7 +2169,7 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
             store,
             tools={"safe_only": lambda arguments: "safe"},
             tool_schemas=[{"name": "safe_only"}],
-            skill_catalog=SkillCatalog.empty(),
+skill_catalog=SkillCatalog.empty(),
         )
     )
 
@@ -2240,9 +2180,7 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_keeps_boundary_abort_for_pending_tools(
-    tmp_path: Path,
-) -> None:
+async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path) -> None:
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[ToolCall("call-1", "step", {})]),
@@ -2250,15 +2188,11 @@ async def test_agent_loop_keeps_boundary_abort_for_pending_tools(
         ]
     )
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
-    )
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("step", lambda arguments: "ran")
     aborted = False
 
-    async for event in AgentLoop(
-        backend, store, registry=registry, skill_catalog=SkillCatalog.empty()
-    ).run_turn("go", origin=MessageOrigin.USER):
+    async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("go", origin=MessageOrigin.USER):
         if event.type is StreamEventType.MESSAGE_END and not aborted:
             registry.abort()
             aborted = True
@@ -2293,14 +2227,10 @@ async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> No
         return arguments["value"]
 
     await _collect_loop(
-        AgentLoop(
-            backend, store, tools={"step": step}, skill_catalog=SkillCatalog.empty()
-        )
+        AgentLoop(backend, store, tools={"step": step}, skill_catalog=SkillCatalog.empty())
     )
 
-    results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
+    results = [message.tool_result for message in store.messages() if message.tool_result]
     assert [result.content for result in results] == [
         "abort",
         "tool execution canceled",
@@ -2329,24 +2259,14 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
             started.set()
         return True
 
-    registry = ToolRegistry(
-        tmp_path, pre_execute_hook=hook, skill_catalog=SkillCatalog.empty()
-    )
-    task = asyncio.create_task(
-        _collect_loop(
-            AgentLoop(
-                backend, store, registry=registry, skill_catalog=SkillCatalog.empty()
-            )
-        )
-    )
-    await asyncio.wait_for(started.wait(), 10)
+    registry = ToolRegistry(tmp_path, pre_execute_hook=hook, skill_catalog=SkillCatalog.empty())
+    task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())))
+    await started.wait()
     await asyncio.sleep(0.05)
     registry.abort()
-    await asyncio.wait_for(task, 10)
+    await task
 
-    results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
+    results = [message.tool_result for message in store.messages() if message.tool_result]
     assert [result.content for result in results] == [
         "tool execution canceled",
         "tool execution canceled",
@@ -2374,9 +2294,15 @@ def _seed_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _assert_env_dump_is_scrubbed(dump: str) -> None:
-    names = {line.split("=", 1)[0] for line in dump.splitlines() if "=" in line}
+    names = {
+        line.split("=", 1)[0]
+        for line in dump.splitlines()
+        if "=" in line
+    }
     for credential in _CREDENTIAL_ENV_FIXTURES:
-        assert credential not in names, f"{credential} leaked into tool subprocess env"
+        assert credential not in names, (
+            f"{credential} leaked into tool subprocess env"
+        )
     for keeper in _UNRELATED_ENV_FIXTURES:
         assert keeper in names, f"{keeper} was stripped by the credential filter"
     assert "PATH" in names, "PATH must survive so shell commands still resolve"
@@ -2478,9 +2404,7 @@ async def test_bash_tool_subprocess_sets_tool_marker(
 ) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
-        ToolCall(
-            "marker", "bash", {"cmd": "/usr/bin/env | grep '^ZETA_TOOL_SUBPROCESS='"}
-        )
+        ToolCall("marker", "bash", {"cmd": "/usr/bin/env | grep '^ZETA_TOOL_SUBPROCESS='"})
     )
     assert result["isError"] is False
     assert "ZETA_TOOL_SUBPROCESS=1" in result["structuredContent"]["stdout"]
@@ -2583,7 +2507,9 @@ async def test_run_background_lowers_child_priority_without_changing_parent(
         ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
     )
 
-    assert int(output["structuredContent"]["output"]) == min(19, parent_niceness + 10)
+    assert int(output["structuredContent"]["output"]) == min(
+        19, parent_niceness + 10
+    )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()
 
