@@ -861,6 +861,47 @@ def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
     assert target in request.visible_entry_ids
 
 
+def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, _targets = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("backlog", "PR #425 needs macOS verification."),
+    )
+    transcript = _transcript(_row(1, "PR #425 merged."))
+    projections = 0
+    original_projection = entry_request._entry_projection
+
+    def projection(entry):
+        nonlocal projections
+        projections += 1
+        return original_projection(entry)
+
+    monkeypatch.setattr(entry_request, "_entry_projection", projection)
+
+    first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+
+    assert second.prompt == first.prompt
+    first_projections = projections
+    assert first_projections > 0
+
+    changed_entry = next(
+        entry for entry in state.entries.values() if isinstance(entry, MemoryEntry)
+    )
+    changed = replace(changed_entry, text=changed_entry.text + " changed")
+    changed_state = replace(
+        state,
+        generation=state.generation + 1,
+        entries={**state.entries, changed.id: changed},
+    )
+    _prepare_request(transcript, changed_state, as_of=date(2026, 10, 9))
+    assert projections == first_projections * 2
+
+
 def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
     tmp_path: Path,
 ) -> None:
