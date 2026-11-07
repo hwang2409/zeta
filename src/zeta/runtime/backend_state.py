@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..core.slash import effective_budget_for_model
-from ..protocol.types import CompletionBackend, ContextWindowBackend
+from ..protocol.types import (
+    CompletionBackend,
+    ContextWindowBackend,
+    OwnedCompletionBackend,
+    is_owned_completion_backend,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +42,21 @@ def prepare_backend_state(loop: Any, backend: CompletionBackend) -> PreparedBack
     return PreparedBackendState(backend, token_budget)
 
 
-def apply_backend_state(loop: Any, state: PreparedBackendState) -> None:
+def apply_backend_state(
+    loop: Any, state: PreparedBackendState
+) -> OwnedCompletionBackend | None:
     if isinstance(state.backend, ContextWindowBackend):
         state.backend.set_token_budget(state.token_budget)
+    previous = loop.backend
     loop.backend = state.backend
     loop.context_assembler.update_backend(state.backend)
     loop.context_assembler.update_token_budget(state.token_budget)
     if loop.step_delivery is not None:
         loop.step_delivery.capacity_changed()
+    if state.backend is previous:
+        return None
+    loop.register_backend_owner(state.backend)
+    if is_owned_completion_backend(previous):
+        previous.retire()
+        return previous
+    return None
