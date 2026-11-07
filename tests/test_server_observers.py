@@ -575,7 +575,7 @@ async def test_observer_cap_and_reconnect(tmp_path: Path) -> None:
     extra_reader, extra_writer = await asyncio.open_unix_connection(str(server.socket_path))
     try:
         response = (await _request(extra_reader, extra_writer, 20, "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]}))[-1]
-        assert response["error"]["code"] == -32004
+        assert response["error"]["code"] == -32001
     finally:
         extra_writer.close(); await extra_writer.wait_closed()
         observers[0][1].close(); await observers[0][1].wait_closed()
