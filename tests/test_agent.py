@@ -4817,9 +4817,18 @@ def test_agent_schema_uses_preset_registry(
     assert agent_type_schema["description"] == expected_description
 
 
-def test_child_registry_agent_schema_uses_its_catalog_snapshot(tmp_path: Path) -> None:
-    initial = AgentCatalog((replace(GENERAL_PRESET, name="initial"),))
-    current = AgentCatalog((replace(GENERAL_PRESET, name="nested"),))
+@pytest.mark.asyncio
+async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_path = tmp_path / "initial.md"
+    initial = AgentCatalog(
+        (replace(GENERAL_PRESET, name="initial", source="user", path=profile_path),)
+    )
+    current = AgentCatalog(
+        (replace(GENERAL_PRESET, name="nested", source="user", path=profile_path),)
+    )
+    monkeypatch.setattr("zeta.config.live.discover_session_agents", lambda **_: current)
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     registry = ToolRegistry(
         tmp_path,
@@ -4827,16 +4836,28 @@ def test_child_registry_agent_schema_uses_its_catalog_snapshot(tmp_path: Path) -
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=initial,
     )
-    registry.agent_catalog = current
-
     child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    child = None
     try:
         child = registry.clone_for_session(child_store)
+        loop = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            registry=child,
+            skill_catalog=SkillCatalog.empty(),
+            agent_catalog=initial,
+            live_config_home=tmp_path,
+            live_config_project_dir=tmp_path,
+        )
+        await loop.refresh_live_config(force=True, publish=False)
         schema = child.definition_reference("agent").schema()
         properties = schema["parameters"]["properties"]
         assert properties["agent_type"]["enum"] == ["nested"]
         assert properties["preset"]["enum"] == ["nested"]
     finally:
+        if child is not None:
+            await child.close()
+        await registry.close()
         child_store.close()
         store.close()
 

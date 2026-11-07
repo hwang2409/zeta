@@ -452,6 +452,9 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
+        child_home = Path(loop.active_home) if loop.active_home else env_home()
+        child_prompt, child_project_dir = await asyncio.to_thread(
+            _child_base_system_prompt, loop, cwd_override, child_registry)
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -461,9 +464,7 @@ async def _build_child_loop(
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                await asyncio.to_thread(
-                    _child_base_system_prompt, loop, cwd_override, child_registry
-                ),
+                child_prompt,
                 preset,
                 explicit_finish=explicit_finish,
             ),
@@ -478,7 +479,10 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            live_config_home=child_home,
+            live_config_project_dir=child_project_dir,
         )
+        await child_loop.refresh_live_config(publish=False)
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)
         child_loop.account_context = child_registry.account_context
@@ -501,6 +505,7 @@ async def _build_child_loop(
         cleanup.result()
         raise
     except BaseException:
+        
         await close_construction(background_task_cause="child spawn setup failed")
         raise
 
