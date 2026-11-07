@@ -563,7 +563,8 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
         for block in message["content"]
     )
     assert not any(
-        isinstance(block, TextContent) and block.text.startswith("skills changed:")
+        isinstance(block, TextContent)
+        and block.text.startswith("[zeta] skill refresh:")
         for message in messages
         for block in message.content
     )
@@ -573,11 +574,12 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
         block.text
         for message in store.messages()
         for block in message.content
-        if isinstance(block, TextContent) and block.text.startswith("skills changed:")
+        if isinstance(block, TextContent)
+        and block.text.startswith("[zeta] skill refresh:")
     ]
     assert notices == [
         (
-            "skills changed: added instant\n"
+            "[zeta] skill refresh: skills changed: added instant\n"
             "skills changed, but this session's prompt predates owned skill spans; "
             "restart the session to refresh its skill index"
         )

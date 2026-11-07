@@ -22,7 +22,6 @@ from ..runtime.prompt import (
     owned_fragment,
     replace_owned_fragment,
 )
-from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry
 from .presets import AgentPreset, compose_system_prompt
 
@@ -171,9 +170,7 @@ def _compose_child_project_context(
         context,
         system_prompt=prompt,
         memory_offset=(
-            context.memory_offset + shift
-            if context.memory_offset is not None
-            else None
+            context.memory_offset + shift if context.memory_offset is not None else None
         ),
         prompt_components=components,
     )
@@ -188,7 +185,7 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = load_agent(preset)
+    body = preset.prompt_suffix
     if explicit_finish:
         body = (
             f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"

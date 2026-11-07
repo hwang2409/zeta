@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...agent.plan_mode import plan_mode_prompt
-from ...protocol.types import Message, MessageOrigin, MessageRole, TextContent
+from ...protocol.types import harness_notice
 from ...skills import SkillCatalog, SkillCatalogWatcher, SkillRefresh
 from ..prompt import PromptFragment, RuntimePrompt, replace_owned_fragment
 
@@ -91,10 +91,10 @@ class SkillRefreshMixin:
             return self._plan_mode_prior_prompt
         return self._runtime_prompt
 
-    def _prompt_base_is_current(
-        self, generation: int, base: RuntimePrompt
-    ) -> bool:
-        return generation == self._prompt_generation and base is self._skill_prompt_base()
+    def _prompt_base_is_current(self, generation: int, base: RuntimePrompt) -> bool:
+        return (
+            generation == self._prompt_generation and base is self._skill_prompt_base()
+        )
 
     def _commit_prepared_prompt(
         self, generation: int, base: RuntimePrompt, prepared: RuntimePrompt
@@ -187,11 +187,7 @@ class SkillRefreshMixin:
         count = len(self._skill_refresh_notices)
         notice = "\n".join(self._skill_refresh_notices[:count])
         await self._append_turn_message(
-            Message(
-                MessageRole.USER,
-                [TextContent(notice)],
-                metadata={"zeta.origin": MessageOrigin.HARNESS_NUDGE.value},
-            )
+            harness_notice("skill refresh", notice, event="skill_refresh")
         )
         del self._skill_refresh_notices[:count]
 

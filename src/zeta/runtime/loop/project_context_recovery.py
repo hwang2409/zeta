@@ -49,8 +49,12 @@ class ProjectContextRecoveryMixin:
         self._project_context_project_id = project_id
         self._project_context_prepare = prepare
         self._project_context_replace_component = replace_component
-        self._project_context_read_task: asyncio.Task[ProjectContextProjection] | None = None
-        self._project_context_prepare_task: asyncio.Task[_PreparedProjectContext] | None = None
+        self._project_context_read_task: (
+            asyncio.Task[ProjectContextProjection] | None
+        ) = None
+        self._project_context_prepare_task: (
+            asyncio.Task[_PreparedProjectContext] | None
+        ) = None
         self._project_context_pending: ProjectContextProjection | None = None
 
     async def _read_project_context_projection(self) -> ProjectContextProjection:

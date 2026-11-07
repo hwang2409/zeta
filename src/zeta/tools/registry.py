@@ -318,6 +318,9 @@ class ToolRegistry:
             if session_store is not None
             else None,
             command_niceness=command_niceness,
+            storage_lease=(
+                session_store._storage_lease if session_store is not None else None
+            ),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -331,6 +334,7 @@ class ToolRegistry:
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
+        self._schema_hidden_names: frozenset[str] = frozenset()
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
@@ -410,7 +414,11 @@ class ToolRegistry:
     def schemas(self) -> list[ToolSchema]:
         schemas: list[ToolSchema] = []
         for name, definition in self._tools.items():
-            if name in self._mcp_hidden or not self.tool_is_allowed(name):
+            if (
+                name in self._mcp_hidden
+                or name in self._schema_hidden_names
+                or not self.tool_is_allowed(name)
+            ):
                 continue
             schema = definition.schema()
             if definition.actions is not None:
@@ -433,7 +441,11 @@ class ToolRegistry:
         allowed: list[ToolSchema] = []
         for schema in schemas:
             name = schema.get("name")
-            if not isinstance(name, str) or not self.tool_is_allowed(name):
+            if (
+                not isinstance(name, str)
+                or name in self._schema_hidden_names
+                or not self.tool_is_allowed(name)
+            ):
                 continue
             definition = self._tools.get(name)
             if definition is not None and definition.actions is not None:
@@ -687,6 +699,7 @@ class ToolRegistry:
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        hide_schema_names: set[str] | frozenset[str] = frozenset(),
         profile_tool_allow: Sequence[str] | None = None,
         cwd: str | Path | None = None,
         image_policy: ImagePolicy | None = None,
@@ -713,6 +726,7 @@ class ToolRegistry:
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._mcp_excluded_names = frozenset(exclude_names)
+        clone._schema_hidden_names = frozenset(hide_schema_names)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
@@ -744,6 +758,7 @@ class ToolRegistry:
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
             command_niceness=clone.command_niceness,
+            storage_lease=store._storage_lease,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -805,7 +820,9 @@ class ToolRegistry:
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
+        self.background_tasks.bind_session_dir(
+            store.session_dir, store.directory_fd, store._storage_lease
+        )
         self.bash_cwd = store.bash_cwd
 
     @property

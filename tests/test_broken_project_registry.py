@@ -65,14 +65,18 @@ _CORRUPTIONS: tuple[tuple[str, Callable[[Path, Path, Path], None]], ...] = (
 _CASE_IDS = [case for case, _corrupt in _CORRUPTIONS]
 
 
-def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "projects"
     registry = ProjectRegistry(root)
     registry.create_project("one", "repo")
     lock = root / ".lock"
     fd = os.open(lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    monkeypatch.setattr("zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        "zeta.project_registry._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0.05
+    )
     finished = threading.Event()
     outcome: list[BaseException] = []
 
@@ -99,15 +103,11 @@ def test_registry_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.Monke
 def _make_registry(home: Path) -> tuple[Path, Path]:
     linked = home / "linked-project"
     linked.mkdir(parents=True)
-    project = ProjectRegistry(home / "projects").create_project(
-        "linked", "git", linked
-    )
+    project = ProjectRegistry(home / "projects").create_project("linked", "git", linked)
     return linked, home / "projects" / project.project_id / "project.json"
 
 
-def _corrupt_registry(
-    home: Path, corrupt: Callable[[Path, Path, Path], None]
-) -> Path:
+def _corrupt_registry(home: Path, corrupt: Callable[[Path, Path, Path], None]) -> Path:
     linked, record = _make_registry(home)
     corrupt(home, linked, record)
     return record
@@ -218,9 +218,14 @@ def test_broken_registry_tui_start_and_resume_without_repair(
             assert ("inbox" in app.loop.tool_registry.registered_names) == (
                 "--resume" in arguments
             )
-            assert app.loop.project_registry is state.registry or app.loop.project_registry is not None
+            assert (
+                app.loop.project_registry is state.registry
+                or app.loop.project_registry is not None
+            )
             assert app.loop.project_context_health is not None
-            assert memory not in app.loop.context_assembler.system_prompt.content[0].text
+            assert (
+                memory not in app.loop.context_assembler.system_prompt.content[0].text
+            )
         assert _registry_snapshot(projects) == before
     finally:
         if record.exists():
@@ -409,7 +414,9 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
 
         def held_close_projection(operation):
             close_read_entered.set()
-            assert close_read_release.wait(30), "project-context close read was not released"
+            assert close_read_release.wait(30), (
+                "project-context close read was not released"
+            )
             return original_close_projection(operation)
 
         # test-contract: seam Hold the production projection read during close.
@@ -436,9 +443,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
             await _drain(close_task, 30)
         elif closing_app is not None:
             await _drain(
-                asyncio.create_task(
-                    closing_app.close(), name="closing_app.close()"
-                ),
+                asyncio.create_task(closing_app.close(), name="closing_app.close()"),
                 30,
             )
         await _drain(asyncio.create_task(app.close(), name="app.close()"), 30)
@@ -492,13 +497,8 @@ def test_tui_omits_malformed_version_authority_but_keeps_inbox_guidance(
         registry._replace_entry_kind(project.project_id, "state", "current")
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         (
-            project_root
-            / "memory-versions"
-            / "versions"
-            / f"{pointer['current']}.json"
-        ).write_text(
-            "{", encoding="utf-8"
-        )
+            project_root / "memory-versions" / "versions" / f"{pointer['current']}.json"
+        ).write_text("{", encoding="utf-8")
     else:
         pointer_path.write_text("{", encoding="utf-8")
     legacy_path = project_root / "memory" / "brief.md"

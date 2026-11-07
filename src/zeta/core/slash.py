@@ -1,4 +1,5 @@
 """Small input-time slash-command dispatcher."""
+
 from __future__ import annotations
 
 import asyncio
@@ -50,13 +51,17 @@ from .store import ConversationEntry
 
 class UsageCounterSource(Protocol):
     """Cumulative usage counters exposed by the context assembler."""
+
     uncached_input_tokens_this_session: int
     output_tokens_this_session: int
     cache_read_input_tokens_this_session: int
     cache_creation_input_tokens_this_session: int
+
+
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
     """One completed turn's token usage."""
+
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
@@ -64,6 +69,7 @@ class UsageSnapshot:
     cache_creation_input_tokens: int = 0
     model: str | None = None
     estimated_cost_usd: float | None = None
+
     @property
     def cache_total(self) -> int:
         return (
@@ -71,13 +77,17 @@ class UsageSnapshot:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
+
     @property
     def cache_hit_rate(self) -> float | None:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
+
+
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
+
     def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
         self.provider = provider
@@ -86,12 +96,15 @@ class UsageTracker:
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
+
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
+
     @property
     def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._cost_by_model.values())
+
     def record(self, event_type: StreamEventType, model: str) -> None:
         current = self._counters()
         self._record_cost_delta(current, model)
@@ -99,14 +112,18 @@ class UsageTracker:
             self._baseline = current
         elif event_type is StreamEventType.TURN_END:
             self._completed_turns += 1
-            snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
+            snapshot = usage_delta(
+                current, self._baseline, self._completed_turns, model
+            )
             self._history.append(snapshot)
             self._baseline = current
+
     def record_compaction(self, model: str) -> None:
         """Record direct compaction usage without adding a trend snapshot."""
         current = self._counters()
         self._record_cost_delta(current, model)
         self._baseline = current
+
     def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
         snapshot = usage_delta(current, self._cost_baseline, 0, model)
         self._cost_baseline = dict(current)
@@ -344,9 +361,7 @@ def compaction_summary(
         entries_folded=entries_folded,
         tokens_saved=max(
             0,
-            source_tokens
-            - token_counter(marker_message)
-            - token_counter(summary),
+            source_tokens - token_counter(marker_message) - token_counter(summary),
         ),
     )
 
@@ -444,7 +459,14 @@ def usage_delta(
 
 LONG_CONTEXT_INPUT_THRESHOLD = 272_000
 LONG_CONTEXT_MODELS = frozenset(
-    {"codex-auto-review", "gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
+    {
+        "codex-auto-review",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    }
 )
 
 
@@ -531,6 +553,7 @@ class SlashStatus:
     transcript_index_failure: str | None = None
     project_context_health: str | None = None
     explicit_finish: bool = False
+    max_agent_depth: int = 3
 
 
 class SlashSession(Protocol):
@@ -538,9 +561,7 @@ class SlashSession(Protocol):
 
     async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str: ...
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str: ...
 
     def slash_model(self, args: str) -> str: ...
 
@@ -619,9 +640,7 @@ class SlashCommandRegistry:
         self._skills: dict[str, SkillMeta] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
-        self._mcp_prompts = MCPPromptCommands(
-            self._notices, self._warning_notices
-        )
+        self._mcp_prompts = MCPPromptCommands(self._notices, self._warning_notices)
 
     def register(self, command: SlashCommand) -> None:
         if not is_slash_safe_name(command.name):
@@ -634,7 +653,9 @@ class SlashCommandRegistry:
     def custom_commands(self) -> tuple[CustomCommand, ...]:
         """Return loaded custom commands in stable name order."""
 
-        return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
+        return tuple(
+            self._custom_commands[name] for name in sorted(self._custom_commands)
+        )
 
     @property
     def builtin_commands(self) -> tuple[SlashCommand, ...]:
@@ -685,9 +706,7 @@ class SlashCommandRegistry:
         prompts = self._mcp_prompts.completion_entries()
         return builtins + custom + skills + prompts
 
-    def set_mcp_prompts(
-        self, entries: Sequence[tuple[str, str, MCPPrompt]]
-    ) -> None:
+    def set_mcp_prompts(self, entries: Sequence[tuple[str, str, MCPPrompt]]) -> None:
         """Replace live MCP prompt commands from one mount snapshot."""
         self._mcp_prompts.replace(tuple(entries))
 
@@ -892,9 +911,7 @@ def _format_status(status: SlashStatus) -> str:
     )
     child_tokens = child_total + status.child_output_tokens_this_session
     cache_hit_rate = (
-        "n/a"
-        if cache_total == 0
-        else f"{cache_read / cache_total * 100:.1f}%"
+        "n/a" if cache_total == 0 else f"{cache_read / cache_total * 100:.1f}%"
     )
     child_hit_rate = (
         "n/a"
@@ -903,19 +920,23 @@ def _format_status(status: SlashStatus) -> str:
     )
     cost_text = _format_estimated_cost(status)
     trend = status.usage_history[-8:]
-    trend_text = " ".join(
-        f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
-        if snapshot.cache_hit_rate is not None
-        else f"{snapshot.turn}:n/a"
-        for snapshot in trend
-    ) or "none"
+    trend_text = (
+        " ".join(
+            f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
+            if snapshot.cache_hit_rate is not None
+            else f"{snapshot.turn}:n/a"
+            for snapshot in trend
+        )
+        or "none"
+    )
     context_gauge = render_context_gauge(
         status.tokens_in_current_context,
         status.model_window,
     )
     window_text = (
         f"{status.tokens_in_current_context} / {status.model_window}"
-        if status.tokens_in_current_context is not None and status.model_window is not None
+        if status.tokens_in_current_context is not None
+        and status.model_window is not None
         else "unknown"
     )
     lines = [
@@ -925,6 +946,7 @@ def _format_status(status: SlashStatus) -> str:
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"explicit_finish: {'on' if status.explicit_finish else 'off'}",
+        f"max_agent_depth: {status.max_agent_depth}",
         f"retained_tail: {status.retained_tail}",
         f"tokens_used_this_session: {status.tokens_used_this_session + child_tokens}",
         f"tokens_in_current_context: {context_tokens}",
@@ -967,12 +989,9 @@ def _format_status(status: SlashStatus) -> str:
         [
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
-            "automatic_memory_failure: "
-            + (status.automatic_memory_failure or "none"),
-            "transcript_index_failure: "
-            + (status.transcript_index_failure or "none"),
-            "project_context_health: "
-            + (status.project_context_health or "healthy"),
+            "automatic_memory_failure: " + (status.automatic_memory_failure or "none"),
+            "transcript_index_failure: " + (status.transcript_index_failure or "none"),
+            "project_context_health: " + (status.project_context_health or "healthy"),
         ]
     )
     if status.todo_counts is not None:
@@ -994,7 +1013,8 @@ def _format_estimated_cost(status: SlashStatus) -> str:
             return f"unavailable (unknown model: {status.model})"
         return "unavailable (model attribution unavailable)"
     if status.usage_cost_by_model and all(
-        snapshot.estimated_cost_usd is not None for snapshot in status.usage_cost_by_model
+        snapshot.estimated_cost_usd is not None
+        for snapshot in status.usage_cost_by_model
     ):
         total = sum(
             snapshot.estimated_cost_usd or 0.0
@@ -1046,9 +1066,7 @@ def _run_init(
         return "init unchanged: /init does not accept arguments"
     if project_root is None:
         return "init error: not inside a project"
-    return ModelInputEnvelope(
-        INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION
-    )
+    return ModelInputEnvelope(INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION)
 
 
 async def _run_compact(session: SlashSession, args: str) -> str:
@@ -1156,24 +1174,29 @@ def create_slash_registry(
     registry.register(SlashCommand("keys", _run_keys, "show keyboard shortcuts"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
-        SlashCommand("model", _run_model, "pick a model or switch to one: /model [name]")
+        SlashCommand(
+            "model", _run_model, "pick a model or switch to one: /model [name]"
+        )
     )
     registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
-    registry.register(
-        SlashCommand("plan", _run_plan, "show or change plan mode")
-    )
+    registry.register(SlashCommand("plan", _run_plan, "show or change plan mode"))
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
     instruction_handler = lambda session, args: project_instructions_command(
-        session, args, private_project_root,
+        session,
+        args,
+        private_project_root,
         Path(effective_home).expanduser().resolve() if effective_home else None,
         project_registry_state,
     )
-    registry.register(SlashCommand(
-        "project-instructions", instruction_handler,
-        "open or create private project instructions in your editor",
-    ))
+    registry.register(
+        SlashCommand(
+            "project-instructions",
+            instruction_handler,
+            "open or create private project instructions in your editor",
+        )
+    )
     registry.register(
         SlashCommand(
             "init",
@@ -1191,9 +1214,7 @@ def create_slash_registry(
             "fork from a prior user message or checkpoint",
         )
     )
-    registry.register(
-        SlashCommand("tree", _run_tree, "list branches or switch to one")
-    )
+    registry.register(SlashCommand("tree", _run_tree, "list branches or switch to one"))
     registry.register(
         SlashCommand("tools", _run_tools, "list tools or trust project tools")
     )
@@ -1214,23 +1235,27 @@ def create_slash_registry(
     )
     registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
     registry.register(
-        SlashCommand("memory", _run_memory, "show, retry, or undo automatic memory updates")
+        SlashCommand(
+            "memory", _run_memory, "show, retry, or undo automatic memory updates"
+        )
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
-    registry.register(
-        SlashCommand("tasks", _run_tasks, "inspect background processes")
-    )
+    registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
         SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
     )
     registry.register(
-        SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
+        SlashCommand(
+            "send", _run_send, "send a follow-up to a run: /send <id> <message>"
+        )
     )
     registry.register(
-        SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
+        SlashCommand(
+            "help", lambda _session, _args: registry.help_text(), "list commands"
+        )
     )
     for command in extra_commands:
         registry.register(command)

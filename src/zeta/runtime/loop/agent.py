@@ -1,4 +1,5 @@
 """The provider-neutral agent loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +18,11 @@ from typing import Any, Literal, TypeVar
 
 from ...agent import recovery_lease
 from ...agent.background import BackgroundAgentOwner
-from ...agent.budget import MAX_AGENT_DEPTH
+from ...agent.budget import (
+    DEFAULT_MAX_AGENT_DEPTH,
+    HARD_MAX_AGENT_DEPTH,
+    agent_tool_available,
+)
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.pending_delivery import (
@@ -179,6 +184,7 @@ class AgentLoop(
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
+        max_agent_depth: int = DEFAULT_MAX_AGENT_DEPTH,
         agent_instance_id: str | None = None,
         root_project_id: str | None = None,
         parent_session_id: str | None = None,
@@ -191,12 +197,22 @@ class AgentLoop(
         skill_project_dir: Path | None = None,
         freeze_skill_catalog: bool = False,
     ) -> None:
-        if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
-            raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
+        if (
+            type(max_agent_depth) is not int
+            or not 0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
+        ):
+            raise ValueError(
+                f"maximum agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
+            )
+        if type(agent_depth) is not int or not 0 <= agent_depth <= HARD_MAX_AGENT_DEPTH:
+            raise ValueError(
+                f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
+            )
         self.backend = backend
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
+        self.max_agent_depth = max_agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
         self.parent_session_id = parent_session_id
@@ -217,7 +233,9 @@ class AgentLoop(
             and project_registry is not None
         ):
             self._child_lineage_publisher = ChildLineagePublisher(
-                project_registry, self.root_session_dir
+                project_registry,
+                self.root_session_dir,
+                self.store._storage_lease,
             )
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
@@ -344,6 +362,8 @@ class AgentLoop(
             schemas = plan_mode_tool_schemas(
                 self.backend, schemas, policy=self._plan_mode_policy
             )
+        if not agent_tool_available(self.agent_depth, self.max_agent_depth):
+            schemas = [schema for schema in schemas if schema.get("name") != "agent"]
         return canonical_tool_schemas(schemas)
 
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:

@@ -83,7 +83,9 @@ class _SessionRecency:
         self._start()
 
     async def flush(self) -> None:
-        running = self._task if self._task is not None and not self._task.done() else None
+        running = (
+            self._task if self._task is not None and not self._task.done() else None
+        )
         try:
             async with asyncio.timeout(0.5):
                 self._start()
@@ -156,9 +158,7 @@ def background_notice(
         # run_background tasks have no shutdown notification, so keep the
         # immediate shutdown notice for those task ids.
         task_ids = [
-            task_id
-            for task_id, owner in notice.tasks
-            if owner == "run_background"
+            task_id for task_id, owner in notice.tasks if owner == "run_background"
         ]
         message = (
             "background tasks killed on session exit: " + ", ".join(task_ids)
@@ -215,7 +215,9 @@ def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
         data = dict(entry.data)
         try:
             app._print_unit(
-                render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
+                render_event(
+                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+                ),
                 blank_before=True,
             )
         except (ValueError, BrokenPipeError, OSError):
@@ -382,7 +384,9 @@ def _create_app_with_root(
     selected_project_id = (
         metadata.project_id
         if resuming
-        else discovery.project.project_id if discovery.project is not None else None
+        else discovery.project.project_id
+        if discovery.project is not None
+        else None
     )
     projection = (
         registry.project_context_projection(selected_project_id)
@@ -529,7 +533,9 @@ def _create_app_with_root(
             selected = current.selected_accounts.get(
                 account_provider(current.provider) or ""
             )
-            account = AccountId(*selected.split(":", 1)) if selected is not None else None
+            account = (
+                AccountId(*selected.split(":", 1)) if selected is not None else None
+            )
             backend, _ = _app.build_backend(
                 current.provider,
                 current.model,
@@ -582,9 +588,7 @@ def _create_app_with_root(
             persist_metadata_change(
                 manager,
                 metadata,
-                lambda candidate: manager.record_plan_mode(
-                    candidate, enabled=enabled
-                ),
+                lambda candidate: manager.record_plan_mode(candidate, enabled=enabled),
             )
         )
 
@@ -654,11 +658,7 @@ def _create_app_with_root(
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
         vim_mode=metadata.vim_mode,
-        on_budget_change=(
-            None
-            if budget_pinned
-            else persist_budget
-        ),
+        on_budget_change=(None if budget_pinned else persist_budget),
         on_vim_mode_change=persist_vim_mode,
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,

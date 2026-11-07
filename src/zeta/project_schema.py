@@ -93,8 +93,7 @@ def validate_project_text(value: object, field: str, maximum: int) -> str:
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
     if "\x00" in value or any(
-        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF
-        for character in value
+        ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value
     ):
         raise ValueError(f"{field} contains an invalid character")
     return value

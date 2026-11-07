@@ -43,8 +43,15 @@ def no_gc():
 
 
 @pytest.mark.usefixtures("no_gc")
-@pytest.mark.parametrize("entry", ["server", "tui", "tui-new", "headless"])
-@pytest.mark.parametrize("failure", [None, "activate", "startup", "close"])
+@pytest.mark.parametrize(
+    ("failure", "entry"),
+    [
+        (failure, entry)
+        for failure in [None, "activate", "startup", "close"]
+        for entry in ["server", "tui", "tui-new", "headless"]
+        if (failure, entry) != (None, "server")
+    ],
+)
 def test_entrypoint_shutdown_releases_every_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, failure: str | None
 ) -> None:

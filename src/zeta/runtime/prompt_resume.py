@@ -64,7 +64,12 @@ def _conservative_context(
             and end <= len(prompt)
             and hashlib.sha256(prompt[offset:end].encode()).hexdigest() == digest
         )
-    if not project_features_enabled and owned and offset is not None and length is not None:
+    if (
+        not project_features_enabled
+        and owned
+        and offset is not None
+        and length is not None
+    ):
         prompt = prompt[:offset] + prompt[offset + length :]
         offset = None
         length = None
@@ -80,7 +85,8 @@ def _conservative_context(
             or (
                 projection.health is not None
                 and projection.health.project_id == metadata.project_id
-                and projection.health.code in {
+                and projection.health.code
+                in {
                     "malformed_project",
                     "malformed_memory",
                     "project_not_found",
@@ -88,7 +94,12 @@ def _conservative_context(
             )
         )
     )
-    if selected_memory_unavailable and owned and offset is not None and length is not None:
+    if (
+        selected_memory_unavailable
+        and owned
+        and offset is not None
+        and length is not None
+    ):
         prompt = prompt[:offset] + prompt[offset + length :]
         empty_digest = hashlib.sha256(b"").hexdigest()
         components["project_memory"] = {
@@ -168,7 +179,9 @@ def _replace_context_skill_index(
             "skills changed, but this session's prompt predates owned skill spans; "
             "restart the session to refresh its skill index"
         )
-        notices = context.notices if notice in context.notices else (*context.notices, notice)
+        notices = (
+            context.notices if notice in context.notices else (*context.notices, notice)
+        )
         return replace(context, notices=notices)
     updated = replace_owned_fragment(
         RuntimePrompt(context.system_prompt, components),
@@ -196,7 +209,9 @@ def _replace_context_skill_index(
     )
 
 
-def _adopted_context(metadata: SessionMetadata, notices: tuple[str, ...]) -> ProjectContext:
+def _adopted_context(
+    metadata: SessionMetadata, notices: tuple[str, ...]
+) -> ProjectContext:
     return ProjectContext(
         metadata.system_prompt,
         tuple(Path(path) for path in metadata.context_files),
@@ -208,7 +223,8 @@ def _adopted_context(metadata: SessionMetadata, notices: tuple[str, ...]) -> Pro
         has_override=metadata.prompt_recipe == "custom",
         prompt_recipe=metadata.prompt_recipe,
         prompt_components={
-            key: dict(component) for key, component in metadata.prompt_components.items()
+            key: dict(component)
+            for key, component in metadata.prompt_components.items()
         },
     )
 
@@ -352,13 +368,11 @@ def resume_prompt(
     composition = manager.resume_prompt_composition(metadata, store, compose)
     context = replace(
         _adopted_context(metadata, composition.notices),
-        health=(
-            project_projection.health if project_projection is not None else None
-        ),
+        health=(project_projection.health if project_projection is not None else None),
     )
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)
-    return ResumedPrompt(context, skills, composition.agent_catalog)
+    return ResumedPrompt(context, skills, agents)
 
 
 __all__ = ["ResumedPrompt", "resume_prompt"]

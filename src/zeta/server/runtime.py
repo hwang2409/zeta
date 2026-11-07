@@ -228,7 +228,9 @@ class ServerRuntime:
         if account is not None:
             credential_kwargs["account"] = account
         elif self._state is not None:
-            credential_kwargs = self._state.loop.account_context.backend_kwargs(provider)
+            credential_kwargs = self._state.loop.account_context.backend_kwargs(
+                provider
+            )
             credential_kwargs.pop("home", None)
         backend, _ = self._build_backend(
             provider,
@@ -379,7 +381,9 @@ class ServerRuntime:
         )
         projection = (
             registry.project_context_projection(
-                associated.project.project_id if associated.project is not None else None
+                associated.project.project_id
+                if associated.project is not None
+                else None
             )
             if registry is not None
             else None
@@ -497,7 +501,9 @@ class ServerRuntime:
                     prepared = await asyncio.to_thread(
                         self._prepare_new_session, session_cwd, provider, model
                     )
-                    config, skill_catalog, agent_catalog, context, session_project = prepared
+                    config, skill_catalog, agent_catalog, context, session_project = (
+                        prepared
+                    )
                     kwargs = {
                         "config": config,
                         "provider": config.provider,

@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta"
 FORBIDDEN = {
@@ -82,36 +84,42 @@ def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
     return violations
 
 
-def test_layer_modules_import_in_fresh_processes() -> None:
-    source_root = str(ROOT.parent.parent)
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = os.pathsep.join(
-        part for part in (source_root, environment.get("PYTHONPATH")) if part
-    )
-    modules = sorted(
+def _layer_modules() -> list[str]:
+    return sorted(
         _module_name(path)
         for path in ROOT.rglob("*.py")
         if path.relative_to(ROOT).parts[0] in FORBIDDEN
         and "tests" not in path.relative_to(ROOT).parts
     )
 
-    failures: list[str] = []
-    for module in modules:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import importlib, sys; importlib.import_module(sys.argv[1])",
-                module,
-            ],
-            cwd=ROOT.parent.parent,
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode:
-            failures.append(f"{module}:\n{result.stderr}")
-    assert not failures, "\n".join(failures)
+
+LAYER_MODULES = _layer_modules()
+
+
+@pytest.mark.parametrize("module", LAYER_MODULES)
+def test_layer_modules_import_in_fresh_processes(module: str) -> None:
+    source_root = str(ROOT.parent.parent)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_root, environment.get("PYTHONPATH")) if part
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, sys; importlib.import_module(sys.argv[1])",
+            module,
+        ],
+        cwd=ROOT.parent.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"{module}:\n{result.stderr}"
+
+
+def test_layer_module_parameters_cover_discovered_modules() -> None:
+    assert LAYER_MODULES == _layer_modules()
 
 
 def test_absolute_import_boundary_has_teeth(tmp_path: Path) -> None:

@@ -42,8 +42,8 @@ from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
+from . import budget
 from .background import CancellationRequest, finish_background_child
-from .budget import child_depth as next_agent_depth
 from .child_context import (
     _child_base_system_prompt,
     _compose_child_project_context,
@@ -86,12 +86,12 @@ async def consume_child(
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
     notification_turn: bool = False,
+    harness_notice_message: Message | None = None,
     finish_gate_state: FinishGateState | None = None,
     delivering_prompt_id: str | None = None,
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
-
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
@@ -195,15 +195,16 @@ async def consume_child(
         )
 
     try:
-        events = (
-            child_loop.run_notification_turn()
-            if notification_turn
-            else child_loop.run_turn(
+        if notification_turn:
+            events = child_loop.run_notification_turn()
+        elif harness_notice_message is not None:
+            events = child_loop.run_harness_notice_turn(harness_notice_message)
+        else:
+            events = child_loop.run_turn(
                 "" if delivering_prompt_id is not None else prompt,
                 origin=origin,
                 persist_user_message=delivering_prompt_id is None,
             )
-        )
         try:
             await consume_events(events)
         finally:
@@ -227,8 +228,7 @@ async def consume_child(
                 "structuredContent": structured_content,
                 "explicitFinishReport": explicit_report,
             }
-        children = owned_children()
-        tasks = owned_tasks()
+        children, tasks = owned_children(), owned_tasks()
         if (
             not child_loop.explicit_finish
             and final_message is not None
@@ -244,6 +244,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if finish_gate_state is not None:
+                finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
                 final_message = Message(
@@ -275,8 +277,7 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:
-        text = f"agent error: {failure_message}"
-        return terminal_result(state="failed", text=text)
+        return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(state="failed", text=text)
@@ -306,7 +307,6 @@ async def consume_run(
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume one child run through its follow-up and idle lifecycle."""
-
     return await consume_follow_up_run(
         consume_child,
         child_loop,
@@ -392,7 +392,6 @@ async def _build_child_loop(
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
         excluded_names, profile_tool_allow = resolve_child_profile_tools(
-            child_depth=child_depth,
             preset=preset,
             policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
             runtime_tool_names=policy_allowed_runtime_names,
@@ -473,6 +472,9 @@ async def _build_child_loop(
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
+            max_agent_depth=budget.depth_limit(
+                loop.max_agent_depth, preset.max_child_depth
+            ),
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
             root_session_dir=loop.root_session_dir,
@@ -630,7 +632,9 @@ async def run_agent_tool(
     if getattr(loop, "one_shot", False):
         # Headless exits after this turn, so a background child would be canceled.
         background = False
-    child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
+    child_depth, nesting_error = budget.child_depth(
+        loop.agent_depth, loop.max_agent_depth, background
+    )
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
@@ -687,6 +691,7 @@ async def run_agent_tool(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
+            _storage_lease=loop.store._storage_lease,
         )
     )
     try:
@@ -808,7 +813,9 @@ async def run_agent_tool(
             description=description,
             child_account_context=child_account_pins,
         )
-        loop._background_owner.project_context_loops[child_store.session_id] = child_loop
+        loop._background_owner.project_context_loops[child_store.session_id] = (
+            child_loop
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
@@ -871,12 +878,14 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        child_store.finish_agent_lifecycle(
-            state,
-            final_result=text,
-            turns_used=child_turns(),
-        )
-        return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
+        turns_used = child_turns()
+        if background:
+            child_store.update_agent_lifecycle(turns_used=turns_used)
+        else:
+            child_store.finish_agent_lifecycle(
+                state, final_result=text, turns_used=turns_used
+            )
+        return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
         text: str,
@@ -960,6 +969,10 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
+    loop._background_owner.causal_episodes.associate_new_member(
+        child_instance_id, loop.agent_instance_id
+    )
+    finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -969,6 +982,7 @@ async def run_agent_tool(
                 loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES
             ),
             "receipt_components": receipt_components,
+            "finish_gate_state": finish_gate_state,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
                 "description": description,
@@ -982,6 +996,7 @@ async def run_agent_tool(
             "record_report": lambda report: receipt_components.setdefault(
                 "report", report
             ),
+            "finish_gate_state": finish_gate_state,
         }
     )
     child_task = loop._create_task(
@@ -1067,7 +1082,9 @@ async def run_agent_tool(
             loop._background_owner.conversation_channel.unregister_loop(
                 child_instance_id
             )
-            loop._background_owner.project_context_loops.pop(child_store.session_id, None)
+            loop._background_owner.project_context_loops.pop(
+                child_store.session_id, None
+            )
             loop._background_owner.unregister(child_instance_id)
             if child_policy is not None:
                 await child_policy.cleanup()
@@ -1079,36 +1096,38 @@ async def run_agent_tool(
 
         async def finish_background() -> None:
             await finish_background_child(
-                    child_task=child_task,
-                    child_store=child_store,
-                    parent_store=loop.store,
-                    tool_call=tool_call,
-                    child_instance_id=child_instance_id,
-                    child_path=child_path,
-                    description=description,
-                    child_turns=child_turns,
-                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                        child_result(
-                            text,
-                            error=error,
-                            status=status,
-                            stats=stats,
-                            include_stats=True,
-                            notice=notice,
-                            notice_items=notice_items,
-                            max_bytes=background_receipt_bytes,
-                        )
-                    ),
-                    validate_result=validate_result,
-                    publish_event=loop._publish_background_event,
-                    cleanup=cleanup_background_child,
-                    close_child=close_background_child,
-                    error_message=error_message,
-                    marker_key=child_marker_key,
-                    agent_instance_id=loop.agent_instance_id,
-                    background_owner=loop._background_owner,
-                    max_receipt_bytes=background_receipt_bytes,
-                    explicit_finish=terminal_fence is not None,
+                child_task=child_task,
+                child_store=child_store,
+                parent_store=loop.store,
+                tool_call=tool_call,
+                child_instance_id=child_instance_id,
+                child_path=child_path,
+                description=description,
+                child_turns=child_turns,
+                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                    child_result(
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
+                    )
+                ),
+                validate_result=validate_result,
+                publish_event=loop._publish_background_event,
+                cleanup=cleanup_background_child,
+                close_child=close_background_child,
+                error_message=error_message,
+                marker_key=child_marker_key,
+                agent_instance_id=loop.agent_instance_id,
+                background_owner=loop._background_owner,
+                max_receipt_bytes=background_receipt_bytes,
+                explicit_finish=terminal_fence is not None,
+                child_loop=child_loop,
+                finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())

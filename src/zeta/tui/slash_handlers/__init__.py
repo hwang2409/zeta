@@ -20,7 +20,7 @@ from ...accounts import (
     AccountUsage,
     account_provider,
 )
-from ...accounts.login import login_named_account
+from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
 from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
@@ -124,9 +124,7 @@ class SlashHandlerMixin:
                 viewed_path.name
             )
             viewed_health = (
-                viewed_loop.project_context_health
-                if viewed_loop is not None
-                else None
+                viewed_loop.project_context_health if viewed_loop is not None else None
             )
         return SlashStatus(
             session_id=self.loop.store.session_id,
@@ -159,6 +157,7 @@ class SlashHandlerMixin:
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
             explicit_finish=self.loop.explicit_finish,
+            max_agent_depth=self.loop.max_agent_depth,
             automatic_memory_failure=(
                 self.loop.memory_reconciler.automatic_memory_status
                 if self.loop.memory_reconciler is not None
@@ -229,8 +228,8 @@ class SlashHandlerMixin:
             await asyncio.to_thread(
                 login_named_account, context.home, requested[1], requested[2]
             )
-        except (AccountError, OSError, RuntimeError, ValueError):
-            return "account login failed"
+        except Exception as exc:
+            return login_failure_message(exc)
         return f"logged in as {requested[1]}:{requested[2].lower()}"
 
     async def slash_accounts(self, args: str) -> str:
@@ -245,7 +244,9 @@ class SlashHandlerMixin:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
         if self.active or self.pending_approvals:
-            return "accounts unavailable: cannot switch while a turn or approval is active"
+            return (
+                "accounts unavailable: cannot switch while a turn or approval is active"
+            )
         if context is None:
             return "accounts unavailable for this session"
         if context.switching_unavailable is not None:

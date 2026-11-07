@@ -13,13 +13,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from ...protocol.types import (
-    MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
     Message,
-    MessageOrigin,
-    MessageRole,
     TextContent,
     ToolUseContent,
+    harness_notice,
 )
 
 # Marks the hidden nudge message so UIs can hide it from the transcript.
@@ -90,15 +88,12 @@ def annotate_turn_metadata(
 
 
 def build_nudge_message() -> Message:
-    """A hidden user message that asks the model to actually respond."""
+    """Build hidden zeta guidance that asks the model to actually respond."""
 
-    return Message(
-        MessageRole.USER,
-        [TextContent(EMPTY_TURN_NUDGE_TEXT)],
-        metadata={
-            "zeta_event": EMPTY_TURN_NUDGE_EVENT,
-            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
-        },
+    return harness_notice(
+        "empty-turn recovery",
+        EMPTY_TURN_NUDGE_TEXT,
+        event=EMPTY_TURN_NUDGE_EVENT,
     )
 
 
@@ -108,13 +103,10 @@ def build_tool_limit_recovery_message(tool_name: str) -> Message:
         "call. You should split the work into smaller calls. For files, create a "
         "smaller file, then edit/append it."
     )
-    return Message(
-        MessageRole.USER,
-        [TextContent(text)],
-        metadata={
-            "zeta_event": TOOL_LIMIT_RECOVERY_EVENT,
-            MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
-        },
+    return harness_notice(
+        "output-limit recovery",
+        text,
+        event=TOOL_LIMIT_RECOVERY_EVENT,
     )
 
 

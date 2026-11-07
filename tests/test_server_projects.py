@@ -31,7 +31,10 @@ def _server(tmp_path: Path) -> ZetaServer:
         cwd=cwd,
         provider="codex",
         port=0,
-        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([]),
+            model or "offline",
+        ),
     )
 
 
@@ -56,7 +59,9 @@ async def _await_setup_reapers(server) -> None:
     await asyncio.wait_for(asyncio.gather(*reapers), 2)
 
 
-def _hold_registry_lock(path: Path) -> tuple[threading.Event, threading.Event, threading.Thread]:
+def _hold_registry_lock(
+    path: Path,
+) -> tuple[threading.Event, threading.Event, threading.Thread]:
     acquired = threading.Event()
     release = threading.Event()
 
@@ -106,9 +111,7 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_probe(
     unrelated = tmp_path / "unrelated"
     cwd.mkdir()
     unrelated.mkdir()
-    await asyncio.to_thread(
-        subprocess.run, ["git", "init", "-q"], cwd=cwd, check=True
-    )
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=cwd, check=True)
     registry = ProjectRegistry(home / "projects")
     healthy = registry.create_project("healthy", "git", cwd)
     malformed = registry.create_project("malformed", "git", unrelated)
@@ -154,9 +157,12 @@ async def test_session_project_preparation_does_not_block_ping(
             request = {"session_id": first.session_id}
         else:
             request = {}
-        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
+        _acquired, release, holder = _hold_registry_lock(
+            server.home / "projects" / ".lock"
+        )
         operation = asyncio.create_task(
-            server.runtime.create_session() if method == "new_session"
+            server.runtime.create_session()
+            if method == "new_session"
             else server.runtime.resume_session(request["session_id"])
         )
         progress = asyncio.create_task(asyncio.sleep(0))
@@ -558,7 +564,8 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
         await asyncio.wait_for(server.close(), 2)
         shutdown = True
         assert any(
-            "abandoned session setup task(s) still running at shutdown" in record.message
+            "abandoned session setup task(s) still running at shutdown"
+            in record.message
             for record in caplog.records
         )
         compose_release.set()
@@ -574,7 +581,9 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
 
 
 @pytest.mark.asyncio
-async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Path) -> None:
+async def test_serve_project_instructions_does_not_block_loop_tick(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     root = server.runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
@@ -582,8 +591,12 @@ async def test_serve_project_instructions_does_not_block_loop_tick(tmp_path: Pat
     registry.create_project("launch", "git", root)
     await server.runtime.create_session()
     try:
-        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
-        operation = asyncio.create_task(run_command(server.runtime, "/project-instructions"))
+        _acquired, release, holder = _hold_registry_lock(
+            server.home / "projects" / ".lock"
+        )
+        operation = asyncio.create_task(
+            run_command(server.runtime, "/project-instructions")
+        )
         progress = asyncio.create_task(asyncio.sleep(0))
         await progress
         assert not operation.done()
@@ -618,7 +631,7 @@ async def test_serve_blocking_git_does_not_block_ping(
     git_started = tmp_path / "git-started"
     git_release = tmp_path / "git-release"
     (fake_bin / "git").write_text(
-        f"#!/bin/sh\ntouch {git_started}\nwhile [ ! -e {git_release} ]; do sleep 0.01; done\nexec {real_git} \"$@\"\n",
+        f'#!/bin/sh\ntouch {git_started}\nwhile [ ! -e {git_release} ]; do sleep 0.01; done\nexec {real_git} "$@"\n',
         encoding="utf-8",
     )
     (fake_bin / "git").chmod(0o755)
@@ -641,16 +654,26 @@ async def test_serve_blocking_git_does_not_block_ping(
                 registry_release.wait(1)
                 return original_build_registry(runtime)
 
-            monkeypatch.setattr(slash_commands, "build_registry", blocking_build_registry)
+            monkeypatch.setattr(
+                slash_commands, "build_registry", blocking_build_registry
+            )
         client = server._client
         assert client is not None
-        _acquired, release, holder = _hold_registry_lock(server.home / "projects" / ".lock")
-        params = (
-            {} if method == "new_session" else
-            {"session_id": first.session_id} if method == "resume" else
-            {"text": "/project-instructions", "session_id": first.session_id}
+        _acquired, release, holder = _hold_registry_lock(
+            server.home / "projects" / ".lock"
         )
-        request_method = {"new_session": "new_session", "resume": "resume", "slash_run": "slash_run"}[method]
+        params = (
+            {}
+            if method == "new_session"
+            else {"session_id": first.session_id}
+            if method == "resume"
+            else {"text": "/project-instructions", "session_id": first.session_id}
+        )
+        request_method = {
+            "new_session": "new_session",
+            "resume": "resume",
+            "slash_run": "slash_run",
+        }[method]
         operation = asyncio.create_task(client._dispatch(2, request_method, params))
         await asyncio.to_thread(_wait_for_path, git_started, 1)
         if method == "slash_run":
@@ -675,7 +698,9 @@ async def test_serve_blocking_git_does_not_block_ping(
 
 
 @pytest.mark.asyncio
-async def test_serve_shutdown_with_registry_reader_held_exits_bounded(tmp_path: Path) -> None:
+async def test_serve_shutdown_with_registry_reader_held_exits_bounded(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     ProjectRegistry(server.home / "projects").create_project("launch", "repo")
     reader, writer = await _connect(server)
@@ -933,7 +958,9 @@ async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path: Path) -> None:
+async def test_project_requests_show_memory_history_and_inbox_read_only(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     root = tmp_path / "alpha"
@@ -952,7 +979,12 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         alpha.project_id,
         expected_digest=registry.memory_digest(alpha.project_id),
         updates={"state.md": "automatic\n", "backlog.md": "also automatic\n"},
-        provenance={"session_id": "a" * 32, "seq_start": 2, "seq_end": 7, "model": "luna"},
+        provenance={
+            "session_id": "a" * 32,
+            "seq_start": 2,
+            "seq_end": 7,
+            "model": "luna",
+        },
     )
     registry.accept_memory(alpha.project_id, "state.md")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
@@ -969,15 +1001,26 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["projects"])
-        projects = (await _request(reader, writer, 2, "list_projects", {"limit": 1}))[-1]["result"]
+        projects = (await _request(reader, writer, 2, "list_projects", {"limit": 1}))[
+            -1
+        ]["result"]
         assert len(projects["projects"]) == 1
         assert projects["next_offset"] == 1
         listed = projects["projects"][0]
-        assert set(listed) == {"id", "name", "scope", "roots", "session_count", "last_activity"}
+        assert set(listed) == {
+            "id",
+            "name",
+            "scope",
+            "roots",
+            "session_count",
+            "last_activity",
+        }
 
-        shown = (await _request(
-            reader, writer, 3, "project_show", {"project_id": alpha.project_id}
-        ))[-1]["result"]
+        shown = (
+            await _request(
+                reader, writer, 3, "project_show", {"project_id": alpha.project_id}
+            )
+        )[-1]["result"]
         assert shown["project"]["id"] == alpha.project_id
         assert shown["memory"]["version_id"]
         assert len(shown["memory"]["digest"]) == 64
@@ -993,13 +1036,27 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         assert files["backlog.md"]["automatic"] is True
         assert len(files) == 5
 
-        log = (await _request(
-            reader, writer, 4, "project_memory_log", {"project_id": alpha.project_id, "limit": 20}
-        ))[-1]["result"]
-        assert [item["kind"] for item in log["versions"]][-3:] == ["import", "update", "accept"]
-        imported = next(item for item in log["versions"] if item["version_id"] == remote.version)
+        log = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "project_memory_log",
+                {"project_id": alpha.project_id, "limit": 20},
+            )
+        )[-1]["result"]
+        assert [item["kind"] for item in log["versions"]][-3:] == [
+            "import",
+            "update",
+            "accept",
+        ]
+        imported = next(
+            item for item in log["versions"] if item["version_id"] == remote.version
+        )
         assert imported["provenance"] == {"source": "remote_sync", "peer": "machine-2"}
-        update = next(item for item in log["versions"] if item["version_id"] == automatic.version)
+        update = next(
+            item for item in log["versions"] if item["version_id"] == automatic.version
+        )
         assert update["provenance"] == {
             "session_id": "a" * 32,
             "seq_start": 2,
@@ -1009,29 +1066,48 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         accepted = log["versions"][-1]
         assert accepted["provenance"] == {"accepted_by": "user"}
 
-        detail = (await _request(
-            reader,
-            writer,
-            5,
-            "project_memory_log",
-            {"project_id": alpha.project_id, "version_id": automatic.version, "file": "state.md"},
-        ))[-1]["result"]
+        detail = (
+            await _request(
+                reader,
+                writer,
+                5,
+                "project_memory_log",
+                {
+                    "project_id": alpha.project_id,
+                    "version_id": automatic.version,
+                    "file": "state.md",
+                },
+            )
+        )[-1]["result"]
         assert detail["version"]["content"] == "automatic\n"
         assert detail["version"]["content_truncated"] is False
-        assert "-" in detail["version"]["diff"] and "+automatic" in detail["version"]["diff"]
+        assert (
+            "-" in detail["version"]["diff"]
+            and "+automatic" in detail["version"]["diff"]
+        )
         assert detail["version"]["diff_truncated"] is False
         missing = await _request(
             reader,
             writer,
             "missing-version",
             "project_memory_log",
-            {"project_id": alpha.project_id, "version_id": "f" * 32, "file": "state.md"},
+            {
+                "project_id": alpha.project_id,
+                "version_id": "f" * 32,
+                "file": "state.md",
+            },
         )
         assert missing[-1]["error"]["code"] == -32602
 
-        result = (await _request(
-            reader, writer, 6, "project_inbox", {"project_id": alpha.project_id, "status": "new"}
-        ))[-1]["result"]
+        result = (
+            await _request(
+                reader,
+                writer,
+                6,
+                "project_inbox",
+                {"project_id": alpha.project_id, "status": "new"},
+            )
+        )[-1]["result"]
         assert result == {
             "status": "new",
             "messages": [result["messages"][0]],
@@ -1045,9 +1121,11 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
 
         await _request(reader, writer, 7, "new_session", {})
         attached_before = _mtimes(server.home)
-        attached = (await _request(
-            reader, writer, 8, "project_show", {"project_id": alpha.project_id}
-        ))[-1]["result"]
+        attached = (
+            await _request(
+                reader, writer, 8, "project_show", {"project_id": alpha.project_id}
+            )
+        )[-1]["result"]
         assert attached["project"]["id"] == alpha.project_id
         assert _mtimes(server.home) == attached_before
     finally:
@@ -1060,19 +1138,39 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
     registry = ProjectRegistry(server.home / "projects")
     project = registry.create_project("alpha", "repo")
     other = registry.create_project("beta", "repo")
-    parent = await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
-        project_role="orchestrator", name="parent", auto_project=False,
-    ))
-    child = await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
-        project_role="worker", parent_session_id=parent.metadata.session_id,
-        name="child", auto_project=False,
-    ))
-    await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
-        project_role="session", auto_project=False,
-    ))
+    parent = await asyncio.to_thread(
+        lambda: server.runtime.manager.create(
+            provider="codex",
+            model="offline",
+            cwd=server.runtime.cwd,
+            project_id=project.project_id,
+            project_role="orchestrator",
+            name="parent",
+            auto_project=False,
+        )
+    )
+    child = await asyncio.to_thread(
+        lambda: server.runtime.manager.create(
+            provider="codex",
+            model="offline",
+            cwd=server.runtime.cwd,
+            project_id=project.project_id,
+            project_role="worker",
+            parent_session_id=parent.metadata.session_id,
+            name="child",
+            auto_project=False,
+        )
+    )
+    await asyncio.to_thread(
+        lambda: server.runtime.manager.create(
+            provider="codex",
+            model="offline",
+            cwd=server.runtime.cwd,
+            project_id=other.project_id,
+            project_role="session",
+            auto_project=False,
+        )
+    )
     parent.store.close()
     child.store.close()
     before = _mtimes(server.home)
@@ -1080,18 +1178,26 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["projects", "list_sessions_paging"])
-        result = (await _request(
-            reader, writer, 2, "list_sessions", {"project_id": project.project_id}
-        ))[-1]["result"]
+        result = (
+            await _request(
+                reader, writer, 2, "list_sessions", {"project_id": project.project_id}
+            )
+        )[-1]["result"]
         assert {item["name"] for item in result["sessions"]} == {"parent", "child"}
-        child_wire = next(item for item in result["sessions"] if item["name"] == "child")
+        child_wire = next(
+            item for item in result["sessions"] if item["name"] == "child"
+        )
         assert child_wire["project_role"] == "worker"
         assert child_wire["parent_session_id"] == parent.metadata.session_id
         projects = (await _request(reader, writer, 3, "list_projects"))[-1]["result"]
-        summary = next(item for item in projects["projects"] if item["id"] == project.project_id)
+        summary = next(
+            item for item in projects["projects"] if item["id"] == project.project_id
+        )
         assert summary["session_count"] == 2
         assert summary["last_activity"] >= parent.metadata.updated_at
-        invalid = await _request(reader, writer, 4, "list_sessions", {"project_id": None})
+        invalid = await _request(
+            reader, writer, 4, "list_sessions", {"project_id": None}
+        )
         assert invalid[-1]["error"]["code"] == -32602
         assert _mtimes(server.home) == before
     finally:
@@ -1099,12 +1205,16 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_project_requests_bound_large_views_and_report_unknown_project(tmp_path: Path) -> None:
+async def test_project_requests_bound_large_views_and_report_unknown_project(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     project = registry.create_project("large", "repo")
     sender = registry.create_project("sender", "repo")
-    for index, name in enumerate(("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")):
+    for index, name in enumerate(
+        ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
+    ):
         content = ("\x01" if index == 0 else str(index)) * (128 * 1024)
         registry.update_memory(project.project_id, {name: content})
     ProjectInbox(registry, sessions_root=server.home / "sessions").send(
@@ -1130,7 +1240,11 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
             for item in shown_frames[-1]["result"]["memory"]["files"]
         )
         log_frames = await _request(
-            reader, writer, 3, "project_memory_log", {"project_id": project.project_id, "limit": 100}
+            reader,
+            writer,
+            3,
+            "project_memory_log",
+            {"project_id": project.project_id, "limit": 100},
         )
         assert "result" in log_frames[-1]
         assert len(str(log_frames[-1]).encode()) < 1_048_576
@@ -1158,7 +1272,9 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
 
 
 @pytest.mark.asyncio
-async def test_project_inbox_isolates_and_reports_invalid_messages(tmp_path: Path) -> None:
+async def test_project_inbox_isolates_and_reports_invalid_messages(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     target = registry.create_project("target", "repo")
@@ -1173,7 +1289,9 @@ async def test_project_inbox_isolates_and_reports_invalid_messages(tmp_path: Pat
         body="body",
     )
     corrupt_name = f"{'e' * 32}.json"
-    corrupt_path = server.home / "projects" / target.project_id / "inbox" / "new" / corrupt_name
+    corrupt_path = (
+        server.home / "projects" / target.project_id / "inbox" / "new" / corrupt_name
+    )
     corrupt_path.write_text("{not json")
 
     reader, writer = await _connect(server)
@@ -1197,7 +1315,9 @@ async def test_project_inbox_isolates_and_reports_invalid_messages(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path) -> None:
+async def test_project_inbox_trust_is_derived_from_returned_page(
+    tmp_path: Path,
+) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     target = registry.create_project("target", "repo")
@@ -1231,7 +1351,9 @@ async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path)
     )
     external = json.loads(external_path.read_text())
     external["origin"] = "remote"
-    external_path.write_text(json.dumps(external, sort_keys=True, separators=(",", ":")) + "\n")
+    external_path.write_text(
+        json.dumps(external, sort_keys=True, separators=(",", ":")) + "\n"
+    )
 
     reader, writer = await _connect(server)
     try:
@@ -1352,9 +1474,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
         elif case == 6:
             path.write_text(json.dumps([record]))
         elif index == 7:
-            path.write_text(
-                json.dumps({**record, "title": "x" * (10 * 1024 * 1024)})
-            )
+            path.write_text(json.dumps({**record, "title": "x" * (10 * 1024 * 1024)}))
         else:
             record["title"] = ["x" * (50_000 + rng.randrange(50_000))]
             path.write_text(json.dumps(record))
@@ -1366,10 +1486,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
     )
     assert set(scanner.scan() or ()) == valid_ids
     for index in range(256):
-        assert (
-            inbox.claim(project.project_id, f"{index + 1024:032x}", "e" * 32)
-            is None
-        )
+        assert inbox.claim(project.project_id, f"{index + 1024:032x}", "e" * 32) is None
 
     reader, writer = await _connect(server)
     try:
@@ -1381,9 +1498,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
             "project_inbox",
             {"project_id": project.project_id, "status": "new", "limit": 1_000},
         )
-        assert {
-            item["id"] for item in response[-1]["result"]["messages"]
-        } == valid_ids
+        assert {item["id"] for item in response[-1]["result"]["messages"]} == valid_ids
     finally:
         await _close(server, writer)
 

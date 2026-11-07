@@ -296,10 +296,12 @@ def compose_runtime(
             root_project_id=metadata.project_id,
             parent_session_id=metadata.parent_session_id,
             project_registry=project_registry,
+            max_agent_depth=config.agents_max_depth,
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
         loop.post_stream_provider_retry = post_stream_provider_retry
+
         def prepare_project_context(projection: Any) -> ProjectContext:
             cwd_project = (
                 resolve_project_context_from_projects(
@@ -338,9 +340,7 @@ def compose_runtime(
                 if project_context.prompt_recipe == "default" or conservative_recovery
                 else None
             ),
-            replace_component=(
-                "project_memory" if conservative_recovery else None
-            ),
+            replace_component=("project_memory" if conservative_recovery else None),
         )
         if project_registry is not None and (
             project_context.health is None
@@ -409,6 +409,7 @@ def compose_runtime(
             if callback is not None
         ]
         if activity_callbacks:
+
             def persisted_activity(seq: int) -> None:
                 for callback in activity_callbacks:
                     callback(seq)

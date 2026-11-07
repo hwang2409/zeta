@@ -198,12 +198,17 @@ def discover_project(
             directory, repo_root, common_dir, None, home, root, False
         )
     first = next(
-        (line for line in worktrees.stdout.splitlines() if line.startswith("worktree ")),
+        (
+            line
+            for line in worktrees.stdout.splitlines()
+            if line.startswith("worktree ")
+        ),
         None,
     )
     if first is None:
         logging.getLogger(__name__).warning(
-            "git project discovery failed for %s: worktree list had no primary", directory
+            "git project discovery failed for %s: worktree list had no primary",
+            directory,
         )
         return ProjectDiscovery(
             directory, repo_root, common_dir, None, home, root, False
@@ -232,7 +237,11 @@ def _checkout_common_dir(path: Path) -> Path | None:
     if not line.startswith("gitdir: "):
         return None
     target = Path(line.removeprefix("gitdir: "))
-    target = (marker.parent / target).resolve() if not target.is_absolute() else target.resolve()
+    target = (
+        (marker.parent / target).resolve()
+        if not target.is_absolute()
+        else target.resolve()
+    )
     if target.parent.name == "worktrees":
         return target.parent.parent
     return target
@@ -265,7 +274,8 @@ def _project_at_root(
             candidate
             for candidate in registry.list_projects()
             if _valid_registry_candidate(candidate, discovery) is not None
-            and Path(candidate.canonical_integration_root).expanduser().resolve() == root
+            and Path(candidate.canonical_integration_root).expanduser().resolve()
+            == root
         ),
         None,
     )
@@ -286,9 +296,7 @@ def _find_or_create_valid_project(
     ]
     for name in names:
         try:
-            return registry.create_project(
-                name, "git", root, memory_profile="zeta"
-            )
+            return registry.create_project(name, "git", root, memory_profile="zeta")
         except ProjectRegistryError:
             project = _project_at_root(registry, root, discovery)
             if project is not None:
@@ -576,7 +584,11 @@ def resolve_project_context_from_projects(
 
     if not discovery.eligible:
         return None
-    roots = (discovery.cwd,) if discovery.primary_root is None else (discovery.primary_root,)
+    roots = (
+        (discovery.cwd,)
+        if discovery.primary_root is None
+        else (discovery.primary_root,)
+    )
     for root in roots:
         project = next(
             (
@@ -734,7 +746,9 @@ def _instruction_files(
                 seen.add(resolved)
                 files.append(resolved)
     if private_project is not None:
-        private_agents = home / "projects" / private_project.project_id / AGENTS_FILENAME
+        private_agents = (
+            home / "projects" / private_project.project_id / AGENTS_FILENAME
+        )
         if _present(private_agents):
             files.append(private_agents.resolve())
     return files
@@ -887,7 +901,9 @@ def load_project_context(
                             context_entries = (
                                 project_projection.memory
                                 if project_projection is not None
-                                else registry.load_memory_for_context(project.project_id)
+                                else registry.load_memory_for_context(
+                                    project.project_id
+                                )
                             )
                         except UnsupportedMemoryFormatError:
                             snapshot = registry._entry_memory_state_for_context(
@@ -896,9 +912,7 @@ def load_project_context(
                             entry_projection = render_entry_memory(
                                 snapshot.state,
                                 now=utc_now(),
-                                byte_cap=min(
-                                    MEMORY_PROMPT_BYTE_CAP, budget_for_memory
-                                ),
+                                byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                             )
                             memory_block = entry_projection.block
                         else:
@@ -923,10 +937,7 @@ def load_project_context(
                                     candidate_manual,
                                     candidate_automatic,
                                 )
-                                if (
-                                    len(candidate.encode("utf-8"))
-                                    <= budget_for_memory
-                                ):
+                                if len(candidate.encode("utf-8")) <= budget_for_memory:
                                     manual_memory_sections = candidate_manual
                                     automatic_memory_sections = candidate_automatic
                                     loaded.append(path)
@@ -994,7 +1005,11 @@ def load_project_context(
             "length": skill_index.length,
             "digest": skill_index.digest,
         }
-    if memory_offset is not None and memory_length is not None and memory_digest is not None:
+    if (
+        memory_offset is not None
+        and memory_length is not None
+        and memory_digest is not None
+    ):
         components["project_memory"] = {
             "offset": memory_offset,
             "length": memory_length,
@@ -1011,9 +1026,7 @@ def load_project_context(
         has_override=has_override,
         prompt_recipe="custom" if has_override else "default",
         prompt_components=components,
-        health=(
-            project_projection.health if project_projection is not None else None
-        ),
+        health=(project_projection.health if project_projection is not None else None),
     )
 
 

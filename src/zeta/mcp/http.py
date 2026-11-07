@@ -50,9 +50,12 @@ from .oauth import (
     refresh_access_token,
 )
 from .oauth_store import (
+    CredentialSnapshot,
+    MCPCredentialStore,
+    MCPCredentialStoreError,
     MCPOAuthToken,
-    load_token,
-    save_token,
+    SaveDisposition,
+    public_credential_store_error,
 )
 from .pagination import drain_pages
 from .resources import RESOURCE_MAX_BYTES
@@ -72,6 +75,12 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
 
 T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class _ActiveRequest:
+    task: asyncio.Task[dict[str, object]] | None = None
+    response: httpx.Response | None = None
 
 
 class StreamableHTTPMCPClient(MCPClient):
@@ -96,15 +105,15 @@ class StreamableHTTPMCPClient(MCPClient):
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
+        self._active_requests: dict[asyncio.Task[object], _ActiveRequest] = {}
+        self._deadline_cleanups: set[asyncio.Task[None]] = set()
         self._home = home
         self._spill_store = spill_store or SpillStore()
         self._limits = limits or MCPCallLimits()
         self._spill_store.configure_transient_limit(self._limits.max_wire_bytes)
         self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
-        self._current_token: MCPOAuthToken | None = None
-        if config.auth_type == "oauth":
-            self._current_token = load_token(config.name, home=home)
+        self._credential_store = MCPCredentialStore(home=home)
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         self._failure_sink = sink
@@ -180,6 +189,13 @@ class StreamableHTTPMCPClient(MCPClient):
                 f"MCP tool {self.config.name}__{name} could not buffer the response "
                 "because the session spill budget is full"
             )
+        except MCPCredentialStoreError as exc:
+            error = public_credential_store_error(exc)
+            if self._failure_sink is not None:
+                self._failure_sink(error["text"])
+            result = make_error_result(error["text"])
+            result["structuredContent"] = {"credential_store_error": error}
+            return result
         except MCPError as exc:
             if self._failure_sink is not None:
                 self._failure_sink(str(exc))
@@ -198,10 +214,55 @@ class StreamableHTTPMCPClient(MCPClient):
             self._notification_task.cancel()
             await asyncio.gather(self._notification_task, return_exceptions=True)
             self._notification_task = None
+        await self._drain_active_requests()
         if self._owns_client:
             await self._client.aclose()
         if self._owns_spill_store:
             self._spill_store.close()
+
+    async def _drain_active_requests(self) -> None:
+        active_tasks = tuple(
+            state.task
+            for state in self._active_requests.values()
+            if state.task is not None
+        )
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks or self._deadline_cleanups:
+            await asyncio.gather(
+                *active_tasks, *tuple(self._deadline_cleanups), return_exceptions=True
+            )
+
+    def deadline_exceeded(self, owner: asyncio.Task[object]) -> None:
+        """Close only the timed-out HTTP response and retain cleanup ownership."""
+
+        state = self._active_requests.get(owner)
+        if state is None or state.task is None:
+            return
+        cleanup = asyncio.create_task(self._cleanup_deadline_request(state))
+        self._deadline_cleanups.add(cleanup)
+        cleanup.add_done_callback(self._deadline_cleanups.discard)
+
+    async def _cleanup_deadline_request(self, state: _ActiveRequest) -> None:
+        task = state.task
+        if task is None:
+            return
+        task.cancel()
+        response = state.response
+        if response is not None:
+            try:
+                await asyncio.wait_for(response.aclose(), HTTP_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning(
+                    "failed to close an MCP HTTP deadline response", exc_info=True
+                )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(task, return_exceptions=True)),
+                HTTP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("timed out joining an MCP HTTP deadline request")
 
     async def _request(
         self,
@@ -219,9 +280,20 @@ class StreamableHTTPMCPClient(MCPClient):
             "method": method,
             "params": dict(params),
         }
-        request_task = asyncio.create_task(self._send_with_auth(payload, request_id))
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("MCP HTTP request requires an asyncio task")
+        state = _ActiveRequest()
+        request_task = asyncio.create_task(
+            self._send_with_auth(payload, request_id, state)
+        )
+        state.task = request_task
+        self._active_requests[owner] = state
         if abort_signal is None:
-            return await request_task
+            try:
+                return await request_task
+            finally:
+                self._active_requests.pop(owner, None)
         abort_task = asyncio.create_task(abort_signal.wait())
         try:
             done, _ = await asyncio.wait(
@@ -232,39 +304,57 @@ class StreamableHTTPMCPClient(MCPClient):
                 await asyncio.gather(request_task, return_exceptions=True)
                 raise MCPCanceled()
             return await request_task
+        except asyncio.CancelledError:
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            raise
         finally:
+            self._active_requests.pop(owner, None)
             if not abort_task.done():
                 abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
 
     async def _send_with_auth(
-        self, payload: Mapping[str, object], request_id: int
+        self,
+        payload: Mapping[str, object],
+        request_id: int,
+        state: _ActiveRequest,
     ) -> dict[str, object]:
-        return await self._with_auth(lambda: self._send(payload, request_id))
+        return await self._with_auth(
+            lambda token: self._send(payload, request_id, state, token)
+        )
 
-    async def _with_auth(self, send: Callable[[], Awaitable[T]]) -> T:
+    async def _with_auth(
+        self, send: Callable[[MCPOAuthToken | None], Awaitable[T]]
+    ) -> T:
         if self.config.auth_type != "oauth":
-            return await send()
-        token_at_send = self._current_token
+            return await send(None)
+        snapshot = await self._credential_store.load(self.config.name)
+        if snapshot.token is None:
+            raise self._auth_error(MCPHTTPError(401, "authorization required"))
         try:
-            return await send()
+            return await send(snapshot.token)
         except MCPHTTPError as exc:
             if exc.status_code != 401:
                 raise
-            refreshed = await self._refresh_token_once(exc, token_at_send)
-            if not refreshed:
+            if not await self._refresh_token_once(exc, snapshot):
                 raise self._auth_error(exc)
-            return await send()
+            retry = await self._credential_store.load(self.config.name)
+            if retry.token is None:
+                raise self._auth_error(exc)
+            return await send(retry.token)
 
     async def _refresh_token_once(
-        self, exc: MCPHTTPError, token_at_send: MCPOAuthToken | None
+        self, exc: MCPHTTPError, sent: CredentialSnapshot
     ) -> bool:
         async with self._token_lock:
-            token = self._current_token
-            if token is not token_at_send:
+            current = await self._credential_store.load(self.config.name)
+            if current.token is None:
+                return False
+            if current.generation != sent.generation:
                 return True
-            if token is None or token.refresh_token is None:
-                self._record_refresh_failure(token, str(exc))
+            token = current.token
+            if token.refresh_token is None:
                 return False
             try:
                 response = await refresh_access_token(
@@ -275,15 +365,15 @@ class StreamableHTTPMCPClient(MCPClient):
                     resource=token.resource,
                     http_client=self._client,
                 )
-            except MCPOAuthError as refresh_exc:
-                self._record_refresh_failure(token, str(refresh_exc))
-                return False
-            access = response.get("access_token")
-            if type(access) is not str or not access:
-                self._record_refresh_failure(
-                    token, "refresh response missing access_token"
+                access = response.get("access_token")
+                if type(access) is not str or not access:
+                    raise MCPOAuthError("refresh response missing access_token")
+            except MCPOAuthError:
+                after_failure = await self._credential_store.load(self.config.name)
+                return (
+                    after_failure.token is not None
+                    and after_failure.generation != current.generation
                 )
-                return False
             import time as _time
 
             expires_at: float | None = None
@@ -297,32 +387,24 @@ class StreamableHTTPMCPClient(MCPClient):
                 else token.refresh_token
             )
             scope_value = response.get("scope")
-            new_scope = scope_value if type(scope_value) is str else token.scope
             token_type_value = response.get("token_type") or token.token_type
-            new_token = replace(
+            candidate = replace(
                 token,
                 access_token=access,
                 refresh_token=new_refresh,
                 expires_at=expires_at,
-                scope=new_scope,
-                token_type=token_type_value
-                if type(token_type_value) is str
-                else token.token_type,
+                scope=scope_value if type(scope_value) is str else token.scope,
+                token_type=(
+                    token_type_value
+                    if type(token_type_value) is str
+                    else token.token_type
+                ),
                 refresh_error=None,
             )
-            save_token(self.config.name, new_token, home=self._home)
-            self._current_token = new_token
-            return True
-
-    def _record_refresh_failure(self, token: MCPOAuthToken | None, reason: str) -> None:
-        if token is None:
-            return
-        marked = replace(token, refresh_error=reason)
-        try:
-            save_token(self.config.name, marked, home=self._home)
-        except OSError:
-            logger.warning("could not persist refresh failure for %s", self.config.name)
-        self._current_token = marked
+            saved = await self._credential_store.save_if_current(
+                self.config.name, current.generation, candidate
+            )
+            return saved.disposition is not SaveDisposition.DELETED
 
     def _auth_error(self, exc: MCPHTTPError) -> MCPHTTPError:
         hint = OAUTH_HINT.format(name=self.config.name)
@@ -332,9 +414,13 @@ class StreamableHTTPMCPClient(MCPClient):
         )
 
     async def _send(
-        self, payload: Mapping[str, object], request_id: int
+        self,
+        payload: Mapping[str, object],
+        request_id: int,
+        state: _ActiveRequest,
+        oauth_token: MCPOAuthToken | None,
     ) -> dict[str, object]:
-        headers = self._auth_headers()
+        headers = self._auth_headers(oauth_token)
         headers.update(
             {
                 "accept": "application/json, text/event-stream",
@@ -349,6 +435,7 @@ class StreamableHTTPMCPClient(MCPClient):
             async with self._client.stream(
                 "POST", self.config.url, headers=headers, json=dict(payload)
             ) as response:
+                state.response = response
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None and session_id != self._session_id:
                     self._session_id = session_id
@@ -376,6 +463,8 @@ class StreamableHTTPMCPClient(MCPClient):
                 return parse_rpc_response(value, request_id)
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
+        finally:
+            state.response = None
 
     async def _listen_notifications(self) -> None:
         if self._session_id is None:
@@ -406,12 +495,14 @@ class StreamableHTTPMCPClient(MCPClient):
             await asyncio.sleep(delay)
             delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
 
-    async def _listen_notification_stream(self) -> bool:
+    async def _listen_notification_stream(
+        self, oauth_token: MCPOAuthToken | None
+    ) -> bool:
         session_id = self._session_id
         if session_id is None:
             return False
         last_event_id = self._notification_event_id
-        headers = self._auth_headers()
+        headers = self._auth_headers(oauth_token)
         headers["accept"] = "text/event-stream"
         headers["mcp-session-id"] = session_id
         if self.protocol_version is not None:
@@ -452,12 +543,17 @@ class StreamableHTTPMCPClient(MCPClient):
     async def _send_notification(
         self, method: str, params: Mapping[str, object]
     ) -> None:
-        await self._with_auth(lambda: self._send_notification_raw(method, params))
+        await self._with_auth(
+            lambda token: self._send_notification_raw(method, params, token)
+        )
 
     async def _send_notification_raw(
-        self, method: str, params: Mapping[str, object]
+        self,
+        method: str,
+        params: Mapping[str, object],
+        oauth_token: MCPOAuthToken | None,
     ) -> None:
-        headers = self._auth_headers()
+        headers = self._auth_headers(oauth_token)
         headers.update(
             {
                 "accept": "application/json, text/event-stream",
@@ -482,7 +578,7 @@ class StreamableHTTPMCPClient(MCPClient):
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
 
-    def _auth_headers(self) -> dict[str, str]:
+    def _auth_headers(self, oauth_token: MCPOAuthToken | None) -> dict[str, str]:
         def resolve(value: str) -> str:
             def replace(match: re.Match[str]) -> str:
                 variable = match.group(1)
@@ -498,9 +594,10 @@ class StreamableHTTPMCPClient(MCPClient):
         headers = {name: resolve(value) for name, value in self.config.headers.items()}
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
             headers["authorization"] = f"Bearer {self.config.auth_token}"
-        elif self.config.auth_type == "oauth" and self._current_token is not None:
-            token = self._current_token
-            headers["authorization"] = f"{token.token_type} {token.access_token}"
+        elif self.config.auth_type == "oauth" and oauth_token is not None:
+            headers["authorization"] = (
+                f"{oauth_token.token_type} {oauth_token.access_token}"
+            )
         return headers
 
 

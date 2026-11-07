@@ -9,9 +9,7 @@ from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
 
-def _error(
-    message: str, *, kind: str = "project_memory"
-) -> StructuredToolResult:
+def _error(message: str, *, kind: str = "project_memory") -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
@@ -57,7 +55,8 @@ async def _inspect_project(
             memory = projects._entry_memory_view(project.project_id, byte_cap=64 * 1024)
         else:
             memory = {
-                name: content for name, content in projects.load_memory(project.project_id)
+                name: content
+                for name, content in projects.load_memory(project.project_id)
             }
         return _success_result(
             text_block(f"read bounded memory for project {project.name}"),

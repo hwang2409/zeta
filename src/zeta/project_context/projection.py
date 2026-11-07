@@ -73,9 +73,7 @@ def _health(
 class ProjectContextProjectionMixin:
     """Read safe prompt inputs under one registry-lock acquisition."""
 
-    def _read_context_projection(
-        self, operation: Callable[[int], _T]
-    ) -> _T:
+    def _read_context_projection(self, operation: Callable[[int], _T]) -> _T:
         """Own the lock seam that p06 can replace in one place."""
 
         return self._read(operation)
@@ -155,9 +153,7 @@ class ProjectContextProjectionMixin:
                 if pointer is not None and isinstance(pointer.get("current"), str):
                     source = f"memory-versions/versions/{pointer['current']}.json"
                 memory.clear()
-                memory_health = _health(
-                    "malformed_memory", selected.project_id, source
-                )
+                memory_health = _health("malformed_memory", selected.project_id, source)
         finally:
             os.close(directory_fd)
         return memory, entry_memory, memory_health
@@ -169,7 +165,9 @@ class ProjectContextProjectionMixin:
 
         def read(root_fd: int) -> ProjectContextProjection:
             names = sorted(
-                name for name in os.listdir(root_fd) if PROJECT_ID_PATTERN.fullmatch(name)
+                name
+                for name in os.listdir(root_fd)
+                if PROJECT_ID_PATTERN.fullmatch(name)
             )
             if len(names) > MAX_PROJECTS:
                 raise ProjectRegistryError("project limit exceeded")

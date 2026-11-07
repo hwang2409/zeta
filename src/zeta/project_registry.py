@@ -107,8 +107,7 @@ def _validate_text(
             f"{field} must be a non-empty string of at most {maximum} characters"
         )
     if "\x00" in value or any(
-        ord(char) < 32
-        or (not allow_surrogates and 0xD800 <= ord(char) <= 0xDFFF)
+        ord(char) < 32 or (not allow_surrogates and 0xD800 <= ord(char) <= 0xDFFF)
         for char in value
     ):
         raise ProjectRegistryError(f"{field} contains an invalid character")
@@ -247,9 +246,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
     def _open_lock(root_fd: int, *, create: bool) -> int | None:
         flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
         try:
-            lock_fd = os.open(
-                ".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
-            )
+            lock_fd = os.open(".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
         except FileNotFoundError:
             if not create:
                 return None
@@ -402,7 +399,9 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                 if len(data) > MAX_RECORD_SIZE or stream.read(1):
                     raise ProjectRegistryError(f"project record {name} is too large")
                 decoder = json.JSONDecoder(
-                    object_pairs_hook=lambda pairs: ProjectRegistry._unique_object(pairs)
+                    object_pairs_hook=lambda pairs: ProjectRegistry._unique_object(
+                        pairs
+                    )
                 )
                 text = data.decode("utf-8")
                 value, end = decoder.raw_decode(text)
@@ -638,9 +637,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             return existing
         base_name = name or path.name
         try:
-            return self.create_project(
-                base_name, scope, path, memory_profile="zeta"
-            )
+            return self.create_project(base_name, scope, path, memory_profile="zeta")
         except ProjectRegistryError:
             existing = self.find_for_directory(path)
             if existing is not None:
@@ -648,8 +645,10 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             # Name allocation is retried under create_project's registry lock;
             # the canonical root check still makes concurrent callers converge.
             parent_name = path.parent.name or "repo"
-            candidates = [f"{base_name}-{parent_name}",
-                          f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}"]
+            candidates = [
+                f"{base_name}-{parent_name}",
+                f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}",
+            ]
             for candidate in candidates:
                 try:
                     return self.create_project(
@@ -782,9 +781,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             "recorded_at",
         }:
             raise ProjectRegistryError("malformed project session reference")
-        _validate_text(
-            value["session_id"], "session_id", 128, allow_surrogates=True
-        )
+        _validate_text(value["session_id"], "session_id", 128, allow_surrogates=True)
         path = _validate_text(
             value["transcript_path"], "transcript_path", MAX_SCOPE_LENGTH
         )
@@ -795,9 +792,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
             raise ProjectRegistryError("invalid project session role")
         parent = value["parent_session_id"]
         if parent is not None:
-            _validate_text(
-                parent, "parent_session_id", 128, allow_surrogates=True
-            )
+            _validate_text(parent, "parent_session_id", 128, allow_surrogates=True)
         recorded = _validate_timestamp(value["recorded_at"], "recorded_at")
         return {
             "session_id": value["session_id"],
@@ -913,6 +908,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
         """Return recent bounded session references without reading transcripts."""
         if type(limit) is not int or limit < 1 or limit > MAX_SESSION_REFERENCES:
             raise ProjectRegistryError("invalid session link limit")
+
         def read(root_fd: int) -> list[dict[str, object]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -1007,7 +1003,9 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                 "parent_session_id": parent_session_id,
                 "recorded_at": _now(),
             }
-            payload = (json.dumps(payload_record, sort_keys=True) + "\n").encode("utf-8")
+            payload = (json.dumps(payload_record, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
             if len(payload) > MAX_SESSION_REFERENCE_SIZE:
                 raise ProjectRegistryError("project session reference is too large")
             payloads.append((session_id, payload))
@@ -1047,11 +1045,7 @@ class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
                 created = True
             fd = os.open(
                 "sessions.jsonl",
-                os.O_WRONLY
-                | os.O_APPEND
-                | os.O_CREAT
-                | os.O_NOFOLLOW
-                | os.O_NONBLOCK,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
                 0o600,
                 dir_fd=directory_fd,
             )

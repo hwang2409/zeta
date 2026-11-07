@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.agent.conversation_channel import ConversationChannel
+from zeta.agent.finish_gate import CausalEpisodeRegistry
 from zeta.agent.pending_delivery import (
     NotificationInput,
     ProducerResult,
@@ -54,7 +55,9 @@ async def test_step_delivery_produce_validates_and_commits_before_edge() -> None
 
 @pytest.mark.asyncio
 async def test_delivery_registry_routes_same_and_cross_loop() -> None:
-    channel = ConversationChannel(SimpleNamespace(), SimpleNamespace())
+    channel = ConversationChannel(
+        SimpleNamespace(causal_episodes=CausalEpisodeRegistry()), SimpleNamespace()
+    )
     local = StepDeliveryFlow(_Store())
     channel.register_delivery_flow("local", local)
     item = PromptInput("local", MessageOrigin.AGENT_SEND, None)

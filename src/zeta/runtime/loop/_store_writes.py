@@ -69,7 +69,9 @@ class StoreWriteMixin:
             and self.project_registry is not None
         ):
             self._child_lineage_publisher = ChildLineagePublisher(
-                self.project_registry, self.root_session_dir
+                self.project_registry,
+                self.root_session_dir,
+                self.store._storage_lease,
             )
         self._configure_transcript_index()
         tool_registry = getattr(self, "tool_registry", None)
