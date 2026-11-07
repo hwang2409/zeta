@@ -109,6 +109,10 @@ jobs:
           enable-cache: false
       - name: Start installed zeta on old home
         run: python scripts/smoke_old_home.py
+      - name: Select stored-format predecessor
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/storage_format_compatibility.py
       - name: Emit candidate stored-format registry
         run: python tests/compatibility/storage_probe.py > storage-format-candidate.json
       - name: Archive candidate registry and lock
