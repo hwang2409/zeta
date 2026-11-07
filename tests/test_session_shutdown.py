@@ -405,11 +405,16 @@ def test_recovery_and_send_release_borrowed_child_stores(
         flow = StepDeliveryFlow(resident_child)
         await flow.initialize()
         channel.register_delivery_flow("child", flow)
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        loop._background_owner.register(
+            "child", watcher.cancel, watcher, parent_store=opened.store
+        )
         monkeypatch.setattr(ConversationStore, "__init__", record)
         assert await send_to_run(
             opened.store,
             "child",
             "follow-up",
+            owner=loop._background_owner,
             channel=channel,
         ) is None
         await asyncio.to_thread(recover_agent_children, loop)

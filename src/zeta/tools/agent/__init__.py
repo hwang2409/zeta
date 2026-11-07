@@ -297,18 +297,15 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
         return read_session_file(directory_fd, name)
 
 
-def _read_agent_output(
-    store: object,
+def _read_agent_output_at_path(
+    store: ConversationStore,
+    child_path: Path,
     *,
     requested_handle: str,
     offset: int,
     limit: int | None,
     max_bytes: int,
 ) -> dict[str, object]:
-    receipts = _active_agent_receipts(store)
-    child_path = receipts.get(requested_handle)
-    if child_path is None:
-        raise ValueError("unknown child handle")
     try:
         raw = _read_child_file(store, child_path, "conversation.jsonl")
         rows = raw.splitlines(keepends=True)
@@ -750,97 +747,25 @@ async def _agent_status(
     requested = arguments.get("handle")
     if requested is not None and (type(requested) is not str or not requested):
         return _agent_error("handle must be a nonempty string", max_bytes)
-    try:
-        children = await asyncio.to_thread(
-            _read_agent_status,
-            registry.session_store,
-            requested_handle=requested,
-        )
-    except (TypeError, ValueError) as exc:
-        return _agent_error(str(exc), max_bytes)
-    if requested is None:
-        finished_omitted = sum(_is_finished_agent_status(child) for child in children)
-        children = [child for child in children if not _is_finished_agent_status(child)]
-    else:
-        finished_omitted = 0
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     if type(offset) is not int or offset < 0:
         return _agent_error("offset must be a nonnegative integer", max_bytes)
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
-    total = len(children)
-    root_idle_usage = idle_resource_usage(children)
-    raw_page = children[offset : offset + limit if limit is not None else None]
-    page: list[dict[str, StructuredContentValue]] = []
-    for index, child in enumerate(raw_page):
-        child_offset = offset + index
-        child_truncated = child_offset + 1 < total
-        fitted = _fit_status_row(
-            child,
-            offset=child_offset,
-            total=total,
-            truncated=child_truncated,
-            next_offset=child_offset + 1 if child_truncated else None,
-            finished_omitted=finished_omitted,
+    from .subtree import read_status_result
+
+    try:
+        return await asyncio.to_thread(
+            read_status_result,
+            registry.session_store,
+            requested_handle=requested,
+            offset=offset,
+            limit=limit,
             max_bytes=max_bytes,
         )
-        if fitted is None:
-            break
-        page.append(fitted)
-
-    while page:
-        next_offset = offset + len(page)
-        truncated = next_offset < total
-        result = _status_response(
-            page,
-            offset=offset,
-            total=total,
-            truncated=truncated,
-            next_offset=next_offset if truncated else None,
-            finished_omitted=finished_omitted,
-            idle_usage=root_idle_usage,
-        )
-        try:
-            fits = len(encode_json(result)) <= max_bytes
-        except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
-            fits = False
-        if fits:
-            return result
-        page.pop()
-    if offset < len(children):
-        return _agent_error("status item exceeds response limit", max_bytes)
-    count = len(children)
-    label = "child" if count == 1 else "children"
-    result = _status_response(
-        [],
-        offset=offset,
-        total=count,
-        truncated=False,
-        next_offset=None,
-        finished_omitted=finished_omitted,
-        idle_usage=root_idle_usage,
-    )
-    if count == 1:
-        result["content"] = [
-            text_block(
-                f"agent status: {count} {label}"
-                + (
-                    f"\n{finished_omitted} finished children omitted "
-                    "(query by handle for results)"
-                    if finished_omitted
-                    else ""
-                )
-            )
-        ]
-    try:
-        return (
-            result
-            if len(encode_json(result)) <= max_bytes
-            else _agent_error("response exceeds response limit", max_bytes)
-        )
-    except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
-        return _agent_error("response exceeds response limit", max_bytes)
+    except (TypeError, ValueError) as exc:
+        return _agent_error(str(exc), max_bytes)
 
 
 async def _agent_output(
@@ -862,15 +787,15 @@ async def _agent_output(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        return _bounded_agent_result(
-            _read_agent_output(
-                registry.session_store,
-                requested_handle=handle,
-                offset=offset,
-                limit=limit,
-                max_bytes=max_bytes,
-            ),
-            max_bytes,
+        from .subtree import read_output_result
+
+        return await asyncio.to_thread(
+            read_output_result,
+            registry.session_store,
+            requested_handle=handle,
+            offset=offset,
+            limit=limit,
+            max_bytes=max_bytes,
         )
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)

@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from ..core.context import ContextAssembler
     from ..core.context_parts.admission import AdmittedSessionRequest
     from ..core.store._client_delivery import ClientSteeringBatch
+    from .background import BackgroundAgentOwner
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_DELIVERY_TIMEOUT_SECONDS = 1.0
@@ -754,6 +755,7 @@ async def send_to_run(
     child_instance_id: object,
     message: object,
     *,
+    owner: BackgroundAgentOwner,
     channel: ConversationChannel,
     origin: MessageOrigin = MessageOrigin.AGENT_SEND,
 ) -> str | None:
@@ -767,6 +769,8 @@ async def send_to_run(
         f"no live run/child {child_instance_id!r}; it was canceled, finished, "
         "or never started"
     )
+    if not owner.controls_child(parent_store, child_instance_id):
+        return no_live_run
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
         return no_live_run
