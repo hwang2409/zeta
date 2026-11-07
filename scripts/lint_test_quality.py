@@ -423,6 +423,16 @@ def _inside_test_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> boo
     )
 
 
+def _enclosing_function_touches_added_line(
+    node: ast.AST, added: set[int], parents: dict[ast.AST, ast.AST]
+) -> bool:
+    return any(
+        _touches_added_line(ancestor, added)
+        for ancestor in _enclosing_nodes(node, parents)
+        if isinstance(ancestor, (ast.AsyncFunctionDef, ast.FunctionDef))
+    )
+
+
 def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return (
         isinstance(node, ast.Call)
@@ -541,12 +551,19 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     }
     findings: list[Finding] = []
     for node in ast.walk(tree):
-        if not hasattr(node, "lineno") or not _touches_added_line(node, added):
+        if not hasattr(node, "lineno"):
             continue
-        findings.extend(_timing_findings(path, node, lines))
-        findings.extend(_digest_findings(path, node, literal_names, serialized_names))
-        findings.extend(_contract_findings(path, node, lines))
-        findings.extend(_deadline_findings(path, node, lines, parents))
+        touches_added = _touches_added_line(node, added)
+        if touches_added:
+            findings.extend(_timing_findings(path, node, lines))
+            findings.extend(
+                _digest_findings(path, node, literal_names, serialized_names)
+            )
+            findings.extend(_contract_findings(path, node, lines))
+        if touches_added or _enclosing_function_touches_added_line(
+            node, added, parents
+        ):
+            findings.extend(_deadline_findings(path, node, lines, parents))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 

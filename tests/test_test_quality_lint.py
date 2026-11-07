@@ -165,6 +165,17 @@ def test_await_deadline_rule_catches_both_pr_772_notification_gates(
     ]
 
 
+def test_deadline_rule_checks_the_whole_changed_function(tmp_path: Path) -> None:
+    source = """async def test_wait():
+    await ready.wait()
+    assert state == "new"
+"""
+
+    findings = _lint(tmp_path, source, added_lines={3})
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 2)]
+
+
 def test_support_deadline_exemption_applies_only_to_bounded_await(
     tmp_path: Path,
 ) -> None:
