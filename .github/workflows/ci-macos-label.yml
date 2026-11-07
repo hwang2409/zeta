@@ -14,9 +14,9 @@ permissions:
   pull-requests: read
 
 jobs:
-  pytest:
+  macos:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
-    name: pytest
+    name: macos
     uses: ./.github/workflows/pytest.yml
     with:
-      os: '["macos-latest"]'
+      os: macos-latest

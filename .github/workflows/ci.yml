@@ -9,10 +9,12 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  # Every main commit needs a result; superseded pull-request runs do not.
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # Every main commit needs an Ubuntu, ruff, and browser result; superseded
+  # pull-request runs do not.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -20,13 +22,23 @@ permissions:
   pull-requests: read
 
 jobs:
-  pytest:
-    name: pytest
+  ubuntu:
+    name: ubuntu
     uses: ./.github/workflows/pytest.yml
     with:
-      # ZETA-84 was a Linux-only bug that darwin-only testing could not see.
-      # Pull requests opt into macOS with the macos label; main always runs both.
-      os: ${{ (github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]' }}
+      os: ubuntu-latest
+
+  macos:
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos') }}
+    name: macos
+    uses: ./.github/workflows/pytest.yml
+    with:
+      os: macos-latest
+    # Main keeps one running macOS job and only the newest pending commit.
+    # Other events use a unique group and cannot replace a main job.
+    concurrency:
+      group: ${{ github.event_name == 'push' && 'ci-macos-main' || format('ci-macos-{0}', github.run_id) }}
+      cancel-in-progress: false
 
   lint:
     name: ruff
