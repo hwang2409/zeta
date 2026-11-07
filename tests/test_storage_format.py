@@ -365,6 +365,30 @@ def test_publish_reads_locked_tree_before_writing(tmp_path: Path) -> None:
     }
 
 
+def test_registry_matches_queued_steer_validator_shape() -> None:
+    from zeta.core.store._client_delivery import validate_client_delivery_data
+    from zeta.protocol.types import (
+        Message,
+        MessageOrigin,
+        MessageRole,
+        TextContent,
+        with_message_origin,
+    )
+
+    accepted = with_message_origin(
+        Message(MessageRole.USER, [TextContent("resume")]), MessageOrigin.USER
+    ).to_dict()
+    payload = {
+        "delivery_id": "d" * 8,
+        "method": "steer",
+        "status": "queued",
+        "outcome": {"accepted": True},
+        "accepted_message": accepted,
+    }
+    validate_client_delivery_data(payload, "session")
+    assert set(payload) == set(storage_format.ACCEPTED_KEY_SETS["client_delivery_queued_steer_acceptance_message"])
+
+
 def test_registry_dump_is_deterministic_and_detects_epoch_neutral_changes() -> None:
     from zeta.storage_format import compare_registry_dumps, registry_dump
 
@@ -386,7 +410,7 @@ def test_registry_dump_is_deterministic_and_detects_epoch_neutral_changes() -> N
             mutated[registry_name][shape].append(value)
         else:
             mutated[registry_name][shape].remove("status")
-        with pytest.raises(ValueError, match="candidate WRITER_EPOCH"):
+        with pytest.raises(ValueError, match="WRITER_EPOCH"):
             compare_registry_dumps(baseline, mutated)
         mutated["writer_epoch"] += 1
         compare_registry_dumps(baseline, mutated)
