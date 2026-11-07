@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import shutil
 from pathlib import Path
 
@@ -111,6 +112,99 @@ async def test_bash_falls_back_once_when_persisted_cwd_was_removed(
 
 
 @pytest.mark.asyncio
+async def test_bash_background_macro_falls_back_when_session_cwd_was_removed(
+    tmp_path: Path,
+) -> None:
+    session_cwd = tmp_path / "worktree"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
+
+    try:
+        shutil.rmtree(session_cwd)
+        started = await asyncio.wait_for(
+            registry.execute(
+                ToolCall("macro", "bash", {"command": "pwd"}),
+                _background=True,
+            ),
+            10,
+        )
+        assert started["isError"] is False
+        task_id = started["structuredContent"]["task_id"]
+        await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
+        completed = await _execute(
+            registry,
+            ToolCall("macro-output", "task_output", {"task_id": task_id}),
+        )
+
+        assert completed["structuredContent"]["output"].strip() == str(tmp_path)
+        assert registry.take_cwd_recovery_notices() == (
+            (str(session_cwd), str(tmp_path)),
+        )
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
+
+
+@pytest.mark.asyncio
+async def test_run_background_falls_back_once_when_session_cwd_was_removed(
+    tmp_path: Path,
+) -> None:
+    session_cwd = tmp_path / "worktree"
+    output = tmp_path / "background-cwd.txt"
+    session_cwd.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=session_cwd)
+    registry = ToolRegistry(
+        session_cwd,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop = AgentLoop(
+        FakeBackend(
+            [
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "background",
+                            "run_background",
+                            {"command": f"pwd > {shlex.quote(str(output))}"},
+                        )
+                    ]
+                ),
+                ScriptedTurn(content=[TextContent("done")]),
+            ]
+        ),
+        store,
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    try:
+        shutil.rmtree(session_cwd)
+        await _collect(loop)
+        result = next(
+            message.tool_result
+            for message in store.messages()
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == "background"
+        )
+        assert result.is_error is False
+        task_id = result.structured_content["task_id"]
+        await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
+        notices = [
+            message
+            for message in store.messages()
+            if message.metadata.get("zeta_event") == "shell_cwd_recovered"
+        ]
+
+        assert output.read_text().strip() == str(tmp_path)
+        assert len(notices) == 1
+        assert notices[0].content[0].text == (
+            f"[zeta] shell cwd: {session_cwd} was removed; continuing in {tmp_path}"
+        )
+    finally:
+        await asyncio.wait_for(loop.close(), 10)
+
+
+@pytest.mark.asyncio
 async def test_run_background_explicit_cwd_survives_removed_session_cwd(
     tmp_path: Path,
 ) -> None:
@@ -145,14 +239,25 @@ async def test_run_background_explicit_cwd_survives_removed_session_cwd(
 
 
 @pytest.mark.asyncio
-async def test_replaced_session_cwd_still_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("replacement", ["directory", "symlink", "file"])
+async def test_replaced_session_cwd_still_fails_closed(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
     session_cwd = tmp_path / "worktree"
     session_cwd.mkdir()
     registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     try:
         shutil.rmtree(session_cwd)
-        session_cwd.mkdir()
+        if replacement == "directory":
+            session_cwd.mkdir()
+        elif replacement == "symlink":
+            target = tmp_path / "replacement-target"
+            target.mkdir()
+            session_cwd.symlink_to(target, target_is_directory=True)
+        else:
+            session_cwd.write_text("replacement")
         bash_result = await _execute(
             registry, ToolCall("bash", "bash", {"command": "pwd"})
         )
