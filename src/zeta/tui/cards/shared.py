@@ -94,7 +94,7 @@ def _cell_prefix(text: str, width: int) -> int:
 
 
 def wrap_by_cells(text: str, width: int) -> list[str]:
-    """Wrap text by terminal cells, splitting words that exceed the width."""
+    """Wrap text by terminal cells, preferring spaces and path separators."""
 
     width = max(1, width)
     lines: list[str] = []
@@ -109,6 +109,9 @@ def wrap_by_cells(text: str, width: int) -> list[str]:
                 lines.append(current)
             while get_cwidth(word) > width:
                 split = _cell_prefix(word, width)
+                separator = max(word.rfind(mark, 0, split) for mark in "/-_.")
+                if separator >= 0:
+                    split = separator + 1
                 lines.append(word[:split])
                 word = word[split:]
             current = word
