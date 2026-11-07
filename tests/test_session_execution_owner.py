@@ -465,14 +465,14 @@ def test_format_socket_and_execution_lock_order_across_processes(
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "storage-format.json").write_text('{"writer_epoch":1}\n')
+    (home / "storage-format.json").write_text('{"writer_epoch":2}\n')
     session_id = _created_session(home, tmp_path)
     owner_ready, owner_send = multiprocessing.Pipe(duplex=False)
     owner_release_recv, owner_release_send = multiprocessing.Pipe(duplex=False)
     owner = _spawn(_hold_session, str(home), session_id, owner_send, owner_release_recv)
     assert owner_ready.recv()[0] == "owned"
     try:
-        advance(home, expected_epoch=1, target_epoch=2)
+        advance(home, expected_epoch=2, target_epoch=3)
     except StorageFormatError as exc:
         advance_error = str(exc)
     else:
@@ -484,7 +484,7 @@ def test_format_socket_and_execution_lock_order_across_processes(
 
     advanced_home = tmp_path / "advanced-home"
     advanced_home.mkdir()
-    (advanced_home / "storage-format.json").write_text('{"writer_epoch":2}\n')
+    (advanced_home / "storage-format.json").write_text('{"writer_epoch":3}\n')
     session_recv, session_send = multiprocessing.Pipe(duplex=False)
     creator = _spawn(
         _create_session_process, str(advanced_home), str(tmp_path), session_send
@@ -543,7 +543,7 @@ def test_format_socket_and_execution_lock_order_across_processes(
     assert socket_result_recv.recv()[0] == "opened"
     after_socket_failure.join()
     assert after_socket_failure.exitcode == 0
-    assert verify(advanced_home).writer_epoch == 2
+    assert verify(advanced_home).writer_epoch == 3
     for connection in (
         owner_ready,
         owner_send,
