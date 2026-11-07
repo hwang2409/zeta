@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import _now
 from ..core.store import ConversationStore
-from ..protocol.types import MessageOrigin
+from ..protocol.types import MessageOrigin, harness_notice
 from ..tools.agent import agent_stats
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
@@ -212,7 +212,12 @@ async def consume_run(
                     result = await consume_child(
                         child_loop,
                         _IMMEDIATE_FINISH_REMINDER,
-                        origin=MessageOrigin.AGENT_PROMPT,
+                        origin=MessageOrigin.HARNESS_NUDGE,
+                        harness_notice_message=harness_notice(
+                            "finish reminder",
+                            _IMMEDIATE_FINISH_REMINDER,
+                            event="agent_finish_reminder",
+                        ),
                         **kwargs,
                     )
                     idle_published = False
@@ -259,7 +264,12 @@ async def consume_run(
                 result = await consume_child(
                     child_loop,
                     _IDLE_NUDGE_PROMPT,
-                    origin=MessageOrigin.AGENT_PROMPT,
+                    origin=MessageOrigin.HARNESS_NUDGE,
+                    harness_notice_message=harness_notice(
+                        "idle reminder",
+                        _IDLE_NUDGE_PROMPT,
+                        event="agent_idle_reminder",
+                    ),
                     **kwargs,
                 )
                 idle_published = False
