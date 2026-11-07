@@ -922,6 +922,12 @@ def main() -> int:
         commit, main, branch, args
     )
     final_revision = args.final
+    if (
+        final_revision
+        and git("rev-parse", f"{commit}^{{commit}}").strip()
+        == git("rev-parse", f"{final_revision}^{{commit}}").strip()
+    ):
+        final_revision = None
     if final_revision:
         final_items, final_sources, final_error_path = _final_index(final_revision)
     else:

@@ -408,6 +408,7 @@ def _final_loss(
     merge_text: str,
     final_text: str | None = None,
     final_path: str = "src/a.py",
+    merge_extra: tuple[str, str] | None = None,
 ) -> tuple[str, str]:
     (r / "src").mkdir()
     (r / "src/a.py").write_text("base = 1\n")
@@ -423,6 +424,11 @@ def _final_loss(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     (r / "src/a.py").write_text(merge_text)
+    if merge_extra is not None:
+        extra_path, extra_text = merge_extra
+        extra = r / extra_path
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text(extra_text)
     commit(r, "merge")
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
@@ -437,6 +443,26 @@ def _final_loss(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
     return merge, final
+
+
+def _final_marker_case(r: Path, case: str) -> tuple[str, str, int, str] | None:
+    if case == "fixed marker":
+        merge = _make_conflict_merge(r)
+        (r / "src/a.py").write_text("def main(): pass\ndef branch(): pass\n")
+        commit(r, "fix")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "fixed later"
+    if case == "final marker":
+        merge = _make_conflict_merge(r)
+        return merge, merge, 2, "merge does not parse"
+    if case == "parse allow-list":
+        merge = _make_conflict_merge(r)
+        body = r / "body.txt"
+        body.write_text("merge-resolution: src/a.py parse -> intentional\n")
+        return merge, body.as_posix(), 0, "allowed merge parse diagnostic"
+    return None
 
 
 def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
@@ -604,6 +630,20 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
             1,
             "route",
         )
+    if case.startswith("checked merge collision"):
+        merge, _ = _final_loss(
+            r,
+            "def helper(): return 1\n",
+            "def branch(): pass\n",
+            "base = 1\n",
+            merge_extra=("src/b.py", "def helper(): return 1\n"),
+        )
+        final = {
+            "checked merge collision full": merge,
+            "checked merge collision short": merge[:7],
+            "checked merge collision HEAD": "HEAD",
+        }[case]
+        return merge, final, 1, "def helper"
     if case == "checked merge":
         return (
             *_final_loss(
@@ -612,21 +652,10 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
             1,
             "def helper",
         )
-    if case == "fixed marker":
-        merge = _make_conflict_merge(r)
-        (r / "src/a.py").write_text("def main(): pass\ndef branch(): pass\n")
-        commit(r, "fix")
-        final = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=r, text=True
-        ).strip()
-        return merge, final, 0, "fixed later"
-    if case == "final marker":
-        merge = _make_conflict_merge(r)
-        return merge, merge, 2, "merge does not parse"
-    merge = _make_conflict_merge(r)
-    body = r / "body.txt"
-    body.write_text("merge-resolution: src/a.py parse -> intentional\n")
-    return merge, body.as_posix(), 0, "allowed merge parse diagnostic"
+    marker_case = _final_marker_case(r, case)
+    if marker_case is not None:
+        return marker_case
+    raise AssertionError(f"unknown final case: {case}")
 
 
 @pytest.mark.parametrize(
@@ -645,6 +674,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         ("duplicate final collection", 1, "TARGET"),
         ("dispatch restored", 0, "moved/restored later: src/a.py"),
         ("dispatch other function", 1, "route"),
+        ("checked merge collision full", 1, "def helper"),
+        ("checked merge collision short", 1, "def helper"),
+        ("checked merge collision HEAD", 1, "def helper"),
         ("checked merge", 1, "def helper"),
         ("fixed marker", 0, "fixed later"),
         ("final marker", 2, "merge does not parse"),
@@ -663,8 +695,11 @@ def test_final_head_identity_table(
         else ("--final", final_or_body)
     )
     result = run(r, merge, *args)
+    output = result.stdout + result.stderr
     assert result.returncode == expected
-    assert expected_line in (result.stdout + result.stderr)
+    assert expected_line in output
+    if case.startswith("checked merge collision"):
+        assert "moved/restored later" not in output
 
 
 def _api_repo(r: Path) -> None:
