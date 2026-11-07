@@ -6564,8 +6564,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
             in rendered
         )
         assert (
-            "project_context_health: malformed_memory "
-            "(p_child/memory/brief.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_child/memory/brief.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
         assert "completion_client_setups: codex/gpt-test=1" in rendered
 
@@ -6573,8 +6574,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         lines = tui_app_module._status_card_lines(app.slash_status())
         rendered = "\n".join("".join(text for _style, text in line) for line in lines)
         assert (
-            "project_context_health: malformed_memory "
-            "(p_root/memory/state.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_root/memory/state.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
     finally:
         await app.close()

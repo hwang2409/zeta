@@ -19,6 +19,7 @@ from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.styles import DynamicStyle, Style
+from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -121,9 +122,14 @@ def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
     body: list[overlay.FragmentLine] = []
     width = STATUS_CARD_MAX_WIDTH - 2
     for line in _format_status(status).splitlines():
+        if cell_len(line) <= width:
+            body.append([overlay.value(line)])
+            continue
         label, separator, value = line.partition(": ")
-        prefix = f"{label}{separator}" if separator else ""
-        wrapped = wrap_by_cells(value if separator else line, width - len(prefix))
+        prefix = f"{label}{separator}" if separator else line[: -len(line.lstrip())]
+        wrapped = wrap_by_cells(
+            value if separator else line.lstrip(), width - cell_len(prefix)
+        )
         body.extend(
             [
                 overlay.value(prefix if index == 0 else " " * len(prefix)),
