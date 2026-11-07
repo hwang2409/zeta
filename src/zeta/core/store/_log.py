@@ -33,6 +33,7 @@ from ..checkpoints import (
 )
 from ..session_files import open_session_file
 from ..transcript_recovery import (
+    RepairTarget,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
