@@ -360,7 +360,7 @@ def test_malformed_registry_decisions_use_startup_state(
         assert warning is not None
         assert app._startup_warnings.count(warning.warning) == 1
         asyncio.run(app._decisions_tick())
-        assert asyncio.run(app.slash_decisions("")) == "no open decisions"
+        assert asyncio.run(app.slash_decisions("")) == "no open attention items"
     finally:
         asyncio.run(app.close())
 
