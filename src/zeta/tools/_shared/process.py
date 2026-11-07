@@ -477,12 +477,17 @@ class BackgroundTaskRegistry:
 
         record = self._record(task_id)
         if record.monitor is not None:
-            if timeout is None:
-                await record.monitor
-            else:
-                await asyncio.wait((record.monitor,), timeout=timeout)
-                if record.monitor.done():
-                    await record.monitor
+            try:
+                if timeout is None:
+                    await asyncio.shield(record.monitor)
+                else:
+                    await asyncio.wait((record.monitor,), timeout=timeout)
+                    if record.monitor.done():
+                        await asyncio.shield(record.monitor)
+            except asyncio.CancelledError:
+                caller = asyncio.current_task()
+                if caller is None or caller.cancelling() or record.running:
+                    raise
         return self._status(record)
 
     async def output(
