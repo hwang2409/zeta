@@ -21,6 +21,7 @@ from ..core.session_files import child_directory, open_session_file
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
+SPILL_SESSION_MAX_BYTES = 100 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 _LOCK_FILE = ".spill.lock"
 
@@ -29,6 +30,31 @@ _LOCK_FILE = ".spill.lock"
 class SpillArtifact:
     path: Path
     byte_size: int
+
+
+class SpillFullError(RuntimeError):
+    """The root session has no spill capacity left."""
+
+
+class SpillByteBudget:
+    """Bound spill bytes shared by one root registry and all its clones."""
+
+    def __init__(self, max_bytes: int | None = None) -> None:
+        self.max_bytes = SPILL_SESSION_MAX_BYTES if max_bytes is None else max_bytes
+        self._used_bytes = 0
+        self._lock = threading.Lock()
+
+    def reserve(self, byte_count: int) -> None:
+        with self._lock:
+            if self._used_bytes + byte_count > self.max_bytes:
+                raise SpillFullError("spill budget is full")
+            self._used_bytes += byte_count
+
+    def release(self, byte_count: int) -> None:
+        with self._lock:
+            if byte_count > self._used_bytes:
+                raise ValueError("spill release exceeds its reservation")
+            self._used_bytes -= byte_count
 
 
 class SpillStore:
@@ -40,8 +66,10 @@ class SpillStore:
         session_dir: Path | None = None,
         directory_fd: int | None = None,
         max_bytes: int = SPILL_MAX_BYTES,
+        byte_budget: SpillByteBudget | None = None,
     ) -> None:
         self.max_bytes = max_bytes
+        self._byte_budget = byte_budget or SpillByteBudget()
         self._lock = threading.Lock()
         self._transient_lock = threading.Lock()
         self._directory_fd: int | None = None
@@ -59,6 +87,7 @@ class SpillStore:
             self._parent_fd = directory_fd
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
+        self._retained: dict[str, int] = {}
         self._transient_bytes = 0
         self._transient_max_bytes = 64 * 1024 * 1024
 
@@ -74,6 +103,7 @@ class SpillStore:
         with self._transient_lock:
             if self._transient_bytes + byte_count > self._transient_max_bytes:
                 raise RuntimeError("transient spill budget is full")
+            self._byte_budget.reserve(byte_count)
             self._transient_bytes += byte_count
 
     def release_transient(self, byte_count: int) -> None:
@@ -83,7 +113,7 @@ class SpillStore:
             if byte_count > self._transient_bytes:
                 raise ValueError("transient spill release exceeds its reservation")
             self._transient_bytes -= byte_count
-
+            self._byte_budget.release(byte_count)
 
     async def awrite_text_group(
         self,
@@ -207,6 +237,8 @@ class SpillStore:
             directory_fd = self._ensure_directory()
             with self._advisory_lock(directory_fd):
                 published: list[str] = []
+                reserved: dict[str, int] = {}
+                committed = False
                 try:
                     for name, temporary, parts in publications.values():
                         fd = open_session_file(
@@ -214,13 +246,26 @@ class SpillStore:
                             temporary,
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                         )
+                        reserved[temporary] = 0
                         with os.fdopen(fd, "wb") as destination:
                             for part in parts:
                                 if isinstance(part, bytes):
-                                    destination.write(part)
-                                    continue
-                                part.seek(0)
-                                shutil.copyfileobj(part, destination)
+                                    chunks = (part,)
+                                else:
+                                    part.seek(0)
+                                    chunks = iter(
+                                        lambda part=part: part.read(1024 * 1024), b""
+                                    )
+                                for chunk in chunks:
+                                    self._reserve_with_eviction(
+                                        directory_fd, len(chunk)
+                                    )
+                                    try:
+                                        destination.write(chunk)
+                                    except BaseException:
+                                        self._byte_budget.release(len(chunk))
+                                        raise
+                                    reserved[temporary] += len(chunk)
                             destination.flush()
                             os.fsync(destination.fileno())
                     for name, temporary, _parts in publications.values():
@@ -232,19 +277,40 @@ class SpillStore:
                         )
                         published.append(name)
                     os.fsync(directory_fd)
+                    self._retained.update(
+                        {
+                            name: reserved[temporary]
+                            for name, temporary, _parts in publications.values()
+                        }
+                    )
+                    committed = True
                 except BaseException:
+                    temporary_by_name = {
+                        name: temporary
+                        for name, temporary, _parts in publications.values()
+                    }
                     for name in published:
+                        temporary = temporary_by_name[name]
                         try:
                             os.unlink(name, dir_fd=directory_fd)
                         except OSError:
-                            pass
+                            self._retained[name] = reserved.pop(temporary)
+                        else:
+                            self._byte_budget.release(reserved.pop(temporary))
                     raise
                 finally:
-                    for _name, temporary, _parts in publications.values():
+                    for name, temporary, _parts in publications.values():
                         try:
                             os.unlink(temporary, dir_fd=directory_fd)
                         except FileNotFoundError:
-                            pass
+                            if not committed and name not in published:
+                                self._byte_budget.release(reserved.pop(temporary, 0))
+                        except OSError:
+                            if not committed:
+                                self._retained[temporary] = reserved.pop(temporary, 0)
+                            raise
+                        else:
+                            self._byte_budget.release(reserved.pop(temporary, 0))
                 self._evict_before(directory_fd, set(published))
         return {
             artifact: (self.root / name).absolute()
@@ -301,6 +367,17 @@ class SpillStore:
             self._parent_fd = None
             if self._temporary_root is not None:
                 shutil.rmtree(self._temporary_root, ignore_errors=True)
+                deleted = [
+                    name
+                    for name in self._retained
+                    if not (self._temporary_root / name).exists()
+                ]
+                self._byte_budget.release(
+                    sum(self._retained.pop(name) for name in deleted)
+                )
+        with self._transient_lock:
+            self._byte_budget.release(self._transient_bytes)
+            self._transient_bytes = 0
 
     def _ensure_directory(self) -> int:
         if self._closed:
@@ -335,6 +412,36 @@ class SpillStore:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
+    def _reserve_with_eviction(self, directory_fd: int, byte_count: int) -> None:
+        while True:
+            try:
+                self._byte_budget.reserve(byte_count)
+                return
+            except SpillFullError:
+                if not self._evict_oldest(directory_fd):
+                    raise
+
+    def _evict_oldest(self, directory_fd: int) -> bool:
+        entries: list[tuple[int, str, int]] = []
+        try:
+            for name in os.listdir(directory_fd):
+                if name.startswith("."):
+                    continue
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    entries.append((info.st_mtime_ns, name, info.st_size))
+        except OSError:
+            return False
+        for _mtime, name, size in sorted(entries):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                continue
+            if (retained_size := self._retained.pop(name, None)) is not None:
+                self._byte_budget.release(retained_size)
+            return True
+        return False
+
     def _evict_before(self, directory_fd: int, newest: set[str]) -> None:
         """Delete oldest files while retaining every file in the newest group."""
 
@@ -360,6 +467,8 @@ class SpillStore:
                 except OSError:
                     continue
                 total -= size
+                if (retained_size := self._retained.pop(name, None)) is not None:
+                    self._byte_budget.release(retained_size)
         except OSError:
             return
 

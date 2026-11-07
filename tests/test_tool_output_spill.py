@@ -792,7 +792,7 @@ async def test_child_spills_share_one_root_byte_cap(
             skill_catalog=SkillCatalog.empty(),
         )
         first = root.clone_for_session(first_store)
-        second = root.clone_for_session(second_store)
+        second = first.clone_for_session(second_store)
         first.spills.max_bytes = 100
         second.spills.max_bytes = 100
         try:
@@ -817,6 +817,17 @@ async def test_child_spills_share_one_root_byte_cap(
             assert "spill budget is full" in str(spill_full)
 
             new_path = first.spills.write_bytes("tool", "new", 0, b"b" * 100)
+            second.spills.reserve_transient(50)
+            with pytest.raises(RuntimeError, match="spill budget is full"):
+                second.spills.reserve_transient(1)
+            second.spills.release_transient(50)
+
+            def broken_parts():
+                yield b"x" * 50
+                raise OSError("source failed")
+
+            with pytest.raises(OSError, match="source failed"):
+                second.spills.write_parts("tool", "broken", 0, broken_parts())
             other_path = second.spills.write_bytes("tool", "other", 0, b"c" * 50)
             assert not old_path.exists()
             assert new_path.read_bytes() == b"b" * 100
