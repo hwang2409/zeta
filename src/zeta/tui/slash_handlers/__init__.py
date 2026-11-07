@@ -30,7 +30,7 @@ from ...core.session import (
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import SlashStatus, build_slash_status
+from ...core.slash import SlashStatus
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -38,6 +38,7 @@ from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
+from ...runtime.status import build_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name

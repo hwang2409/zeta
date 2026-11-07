@@ -82,6 +82,7 @@ async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve
     app = TUIApp(loop, provider="codex", model="offline")
     runtime = SimpleNamespace(
         loop=loop,
+        state=SimpleNamespace(usage_tracker=app._usage_tracker),
         opened=SimpleNamespace(
             metadata=SimpleNamespace(
                 session_id=loop.store.session_id,

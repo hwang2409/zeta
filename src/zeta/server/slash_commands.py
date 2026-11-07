@@ -23,7 +23,6 @@ from ..core.slash import (
     SlashCommand,
     SlashCommandRegistry,
     SlashStatus,
-    build_slash_status,
     create_slash_registry,
 )
 from ..mcp.prompt_commands import SlashPromptError
@@ -31,6 +30,7 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
+from ..runtime.status import build_slash_status
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
