@@ -30,6 +30,7 @@ from .protocol import (
     bounded,
 )
 from .runtime import ServerRuntime
+from .session_mutation import rename_session
 
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
@@ -76,9 +77,7 @@ async def mutate_session(
         return {"session_id": session_id}
     if not isinstance(name, str):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "name must be a string")
-    metadata = await asyncio.to_thread(runtime.manager.rename, session_id, name)
-    if runtime.opened is not None and session_id == runtime.session_id:
-        runtime.manager._copy_metadata(runtime.metadata, metadata)
+    metadata = await rename_session(runtime, session_id, name)
     return {"session": metadata.to_dict()}
 
 
