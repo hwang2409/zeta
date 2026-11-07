@@ -106,7 +106,7 @@ def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
 
 
 def _discover_tool_modules() -> list[str]:
-    package = importlib.import_module(__package__)
+    package = importlib.import_module(__package__)  # import-boundary: load the package being scanned  # fmt: skip
     modules = (
         f"{package.__name__}.{module_info.name}"
         for module_info in pkgutil.iter_modules(package.__path__)
@@ -120,7 +120,7 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
 
     for module_name in _discover_tool_modules():
         try:
-            module = importlib.import_module(module_name)
+            module = importlib.import_module(module_name)  # import-boundary: load a discovered tool module  # fmt: skip
         except Exception as exc:
             raise RuntimeError(
                 f"failed to load tool module {module_name}: {exc}"
