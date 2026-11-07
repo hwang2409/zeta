@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import threading
+import traceback
 from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import replace
@@ -35,6 +36,7 @@ import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
@@ -2680,6 +2682,8 @@ async def test_abort_captures_turn_before_approval_end_write(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
+    abort: asyncio.Task[list[dict[str, Any]]] | None = None
+    allow_approval_end: asyncio.Event | None = None
     try:
         await _request(
             reader,
@@ -2703,8 +2707,10 @@ async def test_abort_captures_turn_before_approval_end_write(
             frame = json.loads(payload)
             if frame.get("params", {}).get("event") == "approval_end":
                 approval_end_started.set()
-                async with asyncio.timeout(TIMEOUT):
-                    await allow_approval_end.wait()
+                await await_or_fail(
+                    allow_approval_end.wait(),
+                    what="approval publication gate release",
+                )
             return await original_write_physical(connection, payload)
 
         # test-contract: seam hold the physical approval-end write until turn capture
@@ -2712,7 +2718,22 @@ async def test_abort_captures_turn_before_approval_end_write(
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
-        await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
+
+        def task_state() -> str:
+            tasks = []
+            for task in asyncio.all_tasks():
+                stack = "".join(traceback.format_stack(task.get_stack()[-1]))
+                tasks.append(f"{task.get_name()}: {stack.strip()}")
+            return (
+                f"turn_task={turn_task!r}, "
+                f"approval_gate_set={allow_approval_end.is_set()}, "
+                f"tasks={tasks!r}"
+            )
+
+        await await_or_fail(
+            approval_end_started.wait(),
+            what=f"approval publication start ({task_state()})",
+        )
         # The abort captured this turn before the approval_end frame reached the
         # wire: it marked the cancellation outcome, so the turn cannot finish yet
         # because its post-gate output is queued behind the held approval_end write.
@@ -2720,10 +2741,20 @@ async def test_abort_captures_turn_before_approval_end_write(
         assert server.control._turn_cancel_outcome is not None
         allow_approval_end.set()
 
-        frames = await asyncio.wait_for(abort, TIMEOUT)
+        frames = await await_or_fail(
+            abort,
+            what=f"approval publication completion after abort ({task_state()})",
+        )
         assert frames[-1]["result"] == {"aborted": True}
         await _frames_until_event(reader, "turn_aborted")
     finally:
+        if allow_approval_end is not None:
+            allow_approval_end.set()
+        if abort is not None:
+            await await_or_fail(
+                asyncio.gather(abort, return_exceptions=True),
+                what="abort task cleanup",
+            )
         await _close(server, writer)
 
 
