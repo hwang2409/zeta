@@ -17,13 +17,14 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..tools.wake import register_wake
 from .pending_delivery import (
     DeliveryPublications,
     StepDeliveryFlow,
     complete_delivery,
     delivery_preview,
 )
-from .wakes import MAX_WAKE_RUN_COMPLETIONS, WakeActivation, wake_notice
+from .wakes import MAX_WAKE_RUN_COMPLETIONS, WakeActivation, WakeScheduler, wake_notice
 
 WakeState = Literal["idle", "scheduled", "running"]
 
@@ -46,6 +47,28 @@ class AgentNotificationMixin:
 
     _notification_turn_scheduled: bool = False
     step_delivery: StepDeliveryFlow | None = None
+
+    def _initialize_wake_scheduler(self, parent_owned_eligible: bool) -> None:
+        self.wake_scheduler: WakeScheduler | None = None
+        self._scheduled_wake_activation: WakeActivation | None = None
+        session_class = (
+            "top_level"
+            if self.agent_instance_id is None
+            else "parent_owned"
+            if parent_owned_eligible
+            else None
+        )
+        if session_class is None:
+            return
+        on_due = (
+            self._background_owner.notify_wake
+            if self.agent_instance_id is None
+            else lambda: self._background_owner.conversation_channel.wake(
+                self.agent_instance_id
+            )
+        )
+        self.wake_scheduler = WakeScheduler(session_class, on_due=on_due)
+        register_wake(self.tool_registry, self.wake_scheduler)
 
     def _initialize_step_delivery(self, store: ConversationStore) -> None:
         try:
@@ -162,36 +185,36 @@ class AgentNotificationMixin:
         notice: Message,
         *,
         max_completions: int | None = None,
+        present_only: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        """Run one zeta-authored notice without representing it as user input."""
+        """Run or only present one zeta-authored system notice."""
 
         if notice.role is not MessageRole.SYSTEM:
             raise ValueError("harness notice must have the system role")
-        return self._run_turn(
-            "",
-            origin=MessageOrigin.HARNESS_NUDGE,
-            system_message=notice,
-            max_completions=max_completions,
-        )
+        if not present_only:
+            return self._run_turn(
+                "",
+                origin=MessageOrigin.HARNESS_NUDGE,
+                system_message=notice,
+                max_completions=max_completions,
+            )
 
-    async def _present_harness_notice(
-        self, notice: Message
-    ) -> AsyncIterator[StreamEvent]:
-        """Present one persisted notice without dispatching a provider."""
+        async def present() -> AsyncIterator[StreamEvent]:
+            self._turn_active = True
+            try:
+                await self._append_turn_message(notice)
+                yield StreamEvent(StreamEventType.AGENT_START)
+                yield StreamEvent(StreamEventType.TURN_START, data={"turn": 0})
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(StreamEventType.MESSAGE_END, message=notice)
+                yield StreamEvent(StreamEventType.AGENT_END)
+            finally:
+                self._turn_active = False
+                self._notification_turn_scheduled = False
+                if self.wake_scheduler is not None and self.wake_scheduler.has_due():
+                    self._background_owner.notify_wake()
 
-        self._turn_active = True
-        try:
-            await self._append_turn_message(notice)
-            yield StreamEvent(StreamEventType.AGENT_START)
-            yield StreamEvent(StreamEventType.TURN_START, data={"turn": 0})
-            yield StreamEvent(StreamEventType.MESSAGE_START)
-            yield StreamEvent(StreamEventType.MESSAGE_END, message=notice)
-            yield StreamEvent(StreamEventType.AGENT_END)
-        finally:
-            self._turn_active = False
-            self._notification_turn_scheduled = False
-            if self.wake_scheduler is not None and self.wake_scheduler.has_due():
-                self._background_owner.notify_wake()
+        return present()
 
     def run_turn(
         self,
@@ -372,7 +395,9 @@ class AgentNotificationMixin:
             self._scheduled_wake_activation = None
             admission = activation.admission
             if admission is None:
-                return self._present_harness_notice(wake_notice(activation))
+                return self.run_harness_notice_turn(
+                    wake_notice(activation), present_only=True
+                )
             self.wake_scheduler.begin_wake_run(admission)
             return self.run_harness_notice_turn(
                 wake_notice(activation), max_completions=MAX_WAKE_RUN_COMPLETIONS

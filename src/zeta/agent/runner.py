@@ -395,6 +395,7 @@ async def _build_child_loop(
             policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
             runtime_tool_names=policy_allowed_runtime_names,
         )
+        excluded_names.add("wake")
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
@@ -475,6 +476,7 @@ async def _build_child_loop(
             child_lineage_publisher=loop._child_lineage_publisher,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
+            parent_owned_wake_eligible=explicit_finish,
         )
         child_loop.explicit_finish = explicit_finish
         child_loop.one_shot = getattr(loop, "one_shot", False)

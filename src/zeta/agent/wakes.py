@@ -63,6 +63,12 @@ class WakeScheduleResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _DueDecision:
+    admission: WakeAdmission | None
+    passive: tuple[WakeRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class WakeOwnedWork:
     pending_ids: tuple[str, ...]
     earliest_due_at_utc: datetime | None
@@ -238,54 +244,64 @@ class WakeScheduler:
         self._require_open()
         self.poll_due()
         now = _utc(self._wall_clock())
-        passive = tuple(
-            sorted(
-                (
-                    record
-                    for record in self._records.values()
-                    if record.state == "passive" and record.due_at_utc <= now
-                ),
-                key=lambda record: (record.due_at_utc, record.wake_id),
-            )
+        passive, due = self._collect_due_cohort(now)
+        decision = self._decide_due_cohort(now, passive, due)
+
+        if decision.admission is not None:
+            for record in decision.admission.records:
+                del self._records[record.wake_id]
+            self._admission_count += 1
+        for record in decision.passive:
+            self._records.pop(record.wake_id, None)
+        self._due_notified = False
+        self._signal_changed()
+
+        if decision.admission is None and not decision.passive:
+            return None
+        return WakeActivation(
+            admission=decision.admission,
+            passive=decision.passive,
         )
-        due = tuple(
-            sorted(
-                (
-                    record
-                    for record in self._records.values()
-                    if record.state == "due" and record.due_at_utc <= now
-                ),
-                key=lambda record: (record.due_at_utc, record.wake_id),
-            )
+
+    def _collect_due_cohort(
+        self, now: datetime
+    ) -> tuple[tuple[WakeRecord, ...], tuple[WakeRecord, ...]]:
+        ordered = sorted(
+            (record for record in self._records.values() if record.due_at_utc <= now),
+            key=lambda record: (record.due_at_utc, record.wake_id),
         )
-        if due and self.session_class == "parent_owned":
-            reason = self._parent_denial_reason()
-            if reason is not None:
-                denied = tuple(
-                    replace(record, state="passive", passive_reason=reason)
-                    for record in due
-                )
-                for record in denied:
-                    self._records[record.wake_id] = record
-                passive = (*passive, *denied)
-                due = ()
-        admission: WakeAdmission | None = None
-        if due:
-            admission = WakeAdmission(
+        return (
+            tuple(record for record in ordered if record.state == "passive"),
+            tuple(record for record in ordered if record.state == "due"),
+        )
+
+    def _decide_due_cohort(
+        self,
+        now: datetime,
+        passive: tuple[WakeRecord, ...],
+        due: tuple[WakeRecord, ...],
+    ) -> _DueDecision:
+        reason = (
+            self._parent_denial_reason()
+            if due and self.session_class == "parent_owned"
+            else None
+        )
+        if reason is not None:
+            denied = tuple(
+                replace(record, state="passive", passive_reason=reason)
+                for record in due
+            )
+            return _DueDecision(None, (*passive, *denied))
+        admission = (
+            WakeAdmission(
                 admission_id="wake_admission_" + self._id_factory(),
                 admitted_at_utc=now,
                 records=due,
             )
-            for record in due:
-                del self._records[record.wake_id]
-            self._admission_count += 1
-        for record in passive:
-            self._records.pop(record.wake_id, None)
-        self._due_notified = False
-        self._signal_changed()
-        if admission is None and not passive:
-            return None
-        return WakeActivation(admission=admission, passive=passive)
+            if due
+            else None
+        )
+        return _DueDecision(admission, passive)
 
     def restore_activation(self, activation: WakeActivation) -> None:
         """Restore an admitted cohort when dispatch is canceled before it starts."""

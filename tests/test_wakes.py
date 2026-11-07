@@ -10,6 +10,8 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.agent import runner as agent_runner_module
+from zeta.agent.presets import AgentPreset
 from zeta.agent.wakes import (
     MAX_PARENT_ADMISSIONS_PER_PROCESS,
     MAX_PENDING_WAKES,
@@ -20,6 +22,7 @@ from zeta.agent.wakes import (
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
+    Message,
     MessageOrigin,
     MessageRole,
     StreamEvent,
@@ -254,6 +257,104 @@ async def test_parent_owned_lifetime_admits_exactly_96_runs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_builds_wake_only_for_eligible_resident_children(
+    tmp_path: Path,
+) -> None:
+    """Mutation: omit child wake eligibility; the eligible tool assertion fails."""
+
+    parent_store = ConversationStore(tmp_path / "sessions")
+    parent_loop = AgentLoop(
+        FakeBackend([]), parent_store, skill_catalog=SkillCatalog.empty()
+    )
+    parent_loop.explicit_finish = True
+    preset = AgentPreset(
+        name="custom",
+        tool_names=None,
+        preamble="",
+        selection_guidance="custom child",
+        accepts_follow_ups=True,
+        explicit_finish=True,
+    )
+    child_loops: list[AgentLoop] = []
+    try:
+        eligible_id = f"{parent_store.session_id}:1"
+        eligible_store = ConversationStore(
+            parent_store.session_dir / "agents", session_id="1"
+        )
+        eligible, _ = await agent_runner_module._build_child_loop(
+            parent_loop,
+            child_backend=FakeBackend([]),
+            child_store=eligible_store,
+            child_instance_id=eligible_id,
+            child_depth=1,
+            preset=preset,
+            model=None,
+            cwd_override=None,
+            follow_up_loop=True,
+            description="eligible child",
+            child_account_context=None,
+        )
+        child_loops.append(eligible)
+        scheduler = eligible.wake_scheduler
+        assert scheduler is not None
+        assert scheduler.session_class == "parent_owned"
+        assert "wake" in {schema["name"] for schema in eligible.tool_registry.schemas}
+
+        scheduler._on_due()
+        await asyncio.wait_for(
+            parent_loop._background_owner.conversation_channel.wait(eligible_id),
+            timeout=10,
+        )
+
+        clock = Clock()
+        scheduler._wall_clock = clock
+        for index in range(MAX_PARENT_ADMISSIONS_PER_PROCESS):
+            result = scheduler.schedule(after_seconds=10, note=f"run {index + 1}")
+            assert result.autonomous is True
+            clock.advance(10)
+            activation = scheduler.admit_due()
+            assert activation is not None and activation.admission is not None
+        denied = scheduler.schedule(after_seconds=10, note="run 97")
+        assert scheduler.admission_count == 96
+        assert denied.autonomous is False
+        assert denied.reason == "parent_lifetime_limit"
+
+        one_shot_id = f"{parent_store.session_id}:2"
+        one_shot_store = ConversationStore(
+            parent_store.session_dir / "agents", session_id="2"
+        )
+        one_shot, _ = await agent_runner_module._build_child_loop(
+            parent_loop,
+            child_backend=FakeBackend([]),
+            child_store=one_shot_store,
+            child_instance_id=one_shot_id,
+            child_depth=1,
+            preset=preset,
+            model=None,
+            cwd_override=None,
+            follow_up_loop=False,
+            description="one-shot child",
+            child_account_context=None,
+        )
+        child_loops.append(one_shot)
+        assert one_shot.wake_scheduler is None
+        assert "wake" not in {
+            schema["name"] for schema in one_shot.tool_registry.schemas
+        }
+    finally:
+        for child_loop in reversed(child_loops):
+            instance_id = child_loop.agent_instance_id
+            await asyncio.wait_for(child_loop.close(), timeout=10)
+            if instance_id is not None:
+                parent_loop._background_owner.conversation_channel.unregister_loop(
+                    instance_id
+                )
+            child_loop.store.close()
+        await asyncio.wait_for(parent_loop.close(), timeout=10)
+        parent_store.close()
+
+
+@pytest.mark.asyncio
 async def test_due_wakes_coalesce_and_later_wake_stays_out_of_closed_cohort() -> None:
     """Mutation: select records after dispatch; wake b joins the first cohort."""
 
@@ -402,6 +503,23 @@ async def test_passive_wake_is_presented_without_provider_dispatch(
     clock = Clock()
     scheduler = _scheduler("top_level", clock)
     loop.wake_scheduler = scheduler
+    notice_modes: list[bool] = []
+    original_run_harness_notice_turn = loop.run_harness_notice_turn
+
+    def observe_notice_mode(
+        notice: Message,
+        *,
+        max_completions: int | None = None,
+        present_only: bool = False,
+    ) -> AsyncIterator[StreamEvent]:
+        notice_modes.append(present_only)
+        return original_run_harness_notice_turn(
+            notice,
+            max_completions=max_completions,
+            present_only=present_only,
+        )
+
+    loop.run_harness_notice_turn = observe_notice_mode  # type: ignore[method-assign]
     try:
         roots = [
             scheduler.schedule(after_seconds=10, note=f"root {index}")
@@ -420,6 +538,7 @@ async def test_passive_wake_is_presented_without_provider_dispatch(
         events = await _collect(loop.run_notification_turn())
 
         assert backend.calls == []
+        assert notice_modes == [True]
         presented = next(
             event.message
             for event in events
