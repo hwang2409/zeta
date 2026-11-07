@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """Small, repeatable performance probe for copied zeta sessions."""
 from __future__ import annotations
-import argparse, json, os, pty, shutil, signal, statistics, subprocess, tempfile, time
+
+import argparse
+import json
+import os
+import pty
+import shutil
+import signal
+import statistics
+import subprocess
+import tempfile
+import time
 from pathlib import Path
+
 from zeta.core.session import SessionManager
 from zeta.storage_format import advance
+
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULTS = {"phoebe": Path.home()/".zeta/sessions/7897c1aed2e5444caba907f462306b10", "orchestrator": Path.home()/".zeta/sessions/86e3d775a40b42ceaa76ca571e27ff1b"}
 def clock(fn):
