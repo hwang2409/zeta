@@ -62,11 +62,9 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
-    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
@@ -88,6 +86,7 @@ from ..prompt import RuntimePrompt
 from ._completion import (
     ProviderAttemptState,
     _error_info,
+    _sanitize_account_message,
     assistant_reset_event,
     can_retry_context,
     close_completion,
@@ -117,21 +116,6 @@ from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
-
-
-def _sanitize_account_message(message: Message) -> Message:
-    content = [
-        ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
-        for block in message.content
-        if not isinstance(block, RedactedThinkingContent)
-    ]
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=message.metadata,
-    )
-
 
 TaskResult = TypeVar("TaskResult")
 
