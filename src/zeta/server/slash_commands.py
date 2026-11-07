@@ -52,6 +52,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "init",
         "memory",
         "model",
+        "project-instructions",
         "status",
         "vim",
     }

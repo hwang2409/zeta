@@ -1273,7 +1273,8 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/memory`, `/model`, `/status`, and `/vim`. Runnable user
+`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
+`/vim`. Runnable user
 commands also include prompt macros (`.zeta/commands/*.md` with `kind: prompt`)
 that do not use inline shell spans, plus skills. `/model` splits by argument
 shape: argless `/model` returns `client_only` so the frontend client can open
