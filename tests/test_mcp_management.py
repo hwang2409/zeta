@@ -78,7 +78,9 @@ async def test_management_service_close_owns_transaction_lifetime(
         calls_after_close = transaction_calls
         release.set()
         if transaction is not None:
-            result = await asyncio.gather(transaction, return_exceptions=True)
+            result = await asyncio.wait_for(
+                asyncio.gather(transaction, return_exceptions=True), 10
+            )
             assert type(result[0]).__name__ == "MCPManagementClosedError"
             assert not manager.path("project").exists()
         with pytest.raises(MCPManagementError) as exc_info:
@@ -184,7 +186,10 @@ async def test_management_close_interrupts_lock_held_by_another_process(
     transaction = None
     try:
         assert holder.stdout is not None
-        assert await asyncio.to_thread(holder.stdout.readline) == "ready\n"
+        assert (
+            await asyncio.wait_for(asyncio.to_thread(holder.stdout.readline), 10)
+            == "ready\n"
+        )
         transaction = asyncio.create_task(
             manager.add("late", scope="user", command=sys.executable)
         )
@@ -197,7 +202,9 @@ async def test_management_close_interrupts_lock_held_by_another_process(
         assert holder.stdin is not None
         holder.stdin.write("\n")
         holder.stdin.flush()
-        result = await asyncio.gather(transaction, return_exceptions=True)
+        result = await asyncio.wait_for(
+            asyncio.gather(transaction, return_exceptions=True), 10
+        )
         assert type(result[0]).__name__ == "MCPManagementClosedError"
         assert config_path.read_bytes() == before
         assert config_path.stat().st_mtime_ns == before_mtime
