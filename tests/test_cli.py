@@ -232,28 +232,47 @@ def _run_bash_completion(script: Path, line: bytes, tmp_path: Path) -> bytes:
     tmp_path.mkdir()
     master, slave = pty.openpty()
     process = None
+    ready_marker = b"\x1eZETA_BASH_READY\x1f"
+    sourced_marker = b"\x1eZETA_BASH_SOURCED\x1f"
+    complete_marker = b"\x1eZETA_BASH_COMPLETE\x1f"
     try:
         process = subprocess.Popen(
             ["bash", "--noprofile", "--norc", "-i"],
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "HOME": str(tmp_path), "PS1": "ZETA_READY> "},
+            env={
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PS1": ready_marker.decode(),
+            },
             cwd=tmp_path,
         )
         os.close(slave)
         slave = -1
         output = bytearray()
-        read_pty_until(master, b"ZETA_READY> ", process=process, output=output)
+        read_pty_until(master, ready_marker, process=process, output=output)
         start = len(output)
-        os.write(master, f"source {script}\n".encode())
+        os.write(
+            master,
+            (
+                f"source {script}; "
+                "_zeta_definition=$(declare -f _zeta_completions); "
+                'eval "${_zeta_definition/_zeta_completions/'
+                '_zeta_test_completions}"; '
+                "_zeta_completions() { _zeta_test_completions; "
+                "printf '\\n%s\\n\\036ZETA_BASH_COMPLETE\\037' "
+                '"${COMPREPLY[*]}"; }; '
+                "printf '\\036ZETA_BASH_SOURCED\\037'\n"
+            ).encode(),
+        )
         read_pty_until(
-            master, b"ZETA_READY> ", process=process, output=output, start=start
+            master, sourced_marker, process=process, output=output, start=start
         )
         start = len(output)
-        os.write(master, line + b"\t\t")
+        os.write(master, line + b"\t")
         read_pty_until(
-            master, b"ZETA_READY> ", process=process, output=output, start=start
+            master, complete_marker, process=process, output=output, start=start
         )
         return bytes(output[start:])
     finally:
