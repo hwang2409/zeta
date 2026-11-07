@@ -636,7 +636,10 @@ async def test_provider_stalls_waiting_for_response_headers(
         error_type = CodexStreamError
     try:
         with pytest.raises(error_type, match="response headers stalled") as caught:
-            await asyncio.wait_for(anext(backend.complete([], [])), timeout=0.5)
+            await await_or_fail(
+                anext(backend.complete([], [])),
+                what="response headers stall",
+            )
         assert caught.value.is_stall is True
         assert len(requests) == 1
     finally:
@@ -656,12 +659,15 @@ async def test_oauth_refresh_network_wait_is_bounded(
     monkeypatch.setattr(account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
 
     async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
-        await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=30)
         raise AssertionError("unreachable")
 
     async with _mock_client(no_refresh_response) as client:
         with pytest.raises(store.http_error_type, match="OAuth token refresh stalled"):
-            await asyncio.wait_for(getattr(store, method_name)(client), timeout=0.5)
+            await await_or_fail(
+                getattr(store, method_name)(client),
+                what="OAuth token refresh stall",
+            )
         assert json.loads(store.path.read_text())["access_token"] == "expired-access"
 
         async def recovered_refresh(_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
@@ -691,7 +697,10 @@ async def test_oauth_credential_lock_wait_is_bounded(
                     "lock; retry the turn"
                 ),
             ):
-                await asyncio.wait_for(store.access_token(client), timeout=0.5)
+                await await_or_fail(
+                    store.access_token(client),
+                    what="account credential lock stall",
+                )
         assert (
             await await_or_fail(
                 store.access_token(client),
