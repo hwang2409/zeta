@@ -918,7 +918,8 @@ async def close_direct_test_runtime_owners(
             home = session_path.parent
             while home.name != "sessions" and home != home.parent:
                 home = home.parent
-            ensure_format(home.parent if home.name == "sessions" else session_path.parent)
+            home = home.parent if home.name == "sessions" else session_path.parent
+            ensure_format(home)
             kwargs["storage_lease"] = test_home_leases[home.resolve()]
         background_init(background, *args, **kwargs)
         caller = Path(sys._getframe(1).f_code.co_filename).resolve()
