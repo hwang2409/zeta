@@ -16,6 +16,7 @@ from zeta.core.context import (
     StaleBranchError,
     SummaryCompletionError,
 )
+from zeta.context_eviction import EVICTION_KIND
 from zeta.context_accounting import (
     compact_json_chunks,
     compact_json_length,
@@ -2107,3 +2108,74 @@ async def test_ephemeral_host_instruction_counts_toward_context_budget_without_p
     assert assembled.messages[0].content[-1].text.endswith(instruction)
     assert assembled.token_count >= len(instruction)
     assert all(instruction not in json.dumps(entry.data) for entry in store.replay())
+
+
+TOOL_SCHEMAS = ({"name": "probe", "description": "d", "input_schema": {}},)
+
+
+async def _turn(assembler: ContextAssembler) -> tuple[bool, AssembledContext, int]:
+    needs = assembler.needs_compaction()
+    context = await assembler.assemble_context()
+    return needs, context, assembler.estimate_request(context.messages, TOOL_SCHEMAS)
+
+
+@pytest.mark.asyncio
+async def test_turn_counts_only_new_messages_after_the_first_turn(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(40):
+        role = MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT
+        store.append_message(text(role, f"message {index} " * 20))
+    counted: list[Message] = []
+
+    def counter(message: Message) -> int:
+        if message.role is not MessageRole.SYSTEM:
+            counted.append(message)
+        return context_module._message_token_count(message)
+
+    assembler = ContextAssembler(
+        store, token_budget=1_000_000, system_prompt="system", token_counter=counter
+    )
+    await _turn(assembler)
+    await _turn(assembler)
+    store.append_message(text(MessageRole.USER, "new"))
+    counted.clear()
+
+    await _turn(assembler)
+
+    assert len(counted) <= 2, len(counted)
+    assert all(message.content == [TextContent("new")] for message in counted)
+
+
+@pytest.mark.asyncio
+async def test_reused_counts_match_a_cold_assembler_across_eviction(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    warm = ContextAssembler(store, token_budget=3_000, system_prompt="system")
+    compacted = 0
+    for index in range(80):
+        role = MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT
+        store.append_message(text(role, f"turn {index} " * 60))
+        _, warm_context, warm_estimate = await _turn(warm)
+        compacted += warm_context.compacted
+        cold = ContextAssembler(store, token_budget=3_000, system_prompt="system")
+        cold_needs = cold.needs_compaction()
+        cold_context = await cold.assemble_context()
+
+        assert cold_context.compacted is False
+        assert warm_context.messages == cold_context.messages
+        assert warm_context.digest == cold_context.digest
+        assert (
+            warm_context.token_count
+            == cold_context.token_count
+            == sum(map(context_module._message_token_count, warm_context.messages))
+        )
+        assert warm_estimate == cold.estimate_request(
+            cold_context.messages, TOOL_SCHEMAS
+        )
+        assert warm.needs_compaction() is cold_needs
+    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    assert compacted >= 2, compacted
+    assert {marker.data.get("kind") for marker in markers} == {EVICTION_KIND}

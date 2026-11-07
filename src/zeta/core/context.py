@@ -16,6 +16,7 @@ from .context_parts.types import (
 from .context_parts.tool_results import truncate_tool_results
 from .context_usage import SessionUsage
 from ..context_accounting import (
+    MessageTokenCounts,
     context_digest as _digest,
     cooperative_call as _cooperative_call,
     message_token_count as _message_token_count,
@@ -133,13 +134,16 @@ class ContextAssembler(ContextMarkerMixin):
         )
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
+        self._token_counts = MessageTokenCounts()
         self._request_budget = ContextRequestBudget(
             self.store.context_calibration_records(),
             provider_limit=self.token_budget,
             safety_margin=self.safety_margin,
             normal_target_ratio=TARGET_RATIO,
             emergency_target_ratio=EMERGENCY_TARGET_RATIO,
-            token_counter=self.token_counter,
+            token_counter=lambda message, counter=self.token_counter: (
+                self._token_counts.count(message, counter)
+            ),
         )
         self._request_admission = SessionRequestAdmission(
             estimate=self.estimate_request,
@@ -166,6 +170,7 @@ class ContextAssembler(ContextMarkerMixin):
             return True
         branch = self.store.active_branch_snapshot()
         items = self._visible_items(branch)
+        self._track_token_counts(items)
         system_prompt = self._system_prompt_message(system_append)
         messages = [
             *([] if system_prompt is None else [system_prompt]),
@@ -582,6 +587,7 @@ class ContextAssembler(ContextMarkerMixin):
         """Build the immutable inputs for compaction without store access."""
 
         items = self._visible_items(branch)
+        self._track_token_counts(items)
         result_seqs = {
             id(item.message): item.entry.seq
             for item in items
@@ -1046,7 +1052,15 @@ class ContextAssembler(ContextMarkerMixin):
         return context
 
     def _count(self, messages: Sequence[Message]) -> int:
-        return sum(self.token_counter(message) for message in messages)
+        counter = self.token_counter
+        return sum(self._token_counts.count(message, counter) for message in messages)
+
+    def _track_token_counts(self, items: Sequence[_ContextItem]) -> None:
+        self._token_counts.track(
+            (item.entry, item.message)
+            for item in items
+            if item.entry is not None and item.entry.type == "message"
+        )
 
     def _system_prompt_message(self, system_append: str = "") -> Message | None:
         if not _text_from_message(self.system_prompt).strip():
