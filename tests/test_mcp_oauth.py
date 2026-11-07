@@ -62,6 +62,7 @@ from zeta.mcp.resources import (
 from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
 from zeta.tools._spill import SpillStore
 
 
@@ -2432,6 +2433,7 @@ async def test_refresh_commit_failure_never_sends_candidate(
     )
     candidate_requests: list[str] = []
     original_fsync = os.fsync
+    await asyncio.to_thread(lambda: open_writer(home).close())
 
     if failure == "durability":
 
