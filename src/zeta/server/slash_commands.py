@@ -30,7 +30,11 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
-from ..runtime.status import build_slash_status
+from ..runtime.status import (
+    SlashStatusSnapshot,
+    build_slash_status,
+    capture_slash_status,
+)
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
@@ -96,13 +100,15 @@ class ServerSlashSession:
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
+        status: SlashStatus | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
+        self._status = status
 
     # --- runnable server-side ---
 
-    def slash_status(self) -> SlashStatus:
+    def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
         loop = runtime.loop
         opened = runtime.opened
@@ -116,7 +122,7 @@ class ServerSlashSession:
             if self._approval_control is not None
             else ()
         )
-        return build_slash_status(
+        return capture_slash_status(
             loop,
             session_id=opened.metadata.session_id,
             provider=opened.metadata.provider,
@@ -126,6 +132,11 @@ class ServerSlashSession:
             pending_approvals=pending,
             usage_tracker=state.usage_tracker,
         )
+
+    def slash_status(self) -> SlashStatus:
+        if self._status is not None:
+            return self._status
+        return build_slash_status(self.status_snapshot())
 
     async def slash_accounts(self, args: str) -> str:
         """List accounts or change one display label."""
@@ -319,6 +330,7 @@ async def run_command(
     *,
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
+    run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -365,6 +377,16 @@ async def run_command(
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": "client_only", "name": name}
     session = ServerSlashSession(runtime, approval_control)
+    if name == "status":
+        snapshot = session.status_snapshot()
+        status = await (
+            run_blocking(lambda: build_slash_status(snapshot))
+            if run_blocking is not None
+            else asyncio.to_thread(build_slash_status, snapshot)
+        )
+        if not isinstance(status, SlashStatus):
+            raise RuntimeError("status worker returned an invalid projection")
+        session = ServerSlashSession(runtime, approval_control, status)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": "unknown", "name": name}

@@ -811,6 +811,7 @@ class _Client:
                 _required_string(params, "text"),
                 register_model_input=register,
                 approval_control=self.server.control,
+                run_blocking=self.server.control._run_blocking,
             )
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())
         if method == "set_settings":

@@ -7075,6 +7075,150 @@ async def test_slash_status_uses_live_hooks_usage_and_cost_over_real_transport(
         await _close(server, writer)
 
 
+@pytest.mark.asyncio
+async def test_slash_status_transcript_work_does_not_block_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    observer_reader, observer_writer = await asyncio.open_connection(
+        "127.0.0.1", server.port
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    request_task: asyncio.Task[None] | None = None
+    try:
+        await _request(
+            observer_reader,
+            observer_writer,
+            "observer-hello",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "ping"],
+            },
+        )
+        assert server.runtime.loop is not None
+        store = server.runtime.loop.store
+        source = store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("source")])
+        )
+        store.append_compaction_marker("summary", source.seq, source.seq)
+        original_counter = server.runtime.loop.context_assembler.token_counter
+
+        def blocked_counter(message: Message) -> int:
+            entered.set()
+            assert release.wait(30), "status transcript worker was not released"
+            return original_counter(message)
+
+        # test-contract: seam hold the real synchronous transcript projection
+        monkeypatch.setattr(
+            server.runtime.loop.context_assembler, "token_counter", blocked_counter
+        )
+        probe_ready = threading.Event()
+        probe_frames: list[dict[str, Any]] = []
+        probe_errors: list[BaseException] = []
+
+        def probe_while_blocked() -> None:
+            try:
+                with socket.create_connection(("127.0.0.1", server.port)) as probe:
+                    probe.settimeout(10)
+                    with probe.makefile("rwb") as stream:
+                        stream.write(
+                            b'{"jsonrpc":"2.0","id":"probe-hello","method":"hello",'
+                            b'"params":{"protocol_version":"1.2","role":"observer",'
+                            b'"features":["serve_observers","ping"]}}\n'
+                        )
+                        stream.flush()
+                        probe_frames.append(json.loads(stream.readline()))
+                        probe_ready.set()
+                        if not entered.wait(10):
+                            raise AssertionError("status transcript worker did not start")
+                        stream.write(
+                            b'{"jsonrpc":"2.0","id":"live","method":"ping",'
+                            b'"params":{}}\n'
+                        )
+                        stream.flush()
+                        probe_frames.append(json.loads(stream.readline()))
+            except (OSError, ValueError, AssertionError) as exc:
+                probe_errors.append(exc)
+            finally:
+                probe_ready.set()
+                release.set()
+
+        probe_thread = threading.Thread(target=probe_while_blocked)
+        probe_thread.start()
+        assert await asyncio.to_thread(probe_ready.wait, 10)
+        assert not probe_errors
+
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "blocked-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        await asyncio.to_thread(probe_thread.join, 20)
+        assert not probe_thread.is_alive()
+        assert not probe_errors
+        assert probe_frames[-1]["id"] == "live"
+
+        status = await _read(reader)
+        assert status["id"] == "blocked-status"
+        assert status["result"]["kind"] == "output"
+
+        entered.clear()
+        release.clear()
+        writer.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "cancelled-status",
+                    "method": "slash_run",
+                    "params": {"session_id": sid, "text": "/status"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, 10)
+        release.set()
+        frames = await _frames_until_eof(reader)
+        assert not any(
+            frame.get("id") == "cancelled-status"
+            or frame.get("params", {}).get("event") is not None
+            for frame in frames
+        )
+        assert (await _request(observer_reader, observer_writer, "after", "ping"))[
+            -1
+        ]["id"] == "after"
+    finally:
+        release.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+        await _close(server, observer_writer)
+
+
 @pytest.mark.parametrize("with_fact_floor", [False, True])
 async def test_slash_status_maps_compaction_with_or_without_fact_floor(
     tmp_path: Path, with_fact_floor: bool

@@ -38,7 +38,7 @@ from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
-from ...runtime.status import build_slash_status
+from ...runtime.status import build_slash_status, capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -107,15 +107,17 @@ class SlashHandlerMixin:
             for request in self.pending_approvals
         )
         return build_slash_status(
-            self.loop,
-            session_id=self.loop.store.session_id,
-            provider=self.provider,
-            model=self.model,
-            context_files=self._context_files,
-            vim_mode=self.vim_mode,
-            pending_approvals=pending,
-            usage_tracker=self._usage_tracker,
-            transcript_session_id=self._viewed_session_path().name,
+            capture_slash_status(
+                self.loop,
+                session_id=self.loop.store.session_id,
+                provider=self.provider,
+                model=self.model,
+                context_files=self._context_files,
+                vim_mode=self.vim_mode,
+                pending_approvals=pending,
+                usage_tracker=self._usage_tracker,
+                transcript_session_id=self._viewed_session_path().name,
+            )
         )
 
     def model_choices(self) -> tuple[str, ...]:
