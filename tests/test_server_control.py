@@ -276,7 +276,9 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
     registry.register(second)
     registry.negotiate_role(second, "controller", "1.2", frozenset())
     assert await registry.send(second, _frame(second, "hello"))
-    assert json.loads(second.frames[0])["params"]["delta"] == "hello"
+    assert [json.loads(frame)["params"]["delta"] for frame in second.frames] == [
+        "hello"
+    ]
     registry.release(second)
 
 
@@ -352,7 +354,9 @@ async def test_release_after_physical_write_reports_delivered() -> None:
     connection._write_physical = write_then_release  # type: ignore[method-assign]
 
     assert await registry.send(connection, _frame(connection, "delivered"))
-    assert json.loads(connection.frames[0])["params"]["delta"] == "delivered"
+    assert [
+        json.loads(frame)["params"]["delta"] for frame in connection.frames
+    ] == ["delivered"]
 
 
 @pytest.mark.asyncio
