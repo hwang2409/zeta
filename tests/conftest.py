@@ -54,10 +54,10 @@ def pytest_collection_modifyitems(
             and path.name != "test_test_environment.py"
         ):
             item.fixturenames.append("close_direct_test_runtime_owners")
-        if (
-            path.is_relative_to(_TEST_SITE_PACKAGES)
-            and path.name != "test_test_environment.py"
-        ):
+        if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name not in {
+            "test_test_environment.py",
+            "test_tui.py",
+        }:
             item.fixturenames.append("close_direct_test_agent_loops")
 
 
