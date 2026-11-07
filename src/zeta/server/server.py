@@ -87,6 +87,14 @@ _ERGONOMICS_METHODS = frozenset(
         MethodDescriptor.SET_SETTINGS,
         MethodDescriptor.SET_COMPACTION,
         MethodDescriptor.SEND_IMAGES,
+        MethodDescriptor.SWITCH_BRANCH,
+        MethodDescriptor.FORK_MESSAGE,
+        MethodDescriptor.SLASH_LIST,
+        MethodDescriptor.SLASH_RUN,
+        MethodDescriptor.ACCOUNT_LIST,
+        MethodDescriptor.ACCOUNT_LOGOUT,
+        MethodDescriptor.ACCOUNT_REFRESH,
+        MethodDescriptor.ACCOUNT_SWITCH,
     }
 )
 _PROJECT_METHODS = frozenset(
@@ -603,90 +611,39 @@ class _Client:
         return await HANDLERS[descriptor](self, request_id, params)
 
     def _descriptor_protocol_error(self, descriptor: MethodDescriptor) -> ProtocolError:
-        if descriptor in _LOGIN_METHODS:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, "login is unavailable on this server"
-            )
-        if descriptor in _ERGONOMICS_METHODS:
-            if descriptor is MethodDescriptor.CONTENT_READ:
-                return ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, "request requires protocol 1.1"
-            )
-        if descriptor is MethodDescriptor.PING:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "ping requires the negotiated ping feature",
-            )
-        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "set_turn_context requires negotiated turn_context feature",
-            )
-        if descriptor in _PROJECT_METHODS:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
+        message = {
+            **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
+            **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
+            MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+            MethodDescriptor.PING: "ping requires the negotiated ping feature",
+            MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+            **dict.fromkeys(
+                _PROJECT_METHODS,
                 f"{descriptor.wire} requires the negotiated projects feature",
-            )
-        if descriptor in {
-            MethodDescriptor.SESSION_GRANTS,
-            MethodDescriptor.REVOKE_SESSION_GRANTS,
-        }:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "session grants require the negotiated session_grants feature",
-            )
-        return ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND,
-            f"{descriptor.wire} requires protocol 1.1",
-        )
+            ),
+            MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+            MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+        }.get(descriptor, f"{descriptor.wire} requires protocol 1.1")
+        return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
     def _descriptor_feature_error(self, descriptor: MethodDescriptor) -> ProtocolError:
-        if descriptor is MethodDescriptor.CLEAR_STEERING:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "clear_steering requires the negotiated abort_scope feature",
-            )
-        if descriptor is MethodDescriptor.DELIVERY_STATUS:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "delivery_status requires negotiated feature 'delivery_id'",
-            )
-        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "set_turn_context requires negotiated turn_context feature",
-            )
-        if descriptor in {
-            MethodDescriptor.SESSION_GRANTS,
-            MethodDescriptor.REVOKE_SESSION_GRANTS,
-        }:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "session grants require the negotiated session_grants feature",
-            )
-        if descriptor in _PROJECT_METHODS:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
+        message = {
+            MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
+            MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
+            MethodDescriptor.SET_TURN_CONTEXT: "set_turn_context requires negotiated turn_context feature",
+            MethodDescriptor.SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+            MethodDescriptor.REVOKE_SESSION_GRANTS: "session grants require the negotiated session_grants feature",
+            MethodDescriptor.PING: "ping requires the negotiated ping feature",
+            MethodDescriptor.CONTENT_READ: "content_read requires the negotiated content_read feature",
+            **dict.fromkeys(
+                _PROJECT_METHODS,
                 f"{descriptor.wire} requires the negotiated projects feature",
-            )
-        if descriptor is MethodDescriptor.PING:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "ping requires the negotiated ping feature",
-            )
-        if descriptor is MethodDescriptor.CONTENT_READ:
-            return ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND,
-                "content_read requires the negotiated content_read feature",
-            )
-        return ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND,
+            ),
+        }.get(
+            descriptor,
             f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
         )
+        return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
     async def _dispatch_descriptor(
         self,
