@@ -21,6 +21,17 @@ from ..protocol.types import (
 
 ReceiptState = Literal["running", "completed", "failed", "canceled"]
 TerminalState = Literal["completed", "failed", "canceled"]
+
+
+def child_cleanup_details(
+    scope: Literal["foreground", "background"], canceled: bool
+) -> tuple[str, str]:
+    """Return the durable kill cause and receipt label for child cleanup."""
+
+    action = "cancellation" if canceled else "completion"
+    return f"{scope} child {action} cleanup", f"child {action}"
+
+
 MAX_AGENT_RESULT_BYTES = 10_000
 # A terminal agent receipt has a fixed persisted-message envelope even when its
 # text and metadata are empty. Receipt call sites clamp configured tool-output
