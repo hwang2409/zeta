@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from websockets.asyncio.client import ClientConnection, connect
 
+from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path
 
 Transport = Literal["unix", "websocket"]
@@ -93,19 +94,19 @@ class ServeClient:
 
     async def close(self) -> None:
         if self._websocket is not None:
-            await self._websocket.close()
+            await await_or_fail(self._websocket.close(), what="WebSocket close")
         if self._writer is not None:
             self._writer.close()
-            await self._writer.wait_closed()
+            await await_or_fail(self._writer.wait_closed(), what="Unix writer close")
 
     async def _send(self, frame: dict[str, object]) -> None:
         payload = json.dumps(frame, separators=(",", ":"))
         if self._websocket is not None:
-            await self._websocket.send(payload)
+            await await_or_fail(self._websocket.send(payload), what="WebSocket send")
             return
         assert self._writer is not None
         self._writer.write((payload + "\n").encode())
-        await self._writer.drain()
+        await await_or_fail(self._writer.drain(), what="Unix writer drain")
 
     async def _receive(self) -> dict[str, Any]:
         frame = json.loads(await self._receive_raw())
@@ -114,11 +115,13 @@ class ServeClient:
 
     async def _receive_raw(self) -> str:
         if self._websocket is not None:
-            payload = await self._websocket.recv()
+            payload = await await_or_fail(
+                self._websocket.recv(), what="WebSocket receive"
+            )
             assert isinstance(payload, str), "serve sent a binary WebSocket frame"
             return payload
         assert self._reader is not None
-        line = await self._reader.readline()
+        line = await await_or_fail(self._reader.readline(), what="Unix socket read")
         assert line, "serve closed the Unix socket"
         return line.decode()
 
@@ -168,7 +171,9 @@ class ServeContract:
             assert process.stderr is not None
             output = bytearray()
             while True:
-                line = await process.stderr.readline()
+                line = await await_or_fail(
+                    process.stderr.readline(), what="serve readiness read"
+                )
                 output.extend(line)
                 assert line, (
                     "zeta serve exited before readiness: "
@@ -182,10 +187,13 @@ class ServeContract:
                 if process.returncode is None:
                     process.kill()
 
+            async def reap_start() -> None:
+                await await_or_fail(process.communicate(), what="serve startup reap")
+
             await _run_cleanup(
                 (
                     ("process kill", kill),
-                    ("process reap", process.communicate),
+                    ("process reap", reap_start),
                     ("socket removal", lambda: socket_path.unlink(missing_ok=True)),
                 ),
                 error,
@@ -195,14 +203,20 @@ class ServeContract:
 
     async def connect(self, role: Role = "controller") -> ServeClient:
         if self._transport == "unix":
-            reader, writer = await asyncio.open_unix_connection(str(self._socket_path))
+            reader, writer = await await_or_fail(
+                asyncio.open_unix_connection(str(self._socket_path)),
+                what="Unix socket connect",
+            )
             client = ServeClient(reader=reader, writer=writer)
         else:
             discovery = json.loads((self._home / "run" / "serve.ws.json").read_text())
             token = discovery[f"{role}_token"]
-            websocket = await connect(
-                f"ws://127.0.0.1:{discovery['port']}/",
-                subprotocols=["zeta.v1", f"zeta.bearer.{token}"],
+            websocket = await await_or_fail(
+                connect(
+                    f"ws://127.0.0.1:{discovery['port']}/",
+                    subprotocols=["zeta.v1", f"zeta.bearer.{token}"],
+                ),
+                what="WebSocket connect",
             )
             client = ServeClient(websocket=websocket)
         self._clients.append(client)
@@ -217,7 +231,17 @@ class ServeContract:
 
         async def reap() -> None:
             nonlocal stdout, stderr
-            stdout, stderr = await self._process.communicate()
+            try:
+                stdout, stderr = await await_or_fail(
+                    self._process.communicate(), what="serve process reap"
+                )
+            except BaseException:
+                if self._process.returncode is None:
+                    self._process.kill()
+                stdout, stderr = await await_or_fail(
+                    self._process.communicate(), what="serve process kill and reap"
+                )
+                raise
 
         def validate_shutdown() -> None:
             assert self._process.returncode == 0, (stdout + stderr).decode(
