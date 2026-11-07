@@ -2694,26 +2694,22 @@ async def test_abort_captures_turn_before_approval_end_write(
         await _event(reader, "approval_request")
 
         assert server._client is not None
-        original_publish = server.connections.publish_controller
+        original_enqueue = server.connections._enqueue
         approval_end_started = asyncio.Event()
-        allow_approval_end = asyncio.Event()
 
-        async def pause_approval_end(
-            event: str, session_id: str | None, **fields: object
-        ) -> bool:
-            if event == "approval_end":
+        def observe_approval_end(output, frame, *, wake=True):
+            payload = json.loads(frame.payload)
+            if payload.get("params", {}).get("event") == "approval_end":
                 approval_end_started.set()
-                await allow_approval_end.wait()
-            return await original_publish(event, session_id, **fields)
+            return original_enqueue(output, frame, wake=wake)
 
-        server.connections.publish_controller = pause_approval_end  # type: ignore[method-assign]
+        server.connections._enqueue = observe_approval_end  # type: ignore[method-assign]
         abort = asyncio.create_task(
             _request(reader, writer, 4, "abort", {"scope": scope})
         )
         await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
         while server.control._turn_task is not None:
             await asyncio.sleep(0)
-        allow_approval_end.set()
 
         frames = await asyncio.wait_for(abort, TIMEOUT)
         assert frames[-1]["result"] == {"aborted": True}
