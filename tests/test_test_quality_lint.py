@@ -277,6 +277,54 @@ def test_move_pairing_keeps_a_genuinely_new_duplicate_violation(tmp_path: Path) 
     assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 3)]
 
 
+def test_deleted_file_does_not_hide_an_added_violation(tmp_path: Path) -> None:
+    source = """def test_new_wait():
+    time.sleep(1)
+"""
+    diff = """diff --git a/tests/test_a.py b/tests/test_a.py
+--- a/tests/test_a.py
++++ b/tests/test_a.py
+@@ -1,1 +1,2 @@
+ def test_new_wait():
++    time.sleep(1)
+diff --git a/tests/test_b.py b/tests/test_b.py
+--- a/tests/test_b.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def test_old_wait():
+-    time.sleep(1)
+"""
+
+    target = tmp_path / "tests/test_a.py"
+    target.parent.mkdir()
+    target.write_text(source)
+
+    findings = lint_diff(diff, tmp_path)
+
+    assert [(finding.code, finding.path, finding.line) for finding in findings] == [
+        ("TQ001", Path("tests/test_a.py"), 2)
+    ]
+
+
+def test_renamed_file_pairs_old_and_new_lines(tmp_path: Path) -> None:
+    source = """def test_existing():
+    time.sleep(1)
+"""
+    diff = """diff --git a/tests/test_old.py b/tests/test_example.py
+similarity index 88%
+rename from tests/test_old.py
+rename to tests/test_example.py
+--- a/tests/test_old.py
++++ b/tests/test_example.py
+@@ -1,2 +1,2 @@
+ def test_existing():
+-    time.sleep(1)
++        time.sleep(1)
+"""
+
+    assert _lint(tmp_path, source, diff=diff) == []
+
+
 def test_select_base_fetches_and_uses_pull_request_merge_base(monkeypatch) -> None:
     runs = []
     checks = []

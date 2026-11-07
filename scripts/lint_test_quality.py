@@ -44,29 +44,52 @@ def _normalized_diff_line(line: str) -> str:
     return re.sub(r"\s+", "", line)
 
 
+def _diff_header_path(value: str) -> Path | None:
+    if value == "/dev/null":
+        return None
+    return Path(value[2:] if value.startswith(("a/", "b/")) else value)
+
+
 def _added_lines(diff: str) -> dict[Path, set[int]]:
     added_by_path: dict[Path, list[tuple[int, str]]] = {}
     deleted_by_path: dict[Path, list[str]] = {}
-    path: Path | None = None
+    source_path: Path | None = None
+    destination_path: Path | None = None
     new_line = 0
     hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
     for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            path = Path(line[6:])
-            added_by_path.setdefault(path, [])
-            deleted_by_path.setdefault(path, [])
+        if line.startswith("diff --git "):
+            source_path = None
+            destination_path = None
+            new_line = 0
+            header = line.removeprefix("diff --git ")
+            if header.startswith("a/") and " b/" in header:
+                source, destination = header.split(" b/", 1)
+                source_path = _diff_header_path(source)
+                destination_path = _diff_header_path(f"b/{destination}")
+            continue
+        if line.startswith("--- "):
+            source_path = _diff_header_path(line[4:])
+            continue
+        if line.startswith("+++ "):
+            destination_path = _diff_header_path(line[4:])
+            if destination_path is not None:
+                added_by_path.setdefault(destination_path, [])
+                deleted_by_path.setdefault(destination_path, [])
             continue
         match = hunk.match(line)
         if match:
             new_line = int(match.group(1))
             continue
-        if path is None or line.startswith(("diff --git ", "--- ")):
+        if destination_path is None:
             continue
-        if line.startswith("+") and not line.startswith("+++"):
-            added_by_path[path].append((new_line, _normalized_diff_line(line[1:])))
+        if line.startswith("+"):
+            added_by_path[destination_path].append(
+                (new_line, _normalized_diff_line(line[1:]))
+            )
             new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            deleted_by_path[path].append(_normalized_diff_line(line[1:]))
+        elif line.startswith("-") and source_path is not None:
+            deleted_by_path[destination_path].append(_normalized_diff_line(line[1:]))
         elif line.startswith(" "):
             new_line += 1
 
