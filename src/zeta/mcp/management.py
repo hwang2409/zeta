@@ -114,10 +114,8 @@ class MCPManagementService:
     ) -> None:
         # These values are deliberately lexical. Canonicalization belongs to the
         # first worker transaction because Path.resolve() can access storage.
-        self.home = Path(home).expanduser() if home is not None else None
-        self.project_dir = (
-            Path(project_dir).expanduser() if project_dir is not None else None
-        )
+        self.home = Path(home) if home is not None else None
+        self.project_dir = Path(project_dir) if project_dir is not None else None
         self.mount = mount
         self._lock_timeout = lock_timeout
         self._transaction_gate = asyncio.Lock()
@@ -272,7 +270,9 @@ class MCPManagementService:
             Path(override).expanduser() if override else home_config_path(self.home)
         ).resolve()
         project_dir = (
-            self.project_dir.resolve() if self.project_dir is not None else None
+            self.project_dir.expanduser().resolve()
+            if self.project_dir is not None
+            else None
         )
         project_path = (
             project_config_path(project_dir).resolve()

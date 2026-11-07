@@ -848,29 +848,35 @@ async def test_constructor_and_scope_setup_do_not_resolve_paths_on_loop_thread(
     tmp_path, monkeypatch
 ):
     loop_thread = threading.get_ident()
-    calls = []
-    original = Path.resolve
-
-    def record_resolve(path, *args, **kwargs):
-        calls.append(threading.get_ident())
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", record_resolve)
-    manager = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "repo"
-    )
-    assert calls == []
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
     )
-    calls.clear()
+    calls = []
+    original_resolve = Path.resolve
+    original_expanduser = Path.expanduser
+
+    def record_resolve(path, *args, **kwargs):
+        calls.append(("resolve", threading.get_ident()))
+        return original_resolve(path, *args, **kwargs)
+
+    def record_expanduser(path, *args, **kwargs):
+        calls.append(("expanduser", threading.get_ident()))
+        return original_expanduser(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", record_resolve)
+    monkeypatch.setattr(Path, "expanduser", record_expanduser)
+    manager = MCPManagementService(
+        home=tmp_path / "home", project_dir=tmp_path / "repo"
+    )
+    assert calls == []
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
 
     assert calls == []
     await manager.refresh()
-    assert calls and all(thread != loop_thread for thread in calls)
+    assert {operation for operation, _thread in calls} == {"expanduser", "resolve"}
+    assert all(thread != loop_thread for _operation, thread in calls)
     await loop.close()
 
 

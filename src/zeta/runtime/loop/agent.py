@@ -255,7 +255,7 @@ class AgentLoop(
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = Path(self.store.cwd).expanduser()
+        self._mcp_project_dir_value: Path | None = Path(self.store.cwd)
         self._mcp_management = MCPManagementService(
             project_dir=self._mcp_project_dir_value
         )

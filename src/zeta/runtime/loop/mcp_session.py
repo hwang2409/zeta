@@ -99,9 +99,7 @@ class MCPSession:
         """Set the home + project scope this loop uses for MCP config files."""
 
         self._mcp_home_hint = None if home is None else str(home)
-        self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser()
-        )
+        self._mcp_project_dir_value = None if project_dir is None else Path(project_dir)
         self._mcp_management = MCPManagementService(
             home=self._mcp_home_hint,
             project_dir=self._mcp_project_dir_value,
