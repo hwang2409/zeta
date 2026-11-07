@@ -7067,7 +7067,8 @@ async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
-def test_memory_command_parity_tui_and_serve() -> None:
+@pytest.mark.asyncio
+async def test_memory_command_parity_tui_and_serve() -> None:
     from types import SimpleNamespace
 
     from zeta.tui.slash_handlers import SlashHandlerMixin
@@ -7106,8 +7107,14 @@ def test_memory_command_parity_tui_and_serve() -> None:
         metadata=SimpleNamespace(project_id="p"),
         manager=SimpleNamespace(project_registry=Registry()),
     )
-    tui_outputs = [SlashHandlerMixin.slash_memory(tui, command) for command in ("log", "undo", "accept state.md")]
-    serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
+    tui_outputs = [
+        await SlashHandlerMixin.slash_memory(tui, command)
+        for command in ("log", "undo", "accept state.md")
+    ]
+    serve_outputs = [
+        await ServerSlashSession(runtime).slash_memory(command)
+        for command in ("log", "undo", "accept state.md")
+    ]
     assert tui_outputs == serve_outputs
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
@@ -7164,6 +7171,58 @@ async def test_slash_status_maps_compaction_with_or_without_fact_floor(
         assert result["kind"] == "output"
         assert "compaction_history:\n  turn 1: 1 entries" in result["text"]
         assert "retained typed facts" not in result["text"]
+    finally:
+        await _close(server, writer)
+
+
+async def test_serve_project_init_runs_discovery_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+
+    loop_thread = threading.get_ident()
+    discovery_threads: list[int] = []
+    run_discovery_git = project_context._run_discovery_git
+
+    def record_discovery(*args, **kwargs):
+        discovery_threads.append(threading.get_ident())
+        return run_discovery_git(*args, **kwargs)
+
+    # test-contract: seam observe the real Git subprocess seam through socket RPC
+    monkeypatch.setattr(project_context, "_run_discovery_git", record_discovery)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=workspace,
+        port=0,
+        provider="codex",
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    discovery_threads.clear()
+    try:
+        response = (
+            await _request(
+                reader,
+                writer,
+                "project-init",
+                "slash_run",
+                {"session_id": sid, "text": "/project init"},
+            )
+        )[-1]
+
+        project_id = server.runtime.metadata.project_id
+        assert project_id is not None
+        assert response["result"] == {
+            "kind": "output",
+            "text": (
+                f"project: workspace ({project_id})\n"
+                f"root: {workspace.resolve()}\n"
+                "memory: brief, decisions, state, backlog, changelog"
+            ),
+        }
+        assert discovery_threads
+        assert all(thread_id != loop_thread for thread_id in discovery_threads)
     finally:
         await _close(server, writer)
 
@@ -7662,6 +7721,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
         assert (await run(5, "/model gpt-5.6-sol"))["error"]["code"] == -32004
+        # `/project init` mutates the session association — must reject.
+        assert (await run("project-init", "/project init"))["error"]["code"] == -32004
         # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
             "kind": "output",
@@ -8797,6 +8858,9 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
 def _serve_switch_rename_race(home_value: str, results: object) -> None:
     home = Path(home_value)
+    from zeta.storage_format import advance
+
+    advance(home, expected_epoch=0)
     first = AccountId("codex", "first")
     second = AccountId("codex", "second")
     for account in (first, second):
@@ -8804,9 +8868,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             OAuthTokens(account.name, "refresh", 9_999_999_999)
         )
     AccountStore(home).set_default(first)
-    from zeta.storage_format import advance
-
-    advance(home, expected_epoch=0)
     server = ZetaServer(home=home, cwd=home, port=0, provider="codex")
 
     async def run() -> None:

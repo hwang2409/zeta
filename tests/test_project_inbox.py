@@ -33,6 +33,16 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
+
+
+@pytest.fixture(autouse=True)
+def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
+    if request.node.get_closest_marker("asyncio") is None:
+        yield
+        return
+    with open_writer(tmp_path / ".zeta"):
+        yield
 
 
 def _projects(tmp_path: Path):
