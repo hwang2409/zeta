@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -38,9 +39,11 @@ def _load_sandbox():
 # Installed as sitecustomize in the bench.py process, so it applies to the
 # unmodified harness. It records the provider traffic of the run: each TCP
 # connect to a loopback host (the local stub), each read of the Claude keychain
-# fallback (stubbed: fake tokens, the real keychain is never read), and each
-# connect or name lookup to a non-local host (refused: the process ends at
-# once, so nothing reaches the network). Once the harness adds its own audit
+# fallback (stubbed: fake tokens, the real keychain is never read), each
+# connect or name lookup to a non-local host, and each file open, listing,
+# change, copy, or spawned command line that names a path under the real
+# ~/.zeta (BENCH_TEST_FORBIDDEN). The last two end the process at once, so
+# nothing reaches the network or the real sessions. Once the harness adds its own audit
 # hook (the sandbox network guard), the recorder moves behind it and sees only
 # what the guard let through.
 SITECUSTOMIZE = r"""
@@ -55,7 +58,47 @@ def _note(line):
         handle.write(line + "\n")
 
 
+_FORBIDDEN = os.path.realpath(os.environ["BENCH_TEST_FORBIDDEN"])
+# Events that name a path (first, and for two-path events second, argument).
+_PATH_EVENTS = {
+    "open", "os.mkdir", "os.rmdir", "os.remove", "os.listdir", "os.scandir",
+    "os.chmod", "os.chown", "os.chflags", "os.utime", "os.truncate",
+    "os.rename", "os.link", "os.symlink", "shutil.copyfile", "shutil.copymode",
+    "shutil.copystat", "shutil.copytree", "shutil.move", "shutil.rmtree",
+    "shutil.chown",
+}
+
+
+def _forbidden(path):
+    if path is None or isinstance(path, int):
+        return False
+    try:
+        path = os.path.realpath(os.fsdecode(path))
+    except (TypeError, ValueError):
+        return False
+    return path == _FORBIDDEN or path.startswith(_FORBIDDEN + os.sep)
+
+
+def _paths(event, args):
+    if event in _PATH_EVENTS:
+        return [args[0] if args[0] is not None else "."] + (
+            [args[1]] if event.startswith(("os.rename", "os.link", "os.symlink",
+                                           "shutil.copy", "shutil.move"))
+            else []
+        )
+    if event == "subprocess.Popen":  # (executable, args, cwd, env): cp, rm, ...
+        argv = args[1] if isinstance(args[1], (list, tuple)) else [args[1]]
+        return [args[0], *argv, args[2]]
+    if event in ("os.posix_spawn", "os.exec"):  # (path, argv, env)
+        return [args[0], *args[1]]
+    return []
+
+
 def _record(event, args):
+    for path in _paths(event, args):
+        if _forbidden(path):
+            _note(f"forbidden {event} {os.fsdecode(path)}")
+            os._exit(98)
     host = None
     if event == "socket.getaddrinfo":
         host = args[0].decode() if isinstance(args[0], bytes) else args[0]
@@ -148,11 +191,34 @@ def short_home() -> Iterator[Path]:
         shutil.rmtree(home, ignore_errors=True)
 
 
+def _real_sessions_state(sessions: Path) -> dict[str, set[str] | None]:
+    """Entry names (no file is opened) of the real sessions dir and fixture dirs.
+
+    Names only: both fixture ids are live sessions on the developer machine
+    (phoebe and the orchestrator), so their files and the top-level dir entries
+    change during the run for reasons unrelated to this test.
+    """
+
+    def names(path: Path) -> set[str] | None:
+        return {entry.name for entry in os.scandir(path)} if path.is_dir() else None
+
+    state = {"": names(sessions)}
+    state.update({sid: names(sessions / sid) for sid in SOURCES.values()})
+    return state
+
+
 def test_bench_serve_probe_reaches_only_the_local_stub(
     tmp_path: Path, short_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The real home, resolved from the account database before anything
+    # changes HOME. The child's audit hook ends the run on any path under it.
+    real_zeta = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".zeta"
+    real_sessions = real_zeta / "sessions"
+    # Any zeta code in this process resolves its home to a temp dir.
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "pytest-zeta-home"))
     home = short_home
     _source_sessions(home, monkeypatch)
+    before = _real_sessions_state(real_sessions)
     site = tmp_path / "site"
     site.mkdir()
     (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
@@ -162,7 +228,12 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         for key, value in os.environ.items()
         # As in the 2026-11-07 runs: no zeta home, account home, Claude config
         # dir, scripted provider, or credential variable is exported, so a
-        # session left on claude falls back to the (stubbed) keychain.
+        # session left on claude falls back to the (stubbed) keychain. The child
+        # cannot get ZETA_HOME: Claude bootstrap skips the keychain whenever it
+        # is set (providers/anthropic.py, AnthropicCredentialDriver.bootstrap),
+        # and that fallback must stay reachable for this test to catch it. The
+        # real ~/.zeta is protected instead by the throwaway HOME, the audit
+        # hook (BENCH_TEST_FORBIDDEN), and the before/after check below.
         if not key.startswith("ZETA_")
         and not any(
             m in key.upper() for m in ("ANTHROPIC", "CLAUDE", "OPENAI", "CODEX")
@@ -174,6 +245,7 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         PYTHONPATH=os.pathsep.join([str(site), src]),
         ZETA_BENCH_TREE=src,  # already on the tree, so bench.py keeps PYTHONPATH
         BENCH_TEST_RECORD=str(record),
+        BENCH_TEST_FORBIDDEN=str(real_zeta),
     )
     try:
         run = subprocess.run(
@@ -198,12 +270,40 @@ def test_bench_serve_probe_reaches_only_the_local_stub(
         run, returncode, stderr = None, "timed out", exc.stderr
 
     # Provider traffic went to the local stub only: no keychain read and no
-    # connect or lookup to a non-local host got past the harness.
+    # connect or lookup to a non-local host got past the harness. No path under
+    # the real ~/.zeta was opened, listed, changed, or passed to a command.
     lines = record.read_text().splitlines() if record.exists() else []
+    forbidden = [line for line in lines if line.startswith("forbidden ")]
     assert {
-        "outside": [line for line in lines if line != "loopback connect"],
+        "forbidden": forbidden,
+        "outside": [
+            line
+            for line in lines
+            if line != "loopback connect" and line not in forbidden
+        ],
         "reached_loopback": "loopback connect" in lines,
-    } == {"outside": [], "reached_loopback": True}, stderr
+    } == {"forbidden": [], "outside": [], "reached_loopback": True}, stderr
+
+    # Belt and braces, by entry names only: no session appeared in the real
+    # sessions dir (it is created rarely, so a concurrent zeta start is the
+    # only false alarm), and no file the fixture sessions hold appeared in the
+    # real fixture-id dirs. Where they did not exist (CI), they still do not.
+    after = _real_sessions_state(real_sessions)
+    fixture_files = {
+        sid: {entry.name for entry in os.scandir(home / ".zeta/sessions" / sid)}
+        for sid in SOURCES.values()
+    }
+    changed = {}
+    for key, was in before.items():
+        now = after[key]
+        if was is None or now is None:
+            if now != was:
+                changed[key] = (was, now)
+            continue
+        appeared = now - was if key == "" else (now - was) & fixture_files[key]
+        if appeared:
+            changed[key] = sorted(appeared)
+    assert changed == {}
     assert returncode == 0, stderr
     assert run is not None
     decoder, text, results = json.JSONDecoder(), run.stdout, {}
