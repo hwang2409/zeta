@@ -662,7 +662,9 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         result = []
         thread = threading.Thread(target=lambda: result.append(open_writer(home)))
         thread.start()
-        thread.join()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise TimeoutError("test storage writer did not open within 10 seconds")
         return result[0]
 
     @wraps(store_init)
@@ -779,7 +781,9 @@ async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
 
             thread = threading.Thread(target=open_test_writer)
             thread.start()
-            thread.join()
+            thread.join(timeout=10)
+            if thread.is_alive():
+                raise TimeoutError("test storage writer did not open within 10 seconds")
             if error:
                 raise error[0]
             test_home_leases[canonical] = result[0]
