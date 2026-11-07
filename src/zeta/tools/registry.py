@@ -30,6 +30,7 @@ from ..core.approval import (
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalRule,
+    ApprovedCwdExecution,
     ApprovedPathExecution,
     parse_approval_rule,
 )
@@ -896,9 +897,42 @@ class ToolRegistry:
         resolved = resolve_shell_cwd(self.bash_cwd, requested_cwd)
         if requested_cwd is not None or Path(resolved).is_dir():
             return resolved
-        fallback = nearest_existing_directory(resolved)
+        return self._recover_shell_cwd(resolved)
+
+    def open_shell_cwd(
+        self,
+        requested_cwd: object,
+        approved_cwd: ApprovedCwdExecution | None = None,
+    ) -> tuple[str, int]:
+        """Resolve and bind one shell cwd descriptor for process launch."""
+
+        start_cwd = (
+            approved_cwd.cwd
+            if approved_cwd is not None
+            else self.resolve_shell_cwd(requested_cwd)
+        )
+        self.verify_cwd_identity(allow_removed=True)
+        if approved_cwd is not None:
+            return start_cwd, open_verified_directory(
+                start_cwd, approved_cwd.identity
+            )
+        if Path(start_cwd) == self.cwd:
+            try:
+                return start_cwd, self._open_cwd()
+            except SessionCwdRemoved:
+                if requested_cwd is not None:
+                    raise
+                start_cwd = self._recover_shell_cwd(start_cwd)
+        bound_cwd = os.path.realpath(start_cwd)
+        identity = os.lstat(bound_cwd)
+        return start_cwd, open_verified_directory(
+            bound_cwd, (identity.st_dev, identity.st_ino)
+        )
+
+    def _recover_shell_cwd(self, removed_cwd: str) -> str:
+        fallback = nearest_existing_directory(removed_cwd)
         self.update_bash_cwd(fallback)
-        self._cwd_recovery_notices.append((resolved, fallback))
+        self._cwd_recovery_notices.append((removed_cwd, fallback))
         return fallback
 
     def take_cwd_recovery_notices(self) -> tuple[tuple[str, str], ...]:
