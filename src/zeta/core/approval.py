@@ -647,8 +647,8 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 return True
         return False
 
-    async def wait_for_pending_requests(self, count: int = 1) -> list[ApprovalRequest]:
-        """Wait until at least ``count`` durable approval requests are published."""
+    async def wait_for_delegated_requests(self, count: int = 1) -> list[ApprovalRequest]:
+        """Wait until at least ``count`` durable delegated requests are published."""
 
         while True:
             publication = self._pending_request_publication

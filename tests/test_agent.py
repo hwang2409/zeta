@@ -3975,7 +3975,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
     pending = await asyncio.wait_for(
-        policy.wait_for_pending_requests(2), timeout=5
+        policy.wait_for_delegated_requests(2), timeout=5
     )
     assert len(pending) == 2
     assert {request.child_instance_id for request in pending} == {
@@ -5451,7 +5451,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
     )
 
     task = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    pending = await asyncio.wait_for(policy.wait_for_pending_requests(), timeout=5)
+    pending = await asyncio.wait_for(policy.wait_for_delegated_requests(), timeout=5)
     assert len(pending) == 1
     request = pending[0]
     assert request.child_instance_id == f"{store.session_id}:1:1"
