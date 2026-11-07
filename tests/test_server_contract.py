@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +22,106 @@ async def serve_contract(
             yield contract
         finally:
             await contract.close()
+
+
+def _install_wrong_readiness_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[asyncio.subprocess.Process, Path]]:
+    spawned: list[tuple[asyncio.subprocess.Process, Path]] = []
+    create_process = asyncio.create_subprocess_exec
+    child = (
+        "import os,signal,socket,sys; "
+        "path=sys.argv[1]; "
+        "server=socket.socket(socket.AF_UNIX); "
+        "server.bind(path); "
+        "sys.stderr.write('wrong readiness marker\\n'); "
+        "sys.stderr.flush(); "
+        "os.close(2); "
+        "signal.pause()"
+    )
+
+    async def create_wrong_readiness_process(
+        *command: object, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        socket_argument = command.index("--socket") + 1
+        socket_path = Path(str(command[socket_argument]))
+        process = await create_process(
+            sys.executable,
+            "-c",
+            child,
+            str(socket_path),
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append((process, socket_path))
+        return process
+
+    # test-contract: seam ServeContract has no public process factory
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", create_wrong_readiness_process
+    )
+    return spawned
+
+
+async def _remove_spawned_process(
+    process: asyncio.subprocess.Process,
+    socket_path: Path,
+    unlink: Any = Path.unlink,
+) -> None:
+    if process.returncode is None:
+        process.kill()
+    await process.communicate()
+    unlink(socket_path, missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_reaps_process_and_removes_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker"):
+            await ServeContract.start(tmp_path, "unix")
+
+        process, socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert not socket_path.exists()
+    finally:
+        if spawned:
+            await _remove_spawned_process(*spawned[0])
+
+
+@pytest.mark.asyncio
+async def test_failed_start_preserves_error_when_socket_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _install_wrong_readiness_process(monkeypatch)
+    real_unlink = Path.unlink
+
+    def fail_socket_removal(path: Path, *, missing_ok: bool = False) -> None:
+        if path.name.startswith("zeta-contract-"):
+            raise OSError("forced socket removal failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    # test-contract: seam ServeContract has no public socket-removal dependency
+    monkeypatch.setattr(Path, "unlink", fail_socket_removal)
+    try:
+        with pytest.raises(AssertionError, match="wrong readiness marker") as raised:
+            await ServeContract.start(tmp_path, "unix")
+
+        process, _socket_path = spawned[0]
+        assert process.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+        assert any(
+            "forced socket removal failure" in note for note in raised.value.__notes__
+        )
+    finally:
+        if spawned:
+            await _remove_spawned_process(*spawned[0], unlink=real_unlink)
 
 
 async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, object]:

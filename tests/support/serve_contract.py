@@ -139,14 +139,22 @@ class ServeContract:
                 )
                 if line.startswith(b"zeta serve: websocket ready:"):
                     break
-        except BaseException:
+        except BaseException as error:
             if process.returncode is None:
                 try:
                     process.kill()
                 except ProcessLookupError:
                     pass
-            await process.communicate()
-            socket_path.unlink(missing_ok=True)
+            try:
+                await process.communicate()
+            except BaseException as cleanup_error:  # noqa: BLE001
+                error.add_note(f"process reap failed during cleanup: {cleanup_error!r}")
+            try:
+                socket_path.unlink(missing_ok=True)
+            except BaseException as cleanup_error:  # noqa: BLE001
+                error.add_note(
+                    f"socket removal failed during cleanup: {cleanup_error!r}"
+                )
             raise
         return cls(process, home, socket_path, transport)
 
@@ -169,11 +177,44 @@ class ServeContract:
         try:
             for client in reversed(self._clients):
                 await client.close()
-        finally:
+        except BaseException as error:
+            await self._cleanup_process(error)
+            raise
+        await self._cleanup_process()
+
+    async def _cleanup_process(
+        self, original_error: BaseException | None = None
+    ) -> None:
+        cleanup_errors: list[BaseException] = []
+        try:
             if self._process.returncode is None:
                 self._process.terminate()
+        except BaseException as error:  # noqa: BLE001
+            cleanup_errors.append(error)
+
+        stdout = stderr = b""
+        try:
             stdout, stderr = await self._process.communicate()
+        except BaseException as error:  # noqa: BLE001
+            cleanup_errors.append(error)
+
+        try:
             assert self._process.returncode == 0, (stdout + stderr).decode(
                 errors="replace"
             )
+        except BaseException as error:  # noqa: BLE001
+            cleanup_errors.append(error)
+        try:
             assert not self._socket_path.exists(), "serve left its Unix socket behind"
+        except BaseException as error:  # noqa: BLE001
+            cleanup_errors.append(error)
+
+        if original_error is not None:
+            for error in cleanup_errors:
+                original_error.add_note(f"server cleanup failed: {error!r}")
+            return
+        if cleanup_errors:
+            error, *additional_errors = cleanup_errors
+            for additional_error in additional_errors:
+                error.add_note(f"additional cleanup failure: {additional_error!r}")
+            raise error
