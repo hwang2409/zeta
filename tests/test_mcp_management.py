@@ -1304,6 +1304,28 @@ async def test_contended_config_lock_fails_off_loop_with_nonblocking_flock(
     assert attempted
     assert all(thread != loop_thread for thread, _operation in attempted)
     assert all(operation & fcntl.LOCK_NB for _thread, operation in attempted)
+    await asyncio.wait_for(manager.view(), 10)
+
+
+@pytest.mark.asyncio
+async def test_failed_transaction_does_not_poison_next_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = service(tmp_path)
+    original_transaction = manager._transaction
+    calls = 0
+
+    def fail_once(mutation=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise MCPManagementError("forced transaction failure")
+        return original_transaction(mutation)
+
+    monkeypatch.setattr(manager, "_transaction", fail_once)
+    with pytest.raises(MCPManagementError, match="forced transaction failure"):
+        await manager.add("first", scope="project", command=sys.executable)
+    await asyncio.wait_for(manager.view(), 10)
 
 
 @pytest.mark.asyncio
