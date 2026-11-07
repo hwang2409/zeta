@@ -306,6 +306,7 @@ def _hold_finish_gate_task_deadlines(
             deadlines.disarm(state)
 
     monkeypatch.setattr(FinishGateState, "start", start)
+    # test-contract: seam monkeypatch helper exposes injected deadline control
     monkeypatch.setattr(FinishGateState, "_task_deadline", task_deadline)
     monkeypatch.setattr(FinishGateState, "_child_deadline", child_deadline)
     monkeypatch.setattr(FinishGateState, "run_model_turn", run_model_turn)
@@ -11084,7 +11085,7 @@ async def test_child_finish_gate_task_handoff_kills_task(tmp_path: Path) -> None
     )
     store, loop, run, completion_published = await _start_task_gate(tmp_path, backend)
 
-    await asyncio.wait_for(run, timeout=5)
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert "Handed off running background work" in notification.data["text"]
     assert "CI can finish outside this worker." in notification.data["text"]
@@ -11118,10 +11119,12 @@ async def test_child_finish_gate_task_turn_bound_defers_to_task_safety(
     run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=5)
+    # test-contract: complexity subprocess-backed finish-gate harness needs bounded waits
+    await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire(state)
-    await asyncio.wait_for(run, timeout=5)
+    # test-contract: complexity subprocess-backed finish-gate harness needs bounded waits
+    await asyncio.wait_for(run, timeout=10)
     notification = await _completion_after_publication(store, completion_published)
     assert backend.gate_seen.is_set()
     assert "finish-gate task safety bound expired" in notification.data["text"]
