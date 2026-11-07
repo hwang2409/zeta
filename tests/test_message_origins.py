@@ -14,6 +14,7 @@ from rich.console import Console
 
 from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.test_agent import (
     RunBackend,
     _agent_call,
@@ -426,14 +427,14 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
     if path == "steer/queued input":
         first = asyncio.create_task(app._handle_prompt_value("start"))
         assert isinstance(backend, SteerToolBackend)
-        await backend.turn1_streaming.wait()
+        await await_or_fail(backend.turn1_streaming.wait(), what="turn1 streaming")
         await app._handle_prompt_value(typed)
         backend.release_turn1.set()
-        await first
+        await await_or_fail(first, what="first prompt task")
     else:
         await app._handle_prompt_value(typed)
     assert app._active_task is not None
-    await app._active_task
+    await await_or_fail(app._active_task, what="active prompt task")
     user_rows = [
         entry.to_dict()
         for entry in store.entries
