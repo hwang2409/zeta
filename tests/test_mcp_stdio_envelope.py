@@ -262,7 +262,7 @@ async def test_simultaneous_stdio_overflows_invalidate_once_and_detach_before_aw
         detached_before_cleanup.append(
             client._process is None
             and client._reader_task is None
-            and client._stderr is None
+            and client._stderr_task is None
             and getattr(client, "_active_accumulator", None) is None
         )
         await real_kill(process, tasks)
