@@ -39,7 +39,6 @@ from ..protocol.types import (
     assistant_text,
 )
 from ..providers.factory import build_backend, credential_store
-from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -1240,7 +1239,7 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = load_agent(preset)
+    body = preset.prompt_suffix
     if explicit_finish:
         body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
     if not body:

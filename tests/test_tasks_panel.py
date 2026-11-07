@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from prompt_toolkit.document import Document
@@ -367,6 +368,80 @@ async def test_output_tail_reads_only_new_bytes(tmp_path: Path) -> None:
         assert tail["output"] == "DELTA\n"
     finally:
         await registry.kill(task_id, cause="test requested task stop")
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_panel_refresh_owns_output_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _app(tmp_path)
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    registry = app.loop.tool_registry.background_tasks
+    task_id, _ = await registry.start("cat", tmp_path)
+    output_appended = asyncio.Event()
+    original_append = registry._append
+
+    def append_output(record: Any, chunk: bytes) -> None:
+        original_append(record, chunk)
+        output_appended.set()
+
+    monkeypatch.setattr(registry, "_append", append_output)
+    await registry.input(task_id, "first\n")
+    await output_appended.wait()
+    output_appended.clear()
+
+    first_read = asyncio.Event()
+    release_first_read = asyncio.Event()
+    original_output = registry.output
+    read_count = 0
+
+    async def controlled_output(
+        selected_task_id: str, since: int | None = None, *, max_chars: int | None = None
+    ) -> dict[str, object]:
+        nonlocal read_count
+        result = await original_output(selected_task_id, since, max_chars=max_chars)
+        read_count += 1
+        if read_count == 1:
+            first_read.set()
+            await release_first_read.wait()
+        return result
+
+    monkeypatch.setattr(registry, "output", controlled_output)
+    app.open_tasks_panel()
+    app._stop_tasks_refresh()
+    app._tasks_key("enter")
+
+    refresh = asyncio.create_task(app._tasks_tick())
+    try:
+        await first_read.wait()
+        await registry.input(task_id, "second\n")
+        await output_appended.wait()
+
+        # Paint from the current immutable snapshot while the only output read
+        # is paused. Painting must not start another read or move its cursor.
+        app._refresh_tasks_panel(keep_offset=True)
+        release_first_read.set()
+        await refresh
+        settled = asyncio.Event()
+        asyncio.get_running_loop().call_soon(settled.set)
+        await settled.wait()
+        await app._tasks_tick()
+
+        rendered = "\n".join(_text(app._tasks_panel))
+        assert rendered.count("first") == 1
+        assert rendered.count("second") == 1
+        assert rendered.index("first") < rendered.index("second")
+    finally:
+        release_first_read.set()
+        if not refresh.done():
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        app.close_tasks_panel()
+        registry.set_notice_sink(None)
+        await registry.kill(task_id)
         await registry.close()
 
 
