@@ -474,6 +474,7 @@ async def test_custom_agent_model_selects_the_child_backend(
         "agent",
         "request_attention",
         "resolve_attention",
+        "wake",
     }
     await loop.close()
 
