@@ -24,8 +24,20 @@ CONTRACT_ERROR = (
     "'# test-contract: complexity <reason>', 'durability <reason>', or "
     "'seam <reason>' on this line or the line above"
 )
-CONTRACT_KINDS = {"complexity", "durability", "latency", "seam"}
+CONTRACT_KINDS = {"bootstrap", "complexity", "durability", "latency", "seam"}
+GLOBAL_BOOTSTRAP_ERROR = (
+    "global test bootstrap {name} hides production startup; use a local fixture "
+    "and a real subprocess test; use '# test-contract: bootstrap <reason>' on "
+    "this line or the line above for an intended session-wide harness setting"
+)
 MIN_HANG_GUARD_SECONDS = 10
+GLOBAL_BOOTSTRAP_ALLOWLIST = {
+    "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
+    "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
+    "ZETA_TEST_AUDIT_LEDGER",  # passes the fixture's audit destination to children
+    "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
+    "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
+}
 
 
 @dataclass(frozen=True)
@@ -138,9 +150,12 @@ def _marker(lines: list[str], line: int) -> tuple[str, str] | None:
     for candidate in (line, line - 1):
         if candidate < 1 or candidate > len(lines):
             continue
+        marker_line = lines[candidate - 1]
+        if candidate == line - 1 and not marker_line.lstrip().startswith("#"):
+            continue
         match = re.search(
             r"#\s*test-contract:\s*([a-z-]+)(?:\s+([^#\s].*?))?\s*$",
-            lines[candidate - 1],
+            marker_line,
         )
         if match and match.group(1) in CONTRACT_KINDS and match.group(2):
             return match.group(1), match.group(2).strip()
@@ -361,6 +376,171 @@ def _contract_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Find
     return [Finding(path, node.lineno, node.col_offset + 1, "TQ003", CONTRACT_ERROR)]
 
 
+def _env_name(node: ast.AST, source: str) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value if node.value.startswith("ZETA_") else None
+    return ast.get_source_segment(source, node) or ast.unparse(node)
+
+
+def _environment_receivers(tree: ast.AST) -> set[str]:
+    receivers = {"os.environ"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "os":
+            for imported in node.names:
+                if imported.name == "environ":
+                    receivers.add(imported.asname or imported.name)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and _name(node.value) == "os.environ"
+        ):
+            receivers.add(node.targets[0].id)
+    return receivers
+
+
+def _env_receiver(node: ast.AST, receivers: set[str]) -> str | None:
+    receiver = _name(node)
+    return receiver if receiver in receivers else None
+
+
+def _literal_key_names(node: ast.Dict, source: str) -> list[str]:
+    return [
+        name
+        for key in node.keys
+        if key is not None
+        for name in [_env_name(key, source)]
+        if name
+    ]
+
+
+def _assignment_bootstrap_names(
+    node: ast.Assign | ast.AugAssign, source: str, receivers: set[str]
+) -> list[str]:
+    if isinstance(node, ast.AugAssign):
+        return (
+            _literal_key_names(node.value, source)
+            if _env_receiver(node.target, receivers) is not None
+            and isinstance(node.value, ast.Dict)
+            else []
+        )
+    if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Subscript):
+        return []
+    target = node.targets[0]
+    if _env_receiver(target.value, receivers) is None:
+        return []
+    name = _env_name(target.slice, source)
+    return [name] if name else []
+
+
+def _direct_environment_call_names(node: ast.Call, source: str) -> list[str]:
+    if _name(node.func) != "os.putenv" or not node.args:
+        return []
+    name = _env_name(node.args[0], source)
+    return [name] if name else []
+
+
+def _monkeypatch_call_names(node: ast.Call, source: str) -> list[str]:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "setenv":
+        return []
+    receiver = node.func.value
+    if _name(receiver) != "monkeypatch" and not (
+        isinstance(receiver, ast.Call) and _name(receiver.func) == "MonkeyPatch"
+    ):
+        return []
+    if not node.args:
+        return []
+    name = _env_name(node.args[0], source)
+    return [name] if name else []
+
+
+def _call_bootstrap_names(
+    node: ast.Call, source: str, receivers: set[str]
+) -> list[str]:
+    if direct := _direct_environment_call_names(node, source):
+        return direct
+    if monkeypatch := _monkeypatch_call_names(node, source):
+        return monkeypatch
+    if not isinstance(node.func, ast.Attribute) or not node.args:
+        return []
+    if _env_receiver(node.func.value, receivers) is None:
+        return []
+    if node.func.attr == "update" and isinstance(node.args[0], ast.Dict):
+        return _literal_key_names(node.args[0], source)
+    if node.func.attr == "setdefault":
+        name = _env_name(node.args[0], source)
+        return [name] if name else []
+    return []
+
+
+def _global_bootstrap_names(
+    node: ast.AST, source: str, receivers: set[str]
+) -> list[str]:
+    if isinstance(node, (ast.Assign, ast.AugAssign)):
+        return _assignment_bootstrap_names(node, source, receivers)
+    if isinstance(node, ast.Call):
+        return _call_bootstrap_names(node, source, receivers)
+    return []
+
+
+def _is_session_fixture(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call) or _name(decorator.func) not in {
+            "pytest.fixture",
+            "fixture",
+        }:
+            continue
+        return any(
+            keyword.arg == "scope"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "session"
+            for keyword in decorator.keywords
+        )
+    return False
+
+
+def _global_bootstrap_findings(
+    path: Path, tree: ast.AST, source: str, added: set[int]
+) -> list[Finding]:
+    module_scope = path.name in {"conftest.py", "sitecustomize.py"}
+    findings: list[Finding] = []
+    receivers = _environment_receivers(tree)
+    lines = source.splitlines()
+
+    def visit(node: ast.AST, global_scope: bool = module_scope) -> None:
+        child_scope = global_scope
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            child_scope = _is_session_fixture(node) or node.name in {
+                "pytest_configure",
+                "pytest_sessionstart",
+                "pytest_load_initial_conftests",
+            }
+        if (
+            global_scope
+            and hasattr(node, "lineno")
+            and _touches_added_line(node, added)
+        ):
+            for name in _global_bootstrap_names(node, source, receivers):
+                if name in GLOBAL_BOOTSTRAP_ALLOWLIST or _has_marker(
+                    lines, node.lineno, {"bootstrap"}
+                ):
+                    continue
+                findings.append(
+                    Finding(
+                        path,
+                        node.lineno,
+                        node.col_offset + 1,
+                        "TQ005",
+                        GLOBAL_BOOTSTRAP_ERROR.format(name=name),
+                    )
+                )
+        for child in ast.iter_child_nodes(node):
+            visit(child, child_scope)
+
+    visit(tree)
+    return findings
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -385,6 +565,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
         findings.extend(_timing_findings(path, node, lines))
         findings.extend(_digest_findings(path, node, literal_names, serialized_names))
         findings.extend(_contract_findings(path, node, lines))
+    findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
 
 
@@ -392,7 +573,9 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
     root = Path.cwd() if root is None else root
     findings: list[Finding] = []
     for path, added in _added_lines(diff).items():
-        if not added or not _is_test_path(path):
+        if not added or not (
+            _is_test_path(path) or path.name in {"conftest.py", "sitecustomize.py"}
+        ):
             continue
         source_path = root / path
         if source_path.is_file():
