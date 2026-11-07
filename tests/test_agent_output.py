@@ -616,12 +616,13 @@ async def test_agent_output_does_not_cache_append_during_read(
     parent = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(parent.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("old")]))
-    # test-contract: seam inject an append between read and post-read fstat
+    # test-contract: seam isolate receipt discovery for the unstable-read test
     monkeypatch.setattr(
         agent_tools,
         "_active_agent_receipts",
         lambda store: {"parent:1": child.session_dir},
     )
+    # test-contract: seam inject an append between read and post-read fstat
     original_fdopen = agent_tools.os.fdopen
     injected = False
 
