@@ -7,8 +7,13 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import _now
-from ..core.store import ConversationStore
-from ..protocol.types import MessageOrigin, harness_notice
+from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..protocol.types import (
+    MessageOrigin,
+    StreamEvent,
+    StreamEventType,
+    harness_notice,
+)
 from ..tools.agent import agent_stats
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
@@ -152,6 +157,7 @@ async def consume_run(
     terminal_result: dict[str, object] | None = None
     delivered_follow_up = False
     segment_reports: list[str] = []
+    ordinary_idle_presented = False
     kwargs["record_report"] = segment_reports.append
     kwargs.setdefault("finish_gate_state", FinishGateState())
 
@@ -174,6 +180,7 @@ async def consume_run(
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 flow.reset_stalled_episode()
+                ordinary_idle_presented = False
                 idle_lifecycle.reset_idle_period()
                 _transition_running(child_loop, child_store)
                 result = await consume_child(
@@ -214,12 +221,31 @@ async def consume_run(
                             text=text,
                         )
 
-                    await flow.publish_stalled(
+                    stalled_result = await flow.publish_stalled(
                         lambda finish_gate_state=finish_gate_state: (
                             finish_gate_state.can_wake_again(child_loop)
                         ),
                         publish_stalled,
                     )
+                    if stalled_result == "suppressed" and not ordinary_idle_presented:
+                        child_loop._publish_background_event(
+                            StreamEvent(
+                                StreamEventType.AGENT_NOTIFICATION,
+                                data={
+                                    "origin": "notification",
+                                    "kind": "child_idle",
+                                    "child_instance_id": str(
+                                        metadata["child_instance_id"]
+                                    ),
+                                    "child_session_path": child_path,
+                                    "description": str(metadata["description"]),
+                                    "status": "child_idle",
+                                    "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
+                                    "display_only": True,
+                                },
+                            )
+                        )
+                        ordinary_idle_presented = True
                 ended_with_text = (
                     isinstance(content, list)
                     and bool(content)

@@ -12456,6 +12456,7 @@ class _ExplicitFinishLoop:
         self._explicit_finish_report = None
         self._yield_for_pending_prompt = False
         self.step_delivery = None
+        self.background_events: list[StreamEvent] = []
 
     async def _ensure_step_delivery(self):
         if self.step_delivery is None:
@@ -12470,6 +12471,9 @@ class _ExplicitFinishLoop:
             )
             self.step_delivery.initialize_resident_edges()
         return self.step_delivery
+
+    def _publish_background_event(self, event: StreamEvent) -> None:
+        self.background_events.append(event)
 
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
@@ -12840,6 +12844,7 @@ async def _run_until_idle_wait(
     *,
     replies: list[str] | None = None,
     wait_for_idle: bool = True,
+    child_instance_id: str = "root:1",
 ) -> tuple[asyncio.Task[dict[str, object]], asyncio.Event, list[str]]:
     idle_waiting = asyncio.Event()
     prompts: list[str] = []
@@ -12873,7 +12878,7 @@ async def _run_until_idle_wait(
             child_turns=lambda: len(prompts),
             child_path=str(child.session_dir),
             explicit_finish_metadata={
-                "child_instance_id": "root:1",
+                "child_instance_id": child_instance_id,
                 "description": "work",
             },
             idle_wait=wait_idle,
@@ -12892,8 +12897,8 @@ async def _cancel_idle_fixture(
 ) -> None:
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run
-    await registry.close()
+        await asyncio.wait_for(run, 10)
+    await asyncio.wait_for(registry.close(), 10)
     parent.close()
     child.close()
 
@@ -12959,6 +12964,48 @@ async def test_idle_with_open_work_does_not_notify_parent(
         if owned_child is not None:
             loop._background_owner.cancel_subtree("root:1:1")
             await asyncio.gather(owned_child, return_exceptions=True)
+        await _cancel_idle_fixture(run, registry, parent, child)
+
+
+@pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
+@pytest.mark.asyncio
+async def test_owned_idle_is_displayed_without_notifying_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child_instance_id: str,
+) -> None:
+    parent, child, registry, loop, _parent_flow, wakes = await _idle_notice_fixture(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        registry.background_tasks,
+        "snapshot",
+        lambda: (
+            SimpleNamespace(
+                running=True, task_id="task-owned", headline="owned task"
+            ),
+        ),
+    )
+    run, _idle_waiting, _prompts = await _run_until_idle_wait(
+        loop,
+        child,
+        monkeypatch,
+        child_instance_id=child_instance_id,
+    )
+    try:
+        idle_events = [
+            event
+            for event in loop.background_events
+            if event.type is StreamEventType.AGENT_NOTIFICATION
+            and event.data.get("kind") == "child_idle"
+        ]
+        assert len(idle_events) == 1
+        assert idle_events[0].data["child_instance_id"] == child_instance_id
+        assert idle_events[0].data["text"] == "last child message"
+        assert idle_events[0].data["display_only"] is True
+        assert parent.agent_notifications(pending_only=False) == []
+        assert wakes == []
+    finally:
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
@@ -13074,15 +13121,18 @@ async def test_follow_up_commit_suppresses_racing_stalled_admission(
                 ),
             )
         )
-        await commit_entered.wait()
+        await asyncio.wait_for(commit_entered.wait(), 10)
         task_running = False
         channel.wake("root:1")
-        await send
+        await asyncio.wait_for(send, 10)
         assert order[0] == "follow_up"
     finally:
         release_commit.set()
         if send is not None:
-            await asyncio.gather(send, return_exceptions=True)
+            send.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(send, return_exceptions=True), 10
+            )
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
@@ -13123,7 +13173,7 @@ async def test_stalled_admission_commits_before_racing_follow_up(
     send: asyncio.Task[object] | None = None
     try:
         try:
-            await idle_entered.wait()
+            await asyncio.wait_for(idle_entered.wait(), 10)
             send = asyncio.create_task(
                 channel.produce_to(
                     "root:1",
@@ -13132,11 +13182,11 @@ async def test_stalled_admission_commits_before_racing_follow_up(
                     ),
                 )
             )
-            await send_started.wait()
+            await asyncio.wait_for(send_started.wait(), 10)
         finally:
             release_idle.set()
         assert send is not None
-        await send
+        await asyncio.wait_for(send, 10)
         await asyncio.wait_for(idle_waiting.wait(), 10)
         assert order[:2] == ["idle", "follow_up"]
         assert any(
@@ -13146,7 +13196,10 @@ async def test_stalled_admission_commits_before_racing_follow_up(
     finally:
         release_idle.set()
         if send is not None:
-            await asyncio.gather(send, return_exceptions=True)
+            send.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(send, return_exceptions=True), 10
+            )
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
