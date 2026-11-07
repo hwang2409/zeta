@@ -939,11 +939,6 @@ class BackgroundTaskRegistry:
                     tui_presented=record.tui_presented,
                 )
 
-    async def _commit_notice(
-        self, notice: BackgroundTaskNoticeSinkValue | None
-    ) -> None:
-        await self._commit_transition(self._persistence_rows(), lambda: None, notice)
-
     async def _commit_transition(
         self,
         rows: tuple[dict[str, object], ...],

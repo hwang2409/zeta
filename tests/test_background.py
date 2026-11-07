@@ -448,6 +448,7 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
         "restart-durable-terminal-notify-false",
         "two-task-close-ordering",
         "two-task-close-cancellation",
+        "persistent-terminal-write-failure-close",
         "crash-before-aggregate",
         "group-exit-after-positive-probe",
     ],
@@ -555,6 +556,39 @@ async def test_background_task_owner_state_table(
                 await resumed.background_tasks.deliver_recovered_exit(item)
             receipts = store.agent_notifications(pending_only=False)
             assert bool(receipts) is row.endswith("true")
+            return
+
+        if row == "persistent-terminal-write-failure-close":
+            events: list[str] = []
+            original_notice = registry.background_tasks._notice
+            registry.background_tasks._notice = lambda notice: (
+                events.append("aggregate") if hasattr(notice, "tasks") else None,
+                original_notice(notice),
+            )[1]
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            original_commit = registry.background_tasks._commit_transition
+
+            async def fail_terminal_write(rows, publish, notice):
+                if any(
+                    item["task_id"] == task_id and not item["running"]
+                    for item in rows
+                ):
+                    raise OSError("terminal write failed permanently")
+                return await original_commit(rows, publish, notice)
+
+            # test-contract: seam inject persistent terminal-write failure
+            monkeypatch.setattr(
+                registry.background_tasks, "_commit_transition", fail_terminal_write
+            )
+            with pytest.raises(OSError, match="terminal write failed permanently"):
+                await asyncio.wait_for(registry.close(), 10)
+            # test-contract: seam aggregate callback is the required internal absence check
+            assert events == []
+            assert store.agent_notifications(pending_only=False) == []
+            # The owner is intentionally still running in storage after the
+            # bounded failure; finish fixture cleanup without retrying close.
+            registry.background_tasks._closed = True
+            registry.background_tasks._closing = False
             return
 
         if row in {"two-task-close-ordering", "two-task-close-cancellation"}:

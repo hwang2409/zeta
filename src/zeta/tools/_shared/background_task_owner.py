@@ -378,9 +378,9 @@ class _BackgroundTaskOwner:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         if lifecycle in done:
-            # The bounded retry budget is exhausted. Keep the persisted row
-            # running rather than letting close wait on an unreachable event.
-            lifecycle.exception()
+            # Propagate the bounded terminal-write failure. Close must not
+            # publish an aggregate success notice or release a receipt.
+            lifecycle.result()
 
     async def release_close_receipt(self) -> None:
         self.defer_receipt_for_close = False
