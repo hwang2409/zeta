@@ -16,7 +16,6 @@ from ..core.approval import ApprovalDecision, ApprovalRequest
 from ..core.commands.custom_commands import CustomCommand, InlineShellResult
 from ..core.slash import SlashPromptError
 from ..model_input import ModelInputEnvelope
-from ..permissions import session_grant_change
 from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
@@ -30,7 +29,6 @@ from ..tools._shared.shell import (
     run_inline_shell_batch,
 )
 from ..tui.composer import UndoCandidate, parse_input
-from ..tui.slash_handlers.permissions import format_session_grant_change
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
 from .model import (
     Submission,
@@ -977,7 +975,6 @@ class SubmissionPipeline:
         )
         if message.decision is ApprovalDecision.ALLOW:
             if message.always:
-                grants_before = policy.session_allow
                 try:
                     rule = policy.remember_allow(request)
                 except ValueError as exc:
@@ -986,12 +983,6 @@ class SubmissionPipeline:
                     )
                     self._ack_action(message)
                     return
-                if rule not in grants_before:
-                    self._host._print_system(
-                        format_session_grant_change(
-                            session_grant_change(policy, "grant", (str(rule),))
-                        )
-                    )
             policy.approve(request.key)
             verb = (
                 f"always allowed {rule} for this session · request" if message.always else "approved"

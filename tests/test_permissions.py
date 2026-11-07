@@ -240,8 +240,6 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
         receipt = app.console.file.getvalue()
         assert "always allowed bash for this session" in receipt
         assert "always allowed inbox(send) for this session" in receipt
-        assert "permissions · session grant added: bash" in receipt
-        assert "permissions · session grant added: inbox(send)" in receipt
         assert not (tmp_path / "home" / "settings.toml").exists()
         assert not backend.calls
         # Reconstructing a policy does not restore an /always session grant.

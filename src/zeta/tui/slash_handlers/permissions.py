@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...config.tool_policy import ToolPolicy
-from ...core.approval import ApprovalPolicy
-from ...permissions import (
+from ...core.approval import (
+    ApprovalPolicy,
     PermissionSnapshot,
     SessionGrantChange,
     SessionGrantNotFound,

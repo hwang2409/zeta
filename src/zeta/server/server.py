@@ -18,9 +18,9 @@ from . import (
     ergonomics,
     login,
     model_selection,
-    session_grants,
     slash_commands,
 )
+from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .host_commands import SessionHostCommands
