@@ -8895,7 +8895,7 @@ async def test_serve_accounts_slash_marks_missing_credentials_unavailable(
         assert result["kind"] == "output"
         assert "codex:missing  unavailable: credentials missing" in result["text"]
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
