@@ -176,27 +176,40 @@ class StubOllama:
 
 class Sandbox:
     def __init__(self, prefix: str, *, keep: bool = False) -> None:
+        self.prefix = prefix
         self.keep = keep
-        PERF.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=PERF))
-        self.guard_log = self.root / "network-guard.log"
-        self.site = self.root / "site"
-        self.site.mkdir()
         self.processes: list[subprocess.Popen[Any]] = []
         self.stub: StubOllama | None = None
 
     def __enter__(self) -> Self:
-        # External timeouts (lockf, kill) send SIGTERM; make it run the cleanup below.
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-        self.stub = StubOllama()
-        env = self.env()
-        os.environ.clear()
-        os.environ.update(env)
-        exec(GUARD_SOURCE, {})  # noqa: S102 - the guard is this module's own code
-        self.write_sitecustomize("")
+        # The root exists only inside the with block: __exit__ does not run when
+        # __enter__ raises, so setup failures clean up here.
+        PERF.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix=f"{self.prefix}-", dir=PERF))
+        self.guard_log = self.root / "network-guard.log"
+        self.site = self.root / "site"
+        try:
+            self.site.mkdir()
+            # External timeouts (lockf, kill) send SIGTERM; make it run the cleanup.
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+            self.stub = StubOllama()
+            env = self.env()
+            os.environ.clear()
+            os.environ.update(env)
+            exec(GUARD_SOURCE, {})  # noqa: S102 - the guard is this module's own code
+            self.write_sitecustomize("")
+        except BaseException:
+            self._cleanup()
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
+        violations = self._cleanup()
+        if violations:
+            raise SystemExit(f"network guard refused non-local access:\n{violations}")
+
+    def _cleanup(self) -> str:
+        """Stop owned processes and the stub, remove the root; return guard refusals."""
         try:
             for process in self.processes:
                 self.stop(process)
@@ -208,8 +221,7 @@ class Sandbox:
                 print(f"kept {self.root}", file=sys.stderr)
             else:
                 shutil.rmtree(self.root, ignore_errors=True)
-        if violations:
-            raise SystemExit(f"network guard refused non-local access:\n{violations}")
+        return violations
 
     def env(self, home: Path | None = None, **extra: str) -> dict[str, str]:
         """The process environment without credential sources, pinned to the stub."""
