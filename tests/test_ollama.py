@@ -142,9 +142,7 @@ class _TCPHTTPServer:
                 ),
                 0,
             )
-            body = (
-                await reader.readexactly(content_length) if content_length else b""
-            )
+            body = await reader.readexactly(content_length) if content_length else b""
             self.request_bodies.append(body)
             script = self.scripts[min(self.calls, len(self.scripts) - 1)]
             self.calls += 1
@@ -1610,7 +1608,9 @@ async def test_ollama_watchdog_retries_real_transport_stall(
             lambda writer, server: _response(writer, server, [ok]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0
+    )
 
     transport = _LoopbackAsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport) as client:
@@ -1656,15 +1656,15 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
             lambda writer, server: _response(
                 writer, server, error_chunks, status=500, wait=never
             ),
-            lambda writer, server: _response(
-                writer, server, [final_error], status=400
-            ),
+            lambda writer, server: _response(writer, server, [final_error], status=400),
         ]
     )
-    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr(
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0
+    )
 
     async def enter_without_header_deadline(enter, *_args):
-        return await enter
+        return await asyncio.wait_for(enter, timeout=_CLIENT_DEADLINE_SECONDS)
 
     monkeypatch.setattr(
         "zeta.providers.ollama.wait_for_response_headers",
