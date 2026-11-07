@@ -18,7 +18,7 @@ from tests.support.fake_backend import FakeBackend
 from zeta.config.settings import load_settings
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
-from zeta.mcp.client import make_error_result
+from zeta.mcp.client import MCPTool, make_error_result
 from zeta.mcp.commands import render_mcp_status
 from zeta.mcp.config import MCPConfig, MCPServerConfig
 from zeta.mcp.envelope import MCPCallEnvelope, MCPCallLimits, MCPTransientQuotaError
@@ -209,49 +209,50 @@ async def test_http_deadline_is_absolute_and_keeps_mount_usable(
     mcp_http_server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _MCPHandler.mode = "deadline-sse"
-    release_on_base: asyncio.Task[None] | None = None
-    if hasattr(MCPServerActor, "_wait_for_call_deadline"):
-        real_deadline_waiter = MCPServerActor._wait_for_call_deadline
-        deadline_waits = 0
+    signal = AbortSignal()
+    abort_on_base: asyncio.Task[None] | None = None
+    deadline_type = getattr(server_actor_module, "MCPCallDeadline", None)
+    clock_offset = 0.0
+    loop = asyncio.get_running_loop()
 
-        async def wait_for_streaming_deadline(actor) -> None:
-            nonlocal deadline_waits
-            deadline_waits += 1
-            if deadline_waits == 1:
+    def clock() -> float:
+        return loop.time() + clock_offset
+
+    if deadline_type is not None:
+        real_wait = deadline_type.wait
+        waits = 0
+
+        async def expire_after_streaming(deadline) -> None:
+            nonlocal waits, clock_offset
+            waits += 1
+            if waits == 1:
                 await asyncio.to_thread(_MCPHandler.deadline_streaming.wait)
-            else:
-                await real_deadline_waiter(actor)
+                clock_offset = 301.0
+                return
+            await real_wait(deadline)
 
-        monkeypatch.setattr(
-            MCPServerActor, "_wait_for_call_deadline", wait_for_streaming_deadline
-        )
+        monkeypatch.setattr(deadline_type, "wait", expire_after_streaming)
     else:
 
-        async def release_stream_on_base() -> None:
+        async def abort_after_streaming() -> None:
             await asyncio.to_thread(_MCPHandler.deadline_streaming.wait)
-            _MCPHandler.release_deadline.set()
+            signal.abort()
 
-        release_on_base = asyncio.create_task(release_stream_on_base())
-    cleanup_release = asyncio.Event()
-    real_call_tool = StreamableHTTPMCPClient.call_tool
-    calls = 0
+        abort_on_base = asyncio.create_task(abort_after_streaming())
 
-    async def hold_first_canceled_cleanup(client, *args, **kwargs):
-        nonlocal calls
-        calls += 1
-        try:
-            return await real_call_tool(client, *args, **kwargs)
-        except asyncio.CancelledError:
-            if calls != 1:
-                raise
-            asyncio.current_task().uncancel()
-            await cleanup_release.wait()
-            raise
+    cleanup_done = asyncio.Event()
+    if deadline_type is not None:
+        real_cleanup = StreamableHTTPMCPClient._cleanup_deadline_request
 
-    monkeypatch.setattr(
-        StreamableHTTPMCPClient, "call_tool", hold_first_canceled_cleanup
-    )
-    monkeypatch.setattr(server_actor_module, "CLIENT_CLOSE_TIMEOUT_SECONDS", 0)
+        async def observe_cleanup(client, state) -> None:
+            try:
+                await real_cleanup(client, state)
+            finally:
+                cleanup_done.set()
+
+        monkeypatch.setattr(
+            StreamableHTTPMCPClient, "_cleanup_deadline_request", observe_cleanup
+        )
     limits = MCPCallLimits(
         deadline_seconds=300.0,
         max_wire_bytes=64 * 1024 * 1024,
@@ -270,22 +271,78 @@ async def test_http_deadline_is_absolute_and_keeps_mount_usable(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"local": config}),
     )
+    if deadline_type is not None:
+        mount._actors["local"]._deadline_clock = clock
     try:
-        result = await mount.call_tool("local", "echo", {})
+        result = await mount.call_tool("local", "echo", {}, signal)
         assert result == make_error_result(
             "MCP tool local__echo exceeded the 300s deadline"
         )
+        await cleanup_done.wait()
+        client = mount._clients["local"]
+        assert not client._active_requests
+        assert not any(not task.done() for task in client._deadline_cleanups)
+
+        clock_offset = 0.0
+        _MCPHandler.release_deadline.set()
         follow_up = await mount.call_tool("local", "echo", {})
         assert follow_up["content"][0]["text"] == "ok"
         assert mount.statuses["local"].state == "mounted"
-        assert not cleanup_release.is_set()
+        assert not any(not task.done() for task in mount._actors["local"]._children)
     finally:
-        cleanup_release.set()
         _MCPHandler.release_deadline.set()
-        if release_on_base is not None:
-            await release_on_base
+        if abort_on_base is not None:
+            await abort_on_base
         await mount.close()
         await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_covers_call_work_before_first_yield(tmp_path: Path) -> None:
+    now = 0.0
+
+    class Client:
+        async def call_tool(self, _name, _arguments, _abort_signal):
+            nonlocal now
+            now = 301.0
+            return {"content": [{"type": "text", "text": "late"}]}
+
+        def deadline_exceeded(self, _owner) -> None:
+            pass
+
+        def set_failure_sink(self, _sink) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    async def connect_and_list(_client) -> list[MCPTool]:
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    client = Client()
+    actor = MCPServerActor(
+        MCPServerConfig("local", "stdio", "unused"),
+        source=tmp_path / "mcp.json",
+        registry=None,
+        publish=lambda *_args: None,
+        build_client=lambda _config: client,
+        connect_and_list=connect_and_list,
+    )
+    if hasattr(actor, "_deadline_clock"):
+        actor._deadline_clock = lambda: now
+        actor._call_deadline_seconds = 300.0
+    actor.start()
+    await actor.wait_started(None)
+    try:
+        result = await actor.call_tool(
+            "echo", {}, AbortSignal(), generation=actor.generation
+        )
+
+        assert result == make_error_result(
+            "MCP tool local__echo exceeded the 300s deadline"
+        )
+    finally:
+        await actor.close()
 
 
 @pytest.mark.asyncio

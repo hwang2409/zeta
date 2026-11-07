@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import zeta.mcp.server_actor as server_actor_module
 import zeta.mcp.stdio as stdio_module
 from zeta.core.abort import AbortSignal
 from zeta.mcp import MCPConfig, MCPServerConfig, StdioMCPClient
@@ -158,23 +159,27 @@ for line in sys.stdin:
     notification_seen = asyncio.Event()
     abort_on_base: asyncio.Task[None] | None = None
     signals = (AbortSignal(), AbortSignal())
-    if hasattr(MCPServerActor, "_wait_for_call_deadline"):
-        real_deadline_waiter = MCPServerActor._wait_for_call_deadline
+    deadline_type = getattr(server_actor_module, "MCPCallDeadline", None)
+    clock_offset = 0.0
+    loop = asyncio.get_running_loop()
+
+    def clock() -> float:
+        return loop.time() + clock_offset
+
+    if deadline_type is not None:
+        real_wait = deadline_type.wait
         deadline_waits = 0
 
-        async def wait_for_notification_deadline(actor) -> None:
-            nonlocal deadline_waits
+        async def wait_for_notification_deadline(deadline) -> None:
+            nonlocal deadline_waits, clock_offset
             deadline_waits += 1
             if deadline_waits <= 2:
                 await notification_seen.wait()
-            else:
-                await real_deadline_waiter(actor)
+                clock_offset = 301.0
+                return
+            await real_wait(deadline)
 
-        monkeypatch.setattr(
-            MCPServerActor,
-            "_wait_for_call_deadline",
-            wait_for_notification_deadline,
-        )
+        monkeypatch.setattr(deadline_type, "wait", wait_for_notification_deadline)
     else:
 
         async def abort_calls_on_base() -> None:
@@ -188,6 +193,8 @@ for line in sys.stdin:
         MCPConfig(tmp_path / "mcp.json", {"deadline": config}),
     )
     expected = make_error_result("MCP tool deadline__echo exceeded the 300s deadline")
+    if deadline_type is not None:
+        mount._actors["deadline"]._deadline_clock = clock
     try:
         mount._clients["deadline"].set_notification_sink(
             lambda _method: notification_seen.set()
@@ -200,6 +207,7 @@ for line in sys.stdin:
         client = mount._clients["deadline"]
         assert client._invalidation is not None
         await asyncio.shield(client._invalidation.task)
+        clock_offset = 0.0
         follow_up = await mount.call_tool("deadline", "echo", {})
         assert follow_up["content"][0]["text"] == "ok"
         assert mount.statuses["deadline"].state == "mounted"
