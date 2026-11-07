@@ -499,6 +499,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._emitted = False
         self._closed = False
         self._attempt_completed = False
+        self._attempt_truncated = False
+        self._attempt_stop_reason: str | None = None
         self._pending: deque[StreamEvent] = deque()
         self._pending_retry: RetryPlan | None = None
         self._transport_deadline = 0.0
@@ -528,6 +530,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             if self._attempt is None:
                 await self._open_attempt()
             assert self._attempt is not None
+            if self._attempt_completed:
+                if await self._finish_completed_attempt():
+                    continue
+                self._closed = True
+                raise StopAsyncIteration
             try:
                 signal = await self._read_signal(self._attempt)
             except StopAsyncIteration:
@@ -575,6 +582,11 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 continue
             if event.type is StreamEventType.MESSAGE_END:
                 self._attempt_completed = True
+                self._attempt_truncated = event.data.get("truncated") is True
+                stop_reason = event.data.get("stop_reason")
+                self._attempt_stop_reason = (
+                    stop_reason if isinstance(stop_reason, str) else None
+                )
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
                     self._retry_usage = dict(usage)
@@ -584,10 +596,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 if retry:
                     continue
             self._observe(event)
-            if self._attempt_completed:
-                if await self._finish_completed_attempt():
-                    continue
-                self._closed = True
             return event
 
     async def _finish_completed_attempt(self) -> bool:
@@ -601,11 +609,14 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             await self._finish_attempt()
             return False
         except BaseException as error:
-            retry = await self._retry(error)
+            retryable_eof = self._attempt_truncated and self._attempt_stop_reason != "max_tokens"
+            retry = await self._retry(error) if retryable_eof else False
             await self._finish_attempt(error)
             if retry:
                 return True
-            raise
+            if retryable_eof:
+                raise
+            return False
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
@@ -810,6 +821,31 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         except BaseException as cleanup_error:
             primary_error = primary if isinstance(primary, BaseException) else None
             producer_error = getattr(attempt, "_producer_error", None)
+            if (
+                primary_error is None
+                and isinstance(producer_error, BaseException)
+                and is_control_exception(producer_error)
+                and not is_control_exception(cleanup_error)
+            ):
+                asyncio.get_running_loop().call_exception_handler(
+                    {
+                        "message": "provider completion cleanup failed",
+                        "exception": cleanup_error,
+                        "provider": self._adapter.provider,
+                    }
+                )
+                return
+            if primary_error is None and primary is not None:
+                if not is_control_exception(cleanup_error):
+                    asyncio.get_running_loop().call_exception_handler(
+                        {
+                            "message": "provider completion cleanup failed",
+                            "exception": cleanup_error,
+                            "provider": self._adapter.provider,
+                        }
+                    )
+                    return
+                raise cleanup_error
             selected = select_completion_outcome(
                 primary_error,
                 producer_error if isinstance(producer_error, BaseException) else None,
