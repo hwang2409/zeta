@@ -113,6 +113,7 @@ class ProviderRetryBudget:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
+        explicit_retry_after = retry_after_seconds(source, event_data)
         delay = retry_wait_seconds(source, self.attempts, event_data)
         is_stall = bool(getattr(source, "is_stall", False))
         stall_seconds = getattr(source, "stall_seconds", 0.0)
@@ -132,7 +133,11 @@ class ProviderRetryBudget:
             not is_stall or has_stall_duration
         ) and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
-            self.records.append({"decision": "budget-exhausted"})
+            record: dict[str, object] = {"decision": "budget-exhausted"}
+            if explicit_retry_after is not None:
+                record["retry_after"] = explicit_retry_after
+                explain_unhonored_retry_after(source, explicit_retry_after)
+            self.records.append(record)
             return None
         return RetryPlan(
             attempt=self.attempts + 1,
@@ -231,16 +236,39 @@ def retryable_provider_error(
     return bool(event_data and event_data.get("retryable") is True)
 
 
+def retry_after_seconds(
+    error: BaseException | object,
+    event_data: Mapping[str, Any] | None = None,
+) -> float | None:
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is None and event_data is not None:
+        retry_after = event_data.get("retry_after")
+    if type(retry_after) in {int, float}:
+        return max(0.0, float(retry_after))
+    return None
+
+
+def explain_unhonored_retry_after(source: BaseException | object, delay: float) -> None:
+    if not isinstance(source, BaseException):
+        return
+    requested = f"{delay:g}"
+    source.args = (
+        (
+            f"{source}; provider requested Retry-After of {requested}s, longer than "
+            f"the remaining turn retry budget (maximum "
+            f"{MAX_PROVIDER_RETRY_SECONDS:g}s); not retrying early"
+        ),
+    )
+
+
 def retry_wait_seconds(
     error: BaseException | object,
     retry_number: int,
     event_data: Mapping[str, Any] | None = None,
 ) -> float:
-    retry_after = getattr(error, "retry_after", None)
-    if retry_after is None and event_data is not None:
-        retry_after = event_data.get("retry_after")
-    if type(retry_after) in {int, float}:
-        return max(0.0, min(MAX_PROVIDER_RETRY_DELAY_SECONDS, float(retry_after)))
+    retry_after = retry_after_seconds(error, event_data)
+    if retry_after is not None:
+        return retry_after
     base = min(MAX_PROVIDER_RETRY_DELAY_SECONDS, float(2 ** (retry_number - 1)))
     return min(
         MAX_PROVIDER_RETRY_DELAY_SECONDS,

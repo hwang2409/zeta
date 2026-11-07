@@ -152,6 +152,9 @@ class SlashHandlerMixin:
                 if self.loop.memory_reconciler is not None
                 else None
             ),
+            transcript_index_failure=self.loop.transcript_index_failure(
+                self._viewed_session_path().name
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -286,7 +289,7 @@ class SlashHandlerMixin:
 
         async def refresh() -> None:
             try:
-                await asyncio.to_thread(
+                refreshed = await asyncio.to_thread(
                     lambda: asyncio.run(
                         AccountUsage(self.loop.account_context.store).refresh_stale()
                     )
@@ -306,6 +309,7 @@ class SlashHandlerMixin:
                 self.loop.account_context.store.list_display
             )
             current.usages = {item.account: item.usage for item in displays}
+            current.usages.update(refreshed)
             self._repaint_accounts_picker()
 
         asyncio.create_task(refresh())

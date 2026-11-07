@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
-from ..accounts.usage import usage_json
+from ..accounts.usage import UsageState, usage_json
 from ..core.session import account_home
 from ..providers.factory import build_backend
 from .protocol import ProtocolError
@@ -38,7 +38,10 @@ async def migrate(home: Path) -> tuple[str, ...]:
     return await asyncio.to_thread(AccountStore(account_home(home)).migrate)
 
 
-async def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
+async def list_accounts(
+    runtime: ServerRuntime,
+    refreshed: dict[AccountId, UsageState] | None = None,
+) -> dict[str, object]:
     context = getattr(runtime.loop, "account_context", None)
     if context is None:
         raise ProtocolError(-32005, "accounts unavailable for this session")
@@ -51,7 +54,9 @@ async def list_accounts(runtime: ServerRuntime) -> dict[str, object]:
                 "detail": item.detail,
                 "current": snapshot.selected.get(item.account.provider) == item.account,
                 "default": snapshot.defaults.get(item.account.provider) == item.account,
-                "usage": usage_json(item.usage),
+                "usage": usage_json(
+                    refreshed.get(item.account, item.usage) if refreshed else item.usage
+                ),
             }
             for item in snapshot.displays
         ]
@@ -115,9 +120,9 @@ async def request(
 
 
 async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
-    await asyncio.to_thread(
+    refreshed = await asyncio.to_thread(
         lambda: asyncio.run(
             AccountUsage(runtime.loop.account_context.store).refresh_stale()
         )
     )
-    return await list_accounts(runtime)
+    return await list_accounts(runtime, refreshed)
