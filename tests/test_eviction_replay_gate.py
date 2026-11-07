@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) -> None:
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--artifact-dir", str(tmp_path / "artifacts")],
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--keep-private-artifacts", str(tmp_path / "artifacts")],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -24,6 +24,26 @@ def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) 
         "readback.json": "3715866d9380bbe995e8f913b4f09f06d886274fea368d891fb9fde6fe2c7c93",
     }
     assert {key: record["records"][0]["digests"][key] for key in expected} == expected
+
+
+def test_fixture_replay_removes_private_artifacts_by_default(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+        env={**__import__("os").environ, "TMPDIR": str(tmp_path)},
+    )
+    assert "artifact_dir" not in json.loads(result.stdout.strip())
+    assert not list(tmp_path.glob("eviction-artifacts-*"))
+    assert not list(tmp_path.glob("eviction-gate-*"))
+
+
+def test_fixture_replay_keeps_private_artifacts_when_opted_in(tmp_path: Path) -> None:
+    artifacts = tmp_path / "kept"
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--keep-private-artifacts", str(artifacts)],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    assert list(artifacts.rglob("context.json"))
 
 
 def test_fixture_compare_same_ref(tmp_path: Path) -> None:
@@ -100,7 +120,7 @@ def test_fixture_compare_rejects_retained_floor_limit_change(tmp_path: Path) -> 
 def test_fixture_replay_fails_when_stability_cap_is_not_reached(tmp_path: Path) -> None:
     head = _mutated_ref(tmp_path, [("for invocation in range(1, 9):", "for invocation in range(1, 2):") ])
     result = subprocess.run(
-        [sys.executable, str(head / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--artifact-dir", str(tmp_path / "artifacts")],
+        [sys.executable, str(head / "scripts/eviction_replay_gate.py"), "run", "--fixture", "--keep-private-artifacts", str(tmp_path / "artifacts")],
         cwd=ROOT, check=False, capture_output=True, text=True,
         env={**__import__("os").environ, "PYTHONPATH": str(head / "src")},
     )

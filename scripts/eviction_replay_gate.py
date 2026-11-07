@@ -145,28 +145,38 @@ def _production_limits() -> dict[str, int]:
     }
 
 
-def _floor_metrics(rows: list[dict[str, Any]], limits: dict[str, int], source: str, violations: list[str] | None = None) -> list[dict[str, int]]:
+def _measure_floor(row: dict[str, Any]) -> dict[str, int] | None:
     from zeta.context_accounting import message_token_count
     from zeta.context_eviction._fact_floor import render_fact_floor, validate_fact_floor
 
+    floor = row.get("data", {}).get("fact_floor")
+    if floor is None:
+        return None
+    if not validate_fact_floor(floor):
+        raise ValueError(f"seq={row.get('seq')} invalid")
+    assert isinstance(floor, dict)
+    rendered = render_fact_floor(floor)
+    return {
+        "oldest": len(floor["oldest"]),
+        "newest": len(floor["newest"]),
+        "chars": len(rendered.content[0].text) if rendered else 0,
+        "tokens": message_token_count(rendered) if rendered else 0,
+    }
+
+
+def _floor_metrics(rows: list[dict[str, Any]], limits: dict[str, int], source: str, violations: list[str] | None = None) -> list[dict[str, int]]:
     metrics: list[dict[str, int]] = []
     for row in rows:
-        floor = row.get("data", {}).get("fact_floor")
-        if floor is None:
-            continue
-        if not validate_fact_floor(floor):
-            detail = f"seq={row.get('seq')} invalid"
+        try:
+            metric = _measure_floor(row)
+        except ValueError as error:
+            detail = str(error)
             if violations is not None:
                 violations.append(detail)
                 continue
-            raise RuntimeError(f"retained-floor bound check failed ({source}): {detail}")
-        assert isinstance(floor, dict)
-        oldest = floor["oldest"]
-        newest = floor["newest"]
-        rendered = render_fact_floor(floor)
-        chars = len(rendered.content[0].text) if rendered else 0
-        tokens = message_token_count(rendered) if rendered else 0
-        metric = {"oldest": len(oldest), "newest": len(newest), "chars": chars, "tokens": tokens}
+            raise RuntimeError(f"retained-floor bound check failed ({source}): {detail}") from error
+        if metric is None:
+            continue
         if any(metric[key] > limits[key] for key in metric):
             detail = (f"seq={row.get('seq')} oldest={metric['oldest']} newest={metric['newest']} "
                       f"chars={metric['chars']} tokens={metric['tokens']}")
@@ -264,24 +274,33 @@ def run(args: argparse.Namespace) -> int:
         shutil.copy2(Path.home() / ".zeta" / "storage-format.json", manifest)
         meta = json.loads((session_dir / "meta.json").read_text())
         budget, tail, provider = int(meta.get("compaction_budget", 400_000)), int(meta.get("retained_tail", 8)), str(meta.get("provider", "anthropic"))
-    artifact_dir = Path(args.artifact_dir or tempfile.mkdtemp(prefix="eviction-artifacts-"))
+    artifact_temporary = None
+    if args.keep_private_artifacts:
+        artifact_dir = Path(args.keep_private_artifacts).expanduser()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        print(f"warning: keeping private replay artifacts in {artifact_dir}", file=sys.stderr)
+    else:
+        artifact_temporary = tempfile.TemporaryDirectory(prefix="eviction-artifacts-")
+        artifact_dir = Path(artifact_temporary.name)
     started = time.monotonic()
     try:
         records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), 600))
         import zeta
-        record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "limits": _production_limits(), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3), "artifact_dir": str(artifact_dir)}
+        record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "limits": _production_limits(), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3)}
         print(json.dumps(record, sort_keys=True, separators=(",", ":")))
         return 0
     finally:
+        if artifact_temporary is not None:
+            artifact_temporary.cleanup()
         temporary.cleanup()
 
 
-def _run_side(session: str, label: str, worktree: str, fixture: bool, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
-    artifact_dir = Path(tempfile.mkdtemp(prefix=f"eviction-{label}-"))
+def _run_side(session: str, label: str, worktree: str, fixture: bool, artifact_dir: Path, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
     runner = Path(worktree) / "scripts/eviction_replay_gate.py"
     if not runner.exists():
         runner = Path(__file__).resolve()
-    command = [sys.executable, str(runner), "run", "--artifact-dir", str(artifact_dir)]
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(runner), "run", "--keep-private-artifacts", str(artifact_dir)]
     environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
     if limits is not None:
         command.extend(["--limits-json", json.dumps(limits, sort_keys=True)])
@@ -325,16 +344,18 @@ def compare(args: argparse.Namespace) -> int:
     manifest: dict[str, Any] = {"phase": "compare", "sessions": []}
     sessions = ["fixture"] if args.fixture else args.session
     for session in sessions:
-        base = _run_side(session, "base", args.base, args.fixture)
-        head = _run_side(session, "head", args.head, args.fixture, base["record"]["limits"] if base else None)
-        if base is None or head is None:
-            return 1
-        failure = _compare_artifacts(session, base, head)
-        if failure:
-            print(f"FAIL {session}: {failure}", file=sys.stderr)
-            return 1
-        manifest["sessions"].append({"session": session, "base": base["record"], "head": head["record"], "status": "PASS"})
-        print(f"PASS {session} {base['record']['elapsed_seconds']}s/{head['record']['elapsed_seconds']}s")
+        with tempfile.TemporaryDirectory(prefix="eviction-compare-") as scratch:
+            scratch_path = Path(scratch)
+            base = _run_side(session, "base", args.base, args.fixture, scratch_path / "base")
+            head = _run_side(session, "head", args.head, args.fixture, scratch_path / "head", base["record"]["limits"] if base else None)
+            if base is None or head is None:
+                return 1
+            failure = _compare_artifacts(session, base, head)
+            if failure:
+                print(f"FAIL {session}: {failure}", file=sys.stderr)
+                return 1
+            manifest["sessions"].append({"session": session, "base": base["record"], "head": head["record"], "status": "PASS"})
+            print(f"PASS {session} {base['record']['elapsed_seconds']}s/{head['record']['elapsed_seconds']}s")
     out.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     print(f"PASS manifest={out}")
     return 0
@@ -346,7 +367,7 @@ def main() -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--session")
     run_parser.add_argument("--fixture", action="store_true")
-    run_parser.add_argument("--artifact-dir")
+    run_parser.add_argument("--keep-private-artifacts")
     run_parser.add_argument("--limits-json")
     run_parser.set_defaults(func=run)
     compare_parser = sub.add_parser("compare")
