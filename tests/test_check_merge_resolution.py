@@ -352,7 +352,7 @@ def test_parent_selection_table(
             else "merge",
         )
     args: tuple[str, ...] = ()
-    if shape in {"both", "wrong"}:
+    if shape == "both":
         subprocess.run(
             ["git", "checkout", "-qb", "later", f"{merge}^1^"], cwd=r, check=True
         )
@@ -382,7 +382,11 @@ def test_parent_selection_table(
     result = run(r, merge, *args)
     if refusal:
         assert result.returncode == 2
-        assert "cannot identify exactly one main parent" in result.stderr
+        if shape == "wrong":
+            assert f"disagrees with the identified main parent {p2}" in result.stderr
+            assert "main parent:" not in result.stdout
+        else:
+            assert "cannot identify exactly one main parent" in result.stderr
     else:
         assert result.returncode == 1
         chosen = (p1, p2)[expected]
