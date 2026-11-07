@@ -70,7 +70,7 @@ class _ResumableNotificationHandler(BaseHTTPRequestHandler):
             self.wfile.write(self._event("event-1", "notifications/first"))
             self.wfile.flush()
             type(self).second_stream_open.set()
-            type(self).close_second_stream.wait(timeout=2)
+            type(self).close_second_stream.wait()
             return
         self._stream_or_stop(
             self._event("event-2", "notifications/second") if get_number == 3 else None
@@ -135,7 +135,7 @@ def resumable_notification_server(monkeypatch: pytest.MonkeyPatch):
         _ResumableNotificationHandler.close_second_stream.set()
         server.shutdown()
         server.server_close()
-        thread.join(timeout=2)
+        thread.join()
 
 
 async def _notification_methods(url: str, expected: int) -> list[str]:
