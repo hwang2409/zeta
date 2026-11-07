@@ -106,6 +106,7 @@ from .empty_turn import (
     EmptyTurnRecoveryState,
     build_nudge_message,
     build_tool_limit_recovery_message,
+    complete_empty_turn,
     empty_turn_recovery_error,
     output_limit_error,
     read_turn_metadata,
@@ -1185,23 +1186,20 @@ class AgentLoop(
                 )
                 recovery_state = transition.recovery_state
                 nudge_turn_pending = transition.nudge_turn_pending
-                if transition.error is not None:
-                    yield StreamEvent(StreamEventType.ERROR, error=transition.error)
-                    if self.agent_instance_id is None:
-                        await step_delivery.admit_terminal("foreground_end")
-                    yield StreamEvent(StreamEventType.AGENT_END)
-                    return
-                yield StreamEvent(
-                    StreamEventType.TURN_END,
-                    message=assistant_message,
-                    data={"turn": turn_number, "tool_calls": 0},
+                events, done = await complete_empty_turn(
+                    transition,
+                    assistant_message,
+                    turn_number,
+                    foreground=self.agent_instance_id is None,
+                    admit_terminal=step_delivery.admit_terminal,
+                    schedule_index=self._schedule_transcript_index,
                 )
+                for event in events:
+                    yield event
                 consuming_notifications = transition.consuming_notifications
-                if transition.continue_turn:
-                    continue
-                self._schedule_transcript_index()
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+                if done:
+                    return
+                continue
             dispatch = dispatch_tool_calls(
                 self,
                 calls,

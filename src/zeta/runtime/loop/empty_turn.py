@@ -16,6 +16,8 @@ from typing import Any
 from ...protocol.types import (
     ErrorInfo,
     Message,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolUseContent,
     harness_notice,
@@ -53,6 +55,36 @@ class EmptyTurnRecoveryState:
         self.last_tool_call = tool_call
         self.last_tool_result = tool_result
         self.tool_result_episode += 1
+
+
+async def complete_empty_turn(
+    transition: Any,
+    assistant_message: Message,
+    turn_number: int,
+    *,
+    foreground: bool,
+    admit_terminal: Any,
+    schedule_index: Any,
+) -> tuple[tuple[Any, ...], bool]:
+    if transition.error is not None:
+        if foreground:
+            await admit_terminal("foreground_end")
+        return (
+            (
+                StreamEvent(StreamEventType.ERROR, error=transition.error),
+                StreamEvent(StreamEventType.AGENT_END),
+            ),
+            True,
+        )
+    turn_end = StreamEvent(
+        StreamEventType.TURN_END,
+        message=assistant_message,
+        data={"turn": turn_number, "tool_calls": 0},
+    )
+    if transition.continue_turn:
+        return (turn_end,), False
+    schedule_index()
+    return (turn_end, "agent_end"), True
 
 
 def _bounded_detail(value: str) -> str:
