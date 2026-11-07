@@ -710,6 +710,13 @@ class AgentLoop(
             recovery_state=recovery_state,
             error=error,
         )
+    @staticmethod
+    def _record_recovery_event(
+        recovery_state: EmptyTurnRecoveryState, event: StreamEvent
+    ) -> None:
+        if event.type is StreamEventType.TOOL_EXECUTION_END:
+            recovery_state.record_tool_result(event.tool_call, event.tool_result)
+
     async def _handle_toolless_turn(
         self,
         step_delivery: StepDeliveryFlow,
@@ -1243,10 +1250,7 @@ class AgentLoop(
             )
             try:
                 async for event in dispatch:
-                    if event.type is StreamEventType.TOOL_EXECUTION_END:
-                        recovery_state.last_tool_call = event.tool_call
-                        recovery_state.last_tool_result = event.tool_result
-                        recovery_state.tool_result_episode += 1
+                    self._record_recovery_event(recovery_state, event)
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is durable before dispatch starts. If

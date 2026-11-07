@@ -49,6 +49,11 @@ class EmptyTurnRecoveryState:
     last_tool_call: Any = None
     last_tool_result: Any = None
 
+    def record_tool_result(self, tool_call: Any, tool_result: Any) -> None:
+        self.last_tool_call = tool_call
+        self.last_tool_result = tool_result
+        self.tool_result_episode += 1
+
 
 def _bounded_detail(value: str) -> str:
     return value[:MAX_EMPTY_TURN_DETAIL_CHARS]
