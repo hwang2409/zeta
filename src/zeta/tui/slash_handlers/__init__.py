@@ -29,12 +29,7 @@ from ...core.session import (
     normalize_session_name,
     persist_metadata_change,
 )
-from ...core.slash import (
-    MODEL_CONTEXT_WINDOWS,
-    SlashStatus,
-    compaction_history,
-)
-from ...core.todo import todo_count_tuple
+from ...core.slash import SlashStatus
 from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
@@ -42,6 +37,7 @@ from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import MessageOrigin, StreamEvent, StreamEventType
 from ...providers.factory import build_backend
+from ...runtime.status import build_slash_status, capture_slash_status
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -105,15 +101,9 @@ class SlashHandlerMixin:
         await controller.resolve_approval(decision, requested_key, always=always)
 
     def slash_status(self) -> SlashStatus:
-        context_assembler = self.loop.context_assembler
-        child_usage = context_assembler.descendant_usage
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
-        )
-        items = self.loop.store.todo_items()
-        compaction_history_data = compaction_history(
-            self.loop.store.replay(), context_assembler.token_counter
         )
         viewed_path = self._viewed_session_path()
         if viewed_path == self.loop.store.session_dir:
@@ -125,50 +115,21 @@ class SlashHandlerMixin:
             viewed_health = (
                 viewed_loop.project_context_health if viewed_loop is not None else None
             )
-        return SlashStatus(
-            session_id=self.loop.store.session_id,
-            provider=self.provider,
-            model=self.model,
-            retained_tail=context_assembler.retained_tail,
-            tokens_used_this_session=context_assembler.tokens_used_this_session,
-            tokens_in_current_context=context_assembler.token_count,
-            compaction_marker_count=self.loop.store.compaction_marker_count(),
-            pending_approvals=pending,
-            checkpoint_count=self.loop.store.checkpoint_count(),
-            cache_read_input_tokens=context_assembler.cache_read_input_tokens_this_session,
-            cache_creation_input_tokens=context_assembler.cache_creation_input_tokens_this_session,
-            uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
-            output_tokens_this_session=context_assembler.output_tokens_this_session,
-            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage[
-                "cache_creation_input_tokens"
-            ],
-            child_uncached_input_tokens=child_usage["input_tokens"],
-            child_output_tokens_this_session=child_usage["output_tokens"],
-            context_files=self._context_files,
-            vim_mode=self.vim_mode,
-            plan_mode=self.loop.plan_mode,
-            hooks=(() if self._hooks is None else self._hooks.status_entries),
-            todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=self._usage_tracker.history,
-            usage_cost_by_model=self._usage_tracker.cost_by_model,
-            compaction_history=compaction_history_data,
-            model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
-            mcp_summary=self.loop.mcp_summary,
-            explicit_finish=self.loop.explicit_finish,
-            connection_setup_counts=self.loop.connection_setup_counts(),
-            max_agent_depth=self.loop.max_agent_depth,
-            automatic_memory_failure=(
-                self.loop.memory_reconciler.automatic_memory_status
-                if self.loop.memory_reconciler is not None
-                else None
-            ),
-            transcript_index_failure=self.loop.transcript_index_failure(
-                viewed_path.name
-            ),
-            project_context_health=(
-                viewed_health.summary if viewed_health is not None else None
-            ),
+        return build_slash_status(
+            capture_slash_status(
+                self.loop,
+                session_id=self.loop.store.session_id,
+                provider=self.provider,
+                model=self.model,
+                context_files=self._context_files,
+                vim_mode=self.vim_mode,
+                pending_approvals=pending,
+                usage_tracker=self._usage_tracker,
+                project_context_health=(
+                    viewed_health.summary if viewed_health is not None else None
+                ),
+                transcript_session_id=viewed_path.name,
+            )
         )
 
     def model_choices(self) -> tuple[str, ...]:
