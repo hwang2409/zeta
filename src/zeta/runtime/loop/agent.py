@@ -392,7 +392,6 @@ class AgentLoop(
         tool_result. Callers must pass a durable USER-role message.
         """
         self.store.queue_client_steering(message)
-
     @property
     def has_pending_steering(self) -> bool:
         return self.store.has_pending_client_steering
