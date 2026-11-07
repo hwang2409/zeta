@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
+from ..permissions import SessionGrantChange, session_grant_change
 from ..protocol.types import (
     ErrorInfo,
     Message,
@@ -17,7 +18,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
-from . import abort_scope, event_contract, model_selection
+from . import abort_scope, event_contract, model_selection, session_grants
 from .approval_lifecycle import (
     ApprovalKey,
     ApprovalLifecycle,
@@ -328,12 +329,19 @@ class ServeControl:
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
-        if loop is None:
+        policy = self.server.runtime.policy
+        if loop is None or policy is None:
             raise ProtocolError(-32003, "no active session")
+        grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
         assert isinstance(result, dict)
+        added = tuple(sorted(map(str, policy.session_allow - grants_before)))
+        if added:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "grant", added)
+            )
         if (
             not self.turn_busy()
             and isinstance(core_key, str)
@@ -346,6 +354,27 @@ class ServeControl:
                 self._resume_tool(core_key, host_commands)
             )
         return result
+
+    async def publish_session_grant_change(
+        self, change: SessionGrantChange
+    ) -> None:
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is None or session_id is None:
+            return
+        await connections.publish_feature_event(
+            session_grants.FEATURE,
+            session_grants.EVENT,
+            session_id,
+            data=session_grants.event_data(change, session_id),
+        )
+
+    async def publish_session_grant_reset(self) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "reset")
+            )
 
     def request_approval_abort(
         self,

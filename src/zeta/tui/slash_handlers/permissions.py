@@ -6,6 +6,23 @@ from pathlib import Path
 
 from ...config.tool_policy import ToolPolicy
 from ...core.approval import ApprovalPolicy
+from ...permissions import (
+    PermissionSnapshot,
+    SessionGrantChange,
+    SessionGrantNotFound,
+    permission_snapshot,
+    revoke_session_grants,
+)
+
+
+def format_session_grant_change(change: SessionGrantChange) -> str:
+    if change.change == "grant":
+        return f"permissions · session grant added: {', '.join(change.changed)}"
+    if change.change == "revoke":
+        return f"permissions · session grant revoked: {', '.join(change.changed)}"
+    if change.change == "clear":
+        return f"permissions · session grants cleared: {', '.join(change.changed)}"
+    return ""
 
 
 def revoke_permissions(policy: ApprovalPolicy | None, args: str) -> str:
@@ -17,30 +34,26 @@ def revoke_permissions(policy: ApprovalPolicy | None, args: str) -> str:
     if policy is None:
         return "permissions · no approval policy is attached"
     if parts == ["clear"]:
-        removed = policy.clear_session_allow()
-        if not removed:
+        change = revoke_session_grants(policy, clear=True)
+        if not change.changed:
             return "permissions · no session grants to clear"
     else:
         target = parts[1]
-        rule = next(
-            (rule for rule in policy.session_allow if str(rule) == target), None
-        )
-        if rule is None:
+        try:
+            change = revoke_session_grants(policy, exact=target)
+        except SessionGrantNotFound:
             return (
                 f"permissions · no session grant matches {target!r}; "
                 "use /permissions to list exact grants"
             )
-        policy.revoke_session_allow(rule)
-        removed = frozenset({rule})
+    snapshot = change.snapshot
     return "\n".join(
         [
-            "permissions · revoked session grants: "
-            + ", ".join(sorted(map(str, removed))),
-            "Remaining allow rules: "
-            + (", ".join(sorted(map(str, policy.always_allow))) or "none"),
-            f"Default: {policy.default.value}; deny > ask > allow > default still applies.",
+            format_session_grant_change(change),
+            "Remaining allow rules: " + (", ".join(snapshot.allow) or "none"),
+            f"Default: {snapshot.default.value}; {' > '.join(snapshot.precedence)} still applies.",
             "Remaining allow rules or default allow can still permit calls; revocation adds no deny rule.",
-            "Applies to future calls. Pending approvals and already authorized calls are unchanged.",
+            "Applies to future parent and delegated-child calls. Pending approvals and already authorized calls are unchanged.",
         ]
     )
 
@@ -56,25 +69,8 @@ def format_permissions(
     if policy is None:
         lines.append("Approval policy: none attached")
     else:
-        lines.extend(
-            [
-                f"Default: {policy.default.value}",
-                "Rule precedence: deny > ask > allow > default",
-                "The default applies to calls requiring approval; some tools/actions are exempt.",
-                "--yolo sets the default to allow; --no-yolo sets it to ask.",
-                "Explicit rules still apply in either mode.",
-            ]
-        )
-        for label, rules in (
-            ("Deny rules", policy.always_deny),
-            ("Ask rules", policy.always_ask),
-            ("Allow rules (including session grants)", policy.always_allow),
-            ("Session grants (/always)", policy.session_allow),
-        ):
-            lines.append(f"{label}:")
-            lines.extend(f"  {rule}" for rule in sorted(map(str, rules)))
-            if not rules:
-                lines.append("  none")
+        snapshot = permission_snapshot(policy)
+        lines.extend(_format_policy(snapshot))
         if policy.notices:
             lines.append("Ignored approval rules:")
             lines.extend(f"  {notice}" for notice in policy.notices)
@@ -84,7 +80,8 @@ def format_permissions(
             "/approve [key] allows one request; /deny [key] denies it.",
             "/always [key] grants the entire tool or resolved action, with any arguments.",
             "For example: bash permits any command; inbox(send) permits sending to any project.",
-            "Session grants still lose to deny/ask rules and reset when the session is reopened.",
+            "Session grants apply to future parent and delegated-child calls, still lose to deny/ask rules, and reset when the session is reopened.",
+            "Delegated approvals cannot create session grants.",
             "Revoke one: /permissions revoke <exact grant> (for example, bash or inbox(send)).",
             "Revoke all session grants: /permissions clear. Configured rules remain unchanged.",
             f"Persistent approval rules: {settings_path} [approval] allow / deny / ask.",
@@ -108,3 +105,24 @@ def format_permissions(
         ]
     )
     return "\n".join(lines)
+
+
+def _format_policy(snapshot: PermissionSnapshot) -> list[str]:
+    lines = [
+        f"Default: {snapshot.default.value}",
+        f"Rule precedence: {' > '.join(snapshot.precedence)}",
+        "The default applies to calls requiring approval; some tools/actions are exempt.",
+        "--yolo sets the default to allow; --no-yolo sets it to ask.",
+        "Explicit rules still apply in either mode.",
+    ]
+    for label, rules in (
+        ("Deny rules", snapshot.deny),
+        ("Ask rules", snapshot.ask),
+        ("Allow rules (including session grants)", snapshot.allow),
+        ("Session grants (/always)", snapshot.session_grants),
+    ):
+        lines.append(f"{label}:")
+        lines.extend(f"  {rule}" for rule in rules)
+        if not rules:
+            lines.append("  none")
+    return lines

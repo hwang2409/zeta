@@ -34,6 +34,7 @@ FEATURES = (
     "session_host_commands",
     "session_history_fidelity",
     "content_read",
+    "session_grants",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128

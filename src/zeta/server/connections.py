@@ -13,7 +13,7 @@ from .protocol import FrameWriteCancelled, ProtocolError
 
 OBSERVER_REQUESTS = frozenset({
     "list_sessions", "status", "session_tree", "session_history", "content_read",
-    "model_catalog", "session_settings", "ping", "delivery_status",
+    "model_catalog", "session_settings", "ping", "delivery_status", "session_grants",
 })
 OBSERVER_READ_ONLY_CODE = "observer_read_only"
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
@@ -201,6 +201,31 @@ class ConnectionRegistry:
         if output.phase != "ready":
             return False
         return await self._send_frame(output, frame)
+
+    async def publish_feature_event(
+        self,
+        feature: str,
+        event: str,
+        session_id: str,
+        *,
+        data: dict[str, object],
+    ) -> None:
+        """Queue one live event for every connection that negotiated a feature."""
+
+        states = tuple(
+            state
+            for state in (self._controller, *self._observers)
+            if state is not None and feature in state.features
+        )
+        await asyncio.gather(
+            *(
+                self.send(
+                    state.connection,
+                    state.connection.codec.notification(event, session_id, data=data),
+                )
+                for state in states
+            )
+        )
 
     def release(self, connection: Any) -> None:
         state = self._connections.pop(connection, None)

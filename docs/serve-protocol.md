@@ -578,6 +578,62 @@ loaded session remains unhealthy and rejects later mutations with `-32000`. If
 an authoritative read finds that the requested decision was durable despite
 the write error, the server completes it once as a normal success.
 
+### session grants (`session_grants` feature)
+
+A client that negotiates `session_grants` can inspect the active approval
+policy and remove session-only grants created by `approve` with
+`scope: "always_tool"`. `ApprovalPolicy` remains the only authority. These
+requests only project or mutate that policy; they do not add a second grant
+store. `/permissions` remains a local TUI command and is not exposed through
+`slash_run`.
+
+`session_grants` takes no params and requires an active session. It returns:
+
+```json
+{
+  "session_id": "abc123",
+  "default": "ask",
+  "precedence": ["deny", "ask", "allow", "default"],
+  "rules": {
+    "deny": ["bash(rm *)"],
+    "ask": ["bash(git push*)"],
+    "allow": ["bash"]
+  },
+  "session_grants": ["bash"]
+}
+```
+
+All rule arrays contain canonical strings in sorted order. `rules.allow` is
+the effective union of configured allow rules and session grants;
+`session_grants` isolates only the removable session entries. The response is
+a fresh projection, so a replacement controller or a reconnected observer
+must read it again instead of reusing a client cache.
+
+`revoke_session_grants` is controller-only. Params are exactly one of
+`{"grant":"<exact canonical string>"}` or `{"clear":true}`. A grant string
+is matched exactly against the current canonical strings; it is never parsed
+into new authority. The response is `removed` plus a fresh snapshot under
+`grants`. Clearing an already-empty set succeeds with `removed: []` and does
+not emit an event. A missing exact grant returns `-32602` with data
+`{"code":"session_grant_not_found","grant":"..."}`. Any other params return
+`-32602` with data `{"code":"invalid_session_grants_revoke"}`. Params on the
+read request return `-32602` with data
+`{"code":"invalid_session_grants_params"}`. Without the negotiated feature,
+both requests return `-32601`; without an active session they return `-32003`.
+An observer can call `session_grants`, but mutation returns the existing
+`-32008` `observer_read_only` error.
+
+A real grant, revoke, clear, or session reset emits `session_grants_changed`
+to every live connection that negotiated the feature. Its data is
+`change` (`grant`, `revoke`, `clear`, or `reset`), sorted `changed` strings,
+and a fresh snapshot under `grants`. Duplicate grants, missing-grant errors,
+and empty clears emit no event. The event is queued before the matching
+request response. Session grants authorize future parent and delegated-child
+calls through the same policy; revocation affects future calls from both,
+while pending or already authorized calls are unchanged. A controller handoff
+or observer reconnect gets no replay: the client reads `session_grants` for
+the current state.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -1313,6 +1369,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
+| `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
@@ -1336,7 +1393,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

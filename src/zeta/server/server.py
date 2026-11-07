@@ -18,6 +18,7 @@ from . import (
     ergonomics,
     login,
     model_selection,
+    session_grants,
     slash_commands,
 )
 from .connections import ConnectionRegistry
@@ -50,6 +51,7 @@ LOADED_SESSION_MUTATIONS = frozenset(
         "deny",
         "fork_message",
         "rename_session",
+        "revoke_session_grants",
         "send",
         "send_images",
         "set_compaction",
@@ -516,6 +518,7 @@ class _Client:
                 self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
+                await self.server.control.publish_session_grant_reset()
                 return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
@@ -561,12 +564,24 @@ class _Client:
                 self.server.control.session_replaced()
                 self.server.control.clear_approvals()
                 await self.server.control.controller_ready()
+                await self.server.control.publish_session_grant_reset()
                 return {"session": self._session_snapshot()}
             except BaseException:
                 if self.server.runtime.state is None:
                     self.server.control._active_host_commands = None
                     self.server.control._host_binding_required = False
                 raise
+        if method in {session_grants.READ, session_grants.REVOKE}:
+            session_grants.require_feature(self.features)
+            runtime = self.server.runtime
+            if method == session_grants.READ:
+                return session_grants.read(runtime.policy, runtime.session_id, params)
+            result, change = session_grants.revoke(
+                runtime.policy, runtime.session_id, params
+            )
+            if change.changed:
+                await self.server.control.publish_session_grant_change(change)
+            return result
         if method == "send":
             return await self.server.control.deliveries.send(params, self.features)
         if method == "steer":
@@ -658,6 +673,8 @@ class _Client:
                 requests.append("clear_steering")
             if "delivery_id" in self.features:
                 requests.append("delivery_status")
+            if session_grants.FEATURE in self.features:
+                requests += [session_grants.READ, session_grants.REVOKE]
         requests = self.server.connections.requests_for_role(role, requests)
         capabilities: dict[str, object] = {
             "requests": requests,
