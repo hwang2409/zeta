@@ -303,6 +303,7 @@ async def test_runtime_reports_backend_close_failure(
     def report(error: BaseException, *, stage: str, provider: str, **_kwargs) -> None:
         reports.append((error, stage, provider))
 
+    # test-contract: seam capture the p26 reporter handoff without filesystem polling
     monkeypatch.setattr(agent_loop_module, "_schedule_cleanup_failure", report)
     loop = AgentLoop(
         backend,

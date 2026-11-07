@@ -8583,6 +8583,33 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
+def test_rebuild_renders_closed_turn_end_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    replay = tuple(
+        SimpleNamespace(
+            type="turn_end", data={"turn_id": "0" * 32, "reason": reason}, id=reason
+        )
+        for reason in ("user_stop", "completed", "error", "disconnect")
+    )
+    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "turn stopped by the user" in rendered
+    assert "turn ended with an error" in rendered
+    assert "turn ended when the controller disconnected" in rendered
+    assert "completed" not in rendered
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
