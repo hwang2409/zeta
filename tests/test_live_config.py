@@ -610,7 +610,7 @@ async def test_many_live_changes_stay_bounded_on_tui_and_serve_paths(
     tmp_path: Path,
 ) -> None:
     from zeta.server.event_contract import config_changed_wire_fields
-    from zeta.server.protocol import MAX_FRAME_BYTES, FrameCodec
+    from zeta.server.protocol import MAX_FRAME_BYTES, EventDescriptor, FrameCodec
 
     loop, home, _project = _loop(tmp_path)
     events: list[StreamEvent] = []
@@ -639,7 +639,9 @@ async def test_many_live_changes_stay_bounded_on_tui_and_serve_paths(
     assert rendered.plain.count("and 107 more") == 2
 
     encoded = FrameCodec().notification(
-        "config_changed", "session-1", **config_changed_wire_fields(events[0])
+        EventDescriptor.CONFIG_CHANGED,
+        "session-1",
+        **config_changed_wire_fields(events[0]),
     )
     frame = json.loads(encoded)
     assert len(encoded) < MAX_FRAME_BYTES
@@ -668,7 +670,7 @@ async def test_added_profile_is_detected_with_unchanged_parent_stat(
 @pytest.mark.asyncio
 async def test_config_changed_projection_is_byte_exact(tmp_path: Path) -> None:
     from zeta.server import event_contract
-    from zeta.server.protocol import FrameCodec
+    from zeta.server.protocol import EventDescriptor, FrameCodec
 
     loop, home, _project = _loop(tmp_path)
     events: list[StreamEvent] = []
@@ -684,7 +686,7 @@ async def test_config_changed_projection_is_byte_exact(tmp_path: Path) -> None:
         lambda event: {"data": dict(event.data)},
     )
     encoded = FrameCodec().notification(
-        "config_changed", "session-1", **projector(events[0])
+        EventDescriptor.CONFIG_CHANGED, "session-1", **projector(events[0])
     )
     expected = (
         '{"jsonrpc":"2.0","method":"event","params":'
