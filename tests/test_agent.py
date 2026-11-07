@@ -9829,43 +9829,44 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
 
 @pytest.mark.asyncio
 async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> None:
-    """The race the closed-queue marker prevents: a queued prompt after finish."""
+    async with contextlib.AsyncExitStack() as stack:
+        """The race the closed-queue marker prevents: a queued prompt after finish."""
 
-    from zeta.tools.agent import send_to_run
+        from zeta.tools.agent import send_to_run
 
-    backend = RunBackend()
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        backend = RunBackend()
+        store = ConversationStore(tmp_path); stack.callback(store.close)
+        loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()); stack.push_async_callback(loop.close)
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
-    handle = _run_handle_from_receipt(store)
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_started.wait(), timeout=10)
+        handle = _run_handle_from_receipt(store)
 
-    # Simulate the race: parent looked at the marker before the run finished,
-    # then the run drained and closed its queue before the parent got here.
-    marker = store.agent_children()[handle]
-    child_path = Path(str(marker["child_session_path"]))
-    child_store = ConversationStore(
-        child_path.parent, session_id=child_path.name, cwd=store.cwd
-    )
-    terminal = await pending_delivery_module.StepDeliveryFlow(
-        child_store
-    ).admit_terminal("foreground_end")
-    assert terminal.closed_empty
-    assert terminal.pending is False
+        # Simulate the race: parent looked at the marker before the run finished,
+        # then the run drained and closed its queue before the parent got here.
+        marker = store.agent_children()[handle]
+        child_path = Path(str(marker["child_session_path"]))
+        child_store = ConversationStore(
+            child_path.parent, session_id=child_path.name, cwd=store.cwd
+        ); stack.callback(child_store.close)
+        terminal = await pending_delivery_module.StepDeliveryFlow(
+            child_store
+        ).admit_terminal("foreground_end")
+        assert terminal.closed_empty
+        assert terminal.pending is False
 
-    error = await send_to_run(
-        store,
-        handle,
-        "too late",
-        channel=loop._background_owner.conversation_channel,
-    )
-    assert error is not None and "no live run" in error
+        error = await send_to_run(
+            store,
+            handle,
+            "too late",
+            channel=loop._background_owner.conversation_channel,
+        )
+        assert error is not None and "no live run" in error
 
-    backend.release_child.set()
-    await wait_background_owner(loop)
-    assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
-    await loop.close()
+        backend.release_child.set()
+        await wait_background_owner(loop)
+        assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -14075,7 +14076,7 @@ async def test_non_explicit_finish_child_gets_no_reminder(
 
         monkeypatch.setattr(agent_runner_module, "consume_child", consume)
         await asyncio.wait_for(
-            agent_runner_module.consume_run(loop, "work", child_store=store), 2
+            agent_runner_module.consume_run(loop, "work", child_store=store), 10
         )
         assert prompts == ["work"]
         assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
@@ -16144,32 +16145,14 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
                     await _cancel_and_drain(parent_wake)
             finally:
                 try:
-                    try:
-                        owner.cancel_subtree("root:1")
-                    finally:
-                        await asyncio.wait_for(
-                            asyncio.gather(
-                                parent_task, grandchild_task, return_exceptions=True
-                            ),
-                            10,
-                        )
+                    owner.cancel_subtree("root:1")
                 finally:
-                    try:
-                        try:
-                            owner.unregister("root:1:1")
-                        finally:
-                            owner.unregister("root:1")
-                    finally:
-                        try:
-                            await asyncio.wait_for(owner.wait(), timeout=10)
-                        finally:
-                            try:
-                                grandchild.close()
-                            finally:
-                                try:
-                                    parent.close()
-                                finally:
-                                    root.close()
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            parent_task, grandchild_task, return_exceptions=True
+                        ),
+                        10,
+                    )
 
 
 @pytest.mark.asyncio

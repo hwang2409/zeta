@@ -181,17 +181,13 @@ async def test_live_live_config_ignores_user_skill_marker_and_replaces_owned_ind
         ); stack.push_async_callback(loop.close)
         _install_live_skill(home)
 
-        try:
-            await loop.refresh_live_config()
-            updated = loop._runtime_prompt
-            text = "".join(
-                block.text
-                for block in updated.system_prompt.content
-                if isinstance(block, TextContent)
-            )
-        finally:
-            await loop.close()
-            loop.store.close()
+        await loop.refresh_live_config()
+        updated = loop._runtime_prompt
+        text = "".join(
+            block.text
+            for block in updated.system_prompt.content
+            if isinstance(block, TextContent)
+        )
 
         assert user_block in text
         assert "live description" in text
@@ -238,34 +234,18 @@ async def test_live_live_config_discards_stale_plan_prompt(
 
         loop._live_config_watcher.prepare = paused_prepare
         refresh = asyncio.create_task(loop.refresh_live_config()); stack.push_async_callback(_cancel_and_drain, refresh)
-        try:
-            assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
-            loop.set_plan_mode(True)
-            release.set()
-            await asyncio.wait_for(refresh, 10)
-
-            assert loop.plan_mode is True
-            assert "live description" not in _runtime_text(loop)
-            assert not any(
-                skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
-            )
-
-            await asyncio.wait_for(loop.refresh_live_config(), 10)
-            assert loop.plan_mode is True
-            assert "live description" in _runtime_text(loop)
-        finally:
-            release.set()
-            if not refresh.done():
-                refresh.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(refresh, return_exceptions=True), 10
-                )
-            finally:
-                try:
-                    await asyncio.wait_for(loop.close(), 10)
-                finally:
-                    loop.store.close()
+        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+        loop.set_plan_mode(True)
+        release.set()
+        await asyncio.wait_for(refresh, 10)
+        assert loop.plan_mode is True
+        assert "live description" not in _runtime_text(loop)
+        assert not any(
+            skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
+        )
+        await asyncio.wait_for(loop.refresh_live_config(), 10)
+        assert loop.plan_mode is True
+        assert "live description" in _runtime_text(loop)
 
 
 @pytest.mark.asyncio
@@ -315,49 +295,33 @@ async def test_live_live_config_discards_stale_memory_prompt(
 
         loop._live_config_watcher.prepare = paused_prepare
         refresh = asyncio.create_task(loop.refresh_live_config()); stack.push_async_callback(_cancel_and_drain, refresh)
-        try:
-            assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
-            changed_memory = "memory changed while refresh prepared"
-            changed_prompt = prompt.replace(memory, changed_memory)
-            changed_offset = changed_prompt.index(changed_memory)
-            loop._set_runtime_prompt(
-                _owned_runtime_prompt(
-                    changed_prompt,
-                    catalog,
-                    {
-                        "project_memory": {
-                            "offset": changed_offset,
-                            "length": len(changed_memory),
-                            "digest": hashlib.sha256(changed_memory.encode()).hexdigest(),
-                        }
-                    },
-                )
+        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+        changed_memory = "memory changed while refresh prepared"
+        changed_prompt = prompt.replace(memory, changed_memory)
+        changed_offset = changed_prompt.index(changed_memory)
+        loop._set_runtime_prompt(
+            _owned_runtime_prompt(
+                changed_prompt,
+                catalog,
+                {
+                    "project_memory": {
+                        "offset": changed_offset,
+                        "length": len(changed_memory),
+                        "digest": hashlib.sha256(changed_memory.encode()).hexdigest(),
+                    }
+                },
             )
-            release.set()
-            await asyncio.wait_for(refresh, 10)
-
-            assert changed_memory in _runtime_text(loop)
-            assert "live description" not in _runtime_text(loop)
-            assert not any(
-                skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
-            )
-
-            await asyncio.wait_for(loop.refresh_live_config(), 10)
-            assert changed_memory in _runtime_text(loop)
-            assert "live description" in _runtime_text(loop)
-        finally:
-            release.set()
-            if not refresh.done():
-                refresh.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(refresh, return_exceptions=True), 10
-                )
-            finally:
-                try:
-                    await asyncio.wait_for(loop.close(), 10)
-                finally:
-                    loop.store.close()
+        )
+        release.set()
+        await asyncio.wait_for(refresh, 10)
+        assert changed_memory in _runtime_text(loop)
+        assert "live description" not in _runtime_text(loop)
+        assert not any(
+            skill.name == "live" for skill in loop.tool_registry.skill_catalog.skills
+        )
+        await asyncio.wait_for(loop.refresh_live_config(), 10)
+        assert changed_memory in _runtime_text(loop)
+        assert "live description" in _runtime_text(loop)
 
 
 @pytest.mark.asyncio
@@ -391,7 +355,6 @@ async def test_new_skill_reaches_provider_prompt_on_actual_next_turn(
         if isinstance(block, TextContent)
     )
     assert "live description" in system_text
-    loop.store.close()
 
 
 @pytest.mark.asyncio
@@ -431,7 +394,6 @@ async def test_tui_submit_discovers_new_skill_slash_before_parse(tmp_path: Path)
     assert "live body" in user_text
     assert "request" in user_text
     await app._submissions.close()
-    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -476,7 +438,7 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
         backend = FakeBackend([ScriptedTurn([TextContent("done")])])
         loop, manager, home, _ = await asyncio.to_thread(lambda: _session_loop(tmp_path, stack, backend))
         # test-contract: seam no public metadata-lock holder seam exists
-        release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id)
+        release, holder = _hold_metadata_lock(manager, loop.session_metadata.session_id); stack.push_async_callback(asyncio.to_thread, holder.join, 10); stack.callback(release.set)
         _install_live_skill(home)
 
         async def refresh_and_run_turn() -> None:
@@ -488,16 +450,10 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
                     async for event in loop.run_turn("next", origin=MessageOrigin.USER)
                 ]
 
-        try:
-            await asyncio.wait_for(refresh_and_run_turn(), timeout=10)
-            catalog = loop.tool_registry.skill_catalog
-            assert "live" in {skill.name for skill in catalog.skills}
-            assert catalog.find("live").description == "live description"
-        finally:
-            release.set()
-            holder.join(1)
-            await loop.close()
-            loop.store.close()
+        await asyncio.wait_for(refresh_and_run_turn(), timeout=10)
+        catalog = loop.tool_registry.skill_catalog
+        assert "live" in {skill.name for skill in catalog.skills}
+        assert catalog.find("live").description == "live description"
 
 
 @pytest.mark.asyncio
@@ -512,13 +468,10 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
         _install_live_skill(home)
         await loop.refresh_live_config()
 
-        other = SessionManager(home).open(loop.session_metadata.session_id)
-        try:
-            await asyncio.to_thread(lambda: SessionManager(home).record_override(
-                other.metadata, provider=None, model="new-model"
-            ))
-        finally:
-            other.store.close()
+        other = SessionManager(home).open(loop.session_metadata.session_id); stack.callback(other.store.close)
+        await asyncio.to_thread(lambda: SessionManager(home).record_override(
+            other.metadata, provider=None, model="new-model"
+        ))
         await asyncio.to_thread(lambda: manager.touch(loop.session_metadata))
 
         assert loop.session_metadata.model == "new-model"
@@ -567,12 +520,8 @@ async def test_runtime_prompt_does_not_read_session_prompt_components(
         loop.session_metadata = StaleSessionMetadata()
         loop.set_plan_mode(True)
         _install_live_skill(home)
-        try:
-            await loop.refresh_live_config()
-            loop.set_plan_mode(False)
-        finally:
-            await loop.close()
-            loop.store.close()
+        await loop.refresh_live_config()
+        loop.set_plan_mode(False)
 
         assert "live description" in loop.context_assembler.system_prompt.content[0].text
 
@@ -653,30 +602,26 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_live_config(
             auto_project=False,
         )
         _install_live_skill(home, "second", "second description")
-        try:
-            _ = [
-                event
-                async for event in runtime.loop.run_turn(
-                    "use both", origin=MessageOrigin.USER
-                )
-            ]
-            system_text = "\n".join(
-                block.text
-                for message in backend.calls[0][0]
-                if message.role is MessageRole.SYSTEM
-                for block in message.content
-                if isinstance(block, TextContent)
+        _ = [
+            event
+            async for event in runtime.loop.run_turn(
+                "use both", origin=MessageOrigin.USER
             )
-            component = runtime.loop._runtime_prompt.prompt_components["project_memory"]
-            offset = int(component["offset"])
-            length = int(component["length"])
-            assert "first description" in system_text
-            assert "second description" in system_text
-            assert system_text[offset : offset + length] == memory
-            assert component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
-        finally:
-            await runtime.loop.close()
-            first.store.close()
+        ]
+        system_text = "\n".join(
+            block.text
+            for message in backend.calls[0][0]
+            if message.role is MessageRole.SYSTEM
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        component = runtime.loop._runtime_prompt.prompt_components["project_memory"]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert "first description" in system_text
+        assert "second description" in system_text
+        assert system_text[offset : offset + length] == memory
+        assert component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -748,29 +693,26 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
             lambda value, **kwargs: value.replace(memory, refreshed_memory),
         )
         resumed = manager.open(opened.metadata.session_id)
-        try:
-            result = await asyncio.to_thread(lambda: resume_prompt(
-                resumed.metadata,
-                manager=manager,
-                store=resumed.store,
-                home=home,
-                repo_root=project,
-                inbox_enabled=False,
-                context_loader=lambda **kwargs: (_ for _ in ()).throw(
-                    AssertionError(f"unexpected default rebuild: {kwargs}")
-                ),
-            ))
-            component = result.context.prompt_components["project_memory"]
-            offset = int(component["offset"])
-            length = int(component["length"])
-            assert "live description" in result.context.system_prompt
-            assert result.context.system_prompt[offset : offset + length] == refreshed_memory
-            assert component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
-            saved = manager.read_metadata(opened.metadata.session_id)
-            assert saved.system_prompt == result.context.system_prompt
-            assert saved.project_memory_offset == offset
-            assert saved.project_memory_length == length
-            assert saved.project_memory_digest == component["digest"]
-            assert saved.skill_catalog[0]["name"] == "live"
-        finally:
-            resumed.store.close()
+        result = await asyncio.to_thread(lambda: resume_prompt(
+            resumed.metadata,
+            manager=manager,
+            store=resumed.store,
+            home=home,
+            repo_root=project,
+            inbox_enabled=False,
+            context_loader=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"unexpected default rebuild: {kwargs}")
+            ),
+        ))
+        component = result.context.prompt_components["project_memory"]
+        offset = int(component["offset"])
+        length = int(component["length"])
+        assert "live description" in result.context.system_prompt
+        assert result.context.system_prompt[offset : offset + length] == refreshed_memory
+        assert component["digest"] == hashlib.sha256(refreshed_memory.encode()).hexdigest()
+        saved = manager.read_metadata(opened.metadata.session_id)
+        assert saved.system_prompt == result.context.system_prompt
+        assert saved.project_memory_offset == offset
+        assert saved.project_memory_length == length
+        assert saved.project_memory_digest == component["digest"]
+        assert saved.skill_catalog[0]["name"] == "live"
