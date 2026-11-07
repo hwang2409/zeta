@@ -718,9 +718,14 @@ class ConnectionRegistry:
             try:
                 result = job()
             except Exception as exc:  # noqa: BLE001 - worker must return every job failure
-                self.loop.call_soon_threadsafe(self._read_done, future, None, exc)
+                result, error = None, exc
             else:
-                self.loop.call_soon_threadsafe(self._read_done, future, result, None)
+                error = None
+            try:
+                self.loop.call_soon_threadsafe(self._read_done, future, result, error)
+            except RuntimeError:
+                if not self.loop.is_closed():
+                    raise
 
     @staticmethod
     def _read_done(
