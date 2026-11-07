@@ -5133,12 +5133,19 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "task_cause",
-    ["foreground child completion cleanup", "tool registry closed"],
-    ids=["child-cleanup", "registry-close"],
+    "task_cause, wait_for_acknowledgement",
+    [
+        ("foreground child completion cleanup", False),
+        ("tool registry closed", False),
+        ("tool registry closed", True),
+    ],
+    ids=["child-cleanup", "registry-close", "acknowledged-before-lookup"],
 )
 async def test_close_kill_cause_reaches_live_serve_event(
-    tmp_path: Path, task_cause: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    task_cause: str,
+    wait_for_acknowledgement: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Protocol 1.2 gives close-driven task exits an explicit event.
     backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
@@ -5229,11 +5236,19 @@ async def test_close_kill_cause_reaches_live_serve_event(
         ]
         assert len(task_rows) == 1
         assert task_cause in task_rows[0]["content"][0]["text"]
+        task_frames = history_frames
+        if wait_for_acknowledgement:
+            # Wait for the notification turn to acknowledge the row before lookup.
+            task_frames += await _frames_until_event(reader, "turn_end")
         notification = next(
-            entry
-            for entry in store.agent_notifications()
-            if entry.data.get("kind") == "task_exited"
+            (
+                entry
+                for entry in store.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "task_exited"
+            ),
+            None,
         )
+        assert notification is not None, "durable task-exited notification was not found"
         rendered = render_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
@@ -5249,7 +5264,6 @@ async def test_close_kill_cause_reaches_live_serve_event(
         assert rendered is not None
         assert task_cause in rendered.plain
 
-        task_frames = history_frames
         if not any(
             frame.get("params", {}).get("event") == "turn_end" for frame in task_frames
         ):
@@ -8443,6 +8457,7 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     worker_errors: list[BaseException] = []
     shutdown_started = asyncio.Event()
     closing: asyncio.Task[None] | None = None
+    request_task: asyncio.Task[None] | None = None
     loop_closed = False
     status_worker: threading.Thread | None = None
 
@@ -8497,6 +8512,15 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await close_control()
 
     monkeypatch.setattr(server.control, "close", track_shutdown)
+    writer_wait_closed = writer.wait_closed
+
+    async def wait_closed_after_server_shutdown() -> None:
+        assert shutdown_started.is_set(), (
+            "server shutdown must start before the test waits for the peer close"
+        )
+        await asyncio.wait_for(writer_wait_closed(), 10)
+
+    monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
     try:
         writer.write(
             json.dumps(
@@ -8510,10 +8534,21 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             + b"\n"
         )
         await writer.drain()
-        assert await asyncio.to_thread(entered.wait, 10)
+        assert await asyncio.to_thread(entered.wait, 10), (
+            "status transcript worker did not start"
+        )
+        client = server._client
+        assert client is not None
+        request_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and any(
+                frame.f_locals.get("client") is client for frame in task.get_stack()
+            )
+        )
 
         writer.close()
-        await writer.wait_closed()
         closing = asyncio.create_task(server.close())
         await asyncio.wait_for(shutdown_started.wait(), 10)
         loop_closed = True
@@ -8521,18 +8556,24 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
         await asyncio.wait_for(worker_completed.wait(), 10)
         assert not worker_errors
         loop_closed = False
-        await asyncio.wait_for(closing, 10)
+        await asyncio.wait_for(asyncio.shield(closing), 10)
+        request_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(request_task), 10)
+        assert request_task.done(), "serve request task remained after cancellation"
     finally:
         loop_closed = False
         release.set()
-        if closing is not None and not closing.done():
-            closing.cancel()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
             with suppress(asyncio.CancelledError):
-                await closing
+                await asyncio.wait_for(asyncio.shield(request_task), 10)
+        if closing is None:
+            closing = asyncio.create_task(server.close())
+        await asyncio.wait_for(asyncio.shield(closing), 10)
         writer.close()
         with suppress(Exception):
-            await writer.wait_closed()
-        await server.close()
+            await asyncio.wait_for(writer.wait_closed(), 10)
 
 
 @pytest.mark.parametrize("with_fact_floor", [False, True])

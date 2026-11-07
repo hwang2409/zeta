@@ -24,7 +24,9 @@ class FixtureAccountCredentials(AccountCredentials):
 
         thread = Thread(target=run)
         thread.start()
-        thread.join()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise TimeoutError("credential operation did not finish within 10 seconds")
         if error:
             raise error[0]
         return result[0] if result else None
