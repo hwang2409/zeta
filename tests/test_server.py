@@ -10817,7 +10817,11 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     assert controller is not None
     connection = controller.connection
     original_write = connection._write_physical
-    original_notify = server.control._notify
+    original_enqueue = server.connections._enqueue
+    original_finish_record = server.control._approvals._finish_record
+    settlement_finish_started = asyncio.Event()
+    competing_finish_started = asyncio.Event()
+    release_settlement_finish = asyncio.Event()
     tool_end_started = asyncio.Event()
 
     async def gated_write(payload: bytes) -> bool:
@@ -10827,15 +10831,26 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             await asyncio.wait_for(release_write.wait(), timeout=10)
         return await original_write(payload)
 
-    async def record_tool_end(event, *args, **kwargs):
-        if event == "tool_end":
+    def record_enqueue(output, frame, *, wake=True):
+        payload = json.loads(frame.payload)
+        if payload.get("params", {}).get("event") == "tool_end":
             tool_end_started.set()
-        return await original_notify(event, *args, **kwargs)
+        return original_enqueue(output, frame, wake=wake)
+
+    async def gated_finish_record(*args, **kwargs):
+        if not settlement_finish_started.is_set():
+            settlement_finish_started.set()
+            await asyncio.wait_for(release_settlement_finish.wait(), timeout=10)
+        else:
+            competing_finish_started.set()
+        return await original_finish_record(*args, **kwargs)
 
     # test-contract: seam the transport has no public physical-write backpressure hook
     monkeypatch.setattr(connection, "_write_physical", gated_write)
-    # test-contract: seam wire output cannot expose an admitted frame behind backpressure
-    monkeypatch.setattr(server.control, "_notify", record_tool_end)
+    # test-contract: seam the bounded queue has no public admission hook
+    monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
+    # test-contract: seam approval settlement has no public pre-publication hook
+    monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish_record)
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
@@ -10869,6 +10884,9 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         )
         await writer.drain()
         async with asyncio.timeout(10):
+            await settlement_finish_started.wait()
+            await competing_finish_started.wait()
+            release_settlement_finish.set()
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
@@ -10885,5 +10903,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         tool_owner = ("tool_end", approval["session_id"], call.id)
         assert_event_order(frames, approval_owner, tool_owner, turn_end_owner)
     finally:
+        release_settlement_finish.set()
         release_write.set()
         await _close(server, writer)
