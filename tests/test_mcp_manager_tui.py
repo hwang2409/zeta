@@ -24,7 +24,8 @@ from zeta.mcp import management as mcp_management
 from zeta.mcp.management import ManagedServer, MCPManagementService
 from zeta.mcp.oauth_store import MCPOAuthToken
 from zeta.runtime.loop import AgentLoop
-from zeta.server.slash_commands import ServerSlashSession
+from zeta.runtime.project_registry_state import available_project_registry
+from zeta.server.slash_commands import run_command
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.mcp_manager import MCPAddDraft, MCPManager
@@ -144,9 +145,21 @@ async def test_public_mcp_views_repair_a_committed_cancelled_add(
         loop._mcp_management = manager
         loop._mcp_mount = mount
         loop._mcp_mount_attempted = True
-        session = ServerSlashSession(SimpleNamespace(loop=loop))
+        runtime = SimpleNamespace(
+            loop=loop,
+            home=tmp_path / "home",
+            cwd=tmp_path / "repo",
+            opened=SimpleNamespace(metadata=SimpleNamespace(cwd=str(tmp_path / "repo"))),
+            manager=SimpleNamespace(
+                project_registry_state=available_project_registry(
+                    tmp_path / "home" / "projects"
+                )
+            ),
+        )
         try:
-            rendered = str(await session.slash_mcp("disable durable"))
+            result = await run_command(runtime, "/mcp disable durable")
+            assert result["kind"] == "output"
+            rendered = str(result["text"])
         finally:
             await loop.close()
 

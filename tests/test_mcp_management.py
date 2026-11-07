@@ -32,24 +32,28 @@ def service(tmp_path, mount=None):
 
 def test_resident_mcp_state_has_no_public_read_bypass():
     message = "MCP state reads must use await service.view() or service.resolve()"
+    resident_names = {"_view", "_published_candidate", "_durable_candidate"}
     public_accessor = "snapshot" in vars(MCPManagementService)
     bypasses = []
     source_root = Path(__file__).parents[1] / "src" / "zeta"
+    owner_path = source_root / "mcp" / "management.py"
     for path in source_root.rglob("*.py"):
-        if path.name == "management.py":
+        if path == owner_path:
             continue
         source = path.read_text()
         if "MCPManagementService" not in source and "_mcp_management" not in source:
             continue
         for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Attribute):
-                continue
-            owner = ast.unparse(node.value).rsplit(".", 1)[-1]
-            if node.attr in {"snapshot", "_snapshot", "_view"} and owner in {
-                "service",
-                "manager",
-                "_mcp_management",
-            }:
+            direct_read = isinstance(node, ast.Attribute) and node.attr in resident_names
+            getattr_read = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in resident_names
+            )
+            if direct_read or getattr_read:
                 bypasses.append(f"{path.relative_to(source_root)}:{node.lineno}")
     assert not public_accessor and not bypasses, (
         f"{message}; public snapshot accessor={public_accessor}; "
