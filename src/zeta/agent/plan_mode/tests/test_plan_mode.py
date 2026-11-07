@@ -22,10 +22,18 @@ from zeta.protocol.types import MessageOrigin, StreamEvent, TextContent, ToolCal
 from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import advance, open_writer
 from zeta.tools.registry import ToolAction
 from zeta.tui import theme
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
+
+
+@pytest.fixture(autouse=True)
+def retain_test_storage_home(tmp_path: Path):
+    lease = open_writer(tmp_path.parent)
+    yield
+    lease.close()
 
 
 @pytest.fixture(autouse=True)
@@ -397,7 +405,8 @@ async def test_allowed_sub_agents_complete_a_turn_in_plan_mode(
             ScriptedTurn([TextContent("child complete")]),
         ]
     )
-    store = ConversationStore(tmp_path)
+    await asyncio.to_thread(advance, tmp_path, expected_epoch=0)
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "root")
     loop = AgentLoop(
         backend,
         store,
@@ -438,7 +447,8 @@ async def test_late_mounted_tool_is_rejected_in_plan_mode(
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
-    store = ConversationStore(tmp_path)
+    await asyncio.to_thread(advance, tmp_path, expected_epoch=0)
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "root")
     loop = AgentLoop(
         backend,
         store,

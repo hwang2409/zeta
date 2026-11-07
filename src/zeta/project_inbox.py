@@ -26,7 +26,7 @@ from .core.session_files import (
     open_session_file,
     read_session_file,
     session_root,
-    write_session_json,
+    write_json_file,
 )
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
@@ -273,7 +273,7 @@ class SentMessageTracker:
     def _persist(self) -> None:
         try:
             with self._session_directory(create=True) as session_fd:
-                write_session_json(
+                write_json_file(
                     session_fd,
                     _SENT_TRACKING_FILE,
                     {"schema_version": 1, "records": self._records},

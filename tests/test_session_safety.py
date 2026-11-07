@@ -15,7 +15,7 @@ import pytest
 from zeta.cli.main import main
 from zeta.core import session as session_module
 from zeta.core.session import SessionError, SessionInUseError, SessionManager
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationStore, TranscriptLoadError
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -207,7 +207,7 @@ def test_read_only_store_holds_lease_without_creating_files(tmp_path):
 def test_failed_open_releases_lease(tmp_path):
     manager, sid = closed_session(tmp_path)
     (manager.sessions_dir / sid / "conversation.jsonl").write_bytes(b"bad\n")
-    with pytest.raises(SessionError):
+    with pytest.raises(TranscriptLoadError):
         manager.open(sid)
     manager.delete(sid)
     assert not (manager.sessions_dir / sid).exists()
@@ -322,8 +322,7 @@ async def test_server_rename_and_cli_delete_serialize_across_processes(tmp_path,
     script = """
 import asyncio, sys
 from zeta.server import ZetaServer
-async def main():
-    server = ZetaServer(home=sys.argv[1], port=0, provider='codex')
+async def main(server):
     manager = server.runtime.manager
     method = '_write_unlocked' if sys.argv[2] == 'rename-first' else 'record_name'
     original = getattr(manager, method)
@@ -335,7 +334,7 @@ async def main():
     await server.start()
     print(server.port, flush=True)
     await asyncio.Event().wait()
-asyncio.run(main())
+asyncio.run(main(ZetaServer(home=sys.argv[1], port=0, provider='codex')))
 """
     env = {**os.environ, "ZETA_HOME": str(manager.home)}
     server = await asyncio.create_subprocess_exec(
@@ -345,7 +344,9 @@ asyncio.run(main())
     )
     writer = None
     try:
-        port = int(await asyncio.wait_for(server.stdout.readline(), 10))
+        port_line = await asyncio.wait_for(server.stdout.readline(), 10)
+        assert port_line, (await server.stderr.read()).decode()
+        port = int(port_line)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         async def request(request_id, method, params):
             writer.write((json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n").encode())
@@ -604,7 +605,11 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
             lifecycle_sink=lambda kind: None,
         )
         assert not result.is_error
-        draft = DraftPersistence(store.session_dir / "draft", directory_fd=store.directory_fd)
+        draft = DraftPersistence(
+            store.session_dir / "draft",
+            directory_fd=store.directory_fd,
+            storage_lease=store._storage_lease,
+        )
         draft.schedule("draft text")
         await draft.flush_pending()
         assert draft.load() == "draft text"
@@ -704,7 +709,11 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
 
     monkeypatch.setattr(composer.subprocess, "run", clipboard)
     try:
-        draft = DraftPersistence(store.session_dir / "draft", directory_fd=store.directory_fd)
+        draft = DraftPersistence(
+            store.session_dir / "draft",
+            directory_fd=store.directory_fd,
+            storage_lease=store._storage_lease,
+        )
         draft.schedule("saved")
         draft.flush()
         assert draft.load() == "saved"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -235,6 +236,7 @@ class OllamaBackend(CompletionBackend):
         timeout: float | None = None,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
         stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
+        diagnostics_path: str | Path | None = None,
         token_budget: int | None = None,
         model_context_window: int | None = None,
     ) -> None:
@@ -249,6 +251,9 @@ class OllamaBackend(CompletionBackend):
         if model_context_window <= 0:
             raise ValueError("Ollama model context window must be positive")
         self.model, self.base_url, self.client = model, base_url.rstrip("/"), client
+        self.diagnostics_path = (
+            Path(diagnostics_path) if diagnostics_path is not None else None
+        )
         self.model_context_window = model_context_window
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
         self.set_token_budget(token_budget)
@@ -488,6 +493,8 @@ class OllamaBackend(CompletionBackend):
                 owns_client=self.client is None,
                 primary_exception=primary_exception,
                 http_error_type=OllamaError,
+                diagnostics_path=self.diagnostics_path,
+                provider="ollama",
             )
             if primary_exception is not None:
                 raise primary_exception

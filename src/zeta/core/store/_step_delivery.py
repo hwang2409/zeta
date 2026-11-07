@@ -253,6 +253,11 @@ def _child_question_mutation_rows(
                         "child_instance_id": child_id,
                         "question_id": entry.data["question_id"],
                         "description": "child question withdrawn",
+                        **(
+                            {"agent_description": entry.data["agent_description"]}
+                            if "agent_description" in entry.data
+                            else {}
+                        ),
                         "status": "withdrawn",
                         "text": (
                             "question withdrawn: child "

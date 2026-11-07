@@ -10,7 +10,7 @@ import shutil
 import threading
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -196,11 +196,14 @@ class _CachedProjection:
 
 
 _cache_creation_lock = threading.Lock()
-_HISTORY_ROW_FEATURES = ("include_delivery_id", "fidelity", "content_read")
+_HISTORY_ROW_FEATURES = (
+    "include_delivery_id", "fidelity", "content_read", "served_turn_end"
+)
 
 
 def _history_feature_key(
-    *, include_delivery_id: bool, fidelity: bool, content_read: bool
+    *, include_delivery_id: bool, fidelity: bool, content_read: bool,
+    served_turn_end: bool
 ) -> tuple[bool, ...]:
     values = locals()
     return tuple(values[name] for name in _HISTORY_ROW_FEATURES)
@@ -219,6 +222,7 @@ def _cache(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    served_turn_end: bool,
 ) -> _CachedProjection | None:
     cache = getattr(store, "_serve_history_projections", {})
     return cache.get(
@@ -226,6 +230,7 @@ def _cache(
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
+            served_turn_end=served_turn_end,
         )
     )
 
@@ -236,6 +241,7 @@ def _publish_cache(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    served_turn_end: bool,
     cached: _CachedProjection,
 ) -> None:
     cache = getattr(store, "_serve_history_projections", None)
@@ -246,6 +252,7 @@ def _publish_cache(
         include_delivery_id=include_delivery_id,
         fidelity=fidelity,
         content_read=content_read,
+        served_turn_end=served_turn_end,
     )] = cached
 
 
@@ -338,11 +345,12 @@ def _project_history_group(
 def history_projection(
     store: ConversationStore, *, include_delivery_id: bool = False,
     fidelity: bool = False, content_read: bool = False,
+    served_turn_end: bool = False,
 ) -> HistoryProjection:
     """Return one immutable wire projection for the store's generation."""
     cached = _cache(
         store, include_delivery_id=include_delivery_id, fidelity=fidelity,
-        content_read=content_read,
+        content_read=content_read, served_turn_end=served_turn_end,
     )
     generation = _generation(store)
     if cached is not None and cached.generation == generation:
@@ -357,8 +365,24 @@ def history_projection(
             break
 
     approval_calls: dict[str, object] = {}
+    accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     for entry in branch:
+        if entry.type == "client_delivery" and isinstance(
+            entry.data.get("accepted_message"), dict
+        ):
+            accepted_messages[entry.data["delivery_id"]] = entry.data[
+                "accepted_message"
+            ]
+        elif entry.type == "client_delivery" and entry.data.get("status") in {
+            "delivered",
+            "dropped",
+        }:
+            accepted = accepted_messages.get(entry.data["delivery_id"])
+            if accepted is not None:
+                entry = replace(
+                    entry, data={**entry.data, "_accepted_message": accepted}
+                )
         if entry.type == "message":
             approval_calls.update(
                 {
@@ -377,7 +401,7 @@ def history_projection(
             "client_delivery",
             "approval_resolution",
             "approval_history",
-        }:
+        } or (entry.type == "turn_end" and served_turn_end):
             entries[-1].append(entry)
 
     entry_index = {entry.id: entry for group in entries for entry in group if hasattr(entry, "id")}
@@ -389,7 +413,7 @@ def history_projection(
     with _cache_creation_lock:
         cached = _cache(
             store, include_delivery_id=include_delivery_id, fidelity=fidelity,
-            content_read=content_read,
+            content_read=content_read, served_turn_end=served_turn_end,
         )
         if cached is None or cached.generation != generation:
             _publish_cache(
@@ -397,6 +421,7 @@ def history_projection(
                 include_delivery_id=include_delivery_id,
                 fidelity=fidelity,
                 content_read=content_read,
+                served_turn_end=served_turn_end,
                 cached=_CachedProjection(generation, built),
             )
             return built
@@ -442,7 +467,11 @@ def _history_entry_rows(
         data = entry.data
         if data.get("status") not in {"delivered", "dropped"} or data.get("method") != "steer":
             return []
-        return [event_contract.delivery_status_row(entry)]
+        accepted = data.get("_accepted_message")
+        message = Message.from_dict(accepted) if isinstance(accepted, dict) else None
+        return [event_contract.delivery_status_row(entry, message)]
+    if entry_type == "turn_end":
+        return [event_contract.served_turn_end_row(entry)]
     if entry_type == "approval_history":
         return [{"id": entry.id, "role": "system", **entry.data}]
     if entry_type == "approval_resolution":
@@ -786,11 +815,12 @@ def _publish_history_page(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    served_turn_end: bool,
 ) -> dict:
     with _cache_creation_lock:
         cached = _cache(
             store, include_delivery_id=include_delivery_id, fidelity=fidelity,
-            content_read=content_read,
+            content_read=content_read, served_turn_end=served_turn_end,
         )
         if cached is not None and cached.generation == generation and len(cached.projection.groups) < len(expanded.groups):
             _publish_cache(
@@ -798,6 +828,7 @@ def _publish_history_page(
                 include_delivery_id=include_delivery_id,
                 fidelity=fidelity,
                 content_read=content_read,
+                served_turn_end=served_turn_end,
                 cached=_CachedProjection(generation, expanded),
             )
     return result
@@ -808,6 +839,7 @@ def _backward_history_request(
     params: dict,
     *,
     include_delivery_id: bool, fidelity: bool, content_read: bool,
+    served_turn_end: bool,
 ) -> dict:
     before = params["before"]
     validator = params.get("history_validator")
@@ -817,7 +849,7 @@ def _backward_history_request(
     generation = _generation(store)
     projection = history_projection(
         store, include_delivery_id=include_delivery_id, fidelity=fidelity,
-        content_read=content_read,
+        content_read=content_read, served_turn_end=served_turn_end,
     )
     end = len(projection.entry_groups) - 1
     if before is None:
@@ -830,7 +862,8 @@ def _backward_history_request(
         backward=True, validator=validator, first_page=first_page,
     )
     return _publish_history_page(
-        store, generation, result, expanded, include_delivery_id, fidelity, content_read
+        store, generation, result, expanded, include_delivery_id, fidelity,
+        content_read, served_turn_end
     )
 
 
@@ -839,18 +872,20 @@ def _forward_history_request(
     params: dict,
     *,
     include_delivery_id: bool, fidelity: bool, content_read: bool,
+    served_turn_end: bool,
 ) -> dict:
     store = runtime.opened.store
     generation = _generation(store)
     projection = history_projection(
         store, include_delivery_id=include_delivery_id, fidelity=fidelity,
-        content_read=content_read,
+        content_read=content_read, served_turn_end=served_turn_end,
     )
     result, expanded = page_history(
         projection, params.get("offset", 0), include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read,
     )
     return _publish_history_page(
-        store, generation, result, expanded, include_delivery_id, fidelity, content_read
+        store, generation, result, expanded, include_delivery_id, fidelity,
+        content_read, served_turn_end
     )
 
 
@@ -876,19 +911,28 @@ def _validate_history_params(params: dict) -> None:
 def history(
     runtime: ServerRuntime, params: dict, *, include_delivery_id: bool = False,
     backward_enabled: bool = False, fidelity: bool = False, content_read: bool = False,
+    served_turn_end: bool = False,
 ) -> dict:
     backward_keys = {"before", "history_validator"}
     if backward_keys.intersection(params) and not backward_enabled:
         raise ProtocolError(-32602, "backward session history requires negotiation")
     if "before" in params:
         _validate_history_params(params)
-        return _backward_history_request(runtime, params, include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read)
+        return _backward_history_request(
+            runtime, params, include_delivery_id=include_delivery_id,
+            fidelity=fidelity, content_read=content_read,
+            served_turn_end=served_turn_end,
+        )
     if backward_keys.intersection(params):
         raise ProtocolError(-32602, "invalid session history parameters")
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
-    return _forward_history_request(runtime, params, include_delivery_id=include_delivery_id, fidelity=fidelity, content_read=content_read)
+    return _forward_history_request(
+        runtime, params, include_delivery_id=include_delivery_id,
+        fidelity=fidelity, content_read=content_read,
+        served_turn_end=served_turn_end,
+    )
 
 def settings(runtime: ServerRuntime) -> dict:
     return {"model": runtime.model, "approval_mode": runtime.policy.default.value}
