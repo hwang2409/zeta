@@ -5661,7 +5661,9 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         store.session_dir / "agents", session_id="1", cwd=store.cwd
     )
     child.mark_agent_parent(call.id)
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved child tail")]))
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("saved child tail")])
+    )
     store.allocate_agent_index()
     store.register_agent_child(
         call,
@@ -5669,17 +5671,21 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         description="task research",
         turns_used=2,
     )
+    child.close()
 
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     await loop.activate()
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
+
     def render_transcript() -> str:
         transcript = TranscriptWidget()
         transcript.start_tool(

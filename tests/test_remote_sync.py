@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -79,7 +80,9 @@ def test_mirror_temporary_kind_keys_match_entry_store() -> None:
 def _git_repo(path: Path) -> None:
     path.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
     (path / "README.md").write_text("test\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=path, check=True)
@@ -96,10 +99,7 @@ def _install_ssh_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bin_dir.mkdir()
     shim = bin_dir / "ssh"
     shim.write_text(
-        "#!/bin/sh\n"
-        "[ \"$1\" = -- ] && shift\n"
-        "shift\n"
-        "exec /bin/sh -c \"$1\"\n",
+        '#!/bin/sh\n[ "$1" = -- ] && shift\nshift\nexec /bin/sh -c "$1"\n',
         encoding="utf-8",
     )
     shim.chmod(0o755)
@@ -113,11 +113,18 @@ def _session(home: Path, repo: Path):
     opened = SessionManager(home).create(
         provider="codex", model="fake", cwd=repo, project_id=project.project_id
     )
-    opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("root transcript")]), MessageOrigin.USER))
+    opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("root transcript")]),
+            MessageOrigin.USER,
+        )
+    )
     child = ConversationStore(
         opened.store.session_dir / "agents", session_id="1", cwd=repo
     )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child transcript")]))
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("child transcript")])
+    )
     child.close()
     spill = opened.store.session_dir / "spill"
     spill.mkdir(mode=0o700)
@@ -174,9 +181,11 @@ def test_session_push_agent_tool_cannot_force_replacement(tmp_path: Path) -> Non
 async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    opened = await asyncio.to_thread(lambda: SessionManager(tmp_path / "home").create(
-        provider="codex", model="fake", cwd=tmp_path
-    ))
+    opened = await asyncio.to_thread(
+        lambda: SessionManager(tmp_path / "home").create(
+            provider="codex", model="fake", cwd=tmp_path
+        )
+    )
     registry = ToolRegistry(
         tmp_path,
         register_builtin=False,
@@ -191,7 +200,9 @@ async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
 
     monkeypatch.setattr(session_push_tool, "push_session", busy)
 
-    result = await registry.definitions_by_name["session_push"].handler({"host": "peer"})
+    result = await registry.definitions_by_name["session_push"].handler(
+        {"host": "peer"}
+    )
 
     assert result["isError"] is True
     assert result["structuredContent"]["error"]["retryable"] is True
@@ -238,9 +249,7 @@ def test_session_push_releases_append_locks_before_destination_copy(
         ):
             destination_copy_started.set()
             assert release_destination_copy.wait(timeout=30)
-        return original_copyfile(
-            source, destination, follow_symlinks=follow_symlinks
-        )
+        return original_copyfile(source, destination, follow_symlinks=follow_symlinks)
 
     monkeypatch.setattr(remote_sync_module.shutil, "copyfile", block_destination_copy)
 
@@ -283,8 +292,8 @@ def test_session_push_releases_append_locks_before_destination_copy(
     destination = remote / "sessions" / result.session_id
     root_lines = (destination / "conversation.jsonl").read_text().splitlines()
     child_lines = (
-        destination / "agents" / "1" / "conversation.jsonl"
-    ).read_text().splitlines()
+        (destination / "agents" / "1" / "conversation.jsonl").read_text().splitlines()
+    )
     assert all(json.loads(line) for line in [*root_lines, *child_lines])
     assert "root before snapshot" in "".join(root_lines)
     assert "child before snapshot" in "".join(child_lines)
@@ -343,7 +352,12 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     result = push_session(
         local, LocalTransport(remote), session_id=opened.metadata.session_id
     )
-    opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("written after snapshot")]), MessageOrigin.USER))
+    opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("written after snapshot")]),
+            MessageOrigin.USER,
+        )
+    )
     opened.store.close()
 
     destination = remote / "sessions" / result.session_id
@@ -360,9 +374,7 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
         remote / "sessions", session_id=result.session_id, _read_only=True
     )
     try:
-        assert any(
-            entry.type == "child_run_started" for entry in transferred.replay()
-        )
+        assert any(entry.type == "child_run_started" for entry in transferred.replay())
     finally:
         transferred.close()
     assert not (remote / "oauth.json").exists()
@@ -378,7 +390,9 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     assert manifest["git"] == {
         "remote_url": "git@github.com:example/project.git",
         "branch": "master",
-        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
+        "head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip(),
     }
     assert manifest["includes_spill_files"] is True
     assert manifest["source_cwd"] == str(repo)
@@ -436,7 +450,12 @@ def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:
     push_session(local, transport, session_id=session_id)
 
     remote_opened = SessionManager(remote).open(session_id)
-    remote_opened.store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("newer remote entry")]), MessageOrigin.USER))
+    remote_opened.store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("newer remote entry")]),
+            MessageOrigin.USER,
+        )
+    )
     remote_opened.store.close()
 
     with pytest.raises(RemoteSyncError, match="newer remote"):
@@ -461,7 +480,12 @@ def test_push_refuses_to_replace_an_open_remote_session_even_with_force(
     with pytest.raises(RemoteSyncError, match="active|open|in use"):
         push_session(source, transport, session_id=session_id, force=True)
     live.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("still writable after refused push")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER, [TextContent("still writable after refused push")]
+            ),
+            MessageOrigin.USER,
+        )
     )
     live.store.close()
 
@@ -494,7 +518,12 @@ def test_pull_refuses_to_replace_an_open_session_even_with_force(
             force=True,
         )
     live.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("still writable after refused pull")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER, [TextContent("still writable after refused pull")]
+            ),
+            MessageOrigin.USER,
+        )
     )
     live.store.close()
 
@@ -517,9 +546,7 @@ def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     transport = LocalTransport(remote)
     push_session(source, transport, session_id=session_id)
 
-    result = pull_session(
-        destination, transport, session_id=session_id, cwd=mapped
-    )
+    result = pull_session(destination, transport, session_id=session_id, cwd=mapped)
 
     imported = SessionManager(destination).open(session_id)
     assert imported.metadata.cwd == str(mapped.resolve())
@@ -527,7 +554,14 @@ def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     assert "transferred to another machine" in imported.metadata.system_prompt
     assert "git@github.com:example/project.git" not in imported.metadata.system_prompt
     imported.store.close()
-    assert dict(ProjectRegistry(destination / "projects").load_memory(imported.metadata.project_id))["brief.md"] == "shared\n"
+    assert (
+        dict(
+            ProjectRegistry(destination / "projects").load_memory(
+                imported.metadata.project_id
+            )
+        )["brief.md"]
+        == "shared\n"
+    )
     assert "git@github.com:example/project.git" in result.resume_notice
     assert "clone" in result.resume_notice.lower()
 
@@ -560,16 +594,13 @@ def test_ssh_transport_uses_configured_alias_and_atomic_remote_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     local = tmp_path / "local"
-    remote = tmp_path / "remote home"
+    remote = initialize_storage_home(tmp_path / "remote home")
     repo = tmp_path / "repo"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     shim = bin_dir / "ssh"
     shim.write_text(
-        "#!/bin/sh\n"
-        "[ \"$1\" = -- ] && shift\n"
-        "shift\n"
-        "exec /bin/sh -c \"$1\"\n",
+        '#!/bin/sh\n[ "$1" = -- ] && shift\nshift\nexec /bin/sh -c "$1"\n',
         encoding="utf-8",
     )
     shim.chmod(0o755)
@@ -651,7 +682,10 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     _git_repo(repo)
     opened = SessionManager(local).create(provider="codex", model="fake", cwd=repo)
     opened.store.append_message(
-        with_message_origin(Message(MessageRole.USER, [TextContent("content larger than one byte")]), MessageOrigin.USER)
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("content larger than one byte")]),
+            MessageOrigin.USER,
+        )
     )
     session_id = opened.metadata.session_id
     opened.store.close()
@@ -842,9 +876,7 @@ def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None
             process.join(timeout=1)
 
 
-@pytest.mark.parametrize(
-    "temporary_suffix", ["6034", f"zeta-atomic-{'0' * 32}"]
-)
+@pytest.mark.parametrize("temporary_suffix", ["6034", f"zeta-atomic-{'0' * 32}"])
 def test_project_snapshot_ignores_disappearing_atomic_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, temporary_suffix: str
 ) -> None:
@@ -883,7 +915,9 @@ def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
     opened.store.close()
     transport = LocalTransport(remote)
     push_project_memory(local, transport, project_id=project.project_id)
-    state_path = next((remote / "projects" / project.project_id / "sync").glob("*.json"))
+    state_path = next(
+        (remote / "projects" / project.project_id / "sync").glob("*.json")
+    )
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["conflicts"]["../project.json"] = {"digests": ["missing", "0" * 64]}
     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -892,7 +926,9 @@ def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
     with pytest.raises(RemoteSyncError, match="synchronization state is invalid"):
         pull_project_memory(local, transport, project_id=project.project_id)
 
-    assert (local / "projects" / project.project_id / "project.json").read_bytes() == original
+    assert (
+        local / "projects" / project.project_id / "project.json"
+    ).read_bytes() == original
 
 
 def test_memory_sync_uses_pair_identity_across_aliases(tmp_path: Path) -> None:
@@ -902,14 +938,27 @@ def test_memory_sync_uses_pair_identity_across_aliases(tmp_path: Path) -> None:
     _git_repo(repo)
     project, opened = _session(first, repo)
     opened.store.close()
-    push_project_memory(first, LocalTransport(second, name="machine-b"), project_id=project.project_id)
-    ProjectRegistry(second / "projects").update_memory(project.project_id, {"brief.md": "v2\n"})
-    result = push_project_memory(second, LocalTransport(first, name="machine-a"), project_id=project.project_id)
+    push_project_memory(
+        first, LocalTransport(second, name="machine-b"), project_id=project.project_id
+    )
+    ProjectRegistry(second / "projects").update_memory(
+        project.project_id, {"brief.md": "v2\n"}
+    )
+    result = push_project_memory(
+        second, LocalTransport(first, name="machine-a"), project_id=project.project_id
+    )
     assert result.updated == ("brief.md",)
-    assert dict(ProjectRegistry(first / "projects").load_memory(project.project_id))["brief.md"] == "v2\n"
+    assert (
+        dict(ProjectRegistry(first / "projects").load_memory(project.project_id))[
+            "brief.md"
+        ]
+        == "v2\n"
+    )
 
 
-def test_memory_pull_rejects_oversized_state_without_reading_it_all(tmp_path: Path) -> None:
+def test_memory_pull_rejects_oversized_state_without_reading_it_all(
+    tmp_path: Path,
+) -> None:
     local = tmp_path / "local"
     remote = tmp_path / "remote"
     repo = tmp_path / "repo"
@@ -918,7 +967,9 @@ def test_memory_pull_rejects_oversized_state_without_reading_it_all(tmp_path: Pa
     opened.store.close()
     transport = LocalTransport(remote)
     push_project_memory(local, transport, project_id=project.project_id)
-    state_path = next((remote / "projects" / project.project_id / "sync").glob("*.json"))
+    state_path = next(
+        (remote / "projects" / project.project_id / "sync").glob("*.json")
+    )
     state_path.write_bytes(b"{" + b"x" * (64 * 1024) + b"}")
     with pytest.raises(RemoteSyncError, match="synchronization state is invalid"):
         pull_project_memory(local, transport, project_id=project.project_id)
@@ -940,7 +991,10 @@ def test_memory_pull_rejects_oversized_memory_before_install(tmp_path: Path) -> 
     with pytest.raises(RemoteSyncError, match="memory file brief.md is too large"):
         pull_project_memory(local, transport, project_id=project.project_id)
 
-    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id)) == original
+    assert (
+        dict(ProjectRegistry(local / "projects").load_memory(project.project_id))
+        == original
+    )
 
 
 def _legacy_project_digest(root: Path) -> str:
@@ -1024,7 +1078,9 @@ def test_project_transfer_includes_user_dot_temporary(tmp_path: Path) -> None:
 
     prepared = prepare_project_transfer(snapshot)
 
-    with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as archive:
+    with tarfile.open(
+        fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz"
+    ) as archive:
         assert "payload/.user-notes.tmp" in archive.getnames()
 
 
@@ -1094,13 +1150,14 @@ def test_memory_push_ignores_edited_readable_mirror(tmp_path: Path) -> None:
 
     assert memory_module.project_digest(project_path) == digest_before_edit
 
-    push_project_memory(
-        local, LocalTransport(remote), project_id=project.project_id
-    )
+    push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
 
-    assert dict(
-        ProjectRegistry(remote / "projects").load_memory(project.project_id)
-    )["brief.md"] == "authoritative\n"
+    assert (
+        dict(ProjectRegistry(remote / "projects").load_memory(project.project_id))[
+            "brief.md"
+        ]
+        == "authoritative\n"
+    )
 
 
 def test_memory_pull_updates_when_only_remote_changed(tmp_path: Path) -> None:
@@ -1121,9 +1178,12 @@ def test_memory_pull_updates_when_only_remote_changed(tmp_path: Path) -> None:
 
     assert result.updated == ("brief.md",)
     assert not result.conflicts
-    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
-        "brief.md"
-    ] == "remote only\n"
+    assert (
+        dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
+            "brief.md"
+        ]
+        == "remote only\n"
+    )
 
 
 def test_memory_push_uses_per_file_cas_and_keeps_conflicts(tmp_path: Path) -> None:
@@ -1145,7 +1205,10 @@ def test_memory_push_uses_per_file_cas_and_keeps_conflicts(tmp_path: Path) -> No
     result = push_project_memory(local, transport, project_id=project.project_id)
 
     assert result.conflicts == ("brief.md",)
-    assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "remote edit\n"
+    assert (
+        dict(remote_projects.load_memory(project.project_id))["brief.md"]
+        == "remote edit\n"
+    )
     conflicts = list(
         (remote / "projects" / project.project_id / "memory").glob(
             "brief.md.conflict-local-*"
@@ -1176,7 +1239,10 @@ def test_memory_conflict_retry_stays_unresolved_and_preserves_destination(
     second = push_project_memory(local, transport, project_id=project.project_id)
 
     assert first.conflicts == second.conflicts == ("brief.md",)
-    assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "remote edit\n"
+    assert (
+        dict(remote_projects.load_memory(project.project_id))["brief.md"]
+        == "remote edit\n"
+    )
     state_path = next((local / "projects" / project.project_id / "sync").glob("*.json"))
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert set(state["conflicts"]["brief.md"]["digests"]) == {
@@ -1213,7 +1279,10 @@ def test_memory_conflict_requires_explicit_resolution(tmp_path: Path) -> None:
     assert resolved.updated == ("brief.md",)
     assert not resolved.conflicts
     assert not retried.conflicts
-    assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "accepted local\n"
+    assert (
+        dict(remote_projects.load_memory(project.project_id))["brief.md"]
+        == "accepted local\n"
+    )
 
 
 def test_ssh_memory_sync_keeps_project_directory_and_side_files(
@@ -1265,10 +1334,7 @@ def _format_two_project_snapshot(
     if invalid:
         pointer = json.loads((snapshot / "memory-current.json").read_text())
         manifest_path = (
-            snapshot
-            / "memory-versions"
-            / "versions"
-            / f"{pointer['current']}.json"
+            snapshot / "memory-versions" / "versions" / f"{pointer['current']}.json"
         )
         manifest = json.loads(manifest_path.read_text())
         old_digest = manifest["snapshot"]
@@ -1441,7 +1507,9 @@ def test_prepared_project_transfer_is_immutable_after_source_change(
     (snapshot / "changed-after-prepare").write_text("new source file\n")
 
     assert prepared.archive_bytes == before
-    with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as archive:
+    with tarfile.open(
+        fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz"
+    ) as archive:
         assert all(member.isfile() for member in archive.getmembers())
         brief = archive.extractfile("payload/memory/brief.md")
         assert brief is not None
@@ -1472,7 +1540,9 @@ def test_ssh_project_publish_rejects_non_regular_archive_member(
     prepared = prepare_project_transfer(snapshot)
     changed = io.BytesIO()
     with tarfile.open(fileobj=changed, mode="w:gz") as output:
-        with tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as source:
+        with tarfile.open(
+            fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz"
+        ) as source:
             for member in source.getmembers():
                 stream = source.extractfile(member)
                 output.addfile(member, stream)
@@ -1483,7 +1553,9 @@ def test_ssh_project_publish_rejects_non_regular_archive_member(
 
     monkeypatch.setattr(
         "zeta.remote_sync.ssh.prepare_project_transfer",
-        lambda _snapshot: prepared.__class__(changed.getvalue(), prepared.transfer_digest),
+        lambda _snapshot: prepared.__class__(
+            changed.getvalue(), prepared.transfer_digest
+        ),
     )
     with pytest.raises(RemoteSyncError):
         SshTransport("fake", str(remote), name="cloud").publish_project(
@@ -1497,9 +1569,7 @@ def _replace_colliding_archive_tree(prepared: PreparedTransfer) -> bytes:
     changed = io.BytesIO()
     with (
         tarfile.open(fileobj=changed, mode="w:gz") as output,
-        tarfile.open(
-            fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz"
-        ) as source,
+        tarfile.open(fileobj=io.BytesIO(prepared.archive_bytes), mode="r:gz") as source,
     ):
         for member in source.getmembers():
             if member.name == "payload/x":
@@ -1573,7 +1643,9 @@ def test_legacy_project_digest_is_upgraded_at_sync_entry(tmp_path: Path) -> None
         ) -> None:
             self.published_expected = expected_digest
             if self.race:
-                concurrent = self.home / "projects" / project_id / "history" / "concurrent"
+                concurrent = (
+                    self.home / "projects" / project_id / "history" / "concurrent"
+                )
                 concurrent.parent.mkdir(exist_ok=True)
                 concurrent.write_text("preserve me\n")
             super().publish_project(
@@ -1668,9 +1740,7 @@ def test_initial_pointerless_project_snapshot_is_validated_and_published(
 ) -> None:
     snapshot, project_id = _pointerless_project_snapshot(tmp_path)
     remote = tmp_path / "remote"
-    _publish_initial_project(
-        kind, remote, snapshot, project_id, tmp_path, monkeypatch
-    )
+    _publish_initial_project(kind, remote, snapshot, project_id, tmp_path, monkeypatch)
 
     registry = ProjectRegistry(remote / "projects")
     assert registry.show_project(project_id).project_id == project_id
@@ -1756,7 +1826,9 @@ def test_project_schema_has_single_source() -> None:
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 value = integer_value(node.value)
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
                 if value == MAX_MEMORY_FILE_SIZE and any(
                     isinstance(target, ast.Name) for target in targets
                 ):
@@ -1823,9 +1895,7 @@ def test_interrupted_initial_creation_leaves_no_incoming_artifacts_ssh(
     transport = SshTransport("fake", str(remote), name="cloud")
     project_script = ssh_module._project_install_script
     script = project_script()
-    marker = (
-        "                shutil.copytree(snapshot, incoming, copy_function=_copy_file)\n"
-    )
+    marker = "                shutil.copytree(snapshot, incoming, copy_function=_copy_file)\n"
     assert marker in script
     killed_script = script.replace(marker, marker + "                os._exit(86)\n", 1)
     monkeypatch.setattr(ssh_module, "_project_install_script", lambda: killed_script)
@@ -1881,12 +1951,13 @@ def test_ssh_interrupted_memory_publication_keeps_valid_project(
         "interrupted sync\n",
     }
 
+
 def test_ssh_memory_pull_publishes_baseline_for_consecutive_remote_edits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     local = tmp_path / "local"
-    remote = tmp_path / "remote"
+    remote = initialize_storage_home(tmp_path / "remote")
     repo = tmp_path / "repo"
     _install_ssh_shim(tmp_path, monkeypatch)
     _git_repo(repo)
@@ -1904,9 +1975,12 @@ def test_ssh_memory_pull_publishes_baseline_for_consecutive_remote_edits(
     assert first.updated == second.updated == ("brief.md",)
     assert not first.conflicts
     assert not second.conflicts
-    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
-        "brief.md"
-    ] == "remote two\n"
+    assert (
+        dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
+            "brief.md"
+        ]
+        == "remote two\n"
+    )
 
 
 # These workers are module-level so the multiprocessing spawn context can import them.
@@ -1928,7 +2002,9 @@ def test_machine_id_concurrent_processes_agree(tmp_path: Path) -> None:
     with context.Manager() as manager:
         barrier = manager.Barrier(count)
         with context.Pool(count) as pool:
-            values = pool.starmap(_machine_id_process_worker, [(str(home), barrier)] * count)
+            values = pool.starmap(
+                _machine_id_process_worker, [(str(home), barrier)] * count
+            )
     assert len(set(values)) == 1
     assert values[0] == (home / ".machine-id").read_text(encoding="ascii").strip()
 
@@ -2004,7 +2080,9 @@ def test_machine_id_temp_file_cleaned_after_write_failure(
         _machine_id(home)
     assert created
     assert all(not path.exists() for path in created)
-    assert not [path for path in home.glob(".machine-id.*") if path.name != ".machine-id.lock"]
+    assert not [
+        path for path in home.glob(".machine-id.*") if path.name != ".machine-id.lock"
+    ]
 
 
 def test_machine_id_existing_file_permissions_repaired(
@@ -2060,9 +2138,9 @@ def test_sync_carries_source_automatic_flag_after_baseline(
 
     entry = next(
         item
-        for item in ProjectRegistry(
-            receiving / "projects"
-        ).load_memory_for_context(project.project_id)
+        for item in ProjectRegistry(receiving / "projects").load_memory_for_context(
+            project.project_id
+        )
         if item.name == "brief.md"
     )
     assert entry.content == f"automatic {direction}\n"
@@ -2129,10 +2207,16 @@ def test_remote_sync_import_creates_versioned_entry(tmp_path: Path) -> None:
     project, opened = _session(local, repo)
     opened.store.close()
     push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
-    ProjectRegistry(remote / "projects").update_memory(project.project_id, {"brief.md": "remote\n"})
+    ProjectRegistry(remote / "projects").update_memory(
+        project.project_id, {"brief.md": "remote\n"}
+    )
     pull_project_memory(local, LocalTransport(remote), project_id=project.project_id)
     records = ProjectRegistry(local / "projects").memory_log(project.project_id)
-    assert any(record.get("kind") == "import" and record.get("provenance", {}).get("source") == "remote_sync" for record in records)
+    assert any(
+        record.get("kind") == "import"
+        and record.get("provenance", {}).get("source") == "remote_sync"
+        for record in records
+    )
     assert ProjectRegistry(local / "projects").undo_memory(project.project_id)
 
 
