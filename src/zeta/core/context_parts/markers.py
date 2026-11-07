@@ -32,29 +32,8 @@ class ContextMarkerMixin:
                 messages = ContextMarkerMixin._eviction_view_messages(
                     view,
                     None if pinned is None else Message.from_dict(pinned),
+                    _fact_floor.projected_fact_floor(entry.data.get("fact_floor")),
                 )
-                floor = _fact_floor.projected_fact_floor(entry.data.get("fact_floor"))
-                pinned_rendered = None
-                if pinned is not None:
-                    pinned_value = Message.from_dict(pinned)
-                    pinned_rendered = Message(
-                        pinned_value.role,
-                        list(pinned_value.content),
-                        tool_result=pinned_value.tool_result,
-                        metadata={
-                            key: value
-                            for key, value in pinned_value.metadata.items()
-                            if key != "source_seq"
-                        },
-                    )
-                if (
-                    pinned_rendered is not None
-                    and messages
-                    and messages[-1] == pinned_rendered
-                ):
-                    messages[-1:] = [*floor, messages[-1]]
-                else:
-                    messages.extend(floor)
             else:
                 messages = [
                     normalize_evicted_tool_result(
@@ -88,7 +67,9 @@ class ContextMarkerMixin:
 
     @staticmethod
     def _eviction_view_messages(
-        view: Sequence[Mapping[str, Any]], pinned: Message | None = None
+        view: Sequence[Mapping[str, Any]],
+        pinned: Message | None = None,
+        floor: Sequence[Message] = (),
     ) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
         messages: list[Message] = []
@@ -151,6 +132,20 @@ class ContextMarkerMixin:
                 messages.insert(last_user + 1, projected_pinned)
             else:
                 messages.append(projected_pinned)
+        if floor:
+            pin_index = next(
+                (
+                    index
+                    for index, message in enumerate(messages)
+                    if message is projected_pinned
+                    or (
+                        pinned is not None
+                        and message == projected_pinned
+                    )
+                ),
+                len(messages),
+            )
+            messages[pin_index:pin_index] = floor
         return messages
 
     @staticmethod

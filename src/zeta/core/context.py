@@ -864,12 +864,12 @@ class ContextAssembler(ContextMarkerMixin):
                     "source_seq": latest_user_item.entry.seq,
                 },
             )
-        view_messages = self._eviction_view_messages(view)
-        proposed = floor_plan.proposed_messages(
-            system_messages,
-            view_messages,
-            None if latest_user_item is None else latest_user_item.message,
+        view_messages = self._eviction_view_messages(
+            view,
+            pinned_message,
+            ([] if floor_plan.message is None else [floor_plan.message]),
         )
+        proposed = floor_plan.proposed_messages(system_messages, view_messages)
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
             for m in view_messages

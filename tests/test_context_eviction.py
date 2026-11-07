@@ -3030,6 +3030,19 @@ async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
     ).assemble_context()
 
     assert "latest request verbatim" in rendered_text(context.messages)
+    request_index = next(
+        index
+        for index, message in enumerate(context.messages)
+        if message.role is MessageRole.USER
+        and "latest request verbatim" in rendered_text([message])
+    )
+    answer_index = next(
+        index
+        for index, message in enumerate(context.messages)
+        if message.tool_result is not None
+        and message.tool_result.tool_call_id == "read-new"
+    )
+    assert request_index < answer_index
     marker = next(entry for entry in store.replay() if entry.type == "compaction")
     expected_pinned = text(
         MessageRole.USER, "latest request verbatim"
