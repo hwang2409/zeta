@@ -672,7 +672,13 @@ class _Client:
                 else None
             )
             return await self.server.connections.read_status(
-                self, await self._status(), session_id
+                self,
+                await self._status(
+                    include_connection_setup_counts=(
+                        params.get("include_connection_setup_counts") is True
+                    )
+                ),
+                session_id,
             )
         raise ProtocolError(-32601, f"method not found: {method}")
 
@@ -835,7 +841,9 @@ class _Client:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
 
-    async def _status(self) -> dict[str, object]:
+    async def _status(
+        self, *, include_connection_setup_counts: bool = False
+    ) -> dict[str, object]:
         runtime = self.server.runtime
         session = self._session_snapshot()
         reconnect = "approval_reconnect" in self.features and self.role != "observer"
@@ -884,10 +892,16 @@ class _Client:
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
-            "connection_setup_counts": (
-                runtime.loop.connection_setup_counts()
-                if runtime.loop is not None
-                else ()
+            **(
+                {
+                    "connection_setup_counts": (
+                        runtime.loop.connection_setup_counts()
+                        if runtime.loop is not None
+                        else ()
+                    )
+                }
+                if include_connection_setup_counts
+                else {}
             ),
             **(
                 {"transcript_index_failure": transcript_index_failure}

@@ -75,7 +75,6 @@ from ...protocol.types import (
     user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
-from ...providers.transport import _schedule_cleanup_failure
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -108,6 +107,7 @@ from ._completion import (
     wait_for_provider_retry,
 )
 from ._store_writes import StoreWriteMixin
+from .backend_owners import BackendOwnerMixin
 from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     build_nudge_message,
@@ -150,6 +150,7 @@ class _ToollessTransition:
 
 
 class AgentLoop(
+    BackendOwnerMixin,
     TurnPersistenceMixin,
     ChildResultPayloadMixin,
     PlanModeRuntimeMixin,
@@ -373,51 +374,10 @@ class AgentLoop(
     def current_backend_state(self) -> PreparedBackendState:
         return PreparedBackendState(self.backend, self.context_assembler.token_budget)
 
-    def register_backend_owner(self, backend: CompletionBackend) -> None:
-        if isinstance(backend, OwnedCompletionBackend) and all(
-            owner is not backend for owner in self._backend_owners
-        ):
-            self._backend_owners.append(backend)
-
     def apply_backend_state(
         self, state: PreparedBackendState
     ) -> OwnedCompletionBackend | None:
         return apply_backend_state(self, state)
-
-    def connection_setup_counts(self) -> tuple[dict[str, object], ...]:
-        return tuple(
-            {
-                "provider": owner.provider,
-                "model": owner.model,
-                "count": owner.connection_setup_count,
-            }
-            for owner in self._backend_owners
-        )
-
-    def _backend_close_reporter(self, backend: OwnedCompletionBackend, stage: str):
-        def report(index: int, error: BaseException) -> None:
-            _schedule_cleanup_failure(
-                error,
-                stage=f"completion_backend_{stage}",
-                index=index,
-                primary_exception=None,
-                diagnostics_path=getattr(backend, "diagnostics_path", None),
-                provider=backend.provider,
-            )
-
-        return report
-
-    async def close_backend(
-        self, backend: OwnedCompletionBackend, *, stage: str
-    ) -> None:
-        backend.retire()
-        report = self._backend_close_reporter(backend, stage)
-        outcome = await backend.aclose(report_failure=report)
-        for failure in outcome.failures:
-            report(failure.index, failure.error)
-        self._backend_owners = [
-            owner for owner in self._backend_owners if owner is not backend
-        ]
 
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""

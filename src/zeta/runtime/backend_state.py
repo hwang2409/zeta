@@ -10,6 +10,7 @@ from ..protocol.types import (
     CompletionBackend,
     ContextWindowBackend,
     OwnedCompletionBackend,
+    is_owned_completion_backend,
 )
 
 
@@ -55,7 +56,7 @@ def apply_backend_state(
     if state.backend is previous:
         return None
     loop.register_backend_owner(state.backend)
-    if isinstance(previous, OwnedCompletionBackend):
+    if is_owned_completion_backend(previous):
         previous.retire()
         return previous
     return None

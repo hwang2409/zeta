@@ -228,7 +228,7 @@ class _FailingCloseClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("primary_error", [False, True])
-async def test_refresh_cleanup_failure_keeps_primary_outcome(
+async def test_refresh_reuses_lease_client_and_keeps_primary_outcome(
     primary_error: bool,
 ) -> None:
     lease = HTTPClientLease.__new__(HTTPClientLease)
@@ -253,14 +253,7 @@ async def test_refresh_cleanup_failure_keeps_primary_outcome(
     finally:
         loop.set_exception_handler(previous_handler)
 
-    assert contexts == [
-        {
-            "exception_type": "builtins.RuntimeError",
-            "stage": "refresh_client",
-            "index": 0,
-            "primary_outcome": "error" if primary_error else "success",
-        }
-    ]
+    assert contexts == []
 
 
 @pytest.mark.asyncio

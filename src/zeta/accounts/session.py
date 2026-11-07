@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.session import account_home
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
+from ..protocol.types import is_owned_completion_backend
 from .exhaustion import classify_subscription_limit, recovery_alternatives
 from .store import AccountDisplay, AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
@@ -304,7 +305,12 @@ class SessionAccountContext:
         build_backend: Callable[[SessionMetadata], Any],
     ) -> SessionMetadata:
         prepared_backend = getattr(new.backend_state, "backend", new.backend_state)
-        discard = prepared_backend if prepared_backend is not loop.backend else None
+        discard = (
+            prepared_backend
+            if prepared_backend is not loop.backend
+            and is_owned_completion_backend(prepared_backend)
+            else None
+        )
 
         def mark_unknown() -> Any:
             self._mark_unknown(build_backend)

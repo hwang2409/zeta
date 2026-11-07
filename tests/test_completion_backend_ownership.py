@@ -18,7 +18,7 @@ from zeta.protocol.types import Message, StreamEvent, ToolSchema
 from zeta.providers.ollama import OllamaBackend
 from zeta.providers.transport import CloseOutcome, close_transport_resources
 from zeta.runtime.loop import AgentLoop
-from zeta.runtime.loop import agent as agent_loop_module
+from zeta.runtime.loop import backend_owners as backend_owner_module
 from zeta.skills import SkillCatalog
 
 
@@ -317,7 +317,7 @@ async def test_runtime_reports_backend_close_failure(
         reports.append((error, stage, provider))
 
     # test-contract: seam capture the p26 reporter handoff without filesystem polling
-    monkeypatch.setattr(agent_loop_module, "_schedule_cleanup_failure", report)
+    monkeypatch.setattr(backend_owner_module, "_schedule_cleanup_failure", report)
     loop = AgentLoop(
         backend,
         ConversationStore(tmp_path),

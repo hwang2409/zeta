@@ -31,13 +31,13 @@ from ..protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    OwnedCompletionBackend,
     StreamEvent,
     StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
     assistant_text,
+    is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, credential_store
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -317,19 +317,12 @@ async def consume_run(
         **kwargs,
     )
 
-
 def resolve_child_backend(
-    loop: AgentLoop,
-    model: object,
+    loop: AgentLoop, model: object
 ) -> tuple[CompletionBackend | None, str | None]:
-    """Pick the backend a child runs on, returning an error message instead of raising.
-
-    Externally injected backends can be shared. Composed backends are rebuilt so
-    the child loop owns its own completion client.
-    """
-
+    """Give composed child loops a distinct backend owner."""
     if model is None:
-        if not isinstance(loop.backend, OwnedCompletionBackend):
+        if not is_owned_completion_backend(loop.backend):
             return loop.backend, None
         model = loop.backend.model
     if type(model) is not str or not model.strip():
@@ -340,16 +333,12 @@ def resolve_child_backend(
         return None, f"agent error: {exc}"
     context = getattr(loop, "account_context", None)
     account_kwargs = context.backend_kwargs(provider) if context is not None else {}
-    # Check credentials up front: the alternative is a child that spawns, burns a
-    # turn, and dies on an auth error the parent cannot act on.
     store = credential_store(provider, **account_kwargs)
     if store is not None:
         tokens = store.read() or store.bootstrap()
         if tokens is None:
-            return None, (
-                f"agent error: not logged in to {provider}; "
-                f"run zeta login --provider {provider}"
-            )
+            message = f"agent error: not logged in to {provider}; "
+            return None, message + f"run zeta login --provider {provider}"
     try:
         child_budget = effective_budget_for_model(
             provider, model, loop.context_assembler.token_budget
@@ -360,7 +349,6 @@ def resolve_child_backend(
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
-
 
 async def _build_child_loop(
     loop: AgentLoop,
@@ -383,7 +371,7 @@ async def _build_child_loop(
     async def close_construction() -> None:
         if child_loop is not None:
             await child_loop.close()
-        elif isinstance(child_backend, OwnedCompletionBackend):
+        elif is_owned_completion_backend(child_backend):
             await loop.close_backend(child_backend, stage="child_construction")
         if child_registry is not None:
             await child_registry.close()

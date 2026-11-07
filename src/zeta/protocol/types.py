@@ -15,6 +15,7 @@ from typing import (
     NotRequired,
     Protocol,
     TypedDict,
+    TypeGuard,
     runtime_checkable,
 )
 
@@ -934,3 +935,9 @@ class OwnedCompletionBackend(CompletionBackend, Protocol):
     async def aclose(
         self, *, report_failure: CloseFailureReporter | None = None
     ) -> CloseOutcome: ...
+
+
+def is_owned_completion_backend(value: object) -> TypeGuard[OwnedCompletionBackend]:
+    return isinstance(value, OwnedCompletionBackend) and callable(
+        getattr(value, "retire", None)
+    )
