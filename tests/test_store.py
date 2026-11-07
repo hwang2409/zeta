@@ -93,7 +93,10 @@ def test_store_reads_persisted_unknown_notification_kind_without_crash(
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    assert reopened.agent_notifications(pending_only=False)[0].data["kind"] == "future_kind"
+    assert (
+        reopened.agent_notifications(pending_only=False)[0].data["kind"]
+        == "future_kind"
+    )
 
 
 def test_task_notification_rejects_non_string_output_tail(tmp_path: Path) -> None:
@@ -277,7 +280,6 @@ def test_append_accepts_legacy_notification_without_killed_task_fields(
     ).agent_notifications()
 
 
-
 def test_load_accepts_legacy_notifications_without_origin(tmp_path: Path) -> None:
     """Rows written before notifications recorded ``origin`` still load."""
 
@@ -309,6 +311,7 @@ def test_load_accepts_legacy_notifications_without_origin(tmp_path: Path) -> Non
         if entry.type == "notification"
     }
     assert "task_exited" in kinds
+
 
 @pytest.mark.parametrize(
     "field_value",
@@ -412,9 +415,7 @@ def test_live_lifecycle_updates_do_not_write_and_finish_persists_final_stats(
     store.update_agent_lifecycle(tool_calls=3)
 
     assert writes == []
-    durable_running = json.loads(
-        store.agent_lifecycle_path.read_text(encoding="utf-8")
-    )
+    durable_running = json.loads(store.agent_lifecycle_path.read_text(encoding="utf-8"))
     assert durable_running["current_step"] == "starting"
     assert durable_running["turns_used"] == 0
     assert durable_running["tool_calls"] == 0
@@ -481,7 +482,9 @@ def test_child_transitions_preserve_sibling_live_turns(tmp_path: Path) -> None:
     assert durable["agent_children"][first.id]["turns_used"] == 4
 
 
-def test_reopened_running_lifecycle_uses_last_durable_transition(tmp_path: Path) -> None:
+def test_reopened_running_lifecycle_uses_last_durable_transition(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path)
     _start_agent_lifecycle(store)
     store.update_agent_lifecycle(
@@ -653,7 +656,9 @@ def test_lifecycle_load_drops_invalid_killed_task_fields(
 
 def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="session-1", cwd="/work")
-    first = store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
+    first = store.append_message(
+        with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER)
+    )
     second = store.append_message(message(MessageRole.ASSISTANT, "hi"))
 
     reopened = ConversationStore(tmp_path, session_id="session-1")
@@ -786,7 +791,9 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
 
     def reenter(_delta: tuple[ConversationEntry, ...] | str) -> None:
         store.on_entries_installed = None
-        observed.append(store.append_message(message(MessageRole.ASSISTANT, "inner")).id)
+        observed.append(
+            store.append_message(message(MessageRole.ASSISTANT, "inner")).id
+        )
 
     store.on_entries_installed = reenter
 
@@ -802,9 +809,7 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
 
 
 def test_flock_install_paths_allow_reentrant_callback_append(tmp_path: Path) -> None:
-    def run_reentrant(
-        store: ConversationStore, action: Callable[[], object]
-    ) -> None:
+    def run_reentrant(store: ConversationStore, action: Callable[[], object]) -> None:
         observed: list[tuple[ConversationEntry, ...] | str] = []
 
         def installed(delta: tuple[ConversationEntry, ...] | str) -> None:
@@ -867,9 +872,7 @@ def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> N
 
     store.append_message(message(MessageRole.ASSISTANT, "outer"))
 
-    durable = [
-        row.data["message"]["content"][0]["text"] for row in store._entries
-    ]
+    durable = [row.data["message"]["content"][0]["text"] for row in store._entries]
     assert observed == durable == ["outer", "inner"]
 
 
@@ -987,7 +990,9 @@ async def test_installed_hook_async_failure_keeps_receipt_bookkeeping(
     monkeypatch.setattr(store, "_accept_persisted_appends", accept)
     store.on_entries_installed = fail
 
-    entry = await store.append_message_async(message(MessageRole.ASSISTANT, "committed"))
+    entry = await store.append_message_async(
+        message(MessageRole.ASSISTANT, "committed")
+    )
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert receipts_accepted
@@ -1020,12 +1025,12 @@ async def test_installed_hook_async_writer_publishes_on_owner_thread(
         delta[0].data["message"]["content"][0]["text"] = "corrupted"
 
     # test-contract: seam exercises the store mutation boundary
-    monkeypatch.setattr(type(store), "_owned_installed_delta", staticmethod(tracked_copy))
+    monkeypatch.setattr(
+        type(store), "_owned_installed_delta", staticmethod(tracked_copy)
+    )
     store.on_entries_installed = installed
 
-    entry = await store.append_message_async(
-        message(MessageRole.ASSISTANT, "worker")
-    )
+    entry = await store.append_message_async(message(MessageRole.ASSISTANT, "worker"))
 
     assert copy_threads
     assert owner_thread not in copy_threads
@@ -1047,9 +1052,7 @@ def test_installed_hook_incremental_reload_emits_foreign_suffix_once(
     resident.refresh()
     resident.refresh()
 
-    assert [[row.id for row in delta] for delta in observed] == [
-        [first.id, second.id]
-    ]
+    assert [[row.id for row in delta] for delta in observed] == [[first.id, second.id]]
 
 
 def test_installed_hook_full_prefix_reload_emits_only_suffix(tmp_path: Path) -> None:
@@ -1201,7 +1204,11 @@ async def test_async_append_runs_off_loop_and_is_durable_on_return(
         real_fsync(fd)
 
     with patch("zeta.core.store._log.os.fsync", side_effect=observed_fsync):
-        entry = await store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
+        entry = await store.append_message_async(
+            with_message_origin(
+                message(MessageRole.USER, "durable"), MessageOrigin.USER
+            )
+        )
 
     assert append_threads and append_threads[0] != event_loop_thread
     reopened = ConversationStore(tmp_path, session_id="async-writer")
@@ -1373,7 +1380,6 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert store._active_pending_prompt_entries == fresh._active_pending_prompt_entries
 
 
-
 @pytest.mark.asyncio
 async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     tmp_path: Path,
@@ -1410,7 +1416,6 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
     assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
-
 
 
 @pytest.mark.asyncio
@@ -1592,7 +1597,6 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
     assert store.agent_lifecycle() == fresh.agent_lifecycle()
 
 
-
 @pytest.mark.asyncio
 async def test_off_loop_refresh_is_bounded_under_owner_writes(
     tmp_path: Path,
@@ -1624,7 +1628,6 @@ async def test_off_loop_refresh_is_bounded_under_owner_writes(
 
     assert loads == 1
     assert store.bash_cwd == "/owner-1"
-
 
 
 @pytest.mark.asyncio
@@ -1681,7 +1684,6 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
     ]
 
 
-
 @pytest.mark.asyncio
 async def test_off_loop_refresh_cancellation_is_prompt(
     tmp_path: Path,
@@ -1712,7 +1714,6 @@ async def test_off_loop_refresh_cancellation_is_prompt(
         await asyncio.gather(refresh, return_exceptions=True)
 
 
-
 @pytest.mark.asyncio
 async def test_async_writes_reuse_one_detached_store_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1721,7 +1722,9 @@ async def test_async_writes_reuse_one_detached_store_open(
     open_count = 0
     original_init = ConversationStore.__init__
 
-    def count_open(instance: ConversationStore, *args: object, **kwargs: object) -> None:
+    def count_open(
+        instance: ConversationStore, *args: object, **kwargs: object
+    ) -> None:
         nonlocal open_count
         if kwargs.get("_must_exist"):
             open_count += 1
@@ -1819,7 +1822,6 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
     assert store._entries == []
 
 
-
 @pytest.mark.asyncio
 async def test_async_write_cancelled_after_worker_start_is_durable(
     tmp_path: Path,
@@ -1833,7 +1835,9 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         assert release_fsync.wait(timeout=5)
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
-        task = asyncio.create_task(store._commit_method_async(store.append_pending_prompt, "durable"))
+        task = asyncio.create_task(
+            store._commit_method_async(store.append_pending_prompt, "durable")
+        )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         task.cancel()
         release_fsync.set()
@@ -1878,10 +1882,7 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
-    assert (
-        store._active_pending_prompt_entries
-        == fresh._active_pending_prompt_entries
-    )
+    assert store._active_pending_prompt_entries == fresh._active_pending_prompt_entries
 
 
 @pytest.mark.asyncio
@@ -1910,7 +1911,9 @@ async def test_async_batch_is_never_partially_visible_in_memory(
         release_install.set()
 
     # test-contract: seam exercises the store mutation boundary
-    monkeypatch.setattr(store, "_before_incremental_state_install", block_before_install)
+    monkeypatch.setattr(
+        store, "_before_incremental_state_install", block_before_install
+    )
     observer = threading.Thread(target=observe_while_blocked)
     observer.start()
     await store.record_agent_notification_delivery_async(
@@ -1944,7 +1947,9 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
     store._before_incremental_state_install = lambda: mutation_threads.append(
         threading.get_ident()
     )
-    await store.append_message_async(with_message_origin(message(MessageRole.USER, "loop-owned"), MessageOrigin.USER))
+    await store.append_message_async(
+        with_message_origin(message(MessageRole.USER, "loop-owned"), MessageOrigin.USER)
+    )
 
     assert mutation_threads
     assert set(mutation_threads) == {event_loop_thread}
@@ -2021,7 +2026,9 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     before = store.path.read_bytes()
 
     with patch(
@@ -2079,7 +2086,10 @@ def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
         "links": "missing prior parent",
         "approval": "approval resolution is not linked",
     }[damage]
-    assert str(error) == f"transcript {expected_label} at row 3 (session diagnose-{damage})"
+    assert (
+        str(error)
+        == f"transcript {expected_label} at row 3 (session diagnose-{damage})"
+    )
     assert (error.kind, error.row_number, error.byte_offset) == (
         kind,
         3,
@@ -2183,7 +2193,9 @@ def test_transcript_compatibility_classification_precedes_corruption(
 
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
 
@@ -2228,7 +2240,9 @@ def test_invalid_entry_fields_are_rejected(
     value: object,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row[field] = value
@@ -2290,7 +2304,9 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
 
 def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     del row["data"]["message"]["content"][0]["text"]
@@ -2303,7 +2319,9 @@ def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> Non
 
 def test_bad_nested_role_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["data"]["message"]["role"] = "not-a-role"
@@ -2316,7 +2334,9 @@ def test_bad_nested_role_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_numeric_nested_text_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["data"]["message"]["content"][0]["text"] = 42
@@ -2357,7 +2377,9 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
 def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     with patch("zeta.core.store._store.os.fsync") as fsync:
-        store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
+        store.append_message(
+            with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER)
+        )
 
     fsync.assert_called_once()
 
@@ -2433,7 +2455,11 @@ async def test_async_append_defers_repeated_cancellation_until_fsync(
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
+            store.append_message_async(
+                with_message_origin(
+                    message(MessageRole.USER, "durable"), MessageOrigin.USER
+                )
+            )
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         for _ in range(cancel_count):
@@ -2464,7 +2490,11 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
+            store.append_message_async(
+                with_message_origin(
+                    message(MessageRole.USER, "durable"), MessageOrigin.USER
+                )
+            )
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         close_thread = threading.Thread(target=close_store)
@@ -2481,7 +2511,9 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path) -> None:
+async def test_close_on_event_loop_drains_worker_without_deadlock(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path, session_id="loop-close")
     fsync_started = threading.Event()
     release_fsync = threading.Event()
@@ -2492,7 +2524,11 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
+            store.append_message_async(
+                with_message_origin(
+                    message(MessageRole.USER, "durable"), MessageOrigin.USER
+                )
+            )
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         release = threading.Timer(0.1, release_fsync.set)
@@ -2511,8 +2547,12 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path
 def test_sessions_are_isolated(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path)
     second = ConversationStore(tmp_path)
-    first.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
-    second.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
+    first.append_message(
+        with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER)
+    )
+    second.append_message(
+        with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER)
+    )
 
     assert first.path != second.path
     assert [item.content[0].text for item in first.messages()] == ["one"]
@@ -2532,7 +2572,9 @@ def test_concurrent_constructors_write_one_header(tmp_path: Path) -> None:
 
 def test_concurrent_constructors_repair_once(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="repair-race")
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
 
@@ -2553,7 +2595,10 @@ def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ConversationIntegrityError, match="missing prior parent"):
-        store.append_message(with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER), parent_id="missing")
+        store.append_message(
+            with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER),
+            parent_id="missing",
+        )
 
 
 def test_empty_session_id_is_rejected(tmp_path: Path) -> None:
@@ -2563,7 +2608,9 @@ def test_empty_session_id_is_rejected(tmp_path: Path) -> None:
 
 def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     rows[-1] = (
         rows[-1]
@@ -2578,7 +2625,9 @@ def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> Non
 
 def test_self_parent_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "self"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "self"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["parent_id"] = row["id"]
@@ -2591,8 +2640,12 @@ def test_self_parent_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_forward_parent_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
-    store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER)
+    )
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     first_row = json.loads(rows[-2])
     second_row = json.loads(rows[-1])
@@ -2606,8 +2659,12 @@ def test_forward_parent_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
-    second = store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
+    first = store.append_message(
+        with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER)
+    )
+    second = store.append_message(
+        with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
+    )
     store._entries[0] = replace(first, parent_id=second.id)
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
@@ -2616,8 +2673,12 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
 
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
-    store.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
+    first = store.append_message(
+        with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER)
+    )
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     second_row = json.loads(rows[-1])
     second_row["id"] = first.id
@@ -2631,19 +2692,31 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
 def test_appends_do_not_reread_the_full_log(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="incremental")
     for index in range(200):
-        store.append_message(with_message_origin(message(MessageRole.USER, f"seed-{index}"), MessageOrigin.USER))
+        store.append_message(
+            with_message_origin(
+                message(MessageRole.USER, f"seed-{index}"), MessageOrigin.USER
+            )
+        )
 
     full_reloads = store._full_reload_count
     for index in range(20):
-        store.append_message(with_message_origin(message(MessageRole.USER, f"new-{index}"), MessageOrigin.USER))
+        store.append_message(
+            with_message_origin(
+                message(MessageRole.USER, f"new-{index}"), MessageOrigin.USER
+            )
+        )
 
     assert store._full_reload_count == full_reloads
 
 
-def test_live_store_tail_syncs_external_append_without_full_read(tmp_path: Path) -> None:
+def test_live_store_tail_syncs_external_append_without_full_read(
+    tmp_path: Path,
+) -> None:
     first = ConversationStore(tmp_path, session_id="shared-tail")
     second = ConversationStore(tmp_path, session_id="shared-tail")
-    second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
+    second.append_message(
+        with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER)
+    )
 
     full_reloads = first._full_reload_count
     first.append_message(message(MessageRole.ASSISTANT, "local"))
@@ -2726,15 +2799,14 @@ def test_approval_states_snapshot_uses_resident_indexes(
     foreign = ConversationStore(root, session_id="snapshot-race")
     call = ToolCall("call-1", "read", {"path": "/tmp/input"})
     foreign.append_approval_request(call.id, call)
+
     def fail_if_parsed(
         cls: type[ConversationEntry], value: dict[str, object]
     ) -> ConversationEntry:
         raise AssertionError(f"approval snapshot parsed {value!r}")
 
     # test-contract: seam exercises the store mutation boundary
-    monkeypatch.setattr(
-        ConversationEntry, "from_dict", classmethod(fail_if_parsed)
-    )
+    monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(fail_if_parsed))
     resident._install_log_state(foreign._snapshot_log_state())
     assert resident.approval_states_snapshot() == {call.id: (call, None)}
 
@@ -2864,7 +2936,9 @@ def test_live_store_separates_external_complete_unterminated_row(
 ) -> None:
     first = ConversationStore(tmp_path, session_id="live-unterminated")
     second = ConversationStore(tmp_path, session_id="live-unterminated")
-    second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
+    second.append_message(
+        with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER)
+    )
     second.close()
     with first.path.open("r+b") as handle:
         handle.seek(-1, 2)
@@ -2881,7 +2955,9 @@ def test_live_store_separates_external_complete_unterminated_row(
 
 def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="live-torn")
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     with store.path.open("ab") as handle:
         handle.write(b'{"seq":3,"id":"torn"')
 
@@ -2899,10 +2975,14 @@ def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> 
 
 def test_live_store_full_reloads_after_file_replacement(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="replaced")
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     replacement = store.path.with_suffix(".replacement")
     replacement.write_bytes(store.path.read_bytes())
-    store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER)
+    )
     replacement.replace(store.path)
 
     reloads = store._full_reload_count
@@ -2916,7 +2996,9 @@ def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="same-size-rewrite")
-    store.append_message(with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER)
+    )
     before = store.path.stat()
     original = store.path.read_bytes()
     rewritten = original.replace(b'"text":"old"', b'"text":"new"')
@@ -2931,7 +3013,9 @@ def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
 
 def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="growing-rewrite")
-    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
     original = store.path.read_bytes()
     store.path.write_bytes(original.replace(b"\n", b"\r\n"))
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
@@ -2946,8 +3030,12 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
     tmp_path: Path,
 ) -> None:
     resident = ConversationStore(tmp_path, session_id="old-prefix-rewrite")
-    resident.append_message(with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER))
-    resident.append_message(with_message_origin(message(MessageRole.USER, "x" * 70_000), MessageOrigin.USER))
+    resident.append_message(
+        with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER)
+    )
+    resident.append_message(
+        with_message_origin(message(MessageRole.USER, "x" * 70_000), MessageOrigin.USER)
+    )
     original = resident.path.read_bytes()
     rewritten = original.replace(b'"text":"old"', b'"text":"new"')
     assert len(rewritten) == len(original)
@@ -2971,11 +3059,15 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
 def test_live_store_full_reloads_after_truncation(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="truncated")
     header = store.path.read_bytes()
-    store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER)
+    )
     store.path.write_bytes(header)
 
     reloads = store._full_reload_count
-    store.append_message(with_message_origin(message(MessageRole.USER, "after"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "after"), MessageOrigin.USER)
+    )
 
     assert store._full_reload_count == reloads + 1
     assert [item.content[0].text for item in store.messages()] == ["after"]
@@ -2999,14 +3091,20 @@ def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:
 
 def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="shared")
-    first = store.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
+    first = store.append_message(
+        with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER)
+    )
 
     with patch(
         "zeta.core.checkpoints.mutation.os.urandom",
         return_value=bytes.fromhex(first.id),
     ):
         with pytest.raises(ConversationIntegrityError, match="duplicate"):
-            store.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
+            store.append_message(
+                with_message_origin(
+                    message(MessageRole.USER, "two"), MessageOrigin.USER
+                )
+            )
 
 
 def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> None:
@@ -3027,8 +3125,12 @@ def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> N
 
 def test_later_root_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
-    store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER)
+    )
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
+    )
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["parent_id"] = None
