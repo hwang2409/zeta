@@ -412,7 +412,6 @@ class ConnectionRegistry:
             return
         self._enqueue(output, _OutputFrame(frame))
 
-
     def _fits(self, output: _OutputState, frame: bytes) -> bool:
         control = output.overflow_frame
         assert control is not None
@@ -474,7 +473,6 @@ class ConnectionRegistry:
             await asyncio.gather(writer, return_exceptions=True)
         await state.connection.close()
         self._finish_future(output.ready, False)
-
 
     @staticmethod
     def _overflow_frame(role: str) -> bytes:
