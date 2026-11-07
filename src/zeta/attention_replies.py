@@ -58,7 +58,7 @@ class AttentionReplies:
             done = journal.with_name(journal.name.replace("sending-", "done-", 1))
             os.replace(journal, done)
             published = True
-            done.rmdir()
+            self._cleanup(done)
         for path in self.attention_dir.glob("done-*"):
             if path.is_dir():
                 self._cleanup(path)
@@ -68,7 +68,9 @@ class AttentionReplies:
         staged = []
         if self.staged_dir.is_dir():
             for path in sorted(self.staged_dir.iterdir()):
-                if path.is_file():
+                if path.name.startswith("."):
+                    path.unlink()
+                elif path.is_file():
                     staged.append((path.name, path.read_text(encoding="utf-8")))
         return RecoveryResult(tuple(staged), published)
 
@@ -98,10 +100,10 @@ class AttentionReplies:
             pairs = list(result.staged)
             if not pairs:
                 return result
-            journal = self._prepare_locked(pairs)
-            for attention_id, _ in pairs:
-                (self.staged_dir / attention_id).unlink()
-            self._send_journal(journal, from_session=from_session)
+            journal = self._prepare_locked(
+                pairs, source=self.staged_dir, from_session=from_session
+            )
+            self._send_journal(journal)
             done = journal.with_name(journal.name.replace("sending-", "done-", 1))
             os.replace(journal, done)
             self._cleanup(done)
@@ -121,9 +123,11 @@ class AttentionReplies:
                 if record.decision != reply:
                     raise ValueError("attention item is already resolved with a different reply")
                 return self._message_id([(attention_id, reply)]), True
-            journal = self._prepare_locked([(attention_id, reply)])
+            journal = self._prepare_locked(
+                [(attention_id, reply)], from_session=from_session
+            )
             message_id = journal.name.rsplit("-", 1)[-1]
-            self._send_journal(journal, from_session=from_session)
+            self._send_journal(journal)
             done = journal.with_name(journal.name.replace("sending-", "done-", 1))
             os.replace(journal, done)
             self._cleanup(done)
@@ -158,8 +162,8 @@ class AttentionReplies:
             pairs = [(item_id, self._validate_reply(reply)) for item_id, reply in replies]
             for item_id, _ in pairs:
                 self._check_open(self._record(item_id))
-            journal = self._prepare_locked(pairs)
-            self._send_journal(journal, from_session=from_session)
+            journal = self._prepare_locked(pairs, from_session=from_session)
+            self._send_journal(journal)
             done = journal.with_name(journal.name.replace("sending-", "done-", 1))
             os.replace(journal, done)
             self._cleanup(done)
@@ -180,7 +184,13 @@ class AttentionReplies:
             raise ValueError("reply must be nonempty and within the size limit")
         return reply.strip()
 
-    def _prepare_locked(self, pairs: list[tuple[str, str]]) -> Path:
+    def _prepare_locked(
+        self,
+        pairs: list[tuple[str, str]],
+        *,
+        from_session: str,
+        source: Path | None = None,
+    ) -> Path:
         for item_id, reply in pairs:
             self._check_open(self._record(item_id))
         sequence = 0
@@ -191,17 +201,21 @@ class AttentionReplies:
             try: sequence = max(sequence, int(path.name.split("-", 2)[1]))
             except (ValueError, IndexError): raise ValueError("invalid attention journal sequence")
         message_id = self._message_id(pairs)
-        private = self.attention_dir / f".batch-{secrets.token_hex(8)}"
         if not pairs:
             raise ValueError("attention batch must not be empty")
-        private.mkdir(mode=0o700)
-        for item_id, reply in pairs:
-            path = private / item_id
-            path.write_text(reply, encoding="utf-8")
-            os.chmod(path, 0o600)
-        self._sync_directory(private)
+        if source is None:
+            source = self.attention_dir / f".batch-{secrets.token_hex(8)}"
+            source.mkdir(mode=0o700)
+            for item_id, reply in pairs:
+                path = source / item_id
+                path.write_text(reply, encoding="utf-8")
+                os.chmod(path, 0o600)
+        sender_path = source / ".sender"
+        sender_path.write_text(from_session, encoding="utf-8")
+        os.chmod(sender_path, 0o600)
+        self._sync_directory(source)
         journal = self.attention_dir / f"sending-{sequence + 1:020d}-{message_id}"
-        os.replace(private, journal)
+        os.replace(source, journal)
         self._sync_directory()
         return journal
 
@@ -213,8 +227,12 @@ class AttentionReplies:
         finally:
             os.close(fd)
 
-    def _send_journal(self, journal: Path, *, from_session: str | None = None) -> None:
-        pairs = [(path.name, path.read_text(encoding="utf-8")) for path in sorted(journal.iterdir())]
+    def _send_journal(self, journal: Path) -> None:
+        pairs = [
+            (path.name, path.read_text(encoding="utf-8"))
+            for path in sorted(journal.iterdir())
+            if not path.name.startswith(".")
+        ]
         if not pairs:
             raise ValueError("attention journal is empty")
         state = self.registry_state or available_project_registry(self.home / "projects")
@@ -224,7 +242,7 @@ class AttentionReplies:
         records = [self._record(item_id) for item_id, _ in pairs]
         if any(record.project_id is None for record in records):
             raise ValueError("attention record has no project")
-        sender = from_session or self.source_session_id
+        sender = (journal / ".sender").read_text(encoding="utf-8")
         first = records[0]
         label = "Decision" if first.kind == "decision" else "Reply"
         sections = []
