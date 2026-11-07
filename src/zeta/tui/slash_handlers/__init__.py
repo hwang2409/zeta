@@ -595,11 +595,6 @@ class SlashHandlerMixin:
             f"{', '.join(work)}; stop it or wait"
         )
 
-    async def _change_plan_mode(self, enabled: bool) -> None:
-        persisted = self.loop.set_plan_mode(enabled)
-        if persisted is not None:
-            await persisted
-
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""
 

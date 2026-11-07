@@ -5416,6 +5416,35 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
             ]["code"] == -32602
         settings = {"model": "gpt-5.6-sol", "approval_mode": "deny"}
         assert (await rpc("set_settings", **settings))["result"] == settings
+        assert (
+            await _request(
+                reader,
+                writer,
+                "plan-on",
+                "slash_run",
+                {"session_id": sid, "text": "/plan on"},
+            )
+        )[-1]["result"]["kind"] == "output"
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        await _request(reader, writer, "new-plan", "new_session", {"provider": "codex"})
+        await _request(reader, writer, "resume-plan", "resume", {"session_id": sid})
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is True
+        assert (
+            await _request(
+                reader,
+                writer,
+                "implement",
+                "slash_run",
+                {"session_id": sid, "text": "/implement"},
+            )
+        )[-1]["result"]["kind"] == "model_input"
+        await _request(
+            reader, writer, "new-implement", "new_session", {"provider": "codex"}
+        )
+        await _request(
+            reader, writer, "resume-implement", "resume", {"session_id": sid}
+        )
+        assert (await rpc("session_settings"))["result"]["plan_mode"] is False
         assert server.runtime.metadata.model_fallback == (
             "codex",
             "gpt-5.6-luna",

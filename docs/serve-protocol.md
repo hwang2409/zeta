@@ -1462,8 +1462,8 @@ The shared slash registry has this order and surface availability:
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/project`,
-`/project-instructions`, `/status`, and `/vim`. `/project` shows the current
+`/implement`, `/inbox`, `/init`, `/mcp`, `/memory`, `/model`, `/plan`,
+`/project`, `/project-instructions`, `/status`, and `/vim`. `/project` shows the current
 association, and `/project init` discovers the working directory and associates
 this session. The mutating
 form is rejected while a turn, child, or approval is active. Runnable user
