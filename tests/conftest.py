@@ -756,8 +756,12 @@ async def close_direct_test_runtime_owners(
                 raise error[0]
             test_home_leases[canonical] = result[0]
 
-    if not Path(str(request.node.fspath)).name.startswith("test_storage_format"):
+    test_file = Path(str(request.node.fspath)).name
+    if not test_file.startswith(
+        ("test_storage_format", "test_background", "test_composer_completion")
+    ):
         ensure_format(tmp_path)
+    if test_file == "test_mcp_oauth.py":
         ensure_format(tmp_path / "zeta-home")
         os.chmod(tmp_path / "zeta-home", 0o700)
 

@@ -274,6 +274,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
     assert {path.relative_to(tmp_path).as_posix() for path in lock_paths} == {
         ".accounts-migration.lock",
         ".accounts.lock",
+        ".storage-format.lock",
         ".anthropic-oauth.json.lock",
         ".codex-oauth.json.lock",
         "account-locks/anthropic/default/lifecycle.lock",
@@ -283,6 +284,7 @@ def test_accounts_status_is_bounded_while_every_account_lock_is_held(
         "account-locks/codex/default/usage.lock",
         "account-locks/codex/login.lock",
     }
+    lock_paths = [path for path in lock_paths if path.name != ".storage-format.lock"]
 
     holder = subprocess.Popen(
         [
