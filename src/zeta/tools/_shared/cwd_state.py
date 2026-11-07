@@ -19,10 +19,14 @@ def open_session_cwd(path: Path, identity: tuple[int, int]) -> int:
     try:
         cwd_fd = os.open(path, _DIRECTORY_FLAGS)
     except OSError as exc:
-        if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
-            raise SessionCwdRemoved(
-                f"session cwd {path} was removed; use an absolute path"
-            ) from exc
+        if exc.errno == errno.ENOENT:
+            try:
+                os.lstat(path)
+            except OSError as path_exc:
+                if path_exc.errno == errno.ENOENT:
+                    raise SessionCwdRemoved(
+                        f"session cwd {path} was removed; use an absolute path"
+                    ) from exc
         raise ValueError("session cwd was replaced") from exc
     try:
         cwd_stat = os.fstat(cwd_fd)

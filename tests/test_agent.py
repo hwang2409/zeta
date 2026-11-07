@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -11717,6 +11718,79 @@ async def test_agent_cwd_rejects_missing_directory(tmp_path: Path) -> None:
     assert "existing directory" in result.content
     assert str(missing) in result.content
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_started_after_session_cwd_removal_uses_live_shell_cwd(
+    tmp_path: Path,
+) -> None:
+    async def run_child(case: str, *, explicit: bool) -> tuple[str, list[Message]]:
+        case_root = tmp_path / case
+        session_cwd = case_root / "removed"
+        survivor = case_root / "survivor"
+        session_cwd.mkdir(parents=True)
+        survivor.mkdir()
+        store = ConversationStore(case_root / "sessions", cwd=session_cwd)
+        child_arguments: dict[str, object] = {
+            "prompt": "child-work",
+            "description": "cwd child",
+        }
+        if explicit:
+            child_arguments["cwd"] = str(survivor)
+        backend = ChildCwdBackend(
+            child_arguments=child_arguments,
+            child_tool_call=ToolCall("child-bash", "bash", {"command": "pwd"}),
+        )
+        loop = AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        )
+
+        try:
+            try:
+                shutil.rmtree(session_cwd)
+                await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+            finally:
+                await loop.close()
+
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            try:
+                result = _first_tool_result(child_store)
+                assert result.is_error is False
+                return (
+                    result.structured_content["stdout"].strip(),
+                    child_store.messages(),
+                )
+            finally:
+                child_store.close()
+        finally:
+            store.close()
+
+    explicit_stdout, explicit_messages = await run_child("explicit", explicit=True)
+    fallback_stdout, fallback_messages = await run_child("fallback", explicit=False)
+    fallback_cwd = tmp_path / "fallback"
+    notices = [
+        message
+        for message in fallback_messages
+        if message.metadata.get("zeta_event") == "shell_cwd_recovered"
+    ]
+
+    assert explicit_stdout == str(tmp_path / "explicit" / "survivor")
+    assert not [
+        message
+        for message in explicit_messages
+        if message.metadata.get("zeta_event") == "shell_cwd_recovered"
+    ]
+    assert fallback_stdout == str(fallback_cwd)
+    assert len(notices) == 1
+    assert notices[0].content[0].text == (
+        f"[zeta] shell cwd: {fallback_cwd / 'removed'} was removed; "
+        f"continuing in {fallback_cwd}"
+    )
 
 
 @pytest.mark.asyncio

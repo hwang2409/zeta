@@ -1064,8 +1064,6 @@ class ToolRegistry:
                     kind="invalid_arguments",
                 )
             )
-        if tool_call.name in {"bash", "run_background"}:
-            self.resolve_shell_cwd(arguments.get("cwd"))
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal

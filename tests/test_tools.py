@@ -513,7 +513,7 @@ async def test_terminate_unregistered_drains_stdout_and_stderr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bash_invalid_start_cwd_falls_back_without_persisting(
+async def test_bash_removed_start_cwd_falls_back_and_persists(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing"
@@ -522,9 +522,9 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
 
     result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
 
-    assert result["isError"] is True
-    assert result["structuredContent"]["cwd_after"] == str(missing)
-    assert registry.bash_cwd == str(missing)
+    assert result["isError"] is False
+    assert result["structuredContent"]["cwd_after"] == str(tmp_path)
+    assert registry.bash_cwd == str(tmp_path)
 
 
 @pytest.mark.asyncio
