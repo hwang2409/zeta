@@ -4,7 +4,22 @@ from __future__ import annotations
 
 from importlib.resources import files
 
+from ..runtime.prompt import PromptFragment, owned_span
 from ..skills import SkillCatalog
+
+
+def load_identity_fragment(
+    *,
+    catalog: SkillCatalog,
+    identity: str | None = None,
+) -> PromptFragment:
+    """Render identity text with its generated skill index ownership."""
+
+    content = load_packaged_identity() if identity is None else identity
+    prefix = f"{content.rstrip()}\n\n"
+    index = catalog.index()
+    text = f"{prefix}{index}\n"
+    return PromptFragment(text, {"skill_index": owned_span(text, len(prefix), len(index))})
 
 
 def load_identity(
@@ -14,8 +29,7 @@ def load_identity(
 ) -> str:
     """Load identity content with the skill index for one session."""
 
-    content = load_packaged_identity() if identity is None else identity
-    return f"{content.rstrip()}\n\n{catalog.index()}\n"
+    return load_identity_fragment(catalog=catalog, identity=identity).text
 
 
 def load_packaged_identity() -> str:
@@ -38,6 +52,7 @@ def load_skill(name: str, *, catalog: SkillCatalog) -> str:
 
 __all__ = [
     "load_identity",
+    "load_identity_fragment",
     "load_packaged_identity",
     "load_runtime_guidance",
     "load_skill",

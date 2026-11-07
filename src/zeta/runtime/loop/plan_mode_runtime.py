@@ -7,7 +7,7 @@ from typing import Any
 
 from ...agent.plan_mode import plan_mode_prompt
 from ...protocol.types import ToolCall
-from .skill_refresh import RuntimePrompt
+from ..prompt import RuntimePrompt
 
 
 class PlanModeRuntimeMixin:

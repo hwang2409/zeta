@@ -28,9 +28,9 @@ from . import theme
 from .cards.agent import AgentCard
 from .cards.agent_message import (
     AgentIdentityIndex,
-    agent_header,
     answer_question_id,
     render_agent_message,
+    render_agent_notification_message,
     render_agent_tool_message,
 )
 from .cards.approval_card import render_approval_card as _render_approval_card
@@ -588,49 +588,6 @@ def render_agent_notification(
         if not isinstance(text, str):
             return Text("project inbox notification unavailable", style=theme.ERROR)
         return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
-    if kind == "child_question":
-        child_instance_id = event.data.get("child_instance_id")
-        question = event.data.get("question")
-        question_id = event.data.get("question_id")
-        options = event.data.get("options", ())
-        if (
-            not isinstance(child_instance_id, str)
-            or not isinstance(question, str)
-            or not isinstance(question_id, str)
-            or not isinstance(options, (list, tuple))
-            or any(not isinstance(option, str) for option in options)
-        ):
-            return Text("background agent notification unavailable", style=theme.ERROR)
-        identity = (identity_index or AgentIdentityIndex()).resolve(child_instance_id)
-        return render_agent_message(
-            agent_header("ask", "←", identity, state="pending"),
-            body=question,
-            options=options,
-            result=f"question {question_id}",
-            state="pending",
-        )
-    if kind == "child_idle":
-        description = event.data.get("description")
-        if not isinstance(description, str) or not description:
-            return Text("background agent notification unavailable", style=theme.ERROR)
-        suffix = " · idle"
-        prefix = "◌ "
-        message = prefix + _compact_notification_text(
-            description,
-            MAX_AGENT_NOTIFICATION_LINE - cell_len(prefix) - cell_len(suffix),
-        ) + suffix
-        return Text(message, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
-    if kind == "child_question_withdrawn":
-        child_instance_id = event.data.get("child_instance_id")
-        question_id = event.data.get("question_id")
-        if not isinstance(child_instance_id, str) or not isinstance(question_id, str):
-            return Text("background agent notification unavailable", style=theme.ERROR)
-        identity = (identity_index or AgentIdentityIndex()).resolve(child_instance_id)
-        return render_agent_message(
-            agent_header("withdraw", "←", identity, state="withdrawn"),
-            result=f"question {question_id}",
-            state="withdrawn",
-        )
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         note = event.data.get("note")
@@ -649,6 +606,20 @@ def render_agent_notification(
         if type(note) is str and note:
             message += f" · {note}"
         return Text(message, style=style, overflow="ellipsis", no_wrap=True)
+    readable_completion = (
+        kind == "agent_completion"
+        and event.data.get("background_owner") != "background_macro"
+        and (
+            isinstance(event.data.get("child_instance_id"), str)
+            or isinstance(event.data.get("summary"), str)
+            or isinstance(event.data.get("verdict"), str)
+        )
+    )
+    if kind in {"child_question", "child_idle", "child_question_withdrawn"} or readable_completion:
+        rendered = render_agent_notification_message(event, identity_index)
+        if rendered is not None:
+            return rendered
+        return Text("background agent notification unavailable", style=theme.ERROR)
     description = event.data.get("description")
     status = event.data.get("status")
     if type(description) is not str or type(status) is not str or not description:
@@ -686,13 +657,12 @@ def render_agent_notification(
             if reason_limit > 0:
                 reason = _compact_notification_text(text, reason_limit)
                 parts.append(f"reason: {reason}")
-    rendered = Text(
+    return Text(
         " · ".join(parts),
         style=theme.ERROR if state != "completed" else theme.RECEIPT,
         overflow="ellipsis",
         no_wrap=True,
     )
-    return rendered
 
 
 def render_event(

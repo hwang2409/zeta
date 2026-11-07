@@ -8,7 +8,7 @@ import logging
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
-from typing import BinaryIO, Literal
+from typing import Literal
 from weakref import WeakKeyDictionary
 
 from ..core.abort import AbortSignal
@@ -45,6 +45,7 @@ from .envelope import (
     _format_wire_limit,
 )
 from .pagination import drain_pages
+from .stderr_log import RotatingStderrLog
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ class _Invalidation:
     generation: int
     process: asyncio.subprocess.Process | None
     reader_task: asyncio.Task[None] | None
-    stderr: BinaryIO | None
+    stderr_task: asyncio.Task[None] | None
     accumulator: MCPCallEnvelope | None
     pending: dict[int, _PendingCall]
     outcomes: dict[int, _Outcome]
@@ -144,7 +145,7 @@ class StdioMCPClient(MCPClient):
         self.protocol_version: str | None = None
         self.capabilities: dict[str, object] = {}
         self._process: asyncio.subprocess.Process | None = None
-        self._stderr: BinaryIO | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._next_id = 0
@@ -194,25 +195,35 @@ class StdioMCPClient(MCPClient):
                 self._invalidation = None
         self._reader_error = None
         log_path = mcp_log_path(self.config.name)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = log_path.open("ab")
+        try:
+            stderr_log = await RotatingStderrLog.prepare(log_path)
+        except OSError as exc:
+            raise MCPTransportError(
+                f"Could not open MCP stderr log {log_path}: {exc}"
+            ) from exc
         try:
             process = await asyncio.create_subprocess_exec(
                 self.config.command,
                 *self.config.args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=log_handle,
+                stderr=asyncio.subprocess.PIPE,
                 env=subprocess_env(self.config.env),
                 limit=MCP_STDIO_LINE_LIMIT,
                 start_new_session=True,
             )
         except BaseException:
-            log_handle.close()
+            await stderr_log.close()
             raise
         self._process = process
-        self._stderr = log_handle
         generation = self._generation
+        if process.stderr is None:
+            await stderr_log.close()
+            await _kill_and_reap(process, [])
+            raise MCPTransportError("MCP stdio server stderr pipe was not created")
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(process.stderr, stderr_log, generation)
+        )
         self._reader_task = asyncio.create_task(self._read_stdout(generation))
         try:
             result = await self._request("initialize", initialize_params())
@@ -480,12 +491,12 @@ class StdioMCPClient(MCPClient):
 
         process = self._process
         reader_task = self._reader_task
-        stderr = self._stderr
+        stderr_task = self._stderr_task
         accumulator = self._active_accumulator
         pending = self._pending
         self._process = None
         self._reader_task = None
-        self._stderr = None
+        self._stderr_task = None
         self._active_accumulator = None
         self._pending = {}
         self._generation += 1
@@ -494,7 +505,7 @@ class StdioMCPClient(MCPClient):
             self._generation - 1,
             process,
             reader_task,
-            stderr,
+            stderr_task,
             accumulator,
             pending,
             outcomes,
@@ -556,12 +567,14 @@ class StdioMCPClient(MCPClient):
                 self._invalidation_results[pending.owner] = result
 
     async def _finish_invalidation(self, invalidation: _Invalidation) -> None:
-        reader_tasks = (
-            [invalidation.reader_task]
-            if invalidation.reader_task is not None
-            and invalidation.reader_task is not invalidation.initiator
-            else []
-        )
+        reader_tasks = [
+            task
+            for task in (invalidation.reader_task,)
+            if task is not None and task is not invalidation.initiator
+        ]
+        stderr_task = invalidation.stderr_task
+        if stderr_task is invalidation.initiator:
+            stderr_task = None
         try:
             if invalidation.process is not None:
                 await _kill_and_reap(invalidation.process, reader_tasks)
@@ -569,11 +582,11 @@ class StdioMCPClient(MCPClient):
                 for task in reader_tasks:
                     task.cancel()
                 await asyncio.gather(*reader_tasks, return_exceptions=True)
+            if stderr_task is not None:
+                await stderr_task
         finally:
             if invalidation.accumulator is not None:
                 await invalidation.accumulator.close()
-            if invalidation.stderr is not None:
-                invalidation.stderr.close()
             for request_id, pending in invalidation.pending.items():
                 if pending.future.done():
                     continue
@@ -660,6 +673,24 @@ class StdioMCPClient(MCPClient):
         if invalidation.task is not None:
             await asyncio.shield(invalidation.task)
         return False
+
+    async def _drain_stderr(
+        self,
+        stream: asyncio.StreamReader,
+        log: RotatingStderrLog,
+        generation: int,
+    ) -> None:
+        try:
+            await log.drain(stream)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - log failure is transport failure
+            if generation == self._generation:
+                invalidation = self._start_invalidation(
+                    MCPTransportError(f"MCP stderr log {log.path} failed: {exc}")
+                )
+                if invalidation.task is not None:
+                    await asyncio.shield(invalidation.task)
 
     async def _read_stdout(self, generation: int | None = None) -> None:
         generation = self._generation if generation is None else generation
