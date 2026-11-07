@@ -89,6 +89,7 @@ class ServeControl:
     def __init__(self, server: ZetaServer) -> None:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
+        self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
@@ -159,9 +160,12 @@ class ServeControl:
 
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
-        return (self._turn_task is not None and not self._turn_task.done()) or (
-            loop is not None and loop.notification_turn_state != "idle"
-        )
+        return (
+            self._turn_task is not None and not self._turn_task.done()
+        ) or (
+            self._turn_handoff_task is not None
+            and not self._turn_handoff_task.done()
+        ) or (loop is not None and loop.notification_turn_state != "idle")
 
     async def require_idle(self) -> None:
         if self.turn_busy():
