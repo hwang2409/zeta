@@ -9220,7 +9220,7 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
 
     server = ZetaServer(
         home=tmp_path,
@@ -9248,12 +9248,16 @@ async def test_slash_run_during_running_turn_applies_busy_policy(
                 "slash_run",
                 {"session_id": sid, "text": text},
             )
+            message = response[-1]
             if "result" in row:
-                assert response[-1]["result"] == row["result"]
+                assert "result" in message and "error" not in message, message
+                assert message["result"] == row["result"]
             elif "result_kind" in row:
-                assert response[-1]["result"]["kind"] == row["result_kind"]
+                assert "result" in message and "error" not in message, message
+                assert message["result"]["kind"] == row["result_kind"]
             else:
-                assert response[-1]["error"]["code"] == row["error_code"], response
+                assert "error" in message and "result" not in message, message
+                assert message["error"]["code"] == row["error_code"], message
     finally:
         release.set()
         await _close(server, writer)

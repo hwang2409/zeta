@@ -77,13 +77,12 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     safe = {
         command.name
         for command in registry.builtin_commands
-        if command.serve is not None and command.serve.runs_while_busy("")
+        if command.serve is not None and command.serve.can_run_while_busy("")
     }
     assert safe == {
         "accounts",
         "help",
         "inbox",
-        "mcp",
         "memory",
         "model",
         "project",
@@ -91,10 +90,12 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
         "vim",
     }
     assert all(
-        command.serve is not None
+        command.serve is not None and command.serve.mutates is not None
         for command in registry.builtin_commands
         if command.name in safe
     )
+    assert registry.command_for("memory").serve.can_run_while_busy("")
+    assert not registry.command_for("memory").serve.can_run_while_busy("undo")
 
 
 def test_protocol_registry_matches_documented_errors_and_events() -> None:

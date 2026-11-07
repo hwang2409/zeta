@@ -878,6 +878,7 @@ class _Client:
                 register_model_input=register,
                 approval_control=self.server.control,
                 run_blocking=self.server.control._run_blocking,
+                busy=self.server.control.turn_busy(),
             )
         await self.server.control.require_idle()
         ergonomics.require_mutable(runtime, self.server.control.has_pending_approvals())

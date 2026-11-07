@@ -398,7 +398,7 @@ async def can_run_while_busy(runtime: ServerRuntime, text: str) -> bool:
     if command is not None:
         if not registry.available(command):
             return True
-        return command.serve is not None and command.serve.runs_while_busy(tail)
+        return command.serve is not None and command.serve.can_run_while_busy(tail)
     custom = registry.custom_command_for(name)
     if custom is not None:
         return custom.kind == "exec" or registry.needs_inline_shell_resolution(text)
@@ -417,6 +417,7 @@ async def run_command(
     register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
     approval_control: _ApprovalProjection | None = None,
     run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
+    busy: bool = False,
 ) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
@@ -451,6 +452,10 @@ async def run_command(
         if custom.kind != "prompt" or registry.needs_inline_shell_resolution(text):
             return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
         envelope = registry.input_for_model(text)
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
@@ -461,6 +466,10 @@ async def run_command(
     if isinstance(result, SlashPromptError):
         return {"kind": SlashResultKindDescriptor.ERROR, "text": result.message}
     if isinstance(result, ModelInputEnvelope):
+        if busy:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         return _model_input_result(result, register_model_input)
     if isinstance(result, _ClientOnlySlashResult):
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": result.name}
