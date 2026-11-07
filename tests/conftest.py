@@ -41,6 +41,24 @@ def _is_repository_test_path(path: Path) -> bool:
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if not _IS_REPOSITORY_TESTS:
+        return
+    root = Path(str(session.config.rootpath)).resolve()
+    if root != _REPOSITORY_ROOT:
+        return
+    import zeta
+
+    imported = Path(zeta.__file__).resolve()
+    source = (root / "src").resolve()
+    if not imported.is_relative_to(source):
+        pytest.exit(
+            f"wrong zeta import: {imported}; expected source under {source}. "
+            f"run uv run pytest from the worktree root or set PYTHONPATH={source}",
+            returncode=2,
+        )
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
