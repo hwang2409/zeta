@@ -24,8 +24,10 @@ from zeta.tui.transcript.message_finder import Role
 async def _open_finder_async(transcript: TranscriptWidget) -> None:
     request = transcript.open_finder()
     assert request is not None
-    candidates = await transcript.build_finder_candidates(request)
-    assert transcript.finder_publish_candidates(request, candidates)
+    async for candidates, complete in transcript.build_finder_candidate_batches(request):
+        assert transcript.finder_publish_candidate_batch(
+            request, candidates, complete=complete
+        )
 
 
 def _open_finder(transcript: TranscriptWidget) -> None:

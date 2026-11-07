@@ -23,13 +23,7 @@ from ..core.agent_progress import live_agent_lifecycle
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
-from ..protocol.types import (
-    Message,
-    TextContent,
-    ToolCall,
-    is_passive_harness_message,
-    is_visible_harness_notice,
-)
+from ..protocol.types import Message, ToolCall, is_passive_harness_message
 from . import theme
 from .cards.agent import (
     AgentCard,
@@ -67,7 +61,7 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
-from .checkpoints import render_replayed_message
+from .checkpoints import render_replayed_message, session_replay_provider
 from .todo import TodoSnapshot
 from .user import displayed_user_text, user_message
 
@@ -489,9 +483,7 @@ def _read_bounded_messages(
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
-                    if is_passive_harness_message(
-                        message
-                    ) and not is_visible_harness_notice(message):
+                    if is_passive_harness_message(message):
                         continue
                     append_message(message)
                     content = message.get("content")
@@ -676,40 +668,33 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
     async def _replay_batches(
         self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
     ) -> None:
+        provider = session_replay_provider(path)
         for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
             if self._closed:
                 return
             for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
-                self._replay(entry_id, raw_message, path)
+                self._replay(entry_id, raw_message, provider)
             await asyncio.sleep(0.001)
 
     def _replay(
-        self, entry_id: str, raw_message: dict[str, Any], path: Path
+        self, entry_id: str, raw_message: dict[str, Any], provider: str | None
     ) -> None:
         try:
             message = Message.from_dict(_bounded_message(raw_message))
         except (TypeError, ValueError):
             return
         unit_start = len(self.transcript._units)
-        if is_visible_harness_notice(message):
-            text = "\n".join(
-                block.text
-                for block in message.content
-                if isinstance(block, TextContent)
-            )
-            self.presenter.print_unit(Text(f"system · {text}", style=theme.CHROME))
-        else:
-            render_replayed_message(
-                message,
-                presenter=self.presenter,
-                print_user=self._print_user,
-                print_unit=self.presenter.print_unit,
-                tool_calls=self._tool_calls,
-                include_thoughts=True,
-                replay_tool_results=True,
-                replay_tool_starts=True,
-                session_path=path,
-            )
+        render_replayed_message(
+            message,
+            presenter=self.presenter,
+            print_user=self._print_user,
+            print_unit=self.presenter.print_unit,
+            tool_calls=self._tool_calls,
+            include_thoughts=True,
+            replay_tool_results=True,
+            replay_tool_starts=True,
+            provider=provider,
+        )
         units = self.transcript._units[unit_start:]
         self._entry_units.setdefault(entry_id, []).extend(units)
         self._unit_entries.update((unit, entry_id) for unit in units)

@@ -904,14 +904,16 @@ def write_ratchet(root: Path | None = None) -> tuple[int, int]:
 
 
 def select_base(event_name: str, base_ref: str = "") -> str:
-    if event_name == "pull_request":
-        if not base_ref:
+    if event_name in {"pull_request", "workflow_dispatch"}:
+        if event_name == "pull_request" and not base_ref:
             raise ValueError("pull_request requires a base ref")
-        subprocess.run(["git", "fetch", "--no-tags", "origin", base_ref], check=True)
+        subprocess.run(
+            ["git", "fetch", "--no-tags", "origin", base_ref or "main"], check=True
+        )
         return subprocess.check_output(
             ["git", "merge-base", "HEAD", "FETCH_HEAD"], text=True
         ).strip()
-    if event_name in {"push", "workflow_dispatch"}:
+    if event_name == "push":
         return subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip()
     raise ValueError(f"unsupported github event: {event_name}")
 
