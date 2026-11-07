@@ -1,5 +1,6 @@
 """The provider-neutral agent loop."""
 from __future__ import annotations
+
 import asyncio
 import inspect
 from collections.abc import (
@@ -116,6 +117,7 @@ from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
+
 
 def _sanitize_account_message(message: Message) -> Message:
     content = [
@@ -449,7 +451,6 @@ class AgentLoop(
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
-
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
         state = self.store.approval_states().get(request_id)
