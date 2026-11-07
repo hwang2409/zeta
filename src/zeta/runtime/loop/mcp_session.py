@@ -1,33 +1,49 @@
 """MCP session lifecycle operations for AgentLoop."""
 
 import asyncio
-import os
 import shlex
 from collections.abc import Callable
 from pathlib import Path
+from typing import Self
 
 from ...mcp import (
     MCPConfigError,
+    MCPManagementError,
     MCPManagementService,
     MCPMount,
-    home_config_path,
-    load_mcp_config_overlay,
     mount_mcp_servers,
-    project_config_path,
     tool_prefix,
 )
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
-    add_and_mount,
     parse_add_command,
-    remove_and_unshadow,
     render_mcp_status,
-    run_mcp_auth,
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
+from ...mcp.oauth import MCPOAuthError
+from ...mcp.oauth_store import (
+    MCPCredentialStoreError,
+    PublicCredentialStoreError,
+    public_credential_store_error,
+)
 from ...model_input import ModelInputEnvelope
+
+
+class MCPCommandOutput(str):
+    """Slash output with an optional typed credential-store error."""
+
+    credential_store_error: PublicCredentialStoreError | None
+
+    def __new__(
+        cls,
+        text: str,
+        credential_store_error: PublicCredentialStoreError | None = None,
+    ) -> Self:
+        value = super().__new__(cls, text)
+        value.credential_store_error = credential_store_error
+        return value
 
 
 class MCPSession:
@@ -46,17 +62,16 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            config = MCPManagementService(
-                home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value,
-            ).runtime_config()
+            service = self._mcp_management
+            config = await service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry,
                 config,
                 notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
             )
-        except MCPConfigError as exc:
+            service.mount = self._mcp_mount
+        except (MCPConfigError, MCPManagementError) as exc:
             self._mcp_config_error = str(exc)
             self._mcp_mount = MCPMount(
                 self.tool_registry, {}, {}, home=self._mcp_home_hint
@@ -84,8 +99,11 @@ class MCPSession:
         """Set the home + project scope this loop uses for MCP config files."""
 
         self._mcp_home_hint = None if home is None else str(home)
-        self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser().resolve()
+        self._mcp_project_dir_value = None if project_dir is None else Path(project_dir)
+        self._mcp_management = MCPManagementService(
+            home=self._mcp_home_hint,
+            project_dir=self._mcp_project_dir_value,
+            mount=self._mcp_mount,
         )
 
     def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
@@ -129,9 +147,7 @@ class MCPSession:
 
         missing = self.tool_registry.missing_required_tools
         if missing:
-            raise ValueError(
-                "required tools are unavailable: " + ", ".join(missing)
-            )
+            raise ValueError("required tools are unavailable: " + ", ".join(missing))
 
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set the sink for MCP mount notices."""
@@ -163,63 +179,87 @@ class MCPSession:
             return f"mcp error: {self._mcp_config_error}"
         if mount is None:
             return "mcp: no configured servers"
+        service = self._mcp_management
+        service.mount = mount
         if not parts:
-            return render_mcp_status(mount, home=self._mcp_home_hint)
+            return await self._render_mcp_status(mount, service)
         verb = parts[0]
         try:
             if verb == "status" and len(parts) == 1:
-                return render_mcp_status(mount, home=self._mcp_home_hint)
+                return await self._render_mcp_status(mount, service)
             if verb == "reconnect":
                 if len(parts) != 2:
                     return MCP_USAGE
-                await MCPManagementService(
-                    home=self._mcp_home_hint,
-                    project_dir=self._mcp_project_dir_value,
-                    mount=mount,
-                ).sync_runtime()
+                await service.sync_runtime()
                 await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
-                return render_mcp_status(mount, home=self._mcp_home_hint)
+                return await self._render_mcp_status(mount, service)
             if verb == "add":
-                await add_and_mount(
-                    mount,
-                    parse_add_command(parts[1:]),
-                    target=self._mcp_add_target(),
-                    notice_sink=self._mcp_notice_sink,
+                parsed = parse_add_command(parts[1:])
+                scope = "project" if self._mcp_project_dir_value is not None else "user"
+                await service.add(
+                    parsed.name,
+                    scope=scope,
+                    command=parsed.command,
+                    args=parsed.args,
+                    url=parsed.url,
+                    oauth=parsed.auth_type == "oauth",
                 )
-                return render_mcp_status(mount, home=self._mcp_home_hint)
-            if verb == "remove":
+                return await self._render_mcp_status(mount, service)
+            if verb in {"remove", "enable", "disable"}:
                 if len(parts) != 2:
                     return MCP_USAGE
-                await remove_and_unshadow(
-                    mount,
-                    parts[1],
-                    home_path=self._mcp_home_path(),
-                    load_home=lambda: (
-                        load_mcp_config_overlay(
-                            home=self._mcp_home_hint, project_dir=None
-                        ).configured_servers
-                    ),
-                    notice_sink=self._mcp_notice_sink,
-                )
-                return render_mcp_status(mount, home=self._mcp_home_hint)
+                item = await service.resolve(parts[1])
+                if verb == "remove":
+                    await service.remove(item.name, scope=item.scope)
+                else:
+                    await service.set_enabled(
+                        item.name, scope=item.scope, enabled=verb == "enable"
+                    )
+                return await self._render_mcp_status(mount, service)
+            if verb in {"trust", "untrust"}:
+                if len(parts) != 2:
+                    return MCP_USAGE
+                await service.set_trusted(parts[1], trusted=verb == "trust")
+                return await self._render_mcp_status(mount, service)
             if verb == "auth":
                 if len(parts) != 2:
                     return MCP_USAGE
-                return await run_mcp_auth(
-                    mount,
-                    parts[1],
-                    home=self._mcp_home_hint,
-                    notice_sink=self._mcp_notice_sink,
-                )
+                await service.login(parts[1])
+                await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
+                return await self._render_mcp_status(mount, service)
+            if verb == "logout":
+                if len(parts) != 2:
+                    return MCP_USAGE
+                await service.logout(parts[1])
+                return f"logged out {parts[1]}."
             if verb == "resources":
                 if len(parts) == 2:
                     return await run_mcp_resources_list(mount, parts[1])
                 if len(parts) == 3:
                     return await run_mcp_resource_attach(mount, parts[1], parts[2])
                 return MCP_USAGE
-        except (MCPCommandError, ValueError) as exc:
+        except MCPCredentialStoreError as exc:
+            error = public_credential_store_error(exc)
+            return MCPCommandOutput(error["text"], error)
+        except (
+            MCPCommandError,
+            MCPManagementError,
+            MCPOAuthError,
+            ValueError,
+        ) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
+
+    async def _render_mcp_status(
+        self, mount: MCPMount, service: MCPManagementService
+    ) -> str:
+        view = await service.refresh_credentials()
+        statuses = {entry.name: entry.auth for entry in view.entries}
+        return render_mcp_status(
+            mount,
+            credential_status=statuses,
+            configured_entries=view.entries,
+        )
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
@@ -227,15 +267,3 @@ class MCPSession:
         if self._mcp_mount is None:
             raise RuntimeError("MCP mount is unavailable")
         return await self._mcp_mount.get_prompt(name, arguments)
-
-    def _mcp_add_target(self) -> Path:
-        project_dir = self._mcp_project_dir_value
-        if project_dir is not None:
-            return project_config_path(project_dir)
-        return home_config_path(self._mcp_home_hint)
-
-    def _mcp_home_path(self) -> Path:
-        override = os.environ.get("ZETA_MCP_CONFIG")
-        if override:
-            return Path(override).expanduser().resolve()
-        return home_config_path(self._mcp_home_hint).resolve()

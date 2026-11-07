@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -1274,11 +1275,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     foreign.close()
 
     owner_thread = threading.get_ident()
-    heavy_threads: dict[str, list[int]] = {
-        "load": [],
-        "validate": [],
-        "rebuild": [],
-    }
+    load_threads: list[int] = []
     active_rows_by_thread: dict[int, int] = {}
     install_threads: list[int] = []
     loop_entry_accesses = 0
@@ -1306,23 +1303,14 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
             self._record_loop_access(len(self))
             return super().copy()
 
-    def observe_heavy(name: str):
-        original = getattr(ConversationStore, name)
+    original_load_full = ConversationStore._load_full
 
-        def observed(candidate: ConversationStore, *args: object, **kwargs: object):
-            heavy_threads[{"_load_full": "load", "_validate_entries": "validate", "_rebuild_incremental_validation_state": "rebuild"}[name]].append(
-                threading.get_ident()
-            )
-            return original(candidate, *args, **kwargs)
+    def observed_load_full(candidate: ConversationStore) -> None:
+        load_threads.append(threading.get_ident())
+        original_load_full(candidate)
 
-        monkeypatch.setattr(ConversationStore, name, observed)
-
-    for method_name in (
-        "_load_full",
-        "_validate_entries",
-        "_rebuild_incremental_validation_state",
-    ):
-        observe_heavy(method_name)
+    # test-contract: seam observe transcript loading across the async store boundary
+    monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
 
     original_record_active_entry = ConversationStore._record_active_entry
 
@@ -1358,12 +1346,8 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
     observe_loop_access = False
 
-    assert all(heavy_threads.values())
-    assert all(
-        thread != owner_thread
-        for threads in heavy_threads.values()
-        for thread in threads
-    )
+    assert load_threads
+    assert all(thread != owner_thread for thread in load_threads)
     assert active_rows_by_thread.get(owner_thread, 0) == 0
     assert sum(active_rows_by_thread.values()) >= len(rows)
     assert install_threads == [owner_thread]
@@ -2037,6 +2021,152 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     assert store.bash_cwd == str(Path.cwd())
 
 
+@pytest.mark.parametrize(
+    ("damage", "kind", "reason_code"),
+    [
+        ("parse", "invalid_row", "invalid_json"),
+        ("payload", "invalid_row", "invalid_payload"),
+        ("links", "broken_links", "missing_parent"),
+        ("approval", "broken_links", "unlinked_approval_resolution"),
+    ],
+)
+def test_corrupt_transcript_diagnosis_localizes_first_bad_row(
+    tmp_path: Path, damage: str, kind: str, reason_code: str
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"diagnose-{damage}")
+    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(message(MessageRole.ASSISTANT, "second"))
+    path = store.path
+    lines = path.read_bytes().splitlines(keepends=True)
+    expected_offset = len(lines[0]) + len(lines[1])
+    row = json.loads(lines[2])
+    if damage == "parse":
+        lines[2] = b'{"private":"must-not-leak"\n'
+    elif damage == "payload":
+        row["data"] = {"private": "must-not-leak"}
+        lines[2] = json.dumps(row).encode() + b"\n"
+    elif damage == "links":
+        row["parent_id"] = "must-not-leak"
+        lines[2] = json.dumps(row).encode() + b"\n"
+    else:
+        row["type"] = "approval_resolution"
+        row["data"] = {"request_id": "must-not-leak", "decision": "deny"}
+        lines[2] = json.dumps(row).encode() + b"\n"
+    damaged = b"".join(lines)
+    path.write_bytes(damaged)
+
+    with pytest.raises(ConversationIntegrityError) as raised:
+        ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
+
+    error = raised.value
+    expected_label = {
+        "parse": "terminated invalid conversation row",
+        "payload": "invalid payload for conversation entry",
+        "links": "missing prior parent",
+        "approval": "approval resolution is not linked",
+    }[damage]
+    assert str(error) == f"transcript {expected_label} at row 3 (session diagnose-{damage})"
+    assert (error.kind, error.row_number, error.byte_offset) == (
+        kind,
+        3,
+        expected_offset,
+    )
+    assert error.valid_prefix_end == expected_offset
+    assert error.reason_code == reason_code
+    stat = path.stat()
+    assert (error.source_device, error.source_inode, error.source_size) == (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+    )
+    assert error.prefix_digest == hashlib.sha256(damaged[:expected_offset]).hexdigest()
+    assert "must-not-leak" not in str(error)
+    assert str(path) not in str(error)
+    assert path.read_bytes() == damaged
+
+
+def test_abandoned_branch_semantic_failure_is_ignored(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="abandoned-semantic-failure")
+    root = store.append_message(message(MessageRole.USER, "root"))
+    store.append_message(message(MessageRole.ASSISTANT, "abandoned"))
+    active = store.append_message(
+        message(MessageRole.ASSISTANT, "active"), parent_id=root.id
+    )
+    rows = store.path.read_bytes().splitlines(keepends=True)
+    abandoned = json.loads(rows[2])
+    abandoned["type"] = "approval_resolution"
+    abandoned["data"] = {"request_id": "abandoned", "decision": "deny"}
+    rows[2] = json.dumps(abandoned).encode() + b"\n"
+    store.path.write_bytes(b"".join(rows))
+    store.close()
+
+    reopened = ConversationStore(
+        tmp_path, session_id="abandoned-semantic-failure", _read_only=True
+    )
+
+    assert [entry.id for entry in reopened.replay()] == [root.id, active.id]
+    reopened.close()
+
+
+def test_full_load_validates_the_final_branch_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="branch-rich")
+    root = store.append_message(message(MessageRole.USER, "root"))
+    for index in range(118):
+        store.append_message(
+            message(MessageRole.ASSISTANT, f"branch-{index}"), parent_id=root.id
+        )
+    store.close()
+    validations = 0
+    original = ConversationStore._record_active_entry
+
+    def count_validation(self: ConversationStore, entry: ConversationEntry) -> None:
+        nonlocal validations
+        validations += 1
+        original(self, entry)
+
+    # test-contract: seam count active-branch validation through a real store reopen
+    monkeypatch.setattr(ConversationStore, "_record_active_entry", count_validation)
+
+    reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
+
+    assert len(reopened.entries) == 119
+    assert len(reopened.replay()) == 2
+    assert validations == 2
+    reopened.close()
+
+
+@pytest.mark.parametrize("damage", ["future_schema", "future_entry"])
+def test_transcript_compatibility_classification_precedes_corruption(
+    tmp_path: Path, damage: str
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"diagnose-{damage}")
+    store.append_message(message(MessageRole.USER, "first"))
+    lines = store.path.read_bytes().splitlines(keepends=True)
+    row_index = 0 if damage == "future_schema" else 1
+    row = json.loads(lines[row_index])
+    if damage == "future_schema":
+        row["data"]["schema"] = "zeta.conversation.v999"
+    else:
+        row["type"] = "future_entry"
+        row["data"] = {"message": "not validated for a future type"}
+    lines[row_index] = json.dumps(row).encode() + b"\n"
+    lines.append(b'{"later":"corruption"\n')
+    store.path.write_bytes(b"".join(lines))
+
+    with pytest.raises(ConversationIntegrityError) as raised:
+        ConversationStore(tmp_path, session_id=store.session_id, _read_only=True)
+
+    assert str(raised.value) == (
+        f"transcript unsupported format at row {row_index + 1} "
+        f"(session diagnose-{damage})"
+    )
+    assert raised.value.kind == "unsupported_format"
+    assert raised.value.row_number == row_index + 1
+    assert raised.value.repairable is False
+
+
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
@@ -2068,7 +2198,9 @@ def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
     with store.path.open("ab") as handle:
         handle.write(b'{"invalid": }\n')
 
-    with pytest.raises(ConversationIntegrityError, match="terminated"):
+    with pytest.raises(
+        ConversationIntegrityError, match="terminated invalid conversation row at row 2"
+    ):
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
@@ -2482,53 +2614,27 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
-def test_appends_do_not_reread_the_full_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_appends_do_not_reread_the_full_log(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="incremental")
     for index in range(200):
         store.append_message(with_message_origin(message(MessageRole.USER, f"seed-{index}"), MessageOrigin.USER))
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    full_reloads = store._full_reload_count
     for index in range(20):
         store.append_message(with_message_origin(message(MessageRole.USER, f"new-{index}"), MessageOrigin.USER))
 
-    assert conversation_reads <= 1
+    assert store._full_reload_count == full_reloads
 
 
-def test_live_store_tail_syncs_external_append_without_full_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_tail_syncs_external_append_without_full_read(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path, session_id="shared-tail")
     second = ConversationStore(tmp_path, session_id="shared-tail")
     second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    full_reloads = first._full_reload_count
     first.append_message(message(MessageRole.ASSISTANT, "local"))
 
-    assert conversation_reads == 0
+    assert first._full_reload_count == full_reloads
     assert [item.content[0].text for item in first.messages()] == [
         "external",
         "local",
@@ -2773,9 +2879,7 @@ def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> 
     ]
 
 
-def test_live_store_full_reloads_after_file_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_full_reloads_after_file_replacement(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="replaced")
     store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     replacement = store.path.with_suffix(".replacement")
@@ -2783,21 +2887,10 @@ def test_live_store_full_reloads_after_file_replacement(
     store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     replacement.replace(store.path)
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    reloads = store._full_reload_count
     store.append_message(message(MessageRole.ASSISTANT, "after"))
 
-    assert conversation_reads == 1
+    assert store._full_reload_count == reloads + 1
     assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
 
 
@@ -2857,29 +2950,16 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
     ]
 
 
-def test_live_store_full_reloads_after_truncation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_live_store_full_reloads_after_truncation(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="truncated")
     header = store.path.read_bytes()
     store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     store.path.write_bytes(header)
 
-    from zeta.core.store import _log as log_module
-
-    original = log_module.read_session_file
-    conversation_reads = 0
-
-    def counted_read(directory_fd: int, name: str) -> bytes:
-        nonlocal conversation_reads
-        if name == "conversation.jsonl":
-            conversation_reads += 1
-        return original(directory_fd, name)
-
-    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    reloads = store._full_reload_count
     store.append_message(with_message_origin(message(MessageRole.USER, "after"), MessageOrigin.USER))
 
-    assert conversation_reads == 1
+    assert store._full_reload_count == reloads + 1
     assert [item.content[0].text for item in store.messages()] == ["after"]
 
 
@@ -2996,3 +3076,67 @@ def test_all_agent_notifications_copy_only_notification_rows(
 
     assert [entry.data["child_instance_id"] for entry in notifications] == ["root:1"]
     assert copied == ["notification"]
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "data"),
+    [
+        (
+            "client_delivery",
+            {
+                "delivery_id": "new-steer",
+                "method": "steer",
+                "status": "queued",
+                "outcome": {"accepted": True},
+                "accepted_message": message(
+                    MessageRole.USER, "keep this steer"
+                ).to_dict(),
+            },
+        ),
+        *(
+            ("turn_end", {"turn_id": f"{index:032x}", "reason": reason})
+            for index, reason in enumerate(
+                ("completed", "user_stop", "error", "disconnect")
+            )
+        ),
+    ],
+)
+def test_store_accepts_and_reopens_new_history_shapes(
+    tmp_path: Path, entry_type: str, data: dict[str, object]
+) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="history-fidelity")
+    try:
+        store._append_row(entry_type, data)
+    except ValueError:
+        accepted = False
+    else:
+        store.close()
+        reopened = ConversationStore(
+            sessions, session_id="history-fidelity", _must_exist=True
+        )
+        try:
+            accepted = any(
+                row.type == entry_type and row.data == data
+                for row in reopened.active_branch_snapshot()
+            )
+            if entry_type == "client_delivery":
+                reopened.append_client_delivery(
+                    "legacy-steer", "steer", "queued", {"accepted": True}
+                )
+                legacy = reopened.active_branch_snapshot()[-1]
+                assert "accepted_message" not in legacy.data
+            else:
+                for invalid in (
+                    {},
+                    {"turn_id": "0" * 32, "reason": "unknown"},
+                    {"turn_id": "0" * 31, "reason": "completed"},
+                    {"turn_id": "A" * 32, "reason": "completed"},
+                    {"turn_id": "g" * 32, "reason": "completed"},
+                    {"turn_id": "0" * 32, "reason": "completed", "extra": True},
+                ):
+                    with pytest.raises(ValueError, match="invalid payload"):
+                        reopened._append_row("turn_end", invalid)
+        finally:
+            reopened.close()
+    assert accepted, f"candidate accepted {entry_type} shape"

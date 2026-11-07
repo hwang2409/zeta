@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING
+import uuid
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
-from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.approval import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    PermissionSnapshot,
+    SessionGrantChange,
+    SessionGrantNotFound,
+    permission_snapshot,
+    revoke_session_grants,
+    session_grant_change,
+)
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -33,7 +44,13 @@ from .approval_lifecycle import (
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
-from .protocol import FrameWriteCancelled, ProtocolError, bounded
+from .protocol import (
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameWriteCancelled,
+    ProtocolError,
+    bounded,
+)
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -93,6 +110,9 @@ class ServeControl:
     def __init__(self, server: ZetaServer) -> None:
         self.server = server
         self._turn_task: asyncio.Task[None] | None = None
+        self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._session_swap_active = False
+        self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
@@ -135,6 +155,7 @@ class ServeControl:
                 origin=origin,
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
+                turn_id=uuid.uuid4().hex,
             )
         )
 
@@ -147,9 +168,8 @@ class ServeControl:
     def reject_client_turn_if_detached(self) -> None:
         if self._host_binding_required and self._active_host_commands is None:
             raise ProtocolError(
-                -32003,
+                ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
-                {"code": "host_binding_required"},
             )
 
     def request_turn_failure(self) -> None:
@@ -163,13 +183,39 @@ class ServeControl:
 
     def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
-        return (self._turn_task is not None and not self._turn_task.done()) or (
-            loop is not None and loop.notification_turn_state != "idle"
+        return (
+            self._session_swap_active
+            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_handoff_task is not None
+                and not self._turn_handoff_task.done()
+            )
+            or (loop is not None and loop.notification_turn_state != "idle")
         )
 
     async def require_idle(self) -> None:
         if self.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
+
+    @contextmanager
+    def reserve_session_swap(self) -> Iterator[None]:
+        if self.turn_busy():
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
+        state = self.server.runtime.state
+        session_id = None if state is None else state.session_id
+        self._session_swap_active = True
+        self._session_swap_id = session_id
+        try:
+            yield
+        finally:
+            self._session_swap_active = False
+            self._session_swap_id = None
+            if session_id is not None:
+                self._schedule_background_wake(session_id)
 
     def model_input_registrar(self, features: frozenset[str]):
         return self._model_inputs.registrar(
@@ -332,12 +378,19 @@ class ServeControl:
         self, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.server.runtime.loop
-        if loop is None:
-            raise ProtocolError(-32003, "no active session")
+        policy = self.server.runtime.policy
+        if loop is None or policy is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
             Decide(method, request_id, scope)
         )
         assert isinstance(result, dict)
+        added = tuple(sorted(map(str, policy.session_allow - grants_before)))
+        if added:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "grant", added)
+            )
         if (
             not self.turn_busy()
             and isinstance(core_key, str)
@@ -347,9 +400,25 @@ class ServeControl:
             if self.server.runtime.state is not None:
                 self.server.runtime.state.tool_started()
             self._turn_task = asyncio.create_task(
-                self._resume_tool(core_key, host_commands)
+                self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
         return result
+
+    async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is None or session_id is None:
+            return
+        await connections.publish_feature_event(
+            FEATURE, EVENT, session_id, data=event_data(change, session_id)
+        )
+
+    async def publish_session_grant_reset(self) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "reset")
+            )
 
     def request_approval_abort(
         self,
@@ -406,6 +475,7 @@ class ServeControl:
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -435,7 +505,11 @@ class ServeControl:
                     if event.type is StreamEventType.AGENT_END:
                         terminal_events.append(pending_turn_end)
                     else:
-                        await self._event(pending_turn_end, session_id=session_id)
+                        await self._event(
+                            pending_turn_end,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                        )
                     pending_turn_end = None
                 if event.type is StreamEventType.TURN_END:
                     pending_turn_end = event
@@ -445,7 +519,7 @@ class ServeControl:
                 elif event.type is StreamEventType.AGENT_END:
                     agent_end = event
                 else:
-                    await self._event(event, session_id=session_id)
+                    await self._event(event, session_id=session_id, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
@@ -459,7 +533,11 @@ class ServeControl:
                 terminal_error = None
                 agent_end = None
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         if terminal_error is not None:
             await self._notify(
@@ -469,14 +547,14 @@ class ServeControl:
                 data={},
             )
         for event in terminal_events:
-            await self._event(event, session_id=session_id)
+            await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
-        if self.closing:
+        if self.closing or self._session_swap_id == session_id:
             return
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -488,11 +566,17 @@ class ServeControl:
         ) or not loop.schedule_notification_turn():
             return
         self._turn_task = asyncio.create_task(
-            self._run_notification_turn(session_id, host_commands)
+            self._run_notification_turn(
+                session_id, host_commands, turn_id=uuid.uuid4().hex
+            )
         )
 
     async def _run_notification_turn(
-        self, session_id: str, host_commands: SessionHostCommands | None = None
+        self,
+        session_id: str,
+        host_commands: SessionHostCommands | None = None,
+        *,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -513,7 +597,10 @@ class ServeControl:
                 terminal_events.append(event)
             else:
                 await self._event(
-                    event, session_id=session_id, background=background
+                    event,
+                    session_id=session_id,
+                    background=background,
+                    turn_id=turn_id,
                 )
 
         try:
@@ -552,12 +639,16 @@ class ServeControl:
             ):
                 self._schedule_background_wake(session_id)
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         for event in terminal_events:
-            await self._event(event, session_id=session_id)
+            await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
 
@@ -570,7 +661,11 @@ class ServeControl:
             self._schedule_background_wake(runtime.session_id)
 
     async def _resume_tool(
-        self, request_id: str, host_commands: SessionHostCommands | None = None
+        self,
+        request_id: str,
+        host_commands: SessionHostCommands | None = None,
+        *,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -586,7 +681,9 @@ class ServeControl:
                 agent_end = event
             else:
                 event_tasks.append(
-                    asyncio.create_task(self._event(event, session_id=session_id))
+                    asyncio.create_task(
+                        self._event(event, session_id=session_id, turn_id=turn_id)
+                    )
                 )
 
         outcome = TurnOutcome.COMPLETED
@@ -609,10 +706,14 @@ class ServeControl:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             self._schedule_background_wake(session_id)
 
     async def _event(
@@ -621,6 +722,7 @@ class ServeControl:
         *,
         session_id: str | None = None,
         background: bool = False,
+        turn_id: str | None = None,
     ) -> None:
         state = self.server.runtime.state
         if session_id is None and not background and state is not None:
@@ -632,6 +734,8 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if foreground:
+            state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
@@ -673,11 +777,22 @@ class ServeControl:
                 )
             return
         connections = getattr(self.server, "connections", None)
-        controller = connections.controller_metadata() if connections is not None else None
-        fidelity = (
-            controller is not None
-            and "session_history_fidelity" in controller.features
+        controller = (
+            connections.controller_metadata() if connections is not None else None
         )
+        fidelity = (
+            controller is not None and "session_history_fidelity" in controller.features
+        )
+        if kind is StreamEventType.TURN_START:
+            data = dict(event.data)
+            if (
+                controller is not None
+                and "served_turn_end" in controller.features
+                and turn_id is not None
+            ):
+                data["turn_id"] = turn_id
+            await self._notify(wire_event, session_id, data=data)
+            return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,
@@ -758,7 +873,7 @@ class ServeControl:
         await self._notify(wire_event, session_id, data=dict(event.data))
 
     async def _start_approval(
-        self, event: StreamEvent, session_id: str | None, wire_event: str
+        self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
     ) -> None:
         await self._approvals.transition(Start(event, session_id, wire_event))
 
@@ -799,7 +914,7 @@ class ServeControl:
             )
 
     async def _notify(
-        self, event: str, session_id: str | None = None, **fields: object
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> bool:
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
@@ -841,3 +956,90 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
     if isinstance(child_id, str) and raw_request_id:
         return child_id, raw_request_id
     return raw_request_id
+
+
+FEATURE = "session_grants"
+READ = "session_grants"
+REVOKE = "revoke_session_grants"
+EVENT = event_contract.AUXILIARY_WIRE_EVENTS[
+    event_contract.AuxiliaryEvent.SESSION_GRANTS_CHANGED
+]
+
+
+def require_feature(features: frozenset[str]) -> None:
+    if FEATURE not in features:
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND,
+            "session grants require the negotiated session_grants feature",
+        )
+
+
+def read(
+    policy: ApprovalPolicy | None, session_id: str | None, params: dict[str, Any]
+) -> dict[str, object]:
+    if params:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_SESSION_GRANTS_PARAMS,
+            "session_grants takes no params",
+        )
+    if policy is None or session_id is None:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+    return snapshot_result(permission_snapshot(policy), session_id)
+
+
+def revoke(
+    policy: ApprovalPolicy | None,
+    session_id: str | None,
+    params: dict[str, Any],
+) -> tuple[dict[str, object], SessionGrantChange]:
+    if policy is None or session_id is None:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+    valid_grant = (
+        set(params) == {"grant"}
+        and isinstance(params.get("grant"), str)
+        and bool(params["grant"])
+    )
+    valid_clear = set(params) == {"clear"} and params.get("clear") is True
+    if not (valid_grant or valid_clear):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_SESSION_GRANTS_REVOKE,
+            "invalid revoke_session_grants params",
+        )
+    try:
+        change = (
+            revoke_session_grants(policy, exact=params["grant"])
+            if valid_grant
+            else revoke_session_grants(policy, clear=True)
+        )
+    except SessionGrantNotFound as exc:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_GRANT_NOT_FOUND,
+            "session grant not found",
+            {"grant": exc.grant},
+        ) from exc
+    return {
+        "removed": list(change.changed),
+        "grants": snapshot_result(change.snapshot, session_id),
+    }, change
+
+
+def event_data(change: SessionGrantChange, session_id: str) -> dict[str, object]:
+    return {
+        "change": change.change,
+        "changed": list(change.changed),
+        "grants": snapshot_result(change.snapshot, session_id),
+    }
+
+
+def snapshot_result(snapshot: PermissionSnapshot, session_id: str) -> dict[str, object]:
+    return {
+        "session_id": session_id,
+        "default": snapshot.default.value,
+        "precedence": list(snapshot.precedence),
+        "rules": {
+            "deny": list(snapshot.deny),
+            "ask": list(snapshot.ask),
+            "allow": list(snapshot.allow),
+        },
+        "session_grants": list(snapshot.session_grants),
+    }

@@ -97,6 +97,18 @@ def validate_client_delivery_data(
             and outcome == {"accepted": True}
         )
         allowed = {"delivery_id", "method", "status", "outcome"}
+        if "accepted_message" in data:
+            accepted_message = data["accepted_message"]
+            if (
+                method != "steer"
+                or status != "queued"
+                or not isinstance(accepted_message, dict)
+            ):
+                raise ValueError("invalid accepted steering message")
+            message = require_new_message_origin(Message.from_dict(accepted_message))
+            if message.role is not MessageRole.USER:
+                raise ValueError("invalid accepted steering message")
+            allowed.add("accepted_message")
         if set(data) - allowed or not valid_acceptance:
             raise ValueError("invalid client delivery")
         return
@@ -228,9 +240,20 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        accepted_message: Message | None = None,
     ) -> ClientDelivery:
         """Atomically append one acceptance and its optional user message."""
 
+        if message is not None and accepted_message is not None:
+            raise ValueError("message and accepted_message are mutually exclusive")
+        if accepted_message is not None and (
+            method != "steer"
+            or status != "queued"
+            or accepted_message.role is not MessageRole.USER
+        ):
+            raise ValueError("invalid accepted steering message")
+        if accepted_message is not None:
+            require_new_message_origin(accepted_message)
         with self._append_lock():
             if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
@@ -242,6 +265,11 @@ class ClientDeliveryMixin:
                         "method": method,
                         "status": status,
                         "outcome": dict(outcome),
+                        **(
+                            {"accepted_message": accepted_message.to_dict()}
+                            if accepted_message is not None
+                            else {}
+                        ),
                     },
                 )
             ]
@@ -265,6 +293,7 @@ class ClientDeliveryMixin:
         outcome: dict[str, object],
         *,
         message: Message | None = None,
+        accepted_message: Message | None = None,
         on_persisted: Callable[[], None] | None = None,
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
@@ -276,6 +305,7 @@ class ClientDeliveryMixin:
             status,
             outcome,
             message=message,
+            accepted_message=accepted_message,
             _on_persisted=on_persisted,
         )
 
@@ -375,18 +405,23 @@ class ClientDeliveryMixin:
 
     async def drop_client_steering_async(
         self: ConversationStore, reason: DeliveryDropReason
-    ) -> tuple[ConversationEntry, ...]:
+    ) -> tuple[tuple[ConversationEntry, Message], ...]:
         """Commit queued drops off-loop, then release their queue ownership."""
 
         queued = tuple(self._client_steering)
         entries = await self._to_thread_durable(
             self._drop_client_steering, queued, reason
         )
+        messages = {
+            item.delivery_id: without_client_delivery_marker(item.message)
+            for item in queued
+            if item.delivery_id is not None
+        }
         for expected in queued:
             if not self._client_steering or self._client_steering[0] != expected:
                 raise RuntimeError("client steering queue changed during drop")
             self._client_steering.popleft()
-        return tuple(entries)
+        return tuple((entry, messages[entry.data["delivery_id"]]) for entry in entries)
 
 
 def image_payload_digest(

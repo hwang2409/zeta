@@ -25,7 +25,7 @@ from ..storage_format import advance, mapping_mutations, open_writer
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
-from .store import ConversationStore
+from .store import ConversationStore, TranscriptLoadError
 from .store.prompt_composition import (
     PromptCompositionMixin,
     parse_prompt_recipe,
@@ -716,6 +716,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 _must_exist=True,
                 _storage_lease=self._storage_lease,
             )
+        except TranscriptLoadError:
+            raise
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:

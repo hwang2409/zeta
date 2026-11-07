@@ -33,6 +33,16 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import open_writer
+
+
+@pytest.fixture(autouse=True)
+def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
+    if request.node.get_closest_marker("asyncio") is None:
+        yield
+        return
+    with open_writer(tmp_path / ".zeta"):
+        yield
 
 
 def _projects(tmp_path: Path):
@@ -928,6 +938,8 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
         notes = _sent_status_notes(backend)
         assert len(notes) == 1
         assert backend.calls[0][0][-1] is notes[0]
+        assert notes[0].role is MessageRole.SYSTEM
+        assert notes[0].content[0].text.startswith("[zeta] inbox status:")
         assert (
             'inbox: your message "Can you review this?" to beta was claimed '
             f"by session {'b' * 32} at {inbox.read(project_b.project_id)['claimed'][0]['claimed_at']}"

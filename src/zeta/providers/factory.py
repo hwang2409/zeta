@@ -157,6 +157,7 @@ def build_backend(
             base_url=base_url,
             stall_seconds=stall_kwargs["stall_seconds"],
             stall_retries=stall_kwargs["stall_retries"],
+            diagnostics_path=runtime_home / "logs" / "stream-diagnostics.jsonl",
             token_budget=effective_budget,
             model_context_window=window,
         ), selected_model

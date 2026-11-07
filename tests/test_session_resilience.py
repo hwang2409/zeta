@@ -4,7 +4,11 @@ from pathlib import Path
 import pytest
 
 from zeta.core.session import SessionError, SessionManager
-from zeta.core.store import ConversationIntegrityError, ConversationStore
+from zeta.core.store import (
+    ConversationIntegrityError,
+    ConversationStore,
+    TranscriptLoadError,
+)
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -305,7 +309,8 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
     assert [(item.session_id, item.preview) for item in previews] == [
         (good.metadata.session_id, "healthy preview")
     ]
-    with pytest.raises(SessionError):
+    error_type = TranscriptLoadError if filename == "conversation.jsonl" else SessionError
+    with pytest.raises(error_type):
         manager.open(bad.metadata.session_id)
     assert path.read_text() == payload
 

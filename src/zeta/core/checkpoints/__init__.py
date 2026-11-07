@@ -40,6 +40,7 @@ CONVERSATION_ENTRY_TYPES = frozenset(
         "fork",
         "approval_resolution",
         "approval_history",
+        "turn_end",
         "notification",
         "notification_ack",
         "notification_tui_presented",

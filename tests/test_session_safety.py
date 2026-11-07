@@ -15,7 +15,7 @@ import pytest
 from zeta.cli.main import main
 from zeta.core import session as session_module
 from zeta.core.session import SessionError, SessionInUseError, SessionManager
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationStore, TranscriptLoadError
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -207,7 +207,7 @@ def test_read_only_store_holds_lease_without_creating_files(tmp_path):
 def test_failed_open_releases_lease(tmp_path):
     manager, sid = closed_session(tmp_path)
     (manager.sessions_dir / sid / "conversation.jsonl").write_bytes(b"bad\n")
-    with pytest.raises(SessionError):
+    with pytest.raises(TranscriptLoadError):
         manager.open(sid)
     manager.delete(sid)
     assert not (manager.sessions_dir / sid).exists()

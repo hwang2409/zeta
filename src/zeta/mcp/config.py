@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from ..core.session import env_home
+from .filename import encode_mcp_filename
 
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -29,7 +29,6 @@ RESERVED_AUTHORIZATION_PARAMS = frozenset(
         "resource",
     }
 )
-_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 MCP_TOOL_SEPARATOR = "__"
@@ -82,9 +81,8 @@ class MCPServerConfig:
 
         allowed = self.allowed_tools
         return (
-            (allowed is None or any(fnmatchcase(name, pattern) for pattern in allowed))
-            and not any(fnmatchcase(name, pattern) for pattern in self.disallowed_tools)
-        )
+            allowed is None or any(fnmatchcase(name, pattern) for pattern in allowed)
+        ) and not any(fnmatchcase(name, pattern) for pattern in self.disallowed_tools)
 
     def unknown_tool_patterns(
         self, names: set[str]
@@ -146,8 +144,7 @@ def mcp_log_path(name: str) -> Path:
     runtime_root = Path(
         os.environ.get("WIKI_AGENT_RUNTIME_DIR", env_home())
     ).expanduser()
-    safe_name = _SAFE_NAME.sub("_", name) or "server"
-    return runtime_root / "mcp-logs" / f"{safe_name}.log"
+    return runtime_root / "mcp-logs" / f"{encode_mcp_filename(name)}.log"
 
 
 def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
@@ -169,40 +166,13 @@ def load_mcp_config_overlay(
     """Load home config with a per-project overlay merged on top."""
 
     override = os.environ.get("ZETA_MCP_CONFIG")
-    home_path = (
-        Path(override).expanduser() if override else home_config_path(home)
-    )
+    home_path = Path(override).expanduser() if override else home_config_path(home)
     home_config = _load_single(home_path)
-    project_path = (
-        project_config_path(project_dir) if project_dir is not None else None
-    )
+    project_path = project_config_path(project_dir) if project_dir is not None else None
     if project_path is None or project_path.resolve() == home_path.resolve():
         return home_config
     project_config = _load_single(project_path)
     return _overlay(home_config, project_config)
-
-
-def write_mcp_config(path: str | Path, servers: dict[str, dict[str, object]]) -> None:
-    """Write a JSON MCP config to path atomically (tmp + rename)."""
-
-    target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    root = _read_mcp_document(target) if target.exists() else {}
-    root["servers"] = servers
-    payload = json.dumps(root, indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".mcp.", suffix=".json.tmp", dir=str(target.parent)
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def read_mcp_config_file(path: str | Path) -> dict[str, dict[str, object]]:
@@ -229,9 +199,7 @@ def _read_mcp_document(path: Path) -> dict[str, object]:
         raise MCPConfigError(f"MCP config servers must be an object: {path}")
     for name in raw_servers:
         if type(name) is not str or not name:
-            raise MCPConfigError(
-                f"MCP server names must be nonempty strings: {path}"
-            )
+            raise MCPConfigError(f"MCP server names must be nonempty strings: {path}")
     return dict(value)
 
 
@@ -263,9 +231,7 @@ def _load_single(selected_path: Path) -> MCPConfig:
             if type(resolved) is dict and deferred_headers is not None:
                 resolved["headers"] = deferred_headers
         except ValueError as exc:
-            malformed[name] = MCPServerConfig(
-                name, "stdio", malformed_reason=str(exc)
-            )
+            malformed[name] = MCPServerConfig(name, "stdio", malformed_reason=str(exc))
             sources[name] = selected_path
             continue
         if missing:
@@ -318,6 +284,7 @@ def _overlay(base: MCPConfig, top: MCPConfig) -> MCPConfig:
 
 def _interpolate(value: object, missing: set[str]) -> tuple[object, set[str]]:
     if type(value) is str:
+
         def replace(match: re.Match[str]) -> str:
             variable = match.group(1)
             resolved = os.environ.get(variable)
@@ -377,7 +344,10 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     if type(callback_port) is not int or not 0 <= callback_port <= 65535:
         raise ValueError("auth.callback_port must be an integer in 0..65535")
     scopes = raw_auth.get("scopes")
-    if scopes is not None and (type(scopes) is not list or any(type(item) is not str or not item for item in scopes)):
+    if scopes is not None and (
+        type(scopes) is not list
+        or any(type(item) is not str or not item for item in scopes)
+    ):
         raise ValueError("auth.scopes must be an array of nonempty strings")
     authorization_params = raw_auth.get("authorization_params", {})
     if type(authorization_params) is not dict or any(
@@ -402,8 +372,14 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
             if type(item) is not str or not item:
                 raise ValueError(f"auth.{key} must be a URL")
             parsed = urlparse(item)
-            if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
-                raise ValueError(f"auth.{key} must be a complete URL without credentials")
+            if (
+                parsed.hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise ValueError(
+                    f"auth.{key} must be a complete URL without credentials"
+                )
             if parsed.fragment:
                 raise ValueError(f"auth.{key} must not contain a fragment")
             if parsed.scheme != "https" and not (
@@ -414,14 +390,19 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
             urls[key] = item
     subjects = value.get("approval_subjects", {})
     raw_headers = value.get("headers", {})
-    if type(raw_headers) is not dict or any(type(k) is not str or type(v) is not str for k, v in raw_headers.items()):
+    if type(raw_headers) is not dict or any(
+        type(k) is not str or type(v) is not str for k, v in raw_headers.items()
+    ):
         raise ValueError("headers must be an object of strings")
     enabled = value.get("enabled", True)
     if type(enabled) is not bool:
         raise ValueError("enabled must be a boolean")
     allowed_tools = _tool_patterns(value, "allowed_tools", optional=True)
     disallowed_tools = _tool_patterns(value, "disallowed_tools", optional=False)
-    if type(subjects) is not dict or any(type(key) is not str or type(item) is not str or not item for key, item in subjects.items()):
+    if type(subjects) is not dict or any(
+        type(key) is not str or type(item) is not str or not item
+        for key, item in subjects.items()
+    ):
         raise ValueError("approval_subjects must map tool names to argument names")
     token = raw_auth.get("token")
     if auth_type == "bearer" and (type(token) is not str or not token):
@@ -507,7 +488,9 @@ def _server_config_for_missing_env(name: str, value: object) -> MCPServerConfig:
     command = raw_command if type(raw_command) is str else None
     raw_url = value.get("url")
     url = raw_url if type(raw_url) is str else None
-    return MCPServerConfig(name, transport, command=command, args=args, env=env, url=url)
+    return MCPServerConfig(
+        name, transport, command=command, args=args, env=env, url=url
+    )
 
 
 def server_to_json(config: MCPServerConfig) -> dict[str, object]:
@@ -587,5 +570,4 @@ __all__ = [
     "read_mcp_config_file",
     "resolve_server_config",
     "server_to_json",
-    "write_mcp_config",
 ]

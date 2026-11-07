@@ -24,7 +24,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
-from .protocol import ProtocolError
+from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -51,7 +51,7 @@ class DeliveryRequests:
         control = self._control
         runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(delivery_id)
         if duplicate is not None:
@@ -59,7 +59,9 @@ class DeliveryRequests:
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         value = control._model_inputs.resolve(
             runtime.session_id,
             params,
@@ -118,22 +120,24 @@ class DeliveryRequests:
     async def send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        from . import ergonomics
+        from . import ergonomics, image_delivery
 
         control = self._control
         runtime = control.server.runtime
         if runtime.loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(
             params, features, feature="send_images_delivery_id"
         )
         control.reject_client_turn_if_detached()
         control._reject_if_unhealthy()
         if control.turn_busy():
-            raise ProtocolError(-32004, "a turn is already running")
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
+            )
         ergonomics.require_mutable(runtime, control.has_pending_approvals())
         worker = asyncio.create_task(
-            asyncio.to_thread(ergonomics.prepare_image_delivery, runtime, params)
+            asyncio.to_thread(image_delivery.prepare_image_delivery, runtime, params)
         )
         try:
             prepared = await asyncio.shield(worker)
@@ -146,12 +150,12 @@ class DeliveryRequests:
             )
         except ProtocolError:
             await asyncio.to_thread(
-                ergonomics.cleanup_image_delivery, runtime, prepared
+                image_delivery.cleanup_image_delivery, runtime, prepared
             )
             raise
         if duplicate is not None:
             await asyncio.to_thread(
-                ergonomics.cleanup_image_delivery, runtime, prepared
+                image_delivery.cleanup_image_delivery, runtime, prepared
             )
             return duplicate
         message = prepared.message
@@ -159,20 +163,16 @@ class DeliveryRequests:
         assert isinstance(text, str)
         if delivery_id is None:
             try:
-                await control.user_message(
-                    text, "send", features, prepared.attachments
-                )
+                await control.user_message(text, "send", features, prepared.attachments)
             except asyncio.CancelledError:
                 await asyncio.to_thread(
-                    ergonomics.cleanup_image_delivery, runtime, prepared
+                    image_delivery.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             control.start_turn(text, message)
             return {"accepted": True, "session_id": runtime.session_id}
 
-        tagged = tag_client_delivery(
-            message, delivery_id, prepared.payload_digest
-        )
+        tagged = tag_client_delivery(message, delivery_id, prepared.payload_digest)
         outcome: dict[str, object] = {
             "accepted": True,
             "session_id": runtime.session_id,
@@ -189,7 +189,7 @@ class DeliveryRequests:
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
                 await asyncio.to_thread(
-                    ergonomics.cleanup_image_delivery, runtime, prepared
+                    image_delivery.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             canceled_after_commit = True
@@ -218,14 +218,14 @@ class DeliveryRequests:
         runtime = control.server.runtime
         loop = runtime.loop
         if loop is None or runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         requested_delivery_id = self._delivery_id(params, features)
         duplicate = self._duplicate(requested_delivery_id)
         if duplicate is not None:
             return duplicate
         control._reject_if_unhealthy()
         if not control.turn_busy():
-            raise ProtocolError(-32005, "no turn is running")
+            raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running")
         text = _required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
@@ -240,6 +240,7 @@ class DeliveryRequests:
                 "steer",
                 "queued",
                 outcome,
+                accepted_message=message,
             )
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
@@ -259,6 +260,7 @@ class DeliveryRequests:
         self,
         session_id: str,
         state: SessionState,
+        turn_id: str,
         outcome: TurnOutcome,
         *,
         schedule_wake: bool,
@@ -270,6 +272,7 @@ class DeliveryRequests:
             self._finalize_turn(
                 session_id,
                 state,
+                turn_id,
                 outcome,
                 schedule_wake=schedule_wake,
                 owner_task=owner_task,
@@ -286,6 +289,7 @@ class DeliveryRequests:
         self,
         session_id: str,
         state: SessionState,
+        turn_id: str,
         outcome: TurnOutcome,
         *,
         schedule_wake: bool,
@@ -302,18 +306,29 @@ class DeliveryRequests:
             dropped = await state.opened.store.drop_client_steering_async(reason)
             connections = control.server.connections
             if connections is not None:
-                for entry in dropped:
-                    row = event_contract.delivery_status_row(entry)
+                for entry, accepted_message in dropped:
+                    row = event_contract.delivery_status_row(entry, accepted_message)
                     await connections.publish_controller(
-                        "delivery_status",
+                        event_contract.AUXILIARY_WIRE_EVENTS[
+                            event_contract.AuxiliaryEvent.DELIVERY_STATUS
+                        ],
                         session_id,
                         required_feature="session_history_fidelity",
                         **{key: value for key, value in row.items() if key != "event"},
                     )
+        turn_reason = {
+            TurnOutcome.COMPLETED: "completed",
+            TurnOutcome.FOREGROUND_CANCELED: "user_stop",
+            TurnOutcome.SESSION_CANCELED: "user_stop",
+            TurnOutcome.FAILED: "error",
+            TurnOutcome.DISCONNECTED: "disconnect",
+        }[outcome]
+        await state.opened.store.append_turn_end_async(turn_id, turn_reason)
         control._approvals.prune_ended()
         if control.server.runtime.state is state:
             state.turn_finished()
         if control._turn_task is owner_task:
+            control._turn_handoff_task = owner_task
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (
@@ -332,7 +347,7 @@ class DeliveryRequests:
         delivery_id = _required_delivery_id(params)
         runtime = control.server.runtime
         if runtime.opened is None:
-            raise ProtocolError(-32003, "no active session")
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
@@ -368,12 +383,9 @@ class DeliveryRequests:
         store = runtime.opened.store
         delivery = store.client_delivery(delivery_id)
         if delivery is not None:
-            if (
-                payload_digest is not None
-                and delivery.payload_digest != payload_digest
-            ):
+            if payload_digest is not None and delivery.payload_digest != payload_digest:
                 raise ProtocolError(
-                    -32010,
+                    ErrorDescriptor.DELIVERY_ID_EVICTED,
                     "delivery id already used for a different payload",
                     {"outcome": delivery.status},
                 )
@@ -383,7 +395,7 @@ class DeliveryRequests:
         outcome = store.client_delivery_outcome(delivery_id)
         if outcome is not None:
             raise ProtocolError(
-                -32010,
+                ErrorDescriptor.DELIVERY_ID_EVICTED,
                 "delivery id already used",
                 {"outcome": outcome},
             )
@@ -393,7 +405,7 @@ class DeliveryRequests:
 async def _cleanup_canceled_image_delivery(
     worker: asyncio.Task[Any], runtime: Any
 ) -> None:
-    from . import ergonomics
+    from . import image_delivery
 
     settled = asyncio.Event()
     worker.add_done_callback(lambda _: settled.set())
@@ -405,7 +417,9 @@ async def _cleanup_canceled_image_delivery(
     if worker.cancelled() or worker.exception() is not None:
         return
     cleanup = asyncio.create_task(
-        asyncio.to_thread(ergonomics.cleanup_image_delivery, runtime, worker.result())
+        asyncio.to_thread(
+            image_delivery.cleanup_image_delivery, runtime, worker.result()
+        )
     )
     while not cleanup.done():
         try:
@@ -450,17 +464,20 @@ async def _deliver_after_commit(
         raise error
 
 
-def _require_feature(
-    features: frozenset[str], feature: str, param: str
-) -> None:
+def _require_feature(features: frozenset[str], feature: str, param: str) -> None:
     if feature not in features:
-        raise ProtocolError(-32602, f"{param} requires negotiated feature '{feature}'")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            f"{param} requires negotiated feature '{feature}'",
+        )
 
 
 def _required_string(params: dict[str, Any], name: str) -> str:
     value = params.get(name)
     if not isinstance(value, str) or not value:
-        raise ProtocolError(-32602, f"{name} must be a nonempty string")
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
+        )
     return value
 
 
@@ -468,7 +485,7 @@ def _required_delivery_id(params: dict[str, Any]) -> str:
     value = params.get("delivery_id")
     if not valid_client_delivery_id(value):
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_PARAMS,
             "delivery_id must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'",
         )
     return value
@@ -481,22 +498,31 @@ class ResolvedModelInput:
     origin: MessageOrigin
     message: Message | None
 
+
 class PendingModelInputs:
     """Issue and consume single-use IDs for server-generated envelopes."""
+
     def __init__(self, *, limit: int = 32) -> None:
         self._limit = limit
         self._inputs: dict[str, tuple[str, ModelInputEnvelope]] = {}
+
     def register(self, session_id: str, envelope: ModelInputEnvelope) -> str:
         while len(self._inputs) >= self._limit:
             del self._inputs[next(iter(self._inputs))]
         input_id = secrets.token_urlsafe(24)
         self._inputs[input_id] = (session_id, envelope)
         return input_id
-    def registrar(self, session_id: str, *, enabled: bool) -> Callable[[ModelInputEnvelope], str] | None:
+
+    def registrar(
+        self, session_id: str, *, enabled: bool
+    ) -> Callable[[ModelInputEnvelope], str] | None:
         if not enabled:
             return None
         return lambda envelope: self.register(session_id, envelope)
-    def resolve(self, session_id: str, params: Mapping[str, object], *, enabled: bool) -> ResolvedModelInput:
+
+    def resolve(
+        self, session_id: str, params: Mapping[str, object], *, enabled: bool
+    ) -> ResolvedModelInput:
         has_text, has_input_id = "text" in params, "input_id" in params
         if has_text == has_input_id:
             raise ValueError("send requires exactly one of text or input_id")
@@ -514,5 +540,14 @@ class PendingModelInputs:
         if pending is None or pending[0] != session_id:
             raise ValueError("input_id is invalid or expired")
         envelope = pending[1]
-        message = Message(MessageRole.USER, [TextContent(envelope.text)], metadata={MESSAGE_ORIGIN_METADATA: envelope.origin.value, "zeta.user_display_text": envelope.display_text})
-        return ResolvedModelInput(envelope.text, envelope.display_text, envelope.origin, message)
+        message = Message(
+            MessageRole.USER,
+            [TextContent(envelope.text)],
+            metadata={
+                MESSAGE_ORIGIN_METADATA: envelope.origin.value,
+                "zeta.user_display_text": envelope.display_text,
+            },
+        )
+        return ResolvedModelInput(
+            envelope.text, envelope.display_text, envelope.origin, message
+        )

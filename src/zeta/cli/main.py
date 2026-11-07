@@ -31,7 +31,7 @@ from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS, OAuthTokens
 from ..providers.factory import credential_store
-from ..storage_format import StorageFormatError, advance
+from ..storage_format import WRITER_EPOCH, StorageFormatError, advance
 from ..tui.app import create_app
 from ..tui.key_bindings import TerminalRenderError
 
@@ -119,9 +119,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 def _provider_name(value: str) -> str:
     if value == "fake":
-        raise argparse.ArgumentTypeError(
-            REMOVED_PROVIDER_ERROR
-        )
+        raise argparse.ArgumentTypeError(REMOVED_PROVIDER_ERROR)
     if value not in PROVIDERS:
         raise argparse.ArgumentTypeError(
             f"invalid provider {value!r}; choose claude, codex or ollama"
@@ -295,7 +293,9 @@ def build_parser() -> argparse.ArgumentParser:
     accounts_parser.add_argument("account", nargs="?")
     accounts_parser.add_argument("new_label", nargs="?")
     accounts_parser.add_argument("--json", action="store_true")
-    accounts_parser.add_argument("--refresh", dest="status_refresh", action="store_true")
+    accounts_parser.add_argument(
+        "--refresh", dest="status_refresh", action="store_true"
+    )
     accounts_parser.add_argument("--replace", action="store_true")
     from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
@@ -340,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         if action == "login":
             sub.add_argument("--no-browser", action="store_true")
     serve_parser = commands.add_parser(
-        "serve", help="serve zeta to one local frontend client"
+        "serve", help="serve zeta to a local controller and observers"
     )
     serve_parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     serve_parser.add_argument(
@@ -417,7 +417,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     storage_format_advance = storage_format_commands.add_parser("advance")
     storage_format_advance.add_argument("--expected-epoch", type=int, required=True)
-    storage_format_advance.add_argument("--target-epoch", type=int, default=1)
+    storage_format_advance.add_argument(
+        "--target-epoch", type=int, default=WRITER_EPOCH
+    )
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -488,10 +490,12 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
         return
     lines: list[str] = []
     for item in accounts:
-        marker = "  ★ default" if store.default(item.account.provider) == item.account else ""
-        lines.append(
-            str(item) + (f"  {item.detail}" if item.detail else "") + marker
+        marker = (
+            "  ★ default"
+            if store.default(item.account.provider) == item.account
+            else ""
         )
+        lines.append(str(item) + (f"  {item.detail}" if item.detail else "") + marker)
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
     print("\n".join(lines))
 
@@ -666,7 +670,9 @@ async def _account_statuses(
     return statuses, all_ok
 
 
-def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool) -> None:
+def _print_account_statuses(
+    statuses: list[dict[str, object]], *, as_json: bool
+) -> None:
     if as_json:
         print(json.dumps(statuses))
         return
@@ -681,7 +687,11 @@ def _print_account_statuses(statuses: list[dict[str, object]], *, as_json: bool)
         line = f"{status['provider']}:{status['account']}  {state}  expires {expiry}{default}"
         refresh = status.get("refresh")
         if isinstance(refresh, dict):
-            line += "  refresh ok" if refresh["ok"] else f"  refresh failed ({refresh['code']})"
+            line += (
+                "  refresh ok"
+                if refresh["ok"]
+                else f"  refresh failed ({refresh['code']})"
+            )
         lines.append(line)
     print("\n".join(lines))
 
@@ -789,14 +799,16 @@ def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> No
 
 
 def _retain_active_draft(
-    app: object | None, retained_drafts: list[_UnsavedDraft],
+    app: object | None,
+    retained_drafts: list[_UnsavedDraft],
 ) -> None:
     if app is not None and (draft := _unsaved_draft(app)) is not None:
         retained_drafts.append(draft)
 
 
 def _create_tui_app(
-    args: argparse.Namespace, parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
 ) -> object | None:
     try:
         if args.continue_session or args.resume is not None:
@@ -811,7 +823,8 @@ def _create_tui_app(
 
 
 def _run_tui_lifecycle(
-    args: argparse.Namespace, parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
     retained_drafts: list[_UnsavedDraft] = []
     current_session_id = ""
@@ -941,6 +954,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService
+        from ..mcp.oauth_store import (
+            MCPCredentialStoreError,
+            public_credential_store_error,
+        )
 
         service = MCPManagementService(project_dir=discover_repo_root(os.getcwd()))
         try:
@@ -949,20 +966,32 @@ def main(argv: list[str] | None = None) -> int:
                 if server_command[:1] == ["--"]:
                     server_command.pop(0)
                 command = server_command[0] if server_command else None
-                result = service.add(
-                    args.name,
-                    scope=args.scope,
-                    command=command,
-                    args=tuple(server_command[1:]),
-                    url=args.url,
-                    oauth=args.oauth,
-                    env=dict(item.split("=", 1) for item in args.env),
-                    headers=dict(item.split("=", 1) for item in args.header),
+                result = asyncio.run(
+                    service.add(
+                        args.name,
+                        scope=args.scope,
+                        command=command,
+                        args=tuple(server_command[1:]),
+                        url=args.url,
+                        oauth=args.oauth,
+                        env=dict(item.split("=", 1) for item in args.env),
+                        headers=dict(item.split("=", 1) for item in args.header),
+                    )
                 )
-                print(json.dumps(result.as_json(), sort_keys=True))
+                item = next(
+                    value
+                    for value in result.entries
+                    if value.name == args.name and value.scope == args.scope
+                )
+                print(json.dumps(item.as_json(), sort_keys=True))
                 return 0
             if args.mcp_action == "list":
-                values = [item.as_json() for item in service.list(scope=args.scope)]
+                view = asyncio.run(service.refresh_credentials())
+                values = [
+                    item.as_json()
+                    for item in view.entries
+                    if args.scope == "effective" or item.scope == args.scope
+                ]
                 output = (
                     json.dumps(values, sort_keys=True)
                     if args.json
@@ -974,7 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action == "show":
-                value = service.show(args.name, scope=args.scope).as_json()
+                asyncio.run(service.refresh_credentials())
+                value = asyncio.run(
+                    service.resolve(args.name, scope=args.scope)
+                ).as_json()
                 output = (
                     json.dumps(value, indent=2, sort_keys=True)
                     if args.json
@@ -983,32 +1015,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(output)
                 return 0
             if args.mcp_action in {"enable", "disable"}:
-                service.set_enabled(
-                    args.name,
-                    scope=args.scope,
-                    enabled=args.mcp_action == "enable",
+                asyncio.run(
+                    service.set_enabled(
+                        args.name,
+                        scope=args.scope,
+                        enabled=args.mcp_action == "enable",
+                    )
                 )
                 return 0
             if args.mcp_action == "remove":
-                service.remove(args.name, scope=args.scope)
+                asyncio.run(service.remove(args.name, scope=args.scope))
                 return 0
             if args.mcp_action == "trust":
-                service.trust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=True))
                 return 0
             if args.mcp_action == "untrust":
-                service.untrust(args.name)
+                asyncio.run(service.set_trusted(args.name, trusted=False))
                 return 0
             if args.mcp_action == "logout":
-                service.logout(args.name, scope=args.scope)
+                asyncio.run(service.logout(args.name, scope=args.scope))
+                print(f"logged out {args.name}.")
                 return 0
             result = (
                 asyncio.run(service.test(args.name, scope=args.scope))
                 if args.mcp_action == "test"
-                else asyncio.run(service.login(args.name, scope=args.scope, no_browser=getattr(args, "no_browser", False)))
+                else asyncio.run(
+                    service.login(
+                        args.name,
+                        scope=args.scope,
+                        no_browser=getattr(args, "no_browser", False),
+                    )
+                )
             )
             if result is not None:
                 print(json.dumps(result, sort_keys=True))
             return 0
+        except MCPCredentialStoreError as exc:
+            print(public_credential_store_error(exc)["text"], file=sys.stderr)
+            return 2
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2

@@ -6,7 +6,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend
 from tests.test_mcp_tool_filter import FilterClient
 from zeta.mcp import MCPServerConfig, StreamableHTTPMCPClient
-from zeta.mcp.oauth_store import MCPOAuthToken, save_token
+from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken
 from zeta.server.runtime import ServerRuntime
 
 
@@ -16,11 +16,19 @@ async def test_serve_mounts_mcp_server_tool_filter(
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    (home / "mcp.json").write_text(json.dumps({"servers": {"google": {
-        "transport": "stdio",
-        "command": "unused",
-        "allowed_tools": ["read_*"],
-    }}}))
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "google": {
+                        "transport": "stdio",
+                        "command": "unused",
+                        "allowed_tools": ["read_*"],
+                    }
+                }
+            }
+        )
+    )
     clients: list[FilterClient] = []
 
     def build(config: MCPServerConfig) -> FilterClient:
@@ -78,13 +86,14 @@ async def test_serve_mounts_already_authorized_oauth_server(
         redirect_uri="http://127.0.0.1:8000/callback",
         resource="https://mcp.test/rpc",
     )
-    save_token("mail", token, home=home)
+    await MCPCredentialStore(home=home).save_login("mail", token)
     mounted: list[StreamableHTTPMCPClient] = []
 
     async def connect_and_list(client: StreamableHTTPMCPClient) -> list:
         mounted.append(client)
-        assert client._current_token is not None
-        assert client._current_token.access_token == "stored-access-token"
+        snapshot = await MCPCredentialStore(home=home).load("mail")
+        assert snapshot.token is not None
+        assert snapshot.token.access_token == "stored-access-token"
         return []
 
     monkeypatch.setattr("zeta.mcp.mount._connect_and_list", connect_and_list)

@@ -12,8 +12,9 @@ newline. Messages are limited to 1 MiB on every transport.
 - `1.1` adds the session extensions and optional feature negotiation below.
 - `1.0` is the legacy base protocol.
 
-The server accepts one client. A second connection receives a JSON-RPC error
-with code `-32001`, then closes. The limit is shared by all enabled transports.
+The server accepts one controller plus up to eight negotiated read-only
+observers. A second controller or ninth observer receives a JSON-RPC error with
+code `-32001`, then closes. The limits are shared by all enabled transports.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
@@ -359,6 +360,25 @@ data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
 recovery.
 
+If the transcript is corrupt or uses a newer conversation format, `resume`
+returns `-32000` with bounded data:
+
+```text
+{
+  code: "corrupt_transcript",
+  kind: "torn_tail" | "invalid_row" | "broken_links" | "unsupported_format" | "unrecoverable_header",
+  row: integer | null,
+  repairable: boolean,
+  session_id: string,
+  actions: []
+}
+```
+
+The diagnosis-only protocol has no repair request, so `actions` is always the
+empty array. The object has at most six fields and contains no transcript
+bytes, payload text, file path, digest, source identity, or arbitrary exception
+text. `row` identifies the first bad physical row when it is known.
+
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
 the message `session working directory no longer exists: <cwd>`, and the active
@@ -470,11 +490,11 @@ With `session_history_fidelity`, a queued steer that is dropped emits a live
 `delivery_status` event after the terminal row commits. Terminal `delivered` and
 `dropped` rows both appear in `session_history`. Each row has `id`,
 `role: "system"`, `event: "delivery_status"`, `delivery_id`, `method: "steer"`,
-`status`, and renderable `content` such as `steer dropped: abort`. A dropped row
-also has `reason` (`restart`, `abort`, `clear`, `disconnect`, `turn_end`, or
-`failed`). Accepted steer text is not included yet; it requires a new stored row
-type after the stored-format gate is available. A missing reason in an old
-session means unknown.
+`status`, and renderable `content`. New queued steers retain their accepted text,
+so live and reloaded terminal rows render that text. Legacy rows without retained
+text keep the generic status content. A dropped row also has `reason` (`restart`,
+`abort`, `clear`, `disconnect`, `turn_end`, or `failed`). A missing reason in an
+old session means unknown.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
@@ -578,6 +598,67 @@ loaded session remains unhealthy and rejects later mutations with `-32000`. If
 an authoritative read finds that the requested decision was durable despite
 the write error, the server completes it once as a normal success.
 
+If a delegated approval-history write fails, the server still emits
+`approval_end` first, then the existing `server_error` event with
+`data.request_id`. The session health becomes `approval_persistence_failed`,
+and the affected turn fails.
+
+### session grants (`session_grants` feature)
+
+A client that negotiates `session_grants` can inspect the active approval
+policy and remove session-only grants created by `approve` with
+`scope: "always_tool"`. `ApprovalPolicy` remains the only authority. These
+requests only project or mutate that policy; they do not add a second grant
+store. `/permissions` remains a local TUI command and is not exposed through
+`slash_run`.
+
+`session_grants` takes no params and requires an active session. It returns:
+
+```json
+{
+  "session_id": "abc123",
+  "default": "ask",
+  "precedence": ["deny", "ask", "allow", "default"],
+  "rules": {
+    "deny": ["bash(rm *)"],
+    "ask": ["bash(git push*)"],
+    "allow": ["bash"]
+  },
+  "session_grants": ["bash"]
+}
+```
+
+All rule arrays contain canonical strings in sorted order. `rules.allow` is
+the effective union of configured allow rules and session grants;
+`session_grants` isolates only the removable session entries. The response is
+a fresh projection, so a replacement controller or a reconnected observer
+must read it again instead of reusing a client cache.
+
+`revoke_session_grants` is controller-only. Params are exactly one of
+`{"grant":"<exact canonical string>"}` or `{"clear":true}`. A grant string
+is matched exactly against the current canonical strings; it is never parsed
+into new authority. The response is `removed` plus a fresh snapshot under
+`grants`. Clearing an already-empty set succeeds with `removed: []` and does
+not emit an event. A missing exact grant returns `-32602` with data
+`{"code":"session_grant_not_found","grant":"..."}`. Any other params return
+`-32602` with data `{"code":"invalid_session_grants_revoke"}`. Params on the
+read request return `-32602` with data
+`{"code":"invalid_session_grants_params"}`. Without the negotiated feature,
+both requests return `-32601`; without an active session they return `-32003`.
+An observer can call `session_grants`, but mutation returns the existing
+`-32008` `observer_read_only` error.
+
+A real grant, revoke, clear, or session reset emits `session_grants_changed`
+to every live connection that negotiated the feature. Its data is
+`change` (`grant`, `revoke`, `clear`, or `reset`), sorted `changed` strings,
+and a fresh snapshot under `grants`. Duplicate grants, missing-grant errors,
+and empty clears emit no event. The event is queued before the matching
+request response. Session grants authorize future parent and delegated-child
+calls through the same policy; revocation affects future calls from both,
+while pending or already authorized calls are unchanged. A controller handoff
+or observer reconnect gets no replay: the client reads `session_grants` for
+the current state.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -637,11 +718,17 @@ work. The result contains `cleared`, the number of removed messages.
 
 ### `status`
 
-Params: none. The result contains `session` (full metadata or `null`), `state`
-(`idle`, `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`,
-and `compaction_markers`. Each pending approval has `request_id`, `tool_call`,
-and `delegated`. Delegated approvals also have `agent_instance_id`, the child
-agent instance that owns the approval.
+Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
+the result includes `connection_setup_counts`, an array of objects with
+`provider` (string), `model` (string), and `count` (integer). Each object reports
+the number of HTTP clients created by one completion backend. The field is
+omitted when the parameter is absent or false.
+
+The result contains `session` (full metadata or `null`), `state` (`idle`,
+`running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
+`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
+`delegated`. Delegated approvals also have `agent_instance_id`, the child agent
+instance that owns the approval.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -649,6 +736,25 @@ server's live projection and is limited to 64 entries. The result also contains
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Without the feature, the status shape and unbounded strict durable
 projection are unchanged.
+
+With the negotiated `served_turn_end` feature, the result also contains
+`last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
+outcome. Otherwise it contains the last outcome on that branch as
+`{"turn_id": string, "reason": string}`. Each status result is authoritative for
+the reported session and active branch, so clients replace any cached value even
+when the new value is `null`. Like other serve reads, `last_turn_outcome` reflects
+the server's resident session state and is current for turns this server ran. The
+reason mapping is:
+
+| user-facing semantic | wire reason |
+| --- | --- |
+| completed | `completed` |
+| failed | `error` |
+| canceled | `user_stop` |
+| disconnected | `disconnect` |
+
+Clients use `turn_id` to correlate this durable outcome with a negotiated
+`turn_start.data.turn_id`. Without `served_turn_end`, the field is omitted.
 
 ```json
 {"jsonrpc":"2.0","id":9,"method":"status","params":{}}
@@ -678,12 +784,17 @@ that gets no answer within its own timeout can treat the server as hung.
 All examples below use the common event envelope:
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
 
 `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, and
-`turn_aborted` carry `data` when the loop supplies it. `turn_end` data includes
-`turn` and `tool_calls`.
+`turn_aborted` carry `data` when the loop supplies it. When the connection
+negotiates `served_turn_end`, each `turn_start` also carries `data.turn_id`, a
+lowercase UUID hex string that identifies the whole served turn. Connections
+without that feature receive the previous `turn_start` shape. `data.turn`
+continues to number provider segments inside the served turn, so several
+`turn_start` events can have the same `turn_id`. `turn_end` data includes `turn`
+and `tool_calls`.
 
 `assistant_delta` carries `delta` (a bounded string) and `kind` (`assistant`,
 `thinking`, or another content type). `assistant_message` carries `message`,
@@ -753,9 +864,10 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`, and
 `child_idle` carry their durable notification `data` object with the matching
-known kind. `child_message_delivered` is emitted for the parent session after a
-running child starts answering a staged `agent_send`; its data contains the
-child label and the bounded one-line message preview.
+known kind. `task_exit_notification.data.note` contains the task kill cause when
+the server stopped the task. `child_message_delivered` is emitted for the parent
+session after a running child starts answering a staged `agent_send`; its data
+contains the child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
 
@@ -830,24 +942,43 @@ failures, then returns to `idle`.
 
 ## errors
 
-Error responses use standard JSON-RPC codes where applicable:
+Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
 
-| code | meaning |
-| ---: | --- |
-| `-32700` | invalid JSON or invalid UTF-8 frame |
-| `-32600` | invalid JSON-RPC request or duplicate handshake |
-| `-32601` | method is not supported |
-| `-32602` | params have the wrong shape or value |
-| `-32000` | unexpected server failure |
-| `-32001` | another client owns the socket |
-| `-32002` | handshake missing or protocol version mismatch |
-| `-32003` | no active session, or a detached host-bound session cannot start a turn |
-| `-32004` | a turn is already running |
-| `-32005` | no turn is running for steering |
-| `-32006` | approval request is missing, already resolved, or reserved by a decision or grace expiry |
-| `-32007` | outbound frame exceeds the size limit |
-| `-32008` | the selected account lock is held by another process |
-| `-32010` | delivery ID was accepted but its full details were evicted |
+Error descriptors are:
+
+| name | code | data.code | meaning |
+| --- | ---: | --- | --- |
+| `parse_error` | `-32700` | none | invalid JSON or invalid UTF-8 frame |
+| `invalid_request` | `-32600` | none | invalid JSON-RPC request or duplicate handshake |
+| `method_not_found` | `-32601` | none | method or negotiated feature is not supported |
+| `invalid_params` | `-32602` | none | params have the wrong shape, value, or negotiated capability |
+| `internal_error` | `-32000` | none | unexpected server or storage failure |
+| `connection_capacity` | `-32001` | none | requested controller or observer connection role is at capacity |
+| `protocol_mismatch` | `-32002` | none | handshake is missing or the protocol version does not match |
+| `no_active_session` | `-32003` | none | no active session, or the active session requires a host binding |
+| `operation_busy` | `-32004` | none | operation is blocked by active turn, tool, or background-agent work |
+| `state_unavailable` | `-32005` | none | requested turn or account state is unavailable |
+| `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
+| `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
+| `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
+| `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
+| `controller_output_overflow` | `-32011` | none | controller output overflow |
+| `observer_output_overflow` | `-32011` | none | observer output overflow |
+| `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
+| `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
+| `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
+| `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
+| `host_binding_required` | `-32003` | `host_binding_required` | the session requires a host binding |
+| `invalid_content_read` | `-32602` | `invalid_content_read` | content_read parameters are invalid |
+| `invalid_session_grants_params` | `-32602` | `invalid_session_grants_params` | session_grants parameters are invalid |
+| `invalid_session_grants_revoke` | `-32602` | `invalid_session_grants_revoke` | revoke_session_grants parameters are invalid |
+| `login_in_progress` | `-32005` | `login_in_progress` | a login is already pending |
+| `observer_read_only` | `-32008` | `observer_read_only` | a read-only observer requested a write method |
+| `project_not_found` | `-32602` | `project_not_found` | the requested project does not exist |
+| `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
+| `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
+| `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -956,10 +1087,12 @@ Event fields are:
 | event | required fields | optional fields |
 | --- | --- | --- |
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
+| `served_turn_end` (feature `served_turn_end`) | `event`, `data: {turn_id: string, reason: "completed"|"user_stop"|"error"|"disconnect"}` | `session_id`, `id` (history only), `role` (history only) |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
 | `account_limit` | `event`, `data: object` | `session_id` |
+| `account_state_unknown` | `event`, `data: object` | `session_id` |
 | `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
@@ -974,9 +1107,11 @@ Event fields are:
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
+| `delivery_status` (features `delivery_id` and `session_history_fidelity`) | `event`, `id: string`, `role: "system"`, `delivery_id: string`, `method: "steer"`, `status: "dropped"`, `content: array[ContentBlock]` | `session_id`, `reason: string` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
+| `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. It is an informational notice that a retry is
@@ -1011,9 +1146,15 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
    `turn_end` ends one provider segment; it does not mean that the agent loop
-   is idle. Clients must wait for `agent_end` before idle-only requests such as
-   `new_session`; the server finalizes the turn before it publishes `agent_end`,
-   while error and abort paths end with `error` or `turn_aborted` instead.
+   is idle, and one served turn can contain several `turn_end` events. The
+   separately negotiated `served_turn_end` history event records the final
+   outcome of the whole served turn. Its `data.turn_id` matches every negotiated
+   provider-segment `turn_start` in that served turn. It occurs at most once per
+   served turn and has one closed `data.reason`: `completed`, `user_stop`,
+   `error`, or `disconnect`. Clients must wait for `agent_end` before idle-only
+   requests such as `new_session`; the server commits `served_turn_end` before
+   cleanup. Error
+   and abort paths still end with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
@@ -1262,7 +1403,11 @@ implementation for the frontend client. Two RPCs cover the surface.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
-  - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `output`: `text` is the composed notice to render as a quiet receipt. For
+    `/status`, this is the same operational view as the TUI, including configured
+    hooks, recent cache-hit history, and model-attributed estimated cost. The
+    shared view omits terminal-only navigation key hints.
+  - `text`: `text` is the MCP status output to render as normal text.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
     an opaque `input_id` and the typed `display_text`; the resolved text and
@@ -1272,16 +1417,26 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `unknown`: no command matched the leading token.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
+Structured slash error codes are:
+
+| code | meaning |
+| --- | --- |
+| `mcp_credential_store` | an MCP credential file could not be loaded or deleted safely |
+
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
-`/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
-`/vim`. Runnable user commands also include prompt macros
+`/inbox`, `/init`, `/memory`, `/model`, `/project`, `/project-instructions`,
+`/status`, and `/vim`. `/project` shows the current association, and `/project
+init` discovers the working directory and associates the session. The mutating
+form is rejected while a turn, child, or approval is active. Runnable user
+commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
 plus skills. Argless `/model` reports the current model, while `/model <name>`
-dispatches server-side through the shared settings-apply path. TUI-owned
-built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
-commands are omitted from the default catalog. Every invocation of one of
-these unavailable commands, including `/mcp status`, reports `client_only`
-instead of half-executing.
+dispatches server-side through the shared settings-apply path. TUI-owned built-ins, exec macros, prompt macros with inline shell spans, and
+MCP prompt commands are omitted from the default catalog. `/mcp status`,
+`/mcp auth`, and `/mcp logout` run server-side; other `/mcp` verbs report
+`client_only`. A credential-store refusal adds `credential_store_error` with
+code `mcp_credential_store`, a bounded reason, server, credential path,
+operation, recovery action, and renderable text.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on
@@ -1320,11 +1475,13 @@ negotiate a feature sees the behavior from before the feature existed.
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
-| `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals. it changes no output |
+| `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
+| `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
@@ -1343,7 +1500,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

@@ -753,6 +753,25 @@ def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) ->
     ).inbox_enabled is False
 
 
+def test_agent_depth_defaults_to_three(tmp_path: Path) -> None:
+    default_depth = getattr(
+        load_settings(home=tmp_path / "home").settings,
+        "agents_max_depth",
+        None,
+    )
+    assert default_depth == 3
+
+
+def test_agent_depth_above_hard_maximum_has_clear_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(home, "[agents]\nmax_depth = 9\n")
+    with pytest.raises(
+        SettingsError,
+        match=r"agents\.max_depth must be an integer from 0 to 5",
+    ):
+        load_settings(home=home)
+
+
 def test_project_cannot_enable_explicit_finish(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"

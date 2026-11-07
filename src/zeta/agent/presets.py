@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Literal
 
 from ..protocol.types import Message, MessageRole, TextContent
-from .budget import MAX_AGENT_DEPTH
 
 AgentType = Literal["general", "explore", "plan", "run"]
 
@@ -28,6 +27,7 @@ class AgentPreset:
     allow_delegation: bool = True
     accepts_follow_ups: bool = False
     explicit_finish: bool = False
+    max_child_depth: int | None = None
 
     @property
     def description(self) -> str:
@@ -44,14 +44,13 @@ class AgentPreset:
 
 def resolve_child_profile_tools(
     *,
-    child_depth: int,
     preset: AgentPreset,
     policy_allowed_names: frozenset[str],
     runtime_tool_names: frozenset[str],
 ) -> tuple[set[str], frozenset[str] | None]:
     """Resolve hard exclusions and one child's profile tool layer."""
     excluded_names = {"inbox", "request_attention", "resolve_attention"}
-    if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
+    if not preset.allow_delegation:
         excluded_names.add("agent")
     resolvable_names = (
         set(policy_allowed_names) | set(runtime_tool_names)
@@ -65,8 +64,6 @@ def resolve_child_profile_tools(
             + ", ".join(sorted(unresolved_names))
         )
     allowed_names = set(preset.tool_names) | set(runtime_tool_names)
-    if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
-        allowed_names.add("agent")
     return excluded_names, frozenset(allowed_names - excluded_names)
 
 
@@ -133,21 +130,6 @@ AGENT_PRESETS: dict[AgentType, AgentPreset] = {
     preset.name: preset
     for preset in (GENERAL_PRESET, EXPLORE_PRESET, PLAN_PRESET, RUN_PRESET)
 }
-
-
-def get_agent_preset(agent_type: object) -> AgentPreset | None:
-    """Return a built-in preset, without defaulting unknown values."""
-
-    if type(agent_type) is not str:
-        return None
-    return next(
-        (preset for preset in AGENT_PRESETS.values() if preset.name == agent_type),
-        None,
-    )
-
-
-
-
 
 
 def compose_system_prompt(

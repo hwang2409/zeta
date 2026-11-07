@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from ..agent.budget import HARD_MAX_AGENT_DEPTH
 from ..agent.presets import AGENT_PRESETS, AgentPreset
 from ..models.catalog import known_model_names
 from .discovery import (
@@ -195,6 +196,15 @@ def _build_agent(
         raise ValueError(
             f"agent {document.path} frontmatter explicit_finish must be a boolean"
         )
+    max_child_depth = metadata.get("max_child_depth")
+    if max_child_depth is not None and (
+        type(max_child_depth) is not int
+        or not 0 <= max_child_depth <= HARD_MAX_AGENT_DEPTH
+    ):
+        raise ValueError(
+            f"agent {document.path} frontmatter max_child_depth must be "
+            f"an integer from 0 to {HARD_MAX_AGENT_DEPTH}"
+        )
     assert isinstance(name, str)
     assert isinstance(description, str)
     return AgentPreset(
@@ -210,6 +220,7 @@ def _build_agent(
         allow_delegation=allow_delegation,
         accepts_follow_ups=accepts_follow_ups,
         explicit_finish=explicit_finish,
+        max_child_depth=max_child_depth,
     )
 
 

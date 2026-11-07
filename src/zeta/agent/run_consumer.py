@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import _now
 from ..core.store import ConversationStore
-from ..protocol.types import MessageOrigin
+from ..protocol.types import MessageOrigin, harness_notice
 from ..tools.agent import agent_stats
-from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
+from .explicit_finish import IdleNudgeLifecycle, TaskSafetyLifecycle
 from .finish_gate import FinishGateState
+from .pending_delivery import PromptInput
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
@@ -31,6 +33,36 @@ _IDLE_NUDGE_PROMPT = (
     "you have been idle for 10 minutes. call `finish` if the contract is complete, "
     "call `ask_parent` if you are waiting on a decision, or continue the work."
 )
+
+
+async def _publish_task_safety_notice(
+    child_loop: AgentLoop, child_store: ConversationStore, text: str
+) -> str:
+    token_marker = text.rpartition("\n")[2]
+
+    async def committed_prompt_id() -> str | None:
+        prompts = await asyncio.to_thread(child_store.pending_prompts)
+        return next(
+            (
+                entry.id
+                for entry in prompts
+                if token_marker in str(entry.data.get("text", ""))
+            ),
+            None,
+        )
+
+    if prompt_id := await committed_prompt_id():
+        return prompt_id
+    try:
+        result = await child_loop._background_owner.conversation_channel.produce_to(
+            child_loop.agent_instance_id,
+            PromptInput(text, MessageOrigin.HARNESS_NUDGE, None),
+        )
+    except (Exception, asyncio.CancelledError):
+        if prompt_id := await committed_prompt_id():
+            return prompt_id
+        raise
+    return result.entries[0].id
 
 
 def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
@@ -128,11 +160,21 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
+    idle_clock = kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time
     idle_lifecycle = IdleNudgeLifecycle(
-        clock=kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time,
+        clock=idle_clock,
         wait=kwargs.pop("idle_wait", None),
         nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
     )
+    task_safety = TaskSafetyLifecycle(
+        child_loop._background_owner.finish_gate_task_timeout,
+        clock=kwargs.pop("task_safety_clock", None) or time.monotonic,
+        wait=kwargs.pop("task_safety_wait", None),
+        cohort_seconds=kwargs.pop("task_safety_cohort_seconds", 1.0),
+    )
+
+    async def publish_task_safety_notice(text: str) -> str:
+        return await _publish_task_safety_notice(child_loop, child_store, text)
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         if not callable(child_turns):
@@ -155,9 +197,13 @@ async def consume_run(
     kwargs["record_report"] = segment_reports.append
     kwargs.setdefault("finish_gate_state", FinishGateState())
 
-    safety_started: float | None = None
     idle_published = False
-    safety_task: asyncio.Task[tuple[str, ...]] | None = None
+    child_loop._create_task(
+        task_safety.run(
+            child_loop.tool_registry.background_tasks,
+            publish_task_safety_notice,
+        )
+    )
     try:
         result = await consume_child(
             child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
@@ -169,9 +215,8 @@ async def consume_run(
                 and isinstance(structured, dict)
                 and structured.get("status") == "running"
             )
-            if idle and safety_started is None:
-                safety_started = asyncio.get_running_loop().time()
             flow = await child_loop._ensure_step_delivery()
+            task_safety.delivery_completed(set(flow.pending_ids()))
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 idle_lifecycle.reset_idle_period()
@@ -203,7 +248,12 @@ async def consume_run(
                     result = await consume_child(
                         child_loop,
                         _IMMEDIATE_FINISH_REMINDER,
-                        origin=MessageOrigin.AGENT_PROMPT,
+                        origin=MessageOrigin.HARNESS_NUDGE,
+                        harness_notice_message=harness_notice(
+                            "finish reminder",
+                            _IMMEDIATE_FINISH_REMINDER,
+                            event="agent_finish_reminder",
+                        ),
                         **kwargs,
                     )
                     idle_published = False
@@ -228,21 +278,6 @@ async def consume_run(
                             text=text,
                         )
                     idle_published = True
-                running_tasks = any(
-                    task.running
-                    for task in child_loop.tool_registry.background_tasks.snapshot()
-                )
-                if running_tasks and safety_task is None:
-                    elapsed = asyncio.get_running_loop().time() - safety_started
-                    timeout = max(
-                        0.0,
-                        child_loop._background_owner.finish_gate_task_timeout - elapsed,
-                    )
-                    safety_task = asyncio.create_task(
-                        kill_tasks_after_deadline(
-                            child_loop.tool_registry.background_tasks, timeout
-                        )
-                    )
                 action = await idle_lifecycle.wait_for_idle_action(
                     lambda: child_loop._background_owner.conversation_channel.wait(
                         child_loop.agent_instance_id
@@ -257,7 +292,12 @@ async def consume_run(
                 result = await consume_child(
                     child_loop,
                     _IDLE_NUDGE_PROMPT,
-                    origin=MessageOrigin.AGENT_PROMPT,
+                    origin=MessageOrigin.HARNESS_NUDGE,
+                    harness_notice_message=harness_notice(
+                        "idle reminder",
+                        _IDLE_NUDGE_PROMPT,
+                        event="agent_idle_reminder",
+                    ),
                     **kwargs,
                 )
                 idle_published = False
@@ -288,10 +328,6 @@ async def consume_run(
         )
         return terminal_result
     finally:
-        if safety_task is not None and not safety_task.done():
-            safety_task.cancel()
-        if safety_task is not None:
-            await asyncio.gather(safety_task, return_exceptions=True)
         if terminal_result is not None and callable(final_finish_lifecycle):
             content = terminal_result.get("content")
             text = (
