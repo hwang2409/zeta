@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
-from ..core.session import SessionMetadata
-from .runtime import ServerRuntime
+from ...core.session import SessionMetadata
+from ..runtime import ServerRuntime
 
 
 async def rename_session(
