@@ -769,13 +769,20 @@ def _final_index(
     sources = load_sources([revision], paths)
     parsed, _unresolved, error = parse_revisions([revision], paths, sources)
     error_path = error[1] if error else None
-    final_lines: list[Item] = []
-    if error is None:
-        for path in paths:
-            text = sources.get((revision, path))
-            if text is not None:
-                final_lines.extend(_line_items(path, text, {}))
-    return parsed[revision], sources, error_path, final_lines
+    return parsed[revision], sources, error_path, _final_line_items(revision, paths, sources, error)
+
+
+def _final_line_items(
+    revision: str, paths: set[str], sources: dict, error: tuple | None
+) -> list[Item]:
+    if error:
+        return []
+    return [
+        item
+        for path in paths
+        if (text := sources.get((revision, path))) is not None
+        for item in _line_items(path, text, {})
+    ]
 
 
 def _parse_error_status(
@@ -941,6 +948,21 @@ def _unique_collection_match(
     )
 
 
+def _find_final_match(
+    finding: Item,
+    final_items: dict[tuple[str, str, str, str], Item],
+    final_lines: list[Item],
+    consumed_lines: set[int],
+) -> Item | None:
+    candidates = final_lines if finding.kind == "pr-line" else list(final_items.values())
+    for index, item in enumerate(candidates):
+        if index not in consumed_lines and _final_match(finding, item, final_items, final_lines):
+            if finding.kind == "pr-line":
+                consumed_lines.add(index)
+            return item
+    return None
+
+
 def _report_final_moves(
     findings: list[Item],
     final_items: dict[tuple[str, str, str, str], Item],
@@ -949,19 +971,7 @@ def _report_final_moves(
     remaining: list[Item] = []
     consumed_lines: set[int] = set()
     for finding in findings:
-        candidates = final_lines if finding.kind == "pr-line" else list(final_items.values())
-        match_index = next(
-            (
-                index
-                for index, item in enumerate(candidates)
-                if index not in consumed_lines
-                and _final_match(finding, item, final_items, final_lines)
-            ),
-            None,
-        )
-        match = candidates[match_index] if match_index is not None else None
-        if match_index is not None and finding.kind == "pr-line":
-            consumed_lines.add(match_index)
+        match = _find_final_match(finding, final_items, final_lines, consumed_lines)
         if match is None:
             remaining.append(finding)
         else:
