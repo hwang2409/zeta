@@ -1151,6 +1151,8 @@ class AgentLoop(
                 approval_requests,
             )
             completion.commit()
+            provider_retry_budget = None
+            provider_budget_prompt_id = None
             self._turn_provider_retry_records = []
             error = output_limit_error(
                 assistant_message, stop_reason=self._turn_stop_reason
