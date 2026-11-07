@@ -224,6 +224,11 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monitor_cancelled = asyncio.Event()
     release_archive = asyncio.Event()
     original_archive_record = registry._archive_record
+    original_terminate_process = process_module._terminate_process
+
+    async def terminate_after_archive(*args, **kwargs) -> None:
+        await original_terminate_process(*args, **kwargs)
+        await archive_entered.wait()
 
     async def gated_archive_record(record, log_handle) -> None:
         archive_entered.set()
@@ -238,21 +243,25 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
 
     # test-contract: seam force the archive-pending monitor cancellation order
     monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
+    # test-contract: seam delay monitor cancellation until archive entry
+    monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
     killer = asyncio.create_task(registry.kill(task_id))
     try:
-        await archive_entered.wait()
-        await monitor_cancelled.wait()
+        await asyncio.wait_for(archive_entered.wait(), 10)
+        await asyncio.wait_for(monitor_cancelled.wait(), 10)
         release_archive.set()
 
-        status = await waiter
+        status = await asyncio.wait_for(waiter, 10)
         assert status["running"] is False
-        await killer
+        await asyncio.wait_for(killer, 10)
     finally:
         release_archive.set()
-        await asyncio.gather(waiter, killer, return_exceptions=True)
-        await registry.close()
+        await asyncio.wait_for(
+            asyncio.gather(waiter, killer, return_exceptions=True), 10
+        )
+        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -2626,7 +2635,7 @@ async def test_task_start_and_exit_wake_task_safety_supervisor(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_task_safety_clock_starts_when_a_late_task_starts() -> None:
+async def test_idle_task_safety_window_starts_with_each_running_task_period() -> None:
     from zeta.agent.explicit_finish import TaskSafetyLifecycle
 
     now = [7200.0]
@@ -2654,6 +2663,22 @@ async def test_task_safety_clock_starts_when_a_late_task_starts() -> None:
             "task late-task (watch ci) has run 1h; kill it with task_kill or leave it running"
         ]
         assert registry.kills == []
+
+        # Once all tasks end, a later task owns a new full window from its start.
+        registry.tasks[0].running = False
+        registry.task_change_generation += 1
+        lifecycle.delivery_completed(set())
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() is None
+        now[0] += 100
+        registry.tasks.append(
+            SimpleNamespace(
+                task_id="later-task", headline="next", running=True, started_at=now[0]
+            )
+        )
+        registry.task_change_generation += 1
+        await wait.releases.put(True)
+        assert await wait.timeouts.get() == 3600
     finally:
         supervisor.cancel()
         await asyncio.gather(supervisor, return_exceptions=True)
@@ -2719,7 +2744,7 @@ async def test_task_safety_rereads_terminal_state_at_deadline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_safety_kills_after_delivered_warning_window() -> None:
+async def test_task_completion_turn_rearms_full_safety_window() -> None:
     from zeta.agent.explicit_finish import TaskSafetyLifecycle
 
     now = [0.0]

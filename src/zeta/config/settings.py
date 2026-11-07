@@ -50,6 +50,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
+from ..agent.budget import DEFAULT_MAX_AGENT_DEPTH, HARD_MAX_AGENT_DEPTH
 from ..core.approval import parse_approval_rule
 from ..mcp.envelope import MCPCallLimits
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_model
@@ -106,7 +107,7 @@ _PROJECT_SAFE_KEYS = frozenset(
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
-_AGENTS_KEYS = frozenset({"explicit_finish"})
+_AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -130,6 +131,7 @@ class Settings:
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
     agents_explicit_finish: bool | None = None
+    agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -164,6 +166,7 @@ class ResolvedConfig:
     auto_project: bool = True
     inbox_enabled: bool = True
     agents_explicit_finish: bool = False
+    agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -322,6 +325,7 @@ def resolve(
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
         agents_explicit_finish=settings.agents_explicit_finish is True,
+        agents_max_depth=settings.agents_max_depth,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
         tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
         tool_allow_layers=(
@@ -554,6 +558,11 @@ def _validate(
     agents_explicit_finish = agents_table.get("explicit_finish")
     if agents_explicit_finish is not None and type(agents_explicit_finish) is not bool:
         raise SettingsError("agents.explicit_finish must be a boolean")
+    agents_max_depth = agents_table.get("max_depth", DEFAULT_MAX_AGENT_DEPTH)
+    if type(agents_max_depth) is not int or not 0 <= agents_max_depth <= HARD_MAX_AGENT_DEPTH:
+        raise SettingsError(
+            f"agents.max_depth must be an integer from 0 to {HARD_MAX_AGENT_DEPTH}"
+        )
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
     memory = data.get("memory", {})
@@ -605,6 +614,7 @@ def _validate(
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
         agents_explicit_finish=agents_explicit_finish,
+        agents_max_depth=agents_max_depth,
         tool_allow=tool_allow,
         tool_deny=tool_deny or (),
         tool_allow_layers=() if tool_allow is None else (tool_allow,),

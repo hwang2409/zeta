@@ -26,7 +26,7 @@ from ...core.session_files import (
     open_session_file,
     session_directory,
 )
-from ...core.store import ConversationStore
+from ...core.store import ConversationStore, TranscriptLoadError
 from ...protocol.types import (
     is_passive_harness_message,
     is_visible_harness_notice,
@@ -451,7 +451,12 @@ class AgentTranscriptSource:
             if path in seen:
                 continue
             seen.add(path)
-            snapshot = self._refresh_path(path)
+            try:
+                snapshot = self._refresh_path(path)
+            except Exception as error:  # isolate nested transcripts
+                if path == self.path:
+                    raise
+                snapshot = self._failed_path_snapshot(path, error)
             projected.append((path, snapshot))
             if recursive:
                 pending.extend(
@@ -554,18 +559,44 @@ class AgentTranscriptSource:
     def _log_refresh_error(self, error: Exception, *, traceback: bool) -> None:
         if self._refresh_error_logged:
             return
-        _LOGGER.warning(
-            "agent transcript refresh failed for %s: %s",
-            self.path,
-            error,
-            exc_info=error if traceback else None,
-        )
+        if isinstance(error, TranscriptLoadError):
+            _LOGGER.warning("agent transcript refresh failed: %s", error)
+        else:
+            _LOGGER.warning(
+                "agent transcript refresh failed for %s: %s",
+                self.path,
+                error,
+                exc_info=error if traceback else None,
+            )
         self._refresh_error_logged = True
 
-    def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
+    def _failed_path_snapshot(
+        self, path: Path, error: Exception
+    ) -> AgentTranscriptSnapshot:
+        if not isinstance(error, TranscriptLoadError):
+            try:
+                ConversationStore(
+                    path.parent,
+                    session_id=path.name,
+                    _read_only=True,
+                    _must_exist=True,
+                ).close()
+            except TranscriptLoadError as diagnosis:
+                error = diagnosis
+            except Exception:  # noqa: BLE001,S110 - preserve original failure
+                pass
         self._log_refresh_error(error, traceback=True)
-        snapshot = AgentTranscriptSnapshot((), (), _REFRESH_UNAVAILABLE)
-        self._snapshots[self.path] = snapshot
+        reason = (
+            str(error)
+            if isinstance(error, TranscriptLoadError)
+            else _REFRESH_UNAVAILABLE
+        )
+        snapshot = AgentTranscriptSnapshot((), (), reason)
+        self._snapshots[path] = snapshot
+        return snapshot
+
+    def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
+        snapshot = self._failed_path_snapshot(self.path, error)
         return AgentTranscriptTreeSnapshot(self.path, ((self.path, snapshot),))
 
 
@@ -715,6 +746,6 @@ async def refresh_agent_cards(cards: Iterable[Any]) -> list[bool]:
         except Exception as error:  # noqa: BLE001 - keep later cards refreshing
             source = card.transcript_source
             if source is not None:
-                source._failed_snapshot(error)
+                await asyncio.to_thread(source._failed_snapshot, error)
             changes[id(card)] = False
     return [changes.get(id(card), False) for card in card_list]
