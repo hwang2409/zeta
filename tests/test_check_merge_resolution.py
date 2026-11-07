@@ -42,11 +42,14 @@ def test_dropped_main_function_flagged(tmp_path: Path):
     )
     commit(r, "main")
     subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
     commit(r, "merge")
-    result = run(r, "--main-parent", "1")
+    result = run(r)
     assert result.returncode == 1
     assert "newer" in result.stdout
 
@@ -63,14 +66,15 @@ def test_branch_side_intended_deletion_not_flagged(tmp_path: Path):
     (r / "src/a.py").write_text("def old(): pass\ndef new(): pass\n")
     commit(r, "add")
     subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
     commit(r, "merge")
-    assert (
-        run(r, "--main-parent", "1").returncode == 1
-    )  # new is still a loss; old is not reported
-    assert "old" not in run(r, "--main-parent", "1").stdout
+    assert run(r).returncode == 1  # new is still a loss; old is not reported
+    assert "old" not in run(r).stdout
 
 
 def test_allowed_drop_passes(tmp_path: Path):
@@ -83,11 +87,14 @@ def test_allowed_drop_passes(tmp_path: Path):
     (r / "src/a.py").write_text("def lost(): pass\ndef added(): pass\n")
     commit(r, "main")
     subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
     commit(r, "merge-resolution: src/a.py def added -> intentional")
-    assert run(r, "--main-parent", "1").returncode == 0
+    assert run(r).returncode == 0
 
 
 def test_new_constant_value_flagged(tmp_path: Path):
@@ -102,13 +109,16 @@ def test_new_constant_value_flagged(tmp_path: Path):
     (r / "src/a.py").write_text("WRITER_EPOCH = 3\n")
     commit(r, "main")
     subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     subprocess.run(["git", "checkout", "branch", "--", "src/a.py"], cwd=r, check=True)
     (r / "src/a.py").write_text("WRITER_EPOCH = 4\n")
     commit(r, "merge")
-    assert run(r, "--main-parent", "1").returncode == 1
-    assert "WRITER_EPOCH" in run(r, "--main-parent", "1").stdout
+    assert run(r).returncode == 1
+    assert "WRITER_EPOCH" in run(r).stdout
 
 
 def test_non_merge_is_clean(tmp_path: Path):
@@ -120,11 +130,16 @@ def test_non_merge_is_clean(tmp_path: Path):
     assert "not a two-parent merge" in run(r).stdout
 
 
-def make_merge(r: Path, *, into: str, from_branch: str) -> tuple[str, str, str]:
+def make_merge(
+    r: Path, *, into: str, from_branch: str, restore: str | None = None
+) -> tuple[str, str, str]:
     subprocess.run(["git", "checkout", "-q", into], cwd=r, check=True)
     subprocess.run(
-        ["git", "merge", "--no-ff", "--no-edit", from_branch], cwd=r, check=True
+        ["git", "merge", "--no-ff", "--no-commit", from_branch], cwd=r, check=True
     )
+    if restore is not None:
+        subprocess.run(["git", "checkout", into, "--", restore], cwd=r, check=True)
+    commit(r, "merge")
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
@@ -146,6 +161,9 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     (r / "src/a.py").write_text("def main(): pass\n")
     commit(r, "main")
     subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    subprocess.run(
         ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
     )
     (r / "src/a.py").write_text(
@@ -155,7 +173,7 @@ def test_unresolved_conflict_is_one_fatal_diagnostic(tmp_path: Path):
     merge = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=r, text=True
     ).strip()
-    result = run(r, merge, "--main-parent", "1")
+    result = run(r, merge)
     assert result.returncode == 2
     assert "merge does not parse:" in result.stderr
     assert "src/a.py:" in result.stderr
@@ -224,4 +242,71 @@ def test_parent_selection_requires_flag_when_ambiguous(tmp_path: Path):
     )
     result = run(r, merge)
     assert result.returncode == 2
-    assert "use --main-parent" in result.stderr
+    assert "pass --main-sha" in result.stderr
+
+
+def test_main_sha_override_and_removed_parent_flag(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("x = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("x = 2\ndef main_only(): pass\n")
+    commit(r, "main change")
+    main = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", main], cwd=r, check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    (r / "src/b.py").write_text("x = 3\n")
+    commit(r, "branch change")
+    merge, p1, p2 = make_merge(r, into="branch", from_branch="main", restore="src/a.py")
+    default = run(r, merge)
+    assert default.returncode == 1
+    assert f"main parent: {p2}" in default.stdout
+    assert "main_only" in default.stdout
+    wrong_side = run(r, merge, "--main-sha", p1)
+    assert wrong_side.returncode == 2
+    assert "disagrees with the identified main parent" in wrong_side.stderr
+    correct = run(r, merge, "--main-sha", p2)
+    assert correct.returncode == 1
+    assert f"main parent: {p2}" in correct.stdout
+    assert "main_only" in correct.stdout
+    abbreviated = run(r, merge, "--main-sha", p2[:8])
+    assert abbreviated.returncode == 2
+    assert "full 40-hex parent sha" in abbreviated.stderr
+    wrong = run(r, merge, "--main-sha", "HEAD~2")
+    assert wrong.returncode == 2
+    assert "full 40-hex parent sha" in wrong.stderr
+    removed = run(r, merge, "--main-parent", "1")
+    assert removed.returncode == 2
+    assert "unrecognized arguments" in removed.stderr
+    assert p1 != p2
+
+
+def test_both_qualifying_parents_are_rejected(tmp_path: Path):
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("x = 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "branch", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("x = 2\n")
+    commit(r, "main change")
+    subprocess.run(["git", "checkout", "-q", "branch"], cwd=r, check=True)
+    (r / "src/b.py").write_text("x = 3\n")
+    commit(r, "branch change")
+    merge, _p1, _p2 = make_merge(r, into="branch", from_branch="main")
+    subprocess.run(
+        ["git", "checkout", "-qb", "mainline", f"{merge}^1^"], cwd=r, check=True
+    )
+    (r / "src/c.py").write_text("x = 4\n")
+    commit(r, "mainline change")
+    subprocess.run(["git", "merge", "--no-ff", "--no-edit", merge], cwd=r, check=True)
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=r, check=True
+    )
+    result = run(r, merge)
+    assert result.returncode == 2
+    assert "both parents qualify" in result.stderr
