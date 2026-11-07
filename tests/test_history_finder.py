@@ -9,8 +9,8 @@ from prompt_toolkit.document import Document
 from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.transcript import FinderControl
 from zeta.tui.transcript.finder_runtime import FinderRuntimeTarget
-from zeta.tui.transcript.transcript_finder import TranscriptFinderMixin
 from zeta.tui.transcript.history_finder import HistoryFinder, build_history_candidates
+from zeta.tui.transcript.transcript_finder import TranscriptFinderMixin
 
 
 def test_finders_implement_the_runtime_interface() -> None:
