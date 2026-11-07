@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from zeta.memory import entry_request
+from zeta.memory import entry_request, entry_store
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import (
     EntryReconciliationFailure,
     reconcile_entry_range,
 )
-from zeta.memory.entry_request import _prepare_request
+from zeta.memory.entry_request import _prepare_request as _prepare_request_impl
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -25,6 +25,7 @@ from zeta.memory.entry_store import (
     apply_operations,
     canonical_state_bytes,
     empty_state,
+    state_digest,
     state_from_bytes,
 )
 from zeta.memory.profiles import (
@@ -43,6 +44,12 @@ from zeta.project_registry import ProjectRegistry
 
 SESSION = "b" * 32
 NOW = "2026-10-08T12:00:00.000000Z"
+
+
+def _prepare_request_with_digest(transcript, state, *, as_of):
+    return _prepare_request_impl(
+        transcript, state, as_of=as_of, snapshot_digest=state_digest(state)
+    )
 
 
 def _key(value: str) -> str:
@@ -143,7 +150,7 @@ def test_reconciler_prompt_rejects_transient_progress_narration(tmp_path: Path) 
     registry, project_id = _registry(tmp_path)
     state = registry._entry_memory_state(project_id).state
 
-    request = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(_transcript(), state, as_of=date(2026, 10, 9))
 
     assert "Do not record transient progress" in request.prompt
     assert "same PR, branch, worker, or task" in request.prompt
@@ -233,8 +240,14 @@ def _crowded_priority_state(
 
 
 def _prepare_request_oracle(transcript: Transcript, state, *, as_of: date):
+    cached = entry_request._cached_entries(
+        state, snapshot_digest=state_digest(state)
+    )
+
     def prompt_with_entries(candidate: Transcript):
-        active = entry_request._active_entries_for_request(state, candidate)
+        active = entry_request._active_entries_for_request(
+            state, candidate, cached=cached
+        )
         indexes = [entry_request._entry_index(entry) for entry in active]
         entry_limit = 28 * 1024 - 12 * 1024
         visible = []
@@ -370,7 +383,7 @@ def _assert_matches_prepare_oracle(transcript: Transcript, state) -> None:
     expected_prompt, expected_transcript, expected_ids = _prepare_request_oracle(
         transcript, state, as_of=date(2026, 10, 9)
     )
-    actual = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    actual = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     assert actual.prompt == expected_prompt
     assert actual.transcript == expected_transcript
     assert actual.visible_entry_ids == expected_ids
@@ -438,13 +451,13 @@ def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -
             ),
         )
         _assert_matches_prepare_oracle(_transcript(), boundary_state)
-        request = _prepare_request(
+        request = _prepare_request_with_digest(
             _transcript(), boundary_state, as_of=date(2026, 10, 9)
         )
         expected_size = 16 * 1024 if added_bytes == exact_padding else 16_226
         assert len(request.prompt.encode()) == expected_size
 
-    empty_state_request = _prepare_request(
+    empty_state_request = _prepare_request_with_digest(
         _transcript(), registry._entry_memory_state(project_id).state,
         as_of=date(2026, 10, 9),
     )
@@ -454,7 +467,7 @@ def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -
     _assert_matches_prepare_oracle(
         _transcript(boundary_row), registry._entry_memory_state(project_id).state
     )
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(boundary_row), registry._entry_memory_state(project_id).state,
         as_of=date(2026, 10, 9),
     )
@@ -466,7 +479,7 @@ def test_incremental_request_matches_oracle_at_byte_boundaries(tmp_path: Path) -
             as_of=date(2026, 10, 9),
         )
     with pytest.raises(ReconciliationError, match="user row exceeds the request limit"):
-        _prepare_request(
+        _prepare_request_with_digest(
             oversized, registry._entry_memory_state(project_id).state,
             as_of=date(2026, 10, 9),
         )
@@ -486,7 +499,7 @@ def test_excluded_row_does_not_change_entry_relevance(tmp_path: Path) -> None:
     )
 
     _assert_matches_prepare_oracle(transcript, state)
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     assert len(request.transcript.rows) == 1
     assert target_ids[0] not in request.visible_entry_ids
 
@@ -532,7 +545,7 @@ def test_chained_relevance_reranks_until_rows_fit(tmp_path: Path) -> None:
     )
 
     _assert_matches_prepare_oracle(transcript, state)
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     assert len(request.prompt.encode()) <= 28 * 1024
     assert len(request.transcript.rows) == 5
 
@@ -557,7 +570,7 @@ def test_incremental_request_matches_oracle_errors(
     with pytest.raises(ReconciliationError) as expected:
         _prepare_request_oracle(_transcript(row), state, as_of=date(2026, 10, 9))
     with pytest.raises(ReconciliationError, match=str(expected.value)):
-        _prepare_request(_transcript(row), state, as_of=date(2026, 10, 9))
+        _prepare_request_with_digest(_transcript(row), state, as_of=date(2026, 10, 9))
 
 
 def test_request_preparation_renders_prompt_constant_times(
@@ -577,7 +590,7 @@ def test_request_preparation_renders_prompt_constant_times(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(entry_request, "_prompt", counted)
-    _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
 
     assert calls <= 5
 
@@ -589,7 +602,7 @@ def test_large_index_reserves_transcript_budget(
     registry, project_id = _registry(tmp_path)
     state = _large_index_state(registry, project_id, count=entry_count)
 
-    request = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(_transcript(), state, as_of=date(2026, 10, 9))
 
     assert len(request.prompt.encode()) <= 28 * 1024 - 12 * 1024
 
@@ -599,7 +612,7 @@ def test_large_index_bounds_oversized_assistant_reply(tmp_path: Path) -> None:
     state = _large_index_state(registry, project_id)
     assistant = _row(72, "\\" * (10 * 1024), origin="agent", role="assistant")
 
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(assistant), state, as_of=date(2026, 10, 9)
     )
 
@@ -617,7 +630,7 @@ def test_large_index_keeps_oversized_user_reply_lossless(tmp_path: Path) -> None
     user_row = _row(45, "\\" * (10 * 1024))
 
     with pytest.raises(ReconciliationError, match="user row exceeds"):
-        _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
+        _prepare_request_with_digest(_transcript(user_row), state, as_of=date(2026, 10, 9))
 
 
 def test_oversized_harness_notification_is_bounded_with_large_index(
@@ -640,7 +653,7 @@ def test_oversized_harness_notification_is_bounded_with_large_index(
         },
     }
 
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(notification), state, as_of=date(2026, 10, 9)
     )
 
@@ -675,7 +688,7 @@ def test_oversized_harness_notification_with_turn_context_requires_lossless_hand
         ReconciliationError,
         match="oversized non-generated transcript row requires lossless handling",
     ):
-        _prepare_request(
+        _prepare_request_with_digest(
             _transcript(notification), state, as_of=date(2026, 10, 9)
         )
     assert notification["data"]["message"]["content"][0]["text"] == "x" * 15_000
@@ -689,7 +702,7 @@ def test_oversized_user_row_still_requires_lossless_handling(
     user_row = _row(45, "x" * 15_000)
 
     with pytest.raises(ReconciliationError, match="user row exceeds"):
-        _prepare_request(_transcript(user_row), state, as_of=date(2026, 10, 9))
+        _prepare_request_with_digest(_transcript(user_row), state, as_of=date(2026, 10, 9))
 
 
 def test_bounded_index_reports_omitted_entries_and_is_deterministic(
@@ -698,8 +711,8 @@ def test_bounded_index_reports_omitted_entries_and_is_deterministic(
     registry, project_id = _registry(tmp_path)
     state = _large_index_state(registry, project_id, count=300)
 
-    first = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
-    second = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    first = _prepare_request_with_digest(_transcript(), state, as_of=date(2026, 10, 9))
+    second = _prepare_request_with_digest(_transcript(), state, as_of=date(2026, 10, 9))
     first_index = [
         line for line in first.prompt.splitlines() if line.startswith("INDEX ")
     ]
@@ -726,7 +739,7 @@ async def test_completion_makes_omitted_entry_visible_and_resolves_it(
     )
     transcript = _transcript(_row(1, "PR #425 merged after final review."))
 
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     assert target in request.visible_entry_ids
     result, _ = await _run(
         registry,
@@ -765,7 +778,7 @@ async def test_correction_makes_omitted_entry_visible_and_supersedes_it(
         _row(1, "Correction: Service Atlas now uses path /srv/atlas-new instead.")
     )
 
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     assert target in request.visible_entry_ids
     result, _ = await _run(
         registry,
@@ -803,7 +816,7 @@ def test_name_relevance_ignores_common_words_and_transcript_keys(
         filler_text="The user message content is now text",
     )
 
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(_row(1, "The Atlas migration is now complete.")),
         state,
         as_of=date(2026, 10, 9),
@@ -823,7 +836,7 @@ def test_non_ascii_name_relevance_makes_omitted_entry_visible(
         filler_text="The user message content is now text",
     )
 
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(_row(1, "李明 finished the work.")),
         state,
         as_of=date(2026, 10, 9),
@@ -852,13 +865,116 @@ def test_short_and_unicode_equivalent_names_make_omitted_entry_visible(
         filler_text="So my ok no if filler remains pending",
     )
 
-    request = _prepare_request(
+    request = _prepare_request_with_digest(
         _transcript(_row(1, mentioned)),
         state,
         as_of=date(2026, 10, 9),
     )
 
     assert target in request.visible_entry_ids
+
+
+def test_prepare_reuses_entry_safety_and_relevance_work_until_memory_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state, _targets = _crowded_priority_state(
+        registry,
+        project_id,
+        ("backlog", "PR #425 needs Linux verification."),
+        ("backlog", "PR #425 needs macOS verification."),
+    )
+    transcript = _transcript(_row(1, "PR #425 merged."))
+    projections = 0
+    relevance_terms = 0
+    original_projection = entry_request._entry_projection
+    original_relevance_terms = entry_request._entry_relevance_terms
+
+    def projection(entry):
+        nonlocal projections
+        projections += 1
+        return original_projection(entry)
+
+    def entry_relevance_terms(entry):
+        nonlocal relevance_terms
+        relevance_terms += 1
+        return original_relevance_terms(entry)
+
+    # test-contract: seam projection cache is observed through prepare output
+    monkeypatch.setattr(entry_request, "_entry_projection", projection)
+    # test-contract: seam relevance cache is observed through prepare output
+    monkeypatch.setattr(
+        entry_request, "_entry_relevance_terms", entry_relevance_terms
+    )
+
+    first = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
+    second = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
+
+    # test-contract: seam cache invalidation is observed only through prepare output
+    assert second.prompt == first.prompt
+    first_projections = projections
+    first_relevance_terms = relevance_terms
+    assert first_projections > 0
+    assert first_relevance_terms > 0
+
+    changed_entry = next(
+        entry for entry in state.entries.values() if isinstance(entry, MemoryEntry)
+    )
+    changed = replace(changed_entry, text=changed_entry.text + " changed")
+    changed_state = replace(
+        state,
+        # A restored snapshot can change content without changing its generation.
+        generation=state.generation,
+        entries={**state.entries, changed.id: changed},
+    )
+    changed_request = _prepare_request_with_digest(
+        transcript, changed_state, as_of=date(2026, 10, 9)
+    )
+    assert changed.text in changed_request.prompt
+    assert projections == first_projections * 2
+    assert relevance_terms == first_relevance_terms * 2
+
+
+def test_prepare_with_digest_does_not_recompute_state_cache_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    state = _large_index_state(registry, project_id, count=10)
+    digest = state_digest(state)
+    digest_calls = 0
+    bytes_calls = 0
+    cache_calls = 0
+    original_cached_entries = entry_request._cached_entries
+
+    def counted_cached_entries(*args, **kwargs):
+        nonlocal cache_calls
+        cache_calls += 1
+        return original_cached_entries(*args, **kwargs)
+
+    def counted_digest(value):
+        nonlocal digest_calls
+        digest_calls += 1
+        return state_digest(value)
+
+    def counted_bytes(value):
+        nonlocal bytes_calls
+        bytes_calls += 1
+        return entry_store.canonical_state_bytes(value)
+
+    monkeypatch.setattr(entry_request, "state_digest", counted_digest, raising=False)
+    # test-contract: seam cache-key work is observed through prepare
+    monkeypatch.setattr(entry_request, "_cached_entries", counted_cached_entries)
+    # test-contract: seam serialization work is observed through prepare
+    monkeypatch.setattr(entry_store, "canonical_state_bytes", counted_bytes)
+    _prepare_request_impl(
+        _transcript(_row(1, "ordinary row")),
+        state,
+        as_of=date(2026, 10, 9),
+        snapshot_digest=digest,
+    )
+    assert digest_calls == 0
+    assert bytes_calls == 0
+    assert cache_calls == 1
 
 
 def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
@@ -871,17 +987,17 @@ def test_relevance_selection_is_stable_and_preserves_no_overlap_order(
         ("backlog", "PR #425 needs Linux verification."),
         ("backlog", "PR #425 needs macOS verification."),
     )
-    no_overlap = _prepare_request(
+    no_overlap = _prepare_request_with_digest(
         _transcript(_row(1, "Quartz hummingbird.")),
         state,
         as_of=date(2026, 10, 9),
     )
-    baseline = _prepare_request(_transcript(), state, as_of=date(2026, 10, 9))
+    baseline = _prepare_request_with_digest(_transcript(), state, as_of=date(2026, 10, 9))
     assert _listed_entry_ids(no_overlap.prompt) == _listed_entry_ids(baseline.prompt)
 
     transcript = _transcript(_row(1, "PR #425 merged."))
-    first = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
-    second = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    first = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
+    second = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
 
     assert all(target in first.visible_entry_ids for target in targets)
     assert _listed_entry_ids(first.prompt) == _listed_entry_ids(second.prompt)
@@ -898,7 +1014,7 @@ async def test_operation_targeting_entry_omitted_from_request_is_rejected(
         project_id, state, expected_digest=current.digest
     )
     transcript = _transcript(_row(1, "Correct one current entry."))
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     omitted = next(
         entry.id
         for entry in state.entries.values()
@@ -954,7 +1070,7 @@ async def test_oversized_memory_indexes_every_active_entry_and_allows_targeting(
         project_id, state, expected_digest=current.digest
     )
     transcript = _transcript(_row(1, "Correct one indexed entry."))
-    request = _prepare_request(transcript, state, as_of=date(2026, 10, 9))
+    request = _prepare_request_with_digest(transcript, state, as_of=date(2026, 10, 9))
     active_ids = {
         entry.id
         for entry in state.entries.values()
