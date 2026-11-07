@@ -1317,7 +1317,10 @@ implementation for the frontend client. Two RPCs cover the surface.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
-  - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `output`: `text` is the composed notice to render as a quiet receipt. For
+    `/status`, this is the same operational view as the TUI, including configured
+    hooks, recent cache-hit history, and model-attributed estimated cost. The
+    shared view omits terminal-only navigation key hints.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
     an opaque `input_id` and the typed `display_text`; the resolved text and

@@ -20,14 +20,12 @@ from ..accounts.usage import format_usage_lines
 from ..core.project_context import discover_repo_root
 from ..core.session import persist_metadata_change
 from ..core.slash import (
-    MODEL_CONTEXT_WINDOWS,
     SlashCommand,
     SlashCommandRegistry,
     SlashStatus,
-    compaction_history,
+    build_slash_status,
     create_slash_registry,
 )
-from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
@@ -110,58 +108,23 @@ class ServerSlashSession:
         opened = runtime.opened
         if loop is None or opened is None:
             raise ProtocolError(-32003, "no active session")
-        assembler = loop.context_assembler
-        child_usage = assembler.descendant_usage
+        state = runtime.state
+        if state is None:
+            raise ProtocolError(-32003, "no active session")
         pending = (
             self._approval_control.pending_approval_labels()
             if self._approval_control is not None
             else ()
         )
-        items = loop.store.todo_items()
-        return SlashStatus(
+        return build_slash_status(
+            loop,
             session_id=opened.metadata.session_id,
             provider=opened.metadata.provider,
             model=opened.metadata.model,
-            retained_tail=assembler.retained_tail,
-            tokens_used_this_session=assembler.tokens_used_this_session,
-            tokens_in_current_context=assembler.token_count,
-            compaction_marker_count=loop.store.compaction_marker_count(),
-            pending_approvals=pending,
-            checkpoint_count=loop.store.checkpoint_count(),
-            cache_read_input_tokens=assembler.cache_read_input_tokens_this_session,
-            cache_creation_input_tokens=assembler.cache_creation_input_tokens_this_session,
-            uncached_input_tokens=assembler.uncached_input_tokens_this_session,
-            output_tokens_this_session=assembler.output_tokens_this_session,
-            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
-            child_cache_creation_input_tokens=child_usage[
-                "cache_creation_input_tokens"
-            ],
-            child_uncached_input_tokens=child_usage["input_tokens"],
-            child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=tuple(opened.metadata.context_files),
             vim_mode=opened.metadata.vim_mode,
-            plan_mode=opened.metadata.plan_mode,
-            hooks=(),
-            todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=(),
-            usage_cost_by_model=(),
-            compaction_history=compaction_history(
-                loop.store.replay(), assembler.token_counter
-            ),
-            model_window=MODEL_CONTEXT_WINDOWS.get(opened.metadata.provider, {}).get(
-                opened.metadata.model
-            ),
-            mcp_summary=loop.mcp_summary,
-            explicit_finish=loop.explicit_finish,
-            max_agent_depth=loop.max_agent_depth,
-            automatic_memory_failure=(
-                loop.memory_reconciler.automatic_memory_status
-                if loop.memory_reconciler is not None
-                else None
-            ),
-            transcript_index_failure=loop.transcript_index_failure(
-                opened.metadata.session_id
-            ),
+            pending_approvals=pending,
+            usage_tracker=state.usage_tracker,
         )
 
     async def slash_accounts(self, args: str) -> str:
@@ -210,6 +173,10 @@ class ServerSlashSession:
         except Exception as exc:  # noqa: BLE001 - context assembler surface is broad
             return f"compact failed: {exc}"
         after = loop.store.compaction_marker_count()
+        state = runtime.state
+        if state is None:
+            raise ProtocolError(-32003, "no active session")
+        state.usage_tracker.record_compaction(state.model)
         if after == before:
             return "compact: nothing to compact"
         marker = next(

@@ -693,6 +693,8 @@ class ServeControl:
             and state.session_id == session_id
         )
         kind = event.type
+        if foreground:
+            state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,

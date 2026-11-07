@@ -7002,6 +7002,79 @@ def test_memory_command_parity_tui_and_serve() -> None:
     assert tui_registry.calls == runtime.manager.project_registry.calls
 
 
+@pytest.mark.asyncio
+async def test_slash_status_uses_live_hooks_usage_and_cost_over_real_transport(
+    tmp_path: Path,
+) -> None:
+    from zeta.tui.app import _status_card_lines
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "hooks.toml").write_text(
+        '[[hook]]\nevent = "stop"\ncommand = "true"\n', encoding="utf-8"
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("done")],
+                usage={"input_tokens": 100, "output_tokens": 50},
+            )
+        ]
+    )
+    server = ZetaServer(
+        home=home,
+        cwd=_seed_slash_fixtures(tmp_path),
+        port=0,
+        provider="codex",
+        model="gpt-5.6-luna",
+        allow_hooks=True,
+        backend_factory=lambda provider, model, home: (
+            backend,
+            model or "gpt-5.6-luna",
+        ),
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, "send", "send", {"text": "hello"})
+        await _event(reader, "usage")
+        await _event(reader, "turn_end")
+
+        result = (
+            await _request(
+                reader,
+                writer,
+                "status",
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["result"]
+        assert result["kind"] == "output"
+        serve_text = result["text"]
+        assert "hooks: stop: true" in serve_text
+        assert "cache_hit_trend: 1:0%" in serve_text
+        assert "estimated_cost_usd: $" in serve_text
+        assert "estimated_cost_usd: unavailable" not in serve_text
+
+        tui_lines = _status_card_lines(
+            ServerSlashSession(server.runtime).slash_status()
+        )
+        tui_text = "\n".join(
+            "".join(text for _style, text in line) for line in tui_lines
+        )
+        for line in (
+            "hooks: stop: true",
+            "  cache_hit_trend: 1:0%",
+            next(
+                line
+                for line in serve_text.splitlines()
+                if line.startswith("  estimated_cost_usd: $")
+            ),
+        ):
+            assert line in tui_text
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.parametrize("with_fact_floor", [False, True])
 async def test_slash_status_maps_compaction_with_or_without_fact_floor(
     tmp_path: Path, with_fact_floor: bool
