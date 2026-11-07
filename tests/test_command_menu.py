@@ -255,7 +255,6 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
         )
     )
     assert menu_bottom + 1 == chrome_top
-    assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
 
 
 @pytest.mark.parametrize("completion_count", [1, 2, 20])

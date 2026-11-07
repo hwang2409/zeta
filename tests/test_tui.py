@@ -6354,6 +6354,39 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     assert rendered.count("\n  plan") == 1
 
 
+@pytest.mark.asyncio
+async def test_status_card_renders_viewed_session_transcript_index_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    viewed = app._agent_navigation.root_path / "child-session"
+    app._agent_navigation.current_path = viewed
+    requested: list[str] = []
+
+    def failure(session_id: str) -> str:
+        requested.append(session_id)
+        return "disk full; pending changes will retry"
+
+    monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
+
+    lines = tui_app_module._status_card_lines(app.slash_status())
+    rendered = "\n".join("".join(text for _style, text in line) for line in lines)
+
+    assert requested == ["child-session"]
+    assert (
+        "transcript_index_failure: disk full; pending changes will retry" in rendered
+    )
+    await app.close()
+
+
 @pytest.mark.parametrize(
     "state", ["streaming", "tool-running", "idle", "interrupted", "compacting"]
 )
@@ -8541,16 +8574,37 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
             FakeBackend([]),
             ConversationStore(tmp_path / "sessions"),
             skip_mcp_mount=True,
-skill_catalog=SkillCatalog.empty(),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="codex",
         model="offline",
     )
 
+    startup_ready = asyncio.Event()
+    rebuild_finished = asyncio.Event()
+    notice_emitted = asyncio.Event()
+    rebuild_transcript = app._rebuild_transcript_async
+    finish_startup_replay = app._finish_startup_replay
+
+    async def tracked_rebuild(*, batch_size: int = 1) -> bool:
+        try:
+            return await rebuild_transcript(batch_size=batch_size)
+        finally:
+            rebuild_finished.set()
+
     async def ensure_mcp_servers() -> None:
+        await asyncio.wait_for(rebuild_finished.wait(), timeout=5)
         assert app.loop._mcp_notice_sink is not None
         app.loop._mcp_notice_sink("mcp · prompts unavailable")
+        notice_emitted.set()
 
+    def tracked_finish_startup_replay(*, completed: bool) -> None:
+        finish_startup_replay(completed=completed)
+        if completed and rebuild_finished.is_set() and notice_emitted.is_set():
+            startup_ready.set()
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", tracked_rebuild)
+    monkeypatch.setattr(app, "_finish_startup_replay", tracked_finish_startup_replay)
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -8565,13 +8619,11 @@ skill_catalog=SkillCatalog.empty(),
             multiline=True,
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(startup_ready.wait(), timeout=5)
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, timeout=5)
 
-    assert "prompts unavailable" in Text.from_ansi(
-        app._transcript.render(120)
-    ).plain
+    assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
@@ -13613,7 +13665,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
             }
         ],
         "last_attempt_at": "2020-01-01T00:00:00Z",
-        "last_error": "rate limited",
+        "last_error": "rate limited; retry later",
     }
     store._write_usage_bytes(account, (json.dumps(usage) + "\n").encode())
     manager = SessionManager(home)
@@ -13653,8 +13705,75 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         assert "5h 42%" in plain
         assert f"resets {local_reset}" in plain
         assert "stale" in plain
-        assert "refresh failed: rate limited" in plain
+        assert "refresh failed: rate limited; retry later" in plain
     finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_refresh_renders_busy_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    account = AccountId("anthropic", "work")
+    await asyncio.to_thread(
+        named_account_credentials(home, "anthropic", "work").save,
+        OAuthTokens("access", "refresh", 9_999_999_999),
+    )
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="claude", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    refresh_rendered = asyncio.Event()
+    app._presenter.print_unit = lambda panel: rendered.append(panel) or panel
+    app._transcript.replace = (
+        lambda unit, replacement: rendered.append(replacement) or replacement
+    )
+    repaint = app._repaint_accounts_picker
+
+    def repaint_and_signal() -> None:
+        repaint()
+        if app._accounts_picker is not None and not app._accounts_picker.refreshing:
+            refresh_rendered.set()
+
+    app._repaint_accounts_picker = repaint_and_signal
+    monkeypatch.setattr("zeta.accounts.usage.OAUTH_REFRESH_TIMEOUT_SECONDS", 0)
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_lifecycle_lock() -> None:
+        with AccountStore(home).lifecycle_guard(account):
+            locked.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold_lifecycle_lock)
+    holder.start()
+    assert locked.wait(1)
+    try:
+        assert await app.slash_accounts("") == ""
+        app.accounts_picker_refresh()
+        await refresh_rendered.wait()
+        assert app._accounts_picker is not None
+        assert app._accounts_picker.usages is not None
+        assert app._accounts_picker.usages[account].error == (
+            "account busy; retry after the other account operation finishes"
+        )
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        plain = Text.from_ansi(output.getvalue()).plain
+        assert "refresh failed: account busy" in plain
+    finally:
+        release.set()
+        holder.join()
         opened.store.close()
 
 

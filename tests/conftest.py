@@ -54,6 +54,11 @@ def pytest_collection_modifyitems(
             and path.name != "test_test_environment.py"
         ):
             item.fixturenames.append("close_direct_test_runtime_owners")
+        if (
+            path.is_relative_to(_TEST_SITE_PACKAGES)
+            and path.name != "test_test_environment.py"
+        ):
+            item.fixturenames.append("close_direct_test_agent_loops")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -868,7 +873,7 @@ async def close_direct_test_runtime_owners(
 
 @pytest.fixture
 async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
-    """Close AgentLoops whose constructor caller is test code, never src/zeta."""
+    """Close every AgentLoop constructed during a repository test."""
     from zeta.runtime.loop import AgentLoop
     from zeta.tools import ToolRegistry
 
@@ -880,9 +885,7 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
     @wraps(loop_init)
     def tracked_init(loop, *args, **kwargs):
         loop_init(loop, *args, **kwargs)
-        caller = Path(sys._getframe(1).f_code.co_filename).resolve()
-        if _is_repository_test_path(caller):
-            loops.append(loop)
+        loops.append(loop)
 
     monkeypatch.setattr(AgentLoop, "__init__", tracked_init)
     yield
@@ -956,10 +959,10 @@ def _inject_scripted_completion_backend(monkeypatch: pytest.MonkeyPatch) -> None
         selected = (
             model
             or {
-            "claude": "claude-sonnet-4-6",
-            "codex": "gpt-5.6-luna",
-            "ollama": "qwen3:4b",
-        }[provider]
+                "claude": "claude-sonnet-4-6",
+                "codex": "gpt-5.6-luna",
+                "ollama": "qwen3:4b",
+            }[provider]
         )
         return FakeInteractiveBackend(delay=0, model=selected), selected
 

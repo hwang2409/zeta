@@ -729,10 +729,12 @@ async def test_stdio_write_after_server_exit_preserves_protocol_error(
         limit=stdio_module.MCP_STDIO_LINE_LIMIT,
     )
     client._process = process
-    client._reader_task = asyncio.create_task(client._read_stdout())
+    reader_task = asyncio.create_task(client._read_stdout())
+    client._reader_task = reader_task
     try:
         await process.wait()
-        await client._reader_task
+        await reader_task
+        assert client._reader_task is None
         with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
             await client._request("initialize", {})
     finally:
@@ -4615,13 +4617,13 @@ async def test_resource_request_error_keeps_actor_mounted(
 
 
 @pytest.mark.asyncio
-async def test_resource_read_abort_sends_cancel_notification(
+async def test_resource_read_abort_invalidates_stdio_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.mcp.resources import MCPResourceError
 
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    marker = tmp_path / "cancelled.txt"
+    cancel_marker = tmp_path / "cancelled.txt"
     source = f"""
 import json
 import pathlib
@@ -4632,14 +4634,14 @@ for line in sys.stdin:
     if method == "notifications/initialized":
         continue
     if method == "notifications/cancelled":
-        pathlib.Path({str(marker)!r}).write_text("cancelled")
+        pathlib.Path({str(cancel_marker)!r}).write_text("cancelled")
         continue
     if method == "initialize":
         result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}, "resources": {{}}}}, "serverInfo": {{"name": "fake", "version": "1"}}}}
     elif method == "tools/list":
         result = {{"tools": []}}
     elif method == "resources/read":
-        continue  # never reply; keep reading stdin so cancellation is observed
+        continue
     else:
         result = {{"content": [], "isError": False}}
     print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
@@ -4652,21 +4654,29 @@ for line in sys.stdin:
         registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
     )
     try:
+        actor = mount._actors["srv"]
+        client = actor._client
+        assert isinstance(client, StdioMCPClient)
+        request_written = asyncio.Event()
+        write_request = client._write_request
+
+        async def observe_write(*args) -> None:
+            await write_request(*args)
+            request = args[1]
+            if request.get("method") == "resources/read":
+                request_written.set()
+
+        monkeypatch.setattr(client, "_write_request", observe_write)
         signal = AbortSignal()
         read_task = asyncio.create_task(
             mount.read_resource("srv", "mem://one", abort_signal=signal)
         )
-        await asyncio.sleep(0.2)
+        await request_written.wait()
         signal.abort()
-        with pytest.raises(MCPResourceError):
-            await asyncio.wait_for(read_task, 5)
-
-        # The server-side request was told to stop via notifications/cancelled.
-        for _ in range(100):
-            if marker.exists():
-                break
-            await asyncio.sleep(0.05)
-        assert marker.exists()
+        with pytest.raises(MCPResourceError, match="unavailable"):
+            await read_task
+        assert actor.status.state == "degraded"
+        assert not cancel_marker.exists()
     finally:
         await mount.close()
         await registry.close()

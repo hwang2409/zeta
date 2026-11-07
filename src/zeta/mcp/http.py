@@ -43,6 +43,7 @@ from .envelope import (
     MCPCallLimits,
     MCPTransientQuotaError,
     MCPWireLimitError,
+    _format_wire_limit,
 )
 from .oauth import (
     MCPOAuthError,
@@ -170,7 +171,7 @@ class StreamableHTTPMCPClient(MCPClient):
         except MCPWireLimitError:
             return make_error_result(
                 f"MCP tool {self.config.name}__{name} exceeded the "
-                f"{self._limits.max_wire_bytes} response limit"
+                f"{_format_wire_limit(self._limits.max_wire_bytes)} response limit"
             )
         except MCPTransientQuotaError:
             return make_error_result(
@@ -608,7 +609,8 @@ async def _iter_sse_events(
         event_wire_bytes += byte_count
         if event_wire_bytes > limits.max_wire_bytes:
             raise MCPWireLimitError(
-                f"MCP HTTP notification event exceeded the {limits.max_wire_bytes} response limit"
+                "MCP HTTP notification event exceeded the "
+                f"{_format_wire_limit(limits.max_wire_bytes)} response limit"
             )
         if aggregate_call:
             call_wire_bytes += byte_count

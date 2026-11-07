@@ -259,6 +259,65 @@ async def test_retry_after_controls_wait_and_notice(provider, tmp_path, monkeypa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", PROVIDERS)
+async def test_retry_after_above_local_cap_is_not_shortened(
+    provider, tmp_path, monkeypatch
+):
+    requests, sleeps = [], []
+
+    async def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "31"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(200, text=provider.success_sse, request=request)
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(transport_module.asyncio, "sleep", record_sleep)
+    _store, client, backend = _setup(provider, tmp_path, handler)
+    await _collect(backend)
+
+    assert len(requests) == 2
+    assert sleeps == [31.0]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", PROVIDERS)
+async def test_retry_after_longer_than_budget_fails_without_retry(
+    provider, tmp_path, monkeypatch
+):
+    requests, sleeps = [], []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            429,
+            headers={"retry-after": "120"},
+            json={"error": {"message": "busy"}},
+            request=request,
+        )
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(transport_module.asyncio, "sleep", record_sleep)
+    _store, client, backend = _setup(provider, tmp_path, handler)
+    with pytest.raises(provider.http_error_type, match=r"Retry-After of 120s"):
+        await _collect(backend)
+
+    assert len(requests) == 1
+    assert sleeps == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", PROVIDERS)
 async def test_stream_rate_limit_retry_notice_uses_429_label(provider, tmp_path, monkeypatch):
     requests = []
 

@@ -115,7 +115,7 @@ class _RegistryEntry:
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_LOCK = threading.RLock()
 
 
 def _canonical_home(home: str | Path) -> Path:

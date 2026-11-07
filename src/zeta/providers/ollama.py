@@ -44,6 +44,7 @@ from .usage import normalize_usage
 OLLAMA_API_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 OLLAMA_SHOW_TIMEOUT_SECONDS = 2.0
+OLLAMA_MAX_STREAM_LINE_BYTES = 1024 * 1024
 
 
 class OllamaError(RuntimeError):
@@ -63,6 +64,29 @@ class OllamaError(RuntimeError):
         self.retry_after = retry_after
         self.retryable = retryable
         self.is_stall = is_stall
+
+
+async def _bounded_stream_lines(response: httpx.Response) -> AsyncIterator[bytes]:
+    buffer = bytearray()
+    chunks = response.aiter_bytes()
+    async for chunk in chunks:
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            end = len(chunk) if newline < 0 else newline
+            if len(buffer) + end - start > OLLAMA_MAX_STREAM_LINE_BYTES:
+                raise OllamaError(
+                    "Ollama stream line exceeded "
+                    f"{OLLAMA_MAX_STREAM_LINE_BYTES} bytes"
+                )
+            buffer.extend(memoryview(chunk)[start:end])
+            if newline < 0:
+                break
+            yield bytes(buffer)
+            buffer.clear()
+            start = newline + 1
+    if buffer:
+        yield bytes(buffer)
 
 
 def _content(message: Message) -> str:
@@ -324,7 +348,7 @@ class OllamaBackend(CompletionBackend):
                 stop_reason: str | None = None
                 done = False
                 async for line in stall_watchdog(
-                    response.aiter_lines(),
+                    _bounded_stream_lines(response),
                     seconds=self.stall_seconds,
                     on_stall=stall_error,
                 ):
@@ -385,6 +409,7 @@ class OllamaBackend(CompletionBackend):
                     for field, normalized in (
                         ("prompt_eval_count", "prompt_tokens"),
                         ("eval_count", "completion_tokens"),
+                        ("prompt_eval_cached_count", "prompt_tokens_details"),
                     ):
                         if field not in item:
                             continue
@@ -393,7 +418,11 @@ class OllamaBackend(CompletionBackend):
                             raise OllamaError(
                                 f"Ollama {field} must be a non-negative integer"
                             )
-                        frame_usage[normalized] = value
+                        frame_usage[normalized] = (
+                            {"cached_tokens": value}
+                            if field == "prompt_eval_cached_count"
+                            else value
+                        )
 
                     if not started:
                         started = True
