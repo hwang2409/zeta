@@ -82,12 +82,11 @@ from ._results import (
 )
 from ._shared.cwd_state import (
     SessionCwdRemoved,
-    nearest_existing_directory,
     open_session_cwd,
     open_verified_directory,
 )
 from ._shared.process import BackgroundTaskRegistry
-from ._shared.sandbox import SandboxPolicy, resolve_shell_cwd
+from ._shared.sandbox import SandboxPolicy
 from ._spill import SpillStore
 from ._validation import (
     MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
@@ -898,17 +897,9 @@ class ToolRegistry:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
 
-    def resolve_shell_cwd(self, requested_cwd: object) -> str:
-        resolved = resolve_shell_cwd(self.bash_cwd, requested_cwd)
-        if requested_cwd is not None or Path(resolved).is_dir():
-            return resolved
-        return self.recover_shell_cwd(resolved)
-
-    def recover_shell_cwd(self, removed_cwd: str) -> str:
-        fallback = nearest_existing_directory(removed_cwd)
+    def commit_cwd_recovery(self, removed_cwd: str, fallback: str) -> None:
         self.update_bash_cwd(fallback)
         self._cwd_recovery_notices.append((removed_cwd, fallback))
-        return fallback
 
     def take_cwd_recovery_notices(self) -> tuple[tuple[str, str], ...]:
         notices = tuple(self._cwd_recovery_notices)

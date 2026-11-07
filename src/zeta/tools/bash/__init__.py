@@ -16,12 +16,9 @@ from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
 from .._shared.background_spawn import _kill_and_reap
-from .._shared.process import (
-    create_subprocess_shell_in_fd,
-    spawn_background,
-    tool_subprocess_env,
-)
-from .._shared.shell_cwd import bind_shell_cwd
+from .._shared.process import spawn_background, tool_subprocess_env
+from .._shared.tool_spawn import create_tool_subprocess_shell
+from .._shared.shell_cwd import bind_shell_cwd_async
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -184,7 +181,7 @@ async def _bash(
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
-        start_cwd, cwd_fd = bind_shell_cwd(
+        start_cwd, cwd_fd = await bind_shell_cwd_async(
             registry, arguments.get("cwd"), approved_cwd
         )
         task_id, pid = await registry.background_tasks.start(
@@ -208,7 +205,9 @@ async def _bash(
             },
         )
 
-    start_cwd, cwd_fd = bind_shell_cwd(registry, arguments.get("cwd"), approved_cwd)
+    start_cwd, cwd_fd = await bind_shell_cwd_async(
+        registry, arguments.get("cwd"), approved_cwd
+    )
     try:
         read_fd, write_fd = os.pipe()
     except BaseException:
@@ -238,11 +237,13 @@ async def _bash(
     timed_out = False
     try:
         if log_path is not None:
-            log_handle = registry.background_tasks.open_log(log_path)
+            log_handle = await asyncio.to_thread(
+                registry.background_tasks.open_log, log_path
+            )
         try:
-            spawn = create_subprocess_shell_in_fd(
+            spawn = create_tool_subprocess_shell(
                 command,
-                cwd_fd,
+                cwd_fd=cwd_fd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
