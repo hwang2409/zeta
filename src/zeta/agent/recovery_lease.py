@@ -88,7 +88,7 @@ def acquire_recovery_subtree(
         return False
     except TranscriptLoadError:
         # keep the parent usable; the child remains unavailable until repair
-        return True
+        return False
     if child_store is None:
         return True
     leases.enter_context(child_store)
