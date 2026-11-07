@@ -1059,8 +1059,8 @@ class ApprovalLifecycle:
                 except asyncio.CancelledError:
                     if not settlement.cancelled():
                         raise
-                except Exception:  # noqa: BLE001 - settlement owns its failure path
-                    pass  # noqa: S110 - the settlement already handled the failure
+                except Exception:  # noqa: BLE001, S110 - settlement owns failure
+                    pass
             record = self._state.records.get(key)
             if record is None:
                 return
