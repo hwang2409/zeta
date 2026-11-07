@@ -13173,13 +13173,16 @@ async def test_child_agent_with_other_project_cwd_loads_its_own_project_file(
             super().__init__(calls)
             self.recorded: list[list[Message]] = []
 
+        @owned_completion
         async def complete(
             self,
             messages: Sequence[Message],
             tool_schemas: Sequence[ToolSchema],
         ) -> AsyncIterator[StreamEvent]:
             self.recorded.append(list(messages))
-            async for event in super().complete(messages, tool_schemas):
+            async for event in super().complete(
+                messages, tool_schemas, control=completion_control()
+            ):
                 yield event
 
     backend = RecordingBackgroundBackend(
