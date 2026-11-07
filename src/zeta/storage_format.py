@@ -9,8 +9,8 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import threading
-import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +18,22 @@ from pathlib import Path
 from typing import Any, Final, Self
 
 WRITER_EPOCH: Final = 3
+
+# These are the authoritative stored roots. An empty sessions/ directory is safe:
+# startup can create it before a session exists. The lock, logs, caches, and other
+# derived or ephemeral output are intentionally not gated.
+GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
+    ("sessions/*", "zeta.core.store and zeta.session_retention"),
+    (
+        "projects",
+        "zeta.project_registry projects and legacy lanes, zeta.memory, and zeta.project_inbox",
+    ),
+    ("accounts.json", "zeta.accounts.store"),
+    ("accounts", "zeta.accounts.store OAuth credentials"),
+    ("anthropic-oauth.json", "zeta.accounts.store legacy OAuth credentials"),
+    ("codex-oauth.json", "zeta.accounts.store legacy OAuth credentials"),
+    ("mcp-tokens", "zeta.mcp.oauth_store"),
+)
 
 BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
     "memory-current.json": frozenset({("history",)}),
@@ -192,17 +208,21 @@ def _open_lock(home: Path) -> int:
     return fd
 
 
+def _missing_manifest_error(home: Path) -> StorageFormatError:
+    return StorageFormatError(
+        f"stored-format manifest is missing at {home}; run "
+        "zeta storage-format advance --expected-epoch 0 "
+        f"--target-epoch {WRITER_EPOCH}"
+    )
+
+
 def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
     try:
         raw = (home / _MANIFEST).read_bytes()
     except FileNotFoundError:
         if absent_epoch is not None:
             return absent_epoch
-        raise StorageFormatError(
-            f"stored-format manifest is missing at {home}; run "
-            "zeta storage-format advance --expected-epoch 0 "
-            f"--target-epoch {WRITER_EPOCH}"
-        ) from None
+        raise _missing_manifest_error(home) from None
     try:
         decoder = json.JSONDecoder()
         text = raw.decode()
@@ -223,20 +243,45 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
     return epoch
 
 
-def _bootstrap_test_manifest(home: Path) -> None:
-    if (
-        os.environ.get("ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT") != "1"
-        or (home / _MANIFEST).exists()
-    ):
-        return
+def _home_has_gated_state(home: Path) -> bool:
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        advance(home, expected_epoch=0)
-    except StorageFormatError:
-        for _ in range(100):
-            if (home / _MANIFEST).exists():
-                return
-            time.sleep(0.01)
-        raise
+        for pattern, _owner in GATED_HOME_PATHS:
+            name = pattern.removesuffix("/*")
+            try:
+                info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not pattern.endswith("/*") or not stat.S_ISDIR(info.st_mode):
+                return True
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=home_fd,
+                )
+            except OSError:
+                return True
+            try:
+                if os.listdir(child_fd):
+                    return True
+            finally:
+                os.close(child_fd)
+        return False
+    finally:
+        os.close(home_fd)
+
+
+def _bootstrap_empty_home(fd: int, home: Path) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise _missing_manifest_error(home) from None
+    if not (home / _MANIFEST).exists():
+        if _home_has_gated_state(home):
+            _read_manifest(home)
+        _publish_manifest(home, WRITER_EPOCH)
+    fcntl.flock(fd, fcntl.LOCK_SH)
 
 
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
@@ -260,10 +305,12 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
             raise StorageFormatError(
                 "stored-format lock acquisition must run off the event loop"
             )
-        _bootstrap_test_manifest(canonical)
         fd = _open_lock(canonical)
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH)
+            if (canonical / _MANIFEST).exists():
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            else:
+                _bootstrap_empty_home(fd, canonical)
             epoch = _read_manifest(canonical)
             if epoch > capability:
                 raise StorageFormatError(

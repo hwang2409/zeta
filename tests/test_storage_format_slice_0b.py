@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.core.session_files import atomic_publish_file
 from zeta.core.slash import create_slash_registry
@@ -223,7 +224,7 @@ def test_sent_ledger_preserves_unknown_record_ids(tmp_path: Path) -> None:
 
 
 def test_reconciliation_keyed_record_preserves_unknown_fields(tmp_path: Path) -> None:
-    home = tmp_path / ".zeta"
+    home = initialize_storage_home(tmp_path / ".zeta")
     path = home / "sessions" / "session-1" / "memory-reconcile.json"
     path.parent.mkdir(parents=True)
     kwargs = {
@@ -741,8 +742,7 @@ def test_closed_variant_readers_reject_without_mutation(
         registry.list_session_links(project.project_id)
     assert sessions_path.read_bytes() == before
 
-    account_home = home / "accounts"
-    account_home.mkdir()
+    account_home = initialize_storage_home(home / "accounts")
     account_path = account_home / "accounts.json"
     _write(
         account_path,
