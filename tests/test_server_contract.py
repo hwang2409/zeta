@@ -125,6 +125,27 @@ async def test_controller_and_observer_roles_match(
     observed = await observer.request("observer-list", "list_sessions")
     rejected = await observer.request("observer-new", "new_session")
     created = await controller.request("controller-new", "new_session")
+    for index in range(7):
+        extra = await serve_contract.connect("observer")
+        await extra.request(
+            f"extra-observer-{index}",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers"],
+            },
+        )
+    overflow = await serve_contract.connect("observer")
+    capacity = await overflow.request(
+        "observer-capacity",
+        "hello",
+        {
+            "protocol_version": "1.2",
+            "role": "observer",
+            "features": ["serve_observers"],
+        },
+    )
 
     assert "new_session" in controller_hello["capabilities"]["requests"]
     assert "new_session" not in observer_hello["result"]["capabilities"]["requests"]
@@ -135,3 +156,4 @@ async def test_controller_and_observer_roles_match(
         "method": "new_session",
     }
     assert created["result"]["session"]["session_id"]
+    assert capacity["error"]["code"] == -32001
