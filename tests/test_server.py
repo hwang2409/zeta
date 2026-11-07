@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -798,39 +798,45 @@ class BlockingThenCaptureBackend:
         )
 
 
-class ConcurrentDelegatedApprovalBackend:
-    def __init__(self, parent_calls: list[ToolCall], child_call: ToolCall) -> None:
-        self.parent = FakeBackend(
-            [
-                ScriptedTurn(tool_calls=parent_calls),
-                ScriptedTurn([TextContent("done")]),
-            ]
-        )
+def _public_input_prompt(messages, prompts: Collection[str]) -> str | None:
+    return next(
+        (
+            block.text
+            for message in messages
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextContent) and block.text in prompts
+        ),
+        None,
+    )
+
+
+class PerActorFakeBackend:
+    def __init__(
+        self,
+        parent_turns: list[ScriptedTurn],
+        child_turns: dict[str, list[ScriptedTurn]],
+        *,
+        gated_child_call: int = 1,
+    ) -> None:
+        self.parent = FakeBackend(parent_turns)
         self.children = {
-            prompt: FakeBackend(
-                [
-                    ScriptedTurn(tool_calls=[child_call]),
-                    ScriptedTurn([TextContent("done")]),
-                ]
-            )
-            for prompt in ("read one", "read two")
+            prompt: FakeBackend(turns) for prompt, turns in child_turns.items()
         }
         self.child_started = {prompt: asyncio.Event() for prompt in self.children}
+        self.child_calls = dict.fromkeys(self.children, 0)
         self.release_children = asyncio.Event()
+        self.gated_child_call = gated_child_call
 
     async def complete(self, messages, tool_schemas):
-        child_prompt = next(
-            (
-                block.text
-                for message in messages
-                if message.role is MessageRole.USER
-                for block in message.content
-                if isinstance(block, TextContent) and block.text in self.children
-            ),
-            None,
-        )
+        child_prompt = _public_input_prompt(messages, self.children)
         backend = self.children.get(child_prompt, self.parent)
-        if child_prompt is not None and not backend.calls:
+        if child_prompt is not None:
+            self.child_calls[child_prompt] += 1
+        if (
+            child_prompt is not None
+            and self.child_calls[child_prompt] == self.gated_child_call
+        ):
             self.child_started[child_prompt].set()
             await self.release_children.wait()
         stream = backend.complete(messages, tool_schemas)
@@ -838,8 +844,10 @@ class ConcurrentDelegatedApprovalBackend:
             await asyncio.gather(
                 *(started.wait() for started in self.child_started.values())
             )
-            yield await anext(stream)
-            self.release_children.set()
+            try:
+                yield await anext(stream)
+            finally:
+                self.release_children.set()
         async for event in stream:
             yield event
 
@@ -1710,13 +1718,18 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         {"prompt": "read", "description": "child", "background": True},
     )
     delegated = ToolCall(raw_id, "read", {"path": str(target)})
-    backend = FakeBackend(
+    backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[foreground, agent]),
-            ScriptedTurn(tool_calls=[delegated]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
+            ScriptedTurn([TextContent("parent done")]),
+        ],
+        {
+            "read": [
+                ScriptedTurn(tool_calls=[delegated]),
+                ScriptedTurn([TextContent("child done")]),
+            ]
+        },
+        gated_child_call=2,
     )
     server = ZetaServer(provider="codex",
         home=tmp_path,
@@ -1750,6 +1763,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         first = await _event(reader, "approval_request")
         second = await _event(reader, "approval_request")
         requests = {event["delegated"]: event for event in (first, second)}
+        assert set(requests) == {False, True}
         assert requests[False]["tool_call"]["id"] == raw_id
         assert requests[True]["tool_call"]["id"] == raw_id
         assert requests[False]["request_id"] != requests[True]["request_id"]
@@ -1768,6 +1782,23 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert {
             event["request_id"] for event in _named_events(frames, "approval_end")
         } == expected_end_ids
+        assert server.runtime.opened is not None
+        assert any(
+            isinstance(block, TextContent) and block.text == "parent done"
+            for message in server.runtime.opened.store.messages()
+            for block in message.content
+        )
+        child_store = ConversationStore(
+            server.runtime.opened.store.session_dir / "agents", session_id="1"
+        )
+        try:
+            assert any(
+                isinstance(block, TextContent) and block.text == "child done"
+                for message in child_store.messages()
+                for block in message.content
+            )
+        finally:
+            child_store.close()
     finally:
         await _close(server, writer)
 
@@ -3622,12 +3653,12 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         {"prompt": "wait", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
-    backend = FakeBackend(
+    backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[parent_call]),
-            ScriptedTurn(tool_calls=[child_call]),
             ScriptedTurn([TextContent("parent done")]),
-        ]
+        ],
+        {"wait": [ScriptedTurn(tool_calls=[child_call])]},
     )
     server = ZetaServer(provider="codex",
         home=tmp_path,
@@ -3766,7 +3797,19 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
             {"prompt": "read two", "description": "child two", "background": True},
         ),
     ]
-    backend = ConcurrentDelegatedApprovalBackend(parent_calls, child_call)
+    backend = PerActorFakeBackend(
+        [
+            ScriptedTurn(tool_calls=parent_calls),
+            ScriptedTurn([TextContent("parent done")]),
+        ],
+        {
+            prompt: [
+                ScriptedTurn(tool_calls=[child_call]),
+                ScriptedTurn([TextContent("child done")]),
+            ]
+            for prompt in ("read one", "read two")
+        },
+    )
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
