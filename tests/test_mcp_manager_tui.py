@@ -19,6 +19,7 @@ from prompt_toolkit.shortcuts import yes_no_dialog as real_yes_no_dialog
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.storage_homes import initialize_storage_home
 from zeta.core.store import ConversationStore
 from zeta.mcp import management as mcp_management
 from zeta.mcp.management import ManagedServer, MCPManagementService
@@ -552,6 +553,7 @@ async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypa
     async def wizard():
         raise AssertionError("must not start")
 
+    # test-contract: seam keep the wizard pending before its first event-loop turn
     monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
     app._status_action("a")
     task = app._mcp_wizard_task
@@ -828,6 +830,7 @@ async def test_real_prompt_mcp_credential_evidence_recovery(
         oauth=True,
         enabled=False,
     )
+    initialize_storage_home(home)
     credential_file = home / "mcp-tokens" / "live.json"
     credential_file.parent.mkdir()
     credential_file.write_text(record)

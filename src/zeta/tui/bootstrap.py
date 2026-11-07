@@ -70,6 +70,7 @@ class _SessionRecency:
     ) -> None:
         self._manager = manager
         self._session_id = metadata.session_id
+        self._execution_lease = metadata._execution_lease
         self._dirty = False
         self._task: asyncio.Task[None] | None = None
 
@@ -78,7 +79,9 @@ class _SessionRecency:
         self._start()
 
     async def flush(self) -> None:
-        running = self._task if self._task is not None and not self._task.done() else None
+        running = (
+            self._task if self._task is not None and not self._task.done() else None
+        )
         try:
             async with asyncio.timeout(0.5):
                 self._start()
@@ -121,7 +124,7 @@ class _SessionRecency:
         def run() -> None:
             try:
                 result: bool | BaseException = self._manager.refresh_recency(
-                    self._session_id
+                    self._session_id, self._execution_lease
                 )
             except BaseException as exc:  # noqa: BLE001 - return worker failure
                 result = exc
@@ -177,7 +180,9 @@ def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
         data = dict(entry.data)
         try:
             app._print_unit(
-                render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
+                render_event(
+                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+                ),
                 blank_before=True,
             )
         except (ValueError, BrokenPipeError, OSError):
@@ -217,8 +222,13 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
     age = format_relative_age(preview.updated_at).rjust(8)
     label = f" [{preview.name}]" if preview.name else ""
+    usage = ""
+    if preview.in_use:
+        usage = (
+            f" [in use, pid {preview.owner_pid}]" if preview.owner_pid else " [in use]"
+        )
     text = preview.preview or "(no user message)"
-    return f"{index}. {age}  {preview.session_id[:8]}{label}  {text}"
+    return f"{index}. {age}  {preview.session_id[:8]}{label}{usage}  {text}"
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
@@ -260,7 +270,13 @@ def _create_app_with_root(
     runtime_home = ephemeral_root if ephemeral else home
     assert runtime_home is not None
     registry_state = load_project_registry(runtime_home / "projects")
-    manager = SessionManager(runtime_home, project_registry_state=registry_state)
+    manager = SessionManager(
+        runtime_home,
+        project_registry_state=registry_state,
+        owner_surface="headless"
+        if getattr(args, "prompt", None) is not None
+        else "tui",
+    )
     opened = None
     try:
         system_prompt_override = resolve_prompt_argument(
@@ -471,7 +487,9 @@ def _create_app_with_root(
             selected = current.selected_accounts.get(
                 account_provider(current.provider) or ""
             )
-            account = AccountId(*selected.split(":", 1)) if selected is not None else None
+            account = (
+                AccountId(*selected.split(":", 1)) if selected is not None else None
+            )
             backend, _ = _app.build_backend(
                 current.provider,
                 current.model,
@@ -524,9 +542,7 @@ def _create_app_with_root(
             persist_metadata_change(
                 manager,
                 metadata,
-                lambda candidate: manager.record_plan_mode(
-                    candidate, enabled=enabled
-                ),
+                lambda candidate: manager.record_plan_mode(candidate, enabled=enabled),
             )
         )
 
@@ -596,11 +612,7 @@ def _create_app_with_root(
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
         vim_mode=metadata.vim_mode,
-        on_budget_change=(
-            None
-            if budget_pinned
-            else persist_budget
-        ),
+        on_budget_change=(None if budget_pinned else persist_budget),
         on_vim_mode_change=persist_vim_mode,
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,
