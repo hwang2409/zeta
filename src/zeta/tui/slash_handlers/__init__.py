@@ -772,7 +772,9 @@ class SlashHandlerMixin:
                 or Path(self.loop.store.cwd).resolve()
             )
             try:
-                project = registry.find_or_create_for_directory(root)
+                project = await asyncio.to_thread(
+                    registry.find_or_create_for_directory, root
+                )
                 await persist_metadata_change(
                     self.loop.manager,
                     self.loop.session_metadata,
@@ -821,7 +823,7 @@ class SlashHandlerMixin:
             MemoryMutationAuthorization.direct_slash(),
         )
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         registry = self.loop.project_registry
@@ -829,9 +831,12 @@ class SlashHandlerMixin:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)

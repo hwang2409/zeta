@@ -121,6 +121,7 @@ class _RegistryEntry:
     fd: int
     references: int
     epoch: int
+    shape_locks: dict[tuple[int, int, str], tuple[threading.Lock, int]]
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
@@ -128,22 +129,52 @@ _REGISTRY_LOCK = threading.RLock()
 
 
 @contextmanager
-def _shape_lock(home: Path, directory_fd: int, name: str) -> Iterator[None]:
+def _shape_lock(
+    entry: _RegistryEntry, home: Path, directory_fd: int, name: str
+) -> Iterator[None]:
     info = os.fstat(directory_fd)
-    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).digest()
-    offset = int.from_bytes(digest[:8]) & ((1 << 63) - 1)
-    fd = os.open(
-        home / ".storage-format-shapes.lock",
-        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
+    shape = (info.st_dev, info.st_ino, name)
+    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).hexdigest()
+    with _REGISTRY_LOCK:
+        thread_lock, users = entry.shape_locks.get(shape, (threading.Lock(), 0))
+        entry.shape_locks[shape] = (thread_lock, users + 1)
     try:
-        os.set_inheritable(fd, False)
-        fcntl.lockf(fd, fcntl.LOCK_EX, 1, offset)
-        yield
+        with thread_lock:
+            lock_root = home / ".storage-format-shape-locks"
+            lock_root.mkdir(mode=0o700, exist_ok=True)
+            root_fd = os.open(
+                lock_root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                fd = os.open(
+                    digest,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            finally:
+                os.close(root_fd)
+            try:
+                os.set_inheritable(fd, False)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
     finally:
-        fcntl.lockf(fd, fcntl.LOCK_UN, 1, offset)
-        os.close(fd)
+        with _REGISTRY_LOCK:
+            _, users = entry.shape_locks[shape]
+            if users == 1:
+                del entry.shape_locks[shape]
+            else:
+                entry.shape_locks[shape] = (thread_lock, users - 1)
 
 
 def _canonical_home(home: str | Path) -> Path:
@@ -236,7 +267,9 @@ def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLe
                 raise StorageFormatError(
                     f"stored format {epoch} is newer than writer capability {capability}"
                 )
-            registered = _RegistryEntry(fd=fd, references=1, epoch=epoch)
+            registered = _RegistryEntry(
+                fd=fd, references=1, epoch=epoch, shape_locks={}
+            )
             _REGISTRY[canonical] = registered
             return WriterLease(canonical, registered)
         except BaseException:
@@ -464,7 +497,7 @@ class WriterLease:
     ) -> dict[str, Any]:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self.home, directory_fd, name):
+        with _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -498,7 +531,7 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self.home, directory_fd, name):
+        with _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -530,6 +563,18 @@ class WriterLease:
             ).encode()
             publish(directory_fd, name, encoded)
             return output
+
+    def delete(self, directory_fd: int, name: str) -> None:
+        """Delete one authoritative shape while excluding all of its publishers."""
+
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        with _shape_lock(self._entry, self.home, directory_fd, name):
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return
+            os.fsync(directory_fd)
 
     def publish_append(
         self,

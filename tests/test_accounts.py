@@ -283,6 +283,7 @@ def test_resolve_account_does_not_migrate(
     monkeypatch.setattr(AccountStore, "migrate", migrate_once)
     monkeypatch.setattr(tui_bootstrap, "env_home", lambda: tmp_path)
     sentinel = object()
+    # test-contract: seam isolates migration from TUI construction
     monkeypatch.setattr(tui_bootstrap, "_create_app_with_root", lambda *_args: sentinel)
 
     assert tui_bootstrap.create_app(SimpleNamespace(no_session=False)) is sentinel

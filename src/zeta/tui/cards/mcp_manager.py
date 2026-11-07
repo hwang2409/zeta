@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -62,8 +63,7 @@ class MCPManager:
         return "!"
 
     _COLUMNS = (
-        "    name                 scope    transport        "
-        "auth          tools status"
+        "    name                 scope    transport        auth          tools status"
     )
 
     def _glyph_style(self, item: ManagedServer) -> str:
@@ -130,7 +130,9 @@ class MCPManager:
                 "↑/↓ select · enter details · a add · e enable/disable · t test"
             )
         )
-        lines.append(overlay.hint("l login · o logout · d remove · T trust · esc close"))
+        lines.append(
+            overlay.hint("l login · o logout · d remove · T trust · esc close")
+        )
         return lines
 
     def add(self, draft: MCPAddDraft) -> ManagedServer:
@@ -201,7 +203,7 @@ class MCPManager:
         elif key == "l":
             self.last_result = await self.service.login(item.name, scope=item.scope)
         elif key == "o":
-            self.service.logout(item.name, scope=item.scope)
+            await asyncio.to_thread(self.service.logout, item.name, scope=item.scope)
             self.last_result = "logged out"
         elif key == "T":
             self.last_result = self.service.trust(item.name)

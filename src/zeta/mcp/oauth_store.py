@@ -127,9 +127,7 @@ def save_token(
         target = token_store_path(name, root)
         values = asdict(token)
         values.pop("client_secret", None)
-        directory_fd = os.open(
-            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             lease.publish_json(
                 directory_fd,
@@ -146,8 +144,16 @@ def delete_token(name: str, *, home: str | Path | None = None) -> None:
     """Remove one server's token file, if it exists."""
 
     root = Path(home).expanduser() if home is not None else env_home()
-    with open_writer(root):
-        token_store_path(name, root).unlink(missing_ok=True)
+    directory = token_store_dir(root)
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    try:
+        with open_writer(root) as lease:
+            lease.delete(directory_fd, token_store_path(name, root).name)
+    finally:
+        os.close(directory_fd)
 
 
 def _publish_token(directory_fd: int, name: str, payload: bytes) -> None:

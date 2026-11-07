@@ -57,6 +57,64 @@ _RAW_PUBLICATION = {
     ("transcript_search/index.py", "_publish", "os.replace"),
 }
 
+_RAW_DELETION = {
+    ("accounts/logout.py", "_remove_directory_files", "unlink"),
+    ("accounts/publication.py", "atomic_publish", "unlink"),
+    ("accounts/store.py", "_delete_publication_pending", "unlink"),
+    ("accounts/store.py", "_unlink_legacy_file", "unlink"),
+    ("core/checkpoints/workspace.py", "_current_tree_sha", "unlink"),
+    ("core/checkpoints/workspace.py", "_materialise_tree", "unlink"),
+    ("core/checkpoints/workspace.py", "_prune_stale_entries", "unlink"),
+    ("core/checkpoints/workspace.py", "_reserve_shadow_index_path", "unlink"),
+    ("core/checkpoints/workspace.py", "_write_current_shadow_commit", "unlink"),
+    ("core/checkpoints/workspace.py", "reset_corruption", "unlink"),
+    ("core/project_context.py", "_load_home_identity", "unlink"),
+    ("core/session.py", "_reconcile_project_link", "unlink"),
+    ("core/session_files.py", "copy_session_tree", "unlink"),
+    ("core/session_files.py", "unlink_session_file", "unlink"),
+    ("core/session_files.py", "write_session_file", "unlink"),
+    ("core/session_links.py", "_remove_entry", "unlink"),
+    ("core/session_links.py", "remove_pending_child_link", "unlink"),
+    ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
+    ("mcp/config.py", "write_mcp_config", "unlink"),
+    ("mcp/management.py", "_atomic_json", "unlink"),
+    ("mcp/oauth_store.py", "_publish_token", "unlink"),
+    ("memory/auto.py", "_append_diagnostic_record", "unlink"),
+    ("memory/entry_access.py", "_refresh_entry_memory_mirror", "unlink"),
+    ("memory/entry_history.py", "_rollback_memory_migration_for_test", "unlink"),
+    ("memory/reconciliation_state.py", "_publish_bytes", "unlink"),
+    ("memory/reconciliation_state.py", "_write_receipt_archive", "unlink"),
+    ("project_inbox.py", "_prune_done", "unlink"),
+    ("project_inbox.py", "claim_wake", "unlink"),
+    ("project_memory_history.py", "_prune_versions", "unlink"),
+    ("project_memory_history.py", "_publish_mirror_file", "unlink"),
+    ("project_registry.py", "create_project", "unlink"),
+    ("providers/stream_diagnostics.py", "write_stream_diagnostic", "unlink"),
+    ("remote_sync/__init__.py", "_rewrite_cwd", "unlink"),
+    ("remote_sync/memory.py", "_atomic_copy_file", "unlink"),
+    ("remote_sync/memory.py", "_atomic_write_file", "unlink"),
+    ("remote_sync/memory.py", "_copy_memory_file", "unlink"),
+    ("remote_sync/memory.py", "_machine_id", "unlink"),
+    ("remote_sync/project_publish.py", "_prune_versions", "unlink"),
+    ("remote_sync/project_publish.py", "_remove_incoming", "unlink"),
+    ("remote_sync/project_publish.py", "atomic_publish_file", "unlink"),
+    ("runtime/loop/persistence.py", "_unlink", "unlink"),
+    ("server/server.py", "_prepare_socket_path", "unlink"),
+    ("server/server.py", "close", "unlink"),
+    ("server/transport.py", "remove_connection_file", "unlink"),
+    ("server/transport.py", "write_connection_file", "unlink"),
+    ("storage_format.py", "_publish_manifest", "unlink"),
+    ("storage_format.py", "delete", "unlink"),
+    ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
+    ("tools/_spill.py", "_evict_before", "unlink"),
+    ("tools/_spill.py", "temporary_file", "unlink"),
+    ("tools/_spill.py", "write_group", "unlink"),
+    ("transcript_search/index.py", "_remove_sqlite_sidecars", "unlink"),
+    ("transcript_search/index.py", "_temporary_database", "unlink"),
+    ("tui/composer.py", "_delete_staged_attachment", "unlink"),
+    ("tui/paste_runtime/__init__.py", "_delete_staged", "unlink"),
+}
+
 _VARIANT_APPEND_SEAMS = {
     ("project_registry.py", "record_session", "publish_append"),
     ("project_registry.py", "record_sessions", "publish_append"),
@@ -83,6 +141,7 @@ def test_all_direct_publication_paths_are_classified() -> None:
     found_callbacks: set[tuple[str, str, str]] = set()
     found_raw: set[tuple[str, str, str]] = set()
     found_append: set[tuple[str, str, str]] = set()
+    found_delete: set[tuple[str, str, str]] = set()
     found_variant_append: set[tuple[str, str, str]] = set()
     for path in root.rglob("*.py"):
         if "tests" in path.parts:
@@ -114,6 +173,8 @@ def test_all_direct_publication_paths_are_classified() -> None:
                     found_callbacks.add((relative, function, name))
                 if name == "publish_append":
                     found_variant_append.add((relative, function, name))
+                if name == "unlink":
+                    found_delete.add((relative, function, name))
                 if (
                     isinstance(node.func, ast.Attribute)
                     and isinstance(node.func.value, ast.Name)
@@ -133,5 +194,6 @@ def test_all_direct_publication_paths_are_classified() -> None:
     assert found_callbacks == _DURABILITY_CALLBACKS
     assert found_raw == _RAW_PUBLICATION
     assert found_append == _APPEND_PUBLICATION
+    assert found_delete == _RAW_DELETION
     assert found_variant_append == _VARIANT_APPEND_SEAMS
     assert _REMOTE_PROJECT_PUBLICATION_P07

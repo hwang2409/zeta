@@ -18,8 +18,8 @@ from typing import Protocol
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..core.commands.custom_commands import CustomCommand
-from ..core.project_context import discover_repo_root
-from ..core.session import persist_metadata_change
+from ..core.project_context import discover_project_root, discover_repo_root
+from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashCommand,
@@ -34,6 +34,7 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
+from ..project_registry import ProjectRegistryError
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
@@ -279,6 +280,70 @@ class ServerSlashSession:
         del args
         return self._client_only("tree")
 
+    async def slash_project(self, args: str) -> str:
+        runtime = self._runtime
+        opened = runtime.opened
+        registry = runtime.manager.project_registry
+        if opened is None:
+            return "project registry unavailable: no active session"
+        if registry is None:
+            return "project registry unavailable"
+        project = None
+        if args.strip() == "init":
+            root = (
+                discover_project_root(opened.store.cwd)
+                or Path(opened.store.cwd).resolve()
+            )
+            try:
+                project = await asyncio.to_thread(
+                    registry.find_or_create_for_directory, root
+                )
+                await persist_metadata_change(
+                    runtime.manager,
+                    runtime.metadata,
+                    lambda candidate: runtime.manager.associate_project(
+                        candidate, project.project_id
+                    ),
+                )
+                if runtime.loop is not None:
+                    runtime.loop._set_runtime_project(runtime.metadata)
+            except (ProjectRegistryError, OSError, SessionError) as exc:
+                return f"could not initialize project: {exc}"
+        else:
+            if runtime.metadata.project_id:
+                try:
+                    project = await asyncio.to_thread(
+                        registry.show_project, runtime.metadata.project_id
+                    )
+                except ProjectRegistryError:
+                    project = None
+            if project is None:
+                project = await asyncio.to_thread(
+                    registry.find_for_directory, opened.store.cwd
+                )
+        if project is None:
+            return "unassociated (run /project init to associate this directory)"
+        if await asyncio.to_thread(registry.memory_format, project.project_id) == 2:
+            memory = (
+                ", ".join(
+                    await asyncio.to_thread(
+                        registry._entry_memory_mirrors, project.project_id
+                    )
+                )
+                or "none"
+            )
+        else:
+            memory = (
+                ", ".join(
+                    name
+                    for name, _ in await asyncio.to_thread(
+                        registry.load_memory, project.project_id
+                    )
+                )
+                or "none"
+            )
+        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+
     async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
@@ -318,7 +383,7 @@ class ServerSlashSession:
         del args
         return self._client_only("name")
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         runtime = self._runtime
@@ -329,9 +394,12 @@ class ServerSlashSession:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)
@@ -440,6 +508,7 @@ async def run_command(
         or name == "compact"
         or (name == "model" and tail.strip())
         or (name == "accounts" and tail.strip())
+        or (name == "project" and tail.strip() == "init")
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit

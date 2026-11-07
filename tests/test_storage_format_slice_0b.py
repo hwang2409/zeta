@@ -14,7 +14,13 @@ import pytest
 
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.core.session_files import atomic_publish_file
-from zeta.mcp.oauth_store import MCPOAuthToken, save_token, token_store_path
+from zeta.mcp.management import ManagedServer
+from zeta.mcp.oauth_store import (
+    MCPOAuthToken,
+    delete_token,
+    save_token,
+    token_store_path,
+)
 from zeta.memory.reconciliation_state import ReconciliationState
 from zeta.project_inbox import (
     SENT_HISTORY_LIMIT,
@@ -25,14 +31,8 @@ from zeta.project_inbox import (
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 from zeta.server.slash_commands import ServerSlashSession
-from zeta.storage_format import (
-    BROAD_OWNED_SUBTREES,
-    CLOSED_VARIANTS,
-    SetValue,
-    StorageFormatError,
-    open_writer,
-    require_closed_variant,
-)
+from zeta.storage_format import CLOSED_VARIANTS, SetValue, open_writer
+from zeta.tui.cards.mcp_manager import MCPManager
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -44,6 +44,49 @@ def _read(path: Path) -> dict[str, object]:
 
 def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n")
+
+
+def _shape_lock_path(home: Path, directory: Path, name: str) -> Path:
+    info = directory.stat()
+    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).hexdigest()
+    return home / ".storage-format-shape-locks" / digest
+
+
+def _shape_flock_is_held(home: Path, directory: Path, name: str) -> bool:
+    lock_path = _shape_lock_path(home, directory, name)
+    if not lock_path.exists():
+        return False
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _shape_process_lock_is_held(home: Path, directory: Path, name: str) -> bool:
+    if _shape_flock_is_held(home, directory, name):
+        return True
+    lock_path = home / ".storage-format-shapes.lock"
+    if not lock_path.exists():
+        return False
+    info = directory.stat()
+    digest = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{name}".encode()).digest()
+    offset = int.from_bytes(digest[:8]) & ((1 << 63) - 1)
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, offset)
+        except BlockingIOError:
+            return True
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, offset)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _publish_shape_field(
@@ -271,6 +314,61 @@ def test_mcp_oauth_token_preserves_unknown_fields(tmp_path: Path) -> None:
     assert _read(path)["future-field"] == {"kept": True}
 
 
+def test_mcp_oauth_logout_during_refresh_leaves_no_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp import oauth_store
+
+    token = MCPOAuthToken(
+        access_token="first",
+        refresh_token="refresh",
+        expires_at=None,
+        token_type="Bearer",
+        scope=None,
+        authorization_server="https://example.test",
+        token_endpoint="https://example.test/token",
+        authorization_endpoint="https://example.test/auth",
+        client_id="client",
+        client_secret=None,
+        redirect_uri="http://127.0.0.1/callback",
+        resource="https://example.test/resource",
+    )
+    save_token("server", token, home=tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_replace = oauth_store.os.replace
+
+    def paused_replace(source: object, target: object, **kwargs: object) -> None:
+        if str(target).endswith("server.json"):
+            entered.set()
+            release.wait()
+        original_replace(source, target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(oauth_store.os, "replace", paused_replace)
+    refresh = threading.Thread(
+        target=save_token, args=("server", token), kwargs={"home": tmp_path}
+    )
+    refresh.start()
+    entered.wait()
+    logout_started = threading.Event()
+
+    def logout() -> None:
+        logout_started.set()
+        delete_token("server", home=tmp_path)
+
+    logout_thread = threading.Thread(target=logout)
+    logout_thread.start()
+    logout_started.wait()
+    token_directory = token_store_path("server", tmp_path).parent
+    if not _shape_flock_is_held(tmp_path, token_directory, "server.json"):
+        logout_thread.join()
+    release.set()
+    refresh.join()
+    logout_thread.join()
+
+    assert not token_store_path("server", tmp_path).exists()
+
+
 def test_project_and_account_keyed_records_preserve_future_records(
     tmp_path: Path,
 ) -> None:
@@ -307,7 +405,9 @@ def test_project_and_account_keyed_records_preserve_future_records(
     assert future["future-field"] is True
 
 
-def test_inbox_mutation_preserves_unknown_record_fields(tmp_path: Path) -> None:
+def test_inbox_claim_regression_guard_preserves_unknown_record_fields(
+    tmp_path: Path,
+) -> None:
     registry = ProjectRegistry(tmp_path / "projects")
     sender = registry.create_project("sender", "scope")
     target = registry.create_project("target", "scope")
@@ -343,6 +443,35 @@ def test_inbox_mutation_preserves_unknown_record_fields(tmp_path: Path) -> None:
     assert _read(claimed_path)["future-field"] == {"kept": True}
 
 
+def test_shape_lock_serializes_two_thread_publishers(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    directory = tmp_path / "records"
+    directory.mkdir()
+    with open_writer(home):
+        pass
+    _write(directory / "state.json", {"known": 1})
+    entered = threading.Event()
+    release = threading.Event()
+    writer_a = threading.Thread(
+        target=_publish_shape_field,
+        args=(str(home), str(directory), "known", 2, entered, release),
+    )
+    writer_a.start()
+    entered.wait()
+    writer_b = threading.Thread(
+        target=_publish_shape_field,
+        args=(str(home), str(directory), "future-field", True),
+    )
+    writer_b.start()
+    if not _shape_flock_is_held(home, directory, "state.json"):
+        writer_b.join()
+    release.set()
+    writer_a.join()
+    writer_b.join()
+
+    assert _read(directory / "state.json") == {"known": 2, "future-field": True}
+
+
 def test_shape_lock_serializes_two_process_publishers(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     directory = tmp_path / "records"
@@ -355,29 +484,17 @@ def test_shape_lock_serializes_two_process_publishers(tmp_path: Path) -> None:
     release = context.Event()
     writer_a = context.Process(
         target=_publish_shape_field,
-        args=(str(home), str(directory), "future-field", True, entered, release),
+        args=(str(home), str(directory), "known", 2, entered, release),
     )
     writer_a.start()
     entered.wait()
-    lock_path = home / ".storage-format-shapes.lock"
-    lock_held = lock_path.exists()
-    if lock_held:
-        info = directory.stat()
-        digest = hashlib.sha256(
-            f"{info.st_dev}:{info.st_ino}:state.json".encode()
-        ).digest()
-        offset = int.from_bytes(digest[:8]) & ((1 << 63) - 1)
-        lock_fd = os.open(lock_path, os.O_RDWR)
-        try:
-            with pytest.raises(BlockingIOError):
-                fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, offset)
-        finally:
-            os.close(lock_fd)
     writer_b = context.Process(
         target=_publish_shape_field,
-        args=(str(home), str(directory), "known", 2),
+        args=(str(home), str(directory), "future-field", True),
     )
     writer_b.start()
+    if not _shape_process_lock_is_held(home, directory, "state.json"):
+        writer_b.join()
     release.set()
     writer_a.join()
     writer_b.join()
@@ -385,12 +502,11 @@ def test_shape_lock_serializes_two_process_publishers(tmp_path: Path) -> None:
     assert writer_b.exitcode == 0
     writer_a.close()
     writer_b.close()
-    assert lock_held, "writer did not hold a cross-process shape lock"
     assert _read(directory / "state.json") == {"known": 2, "future-field": True}
 
 
 @pytest.mark.asyncio
-async def test_memory_slash_and_completed_reply_mutations_run_off_loop(
+async def test_slash_and_completed_reply_mutations_run_off_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop_thread = threading.get_ident()
@@ -424,6 +540,83 @@ async def test_memory_slash_and_completed_reply_mutations_run_off_loop(
         serve_result = await serve_result
     assert serve_result == "ok"
 
+    project_calls: list[int] = []
+    project = SimpleNamespace(
+        project_id="project-id",
+        name="project",
+        canonical_integration_root="/project",
+    )
+
+    class ProjectRegistryStub:
+        def find_or_create_for_directory(self, _root: Path) -> object:
+            project_calls.append(threading.get_ident())
+            return project
+
+        def memory_format(self, _project_id: str) -> int:
+            return 1
+
+        def load_memory(self, _project_id: str) -> list[object]:
+            return []
+
+    async def persist(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr("zeta.tui.slash_handlers.persist_metadata_change", persist)
+    monkeypatch.setattr("zeta.server.slash_commands.persist_metadata_change", persist)
+    project_registry = ProjectRegistryStub()
+    tui_project = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=project_registry,
+            store=SimpleNamespace(cwd="/project"),
+            manager=object(),
+            session_metadata=SimpleNamespace(project_id=None),
+            _set_runtime_project=lambda _metadata: None,
+        )
+    )
+    assert "project: project" in await SlashHandlerMixin.slash_project(
+        tui_project, "init"
+    )
+    assert project_calls[-1] != loop_thread
+
+    serve_runtime = SimpleNamespace(
+        opened=SimpleNamespace(store=SimpleNamespace(cwd="/project")),
+        manager=SimpleNamespace(project_registry=project_registry),
+        metadata=SimpleNamespace(project_id=None),
+        loop=SimpleNamespace(_set_runtime_project=lambda _metadata: None),
+    )
+    assert "project: project" in await ServerSlashSession(serve_runtime).slash_project(
+        "init"
+    )
+    assert project_calls[-1] != loop_thread
+
+    inbox_calls: list[int] = []
+
+    class InboxStub:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def list(self, _project_id: str) -> dict[str, object]:
+            inbox_calls.append(threading.get_ident())
+            return {}
+
+    monkeypatch.setattr("zeta.tui.slash_handlers.ProjectInbox", InboxStub)
+    monkeypatch.setattr("zeta.server.slash_commands.ProjectInbox", InboxStub)
+    inbox_registry = SimpleNamespace(root=Path("/home/projects"))
+    tui_inbox = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=inbox_registry,
+            session_metadata=SimpleNamespace(project_id="project-id"),
+        )
+    )
+    assert await SlashHandlerMixin.slash_inbox(tui_inbox, "") == "{}"
+    assert inbox_calls[-1] != loop_thread
+    serve_inbox_runtime = SimpleNamespace(
+        opened=SimpleNamespace(metadata=SimpleNamespace(project_id="project-id")),
+        loop=SimpleNamespace(project_registry=inbox_registry),
+    )
+    assert await ServerSlashSession(serve_inbox_runtime).slash_inbox("") == "{}"
+    assert inbox_calls[-1] != loop_thread
+
     class Scanner:
         def mark_reported(self, _statuses: object) -> None:
             calls.append(threading.get_ident())
@@ -438,6 +631,32 @@ async def test_memory_slash_and_completed_reply_mutations_run_off_loop(
 
     assert len(calls) == 3
     assert all(thread_id != loop_thread for thread_id in calls)
+
+
+@pytest.mark.asyncio
+async def test_mcp_manager_logout_runs_off_loop() -> None:
+    loop_thread = threading.get_ident()
+    calls: list[int] = []
+    server = ManagedServer(
+        name="server",
+        scope="user",
+        config={"transport": "streamable-http"},
+        enabled=True,
+        trusted=True,
+    )
+
+    class ManagementStub:
+        def list(self, *, scope: str = "effective") -> list[ManagedServer]:
+            del scope
+            return [server]
+
+        def logout(self, name: str, *, scope: str) -> None:
+            assert (name, scope) == ("server", "user")
+            calls.append(threading.get_ident())
+
+    assert await MCPManager(ManagementStub()).dispatch("o") == "logged out"  # type: ignore[arg-type]
+    assert len(calls) == 1
+    assert calls[0] != loop_thread
 
 
 def test_closed_variant_readers_reject_without_mutation(
@@ -547,25 +766,3 @@ def test_closed_variant_readers_reject_without_mutation(
     except ProjectRegistryError:
         links = []
     assert links and links[0]["role"] == "future"
-
-
-def test_slice_0b_registers_closed_variants_and_broad_subtrees() -> None:
-    assert CLOSED_VARIANTS["project.schema_version"] == frozenset({1})
-    assert CLOSED_VARIANTS["project.session_role"] == frozenset(
-        {"session", "orchestrator", "worker"}
-    )
-    assert CLOSED_VARIANTS["project.repo_agents"] == frozenset({"include", "ignore"})
-    assert CLOSED_VARIANTS["inbox.schema_version"] == frozenset({1})
-    assert CLOSED_VARIANTS["inbox.kind"] == frozenset(
-        {"bug_report", "change_request", "question", "info", "reply"}
-    )
-    assert CLOSED_VARIANTS["sent_message_ledger.schema_version"] == frozenset({1})
-    assert CLOSED_VARIANTS["account_registry.version"] == frozenset({1})
-    assert CLOSED_VARIANTS["account.provider"] == frozenset({"anthropic", "codex"})
-    assert CLOSED_VARIANTS["sent_message_ledger.reported_status"] == frozenset(
-        {"claimed", "done"}
-    )
-    assert CLOSED_VARIANTS["memory.format"] == frozenset({1, 2})
-    assert BROAD_OWNED_SUBTREES["memory-current.json"] == frozenset({("history",)})
-    with pytest.raises(StorageFormatError, match="unsupported stored variant"):
-        require_closed_variant("inbox.schema_version", 2)

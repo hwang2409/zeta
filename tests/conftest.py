@@ -679,8 +679,11 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
     yield
     for registry in reversed(registries):
@@ -847,14 +850,23 @@ async def close_direct_test_runtime_owners(
         registry_init(registry, *args, **kwargs)
         registries.append(registry)
 
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ProjectRegistry, "__init__", tracked_project_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(AccountStore, "__init__", tracked_account_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(AgentLoop, "__init__", tracked_loop_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ConversationStore, "__init__", tracked_store_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(AutoMemoryReconciler, "__init__", tracked_memory_runner_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(SessionManager, "__init__", tracked_manager_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(WorkspaceSnapshotStore, "__init__", tracked_workspace_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(ToolRegistry, "__init__", tracked_registry_init)
+    # test-contract: seam tracks process-owned resources created across tests
     monkeypatch.setattr(BackgroundTaskRegistry, "__init__", tracked_background_init)
     yield
     for loop in reversed(loops):
