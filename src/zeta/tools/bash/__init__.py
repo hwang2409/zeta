@@ -15,8 +15,8 @@ from ...core.abort import AbortSignal
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
+from .._shared.background_spawn import _kill_and_reap
 from .._shared.process import (
-    _kill_and_reap,
     create_subprocess_shell_in_fd,
     spawn_background,
     tool_subprocess_env,
