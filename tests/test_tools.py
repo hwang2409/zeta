@@ -8,7 +8,6 @@ import pty
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -438,18 +437,23 @@ async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "child-alive"
+    child_pid = tmp_path / "child.pid"
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
-            ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
+            ToolCall(
+                "bash-abort",
+                "bash",
+                {"cmd": _descendant_command(marker, child_pid=child_pid)},
+            )
         )
     )
 
-    await asyncio.sleep(0.05)
+    child_pid_value = await asyncio.wait_for(read_pid_file(child_pid), 10)
     abort_signal.abort()
-    result = await task
-    await asyncio.sleep(0.5)
+    result = await asyncio.wait_for(task, 10)
+    await asyncio.wait_for(wait_pid_exited(child_pid_value), 10)
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
@@ -1722,27 +1726,8 @@ async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
     assert result["isError"] is True
     assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
-    _, child_pgid = (int(value) for value in pid_file.read_text().split())
-    live_group = []
-    for _ in range(50):
-        rows = (
-            await asyncio.to_thread(
-                subprocess.check_output,
-                ["ps", "-axo", "pid=,pgid=,stat="],
-                text=True,
-            )
-        ).splitlines()
-        live_group = [
-            row.split()[0]
-            for row in rows
-            if len(row.split()) >= 3
-            and int(row.split()[1]) == child_pgid
-            and not row.split()[2].startswith("Z")
-        ]
-        if not live_group:
-            break
-        await asyncio.sleep(0.02)
-    assert not live_group
+    child_pid, _ = (int(value) for value in pid_file.read_text().split())
+    await asyncio.wait_for(wait_pid_exited(child_pid), 10)
 
 
 @pytest.mark.asyncio
