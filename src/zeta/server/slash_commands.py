@@ -417,6 +417,11 @@ async def run_command(
         or name == "compact"
         or (name == "model" and tail.strip())
         or (name == "accounts" and tail.strip())
+        or (
+            name == "mcp"
+            and tail.strip().partition(" ")[0]
+            in {"add", "remove", "enable", "disable", "trust", "untrust"}
+        )
         or (name == "project" and tail.strip() == "init")
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
@@ -463,7 +468,17 @@ async def run_command(
 async def _run_mcp_command(runtime: ServerRuntime, tail: str) -> dict[str, object]:
     stripped = tail.strip()
     verb = stripped.partition(" ")[0]
-    if verb not in {"status", "auth", "logout"}:
+    if verb not in {
+        "status",
+        "auth",
+        "logout",
+        "add",
+        "remove",
+        "enable",
+        "disable",
+        "trust",
+        "untrust",
+    }:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": "mcp"}
     if runtime.loop is None:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
