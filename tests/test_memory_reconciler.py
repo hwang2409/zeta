@@ -9,6 +9,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.server_client import event, request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.memory.reconciler import (
     ReconciliationError,
     Transcript,
@@ -18,6 +19,8 @@ from zeta.memory.reconciler import (
 )
 from zeta.protocol.types import MessageOrigin, ToolCall
 from zeta.server import ZetaServer
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 TODAY = date(2026, 10, 6)
 SESSION = "a" * 32
@@ -374,7 +377,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
     server = ZetaServer(
         provider="codex",
         home=tmp_path,
-        socket_path=Path("/tmp") / f"zeta-memory-steer-{tmp_path.name}.sock",
+        socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     await server.start()

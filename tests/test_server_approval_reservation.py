@@ -18,6 +18,7 @@ import pytest
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
     _close,
@@ -25,7 +26,6 @@ from tests.test_server import (
     _frames_until_event,
     _read_raw,
     _request,
-    _socket_path,
 )
 from zeta.core.approval import ApprovalRequest
 from zeta.core.store import ConversationStore
@@ -43,6 +43,8 @@ from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.server import LOADED_SESSION_MUTATIONS
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> None:

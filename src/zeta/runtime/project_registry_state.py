@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..project_errors import ProjectRegistryError
 from ..project_registry import ProjectRegistry
 
 
@@ -51,10 +50,13 @@ def load_project_registry(root: Path | str) -> ProjectRegistryState:
         return ProjectRegistryState(
             registry, ProjectRegistryUnavailable(registry.root, str(exc))
         )
-    try:
-        registry.list_projects()
-    except (OSError, ProjectRegistryError) as exc:
+    projection = registry.project_context_projection(None)
+    if (
+        projection.health is not None
+        and projection.health.code == "project_registry_unavailable"
+    ):
         return ProjectRegistryState(
-            registry, ProjectRegistryUnavailable(registry.root, str(exc))
+            registry,
+            ProjectRegistryUnavailable(registry.root, projection.health.message),
         )
     return state
