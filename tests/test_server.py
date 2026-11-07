@@ -34,7 +34,7 @@ import zeta.server.ergonomics as ergonomics_module
 import zeta.server.protocol as protocol_module
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.processes import wait_for_path_command
+from tests.support.processes import assert_pid_gone, wait_for_path_command
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     event as _buffered_event,
@@ -2830,13 +2830,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
         completion = await _event(reader, "tool_end")
         assert completion["tool_call"]["id"] == "background-child"
         assert completion["tool_result"]["content"].startswith("child complete")
-        async with asyncio.timeout(TIMEOUT):
-            while True:
-                try:
-                    os.kill(foreground_pid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(0.01)
+        await assert_pid_gone(foreground_pid, timeout=TIMEOUT)
         release.touch()
         assert not marker.exists()
     finally:

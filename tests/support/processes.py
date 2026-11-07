@@ -132,6 +132,11 @@ async def wait_pid_exited(pid: int, timeout: float = 10) -> None:
     await asyncio.to_thread(_wait_pid_exited_sync, pid, timeout)
 
 
+async def assert_pid_gone(pid: int, timeout: float = 10) -> None:
+    """Assert that a process exits, including while it awaits reaping."""
+    await wait_pid_exited(pid, timeout)
+
+
 def _wait_pid_exited_sync(pid: int, timeout: float) -> None:
     if hasattr(os, "pidfd_open"):
         try:
