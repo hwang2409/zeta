@@ -58,6 +58,7 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    OwnedCompletionBackend,
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
@@ -70,6 +71,7 @@ from ...protocol.types import (
     user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
+from ...providers.transport import _schedule_cleanup_failure
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -191,6 +193,8 @@ class AgentLoop(
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
         self.backend = backend
+        self._backend_owners: list[OwnedCompletionBackend] = []
+        self.register_backend_owner(backend)
         self.store = store
         self.store.recover_client_deliveries()
         self.agent_depth = agent_depth
@@ -355,8 +359,51 @@ class AgentLoop(
     def current_backend_state(self) -> PreparedBackendState:
         return PreparedBackendState(self.backend, self.context_assembler.token_budget)
 
-    def apply_backend_state(self, state: PreparedBackendState) -> None:
-        apply_backend_state(self, state)
+    def register_backend_owner(self, backend: CompletionBackend) -> None:
+        if isinstance(backend, OwnedCompletionBackend) and all(
+            owner is not backend for owner in self._backend_owners
+        ):
+            self._backend_owners.append(backend)
+
+    def apply_backend_state(
+        self, state: PreparedBackendState
+    ) -> OwnedCompletionBackend | None:
+        return apply_backend_state(self, state)
+
+    def connection_setup_counts(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "provider": owner.provider,
+                "model": owner.model,
+                "count": owner.connection_setup_count,
+            }
+            for owner in self._backend_owners
+        )
+
+    def _backend_close_reporter(self, backend: OwnedCompletionBackend, stage: str):
+        def report(index: int, error: BaseException) -> None:
+            _schedule_cleanup_failure(
+                error,
+                stage=f"completion_backend_{stage}",
+                index=index,
+                primary_exception=None,
+                diagnostics_path=getattr(backend, "diagnostics_path", None),
+                provider=backend.provider,
+            )
+
+        return report
+
+    async def close_backend(
+        self, backend: OwnedCompletionBackend, *, stage: str
+    ) -> None:
+        backend.retire()
+        report = self._backend_close_reporter(backend, stage)
+        outcome = await backend.aclose(report_failure=report)
+        for failure in outcome.failures:
+            report(failure.index, failure.error)
+        self._backend_owners = [
+            owner for owner in self._backend_owners if owner is not backend
+        ]
 
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
@@ -528,6 +575,13 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
+            owners = tuple(self._backend_owners)
+            for owner in owners:
+                owner.retire()
+            await asyncio.gather(
+                *(self.close_backend(owner, stage="runtime_close") for owner in owners),
+                return_exceptions=True,
+            )
             killed = await self._close_delivery_resources()
         return killed
 

@@ -864,6 +864,11 @@ class _Client:
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
+            "connection_setup_counts": (
+                runtime.loop.connection_setup_counts()
+                if runtime.loop is not None
+                else ()
+            ),
             **(
                 {"transcript_index_failure": transcript_index_failure}
                 if transcript_index_failure is not None

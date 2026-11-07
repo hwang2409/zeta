@@ -322,6 +322,7 @@ def compose_runtime(
                                 stall_retries=config.stream_stall_retries,
                                 token_budget=effective_budget,
                             )
+                            loop.register_backend_owner(memory_backend)
                 return await complete_reconciliation(memory_backend, prompt)
 
             assert project_registry is not None

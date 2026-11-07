@@ -31,6 +31,7 @@ from ..protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    OwnedCompletionBackend,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -323,12 +324,14 @@ def resolve_child_backend(
 ) -> tuple[CompletionBackend | None, str | None]:
     """Pick the backend a child runs on, returning an error message instead of raising.
 
-    Without a model the child inherits the parent's backend, which is what every
-    agent did before cross-provider spawning existed.
+    Externally injected backends can be shared. Composed backends are rebuilt so
+    the child loop owns its own completion client.
     """
 
     if model is None:
-        return loop.backend, None
+        if not isinstance(loop.backend, OwnedCompletionBackend):
+            return loop.backend, None
+        model = loop.backend.model
     if type(model) is not str or not model.strip():
         return None, "agent error: model must be a nonempty string"
     try:
@@ -375,6 +378,16 @@ async def _build_child_loop(
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
+    child_loop: AgentLoop | None = None
+
+    async def close_construction() -> None:
+        if child_loop is not None:
+            await child_loop.close()
+        elif isinstance(child_backend, OwnedCompletionBackend):
+            await loop.close_backend(child_backend, stage="child_construction")
+        if child_registry is not None:
+            await child_registry.close()
+
     try:
         explicit_finish = explicit_finish_eligible(
             global_enabled=loop.explicit_finish,
@@ -487,16 +500,14 @@ async def _build_child_loop(
         child_loop.set_background_event_sink(loop._publish_background_event)
         return child_loop, child_policy
     except asyncio.CancelledError:
-        if child_registry is not None:
-            cleanup = asyncio.create_task(child_registry.close())
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await asyncio.shield(cleanup)
+        cleanup = asyncio.create_task(close_construction())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await asyncio.shield(cleanup)
         raise
     except BaseException:
-        if child_registry is not None:
-            await child_registry.close()
+        await close_construction()
         raise
 
 

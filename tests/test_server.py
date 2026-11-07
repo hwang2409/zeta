@@ -2011,6 +2011,9 @@ async def test_status_surfaces_transcript_index_failure(
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
+        assert status["connection_setup_counts"] == list(
+            loop.connection_setup_counts()
+        )
     finally:
         await _close(server, writer)
 

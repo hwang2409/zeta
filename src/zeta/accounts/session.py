@@ -303,19 +303,32 @@ class SessionAccountContext:
         new: _PreparedAccountState,
         build_backend: Callable[[SessionMetadata], Any],
     ) -> SessionMetadata:
-        def commit(directory_fd: int) -> tuple[SessionMetadata, Callable[[], None]]:
+        prepared_backend = getattr(new.backend_state, "backend", new.backend_state)
+        discard = prepared_backend if prepared_backend is not loop.backend else None
+
+        def mark_unknown() -> Any:
+            self._mark_unknown(build_backend)
+            return discard
+
+        def commit(
+            directory_fd: int,
+        ) -> tuple[SessionMetadata, Callable[[], Any], Any]:
             metadata = self._commit_locked(new, directory_fd)
             if metadata is None:
-                return new.previous_metadata, lambda: self._mark_unknown(build_backend)
+                return new.previous_metadata, mark_unknown, discard
             if self._metadata_equal(metadata, new.metadata):
                 state = self._state_from_metadata(new, metadata)
-                return metadata, lambda: self._apply(loop, state)
+                return metadata, lambda: self._apply(loop, state), discard
             if not self._metadata_equal(metadata, new.previous_metadata):
-                return metadata, lambda: self._mark_unknown(build_backend)
-            return metadata, lambda: None
+                return metadata, mark_unknown, discard
+            return metadata, lambda: discard, discard
 
         return await self._run_locked_apply(
-            build_backend, commit, pins=new.pins
+            loop,
+            build_backend,
+            commit,
+            pins=new.pins,
+            discard_backend=discard,
         )
 
     def _mark_unknown(
@@ -404,10 +417,12 @@ class SessionAccountContext:
 
     async def _run_locked_apply(
         self,
+        loop: Any,
         build_backend: Callable[[SessionMetadata], Any],
-        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        operation: Callable[[int], tuple[Any, Callable[[], Any], Any]],
         *,
         pins: Mapping[str, AccountId] | None = None,
+        discard_backend: Any = None,
     ) -> Any:
         event_loop = asyncio.get_running_loop()
         session_id = self.metadata.session_id
@@ -423,20 +438,29 @@ class SessionAccountContext:
             )
         )
         try:
-            result, applied = await asyncio.shield(worker)
+            result, applied, retired = await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
             try:
-                await asyncio.shield(worker)
-            except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
-                pass
+                _, _, retired = await asyncio.shield(worker)
+            except BaseException:  # noqa: BLE001 - caller cancellation wins
+                retired = discard_backend
+            if retired is not None:
+                try:
+                    await loop.close_backend(retired, stage="replacement")
+                except BaseException:  # noqa: BLE001, S110 - caller cancellation wins
+                    pass
             self._mark_unknown(build_backend)
             raise
         except BaseException:
+            if discard_backend is not None:
+                await loop.close_backend(discard_backend, stage="replacement_failure")
             self._mark_unknown(build_backend)
             raise
         if not applied:
             self._mark_unknown(build_backend)
+        if retired is not None:
+            await loop.close_backend(retired, stage="replacement")
         return result
 
     def _locked_apply_worker(
@@ -444,9 +468,9 @@ class SessionAccountContext:
         event_loop: asyncio.AbstractEventLoop,
         session_id: str,
         cancelled: threading.Event,
-        operation: Callable[[int], tuple[Any, Callable[[], None]]],
+        operation: Callable[[int], tuple[Any, Callable[[], Any], Any]],
         pins: Mapping[str, AccountId] | None,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Any, bool, Any]:
         assert self.manager is not None
         with ExitStack() as stack:
             if pins is not None:
@@ -457,30 +481,31 @@ class SessionAccountContext:
                 )
             )
             assert directory_fd is not None
-            result, apply = operation(directory_fd)
-            applied = self._apply_on_loop(event_loop, cancelled, apply)
-            return result, applied
+            result, apply, discard = operation(directory_fd)
+            applied, retired = self._apply_on_loop(event_loop, cancelled, apply)
+            return result, applied, retired if applied else discard
 
     @staticmethod
     def _apply_on_loop(
         event_loop: asyncio.AbstractEventLoop,
         cancelled: threading.Event,
-        apply: Callable[[], None],
-    ) -> bool:
+        apply: Callable[[], Any],
+    ) -> tuple[bool, Any]:
         confirmed = threading.Event()
         gate = threading.Lock()
         active = True
         error: BaseException | None = None
         applied = False
+        retired = None
 
         def apply_if_active() -> None:
-            nonlocal active, applied, error
+            nonlocal active, applied, error, retired
             with gate:
                 if not active:
                     return
                 try:
                     if not cancelled.is_set():
-                        apply()
+                        retired = apply()
                         applied = True
                 except BaseException as exc:  # noqa: BLE001 - return to worker
                     error = exc
@@ -494,7 +519,7 @@ class SessionAccountContext:
                 active = False
         if error is not None:
             raise error
-        return applied
+        return applied, retired
 
     @staticmethod
     def _metadata_equal(left: SessionMetadata, right: SessionMetadata) -> bool:
@@ -522,15 +547,16 @@ class SessionAccountContext:
             state.backend_state,
         )
 
-    def _apply(self, loop: Any, state: _PreparedAccountState) -> None:
+    def _apply(self, loop: Any, state: _PreparedAccountState) -> Any:
         for name in self.metadata.__slots__:
             setattr(self.metadata, name, getattr(state.metadata, name))
         self._pins = state.pins
         self._switch_sequences = state.switch_sequences
         self._active_provider = state.active_provider
-        loop.apply_backend_state(state.backend_state)
+        retired = loop.apply_backend_state(state.backend_state)
         self._account_state_unknown = False
         self._unknown_state = None
+        return retired
 
     async def ensure_account_state(self, loop: Any) -> None:
         if not self._account_state_unknown:
@@ -554,7 +580,9 @@ class SessionAccountContext:
     ) -> None:
         previous = copy.deepcopy(self.metadata)
 
-        def recover(directory_fd: int) -> tuple[None, Callable[[], None]]:
+        def recover(
+            directory_fd: int,
+        ) -> tuple[None, Callable[[], None], None]:
             assert self.manager is not None
             metadata = self.manager._read(
                 previous.session_id, directory_fd=directory_fd
@@ -566,9 +594,9 @@ class SessionAccountContext:
                 )
                 self._apply(loop, state)
 
-            return None, apply
+            return None, apply, None
 
-        await self._run_locked_apply(build_backend, recover)
+        await self._run_locked_apply(loop, build_backend, recover)
 
     async def subscription_limit_event(self, failure: object) -> dict[str, object] | None:
         return await asyncio.to_thread(self._subscription_limit_event, failure)

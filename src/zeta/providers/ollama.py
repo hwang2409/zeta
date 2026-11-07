@@ -31,8 +31,10 @@ from .payload_common import (
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    HTTPClientLease,
     cleanup_transport,
     close_resource,
+    close_transport_resources,
     provider_retry_notice,
     retry_after_seconds,
     retry_provider_completion,
@@ -263,6 +265,7 @@ class OllamaBackend(CompletionBackend):
             if timeout is None
             else httpx.Timeout(timeout, read=None)
         )
+        self._lease = HTTPClientLease(client, timeout=self.timeout)
 
     def set_token_budget(self, token_budget: int | None) -> None:
         """Align Ollama's allocated context with the model/session budget."""
@@ -296,8 +299,33 @@ class OllamaBackend(CompletionBackend):
         finally:
             await close_resource(attempts)
 
+    @property
+    def connection_setup_count(self) -> int:
+        return self._lease.connection_setup_count
+
+    def retire(self) -> None:
+        self._lease.retire()
+
+    async def aclose(self, *, report_failure=None):
+        self._lease.start_close()
+        return await close_transport_resources(
+            self._lease.aclose(report_failure), report_failure=report_failure
+        )
+
     async def _complete_once(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        async with self._lease.borrow() as client:
+            async for event in self._complete_once_with_client(
+                client, messages, tool_schemas
+            ):
+                yield event
+
+    async def _complete_once_with_client(
+        self,
+        client: httpx.AsyncClient,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -308,7 +336,6 @@ class OllamaBackend(CompletionBackend):
         tools = _tools(tool_schemas)
         if tools:
             payload["tools"] = tools
-        client = self.client or httpx.AsyncClient(timeout=self.timeout)
         stream = None
         entered = False
         primary_exception: BaseException | None = None
@@ -490,7 +517,7 @@ class OllamaBackend(CompletionBackend):
                 stream_context=stream,
                 entered=entered,
                 client=client,
-                owns_client=self.client is None,
+                owns_client=False,
                 primary_exception=primary_exception,
                 http_error_type=OllamaError,
                 diagnostics_path=self.diagnostics_path,

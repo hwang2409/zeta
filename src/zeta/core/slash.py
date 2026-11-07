@@ -530,6 +530,7 @@ class SlashStatus:
     automatic_memory_failure: str | None = None
     transcript_index_failure: str | None = None
     explicit_finish: bool = False
+    connection_setup_counts: tuple[dict[str, object], ...] = ()
 
 
 class SlashSession(Protocol):
@@ -921,6 +922,14 @@ def _format_status(status: SlashStatus) -> str:
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
         f"model: {status.model}",
+        "completion_client_setups: "
+        + (
+            ", ".join(
+                f"{item['provider']}/{item['model']}={item['count']}"
+                for item in status.connection_setup_counts
+            )
+            or "none"
+        ),
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"explicit_finish: {'on' if status.explicit_finish else 'off'}",

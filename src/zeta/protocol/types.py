@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Literal,
     NotRequired,
@@ -16,6 +17,9 @@ from typing import (
     TypedDict,
     runtime_checkable,
 )
+
+if TYPE_CHECKING:
+    from ..providers.transport import CloseFailureReporter, CloseOutcome
 
 from ..media.images import (
     IMAGE_DEGRADATION_WARNING,
@@ -915,3 +919,18 @@ class CompletionBackend(Protocol):
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
         """Return events for one completion. The loop owns turn control."""
+
+
+@runtime_checkable
+class OwnedCompletionBackend(CompletionBackend, Protocol):
+    provider: str
+    model: str
+
+    @property
+    def connection_setup_count(self) -> int: ...
+
+    def retire(self) -> None: ...
+
+    async def aclose(
+        self, *, report_failure: CloseFailureReporter | None = None
+    ) -> CloseOutcome: ...

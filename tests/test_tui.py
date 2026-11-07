@@ -6344,6 +6344,11 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         return "disk full; pending changes will retry"
 
     monkeypatch.setattr(app.loop, "transcript_index_failure", failure, raising=False)
+    monkeypatch.setattr(
+        app.loop,
+        "connection_setup_counts",
+        lambda: ({"provider": "codex", "model": "gpt-test", "count": 1},),
+    )
 
     lines = tui_app_module._status_card_lines(app.slash_status())
     rendered = "\n".join("".join(text for _style, text in line) for line in lines)
@@ -6352,6 +6357,7 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
     assert (
         "transcript_index_failure: disk full; pending changes will retry" in rendered
     )
+    assert "completion_client_setups: codex/gpt-test=1" in rendered
     await app.close()
 
 
@@ -13094,8 +13100,13 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            backend.client = client
-            [event async for event in backend.complete([], [])]
+            probe = OllamaBackend(
+                model=backend.model,
+                base_url=backend.base_url,
+                client=client,
+                token_budget=expected_budget,
+            )
+            [event async for event in probe.complete([], [])]
         persisted = manager.read_metadata(opened.metadata.session_id)
         assert persisted.compaction_budget == expected_budget
         assert loop.context_assembler.token_budget == expected_budget

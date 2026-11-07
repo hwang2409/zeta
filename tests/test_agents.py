@@ -290,8 +290,13 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            backend.client = client
-            [event async for event in backend.complete([], [])]
+            probe = OllamaBackend(
+                model=backend.model,
+                base_url=backend.base_url,
+                client=client,
+                token_budget=40_960,
+            )
+            [event async for event in probe.complete([], [])]
         assert payloads[0]["options"]["num_ctx"] == 40_960
     finally:
         await loop.close()
@@ -321,8 +326,13 @@ async def test_model_selected_ollama_child_uses_one_effective_budget(
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            child_loop.backend.client = client
-            [event async for event in child_loop.backend.complete([], [])]
+            probe = OllamaBackend(
+                model=child_loop.backend.model,
+                base_url=child_loop.backend.base_url,
+                client=client,
+                token_budget=40_960,
+            )
+            [event async for event in probe.complete([], [])]
         return {
             "content": [{"type": "text", "text": "done"}],
             "isError": False,
