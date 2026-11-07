@@ -714,6 +714,69 @@ def test_rule_checks_only_added_test_lines(tmp_path: Path) -> None:
     assert _lint(tmp_path, source, {3}) == []
 
 
+def test_tq007_flags_filesystem_calls_in_async_functions(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def guard():
+    Path("cwd").is_dir()
+    open("log", "w")
+    os.stat("cwd")
+"""
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ007", 4),
+        ("TQ007", 5),
+        ("TQ007", 6),
+    ]
+    assert "asyncio.to_thread" in findings[0].message
+    assert "guard" in findings[0].message
+
+
+def test_tq007_skips_nested_sync_and_off_loop_arguments(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def outer():
+    def sync():
+        Path("old").is_dir()
+    await asyncio.to_thread(Path("safe").is_dir)
+    mapping.exists()
+"""
+
+    assert _lint(tmp_path, source, path="src/zeta/example.py") == []
+
+
+def test_tq007_requires_a_reasoned_marker(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def guarded():
+    # async-blocking: reviewed because the path is already off-loop
+    Path("safe").is_dir()
+
+async def unguarded():
+    # async-blocking:
+    Path("unsafe").is_dir()
+"""
+
+    findings = _lint(tmp_path, source, path="src/zeta/example.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [("TQ007", 9)]
+
+
+def test_tq007_diff_mode_ignores_untouched_old_hit(tmp_path: Path) -> None:
+    source = """from pathlib import Path
+
+async def old():
+    Path("old").is_dir()
+
+async def new():
+    return 1
+"""
+
+    assert _lint(tmp_path, source, added_lines={7}, path="src/zeta/example.py") == []
+
+
 def test_rule_ignores_pure_reindent(tmp_path: Path) -> None:
     source = """def test_existing():
     if enabled:

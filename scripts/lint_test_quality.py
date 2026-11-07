@@ -25,6 +25,56 @@ CONTRACT_ERROR = (
     "'seam <reason>' on this line or the line above"
 )
 CONTRACT_KINDS = {"bootstrap", "complexity", "durability", "latency", "seam"}
+ASYNC_BLOCKING_CODE = "TQ007"
+ASYNC_BLOCKING_ERROR = (
+    "sync filesystem call {call} in async def {function} blocks the event loop; "
+    "move it off the loop with `await asyncio.to_thread(...)`, or mark a reviewed "
+    "exception with `# async-blocking: <reason>`"
+)
+ASYNC_PATH_METHODS = {
+    "is_dir",
+    "is_file",
+    "exists",
+    "stat",
+    "lstat",
+    "open",
+    "read_text",
+    "read_bytes",
+    "write_text",
+    "write_bytes",
+    "mkdir",
+    "unlink",
+    "rename",
+    "replace",
+    "iterdir",
+    "glob",
+    "rglob",
+    "resolve",
+    "touch",
+}
+ASYNC_OS_FUNCTIONS = {
+    "stat",
+    "lstat",
+    "open",
+    "scandir",
+    "listdir",
+    "makedirs",
+    "remove",
+    "unlink",
+    "rename",
+    "replace",
+}
+ASYNC_SHUTIL_FUNCTIONS = {
+    "copy",
+    "copy2",
+    "copyfile",
+    "copytree",
+    "move",
+    "rmtree",
+    "make_archive",
+    "unpack_archive",
+}
+ASYNC_PATH_NAME_HINTS = {"path", "directory", "root", "cwd", "file", "dir"}
 GLOBAL_BOOTSTRAP_ERROR = (
     "global test bootstrap {name} hides production startup; use a local fixture "
     "and a real subprocess test; use '# test-contract: bootstrap <reason>' on "
@@ -166,6 +216,9 @@ def _marker(lines: list[str], line: int) -> tuple[str, str] | None:
         )
         if match and match.group(1) in CONTRACT_KINDS and match.group(2):
             return match.group(1), match.group(2).strip()
+        match = re.search(r"#\s*async-blocking:\s*([^#\s].*?)\s*$", marker_line)
+        if match:
+            return "async-blocking", match.group(1).strip()
     return None
 
 
@@ -779,6 +832,129 @@ def _global_bootstrap_findings(
     return findings
 
 
+def _path_receivers(tree: ast.AST) -> set[str]:
+    """Infer path-like names; dynamic aliases remain a documented false negative."""
+    names = {"Path", "PurePath", "PosixPath", "WindowsPath", "pathlib.Path"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "pathlib":
+            names.update(item.asname or item.name for item in node.names)
+        elif isinstance(node, ast.Import) and any(
+            item.name == "pathlib" for item in node.names
+        ):
+            names.add("pathlib")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            annotation = _name(node.annotation)
+            if annotation.endswith(("Path", "PurePath")):
+                names.add(node.target.id)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            if _name(node.value.func) in names:
+                names.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+    return names
+
+
+def _is_path_receiver(node: ast.AST, path_names: set[str]) -> bool:
+    if isinstance(node, ast.Call):
+        return _name(node.func) in path_names
+    name = _name(node)
+    if not name:
+        return False
+    if name in path_names or name.startswith("pathlib."):
+        return True
+    return any(part.casefold() in ASYNC_PATH_NAME_HINTS for part in name.split("."))
+
+
+def _async_blocking_call(node: ast.Call, path_names: set[str]) -> str | None:
+    name = _name(node.func)
+    if name in {"os." + function for function in ASYNC_OS_FUNCTIONS}:
+        return name
+    if name.startswith("os.path.") and name.rsplit(".", 1)[-1] in {
+        "exists",
+        "isdir",
+        "isfile",
+        "getsize",
+    }:
+        return name
+    if name == "open":
+        return name
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in ASYNC_PATH_METHODS
+        and _is_path_receiver(node.func.value, path_names)
+    ):
+        return f"Path.{node.func.attr}"
+    if name.startswith("shutil.") and name.rsplit(".", 1)[-1] in ASYNC_SHUTIL_FUNCTIONS:
+        return name
+    return None
+
+
+def _async_blocking_findings(
+    path: Path, tree: ast.AST, lines: list[str], added: set[int]
+) -> list[Finding]:
+    path_names = _path_receivers(tree)
+    findings: list[Finding] = []
+    off_loop = {
+        "asyncio.to_thread",
+        "to_thread",
+        "asyncio.run_in_executor",
+        "run_in_executor",
+    }
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.function: str | None = None
+            self.async_depth = 0
+            self.off_loop_depth = 0
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            previous = self.function
+            self.function = node.name
+            self.async_depth += 1
+            for statement in node.body:
+                self.visit(statement)
+            self.async_depth -= 1
+            self.function = previous
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if self.async_depth == 0:
+                self.generic_visit(node)
+            # nested synchronous functions are deliberately excluded
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            if self.async_depth == 0:
+                self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.async_depth and not self.off_loop_depth and node.lineno in added:
+                call = _async_blocking_call(node, path_names)
+                if call and not _has_marker(lines, node.lineno, {"async-blocking"}):
+                    findings.append(
+                        Finding(
+                            path,
+                            node.lineno,
+                            node.col_offset + 1,
+                            ASYNC_BLOCKING_CODE,
+                            ASYNC_BLOCKING_ERROR.format(
+                                call=call, function=self.function
+                            ),
+                        )
+                    )
+            if _name(node.func) in off_loop:
+                self.off_loop_depth += 1
+                for argument in node.args:
+                    self.visit(argument)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+                self.off_loop_depth -= 1
+            else:
+                self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return findings
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -804,9 +980,13 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     nodes = [node for node in ast.walk(tree) if hasattr(node, "lineno")]
     added_nodes = [node for node in nodes if _touches_added_line(node, added)]
     deadline_nodes = _deadline_nodes(nodes, added_nodes, added, parents)
-    findings = _scan_added_nodes(
-        path, added_nodes, lines, literal_names, serialized_names
-    )
+    if path.parts[:2] == ("src", "zeta"):
+        findings = []
+        findings.extend(_async_blocking_findings(path, tree, lines, added))
+    else:
+        findings = _scan_added_nodes(
+            path, added_nodes, lines, literal_names, serialized_names
+        )
     findings.extend(_scan_deadline_nodes(path, deadline_nodes, lines, parents))
     findings.extend(_global_bootstrap_findings(path, tree, source, added))
     return sorted(set(findings), key=lambda item: (item.line, item.column, item.code))
@@ -817,7 +997,9 @@ def lint_diff(diff: str, root: Path | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for path, added in _added_lines(diff).items():
         if not added or not (
-            _is_test_path(path) or path.name in {"conftest.py", "sitecustomize.py"}
+            _is_test_path(path)
+            or path.name in {"conftest.py", "sitecustomize.py"}
+            or path.parts[:2] == ("src", "zeta")
         ):
             continue
         source_path = root / path
@@ -884,6 +1066,19 @@ def _read_ratchet(root: Path) -> set[str]:
 def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Finding]:
     root = Path.cwd() if root is None else root
     findings, trees = _scan_deadline_findings(root)
+    for source_path in sorted((root / "src" / "zeta").rglob("*.py")):
+        path = source_path.relative_to(root)
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        trees[path] = tree
+        findings.extend(
+            _async_blocking_findings(
+                path,
+                tree,
+                source.splitlines(),
+                set(range(1, len(source.splitlines()) + 1)),
+            )
+        )
     if not use_ratchet:
         return findings
     ratchet = _read_ratchet(root)
