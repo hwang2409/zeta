@@ -245,7 +245,7 @@ def _project_install_script() -> str:
         "    if accepted is None or set(payload) - set(accepted):\n"
         "        raise ValueError(f'unknown keys for {shape}')\n"
     )
-    schema_source = dependency_free_registry + schema_source
+    schema_source += dependency_free_registry
     migration_source = Path(migration_filename).read_text(encoding="utf-8").replace(
         "from __future__ import annotations\n\n", "", 1
     )
