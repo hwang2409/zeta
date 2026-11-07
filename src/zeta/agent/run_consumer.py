@@ -153,7 +153,7 @@ async def consume_run(
     delivered_follow_up = False
     segment_reports: list[str] = []
     kwargs["record_report"] = segment_reports.append
-    kwargs.setdefault("finish_gate_state", FinishGateState())
+    kwargs["finish_gate_state"] = FinishGateState()
 
     safety_started: float | None = None
     idle_published = False

@@ -414,50 +414,6 @@ class AsyncDurableWritesMixin:
                 self._durable_write_condition.notify_all()
             raise
 
-    def _run_agent_state_write(
-        self: ConversationStore,
-        method_name: str,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> tuple[Any, _DetachedConversationState]:
-        writer = type(self)(self.root_dir, session_id=self.session_id, _must_exist=True)
-        try:
-            result = getattr(writer, method_name)(*args, **kwargs)
-            state = _DetachedConversationState(
-                log=writer._detach_log_state(),
-                agent_counter=writer._agent_counter,
-                agent_children=writer._agent_children,
-                agent_parent=writer._agent_parent,
-                agent_canceled=writer._agent_canceled,
-                agent_lifecycle=writer._agent_lifecycle,
-            )
-            return result, state
-        finally:
-            writer.close()
-
-    async def _to_thread_agent_state(
-        self: ConversationStore, function: Any, /, *args: Any, **kwargs: Any
-    ) -> Any:
-        """Commit one agent-state mutation off-loop and publish its full state."""
-
-        async with self._async_write_lock:
-            fence = self._publication_fence()
-            worker = asyncio.get_running_loop().run_in_executor(
-                None,
-                self._run_agent_state_write,
-                function.__name__,
-                args,
-                kwargs,
-            )
-            (result, state), cancelled = await self._await_started_worker(worker)
-            with self._durable_write_condition:
-                released_log, installed_delta = self._install_store_state(state, fence)
-            cancelled |= await self._release_log_state_off_loop(released_log)
-            self._publish_prepared_entries_installed(installed_delta)
-            if cancelled:
-                raise asyncio.CancelledError
-            return result
-
     async def _to_thread_durable(
         self: ConversationStore,
         function: Any,

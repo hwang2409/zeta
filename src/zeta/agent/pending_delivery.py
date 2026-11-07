@@ -148,14 +148,11 @@ class StepDeliveryFlow:
         *,
         wake_sink: Callable[[DeliverySource], None] | None = None,
         context_assembler: ContextAssembler | None = None,
-        causal_episodes: Any | None = None,
     ) -> None:
         self.store = store
         self._loop = asyncio.get_running_loop()
         self._wake_sink = wake_sink
         self._context_assembler = context_assembler
-        self._causal_episodes = causal_episodes
-        self._suppressed_ids: set[str] = set()
         self._edges: set[DeliverySource] = set()
         self._active: StagedDelivery | None = None
         self._active_steering: ClientSteeringBatch | None = None
@@ -600,35 +597,11 @@ class StepDeliveryFlow:
             active.prompt_id,
             active.notification_ids,
         )
-        active_ids = active.notification_ids + (
-            () if active.prompt_id is None else (active.prompt_id,)
-        )
-        self._suppressed_ids.difference_update(active_ids)
-        if self._causal_episodes is not None:
-            self._causal_episodes.release_staged(active_ids)
         if active.prompt_id is not None and active.prompt_id == self._prompt_priority:
             self._prompt_priority = None
         self._active = None
         self._active_steering = None
         return publications
-
-    def pending_ids(self) -> tuple[str, ...]:
-        """Return live durable ids that can cause a post-cap provider turn."""
-
-        ids = tuple(self.store._active_pending_prompt_entries)
-        ids += tuple(
-            entry_id
-            for entry_id, entry in self.store._active_notifications.items()
-            if entry.data.get("display_only") is not True
-        )
-        return tuple(item_id for item_id in ids if item_id not in self._suppressed_ids)
-
-    def suppress_pending(self, staged_ids: tuple[str, ...]) -> None:
-        """Keep exhausted input durable without repeatedly waking the model."""
-
-        self._suppressed_ids.update(staged_ids)
-        if not self.pending_ids():
-            self._edges.clear()
 
     def release_active(self) -> None:
         """Re-arm a staged request that ended before provider acknowledgement."""
@@ -667,10 +640,8 @@ class StepDeliveryFlow:
         prompt_pending = bool(self.store._active_pending_prompt_entries)
         if self._low_capacity_notifications and not prompt_pending:
             pending = False
-        if pending and self.pending_ids():
+        if pending:
             self._edges.update(("prompt", "notification"))
-        elif pending:
-            pending = False
         return TerminalResult(pending, closed)
 
     def initialize_resident_edges(self) -> None:
