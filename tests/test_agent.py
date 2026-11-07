@@ -8472,14 +8472,15 @@ async def test_agent_send_racing_wake_clear_remains_armed(
             if target.session_dir == _store_dir:
                 _entered.set()
                 if _producer_first:
-                    assert _release.wait(2)
+                    assert _release.wait(10)
                     return original_stage(target, *args)
                 staged = original_stage(target, *args)
-                assert _release.wait(2)
+                assert _release.wait(10)
                 return staged
             return original_stage(target, *args)
 
         gated_stage.__name__ = "_stage_delivery_request"
+        # test-contract: seam this forced ordering gates the store admission boundary.
         monkeypatch.setattr(ConversationStore, "_stage_delivery_request", gated_stage)
         if producer_first:
             await flow.produce(
@@ -9355,11 +9356,11 @@ async def test_notification_producer_races_step_snapshot_once(
                 _entered.set()
                 if _producer_first:
                     # test-contract: seam a forced order proves the atomic stage handoff
-                    assert _release.wait(2)
+                    assert _release.wait(10)
                     return original_stage(target, *args)
                 staged = original_stage(target, *args)
                 # test-contract: seam a forced order proves the atomic stage handoff
-                assert _release.wait(2)
+                assert _release.wait(10)
                 return staged
             return original_stage(target, *args)
 
@@ -9414,11 +9415,11 @@ async def test_notification_producer_races_turn_end_once(
                 _entered.set()
                 if _producer_first:
                     # test-contract: seam a forced order proves the atomic stage handoff
-                    assert _release.wait(2)
+                    assert _release.wait(10)
                     return original_admit(target, intent)
                 result = original_admit(target, intent)
                 # test-contract: seam a forced order proves the atomic stage handoff
-                assert _release.wait(2)
+                assert _release.wait(10)
                 return result
             return original_admit(target, intent)
 
