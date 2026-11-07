@@ -764,17 +764,11 @@ class ApprovalLifecycle:
                     target.store.resolve_approval,
                     target.store_request_id,
                     decision,
-                    **(
-                        {"reason": reason}
-                        if decision == "abort" and reason
-                        else {}
-                    ),
+                    **({"reason": reason} if decision == "abort" and reason else {}),
                 )
             except OSError:
                 write_failed = True
-            resolution = target.store.approval_resolution_data(
-                target.store_request_id
-            )
+            resolution = target.store.approval_resolution_data(target.store_request_id)
             if resolution is not None:
                 return resolution
             if not write_failed:
@@ -878,6 +872,24 @@ class ApprovalLifecycle:
         else:
             self._remove(record.target.key)
 
+    async def _append_delegated_history(
+        self, record: ApprovalRecord, payload: dict[str, object] | None
+    ) -> OSError | asyncio.CancelledError | None:
+        if payload is None or not record.history_published:
+            return None
+        assert record.target.history_store is not None
+        try:
+            await record.target.history_store.append_approval_history_async(
+                {"event": "approval_end", **payload}
+            )
+        except OSError as exc:
+            logger.warning("delegated approval history write failed", exc_info=True)
+            return exc
+        except asyncio.CancelledError as exc:
+            logger.warning("delegated approval history write cancelled", exc_info=True)
+            return exc
+        return None
+
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
@@ -893,25 +905,9 @@ class ApprovalLifecycle:
             key: value for key, value in resolution.items() if key != "request_id"
         }
         payload = self.end(record.target.key, data=data)
-        history_failed = False
-        cancelled: asyncio.CancelledError | None = None
+        history_outcome: OSError | asyncio.CancelledError | None = None
         try:
-            if payload is not None and record.history_published:
-                assert record.target.history_store is not None
-                try:
-                    await record.target.history_store.append_approval_history_async(
-                        {"event": "approval_end", **payload}
-                    )
-                except OSError:
-                    history_failed = True
-                    logger.warning(
-                        "delegated approval history write failed", exc_info=True
-                    )
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-                    logger.warning(
-                        "delegated approval history write cancelled", exc_info=True
-                    )
+            history_outcome = await self._append_delegated_history(record, payload)
             if payload is not None and record.published:
                 publication_started.set()
                 await self._publish(
@@ -921,7 +917,7 @@ class ApprovalLifecycle:
                     self._session_id(),
                     **payload,
                 )
-            if history_failed:
+            if isinstance(history_outcome, OSError):
                 await self._report_persistence_failure(
                     record, "approval history could not be persisted"
                 )
@@ -929,8 +925,8 @@ class ApprovalLifecycle:
             publication_started.set()
             if self._owns(record):
                 self._remove(record.target.key)
-        if cancelled is not None:
-            raise cancelled
+        if isinstance(history_outcome, asyncio.CancelledError):
+            raise history_outcome
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: str
@@ -1024,9 +1020,7 @@ class ApprovalLifecycle:
             return
         record = current
         if record.disposition == "external":
-            resolution = target.store.approval_resolution_data(
-                target.store_request_id
-            )
+            resolution = target.store.approval_resolution_data(target.store_request_id)
             if resolution is not None:
                 await self._finish_record(record, resolution)
             else:
