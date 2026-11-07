@@ -410,7 +410,6 @@ class AgentLoop(
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
         self._background_event_sink = sink
-
     @property
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
