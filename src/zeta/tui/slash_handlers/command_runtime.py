@@ -198,6 +198,8 @@ class CommandRuntimeMixin:
         )
         register_macro_display(call.id, command=target, argv=())
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        previous_abort_signal = getattr(self, "_standalone_abort_signal", None)
+        self._standalone_abort_signal = abort_signal
         log_path = self.loop.store.session_dir / f"passthrough-{call.id[12:]}.log"
 
         def lifecycle_sink(kind: str) -> None:
@@ -241,6 +243,8 @@ class CommandRuntimeMixin:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
             forget_macro_display(call.id)
+            if self._standalone_abort_signal is abort_signal:
+                self._standalone_abort_signal = previous_abort_signal
         self._handle_tool_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
@@ -262,6 +266,7 @@ class CommandRuntimeMixin:
         self._record_macro_receipt(f"ran !{target}, {status}")
         self._loop_state = "idle"
         self._streaming = False
+        self._invalidate_prompt()
 
     def _watch_background_macro(
         self,
