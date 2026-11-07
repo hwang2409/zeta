@@ -102,7 +102,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop = asyncio.get_running_loop()
-    watcher = loop._watcher
+    watcher = tool_spawn.current_child_watcher(loop)
     child_pid: int | None = None
     baseline_fds = len(os.listdir("/dev/fd"))
 
