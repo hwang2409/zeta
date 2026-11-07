@@ -280,6 +280,7 @@ class CommandRuntimeMixin:
                 )
                 phase = metadata[1] if metadata is not None else "natural_exit"
                 exit_code = status_data.get("exit_code")
+                note = status_data.get("note")
                 if phase in {"task_kill", "session_shutdown"}:
                     status = "canceled"
                     text = f"background macro /{command.name} canceled"
@@ -289,6 +290,8 @@ class CommandRuntimeMixin:
                 else:
                     status = "error"
                     text = f"background macro /{command.name} failed with exit {exit_code}"
+                if isinstance(note, str) and note:
+                    text += f": {note}"
                 await self.loop.step_delivery.produce(
                     NotificationInput(
                         "macro_completion",
@@ -300,6 +303,7 @@ class CommandRuntimeMixin:
                             "text": f"{text}; log {log_path}",
                             "background_owner": "background_macro",
                             "background_phase": phase,
+                            **({"note": note} if isinstance(note, str) else {}),
                         },
                     )
                 )
@@ -310,7 +314,9 @@ class CommandRuntimeMixin:
         self.loop._background_owner.register(
             instance_id,
             lambda: asyncio.create_task(
-                self.loop.tool_registry.background_tasks.kill(task_id)
+                self.loop.tool_registry.background_tasks.kill(
+                    task_id, cause="background macro canceled by the user"
+                )
             ),
             watcher,
             description=f"/{command.name}",

@@ -240,7 +240,9 @@ async def consume_run(
                     )
                     safety_task = asyncio.create_task(
                         kill_tasks_after_deadline(
-                            child_loop.tool_registry.background_tasks, timeout
+                            child_loop.tool_registry.background_tasks,
+                            timeout,
+                            safety_limit=child_loop._background_owner.finish_gate_task_timeout,
                         )
                     )
                 action = await idle_lifecycle.wait_for_idle_action(

@@ -467,6 +467,9 @@ def _history_entry_rows(
                 f"background task {data.get('task_id', '?')} exited "
                 f"({data.get('exit_code')}); {data.get('headline', '')}"
             )
+            note = data.get("note")
+            if isinstance(note, str) and note:
+                text += f"; {note}"
         else:
             text = data.get("text", "background agent notification")
         return [

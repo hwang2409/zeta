@@ -4416,8 +4416,14 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+        task_id="task-1",
+        command="printf hi",
+        exit_code=0,
+        output_tail="hi",
+        note=task_cause,
+        background_metadata=("run_background", "task_kill"),
     )
     store._append_row(
         "notification",
@@ -4449,10 +4455,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
             row["notification"].get("kind", "agent_completion"): row for row in rows
         }
         assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
-        assert (
-            "background task task-1 exited"
-            in by_kind["task_exited"]["content"][0]["text"]
-        )
+        assert task_cause in by_kind["task_exited"]["content"][0]["text"]
         assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
         assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
     finally:
@@ -4471,8 +4474,14 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
     )
     reader, writer, _session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
+    task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
-        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+        task_id="task-1",
+        command="printf hi",
+        exit_code=0,
+        output_tail="hi",
+        note=task_cause,
+        background_metadata=("run_background", "task_kill"),
     )
     store.append_agent_notification(
         "child-1",
@@ -4501,6 +4510,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         assert len(task_events) == 1
         assert task_events[0]["data"]["task_id"] == "task-1"
         assert task_events[0]["data"]["kind"] == "task_exited"
+        assert task_events[0]["data"]["note"] == task_cause
         assert {
             e["data"].get("kind", "agent_completion") for e in receipt_events
         } == {"agent_completion"}

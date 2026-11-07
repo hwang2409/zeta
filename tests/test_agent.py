@@ -700,7 +700,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     release_close = asyncio.Event()
     cleanup_called = asyncio.Event()
 
-    async def close_child() -> tuple[str, ...]:
+    async def close_child(_cause: str) -> tuple[str, ...]:
         close_started.set()
         await release_close.wait()
         return ()
@@ -807,7 +807,7 @@ async def test_background_completion_truncates_long_killed_task_id(
         ),
         publish_event=lambda event: None,
         cleanup=lambda: None,
-        close_child=lambda: asyncio.sleep(0, result=(long_task_id,)),
+        close_child=lambda _cause: asyncio.sleep(0, result=(long_task_id,)),
         error_message=str,
         background_owner=owner,
     )

@@ -1624,6 +1624,26 @@ def terminal_plain(renderable: object) -> str:
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
 
+def test_task_safety_kill_renders_cause() -> None:
+    cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "task_exited",
+            "task_id": "task-safety",
+            "exit_code": -15,
+            "headline": "watch ci",
+            "background_phase": "task_kill",
+            "note": cause,
+        },
+    )
+
+    rendered = render_agent_notification(event)
+
+    assert rendered is not None
+    assert cause in renderable_plain(rendered)
+
+
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
     payloads = _notification_payloads()
 

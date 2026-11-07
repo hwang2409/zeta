@@ -795,7 +795,9 @@ class ToolRegistry:
             raise ValueError("todo tool requires a bound session store")
         return self._todo_store
 
-    async def close(self) -> tuple[str, ...]:
+    async def close(
+        self, *, background_task_cause: str = "tool registry closed"
+    ) -> tuple[str, ...]:
         """Stop session-owned resources and background processes.
 
         Returns the ids of background tasks killed by this close so callers can
@@ -808,7 +810,7 @@ class ToolRegistry:
                 await callback()
         finally:
             try:
-                killed = await self.background_tasks.close()
+                killed = await self.background_tasks.close(cause=background_task_cause)
             finally:
                 self.spills.close()
                 cwd_fd = self._cwd_fd

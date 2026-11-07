@@ -170,12 +170,20 @@ def register_handoff(child_loop: object) -> None:
 
 
 async def kill_tasks_after_deadline(
-    registry: BackgroundTaskRegistry, timeout: float
+    registry: BackgroundTaskRegistry,
+    timeout: float,
+    *,
+    safety_limit: float | None = None,
 ) -> tuple[str, ...]:
     """Kill tasks still running when the single idle safety deadline expires."""
 
     await asyncio.sleep(timeout)
     task_ids = tuple(task.task_id for task in registry.snapshot() if task.running)
+    configured_limit = timeout if safety_limit is None else safety_limit
+    cause = (
+        "explicit-finish child task safety deadline expired after "
+        f"{configured_limit:g} seconds"
+    )
     for task_id in task_ids:
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause=cause)
     return task_ids

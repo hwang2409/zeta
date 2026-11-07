@@ -185,6 +185,10 @@ class BackgroundSpawnCleanupError(RuntimeError):
     """An unregistered process could not be confirmed terminated and reaped."""
 
 
+class BackgroundSpawnNotAdmittedError(RuntimeError):
+    """A spawned process was cleaned up because its registry no longer accepted it."""
+
+
 async def spawn_background(
     spawn: Awaitable[asyncio.subprocess.Process],
     *,
@@ -200,7 +204,7 @@ async def spawn_background(
         if cancellation.cancelled:
             raise asyncio.CancelledError
         require_open()
-    except BaseException:
+    except BaseException as admission_error:
         # Keep ownership through repeated caller cancellation. Event-loop
         # teardown can cancel the cleanup task itself; retry its idempotent
         # cleanup rather than releasing the registry's pending-start token.
@@ -219,7 +223,11 @@ async def spawn_background(
                 ) from exc
         if cleanup.cancelled:
             raise asyncio.CancelledError
-        raise
+        if isinstance(admission_error, asyncio.CancelledError):
+            raise
+        raise BackgroundSpawnNotAdmittedError(
+            "background task registry closed before spawn admission"
+        ) from admission_error
     return process
 
 

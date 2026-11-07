@@ -574,7 +574,13 @@ def render_agent_notification(
     """Render durable notifications unless a tool card or prior TUI owns them."""
     if event.data.get("tui_presented") is True:
         return None
-    if event.data.get("background_phase") == "task_kill":
+    if event.data.get("background_phase") == "task_kill" and event.data.get(
+        "note"
+    ) in {
+        "task_kill tool requested by the agent",
+        "TUI tasks panel requested by the user",
+        "background macro canceled by the user",
+    }:
         return None
     kind = event.data.get("kind", "agent_completion")
     if kind == "project_inbox":
@@ -627,9 +633,11 @@ def render_agent_notification(
         )
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
+        note = event.data.get("note")
         if event.data.get("background_phase") == "session_shutdown":
+            suffix = f" · {note}" if type(note) is str and note else ""
             return Text(
-                f"background tasks killed on session exit: {task_id}",
+                f"background tasks killed on session exit: {task_id}{suffix}",
                 style=theme.DIM,
             )
         code = event.data.get("exit_code")
@@ -638,6 +646,8 @@ def render_agent_notification(
             return Text("background task notification unavailable", style=theme.ERROR)
         style = theme.RECEIPT if code == 0 else theme.ERROR
         message = f"⏺ task {task_id} exited ({code}) · {headline}"
+        if type(note) is str and note:
+            message += f" · {note}"
         return Text(message, style=style, overflow="ellipsis", no_wrap=True)
     description = event.data.get("description")
     status = event.data.get("status")

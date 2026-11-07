@@ -22,7 +22,9 @@ async def close_session(
         await loop.close()
     finally:
         try:
-            await loop.tool_registry.background_tasks.close()
+            await loop.tool_registry.background_tasks.close(
+                cause="runtime cleanup fallback"
+            )
         finally:
             try:
                 if before_store_close is not None:

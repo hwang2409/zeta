@@ -455,10 +455,14 @@ class AgentLoop(
         self.tool_registry.start_batch()
         return True
 
-    async def _close_delivery_resources(self) -> tuple[str, ...]:
+    async def _close_delivery_resources(
+        self, *, background_task_cause: str
+    ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
-            killed = await self.tool_registry.close()
+            killed = await self.tool_registry.close(
+                background_task_cause=background_task_cause
+            )
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
                 done, pending = await asyncio.wait(
@@ -483,7 +487,12 @@ class AgentLoop(
                 )
         return killed
 
-    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
+    async def close(
+        self,
+        *,
+        cancel_background: bool = True,
+        background_task_cause: str = "agent loop closed",
+    ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
 
         Returns the ids of background tasks killed by this close so a completing
@@ -527,7 +536,9 @@ class AgentLoop(
                 await self._mcp_mount.close()
                 self._mcp_mount = None
         finally:
-            killed = await self._close_delivery_resources()
+            killed = await self._close_delivery_resources(
+                background_task_cause=background_task_cause
+            )
         return killed
 
     def session_start(self) -> None:

@@ -17,6 +17,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -395,12 +396,23 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> None:
-    # S6: killing a modeled task notifies exactly once.
+async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "session")
-    registry = _notification_registry(store)
-    task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
-    await registry.kill(task_id)
+    flow = pending_delivery_module.StepDeliveryFlow(store)
+    registry = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    registry.background_tasks.set_notification_sink(
+        lambda item: flow.produce(_task_notification(item))
+    )
+    task_id, _ = await registry.background_tasks.start(
+        _python("import time; time.sleep(30)"), Path.cwd()
+    )
+
+    await registry.execute(
+        ToolCall("kill", "task_kill", {"task_id": task_id})
+    )
+
     task_exits = [
         entry
         for entry in store.agent_notifications(pending_only=False)
@@ -408,14 +420,10 @@ async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> No
     ]
     assert len(task_exits) == 1
     assert task_exits[0].data["task_id"] == task_id
+    assert task_exits[0].data["note"] == "task_kill tool requested by the agent"
     await registry.close()
-    # Closing after the kill must not append a second notification.
-    task_exits = [
-        entry
-        for entry in store.agent_notifications(pending_only=False)
-        if entry.data.get("kind") == "task_exited"
-    ]
-    assert len(task_exits) == 1
+    assert len(store.agent_notifications(pending_only=False)) == 1
+    store.close()
 
 
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
@@ -2408,23 +2416,47 @@ async def test_registry_setup_ignores_corrupt_background_state(
 
 
 @pytest.mark.asyncio
-async def test_explicit_finish_task_safety_deadline_kills_and_wakes(tmp_path: Path) -> None:
-    from zeta.agent.explicit_finish import kill_tasks_after_deadline
+async def test_explicit_finish_task_safety_deadline_names_cause_for_every_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import explicit_finish
 
+    deadline = asyncio.Event()
+    sleep_started = asyncio.Event()
+
+    async def injected_deadline(timeout: float) -> None:
+        assert timeout == 7
+        sleep_started.set()
+        await deadline.wait()
+
+    monkeypatch.setattr(
+        explicit_finish, "asyncio", SimpleNamespace(sleep=injected_deadline)
+    )
     wake = asyncio.Event()
     store = ConversationStore(tmp_path)
-    registry = _notification_registry(
-        store, wake_sink=lambda _source: wake.set()
-    )
-    task_id, _ = await registry.start(
+    registry = _notification_registry(store, wake_sink=lambda _source: wake.set())
+    first_id, _ = await registry.start(
         _python("import time; time.sleep(60)"), tmp_path
     )
-    killed = await kill_tasks_after_deadline(registry, 0.01)
+    kill = asyncio.create_task(
+        explicit_finish.kill_tasks_after_deadline(registry, 7)
+    )
+    await sleep_started.wait()
+    second_id, _ = await registry.start(
+        _python("import time; time.sleep(60)"), tmp_path
+    )
+
+    deadline.set()
+    killed = await kill
     await asyncio.wait_for(wake.wait(), timeout=1)
-    event = store.agent_notifications()[0]
-    assert killed == (task_id,)
-    assert event.data["task_id"] == task_id
-    assert event.data["background_phase"] == "task_kill"
+    events = store.agent_notifications(pending_only=False)
+    cause = (
+        "explicit-finish child task safety deadline expired after 7 seconds"
+    )
+    assert killed == (first_id, second_id)
+    assert [event.data["task_id"] for event in events] == [first_id, second_id]
+    assert all(event.data["background_phase"] == "task_kill" for event in events)
+    assert all(event.data["note"] == cause for event in events)
     await registry.close()
     store.close()
 

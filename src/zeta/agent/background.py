@@ -1004,7 +1004,7 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], Awaitable[None] | None],
-    close_child: Callable[[], Awaitable[tuple[str, ...]]],
+    close_child: Callable[[str], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     background_owner: BackgroundAgentOwner,
     marker_key: str | None = None,
@@ -1022,6 +1022,8 @@ async def finish_background_child(
         else None
     )
     explicit_finish_content: dict[str, object] | None = None
+    result: dict[str, object] = {}
+    close_cause = "background child completion cleanup"
     try:
         try:
             result = await child_task
@@ -1071,7 +1073,14 @@ async def finish_background_child(
                 )
         # Closing the child after its final turn terminates any task it still
         # owns and returns task ids for the parent receipt.
-        killed_tasks = list(await close_child() or ())
+        reported_cause = result.get("backgroundTaskKillCause")
+        if isinstance(reported_cause, str):
+            close_cause = reported_cause
+        elif status == "canceled":
+            close_cause = "background child cancellation cleanup"
+        else:
+            close_cause = "background child completion cleanup"
+        killed_tasks = list(await close_child(close_cause) or ())
         # Completion metadata is persisted in more than one store. Keep the
         # legacy field bounded even when a child owned an unbounded task list.
         killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
@@ -1079,8 +1088,11 @@ async def finish_background_child(
         killed_task_ids_truncated = len(killed_tasks) > len(
             killed_task_metadata
         ) or any(len(task_id) > 64 for task_id in killed_tasks)
+        close_event = (
+            "child cancellation" if status == "canceled" else "child completion"
+        )
         killed_task_notice = (
-            "\nbackground tasks killed on child completion: "
+            f"\nbackground tasks killed on {close_event}; cause: {close_cause}: "
             + ", ".join(
                 f"{task_id} (background command; archive: {child_path}/background-output.archive)"
                 for task_id in killed_tasks
@@ -1226,7 +1238,7 @@ async def finish_background_child(
         )
     finally:
         try:
-            await close_child()
+            await close_child(close_cause)
             # Let the parent finalize the running/terminal tool result before
             # releasing the child store descriptor.
             await asyncio.sleep(0)

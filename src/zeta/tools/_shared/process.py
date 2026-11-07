@@ -30,6 +30,7 @@ from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 from .background_spawn import (
     BackgroundSpawnCleanupError,
+    BackgroundSpawnNotAdmittedError,
     _group_exists,
     _signal_group,
     _terminate_process,
@@ -401,6 +402,26 @@ class BackgroundTaskRegistry:
                     term_grace=self.term_grace,
                     cleanup_timeout=self.term_grace + self.stdin_drain_timeout,
                 )
+            except (asyncio.CancelledError, BackgroundSpawnNotAdmittedError) as exc:
+                if notify_on_exit:
+                    cause = (
+                        "zeta stopped the task because its start was canceled "
+                        "before registry admission"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "zeta stopped the task because its registry closed "
+                        "before spawn admission"
+                    )
+                    await self._notify_exit(
+                        task_id,
+                        command,
+                        None,
+                        "",
+                        effective_log_path,
+                        cause,
+                        owner=owner,
+                        phase="task_kill",
+                    )
+                raise
             except OSError as exc:
                 # run_background's failed tool result is the canonical receipt;
                 # persisting task_exited would render the same failure twice.
@@ -571,7 +592,9 @@ class BackgroundTaskRegistry:
 
         self._closing_for_shutdown = True
 
-    async def kill(self, task_id: str) -> dict[str, Any]:
+    async def kill(
+        self, task_id: str, *, cause: str = "task killed"
+    ) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
             phase: Literal["task_kill", "session_shutdown"] = (
@@ -579,12 +602,14 @@ class BackgroundTaskRegistry:
             )
             await self._terminate(
                 record,
-                reason="task killed on session exit" if phase == "session_shutdown" else "task killed",
+                reason="session shutdown" if phase == "session_shutdown" else cause,
                 phase=phase,
             )
         return self._status(record)
 
-    async def close(self) -> tuple[str, ...]:
+    async def close(
+        self, *, cause: str = "background task registry closed"
+    ) -> tuple[str, ...]:
         if self._closed:
             return ()
         done = self._close_done
@@ -597,7 +622,9 @@ class BackgroundTaskRegistry:
             done = asyncio.get_running_loop().create_future()
             self._close_done = done
             try:
-                result = await self._shutdown()
+                result = await self._shutdown(
+                    "session shutdown" if self._closing_for_shutdown else cause
+                )
             except asyncio.CancelledError:
                 if not done.done():
                     done.set_result(self._shutdown_killed)
@@ -620,7 +647,7 @@ class BackgroundTaskRegistry:
             raise asyncio.CancelledError
         return result
 
-    async def _shutdown(self) -> tuple[str, ...]:
+    async def _shutdown(self, cause: str) -> tuple[str, ...]:
         killed: list[str] = []
         shutdown_result: tuple[str, ...] = ()
         cancelled = False
@@ -656,7 +683,7 @@ class BackgroundTaskRegistry:
             for record in records:
                 record.notify_on_exit = False
                 record.terminal_phase = "session_shutdown"
-                record.note = "task killed on session exit"
+                record.note = cause
             await finish(
                 asyncio.gather(
                     *(self._close_stdin(record) for record in records)
@@ -981,7 +1008,7 @@ class BackgroundTaskRegistry:
         self._notice(
             BackgroundTaskNotice(
                 f"background task {record.task_id} exited ({record.exit_code}): "
-                f"{_command_headline(record.command)}",
+                f"{_command_headline(record.command)}; {record.note}",
                 record.task_id,
                 record.terminal_phase,
                 record.owner,
