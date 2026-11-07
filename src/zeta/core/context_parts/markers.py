@@ -27,6 +27,7 @@ class ContextMarkerMixin:
         active_source_seqs: set[int],
         source_entries: Sequence[ConversationEntry] = (),
     ) -> list[_ContextItem]:
+        sources: dict[int, Mapping[str, Any]] = {}
         if entry.data.get("kind") == EVICTION_KIND:
             view = entry.data["view"]
             valid = valid_eviction_view(entry, active_source_seqs)
@@ -54,6 +55,7 @@ class ContextMarkerMixin:
                     view,
                     pinned_message,
                     _fact_floor.projected_fact_floor(entry.data.get("fact_floor")),
+                    sources,
                 )
             else:
                 messages = [
@@ -72,7 +74,10 @@ class ContextMarkerMixin:
                     if isinstance(item.get("message"), Mapping)
                     for message in [Message.from_dict(item["message"])]
                 ]
-            items = [_ContextItem(entry, message) for message in messages]
+            items = [
+                _ContextItem(entry, message, count_source=sources.get(id(message)))
+                for message in messages
+            ]
         else:
             messages = ContextMarkerMixin._marker_messages(
                 entry.data["source_seq_start"],
@@ -111,6 +116,7 @@ class ContextMarkerMixin:
         view: Sequence[Mapping[str, Any]],
         pinned: Message | None = None,
         floor: Sequence[Message] = (),
+        sources: dict[int, Mapping[str, Any]] | None = None,
     ) -> list[Message]:
         """Project every evicted message once, at its source sequence."""
         pinned_seq = None if pinned is None else pinned.metadata.get("source_seq")
@@ -162,7 +168,10 @@ class ContextMarkerMixin:
                     }
                 ):
                     continue
-            messages.append(ContextMarkerMixin._eviction_view_message(item))
+            message = ContextMarkerMixin._eviction_view_message(item)
+            messages.append(message)
+            if sources is not None:
+                sources[id(message)] = item
             if index % 4 == 3:
                 cooperative_pause()
         if pinned is not None and pin_index is None:
