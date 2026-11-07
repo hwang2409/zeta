@@ -564,6 +564,37 @@ _CANCEL_ROW_HANDLERS = {
 }
 
 
+async def _cancel_close_at(
+    registry, store, task_id: str, row: str, install
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    await install(entered, release)
+    closing = asyncio.create_task(registry.close())
+    try:
+        await await_or_fail(entered.wait(), what=f"{row} entered")
+        closing.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(closing, what=f"{row} cancellation completion")
+        await await_or_fail(registry.close(), what=f"{row} close completion")
+        rows = json.loads(
+            (store.session_dir / "background_tasks.json").read_text()
+        )
+        assert rows and all(not item["running"] for item in rows)
+        assert len(store.agent_notifications(pending_only=False)) == 1
+        assert (await registry.execute(
+            ToolCall("output", "task_output", {"task_id": task_id})
+        ))["structuredContent"]["running"] is False
+    finally:
+        release.set()
+        if not closing.done():
+            closing.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(closing, return_exceptions=True), 10
+            )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "row",
@@ -588,6 +619,12 @@ _CANCEL_ROW_HANDLERS = {
         "cancel-evidence-submit",
         "cancel-install",
         "cancel-notice",
+        "cancel-close-snapshot",
+        "cancel-close-finish-owners",
+        "cancel-close-terminate",
+        "cancel-close-wait-until-durable",
+        "cancel-close-aggregate-notice",
+        "cancel-close-release-receipts",
         "cancel-close-coordinator",
         "archive-failure-recovers-once",
         "restart-durable-terminal-notify-true",
@@ -625,6 +662,65 @@ async def test_background_task_owner_state_table(
                 ToolCall("output", "task_output", {"task_id": task_id})
             )
             return result["structuredContent"]
+
+        if row.startswith("cancel-close-") and row != "cancel-close-coordinator":
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            owner = registry.background_tasks._owners[task_id]
+
+            async def install(entered, release):
+                if row == "cancel-close-snapshot":
+                    async def pending_start():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="snapshot release")
+                    pending = asyncio.create_task(pending_start())
+                    registry.background_tasks._pending_starts.add(pending)
+                    pending.add_done_callback(
+                        registry.background_tasks._pending_starts.discard
+                    )
+                elif row == "cancel-close-finish-owners":
+                    original = owner.finish_for_close
+                    async def finish(cause):
+                        entered.set()
+                        await await_or_fail(release.wait(), what="finish release")
+                        return await original(cause)
+                    monkeypatch.setattr(owner, "finish_for_close", finish)
+                elif row == "cancel-close-terminate":
+                    original = registry.background_tasks._terminate_owned
+                    async def terminate(*args, **kwargs):
+                        entered.set()
+                        await await_or_fail(release.wait(), what="terminate release")
+                        return await original(*args, **kwargs)
+                    # test-contract: seam gate the close terminator await.
+                    monkeypatch.setattr(registry.background_tasks, "_terminate_owned", terminate)
+                elif row == "cancel-close-wait-until-durable":
+                    original = owner.wait_until_durable
+                    async def durable():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable release")
+                        return await original()
+                    monkeypatch.setattr(owner, "wait_until_durable", durable)
+                elif row == "cancel-close-release-receipts":
+                    original = owner.release_close_receipt
+                    async def receipt():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="receipt release")
+                        return await original()
+                    monkeypatch.setattr(owner, "release_close_receipt", receipt)
+                else:
+                    original = registry.background_tasks._notice
+                    def notice(value):
+                        if hasattr(value, "tasks"):
+                            entered.set()
+                            current = asyncio.current_task()
+                            # test-contract: seam cancel at aggregate notice.
+                            assert current is not None
+                            current.cancel()
+                        return original(value)
+                    # test-contract: seam gate the aggregate notice await.
+                    monkeypatch.setattr(registry.background_tasks, "_notice", notice)
+
+            await _cancel_close_at(registry, store, task_id, row, install)
+            return
 
         if row == "cancel-close-coordinator":
             task_id = await start_registered(_python("import time; time.sleep(30)"))
@@ -950,26 +1046,31 @@ async def test_background_task_owner_state_table(
             (store.session_dir / "background_tasks.json").write_text(
                 json.dumps([persisted]), encoding="utf-8"
             )
-            recovered_tools = ToolRegistry(
-                tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+            store.close()
+            resumed_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
             )
-            stack.push_async_callback(recovered_tools.close)
-            recovered = recovered_tools.background_tasks
-            pending = recovered.set_notification_sink(
-                lambda item: flow.produce(_task_notification(item))
+            resumed_loop = AgentLoop(
+                FakeBackend([]),
+                resumed_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
             )
-            for item in pending:
-                await recovered.deliver_recovered_exit(item)
-            receipts = store.agent_notifications(pending_only=False)
-            if row == "suppressed-task-stays-suppressed":
-                assert receipts == []
-            else:
-                assert len(receipts) == 1
-                assert receipts[0].data["task_id"] == task_id
-                assert recovered.set_notification_sink(
-                    lambda item: flow.produce(_task_notification(item))
-                ) == ()
-                assert len(store.agent_notifications(pending_only=False)) == 1
+            try:
+                await resumed_loop.activate()
+                receipts = resumed_store.agent_notifications(pending_only=False)
+                if row == "suppressed-task-stays-suppressed":
+                    assert receipts == []
+                else:
+                    assert len(receipts) == 1
+                    assert receipts[0].data["task_id"] == task_id
+                    await resumed_loop.activate()
+                    assert len(
+                        resumed_store.agent_notifications(pending_only=False)
+                    ) == 1
+            finally:
+                await resumed_loop.close()
+                resumed_store.close()
             return
 
         if row in {"duplicate-input", "durable-receipt-dedupe-after-eviction"}:
