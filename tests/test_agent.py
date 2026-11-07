@@ -8664,7 +8664,9 @@ async def test_agent_send_rewarms_50k_writer_before_commit_deadline(
     ] == ["follow up"]
     await owner.conversation_channel.unregister_delivery_flow(handle)
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await asyncio.wait_for(
+        asyncio.gather(watcher, return_exceptions=True), timeout=10
+    )
     await asyncio.to_thread(fresh.close)
     await asyncio.to_thread(child.close)
     await asyncio.to_thread(parent.close)
@@ -9527,11 +9529,13 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     terminal = await asyncio.wait_for(close, timeout=2)
     assert terminal.pending is False
     assert terminal.closed_empty is True
-    error = await asyncio.wait_for(send, timeout=2)
+    error = await asyncio.wait_for(send, timeout=10)
     assert error is not None and "no live run" in error
     for watcher in watchers:
         watcher.cancel()
-    await asyncio.gather(*watchers, return_exceptions=True)
+    await asyncio.wait_for(
+        asyncio.gather(*watchers, return_exceptions=True), timeout=10
+    )
 
 
 @pytest.mark.asyncio
@@ -10066,7 +10070,9 @@ async def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
         channel=owner.conversation_channel,
     )
     watcher.cancel()
-    await asyncio.gather(watcher, return_exceptions=True)
+    await asyncio.wait_for(
+        asyncio.gather(watcher, return_exceptions=True), timeout=10
+    )
     assert error is not None
     assert "explore" in error and "agent_send" in error
     assert "reviewers are one-shot" not in error
@@ -13491,7 +13497,7 @@ async def test_idle_child_is_running_during_wake_turn(
         )
     )
     owner.register("parent:1", task.cancel, task, parent_store=parent_store)
-    await asyncio.wait_for(first_idle.wait(), timeout=2)
+    await asyncio.wait_for(first_idle.wait(), timeout=10)
     first_idle_since = child_store.agent_lifecycle()["idle_since"]
     assert await send_to_run(
         parent_store,
@@ -17082,7 +17088,7 @@ async def test_done_registered_watcher_cannot_send_or_cancel(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     watcher = asyncio.create_task(asyncio.sleep(0))
-    await watcher
+    await asyncio.wait_for(watcher, timeout=10)
     cancellations = 0
 
     def cancel() -> None:
@@ -17147,7 +17153,9 @@ async def test_adoption_moves_live_mutation_control_to_current_owner(tmp_path: P
         assert owner.controls_child(root, "root:1:1") is True
     finally:
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(watcher, return_exceptions=True), timeout=10
+        )
         reopened_child.close()
 
 

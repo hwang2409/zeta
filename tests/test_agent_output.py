@@ -1303,7 +1303,9 @@ async def test_agent_output_reads_and_fits_off_event_loop(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=10
+        )
 
 
 @pytest.mark.asyncio
@@ -1355,7 +1357,9 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=10
+        )
 
 
 def _create_nested_child_in_process(
