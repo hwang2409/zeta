@@ -16,6 +16,7 @@ from zeta.core.context import (
     StaleBranchError,
     SummaryCompletionError,
 )
+from zeta.context_eviction import EVICTION_KIND
 from zeta.context_accounting import (
     compact_json_chunks,
     compact_json_length,
@@ -2107,3 +2108,138 @@ async def test_ephemeral_host_instruction_counts_toward_context_budget_without_p
     assert assembled.messages[0].content[-1].text.endswith(instruction)
     assert assembled.token_count >= len(instruction)
     assert all(instruction not in json.dumps(entry.data) for entry in store.replay())
+
+
+TOOL_SCHEMAS = ({"name": "probe", "description": "d", "input_schema": {}},)
+
+
+async def _turn(assembler: ContextAssembler) -> tuple[bool, AssembledContext, int]:
+    needs = assembler.needs_compaction()
+    context = await assembler.assemble_context()
+    return needs, context, assembler.estimate_request(context.messages, TOOL_SCHEMAS)
+
+
+@pytest.mark.asyncio
+async def test_turn_counts_only_new_messages_after_the_first_turn(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(40):
+        role = MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT
+        store.append_message(text(role, f"message {index} " * 20))
+    counted: list[Message] = []
+
+    def counter(message: Message) -> int:
+        if message.role is not MessageRole.SYSTEM:
+            counted.append(message)
+        return context_module._message_token_count(message)
+
+    assembler = ContextAssembler(
+        store, token_budget=1_000_000, system_prompt="system", token_counter=counter
+    )
+    await _turn(assembler)
+    await _turn(assembler)
+    store.append_message(text(MessageRole.USER, "new"))
+    counted.clear()
+
+    await _turn(assembler)
+
+    assert len(counted) <= 2, len(counted)
+    assert all(message.content == [TextContent("new")] for message in counted)
+
+
+def _append_read_exchange(store: ConversationStore, index: int) -> None:
+    call = ToolCall(f"read-{index}", "read", {"path": f"file-{index}.txt"})
+    store.append_message(
+        with_message_origin(
+            text(MessageRole.USER, f"read file {index}"), MessageOrigin.USER
+        )
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, f"line {index}\n" * 300),
+        )
+    )
+    store.append_message(text(MessageRole.ASSISTANT, f"file {index} read"))
+
+
+@pytest.mark.asyncio
+async def test_turn_after_eviction_counts_only_new_messages(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    counted: list[Message] = []
+
+    def counter(message: Message) -> int:
+        if message.role is not MessageRole.SYSTEM:
+            counted.append(message)
+        return context_module._message_token_count(message)
+
+    assembler = ContextAssembler(
+        store, token_budget=20_000, system_prompt="system", token_counter=counter
+    )
+    for index in range(80):
+        _append_read_exchange(store, index)
+        _, context, _ = await _turn(assembler)
+        if context.compacted:
+            break
+    assert context.compacted
+    pinned_text = f"read file {index}"
+    await _turn(assembler)
+    store.append_message(text(MessageRole.USER, "new"))
+    counted.clear()
+
+    _, context, _ = await _turn(assembler)
+
+    assert not context.compacted
+    assert sum("source_seq" in m.metadata for m in context.messages) >= 10
+    # Only the new row and the marker's small pinned request are counted again.
+    new_counts = [m for m in counted if m.content == [TextContent("new")]]
+    assert len(new_counts) <= 2, len(new_counts)
+    assert {m.content[0].text for m in counted} <= {"new", pinned_text}, len(counted)
+    assert len(counted) <= 6, len(counted)
+
+
+@pytest.mark.asyncio
+async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stores = [ConversationStore(tmp_path / name) for name in ("on", "off")]
+    cached, uncached = (
+        ContextAssembler(store, token_budget=20_000, system_prompt="system")
+        for store in stores
+    )
+    # test-contract: seam bind no messages so every count is recomputed
+    monkeypatch.setattr(uncached._token_counts, "track", lambda pairs: None)
+    compacted = 0
+    for index in range(80):
+        for store in stores:
+            _append_read_exchange(store, index)
+        cached_needs, cached_context, cached_estimate = await _turn(cached)
+        uncached_needs, uncached_context, uncached_estimate = await _turn(uncached)
+        compacted += cached_context.compacted
+
+        assert cached_needs is uncached_needs
+        assert cached_context.compacted is uncached_context.compacted
+        assert [m.to_dict() for m in cached_context.messages] == [
+            m.to_dict() for m in uncached_context.messages
+        ]
+        assert cached_context.digest == uncached_context.digest
+        assert (
+            cached_context.token_count
+            == uncached_context.token_count
+            == sum(map(context_module._message_token_count, cached_context.messages))
+        )
+        assert cached_estimate == uncached_estimate
+    markers = [
+        [
+            # Replaced marker ids are random per store; their count must match.
+            {**entry.data, "replaces": len(entry.data.get("replaces", []))}
+            for entry in store.replay()
+            if entry.type == "compaction"
+        ]
+        for store in stores
+    ]
+    assert markers[0] == markers[1]
+    assert compacted >= 2, compacted
+    assert {marker.get("kind") for marker in markers[0]} == {EVICTION_KIND}
