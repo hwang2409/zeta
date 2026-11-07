@@ -225,9 +225,7 @@ async def spawn_background(
             raise asyncio.CancelledError
         if isinstance(admission_error, asyncio.CancelledError):
             raise
-        raise BackgroundSpawnNotAdmittedError(
-            "background task registry closed before spawn admission"
-        ) from admission_error
+        raise BackgroundSpawnNotAdmittedError(str(admission_error)) from admission_error
     return process
 
 

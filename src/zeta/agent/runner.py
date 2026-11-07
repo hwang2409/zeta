@@ -95,21 +95,17 @@ async def consume_child(
     failure_message: str | None = None
     tool_calls = 0
     explicit_report: dict[str, object] | None = None
-    background_task_kill_cause: str | None = None
 
     def terminal_result(
         *, state: TerminalState, text: str, **result_options: object
     ) -> dict[str, object]:
         stats = finish_lifecycle(state, text)
-        result = child_result(
+        return child_result(
             text,
             state=state,
             stats=stats,
             **result_options,
         )
-        if background_task_kill_cause is not None:
-            result["backgroundTaskKillCause"] = background_task_kill_cause
-        return result
 
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
@@ -248,7 +244,7 @@ async def consume_child(
                 delivering_prompt_id,
             )
             if gate_result.outcome == "task_safety_expired":
-                background_task_kill_cause = (
+                child_loop.tool_registry.background_tasks.begin_shutdown(
                     "finish-gate task safety bound expired after "
                     f"{child_loop._background_owner.finish_gate_task_timeout:g} seconds"
                 )
@@ -498,11 +494,7 @@ async def _build_child_loop(
         return child_loop, child_policy
     except asyncio.CancelledError:
         if child_registry is not None:
-            cleanup = asyncio.create_task(
-                child_registry.close(
-                    background_task_cause="child spawn canceled during setup"
-                )
-            )
+            cleanup = asyncio.create_task(child_registry.close(background_task_cause="child spawn setup canceled"))
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
@@ -510,9 +502,7 @@ async def _build_child_loop(
         raise
     except BaseException:
         if child_registry is not None:
-            await child_registry.close(
-                background_task_cause="child spawn failed during setup"
-            )
+            await child_registry.close(background_task_cause="child spawn setup failed")
         raise
 
 
@@ -1073,11 +1063,7 @@ async def run_agent_tool(
             loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
-            return tuple(
-                await child_loop.close(
-                    cancel_background=False, background_task_cause=cause
-                )
-            )
+            return tuple(await child_loop.close(cancel_background=False, background_task_cause=cause))
 
         async def finish_background() -> None:
             await finish_background_child(
@@ -1197,9 +1183,7 @@ async def run_agent_tool(
         if not abort_task.done():
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
-        await child_loop.close(
-            cancel_background=False, background_task_cause=background_task_cause
-        )
+        await child_loop.close(cancel_background=False, background_task_cause=background_task_cause)
 
 
 def _child_base_system_prompt(

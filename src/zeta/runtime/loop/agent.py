@@ -460,9 +460,8 @@ class AgentLoop(
     ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
-            killed = await self.tool_registry.close(
-                background_task_cause=background_task_cause
-            )
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
+            killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
                 done, pending = await asyncio.wait(
@@ -507,7 +506,9 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown()
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
