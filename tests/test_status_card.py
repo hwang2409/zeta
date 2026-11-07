@@ -178,7 +178,7 @@ async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
             "".join(screen.data_buffer[y][x].char for x in range(80))
             for y in range(24)
         )
-        assert "No open decisions." in text
+        assert "No open attention items." in text
         assert "esc close" in text
 
         app.close_decisions_panel()
