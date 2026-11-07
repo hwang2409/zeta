@@ -26,6 +26,7 @@ from rich.text import Text
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -418,6 +419,150 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
     await registry.close()
 
 
+async def _cancel_gate(owner, entered, release, *, name: str) -> None:
+    lifecycle = owner.lifecycle
+    assert lifecycle is not None
+    await await_or_fail(entered.wait(), what=f"{name} entered")
+    lifecycle.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await await_or_fail(owner.wait(), what=f"{name} cancellation completion")
+
+
+async def _cancel_at_gate(owner, install, *, name: str) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold() -> None:
+        entered.set()
+        await await_or_fail(release.wait(), what=f"{name} release")
+
+    await install(hold)
+    await _cancel_gate(owner, entered, release, name=name)
+
+
+async def _cancel_process_wait(registry, owner, monkeypatch) -> None:
+    process = owner.process
+    assert process is not None
+    original = process.wait
+
+    async def install(hold):
+        async def wait():
+            await hold()
+            return await original()
+        monkeypatch.setattr(process, "wait", wait)
+
+    await _cancel_at_gate(owner, install, name="process-wait")
+
+
+async def _cancel_reader_drain(registry, owner, monkeypatch) -> None:
+    original = owner._finish_output_drain.wait
+
+    async def install(hold):
+        async def wait():
+            await hold()
+            return await original()
+        monkeypatch.setattr(owner._finish_output_drain, "wait", wait)
+
+    await _cancel_at_gate(owner, install, name="reader-drain")
+
+
+async def _cancel_writer_close(registry, owner, monkeypatch) -> None:
+    original = _OrderedLogWriter.close
+
+    async def install(hold):
+        async def close(writer):
+            await hold()
+            return await original(writer)
+        monkeypatch.setattr(_OrderedLogWriter, "close", close)
+
+    await _cancel_at_gate(owner, install, name="writer-close")
+
+
+async def _cancel_archive(registry, owner, monkeypatch) -> None:
+    original = owner._archive
+
+    async def install(hold):
+        async def archive():
+            await hold()
+            return await original()
+        monkeypatch.setattr(owner, "_archive", archive)
+
+    await _cancel_at_gate(owner, install, name="archive")
+
+
+async def _cancel_persist(registry, owner, monkeypatch) -> None:
+    owner_registry = registry.background_tasks
+    original = owner_registry._commit_transition
+
+    async def install(hold):
+        async def commit(*args, **kwargs):
+            await hold()
+            return await original(*args, **kwargs)
+        # test-contract: seam gate terminal persistence at the owner await
+        monkeypatch.setattr(owner_registry, "_commit_transition", commit)
+
+    await _cancel_at_gate(owner, install, name="persist")
+
+
+async def _cancel_evidence(registry, owner, monkeypatch) -> None:
+    owner_registry = registry.background_tasks
+    original = owner_registry._notification_sink
+
+    async def install(hold):
+        async def sink(item):
+            await hold()
+            return await original(item)
+        # test-contract: seam gate evidence delivery at the owner await
+        monkeypatch.setattr(owner_registry, "_notification_sink", sink)
+
+    await _cancel_at_gate(owner, install, name="evidence")
+
+
+async def _cancel_install(registry, owner, monkeypatch) -> None:
+    original = owner._deliver_exit
+
+    async def install(hold):
+        async def deliver(item):
+            await hold()
+            return await original(item)
+        # test-contract: seam gate the install predecessor at the owner await
+        monkeypatch.setattr(owner, "_deliver_exit", deliver)
+
+    await _cancel_at_gate(owner, install, name="install")
+
+
+async def _cancel_notice(registry, owner, monkeypatch) -> None:
+    entered = asyncio.Event()
+    owner_registry = registry.background_tasks
+    original = owner_registry._notice
+
+    def notice(value):
+        entered.set()
+        lifecycle = owner.lifecycle
+        assert lifecycle is not None
+        lifecycle.cancel()
+        original(value)
+
+    # test-contract: seam gate the synchronous lifecycle notice
+    monkeypatch.setattr(owner_registry, "_notice", notice)
+    await await_or_fail(entered.wait(), what="notice entered")
+    with pytest.raises(asyncio.CancelledError):
+        await await_or_fail(owner.wait(), what="notice cancellation completion")
+
+
+_CANCEL_ROW_HANDLERS = {
+    "process-wait": _cancel_process_wait,
+    "reader-drain": _cancel_reader_drain,
+    "ordered-writer-close": _cancel_writer_close,
+    "archive": _cancel_archive,
+    "persist": _cancel_persist,
+    "evidence-submit": _cancel_evidence,
+    "install": _cancel_install,
+    "notice": _cancel_notice,
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "row",
@@ -490,26 +635,34 @@ async def test_background_task_owner_state_table(
             assert (await output_registered(task_id))["running"] is False
             return
 
-        if row.startswith("cancel-"):
-            task_id = await start_registered(_python("print('cancel-safe')"))
+        if row == "cancel-process-wait":
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_wait = asyncio.subprocess.Process.wait
+
+            async def gated_wait(process):
+                entered.set()
+                await await_or_fail(release.wait(), what="process-wait release")
+                return await original_wait(process)
+
+            monkeypatch.setattr(asyncio.subprocess.Process, "wait", gated_wait)
+            task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
             owner = registry.background_tasks._owners[task_id]
-            awaitable_name = row.removeprefix("cancel-")
-            target = {
-                "process-wait": owner.lifecycle,
-                "reader-drain": owner.lifecycle,
-                "ordered-writer-close": owner.lifecycle,
-                "archive": owner.lifecycle,
-                "persist": owner.lifecycle,
-                "evidence-submit": owner.lifecycle,
-                "install": owner.lifecycle,
-                "notice": owner.lifecycle,
-            }[awaitable_name]
-            assert target is not None
-            target.cancel()
-            await _wait_for_exit(registry.background_tasks, task_id)
+            await _cancel_gate(owner, entered, release, name="process-wait")
             status = await output_registered(task_id)
             assert status["running"] is False
-            assert status["exit_code"] == 0
+            assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
+            return
+
+        if row.startswith("cancel-"):
+            task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
+            owner = registry.background_tasks._owners[task_id]
+            handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
+            await handler(registry, owner, monkeypatch)
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
+            assert owner.record.terminal_phase in {"natural_exit", "task_kill", "session_shutdown"}
             return
 
         if row == "archive-failure-recovers-once":
