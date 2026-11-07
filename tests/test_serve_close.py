@@ -51,12 +51,18 @@ class _CancellationServer:
         self.task: asyncio.Task[None] | None = None
         self.owner_task: asyncio.Task[None] | None = None
         self.cancel_owner = False
+        self.cancel_during_server_wait = False
+        self.trigger = asyncio.Event()
 
     async def close(self) -> None:
         self.task = asyncio.current_task()
         self.started.set()
         if self.cancel_owner and self.owner_task is not None:
             self.owner_task.cancel()
+        if self.cancel_during_server_wait:
+            await asyncio.wait_for(self.trigger.wait(), 10)
+            if self.owner_task is not None:
+                self.owner_task.cancel()
         await asyncio.wait_for(self.release.wait(), 10)
         self.closed = True
 
@@ -80,6 +86,7 @@ class _CancellationWriter:
                 await asyncio.wait_for(self.finished.wait(), 10)
             except asyncio.CancelledError:
                 self.cancelled.set()
+                self.server.trigger.set()
                 raise
         else:
             self.finished.set()
@@ -143,6 +150,7 @@ async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
     close_task = asyncio.create_task(close_serve(server, writer))
     server.owner_task = close_task
     server.cancel_owner = phase == "first-yield"
+    server.cancel_during_server_wait = phase == "writer-wait"
     try:
         if phase == "first-yield":
             await asyncio.wait_for(server.started.wait(), 10)
@@ -150,7 +158,6 @@ async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
             await asyncio.wait_for(writer.waiting.wait(), 10)
             close_task.cancel()
             await asyncio.wait_for(writer.cancelled.wait(), 10)
-            close_task.cancel()
         else:
             await asyncio.wait_for(writer.finished.wait(), 10)
             close_task.cancel()
