@@ -8,20 +8,13 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.project_context import (
-    ProjectContext,
-    discover_project,
-    load_project_context,
-    resolve_project_context_from_projects,
-)
-from ..core.session import env_home
+from ..core.project_context import ProjectContext
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
@@ -44,7 +37,6 @@ from ..protocol.types import (
 from ..providers.factory import build_backend, credential_store
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
-from ..skills.agent_catalog import load_agent
 from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
@@ -52,6 +44,12 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from .background import CancellationRequest, finish_background_child
 from .budget import child_depth as next_agent_depth
+from .child_context import (
+    _child_base_system_prompt,
+    _compose_child_project_context,
+    _compose_child_system_prompt,  # noqa: F401 - retained test seam
+    _load_child_project_context,
+)
 from .conversation_channel import has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
@@ -60,7 +58,6 @@ from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
     AgentPreset,
-    compose_system_prompt,
     resolve_child_profile_tools,
 )
 from .receipt import MAX_AGENT_RESULT_BYTES, TerminalState
@@ -1199,148 +1196,3 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
-
-
-def _load_child_project_context(
-    loop: AgentLoop,
-    cwd_override: str | None,
-    child_registry: ToolRegistry | None,
-    *,
-    projection: ProjectContextProjection | None = None,
-) -> ProjectContext:
-    """Compose one child's project context through the tolerant projection."""
-
-    if child_registry is not None:
-        child_registry.verify_cwd_identity()
-    child_cwd = Path(
-        cwd_override or (child_registry.cwd if child_registry is not None else loop.store.cwd)
-    )
-    home_hint = loop.active_home
-    zeta_home = Path(home_hint) if home_hint else env_home()
-    discovery = discover_project(child_cwd, user_home=zeta_home.parent)
-    registry = loop.project_registry
-    if projection is None and registry is not None:
-        projection = registry.project_context_projection(loop.root_project_id)
-    session_project = (
-        projection.session_project if projection is not None else None
-    )
-    cwd_project = (
-        resolve_project_context_from_projects(discovery, projection.projects)
-        if projection is not None
-        else None
-    )
-    return load_project_context(
-        cwd=child_cwd,
-        repo_root=discovery.primary_root or discovery.cwd,
-        zeta_home=zeta_home,
-        catalog=(
-            child_registry.skill_catalog
-            if child_registry is not None
-            else loop.tool_registry.skill_catalog
-        ),
-        session_project=session_project,
-        cwd_project=cwd_project,
-        inbox_enabled=False,
-        registry=registry,
-        project_projection=projection,
-    )
-
-
-def _child_base_system_prompt(
-    loop: AgentLoop,
-    cwd_override: str | None,
-    child_registry: ToolRegistry | None = None,
-) -> ProjectContext:
-    """Preserve inherited bytes while giving every child its own health."""
-
-    if cwd_override is not None and not same_physical_path(
-        cwd_override, loop.store.cwd
-    ):
-        return _load_child_project_context(loop, cwd_override, child_registry)
-    registry = getattr(loop, "project_registry", None)
-    projection = (
-        registry.project_context_projection(loop.root_project_id)
-        if registry is not None
-        else None
-    )
-    runtime_prompt = (
-        loop._skill_prompt_base()
-        if hasattr(loop, "_skill_prompt_base")
-        else RuntimePrompt(loop.context_assembler.system_prompt, {})
-    )
-    prompt = runtime_prompt.system_prompt
-    if not isinstance(prompt, str):
-        return _load_child_project_context(loop, cwd_override, child_registry)
-    return ProjectContext(
-        prompt,
-        (),
-        prompt_recipe="custom",
-        prompt_components={
-            key: dict(component)
-            for key, component in runtime_prompt.prompt_components.items()
-        },
-        health=projection.health if projection is not None else None,
-    )
-
-
-_EXPLICIT_FINISH_GUIDANCE = (
-    "With explicit finish enabled, this run ends only when you call the `finish` "
-    "tool with `status` and `summary` (plus `verdict` and `head_sha` when they "
-    "apply). Ending a turn without calling `finish` leaves you idle for "
-    "follow-ups; call it when the contract's exit criteria are met or when you "
-    "are blocked."
-)
-
-
-def _compose_child_project_context(
-    context: ProjectContext,
-    preset: AgentPreset,
-    *,
-    explicit_finish: bool = False,
-) -> ProjectContext:
-    """Apply child guidance while retaining owned-span locations."""
-
-    prompt = _compose_child_system_prompt(
-        context.system_prompt,
-        preset,
-        explicit_finish=explicit_finish,
-    )
-    assert isinstance(prompt, str)
-    shift = len(preset.preamble) + 2 if preset.preamble else 0
-    components = {
-        key: {**component, "offset": int(component["offset"]) + shift}
-        for key, component in context.prompt_components.items()
-    }
-    return replace(
-        context,
-        system_prompt=prompt,
-        memory_offset=(
-            context.memory_offset + shift
-            if context.memory_offset is not None
-            else None
-        ),
-        prompt_components=components,
-    )
-
-
-def _compose_child_system_prompt(
-    system_prompt: str | Message,
-    preset: AgentPreset,
-    *,
-    explicit_finish: bool = False,
-) -> str | Message:
-    """Apply the preset preamble and custom body to the child prompt."""
-
-    composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = load_agent(preset)
-    if explicit_finish:
-        body = f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}" if body else _EXPLICIT_FINISH_GUIDANCE
-    if not body:
-        return composed
-    if isinstance(composed, Message):
-        return Message(
-            MessageRole.SYSTEM,
-            [*composed.content, TextContent(body)],
-            metadata=dict(composed.metadata),
-        )
-    return composed + "\n\n" + body
