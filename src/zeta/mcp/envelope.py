@@ -69,7 +69,9 @@ class MCPCallEnvelope:
             return
         if self._handle is None:
             try:
-                self.spill_store.reserve_transient(self.total)
+                await asyncio.to_thread(
+                    self.spill_store.reserve_transient, self.total
+                )
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
             self._reserved = self.total
@@ -80,7 +82,9 @@ class MCPCallEnvelope:
         extra = self.total - self._reserved
         if extra:
             try:
-                self.spill_store.reserve_transient(extra)
+                await asyncio.to_thread(
+                    self.spill_store.reserve_transient, extra
+                )
             except RuntimeError as exc:
                 raise MCPTransientQuotaError from exc
             self._reserved += extra

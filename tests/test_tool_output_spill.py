@@ -763,7 +763,7 @@ async def test_bash_large_output_spills(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_spills_share_one_root_byte_cap(
+async def test_closed_child_spills_are_reclaimed_for_a_sibling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shared_cap = 150
@@ -796,15 +796,10 @@ async def test_child_spills_share_one_root_byte_cap(
         first.spills.max_bytes = 100
         second.spills.max_bytes = 100
         try:
-            old_path = first.spills.write_bytes(
-                "tool", "first", 0, b"a" * 100
-            )
-            spill_full = None
-            try:
-                second.spills.write_bytes("tool", "second", 0, b"b" * 100)
-            except RuntimeError as exc:
-                spill_full = exc
+            old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
+            await first.close()
 
+            new_path = second.spills.write_bytes("tool", "second", 0, b"b" * 60)
             total = sum(
                 path.stat().st_size
                 for store in (first, second)
@@ -812,26 +807,248 @@ async def test_child_spills_share_one_root_byte_cap(
                 for path in store.spills.root.iterdir()
                 if not path.name.startswith(".")
             )
+
+            assert new_path.read_bytes() == b"b" * 60
+            assert not old_path.exists()
             assert total <= shared_cap
-            assert spill_full is not None
-            assert "spill budget is full" in str(spill_full)
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
 
-            new_path = first.spills.write_bytes("tool", "new", 0, b"b" * 100)
+
+@pytest.mark.asyncio
+async def test_child_spills_share_one_root_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", 150, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = 100
+        second.spills.max_bytes = 100
+        try:
+            old_path = first.spills.write_bytes("tool", "first", 0, b"a" * 100)
+            sibling_path = second.spills.write_bytes(
+                "tool", "second", 0, b"b" * 100
+            )
+            assert not old_path.exists()
+
+            newest_path = first.spills.write_bytes("tool", "new", 0, b"c" * 100)
+            assert not sibling_path.exists()
             second.spills.reserve_transient(50)
-            with pytest.raises(RuntimeError, match="spill budget is full"):
-                second.spills.reserve_transient(1)
-            second.spills.release_transient(50)
+            second.spills.reserve_transient(1)
+            second.spills.release_transient(51)
+            assert not newest_path.exists()
 
-            def broken_parts():
+            def broken_parts() -> Iterator[bytes]:
                 yield b"x" * 50
                 raise OSError("source failed")
 
             with pytest.raises(OSError, match="source failed"):
                 second.spills.write_parts("tool", "broken", 0, broken_parts())
-            other_path = second.spills.write_bytes("tool", "other", 0, b"c" * 50)
-            assert not old_path.exists()
-            assert new_path.read_bytes() == b"b" * 100
-            assert other_path.read_bytes() == b"c" * 50
+            other_path = second.spills.write_bytes("tool", "other", 0, b"d" * 50)
+            assert other_path.read_bytes() == b"d" * 50
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_call_limit_reservations_reclaim_retained_spills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_cap = 140
+    call_limit = 64
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", shared_cap, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="retained-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as retained_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-call",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_call_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-call",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_call_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        retained = root.clone_for_session(retained_store)
+        first_call = root.clone_for_session(first_call_store)
+        second_call = root.clone_for_session(second_call_store)
+        retained.spills.max_bytes = 100
+        retained_path = retained.spills.write_bytes(
+            "tool", "retained", 0, b"r" * 100
+        )
+        ready = threading.Barrier(3)
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        def reserve_call(registry: ToolRegistry) -> None:
+            try:
+                registry.spills.reserve_transient(call_limit)
+                ready.wait(timeout=30)
+                assert release.wait(timeout=30)
+                registry.spills.release_transient(call_limit)
+            except (
+                AssertionError,
+                RuntimeError,
+                ValueError,
+                threading.BrokenBarrierError,
+            ) as exc:
+                failures.append(exc)
+                ready.abort()
+
+        threads = [
+            threading.Thread(target=reserve_call, args=(registry,))
+            for registry in (first_call, second_call)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            ready.wait(timeout=30)
+            assert failures == []
+            assert not retained_path.exists()
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=30)
+            await second_call.close()
+            await first_call.close()
+            await retained.close()
+            await root.close()
+        assert not any(thread.is_alive() for thread in threads)
+        assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_transient_bytes_alone_raise_typed_shared_spill_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", 100, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.configure_transient_limit(100)
+        second.spills.configure_transient_limit(100)
+        try:
+            first.spills.reserve_transient(60)
+            with pytest.raises(RuntimeError, match="spill budget is full") as error:
+                second.spills.reserve_transient(41)
+            assert type(error.value).__name__ == "SpillFullError"
+            first.spills.release_transient(60)
+        finally:
+            await second.close()
+            await first.close()
+            await root.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_reclaimed_file_returns_its_charge_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        spill_module, "SPILL_SESSION_MAX_BYTES", 100, raising=False
+    )
+    with (
+        _store(tmp_path, "parent") as parent_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="first-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as first_store,
+        ConversationStore(
+            parent_store.session_dir / "agents",
+            session_id="second-child",
+            cwd=parent_store.cwd,
+            bash_cwd=parent_store.cwd,
+        ) as second_store,
+    ):
+        root = ToolRegistry(
+            parent_store.cwd,
+            session_store=parent_store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = root.clone_for_session(first_store)
+        second = root.clone_for_session(second_store)
+        first.spills.max_bytes = 100
+        second.spills.max_bytes = 100
+        try:
+            missing = first.spills.write_bytes("tool", "missing", 0, b"a" * 100)
+            missing.unlink()
+            live = second.spills.write_bytes("tool", "live", 0, b"b" * 100)
+
+            first.spills.configure_transient_limit(100)
+            first.spills.reserve_transient(100)
+            assert not live.exists()
+            first.spills.release_transient(100)
+            assert second.spills.write_bytes(
+                "tool", "after", 0, b"c" * 100
+            ).read_bytes() == b"c" * 100
         finally:
             await second.close()
             await first.close()
