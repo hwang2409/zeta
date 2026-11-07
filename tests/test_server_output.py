@@ -366,7 +366,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         operation = original_release(reconnect)
 
         async def wait() -> None:
-            await operation
+            await asyncio.wait_for(operation, RELEASE_GATE_GUARD_SECONDS)
             release_entered.set()
             await asyncio.wait_for(release_gate.wait(), RELEASE_GATE_GUARD_SECONDS)
 
