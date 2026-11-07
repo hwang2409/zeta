@@ -299,33 +299,13 @@ def _wait_timeout(node: ast.Call) -> float | None:
     return None
 
 
-def _keyword_is_true(node: ast.Call, name: str) -> bool:
-    return any(
-        keyword.arg == name
-        and isinstance(keyword.value, ast.Constant)
-        and keyword.value.value is True
-        for keyword in node.keywords
-    )
-
-
 def _timing_findings(path: Path, node: ast.AST, lines: list[str]) -> list[Finding]:
     if isinstance(node, ast.Call):
-        allow_short = _name(node.func) == "await_or_fail" and _keyword_is_true(
-            node, "allow_short"
-        )
-        has_latency_marker = _has_marker(lines, node.lineno, {"latency"})
-        if allow_short and not has_latency_marker:
-            return [
-                Finding(
-                    path, node.lineno, node.col_offset + 1, "TQ001", SHORT_TIMEOUT_ERROR
-                )
-            ]
         timeout = _wait_timeout(node)
-        short_override = allow_short and has_latency_marker
         if (
             timeout is not None
             and 0 < timeout < MIN_HANG_GUARD_SECONDS
-            and not short_override
+            and not _has_marker(lines, node.lineno, {"latency"})
         ):
             return [
                 Finding(
@@ -444,16 +424,14 @@ def _inside_test_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> boo
 
 
 def _is_unbounded_sync_wait(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
-    if not isinstance(node, ast.Call) or node.args or node.keywords:
-        return False
-    function = node.func
-    if not isinstance(function, ast.Attribute):
-        return False
-    if function.attr == "join":
-        return True
     return (
-        function.attr == "wait"
-        and isinstance(parents.get(node), ast.Expr)
+        isinstance(node, ast.Call)
+        and not node.args
+        and not node.keywords
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"join", "wait"}
+        and not isinstance(parents.get(node), ast.Await)
+        and not _inside_deadline_argument(node, parents)
         and _inside_test_function(node, parents)
     )
 
@@ -476,68 +454,13 @@ def _bounded_asyncio_wait(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Call)
         and _name(node.func) == "asyncio.wait"
-        and any(keyword.arg == "timeout" for keyword in node.keywords)
-    )
-
-
-def _assigned_names(node: ast.AST) -> set[str]:
-    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-        return set()
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    return {
-        part.id
-        for target in targets
-        for part in ast.walk(target)
-        if isinstance(part, ast.Name)
-    }
-
-
-def _earlier_block_statements(
-    node: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> list[ast.stmt]:
-    child = node
-    for parent in _enclosing_nodes(node, parents):
-        if isinstance(child, ast.stmt):
-            for _, value in ast.iter_fields(parent):
-                if isinstance(value, list) and child in value:
-                    return value[: value.index(child)]
-        child = parent
-    return []
-
-
-def _nearest_assignment(name: str, statements: list[ast.stmt]) -> ast.AST | None:
-    return next(
-        (
-            statement
-            for statement in reversed(statements)
-            if name in _assigned_names(statement)
-        ),
-        None,
-    )
-
-
-def _is_bounded_wait_assignment(node: ast.AST | None) -> bool:
-    value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
-    return isinstance(value, ast.Await) and _bounded_asyncio_wait(value.value)
-
-
-def _support_gather_is_already_done(
-    path: Path, node: ast.Await, parents: dict[ast.AST, ast.AST]
-) -> bool:
-    value = node.value
-    if path.parts[:2] != ("tests", "support") or not (
-        isinstance(value, ast.Call) and _name(value.func) == "asyncio.gather"
-    ):
-        return False
-    gathered = {
-        argument.value.id
-        for argument in value.args
-        if isinstance(argument, ast.Starred) and isinstance(argument.value, ast.Name)
-    }
-    earlier = _earlier_block_statements(node, parents)
-    return bool(gathered) and all(
-        _is_bounded_wait_assignment(_nearest_assignment(name, earlier))
-        for name in gathered
+        and any(
+            keyword.arg == "timeout"
+            and not (
+                isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+            )
+            for keyword in node.keywords
+        )
     )
 
 
@@ -579,7 +502,6 @@ def _deadline_findings(
         not violates
         or _has_marker(lines, node.lineno, CONTRACT_KINDS)
         or _bounded_asyncio_wait(value)
-        or _support_gather_is_already_done(path, node, parents)
         or _inside_timeout_context(node, parents)
         or _inside_deadline_argument(node, parents)
     ):
@@ -709,6 +631,14 @@ def lint_all(root: Path | None = None, *, use_ratchet: bool = True) -> list[Find
     ]
 
 
+def write_ratchet(root: Path | None = None) -> tuple[int, int]:
+    root = Path.cwd() if root is None else root
+    findings, _ = _scan_deadline_findings(root)
+    keys = sorted({finding_ratchet_key(root, finding) for finding in findings})
+    (root / RATCHET_PATH).write_text("".join(f"{key}\n" for key in keys))
+    return len(findings), len(keys)
+
+
 def select_base(event_name: str, base_ref: str = "") -> str:
     if event_name == "pull_request":
         if not base_ref:
@@ -727,6 +657,10 @@ def main(argv: list[str] | None = None) -> int:
     if arguments[:1] == ["--base"] and len(arguments) in {2, 3}:
         print(select_base(arguments[1], arguments[2] if len(arguments) == 3 else ""))
         return 0
+    if arguments == ["--write-ratchet"]:
+        raw_count, key_count = write_ratchet()
+        print(f"wrote {key_count} keys from {raw_count} findings to {RATCHET_PATH}")
+        return 0
     if arguments == ["--all"]:
         findings = lint_all()
     elif len(arguments) == 1:
@@ -739,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             "usage: lint_test_quality.py <unified-diff-path|-> | --all | "
-            "--base <pull_request|push> [base-ref]",
+            "--write-ratchet | --base <pull_request|push> [base-ref]",
             file=sys.stderr,
         )
         return 2

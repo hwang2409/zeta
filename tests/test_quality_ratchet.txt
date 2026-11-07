@@ -1,6 +1,3 @@
-tests/conftest.py::ensure_format
-tests/conftest.py::open_test_writer
-tests/support/credentials.py::_thread_call
 tests/support/server_backend.py::complete
 tests/test_account_home.py::test_refresh_writes_token_and_lock_to_account_home
 tests/test_accounts.py::blocked_refresh
@@ -48,9 +45,11 @@ tests/test_agent.py::reserve
 tests/test_agent.py::reserve_idle_nudge
 tests/test_agent.py::stalled_dispatch
 tests/test_agent.py::test_aborted_notification_wake_commits_durable_notifications
+tests/test_agent.py::test_agent_cancel_propagates_caller_cancellation
 tests/test_agent.py::test_agent_cancel_reports_failed_confirmation_and_allows_retry
 tests/test_agent.py::test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_success
 tests/test_agent.py::test_agent_cancel_retry_after_waiter_cancellation_reuses_confirmation
+tests/test_agent.py::test_agent_cancel_returns_within_bound_when_cleanup_is_stuck
 tests/test_agent.py::test_agent_send_racing_wake_clear_remains_armed
 tests/test_agent.py::test_agent_send_waits_for_blocked_append_before_cancellation
 tests/test_agent.py::test_background_completion_wakes_idle_parent
@@ -64,6 +63,7 @@ tests/test_agent.py::test_child_approval_cleanup_removes_pending_requests
 tests/test_agent.py::test_child_completion_reports_killed_tasks_in_receipt
 tests/test_agent.py::test_child_finish_gate_model_bound_waits_for_grandchild
 tests/test_agent.py::test_child_finish_gate_wait_timeout_adopts
+tests/test_agent.py::test_child_idle_wakes_idle_explicit_finish_parent_tree
 tests/test_agent.py::test_child_policy_inherits_scoped_rules_and_delegates_prompts
 tests/test_agent.py::test_child_setup_cancellation_closes_registry_cwd_descriptor
 tests/test_agent.py::test_close_cancels_adopted_grandchild_after_child_publication
@@ -119,6 +119,7 @@ tests/test_agent.py::test_tool_registry_reports_agent_send_result_after_cleanup_
 tests/test_agent.py::test_tui_child_send_keeps_target_history_across_view_switch
 tests/test_agent.py::test_typed_child_type_survives_cancellation_and_reopen
 tests/test_agent.py::test_user_submission_waits_behind_notification_wake
+tests/test_agent.py::test_wait_with_running_task_wakes_parent_then_accepts_approval
 tests/test_agent.py::wait_for_cancel
 tests/test_agent.py::wait_forever
 tests/test_agent.py::wait_idle
@@ -341,7 +342,6 @@ tests/test_mcp_envelope.py::test_http_deadline_retains_cancellation_resistant_ca
 tests/test_mcp_envelope.py::test_large_http_parse_stays_off_loop
 tests/test_mcp_envelope.py::test_spill_reservation_does_not_wait_for_spill_write
 tests/test_mcp_envelope.py::test_spill_reservation_rejects_before_cap_and_releases
-tests/test_mcp_http_resume.py::resumable_notification_server
 tests/test_mcp_management.py::run_all
 tests/test_mcp_management.py::slow_mount
 tests/test_mcp_management.py::test_activate_starts_slow_mcp_mount_without_blocking_first_render
@@ -549,7 +549,9 @@ tests/test_stream_watchdog.py::manual_wait_for
 tests/test_stream_watchdog.py::no_headers
 tests/test_stream_watchdog.py::no_refresh_response
 tests/test_stream_watchdog.py::source
+tests/test_support_processes.py::test_child_handshake_eof_names_child_status_and_restores_fds
 tests/test_support_processes.py::test_child_handshake_outlives_early_legacy_marker
+tests/test_support_processes.py::test_child_handshake_rejects_a_wrong_token
 tests/test_tasks_panel.py::controlled_output
 tests/test_tasks_panel.py::test_panel_refresh_owns_output_cursor
 tests/test_tasks_panel.py::test_snapshot_runtime_and_terminal_phase

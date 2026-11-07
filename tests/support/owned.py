@@ -26,6 +26,7 @@ async def _cancel_and_drain(
         return
 
     done, pending = await asyncio.wait(unique, timeout=timeout)
+    # test-contract: seam no public task-drain seam exposes only completed tasks
     await asyncio.gather(*done, return_exceptions=True)
     if pending:
         names = ", ".join(
@@ -42,9 +43,8 @@ async def await_or_fail[T](
     *,
     timeout: float = 10,
     what: str,
-    allow_short: bool = False,
 ) -> T:
-    if timeout < 10 and not allow_short:
+    if timeout < 10:
         raise ValueError("timeout must be at least 10 s")
 
     future = asyncio.ensure_future(awaitable)

@@ -27,6 +27,30 @@ async def test_await_or_fail_rejects_short_deadline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_await_or_fail_has_no_short_deadline_escape() -> None:
+    async def value() -> str:
+        return "done"
+
+    explicit = value()
+    unpacked = value()
+    try:
+        with pytest.raises(TypeError, match="allow_short"):
+            await await_or_fail(
+                explicit, timeout=10, what="value", allow_short=(not False)
+            )
+        with pytest.raises(TypeError, match="allow_short"):
+            await await_or_fail(
+                unpacked,
+                timeout=10,
+                what="value",
+                **{"allow_short": True},  # noqa: PIE804 - regression covers unpacking
+            )
+    finally:
+        explicit.close()
+        unpacked.close()
+
+
+@pytest.mark.asyncio
 async def test_await_or_fail_names_wait_that_never_finishes() -> None:
     never = asyncio.Event()
 

@@ -179,32 +179,30 @@ def test_support_deadline_exemption_applies_only_to_bounded_await(
 
 
 @pytest.mark.parametrize(
-    "call",
+    ("wait_and_gather", "expected_lines"),
     [
-        'await await_or_fail(task, timeout=timeout, what="x", allow_short=True)',
-        'await await_or_fail(task, timeout=float(1), what="x", allow_short=True)',
-        'await await_or_fail(task, timeout=1 + 0, what="x", allow_short=True)',
-        'await await_or_fail(task, what="x", allow_short=True)',
+        (
+            """done, pending = await asyncio.wait([task], timeout=10)
+    await asyncio.gather(*done, dangerous.wait())""",
+            [3],
+        ),
+        (
+            """done, pending = await asyncio.wait([task], timeout=None)
+    await asyncio.gather(*done)""",
+            [2, 3],
+        ),
     ],
 )
-def test_allow_short_always_requires_latency_marker(tmp_path: Path, call: str) -> None:
-    source = f"async def test_wait():\n    {call}\n"
-
-    findings = _lint(tmp_path, source)
-
-    assert [(finding.code, finding.line) for finding in findings] == [("TQ001", 2)]
-
-
-def test_support_done_set_must_still_come_from_bounded_wait(tmp_path: Path) -> None:
-    source = """async def helper(task):
-    done, pending = await asyncio.wait([task], timeout=10)
-    done = dangerous_tasks()
-    await asyncio.gather(*done)
-"""
+def test_support_gather_requires_reasoned_marker(
+    tmp_path: Path, wait_and_gather: str, expected_lines: list[int]
+) -> None:
+    source = f"async def helper(task):\n    {wait_and_gather}\n"
 
     findings = _lint(tmp_path, source, path="tests/support/example.py")
 
-    assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 4)]
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ004", line) for line in expected_lines
+    ]
 
 
 @pytest.mark.parametrize("target", ["thread", "process"])
@@ -231,10 +229,21 @@ def test_await_deadline_rule_accepts_bounded_or_string_join(
     assert _lint(tmp_path, source) == []
 
 
-def test_await_deadline_rule_rejects_sync_event_wait(tmp_path: Path) -> None:
-    source = """def test_worker():
-    ready.wait()
-"""
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "ready = event.wait()",
+        "assert ready.wait()",
+        "return ready.wait()",
+        "consume(event.wait())",
+        "status = process.wait()",
+        "joined = worker.join()",
+    ],
+)
+def test_await_deadline_rule_rejects_sync_wait_used_as_value(
+    tmp_path: Path, statement: str
+) -> None:
+    source = f"def test_worker():\n    {statement}\n"
 
     findings = _lint(tmp_path, source)
 
@@ -320,11 +329,11 @@ def test_await_deadline_rule_accepts_reasoned_marker(tmp_path: Path) -> None:
     assert _lint(tmp_path, source) == []
 
 
-def test_short_await_or_fail_requires_latency_override(tmp_path: Path) -> None:
+def test_short_wait_for_requires_latency_marker(tmp_path: Path) -> None:
     source = """async def test_waits():
-    await await_or_fail(task, timeout=1, what="worker")
+    await asyncio.wait_for(task, timeout=1)
     # test-contract: latency verifies a real one-second product deadline
-    await await_or_fail(task, timeout=1, what="worker", allow_short=True)
+    await asyncio.wait_for(task, timeout=1)
 """
 
     findings = _lint(tmp_path, source)
@@ -564,10 +573,33 @@ async def test_new_wait():
     assert [(finding.code, finding.line) for finding in findings] == [("TQ004", 5)]
 
 
-def test_deadline_implementing_support_helper_is_not_flagged(tmp_path: Path) -> None:
+def test_write_ratchet_command_records_each_function_once(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    source = """async def test_waits():
+    await first
+    await second
+"""
+    target = tmp_path / "tests/test_example.py"
+    target.parent.mkdir()
+    target.write_text(source)
+    monkeypatch.chdir(tmp_path)
+
+    assert quality.main(["--write-ratchet"]) == 0
+
+    assert (tmp_path / quality.RATCHET_PATH).read_text() == (
+        "tests/test_example.py::test_waits\n"
+    )
+    assert capsys.readouterr().out == (
+        "wrote 1 keys from 2 findings to tests/test_quality_ratchet.txt\n"
+    )
+
+
+def test_support_helper_can_mark_its_bounded_drain(tmp_path: Path) -> None:
     path = "tests/support/waits.py"
     source = """async def drain(task):
     done, pending = await asyncio.wait([task], timeout=10)
+    # test-contract: seam no public task-drain seam exposes only completed tasks
     await asyncio.gather(*done)
 """
     target = tmp_path / path
