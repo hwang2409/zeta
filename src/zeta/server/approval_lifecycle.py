@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -18,6 +19,8 @@ from .protocol import ProtocolError
 
 Publish = Callable[..., Awaitable[bool]]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
+
+logger = logging.getLogger(__name__)
 
 ApprovalKey = str | tuple[str, str]
 
@@ -43,6 +46,7 @@ class ApprovalRecord:
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
+    publication_started: asyncio.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +283,19 @@ class ApprovalLifecycle:
 
     def _fail(self, health: SessionHealth) -> None:
         self._swap(self._state.records, health=health)
+
+    async def _report_persistence_failure(
+        self, record: ApprovalRecord, message: str
+    ) -> None:
+        self._fail(SessionHealth("approval_persistence_failed", message))
+        with contextlib.suppress(ConnectionError, OSError):
+            await self._publish(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                self._session_id(),
+                error={"code": "server_error", "message": message},
+                data={"request_id": record.wire_id},
+            )
+        self._request_turn_failure()
 
     def _replace_state(self) -> None:
         self._swap({}, health=None, generation=self._state.generation + 1)
@@ -747,17 +764,11 @@ class ApprovalLifecycle:
                     target.store.resolve_approval,
                     target.store_request_id,
                     decision,
-                    **(
-                        {"reason": reason}
-                        if decision == "abort" and reason
-                        else {}
-                    ),
+                    **({"reason": reason} if decision == "abort" and reason else {}),
                 )
             except OSError:
                 write_failed = True
-            resolution = target.store.approval_resolution_data(
-                target.store_request_id
-            )
+            resolution = target.store.approval_resolution_data(target.store_request_id)
             if resolution is not None:
                 return resolution
             if not write_failed:
@@ -790,23 +801,9 @@ class ApprovalLifecycle:
                 await self._finish_record(record, synthetic)
                 return synthetic
             if owns_record:
-                self._fail(
-                    SessionHealth(
-                        "approval_persistence_failed",
-                        "approval decision could not be persisted",
-                    )
+                await self._report_persistence_failure(
+                    record, "approval decision could not be persisted"
                 )
-                with contextlib.suppress(ConnectionError, OSError):
-                    await self._publish(
-                        event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
-                        self._session_id(),
-                        error={
-                            "code": "server_error",
-                            "message": "approval decision could not be persisted",
-                        },
-                        data={"request_id": record.wire_id},
-                    )
-                self._request_turn_failure()
                 record = self._health_abort(record, reason or "turn_canceled")
                 self._change(record, settlement=None)
             raise OSError("approval decision could not be persisted")
@@ -875,24 +872,44 @@ class ApprovalLifecycle:
         else:
             self._remove(record.target.key)
 
+    async def _append_delegated_history(
+        self, record: ApprovalRecord, payload: dict[str, object] | None
+    ) -> OSError | asyncio.CancelledError | None:
+        if payload is None or not record.history_published:
+            return None
+        assert record.target.history_store is not None
+        try:
+            await record.target.history_store.append_approval_history_async(
+                {"event": "approval_end", **payload}
+            )
+        except OSError as exc:
+            logger.warning("delegated approval history write failed", exc_info=True)
+            return exc
+        except asyncio.CancelledError as exc:
+            logger.warning("delegated approval history write cancelled", exc_info=True)
+            return exc
+        return None
+
     async def _finish_record(
         self, record: ApprovalRecord, resolution: dict[str, str]
     ) -> None:
         current = self._state.records.get(record.target.key)
         if current is None or current.token != record.token:
             return
-        record = current
+        if current.publication_started is not None:
+            await current.publication_started.wait()
+            return
+        publication_started = asyncio.Event()
+        record = self._change(current, publication_started=publication_started)
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
         payload = self.end(record.target.key, data=data)
+        history_outcome: OSError | asyncio.CancelledError | None = None
         try:
-            if payload is not None and record.history_published:
-                assert record.target.history_store is not None
-                await record.target.history_store.append_approval_history_async(
-                    {"event": "approval_end", **payload}
-                )
+            history_outcome = await self._append_delegated_history(record, payload)
             if payload is not None and record.published:
+                publication_started.set()
                 await self._publish(
                     event_contract.STREAM_EVENT_WIRE_EVENTS[
                         StreamEventType.TOOL_APPROVAL_END
@@ -900,9 +917,16 @@ class ApprovalLifecycle:
                     self._session_id(),
                     **payload,
                 )
+            if isinstance(history_outcome, OSError):
+                await self._report_persistence_failure(
+                    record, "approval history could not be persisted"
+                )
         finally:
+            publication_started.set()
             if self._owns(record):
                 self._remove(record.target.key)
+        if isinstance(history_outcome, asyncio.CancelledError):
+            raise history_outcome
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: str
@@ -996,9 +1020,7 @@ class ApprovalLifecycle:
             return
         record = current
         if record.disposition == "external":
-            resolution = target.store.approval_resolution_data(
-                target.store_request_id
-            )
+            resolution = target.store.approval_resolution_data(target.store_request_id)
             if resolution is not None:
                 await self._finish_record(record, resolution)
             else:
@@ -1051,7 +1073,7 @@ class ApprovalLifecycle:
             if record.disposition == "active":
                 self._externalize(record)
             return
-        if record.phase != "pending":
+        if record.phase != "pending" and record.phase != "settling":
             return
         resolution = record.target.store.approval_resolution_data(
             record.target.store_request_id

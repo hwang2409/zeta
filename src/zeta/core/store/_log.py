@@ -154,6 +154,7 @@ class _DetachedLogState:
     active_pending_prompt_messages: dict[str, Message]
     active_notification_delivery_message: Message | None
     active_last_message: Message | None
+    active_last_turn_end: ConversationEntry | None
     task_notification_ids: set[str]
     sent_message_receipts: list[tuple[str, str]]
     client_deliveries: OrderedDict[str, ClientDelivery]
@@ -196,6 +197,7 @@ class _FullLoadValidator:
         "_active_pending_prompt_messages",
         "_active_notification_delivery_message",
         "_active_last_message",
+        "_active_last_turn_end",
         "_task_notification_ids",
         "_sent_message_receipts",
         "_client_deliveries",
@@ -432,6 +434,7 @@ class ConversationLogMixin:
                 self._active_notification_delivery_message
             ),
             active_last_message=self._active_last_message,
+            active_last_turn_end=self._active_last_turn_end,
             task_notification_ids=self._task_notification_ids,
             sent_message_receipts=self._sent_message_receipts,
             client_deliveries=self._client_deliveries,
@@ -603,6 +606,7 @@ class ConversationLogMixin:
             state.active_notification_delivery_message
         )
         self._active_last_message = state.active_last_message
+        self._active_last_turn_end = state.active_last_turn_end
         self._task_notification_ids = state.task_notification_ids
         self._sent_message_receipts = state.sent_message_receipts
         self._client_deliveries = state.client_deliveries

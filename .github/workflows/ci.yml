@@ -6,12 +6,15 @@ name: CI
 # a pull-request check alone would not have caught either one.
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  # Every main commit needs a result; superseded pull-request runs do not.
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  # Every main commit needs an Ubuntu, ruff, and browser result; superseded
+  # pull-request runs do not.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -24,41 +27,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
-      # One platform failing must still report the other; a darwin-only
-      # regression is exactly what the second runner is for (ZETA-90).
       fail-fast: false
-      # ZETA-84 was a Linux-only bug that darwin-only testing could not see.
-      # The mirror-image gap is just as real: the F_GETPATH sandbox branch and
-      # the clipboard paste path only run on darwin, so both platforms run.
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos')) && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+    # Main keeps one running macOS job and only the newest pending commit.
+    # Other matrix jobs use a unique group and cannot replace it.
+    concurrency:
+      group: ${{ (github.event_name == 'push' && matrix.os == 'macos-latest') && 'ci-macos-main' || format('ci-{0}-{1}-{2}', github.workflow, github.sha, matrix.os) }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: "0.13.7"
-          enable-cache: false
-
-      # uv defaults to ~/Library/Caches/uv on macOS; pin one location on both
-      # platforms so the cache step below keys the same way.
-      - name: Set uv cache location
-        run: echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
-
-      - name: Cache uv downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-          restore-keys: uv-${{ runner.os }}-
-
-      # --frozen pins the resolution to uv.lock so a transitive bump cannot
-      # turn main red without a lockfile change in the diff.
-      # Bound worker count on both runners and rebalance uneven test durations.
-      # Report slow tests so future bottlenecks are visible in the CI logs.
-      - name: Run the suite
-        run: uv run --frozen pytest -q -n 4 --dist worksteal --durations=25
+      - uses: ./.github/workflows/pytest
 
   lint:
     name: ruff
@@ -66,6 +45,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -81,6 +62,14 @@ jobs:
       # the pull request.
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
+
+      - name: Reject new low-signal test patterns
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
+          git diff --unified=0 "$base" HEAD -- ':(glob)**/*.py' | python scripts/lint_test_quality.py -
 
   browser:
     name: browser
