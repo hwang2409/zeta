@@ -3323,7 +3323,7 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
 
 
 @pytest.mark.asyncio
-async def test_response_cleanup_http_error_is_typed(tmp_path: Path) -> None:
+async def test_response_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -> None:
     class Response:
         status_code = 200
 
@@ -3344,18 +3344,23 @@ async def test_response_cleanup_http_error_is_typed(tmp_path: Path) -> None:
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    with pytest.raises(AnthropicHTTPError) as raised:
-        [
-            event
-            async for event in AnthropicBackend(
-                client=Client(), token_store=store
-            ).complete([], [])
-        ]
-    assert "response cleanup secret" not in str(raised.value)
+    diagnostics_path = tmp_path / "diagnostics.jsonl"
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=Client(),
+            token_store=store,
+            diagnostics_path=diagnostics_path,
+        ).complete([], [])
+    ]
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    contents = diagnostics_path.read_text()
+    assert "response cleanup secret" not in contents
+    assert json.loads(contents)["exception"].endswith("AnthropicHTTPError")
 
 
 @pytest.mark.asyncio
-async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
+async def test_client_cleanup_http_error_is_typed_diagnostic(tmp_path: Path) -> None:
     class Response:
         status_code = 200
 
@@ -3379,13 +3384,18 @@ async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
 
     store = anthropic_credentials(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    diagnostics_path = tmp_path / "diagnostics.jsonl"
     with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
-        with pytest.raises(AnthropicHTTPError) as raised:
-            [
-                event
-                async for event in AnthropicBackend(token_store=store).complete([], [])
-            ]
-    assert "client cleanup secret" not in str(raised.value)
+        events = [
+            event
+            async for event in AnthropicBackend(
+                token_store=store, diagnostics_path=diagnostics_path
+            ).complete([], [])
+        ]
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    contents = diagnostics_path.read_text()
+    assert "client cleanup secret" not in contents
+    assert json.loads(contents)["exception"].endswith("AnthropicHTTPError")
 
 
 @pytest.mark.asyncio

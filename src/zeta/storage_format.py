@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 1
+WRITER_EPOCH: Final = 2
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 
