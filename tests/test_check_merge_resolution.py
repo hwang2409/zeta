@@ -468,6 +468,19 @@ def test_final_conflict_marker_still_fails(tmp_path: Path):
     assert "merge does not parse:" in result.stderr
 
 
+def test_historical_conflict_marker_still_in_final_fails(tmp_path: Path):
+    r = repo(tmp_path)
+    merge = _make_conflict_merge(r)
+    (r / "src/other.py").write_text("value = 1\n")
+    commit(r, "later change without fixing marker")
+    final = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=r, text=True
+    ).strip()
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 2
+    assert "merge does not parse:" in result.stderr
+
+
 def test_parse_diagnostic_can_be_allowed(tmp_path: Path):
     r = repo(tmp_path)
     merge = _make_conflict_merge(r)
