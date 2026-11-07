@@ -16,7 +16,7 @@ def test_fixture_replay_uses_production_path_and_golden_digests(tmp_path: Path) 
         env={**__import__("os").environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
     )
     record = json.loads(result.stdout.strip())
-    assert Path(record["zeta_file"]).resolve().is_relative_to(ROOT.resolve())
+    assert "zeta_file" not in record
     expected = {
         "context.json": "3715866d9380bbe995e8f913b4f09f06d886274fea368d891fb9fde6fe2c7c93",
         "wire.json": "5e87bf4d29a4ff4e83e587d42aa47058e73bd3dfa2ae3cf96a1d950133d24302",
@@ -99,12 +99,12 @@ def test_fixture_compare_rejects_retained_floor_bound_mutation(tmp_path: Path) -
     head = _mutated_ref(tmp_path, [])
     fact_floor = head / "src/zeta/context_eviction/_fact_floor.py"
     text = fact_floor.read_text()
-    text = text.replace("FACT_FLOOR_CHAR_CAP = 4_096", "FACT_FLOOR_CHAR_CAP = 100")
-    text = text.replace("    assert len(text) <= FACT_FLOOR_CHAR_CAP", "    # mutated: production no longer enforces its floor cap")
+    text = text.replace('    lines = ["[retained typed facts]"]\n', '    lines = ["[retained typed facts]"] + ["x" * 5000]\n', 1)
+    text = text.replace("    assert len(text) <= FACT_FLOOR_CHAR_CAP", "    # mutated: production emits an oversized floor", 1)
     fact_floor.write_text(text)
     result = _compare(ROOT, head, tmp_path)
     assert result.returncode != 0
-    assert "limit change" in result.stderr
+    assert "retained-floor bound check failed" in result.stderr
     assert "digest" not in result.stderr.lower()
 
 

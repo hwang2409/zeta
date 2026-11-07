@@ -6,14 +6,16 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 
 def _json(value: Any) -> bytes:
@@ -69,7 +71,7 @@ def _normalize_entries(
 
 
 def _copy_session(source: Path, target: Path) -> None:
-    target.mkdir(parents=True)
+    target.mkdir(parents=True, exist_ok=True)
     for name in ("conversation.jsonl", "meta.json", "session_state.json"):
         source_file = source / name
         if source_file.exists():
@@ -188,6 +190,16 @@ def _floor_metrics(rows: list[dict[str, Any]], limits: dict[str, int], source: s
     return metrics
 
 
+def _assembler(store: Any, *, budget: int, tail: int, system_prompt: str = "") -> Any:
+    from zeta.core.context import ContextAssembler
+
+    assembler = ContextAssembler(store, token_budget=budget, retained_tail=tail,
+                                 system_prompt=system_prompt, backend=None)
+    assert assembler.backend is None
+    _install_summary_guard(assembler)
+    return assembler
+
+
 def _install_summary_guard(assembler: Any) -> None:
     async def forbidden(*args: Any, **kwargs: Any) -> str:
         raise RuntimeError("eviction replay reached model-summary fallback")
@@ -199,14 +211,11 @@ def _collect_artifacts(context: Any, readback: Any, normalized: list[dict[str, A
 
 
 async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int, provider: str, limits: dict[str, int] | None = None) -> list[dict[str, Any]]:
-    from zeta.core.context import ContextAssembler
     from zeta.core.store import ConversationStore
     store = await asyncio.to_thread(ConversationStore, session_dir.parent, session_id=session_dir.name, _collect_persisted_appends=True)
     try:
         meta = json.loads((session_dir / "meta.json").read_text()) if (session_dir / "meta.json").exists() else {}
-        assembler = ContextAssembler(store, token_budget=budget, retained_tail=tail, system_prompt=meta.get("system_prompt", ""), backend=None)
-        assert assembler.backend is None
-        _install_summary_guard(assembler)
+        assembler = _assembler(store, budget=budget, tail=tail, system_prompt=meta.get("system_prompt", ""))
         limits = limits or _production_limits()
         records: list[dict[str, Any]] = []
         previous_count = len(store.replay())
@@ -225,8 +234,7 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
             normalized = _normalize_entries(appended, normalized_ids, next_normalized_id)
             readback_store = await asyncio.to_thread(ConversationStore, session_dir.parent, session_id=store.session_id, _read_only=True, _must_exist=True)
             try:
-                readback_assembler = ContextAssembler(readback_store, token_budget=budget, retained_tail=tail, system_prompt=meta.get("system_prompt", ""), backend=None)
-                _install_summary_guard(readback_assembler)
+                readback_assembler = _assembler(readback_store, budget=budget, tail=tail, system_prompt=meta.get("system_prompt", ""))
                 readback = await readback_assembler.assemble_context(backend=None)
             finally:
                 readback_store.close()
@@ -257,10 +265,23 @@ async def _run_one(session_dir: Path, artifact_dir: Path, budget: int, tail: int
         store.close()
 
 
-def run(args: argparse.Namespace) -> int:
+class _Scratch:
+    def __init__(self, path: Path | None) -> None:
+        self._owned = tempfile.TemporaryDirectory(prefix="eviction-gate-") if path is None else None
+        self.root = path or Path(self._owned.name)  # type: ignore[union-attr]
+
+    def __enter__(self) -> Self:
+        self.root.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self._owned is not None:
+            self._owned.cleanup()
+
+
+def _run_in_scratch(args: argparse.Namespace, scratch: Path) -> int:
     root = Path(args.session).expanduser() if args.session else None
-    temporary = tempfile.TemporaryDirectory(prefix="eviction-gate-")
-    session_root = Path(temporary.name) / "sessions"
+    session_root = scratch / "sessions"
     session_dir = session_root / ("fixture" if args.fixture else Path(args.session).name)
     if args.fixture:
         _fixture_store(session_root)
@@ -269,55 +290,66 @@ def run(args: argparse.Namespace) -> int:
         if root is None:
             raise SystemExit("--session is required")
         _copy_session(root, session_dir)
-        manifest = session_root.parent / "storage-format.json"
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(Path.home() / ".zeta" / "storage-format.json", manifest)
+        shutil.copy2(Path.home() / ".zeta" / "storage-format.json", scratch / "storage-format.json")
         meta = json.loads((session_dir / "meta.json").read_text())
         budget, tail, provider = int(meta.get("compaction_budget", 400_000)), int(meta.get("retained_tail", 8)), str(meta.get("provider", "anthropic"))
-    artifact_temporary = None
     if args.keep_private_artifacts:
         artifact_dir = Path(args.keep_private_artifacts).expanduser()
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        print(f"warning: keeping private replay artifacts in {artifact_dir}", file=sys.stderr)
+        print("warning: keeping private replay artifacts", file=sys.stderr)
     else:
-        artifact_temporary = tempfile.TemporaryDirectory(prefix="eviction-artifacts-")
-        artifact_dir = Path(artifact_temporary.name)
+        artifact_dir = scratch / "artifacts"
+        artifact_dir.mkdir()
     started = time.monotonic()
-    try:
-        records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), 600))
-        import zeta
-        record = {"git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "zeta_file": str(Path(zeta.__file__).resolve()), "limits": _production_limits(), "session": args.session or "fixture", "records": records, "elapsed_seconds": round(time.monotonic() - started, 3)}
-        print(json.dumps(record, sort_keys=True, separators=(",", ":")))
-        return 0
-    finally:
-        if artifact_temporary is not None:
-            artifact_temporary.cleanup()
-        temporary.cleanup()
+    records = asyncio.run(asyncio.wait_for(_run_one(session_dir, artifact_dir, budget, tail, provider, json.loads(args.limits_json) if args.limits_json else None), 600))
+    import zeta
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    print(f"identity: head={head} zeta.__file__={Path(zeta.__file__).resolve()}", file=sys.stderr)
+    record = {"git_head": head, "limits": _production_limits(), "records": records, "elapsed_seconds": round(time.monotonic() - started, 3)}
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
-def _run_side(session: str, label: str, worktree: str, fixture: bool, artifact_dir: Path, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
+def run(args: argparse.Namespace) -> int:
+    with _Scratch(Path(args.scratch_root).expanduser() if args.scratch_root else None) as scratch:
+        return _run_in_scratch(args, scratch.root)
+
+
+def _run_side(session: str, label: str, worktree: str, fixture: bool, scratch: Path, limits: dict[str, int] | None = None) -> dict[str, Any] | None:
     runner = Path(worktree) / "scripts/eviction_replay_gate.py"
     if not runner.exists():
         runner = Path(__file__).resolve()
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(runner), "run", "--keep-private-artifacts", str(artifact_dir)]
-    environment = {**__import__("os").environ, "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
+    scratch.mkdir(parents=True, exist_ok=True)
+    tmpdir = scratch / "tmp"
+    tmpdir.mkdir()
+    command = [sys.executable, str(runner), "run", "--scratch-root", str(scratch)]
+    environment = {**os.environ, "TMPDIR": str(tmpdir), "PYTHONPATH": str(Path(worktree) / "src"), "UV_CACHE_DIR": str(Path(worktree) / ".uv-cache")}
     if limits is not None:
         command.extend(["--limits-json", json.dumps(limits, sort_keys=True)])
     if fixture:
         command.append("--fixture")
     else:
         command.extend(["--session", str(Path.home() / ".zeta" / "sessions" / session)])
-    result = subprocess.run(command, capture_output=True, text=True, timeout=620, check=False, env=environment)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=620)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        print(f"FAIL {session} {label}: child terminated", file=sys.stderr)
+        return None
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if result.returncode:
         detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "runner failed"
         print(f"FAIL {session} {label}: {detail}", file=sys.stderr)
         return None
     record = json.loads(result.stdout.strip().splitlines()[-1])
-    if not Path(record["zeta_file"]).resolve().is_relative_to(Path(worktree).resolve()):
-        print(f"FAIL {session} {label}: zeta.__file__ outside expected worktree", file=sys.stderr)
+    identity = next((line for line in result.stderr.splitlines() if line.startswith("identity: ")), "")
+    expected = str(Path(worktree).resolve())
+    if expected not in identity:
+        print(f"FAIL {session} {label}: identity outside expected worktree", file=sys.stderr)
         return None
-    return {"label": label, "record": record, "artifacts": artifact_dir}
+    return {"label": label, "record": record, "artifacts": scratch / "artifacts"}
 
 
 def _compare_artifacts(session: str, base: dict[str, Any], head: dict[str, Any]) -> str | None:
@@ -369,6 +401,7 @@ def main() -> int:
     run_parser.add_argument("--fixture", action="store_true")
     run_parser.add_argument("--keep-private-artifacts")
     run_parser.add_argument("--limits-json")
+    run_parser.add_argument("--scratch-root")
     run_parser.set_defaults(func=run)
     compare_parser = sub.add_parser("compare")
     compare_parser.add_argument("--base", required=True)
