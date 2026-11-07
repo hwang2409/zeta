@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.test_server import (
     _close,
     _ready_extensions,
@@ -33,7 +34,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             await asyncio.to_thread(registry.create_project, "serve attention", "test")
         ).project_id
         store = AttentionStore(opened.store.session_dir)
-        records = await asyncio.gather(*(
+        records = await await_or_fail(asyncio.gather(*(
             asyncio.to_thread(
                 store.request,
                 session_id=session_id,
@@ -45,7 +46,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
                 options=("yes",),
             )
             for index in range(3)
-        ))
+        )), what="create attention records")
         payload = json.dumps(
             [{"id": record.id, "reply": "yes"} for record in records],
             separators=(",", ":"),

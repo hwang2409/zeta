@@ -17,6 +17,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.runtime.loop import AgentLoop
@@ -44,6 +45,10 @@ def _request(opened, project_id: str, title: str, *, kind: str = "decision"):
         options=("yes",) if kind == "decision" else (),
         kind=kind,
     )
+
+
+def _records(owner, project_id: str):
+    return [_request(owner, project_id, f"Pick {index}") for index in range(3)]
 
 
 def _wait_for_records(home: Path, session_id: str, record_ids: set[str]) -> None:
@@ -89,10 +94,10 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(tmp_p
     project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
     answerer = await asyncio.to_thread(_session, tmp_path, project.project_id)
-    records = await asyncio.gather(*(
-        asyncio.to_thread(_request, owner, project.project_id, f"Pick {index}")
-        for index in range(3)
-    ))
+    records = await await_or_fail(
+        asyncio.to_thread(_records, owner, project.project_id),
+        what="create attention records",
+    )
     app = await _make_app(tmp_path, owner, owner.store.session_id)
     wakes: list[bool] = []
     app._schedule_background_wake = lambda: wakes.append(True)
@@ -137,10 +142,10 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(tmp_pat
     project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
     answerer = await asyncio.to_thread(_session, tmp_path, project.project_id)
-    records = await asyncio.gather(*(
-        asyncio.to_thread(_request, owner, project.project_id, f"Pick {index}")
-        for index in range(3)
-    ))
+    records = await await_or_fail(
+        asyncio.to_thread(_records, owner, project.project_id),
+        what="create attention records",
+    )
     answer = await asyncio.to_thread(_request, owner, project.project_id, "Status", kind="answer")
     app = await _make_app(tmp_path, owner, owner.store.session_id)
     try:
