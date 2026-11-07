@@ -358,7 +358,7 @@ def _create_app_with_root(
             projection = project_context_projection_for_discovery(discovery, registry)
             if (
                 projection.session_project is None
-                and projection.health is None
+                and (projection.health is None or not registry.root.exists())
                 and config.auto_project
                 and not ephemeral
                 and manager.project_registry_unavailable is None
