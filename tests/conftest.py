@@ -24,8 +24,6 @@ import httpx
 import pytest
 from rich.console import Console
 
-from tests.support.owned import await_or_fail
-
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
@@ -731,6 +729,7 @@ def bootstrap_tui_storage_format(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 async def close_direct_test_runtime_owners(monkeypatch: pytest.MonkeyPatch):
     """Close runtime owners constructed during repository tests."""
+    from tests.support.owned import await_or_fail
     from zeta.accounts import AccountStore
     from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
     from zeta.core.session import SessionManager
