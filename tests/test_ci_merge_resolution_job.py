@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -19,6 +21,26 @@ def commit(repo: Path, message: str) -> None:
     git(repo, "commit", "-qm", message)
 
 
+def _merge_resolution_command(tmp_path: Path) -> list[str]:
+    workflows = list((ROOT / ".github/workflows").glob("*.y*ml"))
+    workflow = next(
+        path for path in workflows if "name: merge resolution" in path.read_text()
+    )
+    text = workflow.read_text()
+    script = ROOT / "scripts/ci_merge_resolution.sh"
+    if script.exists():
+        return [str(script)]
+
+    job = text.split("name: merge resolution", 1)[1]
+    run = re.search(r"^        run: \|\n((?:^          .*\n?)+)", job, re.MULTILINE)
+    assert run is not None
+    extracted = textwrap.dedent(run.group(1))
+    command = tmp_path / "merge-resolution.sh"
+    command.write_text(extracted)
+    command.chmod(0o755)
+    return ["bash", str(command)]
+
+
 def test_current_pr_body_is_used_instead_of_event_payload(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -27,6 +49,8 @@ def test_current_pr_body_is_used_instead_of_event_payload(tmp_path: Path) -> Non
     git(repo, "config", "user.name", "test")
     (repo / "src").mkdir()
     (repo / "src/a.py").write_text("def lost(): pass\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts/check_merge_resolution.py").write_text(CHECKER.read_text())
     commit(repo, "base")
     git(repo, "checkout", "-qb", "branch")
     (repo / "src/a.py").write_text("def branch(): pass\n")
@@ -46,7 +70,7 @@ def test_current_pr_body_is_used_instead_of_event_payload(tmp_path: Path) -> Non
     fake_gh.chmod(0o755)
 
     result = subprocess.run(
-        [str(JOB)],
+        _merge_resolution_command(tmp_path),
         cwd=repo,
         env={
             **os.environ,
@@ -56,7 +80,6 @@ def test_current_pr_body_is_used_instead_of_event_payload(tmp_path: Path) -> Non
             "HEAD_SHA": "HEAD",
             "PR_NUMBER": "862",
             "FINAL_SHA": "HEAD",
-            "CHECK_MERGE_RESOLUTION_SCRIPT": str(CHECKER),
             # This models the stale event payload. The job must ask gh for the body.
             "PR_BODY": "",
         },
@@ -73,5 +96,6 @@ def test_workflow_runs_body_edits_without_touching_main_ci() -> None:
     assert "types: [opened, synchronize, reopened, edited]" in workflow
     assert "name: merge resolution" in workflow
     assert "github.event.changes.body != null" in workflow
+    assert "format('title-{0}', github.run_id)" in workflow
     assert "PR_BODY:" not in workflow
     assert "merge-resolution:" not in Path(ROOT / ".github/workflows/ci.yml").read_text()

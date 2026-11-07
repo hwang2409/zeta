@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -eu
 
 body_file=""
 cleanup() { [ -z "$body_file" ] || rm -f "$body_file"; }
