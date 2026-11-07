@@ -301,7 +301,7 @@ def resume_prompt(
     context = _adopted_context(metadata, composition.notices)
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)
-    return ResumedPrompt(context, skills, composition.agent_catalog)
+    return ResumedPrompt(context, skills, agents)
 
 
 __all__ = ["ResumedPrompt", "resume_prompt"]

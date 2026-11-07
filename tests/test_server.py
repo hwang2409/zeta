@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import inspect
 import json
 import multiprocessing
@@ -668,6 +669,12 @@ def _socket_path(tmp_path: Path) -> Path:
     return Path("/tmp") / f"zeta-{tmp_path.name}.sock"
 
 
+@pytest.fixture(autouse=True)
+def _remove_test_socket_lock(tmp_path: Path):
+    yield
+    Path(f"{_socket_path(tmp_path)}.lock").unlink(missing_ok=True)
+
+
 async def _connect(server: ZetaServer):
     await asyncio.wait_for(server.start(), TIMEOUT)
     if server.port is None:
@@ -796,6 +803,52 @@ class BlockingThenCaptureBackend:
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
+
+
+class ConcurrentDelegatedApprovalBackend:
+    def __init__(self, parent_calls: list[ToolCall], child_call: ToolCall) -> None:
+        self.parent = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=parent_calls),
+                ScriptedTurn([TextContent("done")]),
+            ]
+        )
+        self.children = {
+            prompt: FakeBackend(
+                [
+                    ScriptedTurn(tool_calls=[child_call]),
+                    ScriptedTurn([TextContent("done")]),
+                ]
+            )
+            for prompt in ("read one", "read two")
+        }
+        self.child_started = {prompt: asyncio.Event() for prompt in self.children}
+        self.release_children = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        child_prompt = next(
+            (
+                block.text
+                for message in messages
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent) and block.text in self.children
+            ),
+            None,
+        )
+        backend = self.children.get(child_prompt, self.parent)
+        if child_prompt is not None and not backend.calls:
+            self.child_started[child_prompt].set()
+            await self.release_children.wait()
+        stream = backend.complete(messages, tool_schemas)
+        if child_prompt is None and self.parent.calls:
+            await asyncio.gather(
+                *(started.wait() for started in self.child_started.values())
+            )
+            yield await anext(stream)
+            self.release_children.set()
+        async for event in stream:
+            yield event
 
 
 class DelegatedApprovalBackend:
@@ -3059,6 +3112,18 @@ async def test_invalid_utf8_tail_preserves_request_id(tmp_path: Path) -> None:
         await _close(server, writer)
 
 
+async def _unix_hello(server: ZetaServer, request_id: str) -> None:
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+    try:
+        reply = await _request(
+            reader, writer, request_id, "hello", {"protocol_version": "1.0"}
+        )
+        assert reply[-1]["result"]["server"] == "zeta"
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     tmp_path: Path,
@@ -3074,10 +3139,110 @@ async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
     stale.bind(str(socket_path))
     stale.close()
     await server.start()
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
     try:
         assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        await _unix_hello(server, "stale-replaced")
+        with pytest.raises(RuntimeError, match="already listening"):
+            await contender.start()
+        await _unix_hello(server, "live-server-preserved")
     finally:
+        await contender.close()
         await server.close()
+    assert not socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_old_server_close_preserves_replacement_protocol_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    old_server = ZetaServer(
+        home=tmp_path / "old", socket_path=socket_path, provider="codex"
+    )
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fcntl, "flock", lambda *_args: None)
+        await old_server.start()
+    socket_path.unlink()
+    await replacement.start()
+    try:
+        await _unix_hello(replacement, "replacement-before-close")
+        await old_server.close()
+        await _unix_hello(replacement, "replacement-after-close")
+    finally:
+        await old_server.close()
+        await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_socket_lock_prevents_replacement_during_owner_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    owner = ZetaServer(
+        home=tmp_path / "owner", socket_path=socket_path, provider="codex"
+    )
+    contender = ZetaServer(
+        home=tmp_path / "contender", socket_path=socket_path, provider="codex"
+    )
+    socket_path = owner.socket_path
+    await owner.start()
+    await _unix_hello(owner, "owner")
+
+    real_unlink = os.unlink
+    attempted = False
+    contender_error: Exception | None = None
+    path_after_attempt: bool | None = None
+
+    def interleaved_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal attempted, contender_error, path_after_attempt
+        if Path(os.fsdecode(path)) != socket_path or attempted:
+            real_unlink(path, *args, **kwargs)
+            return
+        attempted = True
+        real_unlink(path)
+
+        def run_contender() -> None:
+            nonlocal contender_error
+            try:
+                asyncio.run(contender.start())
+            except RuntimeError as exc:
+                contender_error = exc
+
+        thread = threading.Thread(target=run_contender)
+        thread.start()
+        thread.join()
+        path_after_attempt = socket_path.exists()
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", interleaved_unlink)
+    await owner.close()
+
+    assert attempted
+    assert isinstance(contender_error, RuntimeError)
+    assert "already listening" in str(contender_error)
+    assert path_after_attempt is False
+
+    replacement = ZetaServer(
+        home=tmp_path / "replacement", socket_path=socket_path, provider="codex"
+    )
+    await replacement.start()
+    try:
+        await _unix_hello(replacement, "replacement-after-owner-close")
+    finally:
+        await replacement.close()
     assert not socket_path.exists()
 
 
@@ -3712,24 +3877,15 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         ToolCall(
             "agent-one",
             "agent",
-            {"prompt": "read", "description": "child one", "background": True},
+            {"prompt": "read one", "description": "child one", "background": True},
         ),
         ToolCall(
             "agent-two",
             "agent",
-            {"prompt": "read", "description": "child two", "background": True},
+            {"prompt": "read two", "description": "child two", "background": True},
         ),
     ]
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=parent_calls),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn(tool_calls=[child_call]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
-    )
+    backend = ConcurrentDelegatedApprovalBackend(parent_calls, child_call)
     server = ZetaServer(provider="codex",
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -3743,6 +3899,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         assert first["request_id"] != second["request_id"]
         assert first["tool_call"]["id"] == second["tool_call"]["id"]
         assert first["delegated"] is True
+        assert second["delegated"] is True
         rejected = await _request(
             reader,
             writer,

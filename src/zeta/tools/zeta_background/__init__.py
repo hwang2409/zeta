@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, TypedDict
 
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
-from .._shared.sandbox import expand_user_path
+from .._shared.sandbox import resolve_shell_cwd
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
@@ -27,15 +26,9 @@ async def _run_background(
     *,
     execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
-    cwd = arguments.get("cwd")
-    start_cwd = registry.cwd
-    if cwd is not None:
-        if type(cwd) is not str or not cwd:
-            raise ValueError("cwd must be a nonempty string or null")
-        candidate = Path(expand_user_path(cwd))
-        if not candidate.is_absolute():
-            candidate = registry.cwd / candidate
-        start_cwd = Path(os.path.abspath(candidate))
+    start_cwd = Path(
+        resolve_shell_cwd(registry.bash_cwd, arguments.get("cwd"))
+    )
     approved_execution = (
         execution_context.approved_execution
         if execution_context is not None
@@ -148,7 +141,12 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "minLength": 1},
-                "cwd": {},
+                "cwd": {
+                    "description": (
+                        "Working directory override. Relative paths resolve from the "
+                        "persisted session cwd. Absolute paths are used as given."
+                    )
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
