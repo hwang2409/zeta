@@ -98,17 +98,19 @@ class ServerSlashSession:
 
     # --- runnable server-side ---
 
-    async def slash_status_command(self, args: str) -> str:
+    def slash_status_command(self, args: str) -> str | Awaitable[str]:
         del args
+        if self._run_blocking is None:
+            return _format_status(self.slash_status())
         snapshot = self.status_snapshot()
-        status = await (
-            self._run_blocking(lambda: build_slash_status(snapshot))
-            if self._run_blocking is not None
-            else asyncio.to_thread(build_slash_status, snapshot)
-        )
-        if not isinstance(status, SlashStatus):
-            raise TypeError("status worker returned an invalid projection")
-        return _format_status(status)
+
+        async def build() -> str:
+            status = await self._run_blocking(lambda: build_slash_status(snapshot))
+            if not isinstance(status, SlashStatus):
+                raise TypeError("status worker returned an invalid projection")
+            return _format_status(status)
+
+        return build()
 
     def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
