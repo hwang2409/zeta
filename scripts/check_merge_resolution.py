@@ -161,7 +161,16 @@ def parse_items(
             else ""
         )
         result.append(
-            Item(path, "constant" if rendered else "assignment", name, line, rendered)
+            Item(
+                path,
+                "constant" if rendered else "assignment",
+                name,
+                line,
+                rendered,
+                fingerprint=(
+                    ast.dump(value, include_attributes=False) if value is not None else ""
+                ),
+            )
         )
         elements = _collection_elements(value)
         if elements is not None:
@@ -640,8 +649,22 @@ def _final_match(
 ) -> bool:
     if same_item(finding, item):
         return True
-    if finding.kind not in {"def", "async def", "class"} or finding.path == item.path:
+    if finding.path == item.path or finding.kind != item.kind:
         return False
+    if finding.kind in {"def", "async def", "class"}:
+        return _unique_definition_match(finding, item, final_items)
+    if finding.kind in {"assignment", "constant"}:
+        if "." in finding.name:
+            return _unique_class_member_match(finding, item, final_items)
+        return _unique_assignment_match(finding, item, final_items)
+    if finding.kind == "collection element":
+        return _unique_collection_match(finding, item, final_items)
+    return False
+
+
+def _unique_definition_match(
+    finding: Item, item: Item, final_items: dict[tuple[str, str, str, str, str], Item]
+) -> bool:
     if finding.name != item.name or finding.fingerprint != item.fingerprint:
         return False
     return (
@@ -652,6 +675,67 @@ def _final_match(
             for other in final_items.values()
         )
         == 1
+    )
+
+
+def _unique_class_member_match(
+    finding: Item, item: Item, final_items: dict[tuple[str, str, str, str, str], Item]
+) -> bool:
+    owner = finding.name.rsplit(".", 1)[0]
+    classes = [
+        candidate
+        for candidate in final_items.values()
+        if candidate.kind == "class" and candidate.name == owner
+    ]
+    if len(classes) != 1 or classes[0].path != item.path:
+        return False
+    return (
+        finding.name == item.name
+        and finding.fingerprint == item.fingerprint
+        and item.path == classes[0].path
+    )
+
+
+def _unique_assignment_match(
+    finding: Item, item: Item, final_items: dict[tuple[str, str, str, str, str], Item]
+) -> bool:
+    if finding.owner or item.owner or finding.name != item.name:
+        return False
+    if finding.fingerprint != item.fingerprint:
+        return False
+    return (
+        sum(
+            other.kind in {"assignment", "constant"}
+            and not other.owner
+            and other.name == finding.name
+            and other.fingerprint == finding.fingerprint
+            for other in final_items.values()
+        )
+        == 1
+    )
+
+
+def _unique_collection_match(
+    finding: Item, item: Item, final_items: dict[tuple[str, str, str, str, str], Item]
+) -> bool:
+    if finding.name != item.name or finding.value != item.value:
+        return False
+    collections = [
+        candidate
+        for candidate in final_items.values()
+        if candidate.kind in {"assignment", "constant"}
+        and candidate.name == finding.name
+    ]
+    return (
+        len(collections) == 1
+        and item.path == collections[0].path
+        and any(
+            candidate.kind == "collection element"
+            and candidate.name == finding.name
+            and candidate.value == finding.value
+            and candidate.path == item.path
+            for candidate in final_items.values()
+        )
     )
 
 

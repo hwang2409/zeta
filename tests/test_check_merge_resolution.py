@@ -509,6 +509,77 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
             1,
             "VALUE",
         )
+    if case == "constant moved same value":
+        return (
+            *_final_loss(
+                r,
+                "VALUE = 1\n",
+                "VALUE = 2\n",
+                "base = 1\n",
+                "VALUE = 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "constant duplicate final":
+        merge, final = _final_loss(
+            r,
+            "VALUE = 1\n",
+            "VALUE = 2\n",
+            "base = 1\n",
+            "VALUE = 1\n",
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text("VALUE = 1\n")
+        commit(r, "duplicate final constant")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "VALUE"
+    if case == "class moved with member":
+        return (
+            *_final_loss(
+                r,
+                "class Box:\n    value = 1\n",
+                "class Branch:\n    pass\n",
+                "base = 1\n",
+                "class Box:\n    value = 1\n",
+                "src/b.py",
+            ),
+            0,
+            "moved/restored later: src/b.py",
+        )
+    if case == "element same-named collection moved":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/a.py").unlink()
+        commit(r, "move final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 0, "moved/restored later: src/b.py"
+    if case == "duplicate final collection":
+        merge, final = _final_loss(
+            r,
+            'TARGET = {"lost"}\n',
+            'TARGET = {"lost"}\n',
+            "TARGET = set()\n",
+            'TARGET = {"lost"}\n',
+            "src/b.py",
+        )
+        (r / "src/c.py").write_text('TARGET = {"lost"}\n')
+        commit(r, "duplicate final collection")
+        final = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=r, text=True
+        ).strip()
+        return merge, final, 1, "TARGET"
     if case == "dispatch restored":
         return (
             *_final_loss(
@@ -567,6 +638,11 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         ("element unrelated", 1, "TARGET"),
         ("element restored", 0, "moved/restored later: src/a.py"),
         ("constant different value", 1, "VALUE"),
+        ("constant moved same value", 0, "moved/restored later: src/b.py"),
+        ("constant duplicate final", 1, "VALUE"),
+        ("class moved with member", 0, "moved/restored later: src/b.py"),
+        ("element same-named collection moved", 0, "moved/restored later: src/b.py"),
+        ("duplicate final collection", 1, "TARGET"),
         ("dispatch restored", 0, "moved/restored later: src/a.py"),
         ("dispatch other function", 1, "route"),
         ("checked merge", 1, "def helper"),
