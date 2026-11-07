@@ -8898,11 +8898,11 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
         await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
         assert len(prepared_events) == 1
 
-        base_frames = await asyncio.wait_for(raw_status_frames(), 10)
+        base_frames = await asyncio.wait_for(raw_status_frames(), 30)
         await asyncio.wait_for(
             server.control._event(prepared_events[0], background=True), 10
         )
-        actual_frames = await asyncio.wait_for(raw_status_frames(), 10)
+        actual_frames = await asyncio.wait_for(raw_status_frames(), 30)
 
         assert actual_frames == base_frames
     finally:

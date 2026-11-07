@@ -833,10 +833,9 @@ class _Client:
         runtime = self.server.runtime
         if runtime.opened is None:
             return None
-        snapshot = runtime.metadata.to_dict()
-        loop = runtime.loop
-        if loop is not None:
-            snapshot = _active_runtime_snapshot(snapshot, loop)
+        snapshot = _active_runtime_snapshot(
+            runtime.metadata.to_dict(), runtime.loop
+        )
         if runtime.policy is not None:
             snapshot["approval_mode"] = runtime.policy.default.value
         return snapshot
@@ -967,8 +966,10 @@ class _Client:
 
 
 def _active_runtime_snapshot(
-    persisted: dict[str, object], loop: AgentLoop
+    persisted: dict[str, object], loop: AgentLoop | None
 ) -> dict[str, object]:
+    if loop is None:
+        return persisted
     snapshot = dict(persisted)
     prompt = loop._runtime_prompt.system_prompt
     if isinstance(prompt, str):
