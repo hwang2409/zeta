@@ -1,3 +1,5 @@
+import asyncio
+from dataclasses import replace
 from io import StringIO
 
 import pytest
@@ -11,6 +13,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.submissions import await_submission_pipeline
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -75,6 +78,98 @@ async def test_status_card_open_close_preserves_composer_and_transcript(
     assert session.default_buffer.cursor_position == 5
     assert session.layout.has_focus(session.default_buffer)
     assert app._transcript.units == units
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "title"),
+    [
+        ("status", "completion_client_setups"),
+        ("mcp", "MCP servers"),
+        ("tasks", "Background tasks"),
+        ("decisions", "Decisions"),
+    ],
+)
+async def test_bare_overlay_commands_dispatch_and_render_through_registry(
+    tmp_path, command: str, title: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        zeta_home=tmp_path / "home",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    existing_tasks = asyncio.all_tasks()
+    dispatched: list[str] = []
+    for name in ("help", command):
+        original = app._slash_commands._commands.get(name)
+        assert original is not None
+
+        def traced(session, args, *, _command=original):
+            dispatched.append(_command.name)
+            return _command.run(session, args)
+
+        app._slash_commands._commands[name] = replace(original, handler=traced)
+    try:
+        app._submit_input("/help")
+        await await_submission_pipeline(app)
+        rendered_help = "\n".join(app._transcript.lines(100))
+        assert "/status — show session status" in rendered_help
+        assert "/accounts — list, switch, or label accounts" in rendered_help
+        assert dispatched == ["help"]
+
+        app._submit_input(f"/{command}")
+        await await_submission_pipeline(app)
+        active = {
+            "status": app.status_card_active,
+            "mcp": app.status_card_active and app._mcp_manager_open,
+            "tasks": app.tasks_panel_active,
+            "decisions": app.decisions_panel_active,
+        }
+        assert active[command], active
+        assert dispatched == ["help", command]
+        screen = Screen(initial_width=80, initial_height=24)
+        with set_app(session.app):
+            session.layout.update_parents_relations()
+            session.layout.container.write_to_screen(
+                screen,
+                MouseHandlers(),
+                WritePosition(0, 0, 80, 24),
+                "",
+                False,
+                None,
+            )
+            screen.draw_all_floats()
+        screen_text = "\n".join(
+            "".join(screen.data_buffer[y][x].char for x in range(80))
+            for y in range(24)
+        )
+        assert title in screen_text
+        assert session.default_buffer.text == ""
+    finally:
+        if command in {"status", "mcp"}:
+            app.close_status_card()
+        elif command == "tasks":
+            app.close_tasks_panel()
+        else:
+            app.close_decisions_panel()
+        await app._submissions.close()
+        await app.loop.close()
+        spawned = asyncio.all_tasks() - existing_tasks - {asyncio.current_task()}
+        for task in spawned:
+            task.cancel()
+        if spawned:
+            await asyncio.wait_for(
+                asyncio.gather(*spawned, return_exceptions=True), timeout=30
+            )
 
 
 class _FixedSizeOutput(DummyOutput):
