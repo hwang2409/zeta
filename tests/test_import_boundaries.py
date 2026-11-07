@@ -45,18 +45,32 @@ def _import_from_target(
     return package
 
 
+def _import_statement_aliases(statement: ast.Import) -> set[str]:
+    return {
+        alias.asname or alias.name
+        for alias in statement.names
+        if alias.name == "importlib"
+    }
+
+
+def _import_from_aliases(statement: ast.ImportFrom) -> set[str]:
+    if statement.module != "importlib":
+        return set()
+    return {
+        alias.asname or alias.name
+        for alias in statement.names
+        if alias.name == "import_module"
+    }
+
+
 def _import_aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
     importlib_names = {"importlib"}
     import_module_names: set[str] = set()
     for statement in tree.body:
         if isinstance(statement, ast.Import):
-            for alias in statement.names:
-                if alias.name == "importlib":
-                    importlib_names.add(alias.asname or alias.name)
-        elif isinstance(statement, ast.ImportFrom) and statement.module == "importlib":
-            for alias in statement.names:
-                if alias.name == "import_module":
-                    import_module_names.add(alias.asname or alias.name)
+            importlib_names.update(_import_statement_aliases(statement))
+        elif isinstance(statement, ast.ImportFrom):
+            import_module_names.update(_import_from_aliases(statement))
     return importlib_names, import_module_names
 
 
@@ -89,60 +103,135 @@ def _is_name_derived_package(argument: ast.AST) -> bool:
     )
 
 
+def _dynamic_kind(
+    node: ast.Call, importlib_names: set[str], import_module_names: set[str]
+) -> str | None:
+    function = node.func
+    if isinstance(function, ast.Name):
+        if function.id == "__import__":
+            return "__import__"
+        if function.id in import_module_names:
+            return "import_module"
+    if (
+        isinstance(function, ast.Attribute)
+        and isinstance(function.value, ast.Name)
+        and function.value.id in importlib_names
+        and function.attr == "import_module"
+    ):
+        return "import_module"
+    return None
+
+
+def _literal_module(node: ast.Call) -> str | None:
+    if not node.args:
+        return None
+    module = node.args[0]
+    if isinstance(module, ast.Constant) and isinstance(module.value, str):
+        return module.value
+    return ""
+
+
+def _resolve_relative_name(
+    name: str, node: ast.Call, kind: str, file_package: tuple[str, ...]
+) -> str | None:
+    if not name.startswith("."):
+        return name
+    package = file_package
+    if kind == "import_module":
+        package_argument = _package_argument(node)
+        if isinstance(package_argument, ast.Constant) and isinstance(
+            package_argument.value, str
+        ):
+            package = tuple(package_argument.value.split("."))
+        elif not _is_name_derived_package(package_argument):
+            return None
+    if not package:
+        return None
+    return ".".join(_relative_target(name, package))
+
+
+def _fromlist_argument(node: ast.Call) -> ast.AST | None:
+    if len(node.args) > 3:
+        return node.args[3]
+    for keyword in node.keywords:
+        if keyword.arg == "fromlist":
+            return keyword.value
+    return None
+
+
+def _fromlist_names(node: ast.Call) -> tuple[str, ...] | None:
+    argument = _fromlist_argument(node)
+    if argument is None:
+        return ()
+    if not isinstance(argument, (ast.List, ast.Tuple)):
+        return None
+    return tuple(
+        item.value
+        for item in argument.elts
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    )
+
+
 def _dynamic_target(
     node: ast.Call,
     importlib_names: set[str],
     import_module_names: set[str],
     file_package: tuple[str, ...],
 ) -> tuple[str, ...] | None:
-    function = node.func
-    is_import_module = (
-        isinstance(function, ast.Name) and function.id in import_module_names
-    ) or (
-        isinstance(function, ast.Attribute)
-        and isinstance(function.value, ast.Name)
-        and function.value.id in importlib_names
-        and function.attr == "import_module"
-    )
-    is_dunder_import = isinstance(function, ast.Name) and function.id == "__import__"
-    if not (is_import_module or is_dunder_import) or not node.args:
+    kind = _dynamic_kind(node, importlib_names, import_module_names)
+    if kind is None or not node.args:
         return None
-    module = node.args[0]
-    if not isinstance(module, ast.Constant) or not isinstance(module.value, str):
+    name = _literal_module(node)
+    if name is None or name == "":
         return ()
-    name = module.value
-    if name.startswith("."):
-        package = file_package
-        if is_import_module:
-            package_argument = _package_argument(node)
-            if isinstance(package_argument, ast.Constant) and isinstance(
-                package_argument.value, str
-            ):
-                package = tuple(package_argument.value.split("."))
-            elif _is_name_derived_package(package_argument):
-                package = file_package
-            else:
-                package = ()
-        if not package:
+    resolved = _resolve_relative_name(name, node, kind, file_package)
+    if resolved is None:
+        return ()
+    target = tuple(resolved.split("."))
+    if kind == "__import__":
+        fromlist = _fromlist_names(node)
+        if fromlist is None:
             return ()
-        name = ".".join(_relative_target(name, package))
-    target = tuple(name.split("."))
-    if is_dunder_import:
-        for keyword in node.keywords:
-            if keyword.arg == "fromlist" and isinstance(
-                keyword.value, (ast.List, ast.Tuple)
-            ):
-                target += tuple(
-                    item.value
-                    for item in keyword.value.elts
-                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
-                )
+        target += fromlist
     return target
 
 
 def _has_reason_marker(source_line: str) -> bool:
     marker = "# import-boundary:"
-    return marker in source_line and bool(source_line.split(marker, 1)[1].strip())
+    reason = source_line.split(marker, 1)[1].strip() if marker in source_line else ""
+    return bool(reason) and not reason.startswith("#")
+
+
+def _node_targets(
+    node: ast.AST,
+    file_path: Path,
+    root: Path,
+    importlib_names: set[str],
+    import_module_names: set[str],
+    file_package: tuple[str, ...],
+) -> tuple[list[tuple[str, ...]], bool]:
+    if isinstance(node, ast.Import):
+        return [tuple(alias.name.split(".")) for alias in node.names], False
+    if isinstance(node, ast.ImportFrom):
+        target = _import_from_target(file_path, node, root)
+        names = [target]
+        if node.module is None:
+            names.extend((*target, alias.name) for alias in node.names)
+        return names, False
+    if not isinstance(node, ast.Call):
+        return [], False
+    target = _dynamic_target(node, importlib_names, import_module_names, file_package)
+    if target == ():
+        return [], True
+    return ([target] if target is not None else []), False
+
+
+def _forbidden_target(
+    relative: Path, node: ast.AST, target: tuple[str, ...], forbidden: set[str]
+) -> str | None:
+    if len(target) > 1 and target[0] == "zeta" and target[1] in forbidden:
+        return f"{relative}:{node.lineno}: {'.'.join(target)}"
+    return None
 
 
 def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
@@ -161,32 +250,23 @@ def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
     file_package = ("zeta", *relative.with_suffix("").parts)
     if relative.stem != "__init__":
         file_package = file_package[:-1]
+    lines = source.splitlines()
     violations: list[str] = []
     for node in ast.walk(tree):
-        targets: list[tuple[str, ...]] = []
-        if isinstance(node, ast.Import):
-            targets = [tuple(alias.name.split(".")) for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            target = _import_from_target(file_path, node, root)
-            targets.append(target)
-            if node.module is None:
-                targets.extend((*target, alias.name) for alias in node.names)
-        elif isinstance(node, ast.Call):
-            target = _dynamic_target(
-                node, importlib_names, import_module_names, file_package
-            )
-            if target == ():
-                if not _has_reason_marker(source.splitlines()[node.lineno - 1]):
-                    violations.append(
-                        f"{relative}:{node.lineno}: non-literal dynamic import"
-                    )
-                continue
-            if target is not None:
-                targets.append(target)
-
-        for target in targets:
-            if len(target) > 1 and target[0] == "zeta" and target[1] in forbidden:
-                violations.append(f"{relative}:{node.lineno}: {'.'.join(target)}")
+        targets, dynamic = _node_targets(
+            node, file_path, root, importlib_names, import_module_names, file_package
+        )
+        if dynamic:
+            if not _has_reason_marker(lines[node.lineno - 1]):
+                violations.append(
+                    f"{relative}:{node.lineno}: non-literal dynamic import"
+                )
+            continue
+        violations.extend(
+            violation
+            for target in targets
+            if (violation := _forbidden_target(relative, node, target, forbidden))
+        )
     return violations
 
 
@@ -257,6 +337,8 @@ def test_dynamic_import_boundaries_have_teeth(tmp_path: Path) -> None:
     path.write_text(
         """__import__("zeta.tools")
 __import__("zeta", fromlist=["tools"])
+__import__("zeta", None, None, ["tools"])
+parts = ["tools"]; __import__("zeta", fromlist=parts)
 import importlib as il; il.import_module("zeta.tools")
 from importlib import import_module as load; load("zeta.tools")
 name = "zeta.tools"; load(name)
@@ -269,9 +351,9 @@ load("..tools", package=__package__)
 
     violations = _forbidden_imports(path, root)
 
-    assert sum("zeta.tools" in violation for violation in violations) == 6
+    assert sum("zeta.tools" in violation for violation in violations) == 7
     assert (
-        sum("non-literal dynamic import" in violation for violation in violations) == 2
+        sum("non-literal dynamic import" in violation for violation in violations) == 3
     )
 
 
@@ -288,6 +370,13 @@ def test_dynamic_import_reason_markers_are_line_stable(tmp_path: Path) -> None:
 
     path.write_text(
         "from importlib import import_module as load\nload(name)  # import-boundary:\n",
+        encoding="utf-8",
+    )
+    assert len(_forbidden_imports(path, root)) == 1
+
+    path.write_text(
+        "from importlib import import_module as load\n"
+        "load(name)  # import-boundary:  # fmt: skip\n",
         encoding="utf-8",
     )
     assert len(_forbidden_imports(path, root)) == 1
