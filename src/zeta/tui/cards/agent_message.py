@@ -56,15 +56,16 @@ class AgentIdentityIndex:
         if name == AGENT_TOOL_NAME:
             item = dict(result.structured_content)
             item.setdefault("model", call.arguments.get("model"))
-            self._observe_item(item)
+            self.observe_item(item)
         elif name == "agent_status":
             children = result.structured_content.get("children")
             if isinstance(children, list):
                 for child in children:
                     if isinstance(child, dict):
-                        self._observe_item(child)
+                        self.observe_item(child)
 
-    def _observe_item(self, item: Mapping[str, Any]) -> None:
+    def observe_item(self, item: Mapping[str, Any]) -> None:
+        """Learn one agent identity already present in an in-memory transcript."""
         handle = item.get("child_instance_id", item.get("handle"))
         description = item.get("description")
         if (
@@ -180,6 +181,49 @@ def render_agent_tool_message(
     return renderer(event, running, identity_index or AgentIdentityIndex())
 
 
+def _agent_send_state(
+    *, running: bool, result_content: str | None, is_error: bool
+) -> str:
+    if running or result_content is None:
+        return "sending"
+    if is_error:
+        return "error"
+    if result_content.casefold().startswith("delivered"):
+        return "delivered"
+    return "queued"
+
+
+def agent_send_tail_lines(
+    arguments: Mapping[str, Any],
+    result: Mapping[str, Any] | None,
+    identities: AgentIdentityIndex,
+) -> tuple[str, ...] | None:
+    """Project one stored send through the same identity and state rules as its card."""
+
+    handle = arguments.get("child_instance_id")
+    message = arguments.get("message")
+    if not isinstance(handle, str) or not isinstance(message, str):
+        return None
+    content = result.get("content") if result is not None else None
+    is_error = result is not None and result.get("is_error") is True
+    state = _agent_send_state(
+        running=result is None,
+        result_content=content if isinstance(content, str) else None,
+        is_error=is_error,
+    )
+    header = agent_header(
+        "send",
+        "→",
+        identities.resolve(handle),
+        state=state,
+        answer_to=answer_question_id(message),
+    ).plain
+    lines = (header, *(message.splitlines() or [""]))
+    if is_error and isinstance(content, str) and content:
+        lines = (*lines, content)
+    return lines
+
+
 def _render_agent_send(
     event: StreamEvent,
     running: bool,
@@ -193,14 +237,11 @@ def _render_agent_send(
     if not isinstance(handle, str) or not isinstance(message, str):
         return None
     result = event.tool_result
-    if running or result is None:
-        state = "sending"
-    elif result.is_error:
-        state = "error"
-    elif result.content.casefold().startswith("delivered"):
-        state = "delivered"
-    else:
-        state = "queued"
+    state = _agent_send_state(
+        running=running,
+        result_content=result.content if result is not None else None,
+        is_error=result.is_error if result is not None else False,
+    )
     return render_agent_message(
         agent_header(
             "send",
@@ -411,7 +452,12 @@ def _notification_identity(
     identities: AgentIdentityIndex,
 ) -> AgentIdentity | None:
     handle = event.data.get("child_instance_id")
-    description = event.data.get("description")
+    description = event.data.get("agent_description")
+    if not isinstance(description, str) and event.data.get("kind") not in {
+        "child_question",
+        "child_question_withdrawn",
+    }:
+        description = event.data.get("description")
     if not isinstance(handle, str):
         if isinstance(description, str) and description:
             return AgentIdentity(_identity_description(description), "")

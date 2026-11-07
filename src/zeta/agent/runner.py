@@ -89,7 +89,6 @@ async def consume_child(
     explicit_finish_metadata: Mapping[str, object] = _EMPTY_METADATA,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
-
     final_message: Message | None = None
     failure_message: str | None = None
     tool_calls = 0
@@ -242,6 +241,8 @@ async def consume_child(
                 finish_gate_state,
                 delivering_prompt_id,
             )
+            if finish_gate_state is not None:
+                finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
                 reason, outputs = gate_result.handoff
                 final_message = Message(
@@ -304,7 +305,6 @@ async def consume_run(
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume one child run through its follow-up and idle lifecycle."""
-
     return await consume_follow_up_run(
         consume_child,
         child_loop,
@@ -654,6 +654,7 @@ async def run_agent_tool(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
+            _storage_lease=loop.store._storage_lease,
         )
     )
     try:
@@ -698,7 +699,9 @@ async def run_agent_tool(
             # index (directory-fsynced) BEFORE the registry append, so the root's
             # reconciliation can recover this child link after a crash or a
             # failed append -- without ever walking the agents subtree.
-            persist_pending_child_link(loop.root_session_dir, link)
+            persist_pending_child_link(
+                loop.root_session_dir, link, loop.store._storage_lease
+            )
             loop.project_registry.record_session(
                 loop.root_project_id,
                 session_id=child_instance_id,
@@ -854,12 +857,12 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        child_store.finish_agent_lifecycle(
-            state,
-            final_result=text,
-            turns_used=child_turns(),
-        )
-        return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
+        turns_used = child_turns()
+        if background:
+            child_store.update_agent_lifecycle(turns_used=turns_used)
+        else:
+            child_store.finish_agent_lifecycle(state, final_result=text, turns_used=turns_used)
+        return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
 
     def child_result(
         text: str,
@@ -943,6 +946,8 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if follow_up_loop else consume_child
+    loop._background_owner.causal_episodes.associate_new_member(child_instance_id, loop.agent_instance_id)
+    finish_gate_state = FinishGateState()
     receipt_components: dict[str, str] = {}
     run_kwargs: dict[str, Any] = (
         {
@@ -952,6 +957,7 @@ async def run_agent_tool(
                 loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES
             ),
             "receipt_components": receipt_components,
+            "finish_gate_state": finish_gate_state,
             "explicit_finish_metadata": {
                 "child_instance_id": child_instance_id,
                 "description": description,
@@ -965,6 +971,7 @@ async def run_agent_tool(
             "record_report": lambda report: receipt_components.setdefault(
                 "report", report
             ),
+            "finish_gate_state": finish_gate_state,
         }
     )
     child_task = loop._create_task(
@@ -1091,6 +1098,8 @@ async def run_agent_tool(
                     background_owner=loop._background_owner,
                     max_receipt_bytes=background_receipt_bytes,
                     explicit_finish=terminal_fence is not None,
+                    child_loop=child_loop,
+                    finish_gate_state=finish_gate_state,
             )
 
         watcher = loop._create_task(finish_background())
