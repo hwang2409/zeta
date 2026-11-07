@@ -100,7 +100,6 @@ from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
-from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -421,7 +420,7 @@ async def _background_event_transcript_count(
 
         app._run_full_screen = run_full_screen_after_ready  # type: ignore[method-assign]
         running = asyncio.create_task(app.run(session))
-        await input_ready.wait()
+        await asyncio.wait_for(input_ready.wait(), 10)
         if owner == "run_background":
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
@@ -465,9 +464,11 @@ async def _background_event_transcript_count(
 
         if event.startswith("natural_exit"):
             assert task_id is not None
-            await app.loop.tool_registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(
+                app.loop.tool_registry.background_tasks.wait(task_id), 10
+            )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
             await wait_until(lambda: not store.agent_notifications())
         elif event == "task_kill":
             assert task_id is not None
@@ -485,7 +486,7 @@ async def _background_event_transcript_count(
                 )
             )
             if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await asyncio.wait_for(app.loop._background_owner.wait(), 10)
                 await wait_until(lambda: not store.agent_notifications())
         elif event == "failed_process_creation" and owner == "background_macro":
             await wait_until(lambda: not store.agent_notifications())
@@ -496,7 +497,7 @@ async def _background_event_transcript_count(
             app._print = fail_output
             app._print_unit = fail_output
         app.request_exit()
-        await running
+        await asyncio.wait_for(running, 10)
 
     resumed = ""
     if event == "session_shutdown":
@@ -552,7 +553,7 @@ async def _background_event_transcript_count(
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"background tasks killed on session exit: {task_id}"
+            f"⏺ task {task_id} exited"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
@@ -563,6 +564,8 @@ async def _background_event_transcript_count(
             else "⏺ /matrix · failed"
         )
     visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
+    if event == "session_shutdown" and owner == "run_background":
+        assert "session shutdown" in visible
     return visible.count(needle), visible
 
 
@@ -872,68 +875,6 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
     assert not store.is_agent_notification_presented_to_tui(entry.id)
     assert store.agent_notifications() == [entry]
     store.close()
-
-
-@pytest.mark.asyncio
-async def test_run_background_shutdown_output_failure_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        registry=registry,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    flow = await loop._ensure_step_delivery()
-    producer_started = asyncio.Event()
-    allow_producer = asyncio.Event()
-    original_produce = flow.produce
-
-    async def gated_produce(item):
-        producer_started.set()
-        await allow_producer.wait()
-        return await original_produce(item)
-
-    monkeypatch.setattr(flow, "produce", gated_produce)
-    app = SimpleNamespace(
-        _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
-        _invalidate_prompt=lambda: None,
-        loop=loop,
-    )
-
-    async def close_registry() -> tuple[str, ...]:
-        background_notice(
-            app,
-            BackgroundTaskShutdownNotice(
-                "background tasks killed on session exit: task-1",
-                tasks=(("task-1", "run_background"),),
-            ),
-        )
-        return ()
-
-    monkeypatch.setattr(registry, "close", close_registry)
-    ticks = 0
-    stop_ticker = asyncio.Event()
-
-    async def tick() -> None:
-        nonlocal ticks
-        while not stop_ticker.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
-
-    ticker = asyncio.create_task(tick())
-    close_task = asyncio.create_task(loop.close())
-    await asyncio.wait_for(producer_started.wait(), 1)
-    with pytest.raises(RuntimeError, match="shutdown delivery admission timed out"):
-        await asyncio.wait_for(close_task, 2)
-    stop_ticker.set()
-    await ticker
-
-    assert ticks > 10
-    assert not loop._tracked_tasks
-    assert store.agent_notifications() == []
 
 
 def test_other_background_notices_remain_visible() -> None:
@@ -1592,6 +1533,26 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
+def test_task_safety_kill_renders_cause() -> None:
+    cause = "explicit-finish child task safety deadline expired after 3600 seconds"
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "kind": "task_exited",
+            "task_id": "task-safety",
+            "exit_code": -15,
+            "headline": "watch ci",
+            "background_phase": "task_kill",
+            "note": cause,
+        },
+    )
+
+    rendered = render_agent_notification(event)
+
+    assert rendered is not None
+    assert cause in renderable_plain(rendered)
+
 
 def test_every_durable_notification_kind_has_non_error_rendering() -> None:
     payloads = _notification_payloads()

@@ -200,7 +200,11 @@ class BackgroundTasksMixin:
 
         async def run() -> None:
             try:
-                await registry.kill(task_id)
+                await registry.kill(
+                    task_id,
+                    cause="TUI tasks panel requested by the user",
+                    tui_presented=True,
+                )
             except ValueError:
                 pass
             self._refresh_tasks_panel()
