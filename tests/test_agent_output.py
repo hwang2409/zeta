@@ -1409,22 +1409,19 @@ async def test_resident_root_discovers_descendant_created_by_second_process(
         )
         child.close()
         parent_pipe, child_pipe = multiprocessing.get_context("spawn").Pipe()
-        stack.callback(child_pipe.close)
         process = multiprocessing.get_context("spawn").Process(
             target=_create_nested_child_in_process,
             args=(str(tmp_path), child_pipe),
         )
+        await stack.enter_async_context(
+            owned_child_process(process, endpoints=(parent_pipe, child_pipe))
+        )
         process.start()
         child_pipe.close()
-        loop = AgentLoop(
-            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
-        )
-        await stack.enter_async_context(
-            owned_child_process(
-                process,
-                endpoints=(parent_pipe,),
-                close=loop.close,
-            )
+        stack.push_async_callback(
+            (loop := AgentLoop(
+                FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+            )).close
         )
         ready = await asyncio.to_thread(parent_pipe.poll, 10)
         if not ready:
