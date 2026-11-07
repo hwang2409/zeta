@@ -5,6 +5,7 @@ import os
 import select
 import selectors
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +15,8 @@ from multiprocessing import Process
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import TypeVar
+
+from zeta.tools._shared.background_spawn import _group_exists
 
 _READY_TOKEN = b"ZETA_TEST_READY\n"
 _T = TypeVar("_T")
@@ -258,6 +261,15 @@ def _close_owned_process(process: Process) -> None:
     except ValueError as error:
         if str(error) != "process object is closed":
             raise
+
+
+def kill_group_if_present(pgid: int) -> None:
+    if not _group_exists(pgid):
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 async def wait_pid_exited(pid: int, timeout: float = 10) -> None:
