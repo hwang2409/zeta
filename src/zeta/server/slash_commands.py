@@ -160,6 +160,11 @@ class ServerSlashSession:
             transcript_index_failure=loop.transcript_index_failure(
                 opened.metadata.session_id
             ),
+            project_context_health=(
+                loop.project_context_health.summary
+                if loop.project_context_health is not None
+                else None
+            ),
         )
 
     async def slash_accounts(self, args: str) -> str:

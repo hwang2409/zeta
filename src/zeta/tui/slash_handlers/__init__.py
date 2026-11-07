@@ -155,6 +155,12 @@ class SlashHandlerMixin:
             transcript_index_failure=self.loop.transcript_index_failure(
                 self._viewed_session_path().name
             ),
+            project_context_health=(
+                self.loop.project_context_health.summary
+                if self._viewed_session_path() == self.loop.store.session_dir
+                and self.loop.project_context_health is not None
+                else None
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:

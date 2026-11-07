@@ -529,6 +529,7 @@ class SlashStatus:
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     automatic_memory_failure: str | None = None
     transcript_index_failure: str | None = None
+    project_context_health: str | None = None
     explicit_finish: bool = False
 
 
@@ -970,6 +971,8 @@ def _format_status(status: SlashStatus) -> str:
             + (status.automatic_memory_failure or "none"),
             "transcript_index_failure: "
             + (status.transcript_index_failure or "none"),
+            "project_context_health: "
+            + (status.project_context_health or "healthy"),
         ]
     )
     if status.todo_counts is not None:

@@ -17,7 +17,8 @@ from ..core.project_context import (
 from ..core.session import SessionManager, SessionMetadata
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
-from ..project_registry import Project
+from ..project_context.projection import ProjectContextProjection
+from ..project_registry import Project, ProjectRegistry
 from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from .prompt import PromptFragment, RuntimePrompt, replace_owned_fragment
@@ -42,7 +43,11 @@ def _catalogs(*, home: Path, repo_root: Path) -> tuple[SkillCatalog, AgentCatalo
 
 
 def _conservative_context(
-    metadata: SessionMetadata, *, home: Path, project_features_enabled: bool
+    metadata: SessionMetadata,
+    *,
+    home: Path,
+    project_features_enabled: bool,
+    projection: ProjectContextProjection | None,
 ) -> ProjectContext:
     """Refresh only a digest-owned memory span and preserve all unknown bytes."""
 
@@ -64,6 +69,37 @@ def _conservative_context(
         offset = None
         length = None
         digest = None
+    components = {
+        key: dict(component) for key, component in metadata.prompt_components.items()
+    }
+    selected_memory_unavailable = (
+        projection is not None
+        and metadata.project_id is not None
+        and (
+            projection.session_project is None
+            or (
+                projection.health is not None
+                and projection.health.project_id == metadata.project_id
+                and projection.health.code in {
+                    "malformed_project",
+                    "malformed_memory",
+                    "project_not_found",
+                }
+            )
+        )
+    )
+    if selected_memory_unavailable and owned and offset is not None and length is not None:
+        prompt = prompt[:offset] + prompt[offset + length :]
+        components.pop("project_memory", None)
+        return ProjectContext(
+            prompt,
+            tuple(Path(path) for path in metadata.context_files),
+            memory_project_id=metadata.project_id,
+            has_override=metadata.prompt_recipe == "custom",
+            prompt_recipe=metadata.prompt_recipe,
+            prompt_components=components,
+            health=projection.health,
+        )
     refreshed = refresh_project_memory(
         prompt,
         home=home,
@@ -72,9 +108,6 @@ def _conservative_context(
         memory_length=length,
         memory_digest=digest,
     )
-    components = {
-        key: dict(component) for key, component in metadata.prompt_components.items()
-    }
     if not project_features_enabled:
         components.pop("project_memory", None)
     if owned and offset is not None and length is not None:
@@ -204,6 +237,8 @@ def _resume_composition(
     agents: AgentCatalog,
     explicit_custom: bool,
     project_features_enabled: bool,
+    registry: ProjectRegistry | None,
+    projection: ProjectContextProjection | None,
 ) -> PromptComposition:
     rebuild = (
         current.prompt_recipe == "default"
@@ -221,10 +256,15 @@ def _resume_composition(
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=inbox_enabled,
+            registry=registry,
+            projection=projection,
         )
     else:
         context = _conservative_context(
-            current, home=home, project_features_enabled=project_features_enabled
+            current,
+            home=home,
+            project_features_enabled=project_features_enabled,
+            projection=projection,
         )
         if current.prompt_recipe is not None:
             context = _replace_context_skill_index(context, skills)
@@ -267,6 +307,8 @@ def resume_prompt(
     system_append: str | None = None,
     context_loader: ContextLoader = load_project_context,
     project_features_enabled: bool = True,
+    registry: ProjectRegistry | None = None,
+    projection: ProjectContextProjection | None = None,
 ) -> ResumedPrompt:
     """Classify, safely recompose, persist, and adopt one resumed prompt.
 
@@ -295,10 +337,15 @@ def resume_prompt(
         agents=agents,
         explicit_custom=explicit_custom,
         project_features_enabled=project_features_enabled,
+        registry=registry,
+        projection=projection,
     )
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
-    context = _adopted_context(metadata, composition.notices)
+    context = replace(
+        _adopted_context(metadata, composition.notices),
+        health=projection.health if projection is not None else None,
+    )
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)
     return ResumedPrompt(context, skills, composition.agent_catalog)

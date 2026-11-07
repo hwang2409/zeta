@@ -781,6 +781,16 @@ class _Client:
             if self.protocol_version != "1.0" and runtime.loop is not None
             else None
         )
+        project_context_health = (
+            (
+                runtime.loop.project_context_health.summary
+                if runtime.loop is not None
+                and runtime.loop.project_context_health is not None
+                else "healthy"
+            )
+            if self.protocol_version != "1.0"
+            else None
+        )
         return {
             "session": session,
             "state": (
@@ -799,6 +809,11 @@ class _Client:
             **(
                 {"transcript_index_failure": transcript_index_failure}
                 if transcript_index_failure is not None
+                else {}
+            ),
+            **(
+                {"project_context_health": project_context_health}
+                if project_context_health is not None
                 else {}
             ),
             "store": runtime.opened.store if runtime.opened is not None else None,

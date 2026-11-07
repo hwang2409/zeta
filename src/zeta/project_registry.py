@@ -27,6 +27,9 @@ from typing import TypeVar
 
 from . import project_schema
 from .core.session_files import SessionError, atomic_publish_file, open_session_file
+from .project_context.projection import (
+    ProjectContextProjectionMixin,
+)
 from .project_errors import (
     ProjectNotFoundError,
     ProjectRegistryBusyError,
@@ -48,7 +51,7 @@ from .project_schema import (
 )
 
 MAX_NAME_LENGTH = project_schema.MAX_NAME_LENGTH
-MAX_PROJECTS = 10_000
+MAX_PROJECTS = project_schema.MAX_PROJECTS
 MAX_SESSION_REFERENCE_SIZE = 4096
 MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
@@ -208,7 +211,7 @@ def resolve_project_ref(registry: ProjectRegistry, text: str) -> str | None:
             return None
 
 
-class ProjectRegistry(ProjectMemoryHistoryMixin):
+class ProjectRegistry(ProjectContextProjectionMixin, ProjectMemoryHistoryMixin):
     """A local registry whose root can be overridden for tests."""
 
     def __init__(self, root: Path | str | None = None):

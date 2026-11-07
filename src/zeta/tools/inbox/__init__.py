@@ -126,11 +126,11 @@ def _result(
     )
 
 
-def _error(message: str) -> StructuredToolResult:
+def _error(message: str, *, kind: str = "project_inbox") -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
-        "structuredContent": {"error": {"kind": "project_inbox", "message": message}},
+        "structuredContent": {"error": {"kind": kind, "message": message}},
     }
 
 
@@ -176,6 +176,12 @@ async def _inbox(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
+        state = registry.project_registry_state
+        if state is not None and state.unavailable is not None:
+            return _error(
+                "project registry is temporarily unavailable; try again later",
+                kind="project_registry_unavailable",
+            )
         action = _validate_action(arguments)
         inbox, project_id, session_id = _bound(registry)
         if action == "projects":

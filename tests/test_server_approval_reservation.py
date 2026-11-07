@@ -11,6 +11,7 @@ import threading
 import uuid
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -742,6 +743,12 @@ async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
             "transcript_index_failure",
             lambda _session_id: "disk full; pending changes will retry",
         )
+        server.runtime.loop.project_context_health = SimpleNamespace(
+            summary=(
+                "malformed_memory (p_test/memory/state.md): "
+                "project memory is malformed"
+            )
+        )
         response = (await _request(observer_reader, observer_writer, 11, "status"))[-1]
         result = response["result"]
         assert set(result) == {
@@ -752,10 +759,14 @@ async def test_observer_status_surfaces_transcript_index_failure_when_degraded(
             "usage",
             "compaction_markers",
             "transcript_index_failure",
+            "project_context_health",
         }
         assert result["state"] == "idle"
         assert result["transcript_index_failure"] == (
             "disk full; pending changes will retry"
+        )
+        assert result["project_context_health"] == (
+            "malformed_memory (p_test/memory/state.md): project memory is malformed"
         )
         mutation = (
             await _request(

@@ -91,6 +91,28 @@ class SkillRefreshMixin:
             return self._plan_mode_prior_prompt
         return self._runtime_prompt
 
+    def _prompt_base_is_current(
+        self, generation: int, base: RuntimePrompt
+    ) -> bool:
+        return generation == self._prompt_generation and base is self._skill_prompt_base()
+
+    def _commit_prepared_prompt(
+        self, generation: int, base: RuntimePrompt, prepared: RuntimePrompt
+    ) -> bool:
+        """Commit one off-loop prompt candidate through the shared ownership check."""
+
+        if not self._prompt_base_is_current(generation, base):
+            return False
+        if self._plan_mode:
+            self._plan_mode_prior_prompt = prepared
+            displayed = RuntimePrompt(
+                plan_mode_prompt(prepared.system_prompt), prepared.prompt_components
+            )
+        else:
+            displayed = prepared
+        self._set_runtime_prompt(displayed)
+        return True
+
     def add_skill_catalog_listener(
         self, listener: Callable[[SkillCatalog], None]
     ) -> None:
@@ -123,8 +145,7 @@ class SkillRefreshMixin:
             )
             if (
                 generation != self._skill_refresh_generation
-                or prompt_generation != self._prompt_generation
-                or prompt_base is not self._skill_prompt_base()
+                or not self._prompt_base_is_current(prompt_generation, prompt_base)
             ):
                 return
             refresh = watcher.commit(scan)

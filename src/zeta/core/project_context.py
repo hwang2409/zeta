@@ -47,6 +47,10 @@ from time import monotonic as _monotonic
 
 from ..memory.entry_store import utc_now
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
+from ..project_context.projection import (
+    ProjectContextHealth,
+    ProjectContextProjection,
+)
 from ..project_errors import UnsupportedMemoryFormatError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
@@ -90,6 +94,7 @@ class ProjectContext:
     has_override: bool = False
     prompt_recipe: str | None = None
     prompt_components: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    health: ProjectContextHealth | None = None
 
 
 def _git_env() -> dict[str, str]:
@@ -564,27 +569,50 @@ def _walk_up_agents_files(cwd: Path, stop_at: Path) -> list[Path]:
     return files
 
 
-def resolve_project_context(
-    discovery: ProjectDiscovery, registry: ProjectRegistry
+def resolve_project_context_from_projects(
+    discovery: ProjectDiscovery, projects: tuple[Project, ...]
 ) -> Project | None:
-    """Resolve cwd-owned private instructions without running Git or creating a project."""
+    """Resolve cwd-owned private instructions from one registry snapshot."""
 
-    if not discovery.eligible or not registry.root.exists():
+    if not discovery.eligible:
         return None
-    if discovery.primary_root is None:
-        return _project_at_root(registry, discovery.cwd, discovery)
-    project = _project_at_root(registry, discovery.primary_root, discovery)
-    if project is not None or discovery.common_dir is None:
-        return project
+    roots = (discovery.cwd,) if discovery.primary_root is None else (discovery.primary_root,)
+    for root in roots:
+        project = next(
+            (
+                candidate
+                for candidate in projects
+                if candidate.canonical_integration_root is not None
+                and Path(candidate.canonical_integration_root) == root
+                and _valid_registry_candidate(candidate, discovery) is not None
+            ),
+            None,
+        )
+        if project is not None:
+            return project
+    if discovery.common_dir is None:
+        return None
     return next(
         (
             candidate
-            for candidate in registry.list_projects()
+            for candidate in projects
             if _valid_registry_candidate(candidate, discovery) is not None
             and _checkout_common_dir(Path(candidate.canonical_integration_root))
             == discovery.common_dir
         ),
         None,
+    )
+
+
+def resolve_project_context(
+    discovery: ProjectDiscovery, registry: ProjectRegistry
+) -> Project | None:
+    """Resolve cwd-owned private instructions without running Git or creating a project."""
+
+    if not registry.root.exists():
+        return None
+    return resolve_project_context_from_projects(
+        discovery, tuple(registry.list_projects())
     )
 
 
@@ -604,9 +632,10 @@ def project_instructions_path(
             "here and restart zeta, or start zeta inside a registered project."
         )
     state = registry_state or available_project_registry(zeta_home / "projects")
+    if state.unavailable is not None:
+        return "project instructions unavailable: project registry is temporarily unavailable; try again later"
     if state.registry is None:
-        assert state.unavailable is not None
-        return f"project instructions unavailable: {state.unavailable.reason}"
+        return "project instructions unavailable: project registry capability is unavailable"
     try:
         registry = state.registry
         discovery = discover_project(project_root, user_home=zeta_home.parent)
@@ -723,6 +752,8 @@ def load_project_context(
     session_project: Project | None = None,
     cwd_project: Project | None = None,
     inbox_enabled: bool = True,
+    registry: ProjectRegistry | None = None,
+    projection: ProjectContextProjection | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -810,7 +841,7 @@ def load_project_context(
         # A malformed or unsafe optional registry must not prevent a session from
         # starting; surface it as a startup notice instead.
         try:
-            registry = project_registry(home / "projects")
+            registry = registry or project_registry(home / "projects")
             project = session_project
             if project is not None:
                 manual_memory_sections: list[str] = []
@@ -831,8 +862,10 @@ def load_project_context(
                     )
                 else:
                     try:
-                        context_entries = registry.load_memory_for_context(
-                            project.project_id
+                        context_entries = (
+                            projection.memory
+                            if projection is not None
+                            else registry.load_memory_for_context(project.project_id)
                         )
                     except UnsupportedMemoryFormatError:
                         # Format 2 remains reachable only through the private
@@ -960,6 +993,7 @@ def load_project_context(
         has_override=has_override,
         prompt_recipe="custom" if has_override else "default",
         prompt_components=components,
+        health=projection.health if projection is not None else None,
     )
 
 

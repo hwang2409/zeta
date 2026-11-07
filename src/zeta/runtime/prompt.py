@@ -99,6 +99,19 @@ def _with_prompt_text(prompt: str | Message, text: str) -> str | Message:
     return replace(prompt, content=[TextContent(text)])
 
 
+def replace_runtime_prompt(
+    base: RuntimePrompt,
+    text: str,
+    components: Mapping[str, Mapping[str, int | str]],
+) -> RuntimePrompt:
+    """Prepare a whole prompt replacement while preserving its wire shape."""
+
+    return RuntimePrompt(
+        _with_prompt_text(base.system_prompt, text),
+        {key: dict(component) for key, component in components.items()},
+    )
+
+
 def replace_owned_fragment(
     prompt: RuntimePrompt, key: str, fragment: PromptFragment
 ) -> RuntimePrompt:

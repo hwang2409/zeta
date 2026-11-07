@@ -28,7 +28,9 @@ from zeta.runtime.project_registry_state import (
 from zeta.server.server import ZetaServer
 from zeta.tui.app import create_app
 
-_WARNING_PREFIX = "warning: project registry unavailable at "
+_REGISTRY_WARNING = (
+    "warning: project registry is temporarily unavailable; try again later"
+)
 
 
 def _invalid_json(_home: Path, _linked: Path, record: Path) -> None:
@@ -192,7 +194,7 @@ def test_broken_registry_tui_start_and_resume_without_repair(
     projects = home / "projects"
     before = _registry_snapshot(projects)
     state = load_project_registry(projects)
-    assert state.registry is None
+    assert state.registry is not None
     assert isinstance(state.unavailable, ProjectRegistryUnavailable)
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(repository)
@@ -205,16 +207,16 @@ def test_broken_registry_tui_start_and_resume_without_repair(
         ):
             app = create_app(build_parser().parse_args(arguments))
             apps.append(app)
-            rendered = _render_startup(app)
-            warning = next(
-                item for item in app._startup_warnings if item.startswith(_WARNING_PREFIX)
+            _render_startup(app)
+            assert (_REGISTRY_WARNING in app._startup_warnings) == (
+                _case == "dangling-symlink"
             )
-            assert warning.startswith(f"{_WARNING_PREFIX}{projects}: ")
-            assert warning.endswith("; project features are disabled")
-            assert rendered.count(warning) == 1
-            assert "project" not in app.loop.tool_registry.registered_names
-            assert "inbox" not in app.loop.tool_registry.registered_names
-            assert app.loop.project_registry is None
+            assert "project" in app.loop.tool_registry.registered_names
+            assert ("inbox" in app.loop.tool_registry.registered_names) == (
+                "--resume" in arguments
+            )
+            assert app.loop.project_registry is state.registry or app.loop.project_registry is not None
+            assert app.loop.project_context_health is not None
             assert memory not in app.loop.context_assembler.system_prompt.content[0].text
         assert _registry_snapshot(projects) == before
     finally:
@@ -238,14 +240,91 @@ async def test_broken_registry_serve_hello_without_repair(
     try:
         hello = await _serve_hello(home)
         notices = hello["notices"]
-        assert len(notices) == 1
-        assert notices[0].startswith(f"{_WARNING_PREFIX}{projects}: ")
-        assert notices[0].endswith("; project features are disabled")
-        assert "projects" not in hello["capabilities"].get("features", ())
+        assert notices == [_REGISTRY_WARNING]
+        assert "projects" in hello["capabilities"].get("features", ())
         assert _registry_snapshot(projects) == before
     finally:
         if record.exists():
             record.chmod(0o600)
+
+
+def test_tui_keeps_healthy_legacy_memory_and_recovers_after_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("healthy", "git", repository)
+    memory = registry.root / project.project_id / "memory"
+    (memory / "brief.md").write_text("HEALTHY-MEMORY", encoding="utf-8")
+    (memory / "state.md").write_bytes(b"\xff")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        prompt = app.loop.context_assembler.system_prompt.content[0].text
+        assert "HEALTHY-MEMORY" in prompt
+        assert "Check your inbox with inbox action list" in prompt
+        assert app.loop.project_context_health is not None
+        assert app.loop.project_context_health.source == "memory/state.md"
+
+        (memory / "state.md").write_text("RECOVERED-MEMORY", encoding="utf-8")
+
+        async def recover() -> None:
+            app.loop._advance_project_context_recovery()
+            assert app.loop._project_context_read_task is not None
+            await app.loop._project_context_read_task
+            app.loop._advance_project_context_recovery()
+            assert app.loop._project_context_prepare_task is not None
+            await app.loop._project_context_prepare_task
+            assert app.loop._commit_prepared_prompt(
+                app.loop._prompt_generation,
+                app.loop._runtime_prompt,
+                app.loop._runtime_prompt,
+            )
+            app.loop._advance_project_context_recovery()
+            assert app.loop.project_context_health is not None
+            assert app.loop._project_context_prepare_task is not None
+            await app.loop._project_context_prepare_task
+            app.loop._advance_project_context_recovery()
+
+        asyncio.run(recover())
+        prompt = app.loop.context_assembler.system_prompt.content[0].text
+        assert "RECOVERED-MEMORY" in prompt
+        assert app.loop.project_context_health is None
+    finally:
+        asyncio.run(app.close())
+
+
+def test_tui_omits_malformed_version_authority_but_keeps_inbox_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("healthy", "git", repository)
+    project_root = registry.root / project.project_id
+    (project_root / "memory" / "brief.md").write_text(
+        "LEGACY-MUST-NOT-LEAK", encoding="utf-8"
+    )
+    (project_root / "memory-current.json").write_text("{", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repository)
+
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        prompt = app.loop.context_assembler.system_prompt.content[0].text
+        assert "LEGACY-MUST-NOT-LEAK" not in prompt
+        assert "Check your inbox with inbox action list" in prompt
+        assert app.loop.project_context_health is not None
+        assert app.loop.project_context_health.source == "memory-current.json"
+    finally:
+        asyncio.run(app.close())
 
 
 def test_missing_registry_remains_available(tmp_path: Path) -> None:
@@ -356,9 +435,9 @@ def test_malformed_registry_decisions_use_startup_state(
 
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
-        warning = app.loop.manager.project_registry_unavailable
-        assert warning is not None
-        assert app._startup_warnings.count(warning.warning) == 1
+        assert app.loop.manager.project_registry_unavailable is None
+        assert app.loop.project_context_health is not None
+        assert app.loop.project_context_health.code == "malformed_project"
         asyncio.run(app._decisions_tick())
         assert asyncio.run(app.slash_decisions("")) == "no open decisions"
     finally:
@@ -377,7 +456,10 @@ def test_project_instructions_refuses_unavailable_registry(tmp_path: Path) -> No
 
     result = project_instructions_path("", repository, home, registry_state=state)
 
-    assert result == f"project instructions unavailable: {state.unavailable.reason}"
+    assert result == (
+        "project instructions unavailable: project registry is temporarily "
+        "unavailable; try again later"
+    )
     assert not (record.parent / "AGENTS.md").exists()
 
 

@@ -113,6 +113,7 @@ from .empty_turn import (
 )
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
@@ -152,6 +153,7 @@ class AgentLoop(
     StoreWriteMixin,
     AgentNotificationMixin,
     ProjectInboxNotificationMixin,
+    ProjectContextRecoveryMixin,
     MCPSession,
 ):
     post_stream_provider_retry = True
@@ -205,6 +207,9 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_project_context_recovery(
+            registry=None, project_id=None, health=None, prepare=None
+        )
         self._child_lineage_publisher = (
             ChildLineagePublisher(project_registry, self.root_session_dir)
             if root_project_id is not None and project_registry is not None
@@ -499,6 +504,7 @@ class AgentLoop(
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        await self._close_project_context_recovery()
         if self.memory_reconciler is not None:
             await self.memory_reconciler.close()
         if self.agent_depth == 0:
@@ -717,6 +723,7 @@ class AgentLoop(
         host_instruction: str = "",
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
+        self._advance_project_context_recovery()
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")

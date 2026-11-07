@@ -17,7 +17,7 @@ from ..core.checkpoints import _now
 from ..core.project_context import (
     discover_project,
     load_project_context,
-    resolve_project_context,
+    resolve_project_context_from_projects,
 )
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
@@ -1178,14 +1178,16 @@ def _child_base_system_prompt(
     zeta_home = Path(home_hint) if home_hint else env_home()
     discovery = discover_project(cwd_override, user_home=zeta_home.parent)
     registry = loop.project_registry
-    session_project = None
-    if loop.root_project_id is not None and registry is not None:
-        try:
-            session_project = registry.show_project(loop.root_project_id)
-        except ProjectRegistryError:
-            pass
+    projection = (
+        registry.project_context_projection(loop.root_project_id)
+        if registry is not None
+        else None
+    )
+    session_project = projection.session_project if projection is not None else None
     cwd_project = (
-        resolve_project_context(discovery, registry) if registry is not None else None
+        resolve_project_context_from_projects(discovery, projection.projects)
+        if projection is not None
+        else None
     )
     context = load_project_context(
         cwd=cwd_override,
@@ -1195,6 +1197,8 @@ def _child_base_system_prompt(
         session_project=session_project,
         cwd_project=cwd_project,
         inbox_enabled=False,
+        registry=registry,
+        projection=projection,
     )
     return context.system_prompt
 

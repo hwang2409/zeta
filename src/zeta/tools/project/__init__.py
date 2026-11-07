@@ -9,11 +9,13 @@ from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
 
 
-def _error(message: str) -> StructuredToolResult:
+def _error(
+    message: str, *, kind: str = "project_memory"
+) -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
-        "structuredContent": {"error": {"kind": "project_memory", "message": message}},
+        "structuredContent": {"error": {"kind": kind, "message": message}},
     }
 
 
@@ -31,6 +33,12 @@ async def _inspect_project(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
+        state = registry.project_registry_state
+        if state is not None and state.unavailable is not None:
+            return _error(
+                "project registry is temporarily unavailable; try again later",
+                kind="project_registry_unavailable",
+            )
         projects = registry.project_registry
         if projects is None:
             raise ProjectRegistryError("project registry capability is unavailable")
