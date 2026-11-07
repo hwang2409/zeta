@@ -8233,7 +8233,9 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     writer_wait_closed = writer.wait_closed
 
     async def wait_closed_after_server_shutdown() -> None:
-        await asyncio.wait_for(shutdown_started.wait(), 10)
+        assert shutdown_started.is_set(), (
+            "server shutdown must start before the test waits for the peer close"
+        )
         await asyncio.wait_for(writer_wait_closed(), 10)
 
     monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
