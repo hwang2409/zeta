@@ -544,7 +544,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             if event is None:
                 continue
             if event.type is StreamEventType.MESSAGE_END:
-                self._attempt_completed = event.data.get("truncated") is not True
+                self._attempt_completed = True
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
                     self._retry_usage = dict(usage)
@@ -555,9 +555,22 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                     continue
             self._observe(event)
             if self._attempt_completed:
-                await self._finish_attempt()
+                await self._finish_completed_attempt()
                 self._closed = True
             return event
+
+    async def _finish_completed_attempt(self) -> None:
+        assert self._attempt is not None
+        try:
+            while True:
+                signal = await self._read_signal(self._attempt)
+                if signal.event is not None:
+                    raise RuntimeError("provider event followed completion")
+        except StopAsyncIteration:
+            await self._finish_attempt()
+        except BaseException as error:
+            await self._finish_attempt(error)
+            raise
 
     async def _open_attempt(self) -> None:
         now = self._clock.now()
@@ -606,14 +619,17 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             or event.tool_call is not None
         )
         completed_tool = event.data.get("tool_call_completed") is True
-        completed_tool = completed_tool or (
-            event.tool_call is not None and "tool_call_delta" not in event.data
-        )
-        completed_tool = completed_tool or isinstance(event.content, ToolUseContent)
-        completed_tool = completed_tool or (
-            event.message is not None
-            and any(isinstance(block, ToolUseContent) for block in event.message.content)
-        )
+        if event.data.get("truncated") is not True:
+            completed_tool = completed_tool or (
+                event.tool_call is not None and "tool_call_delta" not in event.data
+            )
+            completed_tool = completed_tool or isinstance(event.content, ToolUseContent)
+            completed_tool = completed_tool or (
+                event.message is not None
+                and any(
+                    isinstance(block, ToolUseContent) for block in event.message.content
+                )
+            )
         self._emitted = self._emitted or public_output
         if completed_tool or (
             public_output and self._control.reset is ResetPolicy.NO_RESET
@@ -766,6 +782,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 if selected is cleanup_error:
                     if primary is None and not is_control_exception(cleanup_error):
                         raise CompletionCleanupError(str(cleanup_error)) from cleanup_error
+                    if primary_error is not None:
+                        raise selected from primary_error
                     raise selected
             if not is_control_exception(cleanup_error):
                 asyncio.get_running_loop().call_exception_handler(
