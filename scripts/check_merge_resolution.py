@@ -145,25 +145,87 @@ def _is_ancestor(ancestor: str, descendant: str) -> bool:
     return result.returncode == 0
 
 
-def _parent_candidates(
+def _train_parent_qualifies(parent: str, first_parent_chain: set[str]) -> bool:
+    """Return whether a parent is the head of a no-ff train chain."""
+    current = parent
+    while True:
+        try:
+            parents = git("rev-list", "--parents", "-n", "1", current).split()[1:]
+        except subprocess.CalledProcessError:
+            return False
+        if len(parents) != 2:
+            return False
+        if current in first_parent_chain:
+            return True
+        current = parents[0]
+
+
+def _direct_main_parent(
+    parents: list[str], first_parent_chain: set[str], origin_main: str
+) -> tuple[int | None, str]:
+    matches = [
+        index for index, parent in enumerate(parents) if parent in first_parent_chain
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is on origin/main first-parent ancestry"
+    if len(matches) > 1:
+        return None, ""
+    matches = [
+        index
+        for index, parent in enumerate(parents)
+        if origin_main and _is_ancestor(parent, origin_main)
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is an ancestor of origin/main"
+    return None, ""
+
+
+def _train_chain_parent(
+    parents: list[str], first_parent_chain: set[str], origin_main: str
+) -> tuple[int | None, str]:
+    if not origin_main:
+        return None, ""
+    matches = [
+        index
+        for index, parent in enumerate(parents)
+        if _train_parent_qualifies(parent, first_parent_chain)
+    ]
+    if len(matches) == 1:
+        return matches[0], "the selected parent is the train merge chain"
+    return None, ""
+
+
+def _identify_main_parent(
     parents: list[str],
-) -> tuple[list[int], str, str]:
+) -> tuple[int | None, str, str, str]:
+    """Identify the main parent, or return evidence for an explicit refusal."""
     try:
-        chain = set(git("rev-list", "--first-parent", "origin/main").splitlines())
+        first_parent_chain = set(
+            git("rev-list", "--first-parent", "origin/main").splitlines()
+        )
         origin_main = git("rev-parse", "--verify", "origin/main").strip()
     except subprocess.CalledProcessError:
-        chain = set()
-        origin_main = ""
-    matches = [index for index, parent in enumerate(parents) if parent in chain]
-    reason = "the selected parent is on origin/main first-parent ancestry"
-    if not matches and origin_main:
-        matches = [
-            index
-            for index, parent in enumerate(parents)
-            if _is_ancestor(parent, origin_main)
-        ]
-        reason = "the selected parent is an ancestor of origin/main"
-    return matches, reason, origin_main
+        first_parent_chain, origin_main = set(), ""
+    index, reason = _direct_main_parent(parents, first_parent_chain, origin_main)
+    if index is not None:
+        return (
+            index,
+            reason,
+            origin_main,
+            "exactly one parent is on origin/main ancestry",
+        )
+    index, reason = _train_chain_parent(parents, first_parent_chain, origin_main)
+    if index is not None:
+        return index, reason, origin_main, "exactly one parent is the train merge chain"
+    train_matches = [
+        parent
+        for parent in parents
+        if origin_main and _train_parent_qualifies(parent, first_parent_chain)
+    ]
+    details = (
+        "both parents qualify" if len(train_matches) > 1 else "neither parent qualifies"
+    )
+    return None, "", origin_main, details
 
 
 def _render_parent_refusal(
@@ -190,8 +252,9 @@ def _validate_override(
     commit: str,
     parents: list[str],
     requested: str,
-    candidates: list[int],
+    identified: int | None,
     origin_main: str,
+    details: str,
 ) -> int | None:
     if len(requested) != 40 or any(
         char not in "0123456789abcdef" for char in requested
@@ -207,31 +270,16 @@ def _validate_override(
             file=sys.stderr,
         )
         return None
+    if identified is None:
+        _render_parent_refusal(commit, parents, origin_main, details)
+        return None
     index = parents.index(requested)
-    if len(candidates) == 1:
-        if index != candidates[0]:
-            print(
-                f"--main-sha {requested} disagrees with the identified main parent "
-                f"{parents[candidates[0]]}",
-                file=sys.stderr,
-            )
-            return None
-        return index
-    if candidates:
-        _render_parent_refusal(commit, parents, origin_main, "both parents qualify")
-        return None
-    if not origin_main:
-        _render_parent_refusal(commit, parents, origin_main, "neither parent qualifies")
-        return None
-    base = git("merge-base", "origin/main", commit).strip()
-    carries = [_is_ancestor(base, parent) for parent in parents]
-    permitted = (
-        0
-        if carries == [True, True]
-        else next((i for i, carries_base in enumerate(carries) if carries_base), None)
-    )
-    if permitted is None or index != permitted:
-        _render_parent_refusal(commit, parents, origin_main, "neither parent qualifies")
+    if index != identified:
+        print(
+            f"--main-sha {requested} disagrees with the identified main parent "
+            f"{parents[identified]}",
+            file=sys.stderr,
+        )
         return None
     return index
 
@@ -241,22 +289,17 @@ def resolve_parent(
 ) -> tuple[str, str, str] | None:
     p1, p2 = parents
     print(f"parents: 1={p1} 2={p2}")
-    candidates, reason, origin_main = _parent_candidates(parents)
+    index, reason, origin_main, details = _identify_main_parent(parents)
     if main_sha is not None:
-        index = _validate_override(commit, parents, main_sha, candidates, origin_main)
+        index = _validate_override(
+            commit, parents, main_sha, index, origin_main, details
+        )
         if index is None:
             return None
         reason = f"explicit --main-sha {parents[index]}"
-    elif len(candidates) != 1:
-        _render_parent_refusal(
-            commit,
-            parents,
-            origin_main,
-            "neither parent qualifies" if not candidates else "both parents qualify",
-        )
+    elif index is None:
+        _render_parent_refusal(commit, parents, origin_main, details)
         return None
-    else:
-        index = candidates[0]
     main, branch = (p1, p2) if index == 0 else (p2, p1)
     print(f"main parent: {main} ({reason})")
     return main, branch, reason
