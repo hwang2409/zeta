@@ -1648,6 +1648,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launcher_ready = tmp_path / "launcher-ready"
+    # test-contract: seam launcher script readiness is controlled by this test
     monkeypatch.setattr(
         tool_spawn_module,
         "_LAUNCHER",
@@ -1683,6 +1684,7 @@ async def test_bash_timeout_starts_after_launcher_is_ready(
 
     await asyncio.wait_for(timeout_started.wait(), 10)
     assert launcher_ready.exists()
+    # test-contract: seam injected timeout awaitable records ordering
     assert not timeout_started_early
     release_timeout.set()
     result = await asyncio.wait_for(execution, 10)
