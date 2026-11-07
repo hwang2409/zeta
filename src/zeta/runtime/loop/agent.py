@@ -1213,11 +1213,8 @@ class AgentLoop(
                     recovery_state.record_event(event)
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
-                # The assistant message is durable before dispatch starts. If
-                # cancellation lands in that small gap, the dispatcher's own
-                # cleanup has not run yet, leaving the provider with an
-                # unpaired function call on resume. Finalization is idempotent,
-                # so this also covers cancellation after dispatch has started.
+                # The assistant message is already durable, so finalization prevents
+                # an unpaired tool call whether cancellation precedes or follows dispatch.
                 for call in calls:
                     self.tool_registry.abort_approval(call)
                 self._finalize_tool_results(calls, [None] * len(calls))
@@ -1225,6 +1222,15 @@ class AgentLoop(
             finally:
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
+            if self._explicit_finish_report is not None:
+                yield StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": len(calls)},
+                )
+                self._schedule_transcript_index()
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             await self._check_project_inbox()
             yield StreamEvent(
                 StreamEventType.TURN_END,
