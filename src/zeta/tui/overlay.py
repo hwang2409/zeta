@@ -21,6 +21,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import OneStyleAndTextTuple
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.utils import get_cwidth
 
 from . import theme
@@ -221,6 +222,12 @@ class OverlayControl(UIControl):
 
     def bottom(self) -> None:
         self._offset = self._max_offset()
+
+    def mouse_handler(self, mouse_event: MouseEvent) -> None:
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self.scroll(-3)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self.scroll(3)
 
     def _max_offset(self) -> int:
         return max(0, len(self._lines) - self._capacity)

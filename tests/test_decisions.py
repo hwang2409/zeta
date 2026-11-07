@@ -8,9 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
@@ -305,6 +306,39 @@ def test_decisions_popup_accepts_fragments_with_mouse_handlers() -> None:
     assert control.preferred_width(120) > 0
     content = control.create_content(width=72, height=10)
     assert content.line_count == 10
+
+
+def test_decisions_popup_scrolls_long_why_with_wheel_and_resets_on_item_change() -> None:
+    panel = DecisionsPanel()
+    long_why = "head " + ("detail " * 200) + " tail-marker"
+    panel.set_items([_item("1" * 32, "Pick DB", long_why, ["SQLite"])])
+    control = OverlayControl()
+    control.set_lines(panel.render_lines(), overflow_hint=True)
+
+    def visible_text() -> str:
+        content = control.create_content(width=72, height=10)
+        return "\n".join(
+            "".join(fragment[1] for fragment in content.get_line(row))
+            for row in range(content.line_count)
+        )
+
+    assert "tail-marker" not in visible_text()
+    for _ in range(100):
+        control.mouse_handler(
+            MouseEvent(
+                Point(0, 0),
+                MouseEventType.SCROLL_DOWN,
+                MouseButton.NONE,
+                frozenset(),
+            )
+        )
+    assert "tail-marker" in visible_text()
+
+    second = _item("2" * 32, "Other", "short", ["Keep"])
+    panel.set_items([second])
+    control.set_lines(panel.render_lines(), overflow_hint=True)
+    assert control.offset == 0
+    assert "tail-marker" not in visible_text()
 
 
 def test_decisions_popup_answer_mode_captures_text() -> None:
