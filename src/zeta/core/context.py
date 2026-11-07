@@ -1092,9 +1092,9 @@ class ContextAssembler(ContextMarkerMixin):
 
     def _track_token_counts(self, items: Sequence[_ContextItem]) -> None:
         self._token_counts.track(
-            (item.entry, item.message)
+            (item.count_source, item.message)
             for item in items
-            if item.entry is not None and item.entry.type == "message"
+            if item.count_source is not None
         )
 
     def _system_prompt_message(self, system_append: str = "") -> Message | None:
@@ -1180,7 +1180,11 @@ class ContextAssembler(ContextMarkerMixin):
                 and message.tool_result.tool_call_id in failed_tool_call_ids
             ):
                 continue
-            items.append(_ContextItem(entry, without_client_delivery_marker(message)))
+            items.append(
+                _ContextItem(
+                    entry, without_client_delivery_marker(message), count_source=entry
+                )
+            )
         for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker, active_source_seqs, entries))
