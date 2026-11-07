@@ -89,6 +89,7 @@ from zeta.core.store import ConversationStore
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.diagnostics import tui_stalls as tui_stalls_module
 from zeta.mcp import MCPPrompt, MCPPromptArgument
+from zeta.project_context.projection import ProjectContextHealth
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialDriver,
@@ -6481,6 +6482,59 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("width", [40, 80, 160])
+async def test_status_card_wraps_complete_project_context_health(
+    tmp_path: Path, width: int
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    project_id = "p_004e3eba882987ad117afcb5a15c30ef"
+    app.loop.project_context_health = ProjectContextHealth(
+        "malformed_project",
+        project_id,
+        "project.json",
+        "project metadata is malformed",
+    )
+
+    try:
+        app.slash_status_command("")
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        app._status_card.bottom()
+        screen = render_full_screen(session, width, height=60)
+        with set_app(session.app):
+            screen.draw_all_floats()
+        rendered_lines = [
+            "".join(
+                screen.data_buffer[row][column].char for column in range(width)
+            ).rstrip()
+            for row in range(60)
+        ]
+        rendered = "\n".join(rendered_lines)
+        compact = "".join(rendered.replace("│", "").split())
+        expected = (
+            f"project_context_health:malformed_project({project_id}/project.json):"
+            "projectmetadataismalformed"
+        )
+
+        assert expected in compact
+        assert all(cell_len(line) <= width for line in rendered_lines)
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
 async def test_status_card_renders_viewed_session_transcript_index_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6532,8 +6586,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
             in rendered
         )
         assert (
-            "project_context_health: malformed_memory "
-            "(p_child/memory/brief.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_child/memory/brief.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
         assert "completion_client_setups: codex/gpt-test=1" in rendered
 
@@ -6541,8 +6596,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         lines = tui_app_module._status_card_lines(app.slash_status())
         rendered = "\n".join("".join(text for _style, text in line) for line in lines)
         assert (
-            "project_context_health: malformed_memory "
-            "(p_root/memory/state.md): project memory is malformed" in rendered
+            "project_context_health:malformed_memory"
+            "(p_root/memory/state.md):projectmemoryismalformed"
+            in "".join(rendered.split())
         )
     finally:
         await app.close()
