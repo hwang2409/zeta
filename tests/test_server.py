@@ -3899,9 +3899,10 @@ async def test_session_swap_reserves_child_completion_during_setup(
 
     # test-contract: seam serve has no public session-setup gate
     monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    # test-contract: seam serve has no public pre-setup gate
     monkeypatch.setattr(
         server.control, "_terminate_pending_approvals", gated_terminate_approvals
-    )  # test-contract: seam serve has no public pre-setup gate
+    )
     # test-contract: seam serve has no public background-wake observation
     monkeypatch.setattr(server.control, "_schedule_background_wake", observe_schedule_wake)
     monkeypatch.setattr(

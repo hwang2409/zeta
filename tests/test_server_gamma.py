@@ -1502,9 +1502,10 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             text="wake a",
         )
         server.control._schedule_background_wake(session_id)
-        await entered[0].wait()
+        assert server.control._turn_task is None
         release_resume.set()
         assert "result" in (await resume)[-1]
+        await entered[0].wait()
         release_backend[0].set()
         approval = await _event(reader, "approval_request")
         assert approval["request_id"] == call_a.id
@@ -1515,10 +1516,10 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             "approve",
             {"request_id": call_a.id},
         )
-        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-a"
+        assert _tool_stdout(await _event(reader, "tool_end")) == "snapshot-b"
         await _event(reader, "agent_end")
         assert any(
-            isinstance(block, TextContent) and "gamma-a" in block.text
+            isinstance(block, TextContent) and "gamma-b" in block.text
             for message in backend.calls[1][0]
             if message.role is MessageRole.SYSTEM
             for block in message.content
