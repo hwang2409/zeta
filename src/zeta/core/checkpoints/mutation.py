@@ -132,7 +132,6 @@ class _MethodMutation[ResultT]:
     persisted_callback: Callable[[], None] | None = None
     accept_external_generation: bool = False
     baseline_count: int | None = None
-    baseline_last_id: str | None = None
     baseline_digest: bytes | None = None
     baseline_patch: Mapping[str, object] | None = None
 
@@ -419,31 +418,30 @@ def _execute_method[ResultT](
         else command.baseline_patch
     )
     baseline_patch = _snapshot_patch(store, command.patch_fields)
+    writer_baseline_matches = (
+        len(store._entries) == baseline_count
+        and store._entry_prefix_digest == baseline_digest
+    )
+    full_reload_count = store._full_reload_count
     result = (
         command.method(store, *command.args, **dict(command.kwargs))
         if command.method_accepts_store
         else command.method(*command.args, **dict(command.kwargs))
     )
-    entries = (
-        store._installed_delta_from_baseline(
-            store._entries, (baseline_count, baseline_digest)
-        )
-        if command.accept_external_generation
-        else store._owned_installed_delta(tuple(store._entries[baseline_count:]))
-    )
-    baseline_index = (command.baseline_count or 0) - 1
-    writer_baseline_id = (
-        store._entries[baseline_index].id
-        if 0 <= baseline_index < len(store._entries)
+    entries = store._owned_installed_delta(tuple(store._entries[baseline_count:]))
+    baseline_parent_id = (
+        store._entries[baseline_count - 1].id
+        if 0 < baseline_count <= len(store._entries)
         else None
     )
     replace_entries = (
-        entries == "reset"
-        or store._entry_prefix_digest != command.baseline_digest
-        or writer_baseline_id != command.baseline_last_id
+        command.accept_external_generation
+        or not writer_baseline_matches
+        or store._full_reload_count != full_reload_count
+        or bool(entries and entries[0].parent_id != baseline_parent_id)
     )
     if replace_entries:
-        entries = tuple(store._entries)
+        entries = store._owned_installed_delta(tuple(store._entries))
     changed_patch = {
         field: copy.deepcopy(getattr(store, field))
         for field, old in baseline_patch.items()

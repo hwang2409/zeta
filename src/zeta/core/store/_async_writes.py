@@ -43,6 +43,7 @@ _REFRESH_PATCH_FIELDS = (
 )
 
 if TYPE_CHECKING:
+    from ..checkpoints import ConversationEntry
     from ._log import _DetachedLogState
     from ._store import ConversationStore
 
@@ -79,21 +80,35 @@ class AsyncDurableWritesMixin:
 
     def _install_committed_delta(
         self: ConversationStore, delta: CommittedDelta[Any]
-    ) -> None:
+    ) -> tuple[ConversationEntry, ...] | str:
         self._assert_owner_thread()
         if delta.duplicate:
-            return
-        if self.conversation_generation != delta.generation_before:
+            return ()
+        entries_to_install = delta.entries_to_install
+        if (
+            self.conversation_generation != delta.generation_before
+            and not delta._resident_patch.replace_entries
+        ):
             existing_ids = {entry.id for entry in self._entries}
-            if all(entry.id in existing_ids for entry in delta.entries_to_install):
-                return
-            raise ConversationIntegrityError(
-                "resident generation changed before committed delta installation"
+            missing = next(
+                (
+                    index
+                    for index, entry in enumerate(entries_to_install)
+                    if entry.id not in existing_ids
+                ),
+                len(entries_to_install),
             )
+            if missing == len(entries_to_install):
+                return ()
+            if any(entry.id in existing_ids for entry in entries_to_install[missing:]):
+                raise ConversationIntegrityError(
+                    "resident generation changed before committed delta installation"
+                )
+            entries_to_install = entries_to_install[missing:]
         entries = (
-            list(delta.entries_to_install)
+            list(entries_to_install)
             if delta._resident_patch.replace_entries
-            else list(copy.deepcopy(delta.entries_to_install))
+            else list(copy.deepcopy(entries_to_install))
         )
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
@@ -118,6 +133,11 @@ class AsyncDurableWritesMixin:
         self._log_prefix_fingerprint = cursor.prefix_fingerprint
         if entries:
             self._transcript_generation += 1
+        return (
+            "reset"
+            if delta._resident_patch.replace_entries
+            else tuple(entries_to_install)
+        )
 
     def commit(
         self: ConversationStore,
@@ -154,6 +174,8 @@ class AsyncDurableWritesMixin:
                 writer = self._new_persistent_durable_writer()
                 self._durable_writer = writer
             self._before_committed_mutation()
+            if cancelled_before_write.is_set():
+                raise asyncio.CancelledError
             cancelled_before_write.write_started.set()
             delta = execute_mutation(writer, command, expected_generation)
             return delta, writer.take_persisted_appends()
@@ -238,14 +260,15 @@ class AsyncDurableWritesMixin:
         )
         task = asyncio.current_task()
         cancelled = cancelled or (task is not None and task.cancelling() > 0)
+        installed: tuple[ConversationEntry, ...] | str = ()
         with self._durable_write_condition:
             if not self._closing and not self._closed:
-                self._install_committed_delta(delta)
+                installed = self._install_committed_delta(delta)
             self._accept_persisted_appends(receipts)
-        if delta._resident_patch.replace_entries:
+        if installed == "reset":
             self._publish_entries_installed("reset")
-        elif delta.entries_to_install:
-            self._publish_prepared_entries_installed(delta.entries_to_install)
+        elif installed:
+            self._publish_prepared_entries_installed(installed)
         if (
             isinstance(command, _MethodMutation)
             and command.persisted_callback is not None
@@ -297,7 +320,6 @@ class AsyncDurableWritesMixin:
                 persisted_callback=_on_persisted,
                 accept_external_generation=_accept_external_generation,
                 baseline_count=len(self._entries),
-                baseline_last_id=self._entries[-1].id if self._entries else None,
                 baseline_digest=self._entry_prefix_digest,
                 baseline_patch={
                     field: copy.deepcopy(getattr(self, field))
@@ -314,9 +336,6 @@ class AsyncDurableWritesMixin:
                     command = replace(
                         command,
                         baseline_count=len(self._entries),
-                        baseline_last_id=self._entries[-1].id
-                        if self._entries
-                        else None,
                         baseline_digest=self._entry_prefix_digest,
                         baseline_patch={
                             field: copy.deepcopy(getattr(self, field))

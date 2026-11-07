@@ -55,7 +55,12 @@ async def complete_delivery(
         for event in publication_events(publications):
             yield event
     if acknowledge is not None:
-        await acknowledge()
+        acknowledgement = asyncio.create_task(acknowledge())
+        try:
+            await asyncio.shield(acknowledgement)
+        except asyncio.CancelledError:
+            await acknowledgement
+            raise
 
 
 if TYPE_CHECKING:
@@ -173,7 +178,6 @@ class StepDeliveryFlow:
             return
         async with self._initialize_lock:
             if not self._initialized:
-                self.store._prepare_durable_writer_snapshot()
                 await self.store._commit_method_async(
                     self.store._warm_step_delivery_writer
                 )

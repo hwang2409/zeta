@@ -895,13 +895,15 @@ async def test_transient_owner_failure_wakes_waiter(
             address, AppendConversationRows((_warning("failed"),))
         )
     )
-    waiter = asyncio.create_task(
-        commit_conversation_async(
-            address, AppendConversationRows((_warning("survivor"),))
-        )
-    )
+    tasks = [owner]
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        waiter = asyncio.create_task(
+            commit_conversation_async(
+                address, AppendConversationRows((_warning("survivor"),))
+            )
+        )
+        tasks.append(waiter)
         await asyncio.sleep(0)
         assert not waiter.done()
         release.set()
@@ -910,12 +912,10 @@ async def test_transient_owner_failure_wakes_waiter(
         await asyncio.wait_for(waiter, 20)
     finally:
         release.set()
-        for task in (owner, waiter):
+        for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(owner, waiter, return_exceptions=True), 10
-        )
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert [entry.data["message"] for entry in reopened.entries] == ["survivor"]
