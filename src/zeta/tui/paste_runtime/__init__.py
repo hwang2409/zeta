@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +10,6 @@ from typing import Any
 
 from prompt_toolkit.buffer import Buffer
 
-from ...media.image_normalization import normalize_image_bytes
 from ...media.image_policy import image_policy_for_provider
 from ...protocol.types import ImageContent
 from .._attachments import AttachmentError, _read_attachment, paste_image
@@ -31,6 +29,8 @@ class PasteRuntime:
         self._generation = 0
         self._buffer_generation = 0
         self._tasks: set[asyncio.Task[str]] = set()
+        self._deletions: set[asyncio.Task[None]] = set()
+        self._prepared: dict[Path, ImageContent] = {}
         self._tail: asyncio.Task[str] | None = None
         self._insertions: dict[int, list[tuple[int, int]]] = {}
 
@@ -88,7 +88,10 @@ class PasteRuntime:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self._deletions:
+            await asyncio.gather(*tuple(self._deletions), return_exceptions=True)
         self._tail = None
+        self._prepared.clear()
         self._insertions.clear()
 
     async def _run(
@@ -142,6 +145,7 @@ class PasteRuntime:
             )
             return ""
 
+        self._prepared[staged.path] = staged.content
         result = host._finish_image_paste(staged)
         if buffer is not None and cursor_position is not None:
             self._insert(buffer, cursor_position, result)
@@ -174,24 +178,37 @@ class PasteRuntime:
     def _stage(store: Any, policy: Any) -> StagedImage:
         path = paste_image(store.session_dir, directory_fd=store.directory_fd)
         try:
-            content = _read_attachment(path, store)
+            content = _read_attachment(path, store, policy)
             if not isinstance(content, ImageContent):
                 raise AttachmentError("clipboard image could not be decoded")
-            prepared = asyncio.run(
-                normalize_image_bytes(base64.b64decode(content.data), policy)
-            )
-            with open(path, "wb") as handle:
-                handle.write(prepared.data or b"")
-            content = ImageContent(
-                base64.b64encode(prepared.data or b"").decode("ascii"),
-                prepared.media_type,
-                str(path),
-                len(prepared.data or b""),
-            )
             return StagedImage(path, content)
         except (AttachmentError, OSError):
             PasteRuntime._delete_staged(path, store.session_dir, store.directory_fd)
             raise
+
+    def prepared_for(self, paths: list[Path]) -> dict[Path, ImageContent]:
+        return {path: self._prepared[path] for path in paths if path in self._prepared}
+
+    def forget(self, path: Path) -> None:
+        self._prepared.pop(path, None)
+
+    def delete(self, path: Path) -> None:
+        self.forget(path)
+        store = self._host.loop.store
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._delete_staged, path, store.session_dir, store.directory_fd
+            )
+        )
+        self._deletions.add(task)
+        task.add_done_callback(self._deletion_finished)
+
+    def _deletion_finished(self, task: asyncio.Task[None]) -> None:
+        self._deletions.discard(task)
+        try:
+            task.result()
+        except OSError as exc:
+            self._host._print_system(f"attachment cleanup failed: {exc}")
 
     def _is_current(
         self,

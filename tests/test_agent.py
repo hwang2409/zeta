@@ -4400,6 +4400,85 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
     assert child_store.agent_lifecycle()["turns_used"] == turns + 1
 
 
+async def _assert_child_uses_committed_profile_body(
+    tmp_path: Path, *, delete_source: bool
+) -> None:
+    home = tmp_path / "home"
+    profile = home / "agents" / "specialist.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "---\nname: specialist\ndescription: focused specialist\n"
+        "---\ncommitted specialist body\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_agents(home=home)
+    preset = catalog.find("specialist")
+    assert preset.prompt_suffix == "committed specialist body"
+    if delete_source:
+        profile.unlink()
+    else:
+        profile.write_text("invalid replacement", encoding="utf-8")
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "specialist-1",
+                        "agent",
+                        {
+                            "prompt": "inspect the task",
+                            "description": "specialist task",
+                            "preset": "specialist",
+                        },
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=catalog,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        assert len(backend.calls) == 2, "child did not start from the committed profile"
+        child_system = backend.calls[1][0][0]
+        assert any(
+            isinstance(block, TextContent)
+            and "committed specialist body" in block.text
+            for block in child_system.content
+        )
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_uses_committed_profile_body_after_invalid_disk_edit(
+    tmp_path: Path,
+) -> None:
+    await _assert_child_uses_committed_profile_body(tmp_path, delete_source=False)
+
+
+@pytest.mark.asyncio
+async def test_child_uses_committed_profile_body_after_source_deletion(
+    tmp_path: Path,
+) -> None:
+    await _assert_child_uses_committed_profile_body(tmp_path, delete_source=True)
+
+
 @pytest.mark.asyncio
 async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_tools(
     tmp_path: Path,

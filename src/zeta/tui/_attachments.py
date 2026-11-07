@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +52,21 @@ class AttachmentError(ValueError):
 class AttachmentRef:
     token: str
     path: Path
+    position: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _AttachmentSource:
+    path: Path
+    token: str | None
+    pending: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAttachments:
+    message: Message
+    publication: tuple[Path, ...]
+    notices: tuple[str, ...]
 
 
 def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ...]:
@@ -78,8 +93,39 @@ def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ..
             path = _attachment_path(path)
         except (RuntimeError, OSError, ValueError):
             continue
-        refs.append(AttachmentRef(match.group(0), path))
+        refs.append(AttachmentRef(match.group(0), path, match.start()))
     return tuple(refs)
+
+
+def _ordered_attachment_sources(
+    value: str,
+    base_dir: str | Path,
+    pending_paths: tuple[Path, ...],
+    pending_tokens: Mapping[str, Path] | None,
+) -> tuple[_AttachmentSource, ...]:
+    positioned = [
+        (ref.position, _AttachmentSource(ref.path, ref.token, False))
+        for ref in attachment_refs(value, base_dir)
+    ]
+    token_positions: dict[Path, int] = {}
+    for token, path in (pending_tokens or {}).items():
+        position = value.find(token)
+        if position >= 0:
+            resolved = _attachment_path(path)
+            token_positions[resolved] = min(
+                position, token_positions.get(resolved, position)
+            )
+    after_text = len(value)
+    for offset, path in enumerate(pending_paths):
+        resolved = _attachment_path(path)
+        positioned.append(
+            (
+                token_positions.get(resolved, after_text + offset),
+                _AttachmentSource(resolved, None, True),
+            )
+        )
+    positioned.sort(key=lambda item: item[0])
+    return tuple(item for _, item in positioned)
 
 
 def _image_media_type(data: bytes) -> str | None:
@@ -208,6 +254,62 @@ def _read_attachment(
     return TextContent(labeled, str(path), size)
 
 
+def prepare_attachments(
+    value: str,
+    base_dir: str | Path,
+    pending_paths: tuple[Path, ...] = (),
+    *,
+    attachment_value: str | None = None,
+    session_store: ConversationStore | None = None,
+    image_policy: ImagePolicy | None = None,
+    prepared_paths: Mapping[Path, ImageContent] | None = None,
+    pending_tokens: Mapping[str, Path] | None = None,
+) -> PreparedAttachments:
+    """Prepare every selected source once; callers must run this off-loop."""
+
+    attached: set[Path] = set()
+    reference_paths: set[Path] = set()
+    publication: list[Path] = []
+    notices: list[str] = []
+    blocks = [TextContent(value)]
+    source_value = value if attachment_value is None else attachment_value
+    sources = _ordered_attachment_sources(
+        source_value, base_dir, pending_paths, pending_tokens
+    )
+    for source in sources:
+        if not source.pending:
+            if source.path in reference_paths:
+                continue
+            reference_paths.add(source.path)
+        elif source.path not in publication:
+            publication.append(source.path)
+        if source.path in attached:
+            continue
+        try:
+            attachment = (
+                prepared_paths.get(source.path)
+                if source.pending and prepared_paths is not None
+                else None
+            )
+            if attachment is None:
+                attachment = _read_attachment(
+                    source.path, session_store, image_policy
+                )
+        except AttachmentError as exc:
+            if source.pending:
+                publication.remove(source.path)
+                notices.append(f"pending attachment dropped: {exc}")
+            elif exc.reason != "missing":
+                notices.append(f"{source.token} not attached: {exc.reason}")
+            continue
+        attached.add(source.path)
+        blocks.append(attachment)
+    message = with_message_origin(
+        Message(MessageRole.USER, blocks), MessageOrigin.USER
+    )
+    return PreparedAttachments(message, tuple(publication), tuple(notices))
+
+
 def build_user_message(
     value: str,
     base_dir: str | Path,
@@ -218,32 +320,20 @@ def build_user_message(
     on_reference_notice: Callable[[str], None] | None = None,
     image_policy: ImagePolicy | None = None,
 ) -> Message:
-    """Resolve attachments; callers with an image policy must run off-loop."""
+    """Build a user message for synchronous callers."""
 
-    paths: list[Path] = []
-    reference_paths: set[Path] = set()
-    blocks = [TextContent(value)]
-    source = value if attachment_value is None else attachment_value
-    for ref in attachment_refs(source, base_dir):
-        if ref.path in reference_paths:
-            continue
-        reference_paths.add(ref.path)
-        try:
-            attachment = _read_attachment(ref.path, session_store, image_policy)
-        except AttachmentError as exc:
-            if exc.reason != "missing" and on_reference_notice is not None:
-                on_reference_notice(f"{ref.token} not attached: {exc.reason}")
-        else:
-            paths.append(ref.path)
-            blocks.append(attachment)
-    for path in pending_paths:
-        resolved = _attachment_path(path)
-        if resolved not in paths:
-            paths.append(resolved)
-            blocks.append(_read_attachment(resolved, session_store))
-    return with_message_origin(
-        Message(MessageRole.USER, blocks), MessageOrigin.USER
+    prepared = prepare_attachments(
+        value,
+        base_dir,
+        pending_paths,
+        attachment_value=attachment_value,
+        session_store=session_store,
+        image_policy=image_policy,
     )
+    if on_reference_notice is not None:
+        for notice in prepared.notices:
+            on_reference_notice(notice)
+    return prepared.message
 
 
 def paste_image(session_dir: str | Path, *, directory_fd: int | None = None) -> Path:
