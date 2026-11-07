@@ -118,7 +118,6 @@ from .skill_refresh import SkillRefreshMixin
 from .tool_schema import canonical_tool_schemas
 from .turn_persistence import TurnPersistenceMixin
 
-
 def _sanitize_account_message(message: Message) -> Message:
     content = [
         ThinkingContent(block.text) if isinstance(block, ThinkingContent) else block
@@ -711,12 +710,9 @@ class AgentLoop(
             error=error,
         )
     @staticmethod
-    def _record_recovery_event(
-        recovery_state: EmptyTurnRecoveryState, event: StreamEvent
-    ) -> None:
+    def _record_recovery_event(state: EmptyTurnRecoveryState, event: StreamEvent) -> None:
         if event.type is StreamEventType.TOOL_EXECUTION_END:
-            recovery_state.record_tool_result(event.tool_call, event.tool_result)
-
+            state.record_tool_result(event.tool_call, event.tool_result)
     async def _handle_toolless_turn(
         self,
         step_delivery: StepDeliveryFlow,
@@ -758,7 +754,6 @@ class AgentLoop(
             ),
             StreamEvent(StreamEventType.AGENT_END),
         ), True
-
     async def _run_turn_impl(
         self,
         user_text: str,
