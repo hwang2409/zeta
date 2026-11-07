@@ -324,7 +324,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
-        self._pending_request_publication = asyncio.Event()
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -647,16 +646,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 return True
         return False
 
-    async def wait_for_delegated_requests(self, count: int = 1) -> list[ApprovalRequest]:
-        """Wait until at least ``count`` durable delegated requests are published."""
-
-        while True:
-            publication = self._pending_request_publication
-            pending = self.pending_requests()
-            if len(pending) >= count:
-                return pending
-            await publication.wait()
-
     def pending_requests(self) -> list[ApprovalRequest]:
         """Return strict pending state for decisions and server actions."""
 
@@ -749,8 +738,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             ),
             store,
         )
-        self._pending_request_publication.set()
-        self._pending_request_publication = asyncio.Event()
 
     def cleanup_delegated(
         self, child_instance_id: str

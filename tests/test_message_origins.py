@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_agent import (
     RunBackend,
@@ -732,7 +733,7 @@ async def test_agent_send_entry_persists_agent_send_origin(tmp_path: Path) -> No
         channel=loop._background_owner.conversation_channel,
     ) is None
     backend.release_child.set()
-    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
+    await wait_background_owner(loop)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     row = next(
