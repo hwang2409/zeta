@@ -860,7 +860,7 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
     async def child_result() -> dict[str, object]:
         return {"content": [{"text": "done"}], "isError": False}
 
-    async def close_child() -> tuple[()]:
+    async def close_child(_cause: str) -> tuple[()]:
         return ()
 
     watcher = asyncio.create_task(
@@ -999,7 +999,7 @@ async def _assert_failed_child_waits_for_owned_descendant(
         }[terminal_path]
         return {"content": [{"text": text}], "isError": True}
 
-    async def close_child() -> tuple[()]:
+    async def close_child(_cause: str) -> tuple[()]:
         return ()
 
     finish_kwargs = {

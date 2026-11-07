@@ -247,7 +247,9 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
-    killer = asyncio.create_task(registry.kill(task_id))
+    killer = asyncio.create_task(
+        registry.kill(task_id, cause="test requested task stop")
+    )
     try:
         await asyncio.wait_for(archive_entered.wait(), 10)
         await asyncio.wait_for(monitor_cancelled.wait(), 10)
@@ -284,7 +286,7 @@ async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
             await waiter
         assert registry.snapshot()[0].running is True
     finally:
-        await registry.kill(task_id)
+        await registry.kill(task_id, cause="test requested task stop")
         await registry.close()
 
 
