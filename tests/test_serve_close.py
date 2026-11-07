@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,9 +46,24 @@ def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
     return lines
 
 
+def _test_files() -> list[Path]:
+    root = _TESTS_ROOT.parent
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--", "tests/*.py", "tests/**/*.py"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return sorted(_TESTS_ROOT.rglob("*.py"))
+    return [root / path for path in result.stdout.splitlines()]
+
+
 def test_close_serve_is_never_called_under_a_condition() -> None:
     offenders: list[str] = []
-    for path in sorted(_TESTS_ROOT.rglob("*.py")):
+    for path in _test_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         root = _TESTS_ROOT.parent
         offenders.extend(
@@ -58,6 +74,17 @@ def test_close_serve_is_never_called_under_a_condition() -> None:
         "close_serve must not be nested inside an if/elif/else body "
         f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
     )
+
+
+def test_close_serve_guard_ignores_untracked_runtime_probe() -> None:
+    probe = _TESTS_ROOT / "test_zz_probe_tmp.py"
+    probe.write_text("def test_probe():\n    pass\n", encoding="utf-8")
+    try:
+        files = _test_files()
+        assert _TESTS_ROOT / "test_serve_close.py" in files
+        assert probe not in files
+    finally:
+        probe.unlink()
 
 
 @dataclass
