@@ -2475,9 +2475,11 @@ def test_missing_credentials_are_derived_availability_not_migration_failure(
     )
 
     assert store.migrate() == ()
-    assert {
-        item.account: item.available for item in store.list_display()
-    } == {current: True, missing: False, other: False}
+    assert {item.account: item.available for item in store.list_display()} == {
+        current: True,
+        missing: False,
+        other: False,
+    }
     assert store.resolve_account("codex") == current
     with pytest.raises(
         AccountError,
