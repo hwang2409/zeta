@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.support.notification_fixtures import notification_payloads
+from zeta import storage_format
 from zeta.core import agent_state
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -2229,6 +2230,49 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     assert reopened_again.entries[-1].seq == warning_seq
     assert reopened_again.entries[-1].parent_id == reopened.entries[-1].parent_id
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
+
+
+@pytest.mark.parametrize("epoch", [2, 3])
+def test_lower_epoch_torn_tail_keeps_legacy_repair_without_recovery_files(
+    tmp_path: Path, epoch: int
+) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id=f"lower-epoch-{epoch}")
+    store.append_message(
+        with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
+    )
+    store.close()
+    path = sessions / store.session_id / "conversation.jsonl"
+    with path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
+    damaged = path.read_bytes()
+    (store._storage_lease.home / "storage-format.json").write_text(
+        json.dumps({"writer_epoch": epoch}) + "\n"
+    )
+
+    script = """
+import json
+from pathlib import Path
+from zeta.core.store import ConversationStore
+store = ConversationStore(Path(__import__('sys').argv[1]), session_id=__import__('sys').argv[2])
+print(json.dumps({
+    'data': store.entries[-1].data,
+    'recovery': list(store.session_dir.glob('conversation.recovery.*')),
+    'quarantine': list(store.session_dir.glob('conversation.quarantine.*')),
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(sessions), store.session_id],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert path.read_bytes() != damaged
+    assert result["data"] == {"message": "dropped torn final conversation line"}
+    assert result["recovery"] == []
+    assert result["quarantine"] == []
+    assert storage_format.WRITER_EPOCH == 4
 
 
 def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:

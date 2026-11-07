@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
+from ...storage_format import WRITER_EPOCH
 from ..checkpoints import (
     CONVERSATION_ENTRY_TYPES,
     ConversationEntry,
@@ -967,6 +968,8 @@ class ConversationLogMixin:
         except TranscriptLoadError as error:
             if not self._repair_explicit or error._source_facts is None:
                 raise
+            if self._storage_lease.observed_epoch != WRITER_EPOCH:
+                raise
             self._last_repair_result = repair_transcript(
                 self.directory_fd,
                 RepairTarget(self.session_id),
@@ -983,6 +986,12 @@ class ConversationLogMixin:
             if self.on_entries_installed is not None
             else ()
         )
+        if torn_offset is not None and self._storage_lease.observed_epoch != WRITER_EPOCH:
+            self._repair_torn_tail_legacy(torn_offset)
+            self._log_offset = torn_offset
+            self._publish_entries_installed(delta)
+            self._append_torn_warning_legacy()
+            return
         if torn_offset is not None:
             prefix = validator.validated_prefix(torn_offset)
             source = TranscriptSourceFacts(
@@ -1122,6 +1131,26 @@ class ConversationLogMixin:
                 )
             validator.accept(physical_row)
         validator.finish()
+
+    def _repair_torn_tail_legacy(self: ConversationStore, offset: int) -> None:
+        with os.fdopen(
+            open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR),
+            "r+b",
+        ) as handle:
+            handle.truncate(offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._set_log_stat(os.fstat(handle.fileno()))
+
+    def _append_torn_warning_legacy(self: ConversationStore) -> None:
+        self._append_row_unlocked(
+            "warning", {"message": "dropped torn final conversation line"}
+        )
+        warnings.warn(
+            f"dropped torn final conversation line from {self.path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     def _write_line(self: ConversationStore, row: dict[str, Any]) -> None:
         encoded = encode_json(row) + b"\n"

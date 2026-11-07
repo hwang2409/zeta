@@ -531,6 +531,13 @@ class WriterLease:
         self._entry = entry
         self._closed = False
 
+    @property
+    def observed_epoch(self) -> int:
+        """Return the home epoch observed when this lease was acquired."""
+        if self._closed:
+            raise StorageFormatError("stored-format lease is closed")
+        return self._entry.epoch
+
     def retain(self) -> WriterLease:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
