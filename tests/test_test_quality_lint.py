@@ -216,6 +216,21 @@ def test_internal_contract_rule_rejects_bare_seam_marker(tmp_path: Path) -> None
     assert "seam <reason>" in findings[0].message
 
 
+def test_tq005_rejects_production_bootstraps_in_conftest(tmp_path: Path) -> None:
+    source = """import os
+
+os.environ[\"ZETA_HOME\"] = \"/tmp/home\"
+os.environ[\"ZETA_TEST_SCRIPTED_PROVIDER\"] = \"1\"
+"""
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [(finding.code, finding.line) for finding in findings] == [
+        ("TQ005", 3),
+        ("TQ005", 4),
+    ]
+
+
 def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> None:
     source = 'import os\nos.environ["ZETA_TEST_BOOTSTRAP_STORAGE_FORMAT"] = "1"\n'
 
@@ -237,6 +252,44 @@ def test_tq005_rejects_global_zeta_bootstraps_in_conftest(tmp_path: Path) -> Non
 )
 def test_tq005_allows_local_environment_setup(tmp_path: Path, source: str) -> None:
     assert _lint(tmp_path, source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """import os
+
+environ = os.environ
+environ[\"ZETA_ALIAS\"] = \"1\"
+""",
+        """from os import environ
+environ[\"ZETA_IMPORTED\"] = \"1\"
+""",
+        """import os
+os.environ |= {\"ZETA_AUGASSIGN\": \"1\"}
+""",
+        """from os import environ
+from pytest import fixture
+
+@fixture(scope=\"session\")
+def session():
+    environ[\"ZETA_IMPORTED_FIXTURE\"] = \"1\"
+""",
+    ],
+)
+def test_tq005_rejects_environment_syntax_variants(tmp_path: Path, source: str) -> None:
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert [finding.code for finding in findings] == ["TQ005"]
+
+
+def test_tq005_reports_dynamic_environment_expression(tmp_path: Path) -> None:
+    source = 'import os\nname = input_name\nos.environ[name] = "1"\n'
+
+    findings = _lint(tmp_path, source, path="tests/conftest.py")
+
+    assert len(findings) == 1
+    assert "global test bootstrap name hides" in findings[0].message
 
 
 def test_tq005_rejects_session_fixture_and_hook(tmp_path: Path) -> None:

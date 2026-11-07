@@ -33,8 +33,6 @@ MIN_HANG_GUARD_SECONDS = 10
 GLOBAL_BOOTSTRAP_ALLOWLIST = {
     "ZETA_TEST_PARENT_PID",  # harness identity for child-process ownership checks
     "ZETA_STALL_WATCHDOG",  # disables an unrelated watchdog during test setup
-    "ZETA_HOME",  # points tests at their isolated home directory
-    "ZETA_TEST_SCRIPTED_PROVIDER",  # selects the test-only provider backend
     "ZETA_TEST_AUDIT_LEDGER",  # passes the fixture's audit destination to children
     "ZETA_TEST_LIVE_HOME",  # identifies the guarded live-home fixture
     "ZETA_TEST_OWNERSHIP_TOKEN",  # authenticates writes from guarded children
@@ -380,53 +378,102 @@ def _env_name(node: ast.AST, source: str) -> str | None:
     return ast.get_source_segment(source, node) or ast.unparse(node)
 
 
-def _global_bootstrap_names(node: ast.AST, source: str) -> list[str]:
-    if isinstance(node, ast.Assign):
-        targets = node.targets
-        if len(targets) != 1 or not isinstance(targets[0], ast.Subscript):
+def _environment_receivers(tree: ast.AST) -> set[str]:
+    receivers = {"os.environ"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "os":
+            for imported in node.names:
+                if imported.name == "environ":
+                    receivers.add(imported.asname or imported.name)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and _name(node.value) == "os.environ"
+        ):
+            receivers.add(node.targets[0].id)
+    return receivers
+
+
+def _env_receiver(node: ast.AST, receivers: set[str]) -> str | None:
+    receiver = _name(node)
+    return receiver if receiver in receivers else None
+
+
+def _assignment_bootstrap_names(
+    node: ast.Assign | ast.AugAssign, source: str, receivers: set[str]
+) -> list[str]:
+    if isinstance(node, ast.AugAssign):
+        if _env_receiver(node.target, receivers) is None or not isinstance(
+            node.value, ast.Dict
+        ):
             return []
-        target = targets[0]
-        if _name(target.value) != "os.environ":
-            return []
-        name = _env_name(target.slice, source)
-        return [name] if name else []
-    if not isinstance(node, ast.Call):
+        return [
+            name
+            for key in node.value.keys
+            if key is not None
+            for name in [_env_name(key, source)]
+            if name
+        ]
+    targets = node.targets
+    if len(targets) != 1 or not isinstance(targets[0], ast.Subscript):
         return []
+    target = targets[0]
+    if _env_receiver(target.value, receivers) is None:
+        return []
+    name = _env_name(target.slice, source)
+    return [name] if name else []
+
+
+def _call_bootstrap_names(
+    node: ast.Call, source: str, receivers: set[str]
+) -> list[str]:
     function = _name(node.func)
-    if function in {"os.putenv", "os.environ.setdefault"} and node.args:
+    if function == "os.putenv" and node.args:
         name = _env_name(node.args[0], source)
         return [name] if name else []
-    if function == "os.environ.update" and node.args:
-        update = node.args[0]
-        if isinstance(update, ast.Dict):
-            names = []
-            for key in update.keys:
-                if key is not None:
-                    name = _env_name(key, source)
-                    if name:
-                        names.append(name)
-            return names
-        name = _env_name(update, source)
-        return [name] if name else []
-    if isinstance(node.func, ast.Attribute) and node.func.attr == "setenv":
-        receiver = node.func.value
-        if (
-            (_name(receiver) == "monkeypatch")
+    if isinstance(node.func, ast.Attribute) and node.args:
+        receiver = _env_receiver(node.func.value, receivers)
+        if receiver is not None and node.func.attr in {"setdefault", "update"}:
+            update = node.args[0]
+            if node.func.attr == "update" and isinstance(update, ast.Dict):
+                return [
+                    name
+                    for key in update.keys
+                    if key is not None
+                    for name in [_env_name(key, source)]
+                    if name
+                ]
+            name = _env_name(update, source)
+            return [name] if name else []
+        if node.func.attr == "setenv" and (
+            _name(node.func.value) == "monkeypatch"
             or (
-                isinstance(receiver, ast.Call) and _name(receiver.func) == "MonkeyPatch"
+                isinstance(node.func.value, ast.Call)
+                and _name(node.func.value.func) == "MonkeyPatch"
             )
-        ) and node.args:
+        ):
             name = _env_name(node.args[0], source)
             return [name] if name else []
     return []
 
 
+def _global_bootstrap_names(
+    node: ast.AST, source: str, receivers: set[str]
+) -> list[str]:
+    if isinstance(node, (ast.Assign, ast.AugAssign)):
+        return _assignment_bootstrap_names(node, source, receivers)
+    if isinstance(node, ast.Call):
+        return _call_bootstrap_names(node, source, receivers)
+    return []
+
+
 def _is_session_fixture(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     for decorator in node.decorator_list:
-        if (
-            not isinstance(decorator, ast.Call)
-            or _name(decorator.func) != "pytest.fixture"
-        ):
+        if not isinstance(decorator, ast.Call) or _name(decorator.func) not in {
+            "pytest.fixture",
+            "fixture",
+        }:
             continue
         return any(
             keyword.arg == "scope"
@@ -442,6 +489,7 @@ def _global_bootstrap_findings(
 ) -> list[Finding]:
     module_scope = path.name in {"conftest.py", "sitecustomize.py"}
     findings: list[Finding] = []
+    receivers = _environment_receivers(tree)
 
     def visit(node: ast.AST, global_scope: bool = module_scope) -> None:
         child_scope = global_scope
@@ -456,7 +504,7 @@ def _global_bootstrap_findings(
             and hasattr(node, "lineno")
             and _touches_added_line(node, added)
         ):
-            for name in _global_bootstrap_names(node, source):
+            for name in _global_bootstrap_names(node, source, receivers):
                 if name in GLOBAL_BOOTSTRAP_ALLOWLIST:
                     continue
                 findings.append(
