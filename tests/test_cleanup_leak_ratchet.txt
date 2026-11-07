@@ -183,15 +183,12 @@ tests/test_agent.py::test_grandchild_approval_composes_with_parent_policy[approv
 tests/test_agent.py::test_grandchild_approval_composes_with_parent_policy[deny-tool execution denied]
 tests/test_agent.py::test_grandchild_inherits_child_cwd
 tests/test_agent.py::test_idle_notification_wakes_waiting_parent_without_polling
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[/Users/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)' 'Authorization: ***'-auth-secret-123]
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[/Users/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)' --***
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[/home/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)' 'Authorization: ***'-auth-secret-123]
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[/home/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)' --***
 tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[3<'url-user:url-pass@example.com' cat; sleep 30-url-user:url-pass@example.com]
 tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[<'/tmp/password-secret' cat; sleep 30-password-secret]
 tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[<<'heredoc-secret' cat\nbody\nheredoc-secret\nsleep 30-heredoc-secret]
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[TOKEN=token-secret-456 /Users/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)'-token-secret-456]
-tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[TOKEN=token-secret-456 /home/runner/work/zeta/zeta/.venv/bin/python -c 'import time; time.sleep(30)'-token-secret-456]
+tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[TOKEN=token-secret-456 {python} -c 'import time; time.sleep(30)'-token-secret-456]
+tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[{python} -c 'import time; time.sleep(30)' 'Authorization: ***'-auth-secret-123]
+tests/test_agent.py::test_killed_task_receipt_never_contains_command_secrets[{python} -c 'import time; time.sleep(30)' --***
 tests/test_agent.py::test_large_request_admission_counts_off_loop_without_stalling_heartbeat
 tests/test_agent.py::test_legacy_tree_budget_fields_are_tolerated
 tests/test_agent.py::test_live_child_holds_runtime_lease_until_store_close
@@ -763,6 +760,7 @@ tests/test_anthropic.py::test_agent_loop_sends_one_zeta_identity_after_oauth_spo
 tests/test_anthropic.py::test_anthropic_failure_persists_signed_empty_thinking_through_loop
 tests/test_anthropic.py::test_anthropic_stop_reason_persisted_on_assistant_message
 tests/test_anthropic.py::test_cancel_mid_thinking_drops_partial_block_before_resume
+tests/test_anthropic.py::test_cancellation_survives_failing_owned_client_cleanup
 tests/test_anthropic.py::test_compaction_keeps_stable_cache_prefix_bytes
 tests/test_anthropic.py::test_early_eof_retry_omits_empty_salvaged_text_block
 tests/test_anthropic.py::test_max_tokens_mid_tool_call_has_no_provider_retry_record
@@ -838,7 +836,6 @@ tests/test_attachments.py::test_unusable_reference_sends_with_notice
 tests/test_auto_memory_integration.py::test_attention_fork_runtime_does_not_enter_project_transcript_index
 tests/test_auto_memory_integration.py::test_composed_runtime_reconciles_real_persisted_trigger_and_notices
 tests/test_auto_memory_integration.py::test_memory_reconciliation_builds_backend_off_event_loop
-tests/test_auto_project_association.py::test_project_init_rebinds_runtime_child_and_approval
 tests/test_auto_project_association.py::test_project_tool_inspects_auto_associated_memory
 tests/test_auto_project_association.py::test_registry_failure_is_nonfatal_and_warns
 tests/test_background.py::test_background_agent_store_closes_before_root_shutdown
@@ -1354,7 +1351,6 @@ tests/test_read_images.py::test_read_uses_active_provider_limits
 tests/test_read_images.py::test_small_image_no_subprocess
 tests/test_read_images.py::test_tui_renders_compact_image_read_card
 tests/test_read_images.py::test_tui_resume_renders_receipt_for_corrupt_stored_image
-tests/test_read_images.py::test_vips_path_converts_display_p3_to_srgb_and_preserves_untagged
 tests/test_remote_sync.py::test_session_push_agent_tool_cannot_force_replacement
 tests/test_remote_sync.py::test_session_push_agent_tool_marks_registry_busy_as_retryable
 tests/test_resume_notification_perf.py::test_async_tui_replay_persists_rendered_notifications_before_error

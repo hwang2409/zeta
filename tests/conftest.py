@@ -719,6 +719,10 @@ def _cleanup_leak_ratchet() -> frozenset[str]:
     )
 
 
+def _cleanup_leak_nodeid(nodeid: str) -> str:
+    return nodeid.replace(sys.executable, "{python}")
+
+
 def _cleanup_leak_failure(
     nodeid: str, stores: int, descriptors: int, ratchet: frozenset[str]
 ) -> str | None:
@@ -895,7 +899,7 @@ async def close_direct_test_runtime_owners(
     after_cleanup = _open_file_descriptors()
     leaked_descriptors = len(before_cleanup.keys() - after_cleanup.keys())
     failure = _cleanup_leak_failure(
-        request.node.nodeid,
+        _cleanup_leak_nodeid(request.node.nodeid),
         leaked_stores,
         leaked_descriptors,
         _cleanup_leak_ratchet(),

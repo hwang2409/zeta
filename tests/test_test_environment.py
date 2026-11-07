@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from tests.conftest import _cleanup_leak_failure
+from tests.conftest import _cleanup_leak_failure, _cleanup_leak_nodeid
 
 COLLECTION_HOME = Path.home()
 
@@ -28,6 +28,14 @@ def test_cleanup_leak_failure_names_the_owner(stores: int, descriptors: int) -> 
     assert failure == (
         f"{stores} stores / {descriptors} fds left open by this test; open them "
         "with `async with owned_resources() as owner: owner.store(...)`"
+    )
+
+
+def test_cleanup_leak_nodeid_hides_the_environment_python_path() -> None:
+    nodeid = f"tests/test_probe.py::test_process[{sys.executable} -c pass]"
+
+    assert _cleanup_leak_nodeid(nodeid) == (
+        "tests/test_probe.py::test_process[{python} -c pass]"
     )
 
 
