@@ -602,8 +602,7 @@ class AgentTranscriptSource:
         self._log_refresh_error(error, traceback=True)
         reason = (
             (
-                "transcript corrupt; run "
-                + command
+                f"{error}; run {command}"
                 if (command := _repair_command(path))
                 else str(error)
             )
