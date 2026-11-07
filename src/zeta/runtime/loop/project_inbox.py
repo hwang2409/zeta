@@ -13,13 +13,7 @@ from ...project_inbox import (
     SentMessageTracker,
 )
 from ...project_registry import ProjectRegistryError
-from ...protocol.types import (
-    MESSAGE_ORIGIN_METADATA,
-    Message,
-    MessageOrigin,
-    MessageRole,
-    TextContent,
-)
+from ...protocol.types import Message, harness_notice
 
 _MAX_PENDING_SENT_STATUSES = 100
 _MAX_SENT_STATUS_LINES = 10
@@ -123,15 +117,14 @@ class ProjectInboxNotificationMixin:
             + "\n".join(lines)
             + "\n--- END UNTRUSTED CROSS-PROJECT DATA ---"
         )
-        return Message(
-            MessageRole.USER,
-            [TextContent(text)],
+        return harness_notice(
+            "inbox status",
+            text,
+            event=SENT_STATUS_EVENT,
             metadata={
-                "zeta_event": SENT_STATUS_EVENT,
-                MESSAGE_ORIGIN_METADATA: MessageOrigin.HARNESS_NUDGE.value,
                 "sent_statuses": [
                     {"message_id": key[0], "status": key[1]} for key, _record in pending
-                ],
+                ]
             },
         )
 
