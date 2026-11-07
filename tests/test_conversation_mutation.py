@@ -824,13 +824,13 @@ async def test_transient_waiter_cancellation_does_not_release_owner(
     owner = asyncio.create_task(
         commit_conversation_async(address, AppendConversationRows((_warning("owner"),)))
     )
-    waiter = asyncio.create_task(
-        commit_conversation_async(
-            address, AppendConversationRows((_warning("cancelled"),))
-        )
-    )
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 11)
+        waiter = asyncio.create_task(
+            commit_conversation_async(
+                address, AppendConversationRows((_warning("cancelled"),))
+            )
+        )
         await asyncio.sleep(0)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
