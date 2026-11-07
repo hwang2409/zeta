@@ -278,7 +278,7 @@ class _GatedClose:
         self._events.append("async.close")
         for entered, release in zip(self.entered, self.release, strict=True):
             entered.set()
-            await release.wait()
+            await asyncio.wait_for(release.wait(), 10)
         if "async.close" in self._failures:
             raise _InjectedError("async.close")
         self.finished = True
