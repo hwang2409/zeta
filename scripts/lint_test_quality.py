@@ -585,6 +585,20 @@ def _scan_deadline_nodes(
     ]
 
 
+def _deadline_nodes(
+    nodes: list[ast.AST],
+    added_nodes: list[ast.AST],
+    added: set[int],
+    parents: dict[ast.AST, ast.AST],
+) -> list[ast.AST]:
+    return [
+        node
+        for node in nodes
+        if node in added_nodes
+        or _enclosing_function_touches_added_line(node, added, parents)
+    ]
+
+
 def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -609,12 +623,7 @@ def lint_source(path: Path, source: str, added: set[int]) -> list[Finding]:
     }
     nodes = [node for node in ast.walk(tree) if hasattr(node, "lineno")]
     added_nodes = [node for node in nodes if _touches_added_line(node, added)]
-    deadline_nodes = [
-        node
-        for node in nodes
-        if node in added_nodes
-        or _enclosing_function_touches_added_line(node, added, parents)
-    ]
+    deadline_nodes = _deadline_nodes(nodes, added_nodes, added, parents)
     findings = _scan_added_nodes(
         path, added_nodes, lines, literal_names, serialized_names
     )

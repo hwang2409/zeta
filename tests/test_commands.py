@@ -17,7 +17,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.owned import owned_app
+from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
@@ -1629,7 +1629,9 @@ skill_catalog=SkillCatalog.empty(),
         app.abort_active()
         await asyncio.wait_for(submission_task, timeout=10)
         assert app._preprocessing_task is not None
-        await app._preprocessing_task
+        await await_or_fail(
+            app._preprocessing_task, what="inline shell preprocessing"
+        )
         app._preprocessing_task = None
         assert backend.calls == []
 
@@ -2285,7 +2287,7 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
 
         macro_task = asyncio.create_task(app._handle_prompt_value("/slow"))
         owner.task(macro_task)
-        await macro_task
+        await await_or_fail(macro_task, what="slow macro submission")
         await _drain_submission_consumer(app)
         assert app.active, "slow macro did not start"
 
@@ -2395,7 +2397,10 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
         await asyncio.wait_for(macro_task, timeout=10)
         assert not canceled.is_set()
         watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(watcher, return_exceptions=True),
+            what="background agent watcher cancellation",
+        )
         app.loop._background_owner.unregister("background")
 
 
