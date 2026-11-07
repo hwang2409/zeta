@@ -854,11 +854,14 @@ async def test_stdio_rejects_malformed_unterminated_initialize_output(
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = """
 import json
+import os
 import sys
 request = json.loads(sys.stdin.readline())
 assert request["method"] == "initialize"
 sys.stdout.write("x" * 2048)
 sys.stdout.flush()
+os.close(sys.stdout.fileno())
+sys.stdin.read()
 """
     client = StdioMCPClient(
         MCPServerConfig("unterminated", "stdio", sys.executable, ("-u", "-c", source))
