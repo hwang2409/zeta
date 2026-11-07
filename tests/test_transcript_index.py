@@ -66,7 +66,7 @@ def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
 def _construct_index_process(project_dir: str, start, results) -> None:
     results.put(("ready",))
     try:
-        start.wait()
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
         TranscriptIndex(Path(project_dir), PROJECT_A)
     except BaseException:  # noqa: BLE001 - child must report every failure
         results.put(("error", traceback.format_exc()))
@@ -79,7 +79,7 @@ def _append_index_process(
 ) -> None:
     results.put(("ready",))
     try:
-        start.wait()
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
         index = TranscriptIndex(Path(project_dir), PROJECT_A)
         index.append(TranscriptSource(session_id, Path(session_dir)))
     except BaseException:  # noqa: BLE001 - child must report every failure
