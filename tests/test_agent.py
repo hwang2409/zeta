@@ -764,7 +764,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
 
     async def wait_for_owner() -> None:
         wait_started.set()
-        await owner.wait()
+        await asyncio.wait_for(owner.wait(), timeout=10)
 
     waiting = asyncio.create_task(wait_for_owner())
     try:
@@ -777,7 +777,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     finally:
         release_close.set()
         await watcher
-        await waiting
+        await asyncio.wait_for(waiting, timeout=10)
     assert cleanup_called.is_set()
 
 
@@ -1659,7 +1659,7 @@ async def test_live_child_holds_runtime_lease_until_store_close(
     assert not await asyncio.to_thread(_probe_child_recovery_lease, child)
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     assert await asyncio.to_thread(_probe_child_recovery_lease, child)
     await loop.close()
@@ -1687,7 +1687,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
     assert store.agent_notifications() == []
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
     assert notification.data["text"].startswith("child complete")
@@ -2185,7 +2185,7 @@ async def test_background_large_configured_receipt_fits_notification_store(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
 
@@ -2301,7 +2301,7 @@ async def test_background_completion_leaves_no_pending_abort_waiter(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert not [
@@ -2364,7 +2364,7 @@ async def test_parent_abort_cancels_background_grandchild(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
     loop.abort()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "canceled"
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -2555,7 +2555,7 @@ async def test_nested_question_wakes_finish_gate_once_then_delivers_follow_up(
     assert backend.gate_turns == 2
 
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     await loop.close()
 
 
@@ -2665,7 +2665,7 @@ async def test_follow_up_wakes_worker_waiting_in_finish_gate(
         backend.release_grandchild.set()
         channel.wake(child_handle)
         try:
-            await loop._background_owner.wait()
+            await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
         finally:
             try:
                 await loop.close()
@@ -2722,7 +2722,7 @@ async def test_follow_up_after_finish_gate_queue_check_is_delivered(
         release_queue_check.set()
         channel.wake(child_handle)
         try:
-            await loop._background_owner.wait()
+            await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
         finally:
             try:
                 await loop.close()
@@ -2773,7 +2773,7 @@ async def test_follow_up_between_gate_turns_is_delivered_once(
         backend.release_grandchild.set()
         channel.wake(next(iter(store.agent_children()), None))
         try:
-            await loop._background_owner.wait()
+            await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
         finally:
             try:
                 await loop.close()
@@ -2830,7 +2830,7 @@ async def test_pending_follow_up_is_processed_before_finish_gate_timeout(
         backend.release_gate_turn.set()
         backend.release_grandchild.set()
         try:
-            await loop._background_owner.wait()
+            await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
         finally:
             try:
                 await loop.close()
@@ -2883,7 +2883,7 @@ async def test_child_finish_gate_explicit_handoff_adopts_grandchild(
         "The adopted child completion receipt in the parent session." in receipt.content
     )
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
     assert notification.data["text"].startswith("evidence ready")
@@ -2915,7 +2915,7 @@ async def test_background_nested_agent_handoff_finishes_without_channel_hold(
     assert marker["description"] == "collect evidence"
 
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     await loop.close()
 
 
@@ -2938,7 +2938,7 @@ async def test_child_finish_gate_handoff_requires_reason_and_outputs(
     assert "outputs" in invalid.content
     assert store.agent_children()
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     child_store.close()
     await loop.close()
@@ -2990,7 +2990,7 @@ async def test_child_finish_gate_counts_model_turns_and_adopts_after_bound(
     assert backend.gate_calls == 3
     assert store.agent_children()
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -3481,7 +3481,7 @@ async def test_child_finish_gate_wait_timeout_adopts(
 
     assert store.agent_children()
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     receipt = store.tool_result("child")
     assert receipt is not None
@@ -3513,7 +3513,7 @@ async def test_child_finish_gate_turn_bound_falls_back_to_adoption(
     marker = next(iter(store.agent_children().values()))
     assert marker["description"] == "collect evidence"
     backend.release_grandchild.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     receipt = store.tool_result("child")
     assert receipt is not None
@@ -3537,7 +3537,7 @@ async def test_top_level_finish_is_not_gated_by_background_child(tmp_path: Path)
     )
     assert loop._background_owner.running
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -3565,7 +3565,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
     )
     assert any(result is not None and result.is_error for result in results)
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -6027,7 +6027,7 @@ async def test_failed_background_receipt_matches_error_flag(
     loop.set_background_event_sink(background_events.append)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[0]
     terminal = next(
         event
@@ -6753,7 +6753,7 @@ async def test_agent_model_implies_background(
     )
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert loop.context_assembler.descendant_usage["input_tokens"] == 8
     assert loop.context_assembler.descendant_usage["output_tokens"] == 2
     await loop.close()
@@ -6915,7 +6915,7 @@ async def test_background_start_text_names_handle_and_polling_tools(
     assert result.content.startswith("background agent started:")
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -7282,7 +7282,7 @@ async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await _collect(loop.run_turn("now start the run", origin=MessageOrigin.USER))
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -7303,7 +7303,7 @@ async def test_a_run_goes_to_the_background_without_being_asked(
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -8958,7 +8958,7 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
     assert error is not None and "no live run" in error
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     await loop.close()
 
@@ -9020,7 +9020,7 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     ) is None
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert backend.child_prompts == ["work the big task", "also check the tests"]
@@ -9057,7 +9057,7 @@ async def test_a_follow_up_reaches_a_worker_at_its_next_turn(tmp_path: Path) -> 
     ) is None
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert backend.child_prompts == ["work the big task", "also check the tests"]
@@ -9072,7 +9072,7 @@ async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> No
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert backend.child_prompts == ["work the big task"]
@@ -9187,7 +9187,7 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     )
 
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     assert backend.child_prompts == ["work the big task", "also check the tests"]
     await loop.close()
@@ -11155,7 +11155,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
     assert child_abort_calls > 0
     assert abort_errors == []
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "canceled"
 
@@ -11713,7 +11713,7 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
         channel=loop._background_owner.conversation_channel,
     ) is None
     backend.release_child.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
@@ -11835,7 +11835,7 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
     loop.set_background_event_sink(collect_event)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
     # Persistence precedes terminal-card publication, so synchronize on the sink too.
@@ -11986,7 +11986,7 @@ async def test_child_finishes_during_notification_turn_that_woke_it(
     child_store.close()
     await loop._background_owner.conversation_channel.produce_to(handle, item)
 
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     notification = store.agent_notifications(pending_only=False)[-1]
     assert notification.data["status"] == "completed"
     completions = [
@@ -13096,7 +13096,7 @@ async def test_parent_exit_cancels_idle_child_subtree_and_cleans_receipts(
         parent_instance_id="root:1",
     )
     owner.cancel_all()
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     assert set(canceled) == {"root:1", "root:1:1"}
     assert not owner.running
     store.close()
@@ -13688,7 +13688,7 @@ async def test_agent_cancel_returns_within_bound_when_cleanup_is_stuck(
     assert await asyncio.wait_for(owner.cancel_and_wait("root:1"), timeout=0.1)
 
     release.set()
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     store.close()
 
 
@@ -13954,7 +13954,7 @@ async def test_agent_cancel_propagates_caller_cancellation(tmp_path: Path) -> No
         await asyncio.wait_for(cancellation, timeout=0.1)
 
     release.set()
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     store.close()
 
 
@@ -14074,7 +14074,7 @@ async def test_wait_with_running_task_wakes_parent_then_accepts_approval(
     ) is None
     assert (await asyncio.to_thread(child.pending_prompts))[0].data["text"] == "approved"
     owner.cancel_subtree("root:1")
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
 
 
 @pytest.mark.asyncio
@@ -14186,7 +14186,7 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     await asyncio.wait_for(parent_wake, timeout=1)
     assert parent.agent_notifications()[0].data["kind"] == "child_idle"
     owner.cancel_subtree("root:1")
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
 
 
 @pytest.mark.asyncio
@@ -14210,7 +14210,7 @@ async def test_finish_accepted_after_follow_up_attempt_is_accepted(
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert len(await asyncio.to_thread(child_store.pending_prompts)) == 1
     backend.release_finish.set()
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     assert await asyncio.to_thread(child_store.pending_prompts) == []
 
@@ -14254,7 +14254,7 @@ async def test_unread_follow_up_still_blocks_finish(
     await _send_follow_up(loop, handle, "second follow-up")
     backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert backend.finish_attempts == 2
@@ -14311,7 +14311,7 @@ async def test_ask_parent_answer_does_not_block_finish(
     ] == [other_question.id]
     backend.release_question_finish.set()
     await asyncio.wait_for(backend.answer_seen.wait(), timeout=2)
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
@@ -14445,7 +14445,7 @@ async def test_follow_up_ack_never_takes_store_lock_on_event_loop(
     await asyncio.wait_for(backend.finish_context_seen.wait(), timeout=2)
     backend.release_finish.set()
     await asyncio.wait_for(backend.finish_generated.wait(), timeout=2)
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     assert store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
 
     assert backend.finish_attempts == 1
@@ -14867,7 +14867,7 @@ async def test_unrelated_send_does_not_close_open_question(
         if entry.data.get("kind") == "child_question"
     ] == [question.id]
     loop._background_owner.cancel_subtree(handle)
-    await loop._background_owner.wait()
+    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
     await loop.close()
 
 

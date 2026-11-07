@@ -884,7 +884,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
         child_stores.append(child_store), track_store(child_store)
     )
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await owner.wait()
+    await asyncio.wait_for(owner.wait(), timeout=10)
     child_store = child_stores[0]
     with pytest.raises(OSError):
         os.fstat(child_store.directory_fd)
