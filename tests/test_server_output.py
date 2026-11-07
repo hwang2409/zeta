@@ -19,7 +19,7 @@ from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 from zeta.server import connections as connections_module
 from zeta.server import server as server_module
-from zeta.server.protocol import ErrorDescriptor, EventDescriptor
+from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
 
 Transport = Literal["unix", "websocket"]
@@ -225,14 +225,21 @@ async def test_unregistered_descriptors_do_not_break_live_connection(
             )
             error = await _read_json(reader, transport)
         assert error["id"] == 2
-        assert error["error"]["code"] == ErrorDescriptor.INTERNAL_ERROR.code
+        internal_code = error["error"]["code"]
+        assert type(internal_code) is int
+        assert internal_code == -32000
+
+        unknown = await _rpc(reader, writer, transport, 3, "not_a_method")
+        unknown_code = unknown["error"]["code"]
+        assert type(unknown_code) is int
+        assert unknown_code == -32601
 
         await _send_json(
             writer,
             transport,
-            {"jsonrpc": "2.0", "id": 3, "method": "status", "params": {}},
+            {"jsonrpc": "2.0", "id": 4, "method": "status", "params": {}},
         )
-        assert (await _read_json(reader, transport))["id"] == 3
+        assert (await _read_json(reader, transport))["id"] == 4
     finally:
         writer.close()
         await writer.wait_closed()
