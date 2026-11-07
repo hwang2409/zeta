@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import ast
 import asyncio
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,122 +10,25 @@ import pytest
 
 from tests.support.serve_close import close_serve
 
-_TESTS_ROOT = Path(__file__).resolve().parent
-_CLOSE_SERVE_CONDITION_FIX = (
-    "call close_serve unconditionally; pass optional writers as "
-    "*[w for w in (...) if w is not None]"
-)
 
-
-def _is_close_serve_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    return (isinstance(func, ast.Name) and func.id == "close_serve") or (
-        isinstance(func, ast.Attribute) and func.attr == "close_serve"
+def _run_owner_test(pytester: pytest.Pytester, source: str):
+    pytester.makeconftest('pytest_plugins = ("tests.conftest", "pytest_asyncio")')
+    pytester.makeini("[pytest]\nasyncio_mode = auto\n")
+    pytester.makepyfile(test_owner=source)
+    root = str(Path(__file__).resolve().parents[1])
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = (
+        root
+        if not old_pythonpath
+        else os.pathsep.join((root, old_pythonpath))
     )
-
-
-def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
-    """Line numbers of close_serve calls that are not unconditional cleanup."""
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
-    lines: set[int] = set()
-    for node in ast.walk(tree):
-        if not _is_close_serve_call(node):
-            continue
-        ancestors: list[ast.AST] = []
-        parent = parents.get(node)
-        function: ast.AST | None = None
-        while parent is not None:
-            ancestors.append(parent)
-            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                function = parent
-                break
-            parent = parents.get(parent)
-        if function is None:
-            lines.add(node.lineno)
-            continue
-        try_ancestor = next(
-            (
-                ancestor
-                for ancestor in ancestors
-                if isinstance(ancestor, ast.Try)
-                and any(node in ast.walk(statement) for statement in ancestor.finalbody)
-            ),
-            None,
-        )
-        if try_ancestor is None:
-            lines.add(node.lineno)
-            continue
-        try_index = ancestors.index(try_ancestor)
-        other_ancestors = ancestors[try_index + 1 :]
-        if any(
-            isinstance(ancestor, (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith))
-            for ancestor in other_ancestors
-        ):
-            lines.add(node.lineno)
-            continue
-        if any(
-            isinstance(ancestor, ast.Try)
-            and not any(node in ast.walk(statement) for statement in ancestor.finalbody)
-            for ancestor in other_ancestors
-        ):
-            lines.add(node.lineno)
-    return lines
-
-
-@pytest.mark.parametrize(
-    ("source", "expected_offender"),
-    [
-        pytest.param("async def test():\n    close_serve(s) if ready else None\n", True, id="ternary"),
-        pytest.param("async def test():\n    for _ in ():\n        close_serve(s)\n", True, id="for"),
-        pytest.param("async def test():\n    while ready:\n        close_serve(s)\n", True, id="while"),
-        pytest.param("async def test():\n    try:\n        close_serve(s)\n    finally:\n        pass\n", True, id="try-body"),
-        pytest.param("async def test():\n    try:\n        pass\n    except Exception:\n        close_serve(s)\n", True, id="except-handler"),
-        pytest.param("async def test():\n    if ready:\n        try:\n            pass\n        finally:\n            close_serve(s)\n", True, id="if-around-finally"),
-        pytest.param("async def test():\n    close_serve(s)\n", True, id="top-level-after-assert"),
-        pytest.param("async def test():\n    async with resource:\n        close_serve(s)\n", True, id="async-with-without-helper"),
-        pytest.param("async def test():\n    try:\n        if ready:\n            try:\n                pass\n            finally:\n                close_serve(s)\n    finally:\n        pass\n", True, id="unreachable-nested-finally"),
-        pytest.param("async def test():\n    try:\n        pass\n    finally:\n        close_serve(s)\n", False, id="finally"),
-        pytest.param(
-            "async def test():\n"
-            "    @asynccontextmanager\n"
-            "    async def serving(server):\n"
-            "        try:\n"
-            "            yield\n"
-            "        finally:\n"
-            "            await close_serve(server)\n"
-            "    async with serving(s):\n"
-            "        pass\n",
-            False,
-            id="helper",
-        ),
-    ],
-)
-def test_close_serve_guard_shapes(source: str, expected_offender: bool) -> None:
-    offenders = _conditional_close_serve_lines(ast.parse(source))
-    assert bool(offenders) is expected_offender
-
-
-def test_close_serve_is_never_called_under_a_condition() -> None:
-    offenders: list[str] = []
-    for path in sorted(_TESTS_ROOT.rglob("*.py")):
-        if path.name == "test_serve_close.py":
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        root = _TESTS_ROOT.parent
-        offenders.extend(
-            f"{path.relative_to(root)}:{line}"
-            for line in sorted(_conditional_close_serve_lines(tree))
-        )
-    assert not offenders, (
-        "close_serve must not be nested inside an if/elif/else body "
-        f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
-    )
+    try:
+        return pytester.runpytest_subprocess("-q")
+    finally:
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
 
 
 @dataclass
@@ -142,6 +45,107 @@ class _Server:
         self.closed = True
         if self.fail:
             raise RuntimeError("server close failed")
+
+
+def test_server_owner_closes_after_body_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_leaked_server(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    original_close = server.close
+    async def close_and_prove():
+        await original_close()
+        assert not server.socket_path.exists()
+        assert server._server is None
+        Path("closed").write_text("closed")
+    server.close = close_and_prove
+    assert False, "original body failure"
+""",
+    )
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*AssertionError: original body failure*"])
+    assert (pytester.path / "closed").read_text() == "closed"
+
+
+def test_server_owner_explicit_close_is_idempotent(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_explicit_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    await server.start()
+    await server.close()
+""",
+    )
+    result.assert_outcomes(passed=1)
+
+
+def test_server_owner_reports_bounded_close_failure(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import asyncio
+import pytest
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_hanging_close(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    async def hang():
+        await asyncio.Event().wait()
+    server.close = hang
+""",
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*ZetaServer.close did not finish within 10 s*"])
+
+
+def test_server_owner_closes_all_servers(pytester: pytest.Pytester) -> None:
+    result = _run_owner_test(
+        pytester,
+        """
+import pytest
+from pathlib import Path
+from zeta.server import ZetaServer
+
+pytestmark = pytest.mark.usefixtures("close_direct_test_runtime_owners")
+
+@pytest.mark.asyncio
+async def test_two_servers(tmp_path):
+    servers = [
+        ZetaServer(home=tmp_path / str(index), port=0, provider="codex")
+        for index in range(2)
+    ]
+    for server in servers:
+        await server.start()
+        original_close = server.close
+        async def close_and_prove(server=server, original_close=original_close):
+            await original_close()
+            assert server._server is None
+            with Path("closed").open("a") as marker:
+                marker.write("x")
+        server.close = close_and_prove
+""",
+    )
+    result.assert_outcomes(passed=1)
+    assert (pytester.path / "closed").read_text() == "xx"
 
 
 class _Writer:
