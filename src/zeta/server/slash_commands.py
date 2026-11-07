@@ -17,8 +17,8 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..core.project_context import discover_repo_root
-from ..core.session import persist_metadata_change
+from ..core.project_context import discover_repo_root, project_command_view
+from ..core.session import SessionError, persist_metadata_change
 from ..core.slash import (
     SlashCommand,
     SlashCommandRegistry,
@@ -30,6 +30,7 @@ from ..memory.user_authorization import MemoryMutationAuthorization
 from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
+from ..project_registry import ProjectRegistryError
 from ..runtime.status import (
     SlashStatusSnapshot,
     build_slash_status,
@@ -55,6 +56,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "memory",
         "mcp",
         "model",
+        "project",
         "project-instructions",
         "status",
         "vim",
@@ -220,7 +222,41 @@ class ServerSlashSession:
             )
         return f"vim mode: {'on' if enabled else 'off'}"
 
-    def slash_memory(self, args: str) -> str:
+    async def slash_project(self, args: str) -> str:
+        runtime = self._runtime
+        opened = runtime.opened
+        registry = runtime.manager.project_registry
+        if opened is None:
+            return "project registry unavailable: no active session"
+        if registry is None:
+            return "project registry unavailable"
+        initialize = args.strip() == "init"
+        try:
+            view = await asyncio.to_thread(
+                project_command_view,
+                registry,
+                opened.store.cwd,
+                runtime.metadata.project_id,
+                initialize=initialize,
+            )
+        except (ProjectRegistryError, OSError, SessionError) as exc:
+            if initialize:
+                return f"could not initialize project: {exc}"
+            raise
+        if initialize:
+            assert view.project is not None
+            await persist_metadata_change(
+                runtime.manager,
+                runtime.metadata,
+                lambda candidate: runtime.manager.associate_project(
+                    candidate, view.project.project_id
+                ),
+            )
+            if runtime.loop is not None:
+                runtime.loop._set_runtime_project(runtime.metadata)
+        return view.text
+
+    async def slash_memory(self, args: str) -> str:
         runtime = self._runtime
         project_id = runtime.metadata.project_id
         if project_id is None:
@@ -230,7 +266,8 @@ class ServerSlashSession:
             return "memory: project registry unavailable"
         loop = getattr(runtime, "loop", None)
         reconciler = loop.memory_reconciler if loop is not None else None
-        return run_memory_command(
+        return await asyncio.to_thread(
+            run_memory_command,
             registry,
             project_id,
             args,
@@ -243,7 +280,7 @@ class ServerSlashSession:
             raise RuntimeError(_UNAVAILABLE_NOTICE)
         return await self._runtime.loop.slash_mcp(args)
 
-    def slash_inbox(self, args: str) -> str:
+    async def slash_inbox(self, args: str) -> str:
         if args.strip():
             return "usage: /inbox"
         runtime = self._runtime
@@ -254,9 +291,12 @@ class ServerSlashSession:
         if registry is None or project_id is None:
             return "project inbox unavailable: session is not associated with a project"
         try:
-            state = ProjectInbox(
-                registry, sessions_root=registry.root.parent / "sessions"
-            ).list(project_id)
+            state = await asyncio.to_thread(
+                ProjectInbox(
+                    registry, sessions_root=registry.root.parent / "sessions"
+                ).list,
+                project_id,
+            )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
         return json.dumps(state, indent=2, sort_keys=True)
@@ -347,6 +387,7 @@ async def run_command(
         or name == "compact"
         or (name == "model" and tail.strip())
         or (name == "accounts" and tail.strip())
+        or (name == "project" and tail.strip() == "init")
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit
