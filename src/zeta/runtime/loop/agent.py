@@ -1,4 +1,5 @@
 """The provider-neutral agent loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -48,9 +49,7 @@ from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
-from ...mcp import (
-    MCPMount,
-)
+from ...mcp import MCPManagementService, MCPMount
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
@@ -267,8 +266,9 @@ class AgentLoop(
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = (
-            Path(self.store.cwd).expanduser().resolve()
+        self._mcp_project_dir_value: Path | None = Path(self.store.cwd)
+        self._mcp_management = MCPManagementService(
+            project_dir=self._mcp_project_dir_value
         )
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
@@ -505,7 +505,9 @@ class AgentLoop(
         return killed
 
     async def close(
-        self, *, cancel_background: bool = True,
+        self,
+        *,
+        cancel_background: bool = True,
         background_task_cause: str = "session shutdown",
     ) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
@@ -522,7 +524,9 @@ class AgentLoop(
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
-                self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
+                self.tool_registry.background_tasks.begin_shutdown(
+                    background_task_cause
+                )
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
