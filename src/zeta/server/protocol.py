@@ -64,6 +64,11 @@ class ErrorDescriptor(Enum):
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    CORRUPT_TRANSCRIPT = (
+        -32000,
+        "corrupt_transcript",
+        "transcript is corrupt or uses an unsupported format",
+    )
     ACTIVE_SESSION = (-32005, "active_session", "the active session cannot be deleted")
     ACCOUNT_LOCK_TIMEOUT = (
         -32008,
@@ -126,10 +131,17 @@ class SlashResultKindDescriptor(StrEnum):
     """One documented slash_run result kind."""
 
     OUTPUT = "output"
+    TEXT = "text"
     MODEL_INPUT = "model_input"
     CLIENT_ONLY = "client_only"
     UNKNOWN = "unknown"
     ERROR = "error"
+
+
+class SlashErrorCodeDescriptor(StrEnum):
+    """One documented structured slash_run error code."""
+
+    MCP_CREDENTIAL_STORE = "mcp_credential_store"
 
 
 class EventDescriptor(StrEnum):
@@ -159,6 +171,7 @@ class EventDescriptor(StrEnum):
     ACCOUNT_LIMIT = "account_limit"
     ACCOUNT_STATE_UNKNOWN = "account_state_unknown"
     TURN_END = "turn_end"
+    SERVED_TURN_END = "served_turn_end"
     AGENT_END = "agent_end"
     ERROR = "error"
     DELIVERY_STATUS = "delivery_status"
@@ -194,6 +207,7 @@ FEATURES = (
     "session_history_backward",
     "session_host_commands",
     "session_history_fidelity",
+    "served_turn_end",
     "content_read",
 )
 MAX_FRAME_BYTES = 1_048_576

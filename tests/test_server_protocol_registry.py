@@ -10,6 +10,7 @@ from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
+    SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
 )
 
@@ -56,6 +57,11 @@ def _documented_slash_result_kinds(document: str) -> set[str]:
     return set(re.findall(r"^  - `([a-z_]+)`:", section, re.MULTILINE))
 
 
+def _documented_slash_error_codes(document: str) -> set[str]:
+    section = _section(document, "Structured slash error codes are:", "The built-ins")
+    return set(re.findall(r"^\| `([a-z_]+)` \|", section, re.MULTILINE))
+
+
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     documented_errors = _documented_errors(document)
@@ -79,6 +85,9 @@ def test_protocol_registry_matches_documented_errors_and_events() -> None:
     assert _documented_slash_result_kinds(document) == {
         kind.value for kind in SlashResultKindDescriptor
     }, "register and document each slash_run result kind"
+    assert _documented_slash_error_codes(document) == {
+        code.value for code in SlashErrorCodeDescriptor
+    }, "register and document each structured slash_run error code"
 
 
 def _annotation_name(argument: ast.arg) -> str | None:
@@ -419,6 +428,18 @@ STRUCTURED_ERROR_FIXTURES = (
         "content not found",
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"content not found","data":{"code":"content_not_found"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CORRUPT_TRANSCRIPT,
+        "transcript terminated invalid conversation row at row 2 (session s1)",
+        {
+            "kind": "invalid_row",
+            "row": 2,
+            "repairable": True,
+            "session_id": "s1",
+            "actions": [],
+        },
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"transcript terminated invalid conversation row at row 2 (session s1)","data":{"code":"corrupt_transcript","kind":"invalid_row","row":2,"repairable":true,"session_id":"s1","actions":[]}}}\n',
     ),
     (
         ErrorDescriptor.ACTIVE_SESSION,

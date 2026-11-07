@@ -172,6 +172,7 @@ async def test_unregistered_descriptors_do_not_break_live_connection(
                 raise RuntimeError("injected failure")
             return await original_dispatch(request_id, method, params)
 
+        # test-contract: seam force dispatch failure through the real transport
         monkeypatch.setattr(client, "_dispatch", fail_dispatch)
         with monkeypatch.context() as context:
             invalid_descriptors = type(
@@ -352,6 +353,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     turn_event_queued = asyncio.Event()
     turn_finalized = asyncio.Event()
     outcomes: list[str] = []
+    finalized_turn_ids: list[object] = []
     original_write = _Client._write_physical
     original_release = server.connections.release
     original_enqueue = server.connections._enqueue
@@ -378,12 +380,13 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     async def record_finalize(
         session_id: str,
         state: Any,
-        outcome: Any,
-        *,
+        *args: Any,
         schedule_wake: bool,
     ) -> None:
+        turn_id, outcome = args if len(args) == 2 else (None, args[0])
+        finalized_turn_ids.append(turn_id)
         outcomes.append(str(outcome))
-        await original_finalize(session_id, state, outcome, schedule_wake=schedule_wake)
+        await original_finalize(session_id, state, *args, schedule_wake=schedule_wake)
         turn_finalized.set()
 
     # test-contract: seam stalls the real transport at a deterministic write
@@ -400,7 +403,11 @@ async def test_controller_overflow_does_not_cancel_active_turn(
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "hello",
-                "params": {"protocol_version": "1.2", "role": "controller"},
+                "params": {
+                    "protocol_version": "1.2",
+                    "role": "controller",
+                    "features": ["served_turn_end"],
+                },
             },
         )
         assert (await _read_json(reader, transport))["id"] == 1
@@ -425,7 +432,6 @@ async def test_controller_overflow_does_not_cancel_active_turn(
         await asyncio.wait_for(head_started.wait(), TIMEOUT)
         server.control.start_turn("finish despite output overload")
         await asyncio.wait_for(turn_event_queued.wait(), TIMEOUT)
-
         trigger_started = asyncio.Event()
 
         async def trigger_overflow() -> bool:
@@ -474,7 +480,11 @@ async def test_controller_overflow_does_not_cancel_active_turn(
                     "jsonrpc": "2.0",
                     "id": 4,
                     "method": "hello",
-                    "params": {"protocol_version": "1.2", "role": "controller"},
+                    "params": {
+                        "protocol_version": "1.2",
+                        "role": "controller",
+                        "features": ["served_turn_end"],
+                    },
                 },
             )
             assert (await _read_json(reconnect_reader, transport))["id"] == 4
@@ -491,6 +501,25 @@ async def test_controller_overflow_does_not_cancel_active_turn(
             status = (await _read_json(reconnect_reader, transport))["result"]
             assert status["session"]["session_id"] == session_id
             assert status["state"] == "idle"
+            await _send_json(
+                reconnect_writer,
+                transport,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "session_history",
+                    "params": {"session_id": session_id},
+                },
+            )
+            history = (await _read_json(reconnect_reader, transport))["result"][
+                "messages"
+            ]
+            served = [row for row in history if row.get("event") == "served_turn_end"]
+            assert len(served) == 1
+            durable_turn_id = served[0]["data"].get("turn_id")
+            assert isinstance(durable_turn_id, str)
+            assert durable_turn_id == finalized_turn_ids[0]
+            assert served[0]["data"]["reason"] == "disconnect"
         finally:
             reconnect_writer.close()
     finally:

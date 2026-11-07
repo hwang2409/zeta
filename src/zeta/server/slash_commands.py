@@ -35,7 +35,12 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from . import accounts, ergonomics
 from .model_selection import apply as apply_settings
-from .protocol import ErrorDescriptor, ProtocolError, SlashResultKindDescriptor
+from .protocol import (
+    ErrorDescriptor,
+    ProtocolError,
+    SlashErrorCodeDescriptor,
+    SlashResultKindDescriptor,
+)
 from .runtime import ServerRuntime
 
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
@@ -51,6 +56,7 @@ EXECUTABLE_BUILTINS: frozenset[str] = frozenset(
         "inbox",
         "init",
         "memory",
+        "mcp",
         "model",
         "project-instructions",
         "status",
@@ -152,6 +158,7 @@ class ServerSlashSession:
             ),
             mcp_summary=loop.mcp_summary,
             explicit_finish=loop.explicit_finish,
+            max_agent_depth=loop.max_agent_depth,
             automatic_memory_failure=(
                 loop.memory_reconciler.automatic_memory_status
                 if loop.memory_reconciler is not None
@@ -257,6 +264,11 @@ class ServerSlashSession:
             reconciler,
             MemoryMutationAuthorization.direct_slash(),
         )
+
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
+        if self._runtime.loop is None:
+            raise RuntimeError(_UNAVAILABLE_NOTICE)
+        return await self._runtime.loop.slash_mcp(args)
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():
@@ -380,6 +392,8 @@ async def run_command(
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
+    if name == "mcp":
+        return await _run_mcp_command(runtime, tail)
     # Prompt macros expand to user input rather than dispatch through a handler.
     # Inline shell spans need the client's approval loop; report those as
     # client-only rather than resolving with unapproved output here.
@@ -402,6 +416,32 @@ async def run_command(
     if isinstance(result, str):
         return {"kind": SlashResultKindDescriptor.OUTPUT, "text": result}
     raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "unexpected slash result type")
+
+
+async def _run_mcp_command(
+    runtime: ServerRuntime, tail: str
+) -> dict[str, object]:
+    stripped = tail.strip()
+    verb = stripped.partition(" ")[0]
+    if verb not in {"status", "auth", "logout"}:
+        return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": "mcp"}
+    if runtime.loop is None:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+    result = await runtime.loop.slash_mcp(stripped)
+    response: dict[str, object] = {
+        "kind": (
+            SlashResultKindDescriptor.TEXT
+            if stripped == "status"
+            else SlashResultKindDescriptor.OUTPUT
+        ),
+        "text": result,
+    }
+    credential_error = getattr(result, "credential_store_error", None)
+    if credential_error is not None:
+        public_error = dict(credential_error)
+        public_error["code"] = SlashErrorCodeDescriptor.MCP_CREDENTIAL_STORE
+        response["credential_store_error"] = public_error
+    return response
 
 
 def _model_input_result(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING
 
@@ -76,7 +77,11 @@ class NotificationPresentation:
             notification.get("kind", "agent_completion"), protocol_version
         )
         try:
-            written = await send(event_name, session_id, data=dict(notification))
+            written = await send(
+                event_name,
+                session_id,
+                data=event_contract.notification_payload(notification),
+            )
         except FrameWriteCancelled as cancelled:
             if not cancelled.written and key is not None:
                 self._presented.discard(key)
@@ -137,6 +142,7 @@ class ServeControl:
                 origin=origin,
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
+                turn_id=uuid.uuid4().hex,
             )
         )
 
@@ -348,7 +354,7 @@ class ServeControl:
             if self.server.runtime.state is not None:
                 self.server.runtime.state.tool_started()
             self._turn_task = asyncio.create_task(
-                self._resume_tool(core_key, host_commands)
+                self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
         return result
 
@@ -407,6 +413,7 @@ class ServeControl:
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -436,7 +443,11 @@ class ServeControl:
                     if event.type is StreamEventType.AGENT_END:
                         terminal_events.append(pending_turn_end)
                     else:
-                        await self._event(pending_turn_end, session_id=session_id)
+                        await self._event(
+                            pending_turn_end,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                        )
                     pending_turn_end = None
                 if event.type is StreamEventType.TURN_END:
                     pending_turn_end = event
@@ -446,7 +457,7 @@ class ServeControl:
                 elif event.type is StreamEventType.AGENT_END:
                     agent_end = event
                 else:
-                    await self._event(event, session_id=session_id)
+                    await self._event(event, session_id=session_id, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
@@ -460,7 +471,11 @@ class ServeControl:
                 terminal_error = None
                 agent_end = None
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         if terminal_error is not None:
             await self._notify(
@@ -470,9 +485,9 @@ class ServeControl:
                 data={},
             )
         for event in terminal_events:
-            await self._event(event, session_id=session_id)
+            await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
 
@@ -489,11 +504,17 @@ class ServeControl:
         ) or not loop.schedule_notification_turn():
             return
         self._turn_task = asyncio.create_task(
-            self._run_notification_turn(session_id, host_commands)
+            self._run_notification_turn(
+                session_id, host_commands, turn_id=uuid.uuid4().hex
+            )
         )
 
     async def _run_notification_turn(
-        self, session_id: str, host_commands: SessionHostCommands | None = None
+        self,
+        session_id: str,
+        host_commands: SessionHostCommands | None = None,
+        *,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -514,7 +535,10 @@ class ServeControl:
                 terminal_events.append(event)
             else:
                 await self._event(
-                    event, session_id=session_id, background=background
+                    event,
+                    session_id=session_id,
+                    background=background,
+                    turn_id=turn_id,
                 )
 
         try:
@@ -553,12 +577,16 @@ class ServeControl:
             ):
                 self._schedule_background_wake(session_id)
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         for event in terminal_events:
-            await self._event(event, session_id=session_id)
+            await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             if outcome is TurnOutcome.COMPLETED:
                 self._schedule_background_wake(session_id)
 
@@ -571,7 +599,11 @@ class ServeControl:
             self._schedule_background_wake(runtime.session_id)
 
     async def _resume_tool(
-        self, request_id: str, host_commands: SessionHostCommands | None = None
+        self,
+        request_id: str,
+        host_commands: SessionHostCommands | None = None,
+        *,
+        turn_id: str,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -587,7 +619,9 @@ class ServeControl:
                 agent_end = event
             else:
                 event_tasks.append(
-                    asyncio.create_task(self._event(event, session_id=session_id))
+                    asyncio.create_task(
+                        self._event(event, session_id=session_id, turn_id=turn_id)
+                    )
                 )
 
         outcome = TurnOutcome.COMPLETED
@@ -610,10 +644,14 @@ class ServeControl:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
             await self.deliveries.finalize_turn(
-                session_id, state, outcome, schedule_wake=agent_end is None
+                session_id,
+                state,
+                turn_id,
+                outcome,
+                schedule_wake=agent_end is None,
             )
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id)
+            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
             self._schedule_background_wake(session_id)
 
     async def _event(
@@ -622,6 +660,7 @@ class ServeControl:
         *,
         session_id: str | None = None,
         background: bool = False,
+        turn_id: str | None = None,
     ) -> None:
         state = self.server.runtime.state
         if session_id is None and not background and state is not None:
@@ -674,11 +713,22 @@ class ServeControl:
                 )
             return
         connections = getattr(self.server, "connections", None)
-        controller = connections.controller_metadata() if connections is not None else None
-        fidelity = (
-            controller is not None
-            and "session_history_fidelity" in controller.features
+        controller = (
+            connections.controller_metadata() if connections is not None else None
         )
+        fidelity = (
+            controller is not None and "session_history_fidelity" in controller.features
+        )
+        if kind is StreamEventType.TURN_START:
+            data = dict(event.data)
+            if (
+                controller is not None
+                and "served_turn_end" in controller.features
+                and turn_id is not None
+            ):
+                data["turn_id"] = turn_id
+            await self._notify(wire_event, session_id, data=data)
+            return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 wire_event,

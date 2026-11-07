@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.session import SessionError, SessionNotFoundError
-from ..core.store import ConversationIntegrityError
+from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..project_errors import ProjectRegistryBusyError
 from . import (
     abort_scope,
@@ -406,6 +406,15 @@ class _Client:
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
                             {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptLoadError as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.CORRUPT_TRANSCRIPT,
+                            str(exc),
+                            exc.protocol_data(),
                         )
                     )
                 except ConversationIntegrityError as exc:
@@ -846,12 +855,18 @@ class _Client:
                 else []
             )
             truncated = False
-        transcript_index_failure = (
-            runtime.loop.transcript_index_failure(runtime.session_id)
-            if self.protocol_version != "1.0" and runtime.loop is not None
+        loop = runtime.loop
+        fallback_config = (
+            await asyncio.to_thread(runtime._config, None, None)
+            if loop is None
             else None
         )
-        return {
+        transcript_index_failure = (
+            loop.transcript_index_failure(runtime.session_id)
+            if self.protocol_version != "1.0" and loop is not None
+            else None
+        )
+        status = {
             "session": session,
             "state": (
                 "idle"
@@ -859,10 +874,18 @@ class _Client:
                 else runtime.state.status
             ),
             "explicit_finish": (
-                runtime.loop.explicit_finish
-                if runtime.loop is not None
-                else runtime._config(None, None).agents_explicit_finish
+                loop.explicit_finish
+                if loop is not None
+                else fallback_config.agents_explicit_finish
             ),
+        }
+        if self.protocol_version != "1.0":
+            status["max_agent_depth"] = (
+                loop.max_agent_depth
+                if loop is not None
+                else fallback_config.agents_max_depth
+            )
+        suffix = {
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
@@ -873,6 +896,8 @@ class _Client:
             ),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
+        status.update(suffix)
+        return status
 
     def _reconcile_project_links(self, session_ids: list[str]) -> None:
         for session_id in session_ids:

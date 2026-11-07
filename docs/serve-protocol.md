@@ -360,6 +360,25 @@ data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
 recovery.
 
+If the transcript is corrupt or uses a newer conversation format, `resume`
+returns `-32000` with bounded data:
+
+```text
+{
+  code: "corrupt_transcript",
+  kind: "torn_tail" | "invalid_row" | "broken_links" | "unsupported_format" | "unrecoverable_header",
+  row: integer | null,
+  repairable: boolean,
+  session_id: string,
+  actions: []
+}
+```
+
+The diagnosis-only protocol has no repair request, so `actions` is always the
+empty array. The object has at most six fields and contains no transcript
+bytes, payload text, file path, digest, source identity, or arbitrary exception
+text. `row` identifies the first bad physical row when it is known.
+
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
 the message `session working directory no longer exists: <cwd>`, and the active
@@ -471,11 +490,11 @@ With `session_history_fidelity`, a queued steer that is dropped emits a live
 `delivery_status` event after the terminal row commits. Terminal `delivered` and
 `dropped` rows both appear in `session_history`. Each row has `id`,
 `role: "system"`, `event: "delivery_status"`, `delivery_id`, `method: "steer"`,
-`status`, and renderable `content` such as `steer dropped: abort`. A dropped row
-also has `reason` (`restart`, `abort`, `clear`, `disconnect`, `turn_end`, or
-`failed`). Accepted steer text is not included yet; it requires a new stored row
-type after the stored-format gate is available. A missing reason in an old
-session means unknown.
+`status`, and renderable `content`. New queued steers retain their accepted text,
+so live and reloaded terminal rows render that text. Legacy rows without retained
+text keep the generic status content. A dropped row also has `reason` (`restart`,
+`abort`, `clear`, `disconnect`, `turn_end`, or `failed`). A missing reason in an
+old session means unknown.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"delivery_status","params":{"delivery_id":"batch-42"}}
@@ -679,12 +698,17 @@ that gets no answer within its own timeout can treat the server as hung.
 All examples below use the common event envelope:
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
 
 `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, and
-`turn_aborted` carry `data` when the loop supplies it. `turn_end` data includes
-`turn` and `tool_calls`.
+`turn_aborted` carry `data` when the loop supplies it. When the connection
+negotiates `served_turn_end`, each `turn_start` also carries `data.turn_id`, a
+lowercase UUID hex string that identifies the whole served turn. Connections
+without that feature receive the previous `turn_start` shape. `data.turn`
+continues to number provider segments inside the served turn, so several
+`turn_start` events can have the same `turn_id`. `turn_end` data includes `turn`
+and `tool_calls`.
 
 `assistant_delta` carries `delta` (a bounded string) and `kind` (`assistant`,
 `thinking`, or another content type). `assistant_message` carries `message`,
@@ -854,6 +878,7 @@ Error descriptors are:
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
 | `account_lock_timeout` | `-32008` | `account_lock_timeout` | another process holds the selected account lock |
 | `approval_persistence_failed` | `-32000` | `approval_persistence_failed` | approval state could not be persisted |
@@ -972,6 +997,7 @@ Event fields are:
 | event | required fields | optional fields |
 | --- | --- | --- |
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
+| `served_turn_end` (feature `served_turn_end`) | `event`, `data: {turn_id: string, reason: "completed"|"user_stop"|"error"|"disconnect"}` | `session_id`, `id` (history only), `role` (history only) |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
@@ -1029,9 +1055,15 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
    `turn_end` ends one provider segment; it does not mean that the agent loop
-   is idle. Clients must wait for `agent_end` before idle-only requests such as
-   `new_session`; the server finalizes the turn before it publishes `agent_end`,
-   while error and abort paths end with `error` or `turn_aborted` instead.
+   is idle, and one served turn can contain several `turn_end` events. The
+   separately negotiated `served_turn_end` history event records the final
+   outcome of the whole served turn. Its `data.turn_id` matches every negotiated
+   provider-segment `turn_start` in that served turn. It occurs at most once per
+   served turn and has one closed `data.reason`: `completed`, `user_stop`,
+   `error`, or `disconnect`. Clients must wait for `agent_end` before idle-only
+   requests such as `new_session`; the server commits `served_turn_end` before
+   cleanup. Error
+   and abort paths still end with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
@@ -1281,6 +1313,7 @@ implementation for the frontend client. Two RPCs cover the surface.
   starting with `/`). Rejects the request when a turn is running with
   `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `text`: `text` is the MCP status output to render as normal text.
   - `model_input`: without `model_input_ids`, `text` is the resolved prompt
     to send as normal text. With `model_input_ids`, the server instead returns
     an opaque `input_id` and the typed `display_text`; the resolved text and
@@ -1290,16 +1323,23 @@ implementation for the frontend client. Two RPCs cover the surface.
   - `unknown`: no command matched the leading token.
   - `error`: the shared dispatcher reported a bounded failure `text`.
 
+Structured slash error codes are:
+
+| code | meaning |
+| --- | --- |
+| `mcp_credential_store` | an MCP credential file could not be loaded or deleted safely |
+
 The built-ins advertised as runnable are `/accounts`, `/compact`, `/help`,
 `/inbox`, `/init`, `/memory`, `/model`, `/project-instructions`, `/status`, and
 `/vim`. Runnable user commands also include prompt macros
 (`.zeta/commands/*.md` with `kind: prompt`) that do not use inline shell spans,
 plus skills. Argless `/model` reports the current model, while `/model <name>`
-dispatches server-side through the shared settings-apply path. TUI-owned
-built-ins, exec macros, prompt macros with inline shell spans, and MCP prompt
-commands are omitted from the default catalog. Every invocation of one of
-these unavailable commands, including `/mcp status`, reports `client_only`
-instead of half-executing.
+dispatches server-side through the shared settings-apply path. TUI-owned built-ins, exec macros, prompt macros with inline shell spans, and
+MCP prompt commands are omitted from the default catalog. `/mcp status`,
+`/mcp auth`, and `/mcp logout` run server-side; other `/mcp` verbs report
+`client_only`. A credential-store refusal adds `credential_store_error` with
+code `mcp_credential_store`, a bounded reason, server, credential path,
+operation, recovery action, and renderable text.
 
 When `model_input_ids` is negotiated, `send` accepts `input_id` instead of
 `text`. IDs are bounded, single-use, and valid only for the active session on
@@ -1343,6 +1383,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends

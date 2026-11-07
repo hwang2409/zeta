@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...mcp.management import ManagedServer, MCPManagementService
+from ...mcp.oauth_store import PublicCredentialStoreError
 from .. import overlay, theme
 
 
@@ -34,6 +35,7 @@ class MCPManager:
         self.wizard_active = False
         self._pending_remove: str | None = None
         self.last_result: object | None = None
+        self.credential_store_error: PublicCredentialStoreError | None = None
 
     @property
     def entries(self) -> list[ManagedServer]:
@@ -62,8 +64,7 @@ class MCPManager:
         return "!"
 
     _COLUMNS = (
-        "    name                 scope    transport        "
-        "auth          tools status"
+        "    name                 scope    transport        auth          tools status"
     )
 
     def _glyph_style(self, item: ManagedServer) -> str:
@@ -130,7 +131,9 @@ class MCPManager:
                 "↑/↓ select · enter details · a add · e enable/disable · t test"
             )
         )
-        lines.append(overlay.hint("l login · o logout · d remove · T trust · esc close"))
+        lines.append(
+            overlay.hint("l login · o logout · d remove · T trust · esc close")
+        )
         return lines
 
     def add(self, draft: MCPAddDraft) -> ManagedServer:
@@ -199,10 +202,14 @@ class MCPManager:
         elif key == "t":
             self.last_result = await self.service.test(item.name, scope=item.scope)
         elif key == "l":
-            self.last_result = await self.service.login(item.name, scope=item.scope)
+            await self.service.login(item.name, scope=item.scope)
+            self.credential_store_error = None
+            await self.service.refresh_credentials()
+            self.last_result = f"authorized {item.name}."
         elif key == "o":
-            self.service.logout(item.name, scope=item.scope)
-            self.last_result = "logged out"
+            await self.service.logout(item.name, scope=item.scope)
+            self.credential_store_error = None
+            self.last_result = f"logged out {item.name}."
         elif key == "T":
             self.last_result = self.service.trust(item.name)
         else:

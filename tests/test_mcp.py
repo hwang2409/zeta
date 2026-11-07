@@ -2444,6 +2444,10 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
     )
+    now = 100.0
+    monkeypatch.setattr(
+        server_actor_module, "time", SimpleNamespace(monotonic=lambda: now)
+    )
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
     )
@@ -2451,14 +2455,11 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     await asyncio.sleep(0)
     actor = mount._actors["retry"]
     actor._failure_count = 1024
-    before = mount_module.time.monotonic()
 
     result = await registry.execute(ToolCall("retry", "retry__echo", {}))
 
     assert result["isError"] is True
-    retry_at = mount.statuses["retry"].next_retry_at
-    assert retry_at is not None
-    assert retry_at - before <= 30.1
+    assert mount.statuses["retry"].next_retry_at == now + 30.0
     await mount.close()
 
 

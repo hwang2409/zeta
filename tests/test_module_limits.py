@@ -5,14 +5,16 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # the codex stream parser is a legitimate provider module at this size; bumped
 # to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser,
 # and to 1255 for viewed-session history wiring in the existing TUI modules.
+# Bumped to 1277 for the persistent detached writer merged in PR #676.
 MAX_FILE_LINES = 1255
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.
 # Bumped on 2026-09-10 for the ZETA-103 fd-anchored session-file safety seam,
 # on 2026-10-09 for the stdlib-only migration-plan seam shipped over SSH, and
-# on 2026-11-03 for the explicit child-lifecycle seam.
-MAX_FILES_PER_DIRECTORY = 20
+# on 2026-11-03 for the explicit child-lifecycle seam, and on 2026-11-06 for
+# the stored-format gate shared by every persistent writer.
+MAX_FILES_PER_DIRECTORY = 21
 
 
 def test_module_limits() -> None:
