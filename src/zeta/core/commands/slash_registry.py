@@ -15,7 +15,6 @@ from ...model_input import ModelInputEnvelope, skill_model_input
 from ...protocol.types import MessageOrigin
 from ...skills import SkillCatalog, SkillMeta, is_slash_safe_name, load_skill_prompt
 from ...skills.invocation import dollar_skill_mentions
-from .slash_errors import unknown_slash_command
 from .custom_commands import (
     CustomCommand,
     InlineShellRunner,
@@ -23,6 +22,7 @@ from .custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .slash_errors import unknown_slash_command
 
 if TYPE_CHECKING:
     from ..slash import SlashSession
