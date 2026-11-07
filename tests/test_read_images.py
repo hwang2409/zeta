@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 from rich.console import Console
 
+from tests.support.owned import owned_resources
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.media import image_normalization
@@ -740,19 +741,25 @@ async def test_vips_path_converts_display_p3_to_srgb_and_preserves_untagged(
     untagged_path = tmp_path / "untagged.png"
     _save_image(untagged_path, Image.new("RGB", source.size, (220, 80, 20)), "PNG")
 
-    async def read(path: Path) -> Image.Image:
-        result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
-            ToolCall("read-image", "read", {"path": path.name})
-        )
-        assert result["isError"] is False, result
-        return Image.open(io.BytesIO(base64.b64decode(result["content"][1]["data"]))).convert(
-            "RGB"
-        )
+    async with owned_resources() as owner:
 
-    tagged = await read(tagged_path)
-    untagged = await read(untagged_path)
-    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(tagged.getpixel((tagged.width // 2, tagged.height // 2)), expected))
-    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(untagged.getpixel((untagged.width // 2, untagged.height // 2)), (220, 80, 20)))
+        async def read(path: Path) -> Image.Image:
+            registry = owner.async_resource(
+                ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()),
+                what="image tool registry",
+            )
+            result = await registry.execute(
+                ToolCall("read-image", "read", {"path": path.name})
+            )
+            assert result["isError"] is False, result
+            return Image.open(
+                io.BytesIO(base64.b64decode(result["content"][1]["data"]))
+            ).convert("RGB")
+
+        tagged = await read(tagged_path)
+        untagged = await read(untagged_path)
+        assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(tagged.getpixel((tagged.width // 2, tagged.height // 2)), expected))
+        assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(untagged.getpixel((untagged.width // 2, untagged.height // 2)), (220, 80, 20)))
 
 
 @pytest.mark.asyncio

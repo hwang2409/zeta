@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from tests.conftest import _cleanup_leak_failure, _cleanup_leak_nodeid
+from tests.conftest import (
+    _cleanup_leak_failure,
+    _cleanup_leak_nodeid,
+    _runtime_cleanup_required,
+)
 
 COLLECTION_HOME = Path.home()
 
@@ -29,6 +33,14 @@ def test_cleanup_leak_failure_names_the_owner(stores: int, descriptors: int) -> 
         f"{stores} stores / {descriptors} fds left open by this test; open them "
         "with `async with owned_resources() as owner: owner.store(...)`"
     )
+
+
+def test_runtime_cleanup_ignores_unrelated_descriptor_churn() -> None:
+    class Closed:
+        _closed = True
+
+    assert not _runtime_cleanup_required(0, [Closed()], [Closed()], [], [])
+    assert _runtime_cleanup_required(1, [], [], [], [])
 
 
 def test_cleanup_leak_nodeid_hides_the_environment_python_path() -> None:

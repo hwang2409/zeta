@@ -19,6 +19,7 @@ from pathlib import Path
 from runpy import run_path
 from statistics import median
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import httpx
 import pytest
@@ -720,7 +721,25 @@ def _cleanup_leak_ratchet() -> frozenset[str]:
 
 
 def _cleanup_leak_nodeid(nodeid: str) -> str:
-    return nodeid.replace(sys.executable, "{python}")
+    return nodeid.replace(sys.executable, "{python}").replace(
+        str(_REPOSITORY_ROOT / ".venv/bin/python"), "{python}"
+    )
+
+
+def _runtime_cleanup_required(
+    leaked_stores: int,
+    loops: list[Any],
+    registries: list[Any],
+    workspaces: list[Any],
+    managers: list[Any],
+) -> bool:
+    return bool(
+        leaked_stores
+        or any(not loop._closed for loop in loops)
+        or any(not registry._closed for registry in registries)
+        or workspaces
+        or managers
+    )
 
 
 def _cleanup_leak_failure(
@@ -871,6 +890,9 @@ async def close_direct_test_runtime_owners(
     before_cleanup = _open_file_descriptors()
     tracked_stores = {id(store): store for store in (*stores, *composed_stores)}
     leaked_stores = sum(not store._closed for store in tracked_stores.values())
+    cleanup_required = _runtime_cleanup_required(
+        leaked_stores, loops, registries, workspaces, managers
+    )
     for loop in reversed(loops):
         if not loop._closed:
             try:
@@ -897,7 +919,9 @@ async def close_direct_test_runtime_owners(
     for manager in reversed(managers):
         manager._release_storage_lease()
     after_cleanup = _open_file_descriptors()
-    leaked_descriptors = len(before_cleanup.keys() - after_cleanup.keys())
+    leaked_descriptors = (
+        len(before_cleanup.keys() - after_cleanup.keys()) if cleanup_required else 0
+    )
     failure = _cleanup_leak_failure(
         _cleanup_leak_nodeid(request.node.nodeid),
         leaked_stores,
