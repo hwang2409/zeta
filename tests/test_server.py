@@ -8720,6 +8720,7 @@ async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
     )
     persisted = asyncio.Event()
     runtime_end = asyncio.Event()
+    runtime_end_handled = asyncio.Event()
     release = asyncio.Event()
     original = ConversationStore._to_thread_durable
     approvals = server.control._approvals
@@ -8735,6 +8736,7 @@ async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
     async def record_runtime_end(*args, **kwargs):
         runtime_end.set()
         await original_end(*args, **kwargs)
+        runtime_end_handled.set()
 
     # test-contract: seam no public hook exists between durable approval commit and settlement
     monkeypatch.setattr(ConversationStore, "_to_thread_durable", gated_durable)
@@ -8761,7 +8763,7 @@ async def test_durable_decision_publishes_approval_end_before_tool_and_turn_end(
         await writer.drain()
         await asyncio.wait_for(persisted.wait(), timeout=10)
         await asyncio.wait_for(runtime_end.wait(), timeout=10)
-        assert server.control._approvals.state.records["gated-call"].phase == "settling"
+        await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
         release.set()
         while not _named_events(frames, "turn_end"):
             frames.append(await asyncio.wait_for(_read(reader), timeout=10))

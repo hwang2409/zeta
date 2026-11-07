@@ -43,6 +43,7 @@ class ApprovalRecord:
     history_published: bool = False
     published: bool = False
     settlement: asyncio.Task[object] | None = None
+    publication_started: asyncio.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -881,7 +882,11 @@ class ApprovalLifecycle:
         current = self._state.records.get(record.target.key)
         if current is None or current.token != record.token:
             return
-        record = current
+        if current.publication_started is not None:
+            await current.publication_started.wait()
+            return
+        publication_started = asyncio.Event()
+        record = self._change(current, publication_started=publication_started)
         data: dict[str, object] = {
             key: value for key, value in resolution.items() if key != "request_id"
         }
@@ -893,6 +898,7 @@ class ApprovalLifecycle:
                     {"event": "approval_end", **payload}
                 )
             if payload is not None and record.published:
+                publication_started.set()
                 await self._publish(
                     event_contract.STREAM_EVENT_WIRE_EVENTS[
                         StreamEventType.TOOL_APPROVAL_END
@@ -901,6 +907,7 @@ class ApprovalLifecycle:
                     **payload,
                 )
         finally:
+            publication_started.set()
             if self._owns(record):
                 self._remove(record.target.key)
 
@@ -1051,19 +1058,6 @@ class ApprovalLifecycle:
             if record.disposition == "active":
                 self._externalize(record)
             return
-        if record.phase == "settling":
-            settlement = record.settlement
-            if settlement is not None and settlement is not asyncio.current_task():
-                try:
-                    await asyncio.shield(settlement)
-                except asyncio.CancelledError:
-                    if not settlement.cancelled():
-                        raise
-                except Exception:  # noqa: BLE001, S110 - settlement owns failure
-                    pass
-            record = self._state.records.get(key)
-            if record is None:
-                return
         if record.phase != "pending" and record.phase != "settling":
             return
         resolution = record.target.store.approval_resolution_data(
