@@ -123,7 +123,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         await asyncio.wait_for(server._client.logins.tasks[provider], 3)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
         saved = await asyncio.to_thread(credential_store, provider, home=server.home)
-        assert await asyncio.to_thread(saved.read) == expected
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
@@ -141,7 +141,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         return "https://authorize.invalid/"
     async def exchange(*args):
         if outcome == "exchange_timeout":
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         raise RuntimeError("SECRET_TOKEN")
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
@@ -162,7 +162,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
             result = (await rpc(reader, writer, "login_cancel", provider="claude"))["result"]
             assert result == {"state": "cancelled"}
         elif outcome == "disconnect":
-            await close_serve(server, writer)
+            await server.close()
             assert not manager.tasks
         else:
             result = await asyncio.wait_for(manager.tasks["claude"], 3)
@@ -177,7 +177,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         listener.close()
         await listener.wait_closed()
         saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
-        assert await asyncio.to_thread(saved.read) is None
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) is None
         if outcome != "disconnect":
             monkeypatch.setattr(providers, "build_anthropic_authorization_url", lambda *args: "https://authorize.invalid/")
             retry = (await rpc(reader, writer, "login_start", provider="claude"))["result"]
@@ -527,7 +527,7 @@ async def test_cancel_during_provider_lock_release_reports_success(
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
         assert task.cancelling() == 0
         saved = await asyncio.to_thread(credential_store, "claude", home=server.home)
-        assert await asyncio.to_thread(saved.read) == expected
+        assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
     finally:
         release_exit.set()
         await close_serve(server, writer)

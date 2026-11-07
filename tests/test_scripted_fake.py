@@ -323,7 +323,7 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         result = await resolve_approval(method, request_id, scope)
-        await tool_ended.wait()
+        await asyncio.wait_for(tool_ended.wait(), 10)
         return result
 
     server.control._notify = record_tool_end

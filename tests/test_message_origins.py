@@ -544,7 +544,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             raise AssertionError(path)
         if path != "serve steer":
             assert server._client is not None and server.control._turn_task is not None
-            await server.control._turn_task
+            await asyncio.wait_for(server.control._turn_task, 10)
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})
             assert reused[-1]["error"]["code"] == -32602

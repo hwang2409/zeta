@@ -192,7 +192,7 @@ async def test_resume_runs_tools_in_the_session_cwd(
 
         async def gated_send(connection: object, payload: bytes) -> bool:
             if connection is controller and json.loads(payload).get("id") == 4:
-                await tool_end_written.wait()
+                await asyncio.wait_for(tool_end_written.wait(), 10)
             return await original_send(connection, payload)
 
         async def record_write(payload: bytes) -> bool:
@@ -708,7 +708,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
 
     def record_decode(*args, **kwargs):
         if threading.get_ident() != threading.main_thread().ident:
-            heartbeat_reached_thread.wait()
+            heartbeat_reached_thread.wait(10)
         decoded_after_heartbeat.append(heartbeat.is_set())
         return original_decode(*args, **kwargs)
 
@@ -742,8 +742,8 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
         )
         asyncio.get_running_loop().call_soon(heartbeat.set)
         asyncio.get_running_loop().call_soon(heartbeat_reached_thread.set)
-        await heartbeat.wait()
-        assert await request == {"accepted": True, "session_id": session_id}
+        await asyncio.wait_for(heartbeat.wait(), 10)
+        assert await asyncio.wait_for(request, 10) == {"accepted": True, "session_id": session_id}
         assert decoded_after_heartbeat and all(decoded_after_heartbeat)
         await _event(reader, "agent_end")
     finally:
@@ -762,7 +762,7 @@ async def test_cancelled_send_images_publishes_nothing(
 
     async def gated_normalize(*args, **kwargs):
         worker_started.set()
-        release_worker.wait()
+        release_worker.wait(10)
         try:
             return await original_normalize(*args, **kwargs)
         finally:
@@ -796,7 +796,7 @@ async def test_cancelled_send_images_publishes_nothing(
         request.cancel()
         release_worker.set()
         with pytest.raises(asyncio.CancelledError):
-            await request
+            await asyncio.wait_for(request, 10)
         await asyncio.to_thread(worker_finished.wait)
 
         assert server.runtime.opened.store.messages() == []

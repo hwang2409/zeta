@@ -1765,7 +1765,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         event: str, session_id: str | None = None, **fields: object
     ) -> bool:
         if event == "approval_end" and fields.get("request_id") != raw_id:
-            await agent_ended.wait()
+            await asyncio.wait_for(agent_ended.wait(), 10)
         return await publish_approval(event, session_id, **fields)
 
     async def record_agent_end(
@@ -1892,7 +1892,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         )
         # test-contract: seam no public completion hook exists for child cancellation
         background_wait = asyncio.create_task(
-            server.runtime.loop._background_owner.wait()
+            asyncio.wait_for(server.runtime.loop._background_owner.wait(), 10)
         )
         frames = await _request(reader, writer, 4, "status")
         parent_tool_end_release.set()
@@ -2018,7 +2018,7 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
             assert server.runtime.loop._background_owner.cancel(
                 live_request["agent_instance_id"]
             )
-            await server.runtime.loop._background_owner.wait()
+            await asyncio.wait_for(server.runtime.loop._background_owner.wait(), 10)
             frames = await _request(reader, writer, 4, "status")
             seen_events = {
                 frame.get("params", {}).get("event")
@@ -2382,7 +2382,7 @@ async def test_lifecycle_prunes_ended_approvals(
 
     async def gated_send(connection: object, payload: bytes) -> bool:
         if connection is controller and json.loads(payload).get("id") == 4:
-            await tool_end_written.wait()
+            await asyncio.wait_for(tool_end_written.wait(), 10)
         return await original_send(connection, payload)
 
     async def record_write(payload: bytes) -> bool:
@@ -2638,7 +2638,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(
         await _event(reader, "tool_end")
         turn_task = server.control._turn_task
         assert turn_task is not None
-        await turn_task
+        await asyncio.wait_for(turn_task, 10)
         status = await _request(reader, writer, 4, "status")
         assert status[-1]["result"]["state"] == "idle"
     finally:
@@ -2704,7 +2704,7 @@ async def test_abort_captures_turn_before_approval_end_write(
         ) -> bool:
             if event == "approval_end":
                 approval_end_started.set()
-                await allow_approval_end.wait()
+                await asyncio.wait_for(allow_approval_end.wait(), 10)
             return await original_publish(event, session_id, **fields)
 
         server.connections.publish_controller = pause_approval_end  # type: ignore[method-assign]
@@ -6436,7 +6436,7 @@ async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> No
             pass
         else:
             raise AssertionError("catalog read ran on the event loop")
-        release.wait()
+        release.wait(10)
         return []
 
     server.runtime.list_sessions = blocked_catalog
@@ -6592,7 +6592,9 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             )
             assert runtime.metadata.model_fallback == expected
         if restart:
-            await close_serve(server, writer)
+            await server.close()
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), 10)
             server = make_server()
             reader, writer = await _connect(server)
             await _request(reader, writer, 4, "hello", {"protocol_version": "1.1"})
@@ -7529,7 +7531,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
 
     server = ZetaServer(
         home=tmp_path,
@@ -9016,7 +9018,7 @@ async def test_serve_account_refresh_reports_busy_lifecycle_lock(
     def hold_lifecycle_lock() -> None:
         with AccountStore(home).lifecycle_guard(account):
             locked.set()
-            release.wait()
+            release.wait(10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -9036,7 +9038,7 @@ async def test_serve_account_refresh_reports_busy_lifecycle_lock(
         )
     finally:
         release.set()
-        holder.join()
+        holder.join(10)
         await close_serve(server, writer)
 
 
@@ -9094,8 +9096,8 @@ async def test_serve_accounts_panel_does_not_block_on_held_lifecycle_lock(
         assert response[-1]["result"]["kind"] == "output"
     finally:
         release.set()
-        holder.join()
-        publisher.join()
+        holder.join(10)
+        publisher.join(10)
         await close_serve(server, writer)
 
 
@@ -9191,7 +9193,7 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
                 yield event
                 if event.type == StreamEventType.MESSAGE_UPDATE:
                     started.set()
-                    await release.wait()
+                    await asyncio.wait_for(release.wait(), 10)
 
     server = ZetaServer(
         home=tmp_path,
@@ -10329,7 +10331,7 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
     finally:
         release.set()
         stop.set()
-        await ticker_task
+        await asyncio.wait_for(ticker_task, 10)
         if not request_task.done():
             request_task.cancel()
         holder.join(timeout=1)
@@ -10501,7 +10503,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             self.calls.append(list(messages))
             if len(self.calls) == 1:
                 self.started.set()
-                await self.release.wait()
+                await asyncio.wait_for(self.release.wait(), 10)
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(MessageRole.ASSISTANT, [TextContent("done")]),

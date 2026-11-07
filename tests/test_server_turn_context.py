@@ -192,7 +192,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         turn_task.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await turn_task
+            await asyncio.wait_for(turn_task, 10)
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
@@ -271,7 +271,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         turn_task.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
-            await turn_task
+            await asyncio.wait_for(turn_task, 10)
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 

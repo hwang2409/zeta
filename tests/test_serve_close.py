@@ -1,11 +1,63 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
 from tests.support.serve_close import close_serve
+
+_TESTS_ROOT = Path(__file__).resolve().parent
+_CLOSE_SERVE_CONDITION_FIX = (
+    "call close_serve unconditionally; pass optional writers as "
+    "*[w for w in (...) if w is not None]"
+)
+
+
+def _is_close_serve_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == "close_serve") or (
+        isinstance(func, ast.Attribute) and func.attr == "close_serve"
+    )
+
+
+def _conditional_close_serve_lines(tree: ast.AST) -> set[int]:
+    """Line numbers of close_serve calls nested in an if/elif/else body.
+
+    close_serve owns serve-test cleanup; gating it behind a condition is the
+    recurring bug where an early failure skips the server/writer close and
+    leaks descriptors into the next test (PR #881 rounds 1-2). The guard has no
+    exemptions: a call that needs a condition is rewritten to the unconditional
+    form instead.
+    """
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            for branch in (node.body, node.orelse):
+                for statement in branch:
+                    for inner in ast.walk(statement):
+                        if _is_close_serve_call(inner):
+                            lines.add(inner.lineno)
+    return lines
+
+
+def test_close_serve_is_never_called_under_a_condition() -> None:
+    offenders: list[str] = []
+    for path in sorted(_TESTS_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        root = _TESTS_ROOT.parent
+        offenders.extend(
+            f"{path.relative_to(root)}:{line}"
+            for line in sorted(_conditional_close_serve_lines(tree))
+        )
+    assert not offenders, (
+        "close_serve must not be nested inside an if/elif/else body "
+        f"({', '.join(offenders)}): {_CLOSE_SERVE_CONDITION_FIX}"
+    )
 
 
 @dataclass
@@ -172,4 +224,4 @@ async def test_close_serve_drains_server_when_cancelled(phase: str) -> None:
         server.release.set()
         if not close_task.done():
             close_task.cancel()
-        await asyncio.gather(close_task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(close_task, return_exceptions=True), 10)

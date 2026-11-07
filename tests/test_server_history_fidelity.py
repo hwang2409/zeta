@@ -452,7 +452,7 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
         live_turn_id = started["data"].get("turn_id")
         assert isinstance(live_turn_id, str)
         if isinstance(backend, _BlockingBackend):
-            await backend.started.wait()
+            await asyncio.wait_for(backend.started.wait(), 10)
         if reason == "user_stop":
             await request(reader, writer, 12, "abort")
         elif reason == "disconnect":
@@ -460,7 +460,7 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
             await writer.wait_closed()
         if terminal is not None:
             await event(reader, terminal)
-        await finalized.wait()
+        await asyncio.wait_for(finalized.wait(), 10)
 
         if reason != "disconnect":
             writer.close()
@@ -545,7 +545,7 @@ async def test_background_finalizers_persist_served_turn_end(
             started = await event(reader, "turn_start")
             live_turn_id = started["data"].get("turn_id")
             assert isinstance(live_turn_id, str)
-        await finalized.wait()
+        await asyncio.wait_for(finalized.wait(), 10)
 
         rows = await _history(reader, writer, session_id)
         served = [row for row in rows if row.get("event") == "served_turn_end"]
@@ -624,7 +624,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         assert not announcement.done()
 
         release.set()
-        await announcement
+        await asyncio.wait_for(announcement, 10)
         rows = await _history(reader, writer, session_id)
         assert [
             row["data"]["reason"]

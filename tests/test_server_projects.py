@@ -224,7 +224,7 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
         operation.cancel()
         preparation_release.set()
         with pytest.raises(asyncio.CancelledError):
-            await operation
+            await asyncio.wait_for(operation, 10)
         await _await_setup_reapers(server)
         assert await asyncio.to_thread(preparation_done.wait, 2)
         assert opened and opened[0]._closed
@@ -286,7 +286,7 @@ async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_s
         opened[0].close = tracked_close
         operation.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await operation
+            await asyncio.wait_for(operation, 10)
         await _await_setup_reapers(server)
         assert compose_done.is_set()
         assert worker_saw_closed == [False]

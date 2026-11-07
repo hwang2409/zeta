@@ -1174,7 +1174,7 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
         ] == [{"type": "text", "text": "steer dropped: abort"}]
 
         await _request(reader, writer, 3, "send", {"text": "stop this turn"})
-        await backend.started.wait()
+        await asyncio.wait_for(backend.started.wait(), 10)
         await _request(reader, writer, 4, "abort")
         await _event(reader, "turn_aborted")
         await _request(reader, writer, 5, "send", {"text": "fail this turn"})
@@ -1332,7 +1332,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             calls += 1
             if calls == 2:
                 entered.set()
-                await release.wait()
+                await asyncio.wait_for(release.wait(), 10)
             return await original(*args, **kwargs)
 
         server.runtime.loop.context_assembler.assemble = blocked_assemble

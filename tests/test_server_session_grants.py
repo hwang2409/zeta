@@ -541,7 +541,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         async def block_observer(payload: bytes) -> bool:
             if b"session_grants_changed" in payload:
                 observer_blocked.set()
-                await release_observer.wait()
+                await asyncio.wait_for(release_observer.wait(), 10)
             return await original_write(payload)
 
         # test-contract: seam gate the real observer transport write
@@ -555,7 +555,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 {"request_id": "call-1", "scope": "always_tool"},
             )
         )
-        await observer_blocked.wait()
+        await asyncio.wait_for(observer_blocked.wait(), 10)
         approve_frames = await _assert_completes_in_ready_turns(approve)
         assert approve_frames[-1]["result"] == {
             "accepted": True,
@@ -580,7 +580,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
                 {"grant": "bash"},
             )
         )
-        await observer_blocked.wait()
+        await asyncio.wait_for(observer_blocked.wait(), 10)
         revoke_frames = await _assert_completes_in_ready_turns(revoke)
         assert revoke_frames[-1]["result"]["removed"] == ["bash"]
         release_observer.set()
@@ -683,7 +683,7 @@ async def test_observer_write_failure_does_not_block_approved_tool_resume(
             "request_id": "call-1",
             "scope": "always_tool",
         }
-        await write_failed.wait()
+        await asyncio.wait_for(write_failed.wait(), 10)
         await _frames_until_event(reader, "turn_end")
         snapshot = (await _request(reader, writer, 5, "session_grants"))[-1]["result"]
         assert snapshot["session_grants"] == ["bash"]
@@ -756,7 +756,7 @@ async def test_observer_write_failure_does_not_turn_revoke_into_error(
         revoked = revoke_response["result"]
         assert revoked["removed"] == ["bash"]
         assert revoked["grants"]["session_grants"] == []
-        await write_failed.wait()
+        await asyncio.wait_for(write_failed.wait(), 10)
         assert (await _request(reader, writer, 6, "session_grants"))[-1]["result"] == (
             revoked["grants"]
         )
@@ -1065,7 +1065,7 @@ async def test_replacement_controller_discards_cache_and_reads_current_snapshot(
         monkeypatch.setattr(server.connections, "release", release)
         writer.close()
         await writer.wait_closed()
-        await released.wait()
+        await asyncio.wait_for(released.wait(), 10)
 
         replacement_reader, replacement_writer = await asyncio.open_unix_connection(
             str(server.socket_path)

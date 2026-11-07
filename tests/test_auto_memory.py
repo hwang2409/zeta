@@ -173,7 +173,7 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
         )
         session_id = created[-1]["result"]["session"]["session_id"]
         await server_request(reader, writer, 3, "send", {"text": "stop this turn"})
-        await backend.started.wait()
+        await asyncio.wait_for(backend.started.wait(), 10)
         await server_request(reader, writer, 4, "abort")
         await server_event(reader, "turn_aborted")
         await server_request(reader, writer, 5, "send", {"text": "fail this turn"})
