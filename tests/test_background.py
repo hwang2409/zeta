@@ -224,6 +224,11 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
     monitor_cancelled = asyncio.Event()
     release_archive = asyncio.Event()
     original_archive_record = registry._archive_record
+    original_terminate_process = process_module._terminate_process
+
+    async def terminate_after_archive(*args, **kwargs) -> None:
+        await original_terminate_process(*args, **kwargs)
+        await archive_entered.wait()
 
     async def gated_archive_record(record, log_handle) -> None:
         archive_entered.set()
@@ -238,21 +243,24 @@ async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
 
     # test-contract: seam force the archive-pending monitor cancellation order
     monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
+    monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
     monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
     waiter = asyncio.create_task(registry.wait(task_id))
     killer = asyncio.create_task(registry.kill(task_id))
     try:
-        await archive_entered.wait()
-        await monitor_cancelled.wait()
+        await asyncio.wait_for(archive_entered.wait(), 10)
+        await asyncio.wait_for(monitor_cancelled.wait(), 10)
         release_archive.set()
 
-        status = await waiter
+        status = await asyncio.wait_for(waiter, 10)
         assert status["running"] is False
-        await killer
+        await asyncio.wait_for(killer, 10)
     finally:
         release_archive.set()
-        await asyncio.gather(waiter, killer, return_exceptions=True)
-        await registry.close()
+        await asyncio.wait_for(
+            asyncio.gather(waiter, killer, return_exceptions=True), 10
+        )
+        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
