@@ -50,6 +50,7 @@ class _ReadResult:
     last_entry_id: str | None
     full: bool
     bytes_read: int
+    recovery_generation: int
 
 
 def _bounded_text(value: str, max_chars: int) -> str:
@@ -110,9 +111,7 @@ def _project_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
             if not isinstance(block, Mapping):
                 continue
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                content.append(
-                    {"type": "text", "text": redact_secrets(block["text"])}
-                )
+                content.append({"type": "text", "text": redact_secrets(block["text"])})
             elif block.get("type") == "tool_use":
                 call = block.get("tool_call")
                 if isinstance(call, Mapping):
@@ -161,6 +160,8 @@ def _read_transcript(
     path: Path,
     cursor: _Cursor | None,
     append_receipts: tuple[PersistedAppend, ...] | None = None,
+    *,
+    recovery_generation: int = 0,
 ) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
@@ -210,13 +211,17 @@ def _read_transcript(
                 if value.get("type") == "header":
                     if not full or rows:
                         if not full:
-                            return _read_transcript(path, None)
+                            return _read_transcript(
+                                path, None, recovery_generation=recovery_generation
+                            )
                         raise ValueError("unexpected transcript header")
                     continue
                 entry = ConversationEntry.from_dict(value)
                 if entry.seq != last_seq + 1:
                     if not full:
-                        return _read_transcript(path, None)
+                        return _read_transcript(
+                            path, None, recovery_generation=recovery_generation
+                        )
                     raise ValueError("transcript sequence is not contiguous")
                 rows.append(_project_entry(entry))
                 last_seq = entry.seq
@@ -233,6 +238,7 @@ def _read_transcript(
             last_entry_id,
             full,
             bytes_read,
+            recovery_generation,
         )
     finally:
         os.close(fd)
@@ -280,13 +286,19 @@ def _receipts_extend_cursor(
             receipt.before_mtime_ns,
             receipt.before_ctime_ns,
         )
-        if receipt.start_offset != expected_offset or before_identity != expected_identity:
+        if (
+            receipt.start_offset != expected_offset
+            or before_identity != expected_identity
+        ):
             return False
         length = receipt.end_offset - receipt.start_offset
         if length <= 0:
             return False
         appended = os.pread(fd, length, receipt.start_offset)
-        if len(appended) != length or hashlib.sha256(appended).hexdigest() != receipt.digest:
+        if (
+            len(appended) != length
+            or hashlib.sha256(appended).hexdigest() != receipt.digest
+        ):
             return False
         expected_offset = receipt.end_offset
         expected_identity = (

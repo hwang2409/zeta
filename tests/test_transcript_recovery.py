@@ -20,6 +20,8 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
+from zeta.transcript_search.index import TranscriptSource
+from zeta.transcript_search.source import _read_transcript
 
 
 def _recovery():
@@ -247,7 +249,9 @@ def test_nested_target_resolution_uses_public_identity_and_no_symlinks(
         pass
 
 
-def test_record_parser_rejects_unknown_fields(tmp_path: Path) -> None:
+def test_record_parser_rejects_unknown_fields_and_search_carries_generation(
+    tmp_path: Path,
+) -> None:
     root, _, diagnosis = _diagnosed_store(tmp_path)
     recovery = _recovery()
     target = recovery.RepairTarget("damaged")
@@ -265,3 +269,15 @@ def test_record_parser_rejects_unknown_fields(tmp_path: Path) -> None:
     value["unexpected"] = True
     with pytest.raises(recovery.TranscriptRecoveryIntegrityError, match="shape"):
         recovery.parse_evidence_manifest(value)
+
+    source = TranscriptSource(
+        session_id="damaged",
+        session_dir=root / "damaged",
+        recovery_generation=7,
+    )
+    read = _read_transcript(
+        source.conversation_path,
+        None,
+        recovery_generation=source.recovery_generation,
+    )
+    assert read.recovery_generation == 7
