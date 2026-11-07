@@ -78,6 +78,11 @@ def _styles(panel: BackgroundTasksPanel) -> list[tuple[str, str]]:
 @pytest.mark.parametrize(
     ("text", "width", "expected"),
     [
+        pytest.param("", 0, [""], id="empty-nonpositive-width"),
+        pytest.param("abc", 0, ["a", "b", "c"], id="nonpositive-width"),
+        pytest.param("a  b", 4, ["a b"], id="repeated-spaces"),
+        pytest.param("a\n\n", 4, ["a", ""], id="trailing-newlines"),
+        pytest.param("ab", 2, ["ab"], id="exact-width"),
         pytest.param("abcdefgh", 3, ["abc", "def", "gh"], id="long-token"),
         pytest.param("ab界cd", 4, ["ab界", "cd"], id="wide-cjk-boundary"),
         pytest.param("ab🙂cd", 4, ["ab🙂", "cd"], id="emoji-boundary"),
