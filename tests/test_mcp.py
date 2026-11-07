@@ -3431,7 +3431,7 @@ async def test_slash_mcp_add_http_writes_and_registers(
 
 
 @pytest.mark.asyncio
-async def test_slash_mcp_add_rejects_duplicate_and_bad_flags(
+async def test_slash_mcp_add_accepts_duplicate_and_rejects_bad_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "home"
@@ -3451,7 +3451,7 @@ async def test_slash_mcp_add_rejects_duplicate_and_bad_flags(
 
     await loop.slash_mcp("add remote --http https://mcp.example")
     duplicate = await loop.slash_mcp("add remote --http https://mcp.example")
-    assert "already configured" in duplicate
+    assert "remote: mounted" in duplicate
     bad_flag = await loop.slash_mcp("add other --socket cmd")
     assert "unknown add flag" in bad_flag
     bad_http = await loop.slash_mcp("add three --http a b c")

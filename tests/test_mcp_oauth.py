@@ -2282,7 +2282,7 @@ async def test_idle_client_does_not_send_token_after_public_logout(
     )
     outcome = manager.logout("live", scope="user")
     if inspect.isawaitable(outcome):
-        await outcome
+        await asyncio.wait_for(outcome, 10)
     result = await client.call_tool("echo", {}, AbortSignal())
     assert result["isError"] is True
     assert token.access_token not in result["content"][0]["text"]
@@ -2792,7 +2792,7 @@ async def test_colliding_server_names_keep_separate_credentials_and_logout(
 
         logout = manager.logout("team/server", scope="user")
         if inspect.isawaitable(logout):
-            await logout
+            await asyncio.wait_for(logout, 10)
         removed = await pairs["team/server"][0].call_tool("echo", {}, AbortSignal())
         retained = await pairs["team_server"][0].call_tool("echo", {}, AbortSignal())
         assert removed["isError"] is True

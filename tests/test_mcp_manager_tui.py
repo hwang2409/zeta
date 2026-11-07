@@ -218,7 +218,7 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
                 await asyncio.sleep(0.01)
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await prompt
+            await asyncio.wait_for(prompt, 10)
     await loop.close()
 
 
@@ -366,7 +366,7 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
     @asynccontextmanager
     async def gated_terminal():
         terminal_entered.set()
-        await terminal_release.wait()
+        await asyncio.wait_for(terminal_release.wait(), 10)
         yield
 
     async def cancelled_collect():
@@ -420,7 +420,7 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
         assert app._mcp_manager.selected == selected
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await prompt
+            await asyncio.wait_for(prompt, 10)
     await loop.close()
 
 
@@ -492,7 +492,7 @@ async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch)
     async def wizard():
         nonlocal started
         started += 1
-        await gate.wait()
+        await asyncio.wait_for(gate.wait(), 10)
 
     monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
     app._status_action("a")
@@ -502,7 +502,7 @@ async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch)
     await asyncio.sleep(0)
     assert started == 1
     gate.set()
-    await first
+    await asyncio.wait_for(first, 10)
     await loop.close()
 
 
@@ -520,7 +520,7 @@ async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
 
     async def wizard():
         try:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         except asyncio.CancelledError:
             cancelled.set()
             raise
@@ -806,5 +806,5 @@ async def test_real_prompt_mcp_credential_evidence_recovery(
         assert app._mcp_manager.credential_store_error is None
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await prompt
+            await asyncio.wait_for(prompt, 10)
     await loop.close()
