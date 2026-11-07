@@ -7709,7 +7709,7 @@ async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
     try:
         return await _raw_response_line(reader, writer, "hello", "hello", params)
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -7759,9 +7759,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
             )
         )
     finally:
-        observer_writer.close()
-        await observer_writer.wait_closed()
-        await _close(observer_server, controller_writer)
+        await close_serve(observer_server, controller_writer, observer_writer)
 
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
@@ -7800,7 +7798,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
             ]
         )
     finally:
-        await _close(server, writer)
+        await close_serve(server, writer)
 
     help_project = tmp_path / "help-project"
     help_project.mkdir()
@@ -7828,7 +7826,7 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
             )
         )
     finally:
-        await _close(help_server, help_writer)
+        await close_serve(help_server, help_writer)
 
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()

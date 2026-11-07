@@ -30,7 +30,7 @@ async def close_serve(server: Any, *writers: Any) -> None:
                 await asyncio.wait_for(asyncio.shield(server_task), _CLOSE_TIMEOUT)
             except asyncio.CancelledError as error:
                 cancellation = cancellation or error
-            except asyncio.TimeoutError as error:
+            except TimeoutError as error:
                 server_task.cancel()
                 if first_error is None:
                     first_error = error
