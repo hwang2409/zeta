@@ -1035,12 +1035,13 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
         project_role="worker", parent_session_id=parent.metadata.session_id,
         name="child", auto_project=False,
     ))
-    await asyncio.to_thread(lambda: server.runtime.manager.create(
+    other_opened = await asyncio.to_thread(lambda: server.runtime.manager.create(
         provider="codex", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
         project_role="session", auto_project=False,
     ))
     parent.store.close()
     child.store.close()
+    other_opened.store.close()
     before = _mtimes(server.home)
 
     reader, writer = await _connect(server)

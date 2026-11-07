@@ -8,9 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.key_binding.key_processor import KeyPress
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
@@ -505,7 +508,7 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         why = "\n".join(
             f"why paragraph {index} has useful context " + "useful context " * 12
             for index in range(17)
-        )
+        ) + "\ntail-marker"
         item = _item(
             "1" * 32,
             "Which deployment should we use?",
@@ -516,7 +519,7 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         app._decisions_panel.set_items([item])
         app.open_decisions_panel()
 
-        async def render() -> str:
+        async def render() -> tuple[Screen, MouseHandlers]:
             session.app.output = _FixedSizeOutput(width, height)
             screen = Screen()
             handlers = MouseHandlers()
@@ -526,19 +529,84 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
                     screen, handlers, WritePosition(0, 0, width, height), "", False, None
                 )
                 screen.draw_all_floats()
-            return _screen_text(screen, width, height)
+            return screen, handlers
 
-        first = await render()
+        def press(key: str) -> None:
+            with set_app(session.app):
+                session.app.key_processor.feed(KeyPress(key))
+                session.app.key_processor.process_keys()
+
+        first_screen, _ = await render()
+        first = _screen_text(first_screen, width, height)
         assert "↓ more · pgdn" in first
         for _ in range(20):
-            app._decisions_key("pagedown")
-        bottom = await render()
+            press(Keys.PageDown)
+        bottom_screen, _ = await render()
+        bottom = _screen_text(bottom_screen, width, height)
         assert "Recommendation:" in bottom
         assert "↓ more · pgdn" not in bottom
         assert "↑ more · pgup" in bottom
-        app._decisions_key("pageup")
-        returned = await render()
-        assert "more" in returned
+
+        offset_at_bottom = app._decisions_panel_control.offset
+        press(Keys.PageUp)
+        assert app._decisions_panel_control.offset < offset_at_bottom
+        press(Keys.PageDown)
+        assert app._decisions_panel_control.offset == offset_at_bottom
+
+        # The answer input owns focus, but page keys must still scroll the popup.
+        press("a")
+        assert app._decisions_panel.mode == "answer"
+        app._decisions_panel_control.top()
+        for _ in range(20):
+            press(Keys.PageDown)
+        answer_bottom_screen, _ = await render()
+        answer_bottom = _screen_text(answer_bottom_screen, width, height)
+        assert "tail-marker" in answer_bottom
+        assert "↑ more · pgup" in answer_bottom
+        answer_offset = app._decisions_panel_control.offset
+        press("x")
+        assert app._decisions_panel_control.offset == answer_offset
+
+        # The rendered popup installs the wheel handler in MouseHandlers.
+        press(Keys.Escape)
+        app._decisions_panel_control.top()
+        initial_screen, handlers = await render()
+        initial = _screen_text(initial_screen, width, height)
+        assert "↓ more · pgdn" in initial
+        wheel_event = MouseEvent(
+            position=Point(0, 0),
+            event_type=MouseEventType.SCROLL_DOWN,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+        wheel_handler = None
+        with set_app(session.app):
+            for row in range(height):
+                for column in range(width):
+                    candidate = handlers.mouse_handlers[row][column]
+                    if candidate is None:
+                        continue
+                    wheel_event.position = Point(column, row)
+                    candidate(wheel_event)
+                    if app._decisions_panel_control.offset > 0:
+                        wheel_handler = candidate
+                        break
+                if wheel_handler is not None:
+                    break
+            assert wheel_handler is not None
+            for _ in range(30):
+                wheel_handler(wheel_event)
+        wheel_screen, _ = await render()
+        wheel_text = _screen_text(wheel_screen, width, height)
+        assert "tail-marker" in wheel_text
+        assert "↑ more · pgup" in wheel_text
+
+        press(Keys.PageUp)
+        assert app._decisions_panel_control.offset < app._decisions_panel_control._max_offset()
+        second = _item("2" * 32, "Other decision", "short", ["Keep"])
+        app._decisions_panel.set_items([second])
+        app._refresh_decisions_panel()
+        assert app._decisions_panel_control.offset == 0
     finally:
         await app.close()
 

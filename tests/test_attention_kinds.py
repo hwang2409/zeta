@@ -120,7 +120,7 @@ def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(
         ValueError,
-        match="zeta storage-format advance --expected-epoch 2 --target-epoch 3",
+        match="zeta storage-format advance --expected-epoch 2 --target-epoch 4",
     ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()
