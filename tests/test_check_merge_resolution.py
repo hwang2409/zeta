@@ -871,6 +871,53 @@ def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
 
 
 
+def test_pr_line_count_subtracts_base_and_main_copies(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    emit()\n    anchor()\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    emit()\n    anchor()\n    emit()\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    anchor()\n")
+    commit(r, "main removes base copy")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    anchor()\n    emit()\n")
+    commit(r, "merge keeps pr copy")
+    result = run(r)
+    assert result.returncode == 0
+    assert "pr-line" not in result.stdout
+
+
+def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> None:
+    r = repo(tmp_path)
+    (r / "src").mkdir()
+    (r / "src/a.py").write_text("def check():\n    return 1\n")
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "main")
+    _set_origin_main(r)
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
+    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    commit(r, "lost merge")
+    merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n")
+    commit(r, "exact restoration")
+    exact = run(r, merge, "--final", "HEAD")
+    assert exact.returncode == 0
+    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n")
+    commit(r, "modified restoration")
+    modified = run(r, merge, "--final", "HEAD")
+    assert modified.returncode == 1
+    assert "pr-line" in modified.stdout
+
+
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -887,12 +934,16 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     (r / "src/a.py").write_text("def check():\n    return 1\n")
     commit(r, "merge")
     result = run(r)
-    line = next(line for line in result.stdout.splitlines() if "pr-line" in line)
+    line = next(line for line in result.stdout.splitlines() if ": pr-line " in line)
     name = line.split("pr-line ", 1)[1].split(":", 1)[0]
     owner, digest = name.rsplit("@", 1)
+    marker = next(line for line in result.stdout.splitlines() if line.startswith("suggested override: "))
+    printed = marker.removeprefix("suggested override: ")
+    assert printed.startswith(f"merge-resolution: src/a.py pr-lines {owner}@")
     group = hashlib.sha256(f"{name}=added = 2".encode()).hexdigest()[:12]
+    assert printed.split("@", 1)[1].split(" ", 1)[0] == group
     body = tmp_path / "body"
-    body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{group} -> intentional\n")
+    body.write_text(f"{printed[:-8]}intentional\n")
     assert run(r, "--pr-body-file", str(body)).returncode == 0
     body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{digest} -> stale\n")
     assert run(r, "--pr-body-file", str(body)).returncode == 1

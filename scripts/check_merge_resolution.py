@@ -8,6 +8,7 @@ import difflib
 import hashlib
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 
 ROOTS = ("src/", "scripts/", "tests/")
@@ -263,22 +264,6 @@ def _owner_was_removed(
     )
 
 
-def _line_owner(tree: ast.Module, line: int) -> str:
-    owners: list[tuple[int, int, str]] = []
-
-    def visit(body: list[ast.stmt], scope: str = "") -> None:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{scope}{node.name}"
-                end = getattr(node, "end_lineno", node.lineno)
-                owners.append((node.lineno, end, name))
-                visit(node.body, f"{name}.")
-
-    visit(tree.body)
-    matches = [(end - start, name) for start, end, name in owners if start <= line <= end]
-    return min(matches)[1] if matches else "<module>"
-
-
 def _owners_by_line(tree: ast.Module, count: int) -> list[str]:
     owners = ["<module>"] * count
     scopes: list[tuple[int, int, str]] = []
@@ -306,67 +291,106 @@ def _diff_blocks(base: list[str], side: list[str]) -> list[tuple[int, int, int, 
     ]
 
 
+def _owner_translation(source: dict, target: dict) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in source.values():
+        if item.kind not in {"def", "async def", "class"}:
+            continue
+        matches = [
+            candidate
+            for candidate in target.values()
+            if candidate.kind == item.kind and candidate.fingerprint == item.fingerprint
+        ]
+        if len(matches) == 1:
+            result[item.name] = matches[0].name
+            continue
+        same_name = [
+            candidate for candidate in target.values()
+            if candidate.kind == item.kind and candidate.name == item.name
+        ]
+        if len(same_name) == 1:
+            result[item.name] = same_name[0].name
+    return result
+
+
+def _line_items(path: str, text: str, owners: dict[str, str]) -> list[Item]:
+    try:
+        tree = ast.parse(text, filename=path)
+    except SyntaxError:
+        return []
+    lines = text.splitlines()
+    names = _owners_by_line(tree, len(lines))
+    definitions = {
+        item.name: item.fingerprint
+        for item in parse_items(path, tree, {})[0]
+        if item.kind in {"def", "async def", "class"}
+    }
+    result = []
+    for number, (value, owner) in enumerate(zip(lines, names), 1):
+        value = value.strip()
+        if not value or value.startswith("#"):
+            continue
+        owner = owners.get(owner, owner)
+        digest = hashlib.sha256(f"{owner}\\0{value}".encode()).hexdigest()[:12]
+        result.append(
+            Item(
+                path, "pr-line", f"{owner}@{digest}", number, value,
+                owner=owner, fingerprint=definitions.get(names[number - 1], ""),
+            )
+        )
+    return result
+
+
+def _main_overlaps(start: int, end: int, blocks: list[tuple[int, int, int, int]]) -> bool:
+    return any(
+        (start == end == other_start == other_end)
+        or (start != end and other_start <= start and other_end >= end)
+        for other_start, other_end, _new_start, _new_end in blocks
+    )
+
+
+def _pr_line_candidates(
+    path: str, base: list[str], branch: list[str], owners: dict[str, str]
+) -> list[tuple[Item, tuple[int, int]]]:
+    branch_items = _line_items(path, "\n".join(branch), owners)
+    by_line = {item.line: item for item in branch_items}
+    candidates = []
+    for old_start, old_end, new_start, new_end in _diff_blocks(base, branch):
+        for line in range(new_start + 1, new_end + 1):
+            if line in by_line:
+                candidates.append((by_line[line], (old_start, old_end)))
+    return candidates
+
+
 def _pr_line_items(
     path: str,
     base_text: str,
     branch_text: str,
     main_text: str,
     merge_text: str | None,
-    owner_map: dict[str, str] | None = None,
+    owner_maps: tuple[dict[str, str], dict[str, str], dict[str, str]] = ({}, {}, {}),
 ) -> list[Item]:
-    try:
-        tree = ast.parse(branch_text, filename=path)
-    except SyntaxError:
-        return []
-    base = base_text.splitlines()
-    branch = branch_text.splitlines()
-    main = main_text.splitlines()
-    merged = (merge_text or "").splitlines()
-    branch_tree = tree
-    merge_tree = ast.parse(merge_text, filename=path) if merge_text is not None else None
-    owner_map = owner_map or {}
-    branch_owners = _owners_by_line(branch_tree, len(branch))
-    merge_owners = _owners_by_line(merge_tree, len(merged)) if merge_tree else []
-    pr_blocks = _diff_blocks(base, branch)
+    base, branch, main = (text.splitlines() for text in (base_text, branch_text, main_text))
+    base_map, main_map, merge_map = owner_maps
+    candidates = _pr_line_candidates(path, base, branch, {})
     main_blocks = _diff_blocks(base, main)
-    candidates: list[tuple[Item, tuple[int, int]]] = []
-    for old_start, old_end, new_start, new_end in pr_blocks:
-        for line_no in range(new_start, new_end):
-            value = branch[line_no].strip()
-            if not value or value.startswith("#"):
-                continue
-            owner = owner_map.get(branch_owners[line_no], branch_owners[line_no])
-            digest = hashlib.sha256(f"{owner}\\0{value}".encode()).hexdigest()[:12]
-            candidates.append(
-                (
-                    Item(path, "pr-line", f"{owner}@{digest}", line_no + 1, value, owner=owner),
-                    (old_start, old_end),
-                )
-            )
-    kept: list[Item] = []
+    base_items = _line_items(path, base_text, base_map)
+    branch_items = _line_items(path, branch_text, {})
+    main_items = _line_items(path, main_text, main_map)
+    merge_items = _line_items(path, merge_text or "", merge_map)
+    counts = [Counter(item_key(item) for item in items) for items in
+              (base_items, branch_items, main_items, merge_items)]
+    additions = Counter(item_key(item) for item, _interval in candidates)
+    result = []
     for item, (start, end) in candidates:
-        if any(
-            (start == end == other_start == other_end)
-            or (start != end and other_start <= start and other_end >= end)
-            for other_start, other_end, _new_start, _new_end in main_blocks
-        ):
+        if _main_overlaps(start, end, main_blocks):
             continue
-        branch_count = sum(
-            line.strip() == item.value and owner_map.get(owner, owner) == item.owner
-            for line, owner in zip(branch, branch_owners)
-        )
-        merged_count = sum(
-            line.strip() == item.value and owner == item.owner
-            for line, owner in zip(merged, merge_owners)
-        )
-        if merged_count < branch_count:
-            already = sum(
-                candidate.value == item.value and candidate.owner == item.owner
-                for candidate in kept
-            )
-            if already < branch_count - merged_count:
-                kept.append(item)
-    return kept
+        key = item_key(item)
+        required = max(0, counts[1][key] + counts[2][key] - counts[0][key])
+        lost = min(additions[key], max(0, required - counts[3][key]))
+        if lost and sum(item_key(candidate) == key for candidate in result) < lost:
+            result.append(item)
+    return result
 
 
 def _group_marker(line: str, findings: list[Item]) -> set[Item]:
@@ -378,7 +402,7 @@ def _group_marker(line: str, findings: list[Item]) -> set[Item]:
     owner, digest = rest.rsplit("@", 1)
     group = [item for item in findings if item.path == path and item.owner == owner]
     values = sorted(f"{item.name}={item.value}" for item in group)
-    actual = hashlib.sha256("\\n".join(values).encode()).hexdigest()[:12]
+    actual = hashlib.sha256("\n".join(values).encode()).hexdigest()[:12]
     return set(group) if actual == digest else set()
 
 
@@ -727,6 +751,12 @@ def _final_index(
     sources = load_sources([revision], paths)
     parsed, _unresolved, error = parse_revisions([revision], paths, sources)
     error_path = error[1] if error else None
+    if error is None:
+        for path in paths:
+            text = sources.get((revision, path))
+            if text is not None:
+                for item in _line_items(path, text, {}):
+                    parsed[revision][item_key(item)] = item
     return parsed[revision], sources, error_path
 
 
@@ -772,7 +802,19 @@ def _final_match(
 ) -> bool:
     if same_item(finding, item):
         return True
-    if finding.path == item.path or finding.kind != item.kind:
+    if finding.kind != item.kind:
+        return False
+    if finding.kind == "pr-line":
+        if finding.value != item.value or finding.fingerprint != item.fingerprint:
+            return False
+        candidates = [
+            candidate for candidate in final_items.values()
+            if candidate.kind == "pr-line"
+            and candidate.value == finding.value
+            and candidate.fingerprint == finding.fingerprint
+        ]
+        return len({(candidate.path, candidate.owner) for candidate in candidates}) == 1
+    if finding.path == item.path:
         return False
     if finding.kind in {"def", "async def"} and "." in finding.name:
         return _unique_class_member_match(finding, item, final_items)
@@ -973,6 +1015,13 @@ def _render_finding(
     where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merge absent"
     if finding.kind == "constant" and merged is not None:
         where = f"main parent line {finding.line}; branch parent line {branch_item.line if branch_item else 'absent'}; merged value {merged.value!r}"
+    if finding.kind == "pr-line":
+        print(f"{finding.path}: pr-line {finding.name}: {where}")
+        print(
+            f"  add: merge-resolution: {finding.path} pr-lines "
+            f"{finding.owner}@<group-digest> -> explain intended drop"
+        )
+        return
     if finding.kind in {"collection element", "membership element"}:
         parents_with_element = []
         main_item = main_items.get(key)
@@ -1007,7 +1056,7 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
     line_findings: list[Item] = []
     if error:
         return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
-    _old_items, _main_items, branch_items, merge_items = (
+    _old_items, _main_items, _branch_items, _merge_items = (
         parsed[revision] for revision in revisions
     )
     for path in all_paths:
@@ -1017,23 +1066,33 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
         merge_text = sources.get((commit, path))
         if not base_text or not branch_text or not main_text or merge_text is None:
             continue
-        owner_map: dict[str, str] = {}
-        for item in branch_items.values():
-            if item.path != path or item.kind not in {"def", "async def", "class"}:
-                continue
-            matches = [
-                candidate
-                for candidate in merge_items.values()
-                if candidate.path == path
-                and candidate.kind == item.kind
-                and candidate.fingerprint == item.fingerprint
-            ]
-            if len(matches) == 1:
-                owner_map[item.name] = matches[0].name
+        path_items = [
+            {
+                key: item for key, item in parsed[revision].items() if item.path == path
+            }
+            for revision in revisions
+        ]
+        base_map = _owner_translation(path_items[0], path_items[2])
+        main_map = _owner_translation(path_items[1], path_items[2])
+        merge_map = _owner_translation(path_items[3], path_items[2])
         line_findings.extend(
-            _pr_line_items(path, base_text, branch_text, main_text, merge_text, owner_map)
+            _pr_line_items(
+                path, base_text, branch_text, main_text, merge_text,
+                (base_map, main_map, merge_map),
+            )
         )
     return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
+
+
+def _print_group_markers(findings: list[Item]) -> None:
+    groups: dict[tuple[str, str], list[Item]] = {}
+    for finding in findings:
+        if finding.kind == "pr-line":
+            groups.setdefault((finding.path, finding.owner), []).append(finding)
+    for (path, owner), group in sorted(groups.items()):
+        values = sorted(f"{item.name}={item.value}" for item in group)
+        digest = hashlib.sha256("\n".join(values).encode()).hexdigest()[:12]
+        print(f"suggested override: merge-resolution: {path} pr-lines {owner}@{digest} -> <reason>")
 
 
 def _filter_findings(findings: list[Item], text: str) -> list[Item]:
@@ -1110,6 +1169,7 @@ def main() -> int:
     if findings:
         for finding in findings:
             _render_finding(finding, main_items, branch_items, merge_items)
+        _print_group_markers(findings)
         return 1
     print(
         f"clean merge: {len(main_items)} main-side items checked across {len(all_paths)} Python files"
