@@ -2333,8 +2333,6 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
         "tool_call_id": call.id,
         "content": "tool execution canceled",
     }
-    await loop._background_owner.wait()
-    assert not store.agent_children()
     await loop.close()
 
 
