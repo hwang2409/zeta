@@ -17,6 +17,10 @@ class SessionError(ValueError):
     """Raised when a session cannot be accessed safely."""
 
 
+class TerminalRenderError(RuntimeError):
+    """A redraw failed; unwind the TUI before reporting the failure."""
+
+
 class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
 
