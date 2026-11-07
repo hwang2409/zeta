@@ -14,7 +14,12 @@ import pytest
 
 from zeta.cli.main import main
 from zeta.core import session as session_module
-from zeta.core.session import SessionError, SessionInUseError, SessionManager, SessionOwnedError
+from zeta.core.session import (
+    SessionError,
+    SessionInUseError,
+    SessionManager,
+    SessionOwnedError,
+)
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

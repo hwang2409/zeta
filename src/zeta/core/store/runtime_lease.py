@@ -109,7 +109,6 @@ def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
     os.write(fd, record)
-    os.fsync(fd)
 
 
 class SessionExecutionLease:

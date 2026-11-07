@@ -671,31 +671,43 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             )
                         os.fsync(destination_fd)
                     os.fsync(root_fd)
-            if project_id is not None:
-                link = {
-                    "project_id": project_id,
-                    "role": project_role or "session",
-                    "parent_session_id": parent_session_id,
-                    "transcript_path": str(self.sessions_dir / session_id),
-                }
-                # The intent is the durable source of truth.  Publish it before
-                # touching the registry, so a crash at either boundary is
-                # recoverable after restart.
-                try:
-                    with session_directory(self.sessions_dir, session_id) as (
-                        _,
-                        directory_fd,
-                    ):
-                        self._storage_lease.publish_json(
+            store = ConversationStore(
+                self.sessions_dir,
+                session_id=session_id,
+                _must_exist=True,
+                _storage_lease=self._storage_lease,
+                _owner_surface=self._owner_surface,
+            )
+            metadata._execution_lease = store.execution_lease
+            try:
+                if project_id is not None:
+                    link = {
+                        "project_id": project_id,
+                        "role": project_role or "session",
+                        "parent_session_id": parent_session_id,
+                        "transcript_path": str(self.sessions_dir / session_id),
+                    }
+                    # The durable intent makes a crash at either boundary repairable.
+                    try:
+                        with session_directory(self.sessions_dir, session_id) as (
+                            _,
                             directory_fd,
-                            "project_link_pending.json",
-                            mapping_mutations(link),
-                            write_session_file,
+                        ):
+                            self._storage_lease.publish_json(
+                                directory_fd,
+                                "project_link_pending.json",
+                                mapping_mutations(link),
+                                write_session_file,
+                            )
+                    except (SessionError, OSError) as exc:
+                        logger.warning(
+                            "could not persist project linkage intent: %s", exc
                         )
-                except (SessionError, OSError) as exc:
-                    logger.warning("could not persist project linkage intent: %s", exc)
-                self._reconcile_project_link(session_id)
-            return self.open(session_id)
+                    self._reconcile_project_link(session_id)
+                return OpenedSession(metadata, store)
+            except BaseException:
+                store.close()
+                raise
         raise SessionError("could not allocate a unique session id")
 
     def associate_project(

@@ -140,6 +140,7 @@ class AsyncDurableWritesMixin:
         reader = type(self)(
             self.root_dir,
             session_id=self.session_id,
+            _read_only=True,
             _must_exist=True,
             _storage_lease=self._storage_lease,
         )
@@ -155,6 +156,7 @@ class AsyncDurableWritesMixin:
         reader = type(self)(
             self.root_dir,
             session_id=self.session_id,
+            _read_only=True,
             _must_exist=True,
             _storage_lease=self._storage_lease,
         )

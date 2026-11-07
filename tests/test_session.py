@@ -1099,6 +1099,7 @@ def test_partial_context_metadata_preserves_recorded_prompt_bytes(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    first.loop.store.close()
     metadata.pop("context_files")
     context_file.write_text("replacement rules", encoding="utf-8")
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -1338,7 +1339,9 @@ def test_session_bash_cwd_round_trips_through_store_state(
     opened = manager.create(provider="codex", model="offline", cwd=tmp_path)
 
     opened.store.set_bash_cwd("/tmp")
-    resumed = manager.open(opened.store.session_id)
+    session_id = opened.store.session_id
+    opened.store.close()
+    resumed = manager.open(session_id)
 
     assert resumed.store.bash_cwd == "/tmp"
     assert json.loads(resumed.store.state_path.read_text(encoding="utf-8")) == {
@@ -1409,9 +1412,9 @@ async def test_completed_turn_refreshes_recency_off_loop_and_flushes_on_close(
     write_threads: list[int] = []
     original_refresh = SessionManager.refresh_recency
 
-    def record_refresh(self: SessionManager, target_session_id: str) -> bool:
+    def record_refresh(self: SessionManager, target_session_id: str, execution_lease: object | None = None) -> bool:
         write_threads.append(threading.get_ident())
-        return original_refresh(self, target_session_id)
+        return original_refresh(self, target_session_id, execution_lease)
 
     monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
     monkeypatch.setattr(SessionManager, "refresh_recency", record_refresh)
@@ -1638,6 +1641,7 @@ async def test_recency_refresh_does_not_overwrite_newer_metadata(
     await app._consume_turn("hello")
     manager = SessionManager(home)
     latest = manager.read_metadata(session_id)
+    latest._execution_lease = app.loop.store.execution_lease
     await asyncio.to_thread(
         manager.record_override, latest, provider=None, model="newer-model"
     )
@@ -1653,6 +1657,7 @@ def test_resume_reopens_an_explicit_session(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
 
     resumed = create_app(
         build_parser().parse_args(["--resume", session_id, "--provider", "codex"])
@@ -1716,15 +1721,14 @@ async def test_model_swap_persists_and_restores_on_resume(
     output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(first, "/model gpt-5.6-sol")
     assert output.startswith("model: gpt-5.6-sol")
     assert first.model == "gpt-5.6-sol"
-    assert (
-        SessionManager(home).open(first.loop.store.session_id).metadata.model
-        == "gpt-5.6-sol"
-    )
+    session_id = first.loop.store.session_id
+    assert SessionManager(home).read_metadata(session_id).model == "gpt-5.6-sol"
+    first.loop.store.close()
 
     resumed = await asyncio.to_thread(
         create_app,
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "codex"]
+            ["--resume", session_id, "--provider", "codex"]
         ),
     )
     assert resumed.model == "gpt-5.6-sol"
@@ -1746,15 +1750,14 @@ async def test_vim_mode_defaults_on_and_persists_on_resume(
         == "vim mode: off"
     )
     assert first.vim_mode is False
-    assert (
-        SessionManager(home).open(first.loop.store.session_id).metadata.vim_mode
-        is False
-    )
+    session_id = first.loop.store.session_id
+    assert SessionManager(home).read_metadata(session_id).vim_mode is False
+    first.loop.store.close()
 
     resumed = await asyncio.to_thread(
         create_app,
         build_parser().parse_args(
-            ["--resume", first.loop.store.session_id, "--provider", "codex"]
+            ["--resume", session_id, "--provider", "codex"]
         ),
     )
     assert resumed.vim_mode is False
@@ -1768,6 +1771,7 @@ def test_legacy_session_metadata_defaults_vim_mode_on(
     first = create_app(_args())
     metadata_path = home / "sessions" / first.loop.store.session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    first.loop.store.close()
     metadata.pop("vim_mode")
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
@@ -1787,7 +1791,7 @@ async def _accept_model_change(model: str) -> SimpleNamespace:
 async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(backend, await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1828,13 +1832,13 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
         "(model catalog unavailable for claude — using anyway)"
     )
     assert app.model == "claude-definitely-not-real"
-    assert manager.open(opened.store.session_id).metadata.model == "claude-sonnet-4-6"
+    assert manager.read_metadata(opened.store.session_id).model == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
 async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1861,7 +1865,7 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1893,7 +1897,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
@@ -1917,7 +1921,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="gpt-5.4",
         on_model_change=_accept_model_change,
@@ -1933,7 +1937,7 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset(),
@@ -1947,7 +1951,7 @@ async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(FakeBackend([]), await asyncio.to_thread(ConversationStore, tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
     )
@@ -1965,7 +1969,7 @@ async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions")
     policy = ApprovalPolicy(store=store)
     call = ToolCall("pending-model-swap", "echo", {})
     store.append_message_with_approval_requests(
@@ -1988,7 +1992,7 @@ async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
-    store = ConversationStore(tmp_path / "sessions")
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "sessions")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
     assembler = ContextAssembler(
@@ -2129,10 +2133,14 @@ def test_session_preview_picker_limits_recent_sessions(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
-    sessions = [create_app(_args()).loop.store.session_id for _ in range(21)]
+    sessions = []
+    for _ in range(21):
+        app = create_app(_args())
+        sessions.append(app.loop.store.session_id)
+        app.loop.store.close()
     manager = SessionManager(home)
     for index, session_id in enumerate(sessions):
-        metadata = manager.open(session_id).metadata
+        metadata = manager.read_metadata(session_id)
         metadata.updated_at = f"2030-01-01T00:00:{index:02d}+00:00"
         manager._write(metadata)
 
@@ -2263,6 +2271,7 @@ def test_resume_picker_stays_within_shared_content_width(
             [TextContent("a very long session preview " * 12)],
         ), MessageOrigin.USER)
     )
+    session.loop.store.close()
     monkeypatch.setattr(
         "zeta.tui.app.get_terminal_size",
         lambda fallback: SimpleNamespace(columns=terminal_width, lines=24),
@@ -2311,6 +2320,7 @@ def test_resume_provider_override_requires_force_and_records_audit(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
 
     with pytest.raises(SessionError, match="override rejected"):
         create_app(
@@ -2328,6 +2338,7 @@ def test_resume_honors_provider_from_settings_file(
     monkeypatch.chdir(tmp_path)
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    first.loop.store.close()
 
     project = tmp_path / "project"
     dot_zeta = project / ".zeta"
@@ -2447,6 +2458,7 @@ def test_force_provider_requires_a_model(
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
     first = create_app(_args())
+    first.loop.store.close()
 
     with pytest.raises(SessionError, match="requires --model"):
         create_app(
@@ -2484,6 +2496,7 @@ def test_forced_backend_failure_leaves_metadata_unchanged(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     before = metadata_path.read_text()
+    first.loop.store.close()
 
     def fail_backend(*args: object, **kwargs: object) -> object:
         raise RuntimeError("backend construction failed")
@@ -3647,6 +3660,7 @@ def test_legacy_summary_session_setting_resumes_with_eviction(
     session_id = first.loop.store.session_id
     metadata_path = home / "sessions" / session_id / "meta.json"
     metadata = json.loads(metadata_path.read_text())
+    first.loop.store.close()
     metadata["compaction"] = "summary"
     metadata["compaction_pinned"] = True
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")

@@ -3735,7 +3735,7 @@ async def test_resume_drops_corrupt_lifecycle_killed_task_metadata(
 @pytest.mark.asyncio
 async def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     child_call = _background_agent_call("child")
     child.mark_agent_parent(child_call.id)
@@ -5249,7 +5249,7 @@ async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     child_call = _agent_call("child")
     grandchild_call = _agent_call("grandchild")
@@ -5273,7 +5273,7 @@ async def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
 
     assert not resumed.agent_children()
     assert ConversationStore(
-        root.session_dir / "agents", session_id="1"
+        root.session_dir / "agents", session_id="1", _read_only=True
     ).agent_canceled() == {
         "tool_call_id": "child",
         "content": "tool execution canceled",
@@ -5291,7 +5291,7 @@ async def test_resume_cancels_gated_nested_tree_without_duplicate_notifications(
     tmp_path: Path,
 ) -> None:
     root = ConversationStore(tmp_path, session_id="root")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     child_call = _background_agent_call("child")
     grandchild_call = _background_agent_call("grandchild")
@@ -12829,9 +12829,9 @@ def _seed_recoverable_child(
 
 @pytest.mark.asyncio
 async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> None:
-    root = ConversationStore(tmp_path, session_id="root")
-    child = _seed_recoverable_child(root)
-    dead_child = _seed_recoverable_child(root, number="2")
+    root = await asyncio.to_thread(ConversationStore, tmp_path, session_id="root")
+    child = await asyncio.to_thread(_seed_recoverable_child, root)
+    dead_child = await asyncio.to_thread(_seed_recoverable_child, root, number="2")
     root.append_child_question(
         child_instance_id="root:1", question_id="busy-question", question="wait?"
     )
@@ -12888,7 +12888,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
-        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        observed = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
         appends_before_recovery_returned = [
             message.content[0].text
             for message in observed.messages()
@@ -12950,13 +12950,13 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         ]
         assert len(dead_completions) == 1
         dead_observed = ConversationStore(
-            root.session_dir / "agents", session_id="2"
+            root.session_dir / "agents", session_id="2", _read_only=True
         )
         assert dead_observed.agent_lifecycle()["state"] == "canceled"
         assert dead_observed.agent_canceled() is not None
         dead_observed.close()
 
-        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        observed = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
         assert observed.agent_canceled() is None
         all_appends = [
             message.content[0].text
@@ -12974,8 +12974,9 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         await loop.close()
     finally:
         _stop_lease_holder(holder, stop)
+    root.close()
 
-    repaired_root = ConversationStore(tmp_path, session_id="root")
+    repaired_root = await asyncio.to_thread(ConversationStore, tmp_path, session_id="root")
     repaired_loop = AgentLoop(
         FakeBackend([]), repaired_root, skill_catalog=SkillCatalog.empty()
     )
@@ -13003,7 +13004,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         if entry.data.get("kind") == "child_question_withdrawn"
     } == {"busy-question", "busy-descendant-question", "dead-question"}
     repaired_child = ConversationStore(
-        repaired_root.session_dir / "agents", session_id="1"
+        repaired_root.session_dir / "agents", session_id="1", _read_only=True
     )
     assert repaired_child.agent_canceled() is not None
     repaired_child.close()
@@ -13015,10 +13016,10 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
 async def test_recovery_skips_ancestor_when_descendant_is_leased(
     tmp_path: Path,
 ) -> None:
-    root = ConversationStore(tmp_path, session_id="root")
-    child = _seed_recoverable_child(root)
-    descendant = _seed_recoverable_child(
-        child, number="1", parent_handle="root:1"
+    root = await asyncio.to_thread(ConversationStore, tmp_path, session_id="root")
+    child = await asyncio.to_thread(_seed_recoverable_child, root)
+    descendant = await asyncio.to_thread(
+        _seed_recoverable_child, child, number="1", parent_handle="root:1"
     )
     descendant.close()
     child.close()
@@ -13029,7 +13030,7 @@ async def test_recovery_skips_ancestor_when_descendant_is_leased(
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
         assert root.agent_children()
-        observed = ConversationStore(root.session_dir / "agents", session_id="1")
+        observed = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
         assert observed.agent_children()
         assert observed.agent_canceled() is None
         observed.close()
@@ -13043,8 +13044,8 @@ async def test_recovery_skips_ancestor_when_descendant_is_leased(
 async def test_recovery_refresh_never_runs_on_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path)
-    child = _seed_recoverable_child(store)
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    child = await asyncio.to_thread(_seed_recoverable_child, store)
     child.close()
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     owner_thread = threading.get_ident()
@@ -13070,19 +13071,15 @@ async def test_recovery_refresh_never_runs_on_event_loop(
 
 @pytest.mark.asyncio
 async def test_child_lease_work_never_runs_on_event_loop(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    with (
-        pytest.raises(RuntimeError, match="event-loop thread"),
-        store.orphan_recovery_lease(),
-    ):
-        pass
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    store.assert_execution_owner()
     store.close()
 
 
 @pytest.mark.asyncio
 async def test_idle_child_restart_recovers_as_canceled(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _read_only=True)
     call = ToolCall(
         "agent-1",
         "agent",
