@@ -12,6 +12,7 @@ from tests.support.fake_backend import FakeBackend
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as server_event
 from tests.support.server_client import request as server_request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.codex import CodexCredentialDriver
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -29,6 +30,8 @@ from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 SESSION = "a" * 32
 
@@ -158,7 +161,7 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
     server = ZetaServer(
         provider="codex",
         home=runner.session_dir.parents[1],
-        socket_path=Path("/tmp") / f"zeta-memory-fidelity-{tmp_path.name}.sock",
+        socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     await server.start()
@@ -172,7 +175,7 @@ async def test_transcript_scanner_reads_every_row_written_by_history_fidelity(
         )
         session_id = created[-1]["result"]["session"]["session_id"]
         await server_request(reader, writer, 3, "send", {"text": "stop this turn"})
-        await backend.started.wait()
+        await asyncio.wait_for(backend.started.wait(), 10)
         await server_request(reader, writer, 4, "abort")
         await server_event(reader, "turn_aborted")
         await server_request(reader, writer, 5, "send", {"text": "fail this turn"})
