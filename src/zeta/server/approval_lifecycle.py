@@ -78,13 +78,11 @@ class Start:
     session_id: str | None
     wire_event: EventDescriptor
 
-
 @dataclass(frozen=True, slots=True)
 class Decide:
     method: str
     request_id: str
     scope: str = "once"
-
 
 @dataclass(frozen=True, slots=True)
 class ExternalEnd:
