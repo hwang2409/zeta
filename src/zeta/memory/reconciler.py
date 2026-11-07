@@ -520,9 +520,28 @@ def prepare_request(
             raise ReconciliationError("reconciliation request limit is too small")
         safe_memory[largest] = "[memory omitted for request size]"
 
+    steer_delivery_ids = {
+        data.get("delivery_id")
+        for row in transcript.rows
+        if row.get("type") == "client_delivery"
+        and isinstance(row.get("data"), dict)
+        for data in (row["data"],)
+        if data.get("method") == "steer"
+    }
     rows: list[dict[str, Any]] = []
     for raw_row in transcript.rows:
+        raw_data = raw_row.get("data")
+        raw_message = raw_data.get("message") if isinstance(raw_data, dict) else None
+        raw_metadata = raw_message.get("metadata") if isinstance(raw_message, dict) else None
+        if isinstance(raw_metadata, dict) and raw_metadata.get("zeta_client_delivery_id") in steer_delivery_ids:
+            continue
         projected_row = project_transcript_row(raw_row)
+        if projected_row is not None:
+            data = projected_row.get("data")
+            message = data.get("message") if isinstance(data, dict) else None
+            metadata = message.get("metadata") if isinstance(message, dict) else None
+            if isinstance(metadata, dict) and metadata.get("zeta_client_delivery_id") in steer_delivery_ids:
+                continue
         if projected_row is None:
             continue
         safe_row = _sanitized(projected_row)

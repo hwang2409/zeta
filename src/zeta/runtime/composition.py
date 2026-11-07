@@ -366,8 +366,10 @@ def compose_runtime(
             memory_backend_lock = asyncio.Lock()
 
             async def invoke_memory(
-                prompt: str, budget: CompletionRetryBudget
+                prompt: str, budget: CompletionRetryBudget | None = None
             ) -> ReconciliationResponse:
+                if budget is None:
+                    budget = CompletionRetryBudget()
                 nonlocal memory_backend
                 if memory_backend is None:
                     async with memory_backend_lock:
