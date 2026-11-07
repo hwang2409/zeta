@@ -80,7 +80,6 @@ from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager, account_home
 from zeta.core.slash import SlashStatus, budget_for_model
 from zeta.core.slash import UsageSnapshot as SlashUsageSnapshot
@@ -95,6 +94,7 @@ from zeta.providers.anthropic import (
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop import persistence as persistence_module
 from zeta.runtime.loop.persistence import DraftPersistence
 from zeta.skills import SkillCatalog
@@ -5661,7 +5661,9 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         store.session_dir / "agents", session_id="1", cwd=store.cwd
     )
     child.mark_agent_parent(call.id)
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved child tail")]))
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("saved child tail")])
+    )
     store.allocate_agent_index()
     store.register_agent_child(
         call,
@@ -5669,17 +5671,21 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
         description="task research",
         turns_used=2,
     )
+    child.close()
 
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     await loop.activate()
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=result,
     )
+
     def render_transcript() -> str:
         transcript = TranscriptWidget()
         transcript.start_tool(
@@ -9102,7 +9108,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from tempfile import TemporaryDirectory
 
         from tests.support.fake_backend import FakeBackend
-        from zeta.core.loop import AgentLoop
+        from zeta.runtime.loop import AgentLoop
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
@@ -14393,7 +14399,14 @@ async def test_history_finder_does_not_cross_session_boundaries(
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
-    candidates = await second._history_finder.build_finder_candidates(request)
+    batches = [
+        batch
+        async for batch, complete in second._history_finder.build_finder_candidate_batches(
+            request
+        )
+        if complete
+    ]
 
-    assert [candidate.text for candidate in candidates.candidates] == []
+    assert len(batches) == 1
+    assert [candidate.text for candidate in batches[0].candidates] == []
     await second.close()

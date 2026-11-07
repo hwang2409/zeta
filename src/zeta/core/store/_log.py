@@ -686,7 +686,7 @@ class ConversationLogMixin:
         """Synchronize changed log metadata unless another writer owns it."""
         if self._log_metadata_matches():
             return
-        with self._append_lock(wait=False) as acquired:
+        with self._append_lock(wait=False, observer=self._read_only) as acquired:
             if not acquired:
                 # A writer can expose a new size before releasing the lock. A
                 # later query synchronizes the append after the writer exits.
