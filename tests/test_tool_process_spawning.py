@@ -101,7 +101,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loop = asyncio.get_running_loop()
-    watcher = loop._watcher
+    watcher = tool_spawn.current_child_watcher(loop)
     child_pid: int | None = None
     baseline_fds = len(os.listdir("/dev/fd"))
 
@@ -112,9 +112,7 @@ async def test_watcher_registration_failure_leaves_no_process_zombie_or_fd(
 
     monkeypatch.setattr(watcher, "add_child_handler", fail_registration)
     with pytest.raises(RuntimeError, match="registration failed"):
-        await create_tool_subprocess_shell(
-            "sleep 30", stdin=asyncio.subprocess.DEVNULL
-        )
+        await create_tool_subprocess_shell("sleep 30", stdin=asyncio.subprocess.DEVNULL)
 
     assert child_pid is not None
     await assert_pid_gone(child_pid)

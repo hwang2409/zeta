@@ -100,6 +100,17 @@ class _ToolSubprocessTransport(unix_events._UnixSubprocessTransport):  # type: i
         self._proc = _posix_spawn(args, stdin, stdout, stderr, **kwargs)
 
 
+def current_child_watcher(loop: asyncio.AbstractEventLoop) -> Any:
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            watcher = events.get_child_watcher()
+        if not watcher.is_active():
+            raise RuntimeError("asyncio child watcher is not active")
+    return watcher
+
+
 async def create_tool_subprocess_shell(
     command: str,
     *,
@@ -126,13 +137,7 @@ async def create_tool_subprocess_shell(
             asyncio.streams._DEFAULT_LIMIT, loop
         )
         waiter = loop.create_future()
-        watcher = getattr(loop, "_watcher", None)
-        if watcher is None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                watcher = events.get_child_watcher()
-            if not watcher.is_active():
-                raise RuntimeError("asyncio child watcher is not active")
+        watcher = current_child_watcher(loop)
         transport = _ToolSubprocessTransport(
             loop,
             protocol,
@@ -276,14 +281,21 @@ def _file_actions(
     ]
     actions.extend(
         (os.POSIX_SPAWN_CLOSE, fd)
-        for fd in owner.opened - {owner.child_stdin, owner.child_stdout, owner.child_stderr}
+        for fd in owner.opened
+        - {owner.child_stdin, owner.child_stdout, owner.child_stderr}
     )
     return actions
 
 
 def _posix_spawn(
-    args: Sequence[str], stdin: int, stdout: int, stderr: int, *, cwd_fd: int,
-    pass_fds: Sequence[int], env: Mapping[str, str],
+    args: Sequence[str],
+    stdin: int,
+    stdout: int,
+    stderr: int,
+    *,
+    cwd_fd: int,
+    pass_fds: Sequence[int],
+    env: Mapping[str, str],
 ) -> _SpawnedProcess:
     if stdin not in (subprocess.PIPE, subprocess.DEVNULL):
         raise ValueError("tool subprocess stdin must be PIPE or DEVNULL")
@@ -298,7 +310,8 @@ def _posix_spawn(
         inherited = (cwd_fd, owner.child_ready, *pass_fds)
         unavailable = {0, 1, 2, *owner.opened, *inherited}
         child_fds = tuple(
-            fd for fd in range(3, 3 + len(unavailable) + len(inherited))
+            fd
+            for fd in range(3, 3 + len(unavailable) + len(inherited))
             if fd not in unavailable
         )[: len(inherited)]
         spawn_args = (
@@ -308,15 +321,24 @@ def _posix_spawn(
             *args[3:],
             *(
                 f"{source}:{target}"
-                for source, target in zip(
-                    child_fds[2:], pass_fds, strict=True
-                )
+                for source, target in zip(child_fds[2:], pass_fds, strict=True)
             ),
         )
         pid = os.posix_spawn(
-            spawn_args[0], spawn_args, env,
-            file_actions=_file_actions(owner, inherited, child_fds), setsid=True,
-            setsigdef=tuple(signum for signum in (signal.SIGPIPE, getattr(signal, "SIGXFZ", None), getattr(signal, "SIGXFSZ", None)) if signum is not None),
+            spawn_args[0],
+            spawn_args,
+            env,
+            file_actions=_file_actions(owner, inherited, child_fds),
+            setsid=True,
+            setsigdef=tuple(
+                signum
+                for signum in (
+                    signal.SIGPIPE,
+                    getattr(signal, "SIGXFZ", None),
+                    getattr(signal, "SIGXFSZ", None),
+                )
+                if signum is not None
+            ),
         )
         return owner.transfer(pid)
     except BaseException:
