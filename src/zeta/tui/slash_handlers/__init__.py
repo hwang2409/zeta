@@ -147,6 +147,7 @@ class SlashHandlerMixin:
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
             explicit_finish=self.loop.explicit_finish,
+            connection_setup_counts=self.loop.connection_setup_counts(),
             max_agent_depth=self.loop.max_agent_depth,
             automatic_memory_failure=(
                 self.loop.memory_reconciler.automatic_memory_status

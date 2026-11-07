@@ -52,6 +52,7 @@ from .transport import (
     build_response_error,
     cleanup_transport,
     close_resource,
+    close_transport_resources,
     is_control_exception,
     provider_retry_notice,
     request_error,
@@ -431,6 +432,8 @@ def _default_diagnostics_path(token_store: AnthropicCredential) -> Path:
 class AnthropicBackend(CompletionBackend):
     """One-completion Anthropic Messages streaming backend."""
 
+    provider = "claude"
+
     def __init__(
         self,
         *,
@@ -456,6 +459,7 @@ class AnthropicBackend(CompletionBackend):
             assert token_store is not None
         self.token_store = token_store
         self.client = client
+        self._lease = HTTPClientLease(client)
         self.diagnostics_path = (
             Path(diagnostics_path)
             if diagnostics_path is not None
@@ -495,8 +499,21 @@ class AnthropicBackend(CompletionBackend):
         finally:
             await close_resource(attempts)
 
+    @property
+    def connection_setup_count(self) -> int:
+        return self._lease.connection_setup_count
+
+    def retire(self) -> None:
+        self._lease.retire()
+
+    async def aclose(self, *, report_failure=None):
+        self._lease.start_close()
+        return await close_transport_resources(
+            self._lease.aclose(report_failure), report_failure=report_failure
+        )
+
     async def _refresh_token(self) -> str:
-        return await HTTPClientLease(self.client).refresh(self.token_store.refresh_token)
+        return await self._lease.refresh(self.token_store.refresh_token)
 
     async def _complete_once(
         self,
@@ -505,8 +522,20 @@ class AnthropicBackend(CompletionBackend):
         *,
         token: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        lease = HTTPClientLease(self.client)
-        client = lease.client
+        async with self._lease.borrow() as client:
+            async for event in self._complete_once_with_client(
+                client, messages, tool_schemas, token=token
+            ):
+                yield event
+
+    async def _complete_once_with_client(
+        self,
+        client: httpx.AsyncClient,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+        *,
+        token: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         stream_context = None
         entered = False
         primary_exception: BaseException | None = None
@@ -590,7 +619,7 @@ class AnthropicBackend(CompletionBackend):
                 stream_context=stream_context,
                 entered=entered,
                 client=client,
-                owns_client=lease.owned,
+                owns_client=False,
                 primary_exception=primary_exception,
                 http_error_type=AnthropicHTTPError,
                 diagnostics_path=self.diagnostics_path,
