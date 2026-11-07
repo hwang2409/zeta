@@ -128,8 +128,9 @@ async def consume_run(
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
     final_finish_lifecycle = finish_lifecycle
+    idle_clock = kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time
     idle_lifecycle = IdleNudgeLifecycle(
-        clock=kwargs.pop("idle_clock", None) or asyncio.get_running_loop().time,
+        clock=idle_clock,
         wait=kwargs.pop("idle_wait", None),
         nudge_seconds=kwargs.pop("idle_nudge_seconds", None),
     )
@@ -169,9 +170,17 @@ async def consume_run(
                 and isinstance(structured, dict)
                 and structured.get("status") == "running"
             )
-            if idle and safety_started is None:
-                safety_started = asyncio.get_running_loop().time()
             flow = await child_loop._ensure_step_delivery()
+            running_tasks = any(
+                task.running
+                for task in child_loop.tool_registry.background_tasks.snapshot()
+            )
+            if not running_tasks:
+                safety_started = None
+                if safety_task is not None:
+                    safety_task.cancel()
+                    await asyncio.gather(safety_task, return_exceptions=True)
+                    safety_task = None
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 idle_lifecycle.reset_idle_period()
@@ -228,19 +237,12 @@ async def consume_run(
                             text=text,
                         )
                     idle_published = True
-                running_tasks = any(
-                    task.running
-                    for task in child_loop.tool_registry.background_tasks.snapshot()
-                )
-                if running_tasks and safety_task is None:
-                    elapsed = asyncio.get_running_loop().time() - safety_started
-                    timeout = max(
-                        0.0,
-                        child_loop._background_owner.finish_gate_task_timeout - elapsed,
-                    )
+                if running_tasks and safety_started is None:
+                    safety_started = idle_clock()
                     safety_task = asyncio.create_task(
                         kill_tasks_after_deadline(
-                            child_loop.tool_registry.background_tasks, timeout
+                            child_loop.tool_registry.background_tasks,
+                            child_loop._background_owner.finish_gate_task_timeout,
                         )
                     )
                 action = await idle_lifecycle.wait_for_idle_action(

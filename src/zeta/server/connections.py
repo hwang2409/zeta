@@ -608,7 +608,10 @@ class ConnectionRegistry:
                 target,
                 params,
                 include_delivery_id=include_delivery_id,
-                backward_enabled="session_history_backward" in features, fidelity="session_history_fidelity" in features, content_read="content_read" in features,
+                backward_enabled="session_history_backward" in features,
+                fidelity="session_history_fidelity" in features,
+                content_read="content_read" in features,
+                served_turn_end="served_turn_end" in features,
             ),
             session_id=target[0],
         )
@@ -695,12 +698,22 @@ class ConnectionRegistry:
                 connection, lambda: connection._list_sessions(request_id, params)
             )
             return True, result
-        target = capture_read(connection, method, params)
+        fallback_config = None
+        if method == "status" and connection.server.runtime.loop is None:
+            fallback_config = await self.run_blocking(
+                lambda: connection.server.runtime._config(None, None)
+            )
+        target = capture_read(
+            connection, method, params, fallback_config=fallback_config
+        )
         result = await self.run_read(
             connection,
             lambda: perform_read(
                 method, target, params,
-                backward_enabled="session_history_backward" in state.features, fidelity="session_history_fidelity" in state.features, content_read="content_read" in state.features,
+                backward_enabled="session_history_backward" in state.features,
+                fidelity="session_history_fidelity" in state.features,
+                content_read="content_read" in state.features,
+                served_turn_end="served_turn_end" in state.features,
             ),
             session_id=target[0],
         )
@@ -722,7 +735,13 @@ class ConnectionRegistry:
         self._observers.clear()
         self._controller = None
 
-def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str | None, object]:
+def capture_read(
+    client: Any,
+    method: str,
+    params: dict[str, Any],
+    *,
+    fallback_config: Any = None,
+) -> tuple[str | None, object]:
     runtime = client.server.runtime
     if method == "content_read":
         if set(params) - {"handle", "offset", "limit"}:
@@ -738,29 +757,58 @@ def capture_read(client: Any, method: str, params: dict[str, Any]) -> tuple[str 
         store = ergonomics.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
+        loop = runtime.loop
+        if loop is None and fallback_config is None:
+            raise RuntimeError("status fallback config was not resolved")
         if runtime.opened is None:
-            return None, {"session": None, "state": "idle", "explicit_finish": False, "pending_approvals": [], "usage": {}, "compaction_markers": 0}
-        transcript_index_failure = (
-            runtime.loop.transcript_index_failure(runtime.session_id)
-            if client.protocol_version != "1.0" and runtime.loop is not None
-            else None
-        )
-        return runtime.session_id, {
-            "session": client._session_snapshot(),
-            "state": (
-                "idle"
-                if client.server.control.unhealthy() or runtime.state is None
-                else runtime.state.status
-            ),
-            "explicit_finish": runtime.loop.explicit_finish if runtime.loop is not None else runtime._config(None, None).agents_explicit_finish,
-            "pending_approvals": [], "usage": dict(runtime.usage),
-            **(
-                {"transcript_index_failure": transcript_index_failure}
-                if transcript_index_failure is not None
-                else {}
-            ),
-            "store": runtime.opened.store,
-        }
+            status = {
+                "session": None,
+                "state": "idle",
+                "explicit_finish": False,
+            }
+            suffix = {
+                "pending_approvals": [],
+                "usage": {},
+                "compaction_markers": 0,
+            }
+            session_id = None
+        else:
+            transcript_index_failure = (
+                loop.transcript_index_failure(runtime.session_id)
+                if client.protocol_version != "1.0" and loop is not None
+                else None
+            )
+            status = {
+                "session": client._session_snapshot(),
+                "state": (
+                    "idle"
+                    if client.server.control.unhealthy() or runtime.state is None
+                    else runtime.state.status
+                ),
+                "explicit_finish": (
+                    loop.explicit_finish
+                    if loop is not None
+                    else fallback_config.agents_explicit_finish
+                ),
+            }
+            suffix = {
+                "pending_approvals": [], "usage": dict(runtime.usage),
+                **(
+                    {"transcript_index_failure": transcript_index_failure}
+                    if transcript_index_failure is not None
+                    else {}
+                ),
+                "store": runtime.opened.store,
+            }
+            session_id = runtime.session_id
+        if client.protocol_version != "1.0":
+            status["max_agent_depth"] = (
+                loop.max_agent_depth
+                if loop is not None
+                else fallback_config.agents_max_depth
+            )
+        status.update(suffix)
+        return session_id, status
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)
     if method == "session_settings":
@@ -786,6 +834,7 @@ def perform_read(
     backward_enabled: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    served_turn_end: bool = False,
 ) -> object:
     if method == "status":
         return project_status(target[1])
@@ -804,6 +853,7 @@ def perform_read(
             backward_enabled=backward_enabled,
             fidelity=fidelity,
             content_read=content_read,
+            served_turn_end=served_turn_end,
         )
     if method == "content_read":
         return content.read(store, params.get("handle"), offset=params.get("offset", 0), limit=params.get("limit", content.MAX_CONTENT_READ))
