@@ -12725,7 +12725,8 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
         [
             ScriptedTurn(tool_calls=[_run_agent_call()]),
             ScriptedTurn(tool_calls=[finish_call]),
-            ScriptedTurn([TextContent("ignored after finish")]),
+            ScriptedTurn(),
+            ScriptedTurn([TextContent("empty-turn recovery should be unreachable")]),
         ]
     )
     monkeypatch.setitem(
@@ -12752,10 +12753,17 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await wait_background_owner(loop)
-    notification = store.agent_notifications(pending_only=False)[-1]
+    notifications = store.agent_notifications(pending_only=False)
+    assert len(backend.calls) == 2
+    assert not any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in store.messages()
+    )
+    assert len(notifications) == 1
+    notification = notifications[0]
     assert notification.data["status"] == "completed"
     # Persistence precedes terminal-card publication, so synchronize on the sink too.
-    await asyncio.wait_for(terminal_published.wait(), timeout=2)
+    await asyncio.wait_for(terminal_published.wait(), timeout=10)
     terminal = next(
         event
         for event in background_events
@@ -12784,6 +12792,127 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
     )
     assert status[0]["report_status"] == "done"
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
+    tmp_path: Path,
+) -> None:
+    from zeta.tools.finish import register as register_finish
+
+    report = {"status": "done", "summary": "done"}
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("finish-1", "finish", report)]),
+            ScriptedTurn(tool_calls=[ToolCall("finish-2", "finish", report)]),
+            ScriptedTurn(),
+            ScriptedTurn([TextContent("empty-turn recovery should be unreachable")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=4,
+        agent_depth=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = True
+    register_finish(registry, child_loop=loop)
+    owned = asyncio.create_task(asyncio.Event().wait())
+    loop._background_owner.register(
+        "root:1:1",
+        owned.cancel,
+        owned,
+        parent_store=store,
+        description="owned child",
+        parent_instance_id="root:1",
+    )
+    original_complete = backend.complete
+
+    async def release_owned_work(messages, tool_schemas):
+        if len(backend.calls) == 1:
+            loop._background_owner.unregister("root:1:1")
+            owned.cancel()
+        async for event in original_complete(messages, tool_schemas):
+            yield event
+
+    backend.complete = release_owned_work
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.AGENT_PROMPT))
+        assert len(backend.calls) == 2
+        refused = store.tool_result("finish-1")
+        assert refused is not None and refused.is_error
+        accepted = store.tool_result("finish-2")
+        assert accepted is not None and not accepted.is_error
+        assert not any(
+            message.metadata.get("zeta_event") == "empty_turn_nudge"
+            for message in store.messages()
+        )
+    finally:
+        loop._background_owner.unregister("root:1:1")
+        owned.cancel()
+        await asyncio.gather(owned, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_finish_ends_after_other_tool_in_same_batch(
+    tmp_path: Path,
+) -> None:
+    from zeta.tools.finish import register as register_finish
+
+    ran: list[bool] = []
+
+    async def other_tool(_arguments: dict[str, object]) -> str:
+        ran.append(True)
+        return "other tool complete"
+
+    report = {"status": "done", "summary": "done"}
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("other-1", "other", {}),
+                    ToolCall("finish-1", "finish", report),
+                ]
+            ),
+            ScriptedTurn(),
+            ScriptedTurn([TextContent("empty-turn recovery should be unreachable")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry.register("other", other_tool, requires_approval=False)
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=3,
+        agent_depth=1,
+        agent_instance_id="root:1",
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.explicit_finish = True
+    register_finish(registry, child_loop=loop)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.AGENT_PROMPT))
+        assert ran == [True]
+        assert len(backend.calls) == 1
+        assert store.tool_result("other-1") is not None
+        finish_result = store.tool_result("finish-1")
+        assert finish_result is not None and not finish_result.is_error
+        assert not any(
+            message.metadata.get("zeta_event") == "empty_turn_nudge"
+            for message in store.messages()
+        )
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.parametrize("wake_kind", ["task", "child"])
