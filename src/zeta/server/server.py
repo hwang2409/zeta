@@ -493,10 +493,14 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
+            release = None
             if self.role == "controller" and self.connections.is_controller(self):
-                await self.server.control.controller_released(
+                release = self.server.control.begin_controller_release(
                     reconnect="approval_reconnect" in self.features
                 )
+            self.connections.release(self)
+            if release is not None:
+                await asyncio.shield(release)
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
             self.writer.close()
@@ -517,6 +521,7 @@ class _Client:
                     reconnect=reconnect,
                     require_host_binding="session_host_commands" in self.features,
                 )
+                self.connections.activate_controller(self)
                 if not reconnect:
                     await self.server.control.controller_ready()
             return True, result
