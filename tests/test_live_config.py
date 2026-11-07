@@ -5,6 +5,8 @@ import inspect
 import json
 import os
 import threading
+from contextlib import AsyncExitStack
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MessageOrigin,
     StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
 )
@@ -26,6 +29,7 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import discover_session_agents
 from zeta.tools import ToolRegistry
 from zeta.tui import theme
+from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 
 
@@ -603,6 +607,39 @@ async def test_config_changed_event_renders_through_real_render_event(
     assert rendered.style == theme.NOTICE
     assert console.export_text().strip() == "agent profiles changed: added specialist"
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_config_changed_background_event_renders_immediately(
+    tmp_path: Path,
+) -> None:
+    stack = AsyncExitStack()
+    async with stack:
+        store = ConversationStore(tmp_path / "session")
+        stack.callback(store.close)
+        loop = AgentLoop(
+            FakeBackend([]), store, skill_catalog=SkillCatalog.empty()
+        )
+        stack.push_async_callback(loop.close)
+        output = StringIO()
+        app = TUIApp(
+            loop,
+            provider="codex",
+            model="offline",
+            console=Console(file=output, force_terminal=False),
+        )
+        stack.push_async_callback(app.close)
+
+        app._handle_background_event_now(
+            StreamEvent(
+                StreamEventType.CONFIG_CHANGED,
+                data={"message": "agent profiles changed: added specialist"},
+            )
+        )
+
+        assert output.getvalue().strip() == (
+            "agent profiles changed: added specialist"
+        )
 
 
 @pytest.mark.asyncio
