@@ -543,4 +543,3 @@ def test_retry_precedence_for_4xx_statuses(
     error.code = code
 
     assert retryable_provider_error(error) is (status_code != 400)
-

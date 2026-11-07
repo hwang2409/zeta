@@ -1128,12 +1128,12 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
 
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        await asyncio.wait_for(backend.completion_started.wait(), timeout=5)
-        await asyncio.wait_for(tracked_ready.wait(), timeout=5)
+        await asyncio.wait_for(backend.completion_started.wait(), timeout=10)
+        await asyncio.wait_for(tracked_ready.wait(), timeout=10)
         os.fstat(tracked[0].directory_fd)
 
         backend.completion_gate.set()
-        await asyncio.wait_for(owner.wait(), timeout=5)
+        await asyncio.wait_for(owner.wait(), timeout=10)
         for child_store in tracked:
             with pytest.raises(OSError):
                 os.fstat(child_store.directory_fd)

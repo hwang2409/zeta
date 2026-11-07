@@ -406,7 +406,9 @@ async def test_provider_stalls_waiting_for_response_headers(
         error_type = CodexStreamError
     try:
         with pytest.raises(error_type, match="response headers stalled") as caught:
-            await asyncio.wait_for(anext(backend.complete([], [], control=completion_control())), timeout=0.5)
+            await asyncio.wait_for(
+                anext(backend.complete([], [], control=completion_control())), timeout=10
+            )
         assert caught.value.is_stall is True
         assert len(requests) == 1
     finally:

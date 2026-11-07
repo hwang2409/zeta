@@ -202,5 +202,3 @@ def can_retry_context(
         and not partial
         and message is None
     )
-
-
