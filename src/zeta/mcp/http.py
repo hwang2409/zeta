@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TypeVar
 
@@ -66,6 +66,7 @@ MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
+MAX_SSE_EVENT_ID_BYTES = 8192
 NOTIFICATION_RECONNECT_INITIAL_SECONDS = 0.1
 NOTIFICATION_RECONNECT_MAX_SECONDS = 5.0
 NOTIFICATION_STREAM_HEALTHY_SECONDS = 5.0
@@ -90,6 +91,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
         self._owns_client = client is None
         self._session_id: str | None = None
+        self._notification_event_id: bytes | None = None
         self.protocol_version: str | None = None
         self.capabilities: dict[str, object] = {}
         self._next_id = 0
@@ -361,8 +363,9 @@ class StreamableHTTPMCPClient(MCPClient):
                 "POST", self.config.url, headers=headers, json=dict(payload)
             ) as response:
                 session_id = response.headers.get("mcp-session-id")
-                if session_id is not None:
+                if session_id is not None and session_id != self._session_id:
                     self._session_id = session_id
+                    self._notification_event_id = None
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -419,27 +422,41 @@ class StreamableHTTPMCPClient(MCPClient):
     async def _listen_notification_stream(
         self, oauth_token: MCPOAuthToken | None
     ) -> bool:
-        if self._session_id is None:
+        session_id = self._session_id
+        if session_id is None:
             return False
+        last_event_id = self._notification_event_id
         headers = self._auth_headers(oauth_token)
         headers["accept"] = "text/event-stream"
-        headers["mcp-session-id"] = self._session_id
+        headers["mcp-session-id"] = session_id
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
+        request_headers = httpx.Headers(headers)
+        if last_event_id:
+            request_headers = httpx.Headers(
+                [*request_headers.raw, (b"last-event-id", last_event_id)]
+            )
         try:
             async with self._client.stream(
-                "GET", self.config.url, headers=headers
+                "GET", self.config.url, headers=request_headers
             ) as response:
                 if response.status_code >= 400:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 started = asyncio.get_running_loop().time()
                 delivered = False
-                async for value in _iter_sse_events(
+                async for event in _iter_sse_event_records(
                     response, self._spill_store, self._limits
                 ):
+                    if self._session_id != session_id:
+                        return delivered
+                    if event.event_id and event.event_id == last_event_id:
+                        continue
                     delivered = True
-                    _dispatch_sse_notification(value, self._notification_sink)
+                    if event.event_id is not None:
+                        last_event_id = event.event_id
+                        self._notification_event_id = event.event_id
+                    _dispatch_sse_notification(event.value, self._notification_sink)
                 return delivered or (
                     asyncio.get_running_loop().time() - started
                     >= NOTIFICATION_STREAM_HEALTHY_SECONDS
@@ -605,6 +622,12 @@ def _dispatch_sse_notification(
         notification_sink(method)
 
 
+@dataclass(frozen=True)
+class _SSEEvent:
+    value: object
+    event_id: bytes | None
+
+
 async def _iter_sse_events(
     response: httpx.Response,
     spill_store: SpillStore,
@@ -612,10 +635,24 @@ async def _iter_sse_events(
     *,
     aggregate_call: bool = False,
 ) -> AsyncIterator[object]:
-    """Parse SSE JSON events without materializing oversized data fields."""
+    async for event in _iter_sse_event_records(
+        response, spill_store, limits, aggregate_call=aggregate_call
+    ):
+        yield event.value
+
+
+async def _iter_sse_event_records(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    limits: MCPCallLimits,
+    *,
+    aggregate_call: bool = False,
+) -> AsyncIterator[_SSEEvent]:
+    """Parse SSE JSON events without materializing oversized fields."""
 
     envelope = MCPCallEnvelope(limits, spill_store)
     has_data_line = False
+    event_id: bytes | None = None
     event_wire_bytes = 0
     call_wire_bytes = 0
 
@@ -641,17 +678,23 @@ async def _iter_sse_events(
         if data:
             await envelope.append(data)
 
-    async def parse_event() -> object:
-        nonlocal envelope, has_data_line
+    async def parse_event() -> _SSEEvent:
+        nonlocal envelope, event_id, has_data_line
         value = await envelope.finish_json()
+        parsed = _SSEEvent(value, event_id)
         envelope = MCPCallEnvelope(limits, spill_store)
         has_data_line = False
-        return value
+        event_id = None
+        return parsed
 
     line_prefix = bytearray()
     line_is_data = False
+    line_is_id = False
     line_ignored = False
     stripping_whitespace = True
+    id_value = bytearray()
+    id_valid = True
+    id_at_start = True
 
     async def feed_data(data: bytes) -> None:
         nonlocal stripping_whitespace
@@ -664,13 +707,30 @@ async def _iter_sse_events(
                 stripping_whitespace = False
         await append_data(data)
 
+    def feed_id(data: bytes) -> None:
+        nonlocal id_at_start, id_valid
+        if id_at_start:
+            id_at_start = False
+            if data.startswith(b" "):
+                data = data[1:]
+        if b"\x00" in data or len(id_value) + len(data) > MAX_SSE_EVENT_ID_BYTES:
+            id_valid = False
+            return
+        if id_valid:
+            id_value.extend(data)
+
     async def feed_line(data: bytes, *, end_line: bool) -> bool:
-        nonlocal line_is_data, line_ignored, stripping_whitespace
-        if not line_is_data and not line_ignored:
+        nonlocal event_id, line_is_data, line_is_id, line_ignored
+        nonlocal stripping_whitespace
+        if not line_is_data and not line_is_id and not line_ignored:
             needed = 5 - len(line_prefix)
             line_prefix.extend(data[:needed])
             data = data[needed:]
-            if len(line_prefix) == 5:
+            if len(line_prefix) >= 3 and line_prefix[:3] == b"id:":
+                line_is_id = True
+                data = bytes(line_prefix[3:]) + data
+                line_prefix.clear()
+            elif len(line_prefix) == 5:
                 if line_prefix == b"data:":
                     line_is_data = True
                     stripping_whitespace = True
@@ -679,16 +739,32 @@ async def _iter_sse_events(
                     line_ignored = True
         if line_is_data:
             await feed_data(data)
+        elif line_is_id:
+            feed_id(data)
         if not end_line:
             return False
-        return not line_is_data and not line_ignored and not line_prefix
+        if line_is_id and id_valid:
+            try:
+                id_value.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                event_id = bytes(id_value)
+        return (
+            not line_is_data and not line_is_id and not line_ignored and not line_prefix
+        )
 
     def reset_line() -> None:
-        nonlocal line_is_data, line_ignored, stripping_whitespace
+        nonlocal id_at_start, id_valid, line_is_data, line_is_id, line_ignored
+        nonlocal stripping_whitespace
         line_prefix.clear()
         line_is_data = False
+        line_is_id = False
         line_ignored = False
         stripping_whitespace = True
+        id_value.clear()
+        id_valid = True
+        id_at_start = True
 
     pending_cr = False
     pending_blank = False
