@@ -15,12 +15,13 @@ def _owner(registry: ToolRegistry) -> Any:
     return owner
 
 
-def _status(registry: ToolRegistry, handles: list[str]) -> set[str]:
-    from .agent import _read_agent_status
+def _direct_terminal(registry: ToolRegistry, handle: str) -> bool:
+    from .agent import _is_finished_agent_status, _read_agent_status
 
-    rows = _read_agent_status(registry.session_store)
-    known = {row.get("handle") for row in rows}
-    return set(handles) - known
+    if handle not in {item[0] for item in registry.session_store.active_agent_receipts()}:
+        return False
+    rows = _read_agent_status(registry.session_store, requested_handle=handle)
+    return len(rows) == 1 and _is_finished_agent_status(rows[0])
 
 
 async def agent_cancel(
@@ -39,29 +40,36 @@ async def agent_cancel(
         if abort_signal.is_set():
             raise asyncio.CancelledError
         owner = _owner(registry)
-        if await asyncio.to_thread(_status, registry, [handle]):
-            return _agent_error("unknown child handle", max_bytes)
-        outcome = await owner.cancel_and_wait(handle)
+        if not owner.controls_child(registry.session_store, handle):
+            if await asyncio.to_thread(_direct_terminal, registry, handle):
+                outcome_status = "already_finished"
+                outcome_error = None
+            else:
+                return _agent_error("unknown child handle", max_bytes)
+        else:
+            outcome = await owner.cancel_and_wait(handle)
+            outcome_status = outcome.status
+            outcome_error = outcome.error
         status = {
             "confirmed": "cancellation_confirmed",
             "unconfirmed": "cancellation_unconfirmed",
             "failed": "cancellation_failed",
             "already_finished": "already_finished",
-        }[outcome.status]
+        }[outcome_status]
         text = {
             "confirmed": "agent cancellation confirmed: ",
             "unconfirmed": "agent cancellation not confirmed within 1 second: ",
             "failed": "agent cancellation failed: ",
             "already_finished": "agent already finished: ",
-        }[outcome.status] + handle
-        if outcome.error is not None:
-            text += ": " + outcome.error
+        }[outcome_status] + handle
+        if outcome_error is not None:
+            text += ": " + outcome_error
         structured_content = {"handle": handle, "status": status}
-        if outcome.error is not None:
-            structured_content["confirmation_error"] = outcome.error
+        if outcome_error is not None:
+            structured_content["confirmation_error"] = outcome_error
         result = {
             "content": [text_block(text)],
-            "isError": outcome.status in {"unconfirmed", "failed"},
+            "isError": outcome_status in {"unconfirmed", "failed"},
             "structuredContent": structured_content,
         }
         return _bounded_agent_result(result, max_bytes)

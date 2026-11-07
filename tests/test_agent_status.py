@@ -374,11 +374,11 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
     loop_thread = threading.get_ident()
-    read_threads: list[int] = []
+    reads: list[tuple[int, str]] = []
     original = agent_tools._read_child_file
 
     def tracked_read(*args: object, **kwargs: object) -> bytes:
-        read_threads.append(threading.get_ident())
+        reads.append((threading.get_ident(), str(args[2])))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(agent_tools, "_read_child_file", tracked_read)
@@ -388,8 +388,9 @@ async def test_agent_status_does_not_read_lifecycle_files_on_event_loop(
     status = await _status(loop)
 
     assert len(status["structuredContent"]["children"]) == 8
-    assert len(read_threads) == 8
-    assert loop_thread not in read_threads
+    assert [name for _, name in reads].count("conversation.jsonl") == 8
+    assert [name for _, name in reads].count("agent_lifecycle.json") == 8
+    assert all(thread != loop_thread for thread, _ in reads)
     await loop.close()
 
 
