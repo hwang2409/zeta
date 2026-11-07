@@ -454,7 +454,7 @@ class SubmissionPipeline:
                     self._retry_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
-        await self._host.loop.refresh_skills()
+        await self._host.loop.refresh_live_config()
         entry = _Entry(message.submission)
         entry.acknowledged = message.acknowledged
         self._entries[entry.submission.id] = entry

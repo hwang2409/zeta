@@ -47,6 +47,7 @@ from ...protocol.types import (
     ToolCall,
     ToolUseContent,
 )
+from ...skills.agent_catalog import AgentCatalog
 from ..agent_send import (  # noqa: F401
     AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
     register_send,
@@ -959,77 +960,86 @@ async def _agent(
     )
 
 
+def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
+    """Build the catalog-dependent agent tool schema without registry state."""
+
+    agent_names = catalog.names()
+    agent_description = catalog.description()
+    description = (
+        "Delegate multi-step exploration or research that would pollute the "
+        "main context. The child has its own bounded context and may spawn "
+        "one level of grandchildren, but grandchildren cannot spawn agents. "
+        "Pass model to run the child on another provider's model and "
+        "orchestrate it from here. Pass cwd to start the child in another "
+        "directory or git worktree so its bash session and relative file "
+        "paths resolve there instead of your own working directory. The "
+        "returned child_instance_id is the "
+        "stable handle for agent_status. Background completion is announced "
+        "automatically: while you run, after your current tool call and "
+        "before your next model call; while you are idle, at your next "
+        "turn. Do not poll. "
+        "Built-in types: "
+        f"{agent_description}"
+    )
+    parameters: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "description": {"type": "string"},
+            "agent_type": {
+                "type": "string",
+                "enum": agent_names,
+                "description": agent_description,
+            },
+            "preset": {
+                "type": "string",
+                "enum": agent_names,
+                "description": (
+                    "Alias for agent_type. Select a preset from the session catalog."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "enum": known_model_names(),
+                "description": (
+                    "Run the child on this model instead of inheriting the "
+                    "parent's. The provider follows from the model, so this "
+                    "is how one provider delegates to another. Implies "
+                    "background unless background is passed explicitly; "
+                    "--print runs children synchronously."
+                ),
+            },
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Directory the child works in: its bash session cwd and "
+                    "relative read/edit/write paths resolve here. Absolute, "
+                    "or relative to your own working directory; must be an "
+                    "existing directory (a symlinked directory is rejected). "
+                    "Pass this when delegating work in another directory or "
+                    "git worktree so the child does not run in your checkout. "
+                    "Omit to inherit your working directory. Grandchildren "
+                    "default to their parent's cwd."
+                ),
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Keep the child running across parent turns and return a handle.",
+            },
+        },
+        "required": ["prompt", "description"],
+        "additionalProperties": False,
+    }
+    return description, parameters
+
+
 def register(registry: ToolRegistry) -> None:
-    agent_names = registry.agent_catalog.names()
-    agent_description = registry.agent_catalog.description()
+    description, parameters = agent_tool_schema(registry.agent_catalog)
     registry.register_session_tool(
         "agent",
         _agent,
-        description=(
-            "Delegate multi-step exploration or research that would pollute the "
-            "main context. The child has its own bounded context and may spawn "
-            "one level of grandchildren, but grandchildren cannot spawn agents. "
-            "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. Pass cwd to start the child in another "
-            "directory or git worktree so its bash session and relative file "
-            "paths resolve there instead of your own working directory. The "
-            "returned child_instance_id is the "
-            "stable handle for agent_status. Background completion is announced "
-            "automatically: while you run, after your current tool call and "
-            "before your next model call; while you are idle, at your next "
-            "turn. Do not poll. "
-            "Built-in types: "
-            f"{agent_description}"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "description": {"type": "string"},
-                "agent_type": {
-                    "type": "string",
-                    "enum": agent_names,
-                    "description": agent_description,
-                },
-                "preset": {
-                    "type": "string",
-                    "enum": agent_names,
-                    "description": (
-                        "Alias for agent_type. Select a preset from the session catalog."
-                    ),
-                },
-                "model": {
-                    "type": "string",
-                    "enum": known_model_names(),
-                    "description": (
-                        "Run the child on this model instead of inheriting the "
-                        "parent's. The provider follows from the model, so this "
-                        "is how one provider delegates to another. Implies "
-                        "background unless background is passed explicitly; "
-                        "--print runs children synchronously."
-                    ),
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": (
-                        "Directory the child works in: its bash session cwd and "
-                        "relative read/edit/write paths resolve here. Absolute, "
-                        "or relative to your own working directory; must be an "
-                        "existing directory (a symlinked directory is rejected). "
-                        "Pass this when delegating work in another directory or "
-                        "git worktree so the child does not run in your checkout. "
-                        "Omit to inherit your working directory. Grandchildren "
-                        "default to their parent's cwd."
-                    ),
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Keep the child running across parent turns and return a handle.",
-                },
-            },
-            "required": ["prompt", "description"],
-            "additionalProperties": False,
-        },
+        description=description,
+        parameters=parameters,
         requires_approval=False,
         parallel_safe=True,
     )

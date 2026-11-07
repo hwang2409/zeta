@@ -338,7 +338,7 @@ class ToolRegistry:
         self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
-        self._skill_refresher: Callable[[bool], Awaitable[None]] | None = None
+        self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
 
@@ -348,16 +348,16 @@ class ToolRegistry:
         if register_builtin:
             _register_discovered_tools(self)
 
-    def set_skill_refresher(
+    def set_live_config_refresher(
         self, refresher: Callable[[bool], Awaitable[None]]
     ) -> None:
         """Let tools request one live catalog refresh."""
 
-        self._skill_refresher = refresher
+        self._live_config_refresher = refresher
 
-    async def refresh_skills(self, *, force: bool = False) -> None:
-        if self._skill_refresher is not None:
-            await self._skill_refresher(force)
+    async def refresh_live_config(self, *, force: bool = False) -> None:
+        if self._live_config_refresher is not None:
+            await self._live_config_refresher(force)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
@@ -455,6 +455,16 @@ class ToolRegistry:
             else:
                 allowed.append(copy.deepcopy(schema))
         return allowed
+
+    def definition_reference(self, name: str) -> ToolDefinition | None:
+        return self._tools.get(name)
+
+    def commit_prepared_definition(
+        self, base: ToolDefinition | None, replacement: ToolDefinition
+    ) -> None:
+        if self._tools.get(replacement.name) is not base:
+            raise RuntimeError(f"stale prepared tool definition: {replacement.name}")
+        self._tools[replacement.name] = replacement
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:

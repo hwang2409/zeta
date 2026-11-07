@@ -337,7 +337,7 @@ async def list_commands(
     """Enumerate runnable commands, with an optional complete catalog."""
 
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     registry = await asyncio.to_thread(build_registry, runtime)
     entries = _entries_from_registry(registry, include_unavailable=include_unavailable)
     return {
@@ -379,7 +379,7 @@ async def run_command(
             approval_control is not None and approval_control.has_pending_approvals(),
         )
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     registry = await asyncio.to_thread(build_registry, runtime)
     builtin_names = {command.name for command in registry.builtin_commands}
     if name in builtin_names and name not in EXECUTABLE_BUILTINS:

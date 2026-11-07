@@ -1342,6 +1342,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `send_images_delivery_id` | with `delivery_id`, lets `send_images` accept durable idempotency IDs; matching echoes and history rows use `user_message_delivery_id` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
+| `live_config_changed` | live skill and agent-profile reloads emit `config_changed` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `model_input_ids` | `slash_run` stores generated model input server-side and returns a single-use `input_id` accepted by `send` |

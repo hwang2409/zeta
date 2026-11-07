@@ -695,7 +695,7 @@ class SlashHandlerMixin:
         if discovery is None or not pending:
             return "tools: no project tools waiting for trust"
         notices, trusted = trust_project_tools(self.loop.tool_registry, discovery)
-        self.loop.tool_schemas = list(self.loop.tool_registry.schemas)
+        self.loop.tool_schemas = tuple(self.loop.tool_registry.schemas)
         for notice in notices:
             self._print_system(notice)
         names = sorted({tool.module_stem for tool in trusted})
