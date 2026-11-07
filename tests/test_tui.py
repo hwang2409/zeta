@@ -11368,12 +11368,14 @@ async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
 
     monkeypatch.setattr(source, "refresh", blocked_refresh)
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
     agent_sync._REFRESH_LOCK.acquire()
     try:
         navigation.transcript_control.request_sync(source.path, published.set)
         await wait_until(entered.is_set)
         await asyncio.wait_for(app.close(), timeout=3)
         assert not source._closed
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         agent_sync._REFRESH_LOCK.release()
 
@@ -11416,12 +11418,14 @@ async def test_tui_close_hands_off_blocked_todo_source(
 
     monkeypatch.setattr(source, "refresh", blocked_refresh)
     monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
+    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
     source._lock.acquire()
     try:
         control.request(child.session_dir, published.set)
         await wait_until(entered.is_set)
         await asyncio.wait_for(app.close(), timeout=3)
         assert not source._closed
+        assert len(agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before) == 1
     finally:
         source._lock.release()
 
