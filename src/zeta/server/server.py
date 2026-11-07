@@ -904,7 +904,6 @@ class _Client:
         status.update(suffix)
         return status
 
-
     def _list_sessions(
         self, request_id: str | int, params: dict[str, Any]
     ) -> tuple[dict[str, object], list[str]]:

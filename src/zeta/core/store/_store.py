@@ -595,7 +595,11 @@ class ConversationStore(
 
     @contextmanager
     def _append_lock(
-        self, *, deadline: float | None = None, wait: bool = True, observer: bool = False
+        self,
+        *,
+        deadline: float | None = None,
+        wait: bool = True,
+        observer: bool = False,
     ) -> Iterator[bool]:
         """Lock and synchronize the log before exposing resident state."""
         if self._closed:

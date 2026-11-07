@@ -115,6 +115,7 @@ def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
         pass
     return True, pid
 
+
 def _publish_owner(fd: int, owner: OwnerHint, epoch: str) -> None:
     record = json.dumps(
         {
