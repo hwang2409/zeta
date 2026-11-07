@@ -1857,6 +1857,12 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
     approval_end_release = asyncio.Event()
     notify = server.control._notify
 
+    async def wait_for_gate(gate: asyncio.Event, name: str) -> None:
+        try:
+            await asyncio.wait_for(gate.wait(), 10)
+        except TimeoutError:
+            pytest.fail(f"{name} was not released within 10 s")
+
     async def force_parent_tool_end_before_approval_end(
         event: str, session_id: str | None = None, **fields: object
     ) -> bool:
@@ -1867,9 +1873,9 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
             and tool_call.get("id") == "agent-one"
         )
         if is_parent_tool_end:
-            await parent_tool_end_release.wait()
+            await wait_for_gate(parent_tool_end_release, "parent tool_end release gate")
         elif event == "approval_end":
-            await approval_end_release.wait()
+            await wait_for_gate(approval_end_release, "approval_end release gate")
         published = await notify(event, session_id, **fields)
         if is_parent_tool_end:
             parent_tool_end_sent.set()
@@ -1895,7 +1901,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         )
         frames = await _request(reader, writer, 4, "status")
         parent_tool_end_release.set()
-        await asyncio.wait_for(parent_tool_end_sent.wait(), 10)
+        await wait_for_gate(parent_tool_end_sent, "parent tool_end publication gate")
         approval_end_release.set()
         try:
             async with asyncio.timeout(10):
@@ -1927,7 +1933,10 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         approval_end_release.set()
         try:
             if background_wait is not None:
-                await asyncio.wait_for(background_wait, 10)
+                try:
+                    await asyncio.wait_for(background_wait, 10)
+                except TimeoutError:
+                    pytest.fail("background owner task did not finish within 10 s")
         except BaseException as cleanup_error:
             if test_error is None:
                 raise
