@@ -20,6 +20,10 @@ def _format_wire_limit(size: int) -> str:
     return f"{size} bytes"
 
 
+def _format_deadline(seconds: float) -> str:
+    return f"{seconds:g}s"
+
+
 @dataclass(frozen=True, slots=True)
 class MCPCallLimits:
     deadline_seconds: float = 300.0
