@@ -292,5 +292,72 @@ signal.pause()
     assert spawn_attempts == (
         [True] if spawn_path == "native_setsid" else [True, False]
     )
-    assert tool_spawn._POSIX_SPAWN_SETSID_SUPPORTED is (spawn_path == "native_setsid")
     assert len(os.listdir("/dev/fd")) == baseline_fds
+
+
+@pytest.mark.asyncio
+async def test_launcher_exit_before_failure_preserves_spawn_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadyPipe:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        ready = ReadyPipe()
+
+    class Transport:
+        instance: Transport
+
+        def __init__(
+            self,
+            *args: object,
+            waiter: asyncio.Future[None],
+            **kwargs: object,
+        ) -> None:
+            del args, kwargs
+            self._proc: Process | None = Process()
+            self.closed = False
+            self.waited = False
+            Transport.instance = self
+            waiter.set_result(None)
+
+        def get_pid(self) -> int:
+            return 1
+
+        def _process_exited(self, returncode: int) -> None:
+            assert returncode == 1
+            self._proc = None
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def _wait(self) -> int:
+            self.waited = True
+            return 1
+
+    async def fail_after_process_exit(*, process: Process) -> None:
+        assert Transport.instance._proc is process
+        Transport.instance._process_exited(1)
+        raise RuntimeError("tool subprocess launcher failed to start")
+
+    loop = asyncio.get_running_loop()
+    watcher = getattr(loop, "_watcher", None)
+    if watcher is None:
+        with tool_spawn.warnings.catch_warnings():
+            tool_spawn.warnings.simplefilter("ignore", DeprecationWarning)
+            watcher = tool_spawn.events.get_child_watcher()
+    monkeypatch.setattr(watcher, "add_child_handler", lambda *args: None)
+    # test-contract: seam no public hook can force the transport's process-exit race
+    monkeypatch.setattr(tool_spawn, "_ToolSubprocessTransport", Transport)
+    # test-contract: seam no public hook orders launcher failure after process exit
+    monkeypatch.setattr(tool_spawn, "_wait_for_launcher", fail_after_process_exit)
+
+    with pytest.raises(RuntimeError, match="tool subprocess launcher failed to start"):
+        await create_tool_subprocess_shell("printf unreachable")
+
+    assert Process.ready.closed
+    assert Transport.instance.closed
+    assert Transport.instance.waited

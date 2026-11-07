@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .ergonomics import history_projection
-from .protocol import ProtocolError, bounded
+from .protocol import ErrorDescriptor, ProtocolError, bounded
 
 MAX_CONTENT_READ = 524_288
 _ROW_PREFIX = "r1"
@@ -25,7 +25,7 @@ def row_handle(entry_id: str, field: str, block_index: int) -> str:
 
 
 def _not_found(handle: object) -> ProtocolError:
-    return ProtocolError(-32012, "content not found", {"code": "content_not_found"})
+    return ProtocolError(ErrorDescriptor.CONTENT_NOT_FOUND, "content not found")
 
 
 def _decode_handle(handle: object) -> tuple[str, str, int] | None:
@@ -48,9 +48,8 @@ def read(
         raise _not_found(handle)
     if type(offset) is not int or type(limit) is not int or offset < 0 or limit < 1:
         raise ProtocolError(
-            -32602,
+            ErrorDescriptor.INVALID_CONTENT_READ,
             "invalid content read",
-            {"code": "invalid_content_read"},
         )
     limit = min(limit, MAX_CONTENT_READ)
     entry_id, field, block_index = locator
@@ -86,7 +85,7 @@ def read(
         raise _not_found(handle) from None
     if offset > len(raw):
         raise ProtocolError(
-            -32602, "invalid content read", {"code": "invalid_content_read"}
+            ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read"
         )
     chunk = raw[offset : offset + limit]
     title = block.get("caption")
