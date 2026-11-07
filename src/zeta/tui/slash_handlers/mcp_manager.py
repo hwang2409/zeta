@@ -43,6 +43,7 @@ class MCPManagerMixin:
         await self._mcp_manager.service.sync_runtime()
         try:
             await self._mcp_manager.service.refresh_credentials()
+            self._mcp_manager.credential_store_error = None
         except MCPCredentialStoreError as exc:
             error = public_credential_store_error(exc)
             self._mcp_manager.credential_store_error = error
