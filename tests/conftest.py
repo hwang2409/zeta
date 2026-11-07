@@ -27,6 +27,9 @@ from rich.console import Console
 _TEST_SITE_PACKAGES = Path(__file__).parent.resolve()
 _REPOSITORY_ROOT = _TEST_SITE_PACKAGES.parent
 _IS_REPOSITORY_TESTS = (_REPOSITORY_ROOT / "pyproject.toml").is_file()
+pytest_plugins = (
+    ("pytester", "tests.support.fake_backend") if _IS_REPOSITORY_TESTS else ()
+)
 os.environ["ZETA_TEST_PARENT_PID"] = str(os.getpid())
 
 

@@ -41,13 +41,13 @@ from zeta.accounts.usage import (
     read_usage,
     record_subscription_limit,
 )
-from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, MessageRole, StreamEventType, TextContent
 from zeta.providers.codex import CodexBackend
 from zeta.providers.retry_policy import ProviderRetryBudget
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.storage_format import advance
 from zeta.tui import TUIApp
