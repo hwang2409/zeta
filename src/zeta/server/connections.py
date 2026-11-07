@@ -759,6 +759,8 @@ def capture_read(
                 "session": None,
                 "state": "idle",
                 "explicit_finish": False,
+            }
+            suffix = {
                 "pending_approvals": [],
                 "usage": {},
                 "compaction_markers": 0,
@@ -782,6 +784,8 @@ def capture_read(
                     if loop is not None
                     else fallback_config.agents_explicit_finish
                 ),
+            }
+            suffix = {
                 "pending_approvals": [], "usage": dict(runtime.usage),
                 **(
                     {"transcript_index_failure": transcript_index_failure}
@@ -797,6 +801,7 @@ def capture_read(
                 if loop is not None
                 else fallback_config.agents_max_depth
             )
+        status.update(suffix)
         return session_id, status
     if method == "model_catalog":
         return None, ergonomics.catalog(runtime)

@@ -366,7 +366,6 @@ async def _build_child_loop(
     child_store: ConversationStore,
     child_instance_id: str,
     child_depth: int,
-    child_max_depth: int,
     preset: AgentPreset,
     model: object,
     cwd_override: Path | None,
@@ -390,11 +389,10 @@ async def _build_child_loop(
             for name in runtime_tool_names
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
-        (
-            excluded_names,
-            profile_tool_allow,
-            schema_hidden_names,
-        ) = resolve_child_profile_tools(
+        child_max_depth = loop.max_agent_depth
+        if preset.max_child_depth is not None:
+            child_max_depth = min(child_max_depth, preset.max_child_depth)
+        excluded, profile_allow, schema_hidden = resolve_child_profile_tools(
             child_depth=child_depth,
             child_max_depth=child_max_depth,
             preset=preset,
@@ -409,9 +407,9 @@ async def _build_child_loop(
         )
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
-            exclude_names=excluded_names,
-            hide_schema_names=schema_hidden_names,
-            profile_tool_allow=profile_tool_allow,
+            exclude_names=excluded,
+            hide_schema_names=schema_hidden,
+            profile_tool_allow=profile_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,
         )
@@ -790,16 +788,12 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
-        child_max_depth = loop.max_agent_depth
-        if preset.max_child_depth is not None:
-            child_max_depth = min(child_max_depth, preset.max_child_depth)
         child_loop, child_policy = await _build_child_loop(
             loop,
             child_backend=child_backend,
             child_store=child_store,
             child_instance_id=child_instance_id,
             child_depth=child_depth,
-            child_max_depth=child_max_depth,
             preset=preset,
             model=model,
             cwd_override=cwd_override,

@@ -867,6 +867,14 @@ class _Client:
                 if loop is not None
                 else fallback_config.agents_explicit_finish
             ),
+        }
+        if self.protocol_version != "1.0":
+            status["max_agent_depth"] = (
+                loop.max_agent_depth
+                if loop is not None
+                else fallback_config.agents_max_depth
+            )
+        suffix = {
             "pending_approvals": pending,
             **({"pending_approvals_truncated": truncated} if reconnect else {}),
             "usage": dict(runtime.usage),
@@ -877,12 +885,7 @@ class _Client:
             ),
             "store": runtime.opened.store if runtime.opened is not None else None,
         }
-        if self.protocol_version != "1.0":
-            status["max_agent_depth"] = (
-                loop.max_agent_depth
-                if loop is not None
-                else fallback_config.agents_max_depth
-            )
+        status.update(suffix)
         return status
 
     def _reconcile_project_links(self, session_ids: list[str]) -> None:
