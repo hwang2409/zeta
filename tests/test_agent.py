@@ -12857,11 +12857,16 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
             for message in store.messages()
         )
     finally:
-        loop._background_owner.unregister("root:1:1")
-        owned.cancel()
-        await asyncio.wait_for(asyncio.gather(owned, return_exceptions=True), 10)
-        await loop.close()
-        store.close()
+        try:
+            await _cancel_and_drain(owned)
+        finally:
+            try:
+                loop._background_owner.unregister("root:1:1")
+            finally:
+                try:
+                    await asyncio.wait_for(loop.close(), 10)
+                finally:
+                    store.close()
 
 
 @pytest.mark.asyncio
@@ -13217,18 +13222,33 @@ async def _run_until_idle_wait(
     return run, idle_waiting, prompts
 
 
+async def _cancel_and_drain(task: asyncio.Task[object]) -> None:
+    try:
+        task.cancel()
+    finally:
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+
+
 async def _cancel_idle_fixture(
     run: asyncio.Task[dict[str, object]],
     registry: ToolRegistry,
     parent: ConversationStore,
     child: ConversationStore,
 ) -> None:
-    run.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(run, 10)
-    await asyncio.wait_for(registry.close(), 10)
-    parent.close()
-    child.close()
+    try:
+        try:
+            run.cancel()
+        finally:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(run, 10)
+    finally:
+        try:
+            await asyncio.wait_for(registry.close(), 10)
+        finally:
+            try:
+                parent.close()
+            finally:
+                child.close()
 
 
 @pytest.mark.parametrize(
@@ -13323,15 +13343,25 @@ async def test_idle_with_open_work_does_not_notify_parent(
         assert lifecycle["state"] == "idle"
         assert lifecycle["current_step"] == "idle, waiting for follow-up"
     finally:
-        if owned_child is not None:
-            loop._background_owner.cancel_subtree("root:1:1")
-            await asyncio.wait_for(
-                asyncio.gather(owned_child, return_exceptions=True), 10
-            )
-            loop._background_owner.unregister("root:1:1")
-        if owned_child_store is not None:
-            owned_child_store.close()
-        await _cancel_idle_fixture(run, registry, parent, child)
+        try:
+            if owned_child is not None:
+                try:
+                    loop._background_owner.cancel_subtree("root:1:1")
+                finally:
+                    await _cancel_and_drain(owned_child)
+        finally:
+            try:
+                if owned_child is not None:
+                    loop._background_owner.unregister("root:1:1")
+            finally:
+                try:
+                    if owned_child_store is not None:
+                        owned_child_store.close()
+                finally:
+                    try:
+                        await asyncio.wait_for(loop._background_owner.wait(), 10)
+                    finally:
+                        await _cancel_idle_fixture(run, registry, parent, child)
 
 
 @pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])
@@ -13794,62 +13824,78 @@ async def test_no_immediate_reminder_while_child_owns_running_task_or_live_child
 ) -> None:
     store, registry, loop = _reminder_loop(tmp_path)
     owned_child: asyncio.Task[None] | None = None
-    if owned_kind == "task":
-        monkeypatch.setattr(
-            registry.background_tasks,
-            "snapshot",
-            lambda: (
-                SimpleNamespace(
-                    running=True, task_id="task-owned", headline="owned task"
+    run: asyncio.Task[dict[str, object]] | None = None
+    try:
+        if owned_kind == "task":
+            monkeypatch.setattr(
+                registry.background_tasks,
+                "snapshot",
+                lambda: (
+                    SimpleNamespace(
+                        running=True, task_id="task-owned", headline="owned task"
+                    ),
                 ),
-            ),
-        )
-    else:
-        owned_child = asyncio.create_task(
-            asyncio.wait_for(asyncio.Event().wait(), 10)
-        )
-        loop._background_owner.register(
-            "root:1:1",
-            lambda: None,
-            owned_child,
-            parent_instance_id="root:1",
-            description="owned child",
-        )
-    prompts: list[str] = []
-    idle_waiting = asyncio.Event()
+            )
+        else:
+            owned_child = asyncio.create_task(
+                asyncio.wait_for(asyncio.Event().wait(), 10)
+            )
+            loop._background_owner.register(
+                "root:1:1",
+                lambda: None,
+                owned_child,
+                parent_instance_id="root:1",
+                description="owned child",
+            )
+        prompts: list[str] = []
+        idle_waiting = asyncio.Event()
 
-    async def consume(_loop, prompt, **kwargs):
-        await _ack_fake_delivery(store, kwargs)
-        prompts.append(prompt)
-        return {
-            "content": [{"type": "text", "text": "reply"}],
-            "isError": False,
-            "structuredContent": {"status": "running"},
-        }
+        async def consume(_loop, prompt, **kwargs):
+            await _ack_fake_delivery(store, kwargs)
+            prompts.append(prompt)
+            return {
+                "content": [{"type": "text", "text": "reply"}],
+                "isError": False,
+                "structuredContent": {"status": "running"},
+            }
 
-    async def wait_idle(_wake, _timeout):
-        idle_waiting.set()
-        await asyncio.wait_for(asyncio.Event().wait(), 10)
-        return True
+        async def wait_idle(_wake, _timeout):
+            idle_waiting.set()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
+            return True
 
-    monkeypatch.setattr(agent_runner_module, "consume_child", consume)
-    run = asyncio.create_task(
-        agent_runner_module.consume_run(
-            loop, "work", child_store=store, idle_wait=wait_idle
+        monkeypatch.setattr(agent_runner_module, "consume_child", consume)
+        run = asyncio.create_task(
+            agent_runner_module.consume_run(
+                loop, "work", child_store=store, idle_wait=wait_idle
+            )
         )
-    )
-    await asyncio.wait_for(idle_waiting.wait(), 10)
-    assert prompts == ["work"]
-    run.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(run, 10)
-    if owned_child is not None:
-        owned_child.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(owned_child, return_exceptions=True), 10
-        )
-    await registry.close()
-    store.close()
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        assert prompts == ["work"]
+    finally:
+        try:
+            if run is not None:
+                try:
+                    run.cancel()
+                finally:
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(run, 10)
+        finally:
+            try:
+                if owned_child is not None:
+                    await _cancel_and_drain(owned_child)
+            finally:
+                try:
+                    if owned_child is not None:
+                        loop._background_owner.unregister("root:1:1")
+                finally:
+                    try:
+                        await asyncio.wait_for(loop._background_owner.wait(), 10)
+                    finally:
+                        try:
+                            await asyncio.wait_for(registry.close(), 10)
+                        finally:
+                            store.close()
 
 
 @pytest.mark.asyncio
@@ -16099,50 +16145,82 @@ async def test_child_idle_wakes_idle_explicit_finish_parent_tree(
     owner = BackgroundAgentOwner(root)
     parent_task = asyncio.create_task(asyncio.wait_for(asyncio.Event().wait(), 10))
     grandchild_task = asyncio.create_task(asyncio.wait_for(asyncio.Event().wait(), 10))
-    owner.register(
-        "root:1",
-        parent_task.cancel,
-        parent_task,
-        parent_store=root,
-        active_store=parent,
-        parent_instance_id=None,
-        description="parent",
-    )
-    owner.register(
-        "root:1:1",
-        grandchild_task.cancel,
-        grandchild_task,
-        parent_store=parent,
-        active_store=grandchild,
-        parent_instance_id="root:1",
-        description="grandchild",
-    )
-    owner.conversation_channel.register_loop("root:1")
-    owner.conversation_channel.register_delivery_flow(
-        None, pending_delivery_module.StepDeliveryFlow(root)
-    )
-    owner.conversation_channel.register_delivery_flow(
-        "root:1",
-        pending_delivery_module.StepDeliveryFlow(
-            parent,
-            wake_sink=lambda _source: owner.conversation_channel.wake("root:1"),
-        ),
-    )
-    parent_wake = asyncio.create_task(owner.conversation_channel.wait("root:1"))
-    await owner.conversation_channel.publish_idle(
-        child_instance_id="root:1:1",
-        child_session_path=str(grandchild.session_dir),
-        description="grandchild",
-        text="WAIT",
-    )
-    await asyncio.wait_for(parent_wake, timeout=10)
-    assert parent.agent_notifications()[0].data["kind"] == "child_idle"
-    assert not any(
-        entry.data.get("kind") == "child_idle"
-        for entry in root.agent_notifications(pending_only=False)
-    )
-    owner.cancel_subtree("root:1")
-    await asyncio.wait_for(owner.wait(), timeout=10)
+    parent_wake: asyncio.Task[None] | None = None
+    try:
+        owner.register(
+            "root:1",
+            parent_task.cancel,
+            parent_task,
+            parent_store=root,
+            active_store=parent,
+            parent_instance_id=None,
+            description="parent",
+        )
+        owner.register(
+            "root:1:1",
+            grandchild_task.cancel,
+            grandchild_task,
+            parent_store=parent,
+            active_store=grandchild,
+            parent_instance_id="root:1",
+            description="grandchild",
+        )
+        owner.conversation_channel.register_loop("root:1")
+        owner.conversation_channel.register_delivery_flow(
+            None, pending_delivery_module.StepDeliveryFlow(root)
+        )
+        owner.conversation_channel.register_delivery_flow(
+            "root:1",
+            pending_delivery_module.StepDeliveryFlow(
+                parent,
+                wake_sink=lambda _source: owner.conversation_channel.wake("root:1"),
+            ),
+        )
+        parent_wake = asyncio.create_task(owner.conversation_channel.wait("root:1"))
+        await owner.conversation_channel.publish_idle(
+            child_instance_id="root:1:1",
+            child_session_path=str(grandchild.session_dir),
+            description="grandchild",
+            text="WAIT",
+        )
+        await asyncio.wait_for(parent_wake, timeout=10)
+        assert parent.agent_notifications()[0].data["kind"] == "child_idle"
+        assert not any(
+            entry.data.get("kind") == "child_idle"
+            for entry in root.agent_notifications(pending_only=False)
+        )
+    finally:
+        try:
+            if parent_wake is not None:
+                await _cancel_and_drain(parent_wake)
+        finally:
+            try:
+                try:
+                    owner.cancel_subtree("root:1")
+                finally:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            parent_task, grandchild_task, return_exceptions=True
+                        ),
+                        10,
+                    )
+            finally:
+                try:
+                    try:
+                        owner.unregister("root:1:1")
+                    finally:
+                        owner.unregister("root:1")
+                finally:
+                    try:
+                        await asyncio.wait_for(owner.wait(), timeout=10)
+                    finally:
+                        try:
+                            grandchild.close()
+                        finally:
+                            try:
+                                parent.close()
+                            finally:
+                                root.close()
 
 
 @pytest.mark.asyncio
