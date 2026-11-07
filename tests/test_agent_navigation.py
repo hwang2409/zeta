@@ -1400,6 +1400,10 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
             wake_sink=lambda _source: channel.wake("root:worker"),
         ),
     )
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    app.loop._background_owner.register(
+        "root:worker", watcher.cancel, watcher, parent_store=app.loop.store
+    )
     notices: list[str] = []
     loop = asyncio.get_running_loop()
     queued = asyncio.Event()

@@ -335,21 +335,9 @@ class BackgroundAgentOwner:
         if instance_id in self._watchers:
             self._parent_stores[instance_id] = parent_store
             self._parent_ids[instance_id] = parent_instance_id
-
-    def controls_child(
-        self,
-        parent_store: ConversationStore,
-        child_instance_id: str,
-    ) -> bool:
-        """Return whether this live owner edge permits child mutation."""
-
-        watcher = self._watchers.get(child_instance_id)
-        return (
-            watcher is not None
-            and not watcher.done()
-            and self._parent_stores.get(child_instance_id) is parent_store
-        )
-
+    def controls_child(self, parent: ConversationStore, child: str) -> bool:
+        watcher = self._watchers.get(child)
+        return bool(watcher and not watcher.done() and self._parent_stores.get(child) is parent)
     def parent_edge(
         self,
         instance_id: str,

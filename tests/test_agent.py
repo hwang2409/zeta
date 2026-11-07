@@ -7935,6 +7935,20 @@ def _run_agent_call(call_id: str = "run-1") -> ToolCall:
     )
 
 
+def _register_live_delivery(
+    owner: BackgroundAgentOwner,
+    parent: ConversationStore,
+    handle: str,
+    child: ConversationStore,
+) -> None:
+    owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
+    )
+    watcher = asyncio.current_task()
+    assert watcher is not None
+    owner.register(handle, lambda: None, watcher, parent_store=parent)
+
+
 class _RunCommands(AgentRunCommandMixin):
     """Minimal host for the mixin: it only needs loop.store."""
 
@@ -9479,9 +9493,7 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
     owner = BackgroundAgentOwner(parent_store)
-    owner.conversation_channel.register_delivery_flow(
-        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
-    )
+    _register_live_delivery(owner, parent_store, "parent:1", child_store)
     registry._agent_owner = owner
     task = asyncio.create_task(
         registry.execute(
@@ -9545,9 +9557,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
         tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty()
     )
     owner = BackgroundAgentOwner(parent_store)
-    owner.conversation_channel.register_delivery_flow(
-        "parent:1", pending_delivery_module.StepDeliveryFlow(child_store)
-    )
+    _register_live_delivery(owner, parent_store, "parent:1", child_store)
     registry._agent_owner = owner
     task = asyncio.create_task(
         registry.execute(
@@ -9607,6 +9617,9 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
     delivery_flow = pending_delivery_module.StepDeliveryFlow(child_store)
     await delivery_flow.initialize()
     owner.conversation_channel.register_delivery_flow("parent:1", delivery_flow)
+    watcher = asyncio.current_task()
+    assert watcher is not None
+    owner.register("parent:1", lambda: None, watcher, parent_store=parent_store)
     registry._agent_owner = owner
     lock = child_store._append_lock()
     lock.__enter__()
@@ -15266,9 +15279,7 @@ async def test_tui_child_send_keeps_target_history_across_view_switch(
         child_instance_id=handle,
         accepts_follow_ups=True,
     )
-    loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child_a)
-    )
+    _register_live_delivery(loop._background_owner, parent, handle, child_a)
     started = asyncio.Event()
     release = asyncio.Event()
     original_send = agent_card_module.send_to_run
@@ -15317,9 +15328,7 @@ async def test_slash_send_records_history_for_target_child(tmp_path: Path) -> No
         child_instance_id=handle,
         accepts_follow_ups=True,
     )
-    loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child_a)
-    )
+    _register_live_delivery(loop._background_owner, parent, handle, child_a)
     commands = _RunCommands(loop)
     commands._agent_navigation.current_path = child_b.session_dir
 
@@ -15381,9 +15390,7 @@ async def test_tui_child_prompt_history_tracks_pending_consumed_and_acknowledged
         child_instance_id=handle,
         accepts_follow_ups=True,
     )
-    loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child)
-    )
+    _register_live_delivery(loop._background_owner, parent, handle, child)
     commands = _RunCommands(loop)
     source = AgentTranscriptSource(child.session_dir)
 
@@ -15439,9 +15446,7 @@ async def test_tui_child_composer_answer_closes_matching_question(
     question = parent.append_child_question(
         child_instance_id=handle, question_id="q-composer", question="approve?"
     )
-    loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child)
-    )
+    _register_live_delivery(loop._background_owner, parent, handle, child)
     commands = _RunCommands(loop)
     commands._agent_navigation = SimpleNamespace(
         child_view_active=True, child_instance_id=lambda: handle
@@ -15480,9 +15485,7 @@ async def test_slash_send_answer_closes_matching_question(tmp_path: Path) -> Non
     question = parent.append_child_question(
         child_instance_id=handle, question_id="q-slash", question="approve?"
     )
-    loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child)
-    )
+    _register_live_delivery(loop._background_owner, parent, handle, child)
     commands = _RunCommands(loop)
 
     result = commands.slash_send(f"{handle} Re q-slash: approved")
@@ -15516,9 +15519,7 @@ async def test_retry_before_provider_event_leaves_prompt_pending(
         child_instance_id=handle,
         accepts_follow_ups=True,
     )
-    parent_loop._background_owner.conversation_channel.register_delivery_flow(
-        handle, pending_delivery_module.StepDeliveryFlow(child)
-    )
+    _register_live_delivery(parent_loop._background_owner, parent, handle, child)
     await _send_follow_up(parent_loop, handle, "retry follow-up")
     pending = (await asyncio.to_thread(child.pending_prompts))[0]
     prompt_message = Message(

@@ -123,7 +123,7 @@ async def test_agent_control_tools_execute_through_registry(
     )
     owner = BackgroundAgentOwner(store)
     task = asyncio.create_task(asyncio.sleep(10))
-    owner.register("child", lambda: None, task)
+    owner.register("child", lambda: None, task, parent_store=store)
     registry._agent_owner = owner
     monkeypatch.setattr(
         "zeta.tools.agent._read_agent_status", lambda _: [{"handle": "child"}]
@@ -149,25 +149,20 @@ async def test_agent_cancel_reads_status_off_event_loop(
         skill_catalog=SkillCatalog.empty(),
         register_builtin=True,
     )
-    owner = BackgroundAgentOwner(store)
-    task = asyncio.create_task(asyncio.sleep(10))
-    owner.register("child", lambda: None, task)
-    registry._agent_owner = owner
+    registry._agent_owner = BackgroundAgentOwner(store)
     loop_thread = threading.get_ident()
     read_threads: list[int] = []
 
-    def status(_: object) -> list[dict[str, str]]:
+    def status(_: object, **__: object) -> list[dict[str, str]]:
         read_threads.append(threading.get_ident())
-        return [{"handle": "child"}]
+        return [{"handle": "child", "state": "completed"}]
 
+    monkeypatch.setattr(store, "active_agent_receipts", lambda: (("child", "path"),))
     monkeypatch.setattr("zeta.tools.agent._read_agent_status", status)
     try:
         await registry.execute(ToolCall("cancel", "agent_cancel", {"handle": "child"}))
         assert read_threads and loop_thread not in read_threads
-        owner.unregister("child")
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
         await registry.close()
 
 
