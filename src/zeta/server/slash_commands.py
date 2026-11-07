@@ -90,17 +90,25 @@ class ServerSlashSession:
         self,
         runtime: ServerRuntime,
         approval_control: _ApprovalProjection | None = None,
-        status: SlashStatus | None = None,
+        run_blocking: Callable[[Callable[[], object]], Awaitable[object]] | None = None,
     ) -> None:
         self._runtime = runtime
         self._approval_control = approval_control
-        self._status = status
+        self._run_blocking = run_blocking
 
     # --- runnable server-side ---
 
-    def slash_status_command(self, args: str) -> str:
+    async def slash_status_command(self, args: str) -> str:
         del args
-        return _format_status(self.slash_status())
+        snapshot = self.status_snapshot()
+        status = await (
+            self._run_blocking(lambda: build_slash_status(snapshot))
+            if self._run_blocking is not None
+            else asyncio.to_thread(build_slash_status, snapshot)
+        )
+        if not isinstance(status, SlashStatus):
+            raise TypeError("status worker returned an invalid projection")
+        return _format_status(status)
 
     def status_snapshot(self) -> SlashStatusSnapshot:
         runtime = self._runtime
@@ -128,8 +136,6 @@ class ServerSlashSession:
         )
 
     def slash_status(self) -> SlashStatus:
-        if self._status is not None:
-            return self._status
         return build_slash_status(self.status_snapshot())
 
     async def slash_accounts(self, args: str) -> str:
@@ -398,17 +404,9 @@ async def run_command(
         return _model_input_result(envelope, register_model_input)
     if name in {entry[0] for entry in registry.mcp_prompt_entries}:
         return {"kind": SlashResultKindDescriptor.CLIENT_ONLY, "name": name}
-    session = ServerSlashSession(runtime, approval_control)
-    if name == "status":
-        snapshot = session.status_snapshot()
-        status = await (
-            run_blocking(lambda: build_slash_status(snapshot))
-            if run_blocking is not None
-            else asyncio.to_thread(build_slash_status, snapshot)
-        )
-        if not isinstance(status, SlashStatus):
-            raise RuntimeError("status worker returned an invalid projection")
-        session = ServerSlashSession(runtime, approval_control, status)
+    session = ServerSlashSession(
+        runtime, approval_control, run_blocking=run_blocking
+    )
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": SlashResultKindDescriptor.UNKNOWN, "name": name}

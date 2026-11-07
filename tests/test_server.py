@@ -7867,11 +7867,39 @@ async def test_slash_wire_pin_matches_origin_main_fixture(tmp_path: Path) -> Non
     finally:
         await _close(server, writer)
 
+    help_project = tmp_path / "help-project"
+    help_project.mkdir()
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(help_project)],
+        check=True,
+        capture_output=True,
+    )
+    help_server = ZetaServer(
+        home=tmp_path / "help-home",
+        cwd=help_project,
+        port=0,
+        provider="codex",
+    )
+    help_reader, help_writer, help_sid = await _ready_extensions(help_server)
+    try:
+        observed.append(
+            await _raw_response_line(
+                help_reader,
+                help_writer,
+                "help",
+                "slash_run",
+                {"session_id": help_sid, "text": "/help"},
+            )
+        )
+    finally:
+        await _close(help_server, help_writer)
+
     fixture = Path(__file__).parent / "fixtures" / "serve_slash_wire_pin.jsonl"
     rows = fixture.read_text().splitlines()
     assert rows[0] == (
-        "# baseline origin/main ba695c06; accepted deltas: "
-        "W1, W3, W5, text->output"
+        "# baseline origin/main 66c084d8; accepted deltas: "
+        "W1, W2, W3, W5, text->output"
     )
     assert observed == rows[1:]
 
