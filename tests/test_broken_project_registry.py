@@ -540,6 +540,40 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
     async def turn(text: str) -> None:
         await _collect_turn(app.loop, text)
 
+    async def _join(task: asyncio.Task[Any] | None) -> None:
+        # Recovery runs its projection read and prepare off the turn loop. Wait for
+        # the real task the last boundary started instead of counting turns, so a
+        # slow read under load cannot race the assertions below. Shield keeps the
+        # loop-owned task alive if this wait times out.
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), 10)
+
+    async def _advance_until_prepare_entry() -> None:
+        # One boundary starts the projection read; the next consumes it and starts
+        # the prepare task, whose thread sets prepare_entered before it blocks.
+        for _ in range(6):
+            if app.loop._project_context_prepare_task is not None:
+                break
+            await _join(app.loop._project_context_read_task)
+            await turn("advance")
+        assert await asyncio.wait_for(
+            asyncio.to_thread(prepare_entered.wait, 10), timeout=15
+        )
+
+    async def _advance_until(event: threading.Event) -> None:
+        # Drive recovery through its real read/prepare tasks until the event fires.
+        for _ in range(6):
+            if event.is_set():
+                break
+            await _join(app.loop._project_context_read_task)
+            await _join(app.loop._project_context_prepare_task)
+            if event.is_set():
+                break
+            await turn("advance")
+        assert await asyncio.wait_for(
+            asyncio.to_thread(event.wait, 10), timeout=15
+        )
+
     closing_app = None
     close_task = None
     close_read_release = threading.Event()
@@ -550,10 +584,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         assert app.loop.project_context_health is not None
 
         (memory_dir / "state.md").write_text("RECOVERED-MEMORY", encoding="utf-8")
-        for index in range(4):
-            await turn(f"advance-{index}")
-            if prepare_entered.is_set():
-                break
+        await _advance_until_prepare_entry()
         assert prepare_entered.is_set()
         skill = home / "skills" / "recovered" / "SKILL.md"
         skill.parent.mkdir(parents=True)
@@ -571,10 +602,7 @@ async def test_custom_resume_recovers_through_real_turns_without_losing_skill_re
         )
 
         await turn("fifth")
-        for index in range(3):
-            if prepare_done[1].is_set():
-                break
-            await turn(f"retry-{index}")
+        await _advance_until(prepare_done[1])
         assert prepare_done[1].is_set()
         assert app.loop.project_context_health is not None
 
