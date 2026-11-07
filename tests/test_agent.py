@@ -16719,3 +16719,41 @@ async def test_agent_cancel_preserves_already_finished_for_direct_terminal_child
 
     assert result["isError"] is False
     assert result["structuredContent"]["status"] == "already_finished"
+
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    grandchild.start_agent_lifecycle(
+        handle="root:1:1",
+        started_at="2026-11-08T00:00:00+00:00",
+        depth=2,
+        agent_type="general",
+        description="finished descendant",
+    )
+    grandchild.finish_agent_lifecycle(
+        "completed",
+        final_result="done",
+        turns_used=1,
+        finished_at="2026-11-08T00:00:01+00:00",
+    )
+    nested_call = ToolCall("terminal-descendant", "agent", {"prompt": "work"})
+    child.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(nested_call)]))
+    child.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("done")],
+            tool_result=ToolResult(
+                nested_call.id,
+                "done",
+                structured_content={
+                    "child_instance_id": "root:1:1",
+                    "child_session_path": str(grandchild.session_dir),
+                },
+            ),
+        )
+    )
+
+    descendant = await loop.tool_registry.execute(
+        ToolCall("cancel-terminal-descendant", "agent_cancel", {"handle": "root:1:1"})
+    )
+
+    assert descendant["isError"] is True
+    assert "unknown child handle" in descendant["content"][0]["text"]

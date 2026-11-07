@@ -8,7 +8,20 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
-from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.tui import theme
 from zeta.tui.render import render_event
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
@@ -867,3 +880,74 @@ def test_unknown_identity_snapshot_is_cached_until_observed() -> None:
 
     assert index.resolve("root:404").label == "late child :404"
     assert snapshots == 1
+
+
+@pytest.mark.asyncio
+async def test_subtree_status_and_output_render_through_transcript_presenter(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    child_call = ToolCall("child", "agent", {"prompt": "child"})
+    nested_call = ToolCall("nested", "agent", {"prompt": "nested"})
+    for store, call, handle, target, depth in (
+        (root, child_call, "root:1", child, 1),
+        (child, nested_call, "root:1:1", grandchild, 2),
+    ):
+        target.start_agent_lifecycle(
+            handle=handle,
+            started_at=f"2026-11-08T00:00:0{depth}+00:00",
+            depth=depth,
+            agent_type="general",
+            description="nested verifier",
+        )
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("running")],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={
+                        "child_instance_id": handle,
+                        "child_session_path": str(target.session_dir),
+                    },
+                ),
+            )
+        )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested output")])
+    )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await loop.tool_registry.execute(
+        ToolCall("status", "agent_status", {"handle": "root:1:1"})
+    )
+    output = await loop.tool_registry.execute(
+        ToolCall("output", "agent_output", {"handle": "root:1:1"})
+    )
+
+    rendered = _render_sequence(
+        [
+            _tool_result_event(
+                "agent_status",
+                {"handle": "root:1:1"},
+                status["content"][0]["text"],
+                status["structuredContent"],
+            ),
+            _tool_result_event(
+                "agent_output",
+                {"handle": "root:1:1"},
+                output["content"][0]["text"],
+                output["structuredContent"],
+            ),
+        ],
+        100,
+    )
+
+    assert "nested verifier" in rendered
+    assert ":1:1" in rendered
+    assert "nested output" in rendered

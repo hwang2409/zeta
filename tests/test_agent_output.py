@@ -1285,6 +1285,7 @@ async def test_agent_output_reads_and_fits_off_event_loop(
         return original(*args, **kwargs)
 
     asyncio_loop = asyncio.get_running_loop()
+    # test-contract: seam deterministic transcript I/O thread identity
     monkeypatch.setattr(agent_tools, "_read_child_file", controlled_read)
     task = asyncio.create_task(
         loop.tool_registry.execute(
@@ -1334,6 +1335,7 @@ async def test_agent_status_projects_and_fits_off_event_loop(
         return original(*args, **kwargs)
 
     asyncio_loop = asyncio.get_running_loop()
+    # test-contract: seam deterministic response fitting thread identity
     monkeypatch.setattr(agent_tools, "_status_response", controlled_projection)
     task = asyncio.create_task(
         loop.tool_registry.execute(ToolCall("status-thread", "agent_status", {}))
@@ -1446,6 +1448,7 @@ async def test_nested_reader_rejects_outside_and_malformed_handles_before_file_o
         opens += 1
         raise AssertionError("invalid handle opened a session")
 
+    # test-contract: seam invalid handles must fail before snapshot I/O
     monkeypatch.setattr(subtree, "_open_snapshot", forbidden_open)
     loop = AgentLoop(
         FakeBackend([]), child, max_turns=1, skill_catalog=SkillCatalog.empty()

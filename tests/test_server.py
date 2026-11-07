@@ -74,6 +74,7 @@ from zeta.protocol.types import (
     with_message_origin,
 )
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.approval_lifecycle import (
     ApprovalLifecycle,
@@ -8736,3 +8737,73 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     result = notifications[0][1]["tool_result"]
     assert result["content"] == "agent error: unknown child handle"
     assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    for store, handle, target, depth in (
+        (root, "root:1", child, 1),
+        (child, "root:1:1", grandchild, 2),
+    ):
+        call = ToolCall(f"agent-{depth}", "agent", {"prompt": "inspect"})
+        target.start_agent_lifecycle(
+            handle=handle,
+            started_at=f"2026-11-08T00:00:0{depth}+00:00",
+            depth=depth,
+            agent_type="general",
+            description="nested verifier",
+        )
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("running")],
+                tool_result=ToolResult(
+                    call.id,
+                    "running",
+                    structured_content={
+                        "child_instance_id": handle,
+                        "child_session_path": str(target.session_dir),
+                    },
+                ),
+            )
+        )
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    call = ToolCall("nested-status", "agent_status", {"handle": "root:1:1"})
+    result = await loop.tool_registry.execute(call)
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path / "serve"))
+    client = ServeControl(
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                result["content"][0]["text"],
+                structured_content=result["structuredContent"],
+            ),
+        ),
+        session_id="session",
+        background=True,
+    )
+
+    wire_result = notifications[0][1]["tool_result"]
+    children = wire_result["structured_content"]["children"]
+    assert children[0]["handle"] == "root:1:1"
+    assert children[0]["description"] == "nested verifier"
