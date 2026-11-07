@@ -25,6 +25,7 @@ import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.accounts import AccountCredentials
 from zeta.codex import CodexStreamError
 from zeta.config.settings import Settings, load_settings, resolve
@@ -667,7 +668,13 @@ async def test_oauth_refresh_network_wait_is_bounded(
             return OAuthTokens("fresh-access", "refresh-fixture", 4_000_000_000)
 
         monkeypatch.setattr(store, "refresh", recovered_refresh)
-        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == "fresh-access"
+        assert (
+            await await_or_fail(
+                store.access_token(client),
+                what="recovered OAuth access token",
+            )
+            == "fresh-access"
+        )
 
 
 async def test_oauth_credential_lock_wait_is_bounded(
@@ -685,8 +692,12 @@ async def test_oauth_credential_lock_wait_is_bounded(
                 ),
             ):
                 await asyncio.wait_for(store.access_token(client), timeout=0.5)
-        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
-            _codex_access_token()
+        assert (
+            await await_or_fail(
+                store.access_token(client),
+                what="access token after credential lock release",
+            )
+            == _codex_access_token()
         )
 
 
