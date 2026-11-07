@@ -756,6 +756,7 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
+        await asyncio.sleep(0)
         await self.refresh_skills()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
