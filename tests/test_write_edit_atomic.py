@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import stat
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -16,6 +17,28 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 ToolInvocation = Callable[[ToolRegistry, str], Awaitable[StructuredToolResult]]
+
+
+async def _assert_completes_before_worker_release(
+    operation: asyncio.Task[StructuredToolResult],
+) -> StructuredToolResult:
+    completed = asyncio.ensure_future(asyncio.shield(operation))
+
+    async def event_loop_checkpoint() -> None:
+        loop = asyncio.get_running_loop()
+        for _ in range(20):
+            turn = loop.create_future()
+            loop.call_soon(turn.set_result, None)
+            await turn
+
+    checkpoint = asyncio.create_task(event_loop_checkpoint())
+    done, _pending = await asyncio.wait(
+        {completed, checkpoint}, return_when=asyncio.FIRST_COMPLETED
+    )
+    assert completed in done, "abort did not finish while the file worker was blocked"
+    checkpoint.cancel()
+    await asyncio.gather(checkpoint, return_exceptions=True)
+    return completed.result()
 
 
 async def _write(registry: ToolRegistry, path: str) -> StructuredToolResult:
@@ -122,6 +145,7 @@ async def test_edit_rejects_concurrent_change_before_commit(
                 os.replace(replacement, target)
         return original_count(content, old_string)
 
+    # test-contract: seam force a concurrent change after the real tool reads
     monkeypatch.setattr(edit_module, "_count_overlapping", change_after_read)
 
     try:
@@ -258,7 +282,7 @@ async def test_write_does_not_publish_new_file_before_content_is_ready(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invoke", [_write, _edit])
-async def test_abort_waits_for_file_worker_and_prevents_publication(
+async def test_abort_finishes_before_blocked_worker_and_prevents_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     invoke: ToolInvocation,
@@ -268,8 +292,10 @@ async def test_abort_waits_for_file_worker_and_prevents_publication(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     entered = threading.Event()
     release = threading.Event()
+    temporary_removed = threading.Event()
     main_thread = threading.get_ident()
     original_fdopen = os.fdopen
+    original_unlink = os.unlink
 
     class BlockingWriter:
         def __init__(self, handle: Any) -> None:
@@ -297,25 +323,70 @@ async def test_abort_waits_for_file_worker_and_prevents_publication(
         handle = original_fdopen(fd, mode, *args, **kwargs)
         return BlockingWriter(handle) if "w" in mode or "+" in mode else handle
 
+    def observed_unlink(
+        path: os.PathLike[str] | str, *args: Any, **kwargs: Any
+    ) -> None:
+        original_unlink(path, *args, **kwargs)
+        if str(path).endswith(".tmp"):
+            temporary_removed.set()
+
     monkeypatch.setattr(os, "fdopen", blocking_fdopen)
+    monkeypatch.setattr(os, "unlink", observed_unlink)
     operation = asyncio.create_task(invoke(registry, target.name))
     try:
         await asyncio.to_thread(entered.wait)
         registry.abort()
-        loop = asyncio.get_running_loop()
-        for _ in range(4):
-            turn = loop.create_future()
-            loop.call_soon(turn.set_result, None)
-            await turn
 
-        assert not operation.done()
-
-        release.set()
-        result = await operation
+        result = await _assert_completes_before_worker_release(operation)
         assert result["isError"] is True
         assert result["content"][0]["text"] == "tool execution canceled"
+
+        release.set()
+        await asyncio.to_thread(temporary_removed.wait)
         assert target.read_text(encoding="utf-8") == "old content"
+        assert list(tmp_path.glob(".*.tmp")) == []
     finally:
         release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invoke", [_write, _edit])
+async def test_abort_after_publication_reports_unconfirmed_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invoke: ToolInvocation,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("old content", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    published = threading.Event()
+    release = threading.Event()
+    trailing_fsync_finished = threading.Event()
+    original_fsync = os.fsync
+
+    def blocking_directory_fsync(file_descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            published.set()
+            release.wait()
+            trailing_fsync_finished.set()
+        original_fsync(file_descriptor)
+
+    monkeypatch.setattr(os, "fsync", blocking_directory_fsync)
+    operation = asyncio.create_task(invoke(registry, target.name))
+    try:
+        await asyncio.to_thread(published.wait)
+        registry.abort()
+
+        result = await _assert_completes_before_worker_release(operation)
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == (
+            "file was written; durability was not confirmed before cancellation"
+        )
+        assert target.read_text(encoding="utf-8") == "new content"
+    finally:
+        release.set()
+        await asyncio.to_thread(trailing_fsync_finished.wait)
         await asyncio.gather(operation, return_exceptions=True)
         await registry.close()

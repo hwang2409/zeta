@@ -8,6 +8,7 @@ import hashlib
 import os
 import secrets
 import stat
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,50 @@ class ConcurrentFileChangeError(ValueError):
     """The opened file no longer matches the file at its path."""
 
 
+class FilePublishedWithoutDurabilityError(RuntimeError):
+    """Publication completed before cancellation, but its fsync did not."""
+
+
+class PublicationGuard:
+    """Let cancellation and one publication syscall choose one winner."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._canceled = False
+        self._published = False
+
+    def publish(self, function: Callable[[], None]) -> None:
+        with self._lock:
+            if self._canceled:
+                raise asyncio.CancelledError
+            function()
+            self._published = True
+
+    def cancel(self) -> bool:
+        """Return whether publication had already completed."""
+
+        with self._lock:
+            if self._published:
+                return True
+            self._canceled = True
+            return False
+
+
+async def _cancel_publication(publication: PublicationGuard) -> bool:
+    task = asyncio.create_task(asyncio.to_thread(publication.cancel))
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            pass
+    return task.result()
+
+
+def _retrieve_worker_result(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 async def run_file_worker[Result](
     function: Callable[..., Result],
     /,
@@ -28,17 +73,22 @@ async def run_file_worker[Result](
 ) -> Result:
     """Keep ownership of file work until its disk outcome is known."""
 
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    interrupted = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            interrupted = True
-    result = task.result()
-    if interrupted and not signal.is_set():
-        raise asyncio.CancelledError
-    return result
+    publication = PublicationGuard()
+    task = asyncio.create_task(
+        asyncio.to_thread(function, *args, publication=publication, **kwargs)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        published = await _cancel_publication(publication)
+        if task.done():
+            return task.result()
+        task.add_done_callback(_retrieve_worker_result)
+        if published and signal.is_set():
+            raise FilePublishedWithoutDurabilityError(
+                "file was written; durability was not confirmed before cancellation"
+            ) from None
+        raise
 
 
 def _temporary_name(name: str) -> str:
@@ -74,6 +124,7 @@ def atomic_create(
     path: str,
     content: bytes,
     abort_signal: AbortSignal,
+    publication: PublicationGuard,
 ) -> None:
     """Publish a complete new file without replacing an existing target."""
 
@@ -98,12 +149,14 @@ def atomic_create(
             raise ValueError(f"could not write file: {path}: {exc}") from exc
         if abort_signal.is_set():
             raise asyncio.CancelledError
-        os.link(
-            temporary_name,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
+        publication.publish(
+            lambda: os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         )
         os.unlink(temporary_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -161,6 +214,7 @@ def atomic_replace(
     path: str,
     content: bytes,
     abort_signal: AbortSignal,
+    publication: PublicationGuard,
     *,
     expected_digest: bytes | None = None,
 ) -> None:
@@ -212,11 +266,13 @@ def atomic_replace(
             os.close(final_fd)
         if abort_signal.is_set():
             raise asyncio.CancelledError
-        os.replace(
-            temporary_name,
-            target.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
+        publication.publish(
+            lambda: os.replace(
+                temporary_name,
+                target.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
         )
         published = True
         os.fsync(parent_fd)

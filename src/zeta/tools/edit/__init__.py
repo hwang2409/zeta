@@ -10,6 +10,7 @@ from typing import NotRequired, TypedDict
 from ...protocol.types import StructuredToolResult
 from .._atomic_replace import (
     ConcurrentFileChangeError,
+    PublicationGuard,
     atomic_replace,
     run_file_worker,
 )
@@ -60,6 +61,7 @@ def _edit_target(
     batch: bool,
     abort_signal: AbortSignal,
     execution_context: ToolExecutionContext,
+    publication: PublicationGuard,
 ) -> StructuredToolResult:
     try:
         for old_string, new_string in replacements:
@@ -117,6 +119,7 @@ def _edit_target(
                 path,
                 updated_bytes,
                 abort_signal,
+                publication,
                 expected_digest=hashlib.sha256(content_bytes).digest(),
             )
         except ConcurrentFileChangeError as exc:
