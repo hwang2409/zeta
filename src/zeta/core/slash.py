@@ -31,6 +31,7 @@ from ..skills import (
     is_slash_safe_name,
     load_skill_prompt,
 )
+from ..skills.catalog import LiveSkillProjection, prepare_slash_projection
 from ..skills.invocation import dollar_skill_mentions
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
@@ -609,15 +610,6 @@ class SlashCommand:
         return self.handler(session, args)
 
 
-@dataclass(frozen=True, slots=True)
-class LiveSkillProjection:
-    """Worker-prepared slash skill state for constant-time commit."""
-
-    skills: dict[str, SkillMeta]
-    notices: tuple[str, ...]
-    warning_notices: frozenset[str]
-
-
 class SlashCommandRegistry:
     """Map registered command names to their handlers."""
 
@@ -727,22 +719,9 @@ class SlashCommandRegistry:
     def prepare_live_config(
         self, catalog: SkillCatalog, _agents: object
     ) -> LiveSkillProjection:
-        """Build the complete slash skill projection without mutating the registry."""
-
-        skills: dict[str, SkillMeta] = {}
-        notices = list(catalog.notices)
-        for skill in catalog.skills:
-            if skill.name in self._commands:
-                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
-            elif skill.name in self._custom_commands:
-                notice = (
-                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
-                )
-            else:
-                skills[skill.name] = skill
-                continue
-            notices.append(notice)
-        return LiveSkillProjection(skills, tuple(notices), frozenset(notices))
+        return prepare_slash_projection(
+            catalog, self._commands, self._custom_commands
+        )
 
     def commit_live_config(self, prepared: object) -> None:
         """Commit one worker-prepared slash projection by reference."""

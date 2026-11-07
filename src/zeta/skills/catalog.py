@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -29,6 +30,13 @@ class SkillMeta:
     source: str = ""
     # Keep the discovery root independent from later filesystem changes.
     skills_root: Path | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSkillProjection:
+    skills: dict[str, SkillMeta]
+    notices: tuple[str, ...]
+    warning_notices: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +149,23 @@ class SkillCatalog:
 
 
 type SkillRootsSignature = tuple[tuple[str, tuple[int, int, int, int] | None], ...]
+
+
+def prepare_slash_projection(
+    catalog: SkillCatalog, builtins: Collection[str], custom: Collection[str]
+) -> LiveSkillProjection:
+    skills: dict[str, SkillMeta] = {}
+    notices = list(catalog.notices)
+    for skill in catalog.skills:
+        if skill.name in builtins:
+            notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
+        elif skill.name in custom:
+            notice = f"ignored skill {skill.path}: shadows custom command /{skill.name}"
+        else:
+            skills[skill.name] = skill
+            continue
+        notices.append(notice)
+    return LiveSkillProjection(skills, tuple(notices), frozenset(notices))
 
 
 def _skills_dir(home: Path) -> Path:
@@ -290,6 +315,7 @@ def load_skill_prompt(meta: SkillMeta) -> str:
 
 __all__ = [
     "SKILL_INDEX_BYTE_LIMIT",
+    "LiveSkillProjection",
     "SkillCatalog",
     "SkillMeta",
     "discover_packaged_skills",
@@ -298,4 +324,5 @@ __all__ = [
     "is_slash_safe_name",
     "load_skill",
     "load_skill_prompt",
+    "prepare_slash_projection",
 ]

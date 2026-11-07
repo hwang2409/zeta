@@ -11749,12 +11749,15 @@ async def test_child_cwd_inherits_parent_project_memory_and_tools(
         project_registry=registry,
     )
 
-    prepared = _child_base_system_prompt(loop, str(child_cwd), child_tools)
-    assert isinstance(prepared.prompt, str)
+    prompt, project_dir = _child_base_system_prompt(
+        loop, str(child_cwd), child_tools
+    )
+    assert isinstance(prompt, str)
 
-    assert "PROJECT A MEMORY" in prepared.prompt
-    assert "PROJECT B MEMORY" not in prepared.prompt
-    assert "CHILD CWD INSTRUCTIONS" in prepared.prompt
+    assert "PROJECT A MEMORY" in prompt
+    assert "PROJECT B MEMORY" not in prompt
+    assert "CHILD CWD INSTRUCTIONS" in prompt
+    assert project_dir == child_cwd
     assert child_tools.project_id == project_a.project_id
     assert child_tools.project_id != project_b.project_id
     await child_tools.close()
