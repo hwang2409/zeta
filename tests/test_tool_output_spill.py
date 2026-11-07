@@ -425,17 +425,18 @@ async def test_fetch_temporary_file_closes_after_repeated_cancellation(
         async with fetch_tool._temporary_file(Spills()):
             raise AssertionError("cancelled acquisition yielded a handle")
 
+    async def next_loop_turn() -> None:
+        resumed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(resumed.set)
+        await asyncio.wait_for(resumed.wait(), 10)
+
     task = asyncio.create_task(use_temporary_file())
     try:
         assert await asyncio.to_thread(started.wait, 10)
         task.cancel()
-        resumed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(resumed.set)
-        await resumed.wait()
+        await next_loop_turn()
         task.cancel()
-        resumed = asyncio.Event()
-        asyncio.get_running_loop().call_soon(resumed.set)
-        await resumed.wait()
+        await next_loop_turn()
         release.set()
         assert await asyncio.to_thread(entered.wait, 10)
         with pytest.raises(asyncio.CancelledError):

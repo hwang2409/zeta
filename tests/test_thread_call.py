@@ -17,7 +17,7 @@ from zeta.core.thread_call import run_owned_thread_call
 async def _next_loop_turn() -> None:
     resumed = asyncio.Event()
     asyncio.get_running_loop().call_soon(resumed.set)
-    await resumed.wait()
+    await asyncio.wait_for(resumed.wait(), 10)
 
 
 def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
@@ -37,7 +37,7 @@ def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        pytest.fail("owned thread call completed within the hang guard", pytrace=False)
+        pytest.fail("owned thread call did not complete within the hang guard", pytrace=False)
 
 
 def test_owned_thread_call_propagates_worker_cancelled_error_once() -> None:
