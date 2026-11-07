@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import zeta.core.session as session_module
+import zeta.core.store._async_writes as async_writes_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
     TIMEOUT,
@@ -533,13 +534,16 @@ async def test_serve_bound_approval_writes_only_through_settlement(
             )
 
         writers: list[tuple[str, ...]] = []
-        original_resolve = store.resolve_approval
+        original_commit = store._commit_method_async
 
-        def record_writer(*args: object, **kwargs: object) -> bool:
-            writers.append(tuple(frame.function for frame in inspect.stack()))
-            return original_resolve(*args, **kwargs)
+        async def record_writer(
+            method: object, *args: object, **kwargs: object
+        ) -> object:
+            if method.__name__ == "resolve_approval":
+                writers.append(tuple(frame.function for frame in inspect.stack()))
+            return await original_commit(method, *args, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_approval", record_writer)
+        monkeypatch.setattr(store, "_commit_method_async", record_writer)
         assert abort() is None
         await asyncio.sleep(0)
         await server.control.wait_for_approval_settlement()
@@ -609,17 +613,24 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             background=path == "delegated",
         )
 
-        original_resolve = store.resolve_approval
+        original_mutation = async_writes_module.execute_mutation
         writes = 0
 
-        def fail_twice_then_recover(*args: object, **kwargs: object) -> bool:
+        def fail_twice_then_recover(
+            writer: ConversationStore,
+            command: object,
+            expected_generation: int,
+        ) -> object:
             nonlocal writes
-            writes += 1
-            if writes <= 2:
-                raise OSError("injected settlement failure")
-            return original_resolve(*args, **kwargs)
+            if command.method.__name__ == "resolve_approval":
+                writes += 1
+                if writes <= 2:
+                    raise OSError("injected settlement failure")
+            return original_mutation(writer, command, expected_generation)
 
-        monkeypatch.setattr(store, "resolve_approval", fail_twice_then_recover)
+        monkeypatch.setattr(
+            async_writes_module, "execute_mutation", fail_twice_then_recover
+        )
         monkeypatch.setattr(server.runtime.loop, "abort", signal.set)
         request_id = server.control._approvals.wire_id(key)
         with pytest.raises(ProtocolError) as error:
@@ -1572,7 +1583,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         key = call.id if path == "foreground" else ("child", call.id)
         assert key not in server.control._approvals.state.records
         assert writer_paths
-        assert all("_run_durable_write" in caller for caller in writer_paths)
+        assert all("_run_committed_mutation" in caller for caller in writer_paths)
         if path == "delegated":
             history = [
                 entry.data
@@ -1906,7 +1917,7 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         grace.cancel()
         await asyncio.gather(grace, return_exceptions=True)
         server.approval_reconnect_grace = 0
-        monkeypatch.setattr(server.runtime.opened.store, gate.method, gate.call)
+        gate.install(monkeypatch)
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
         await _wait_thread_gate(gate)
 

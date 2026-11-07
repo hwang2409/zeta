@@ -76,9 +76,7 @@ class ApprovalHistoryStoreMixin:
             )
         return states
 
-    def append_approval_history(
-        self, payload: Mapping[str, Any]
-    ) -> ConversationEntry:
+    def append_approval_history(self, payload: Mapping[str, Any]) -> ConversationEntry:
         with self._append_lock():
             entry = self._append_row_unlocked("approval_history", dict(payload))
             return self._snapshot_entry(entry)
@@ -87,7 +85,7 @@ class ApprovalHistoryStoreMixin:
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:
         """Append delegated history through the store's durable writer."""
-        return await self._to_thread_durable(self.append_approval_history, payload)
+        return await self._commit_method_async(self.append_approval_history, payload)
 
     def approval_resolution_data(self, request_id: str) -> dict[str, str] | None:
         """Read a published approval resolution without touching the log."""

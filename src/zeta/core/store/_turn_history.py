@@ -36,4 +36,4 @@ class TurnHistoryMixin:
     ) -> None:
         data = {"turn_id": turn_id, "reason": reason}
         validate_turn_end_data(data)
-        await self._to_thread_durable(self._append_row, "turn_end", data)
+        await self._commit_method_async(self._append_row, "turn_end", data)

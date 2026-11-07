@@ -69,8 +69,10 @@ def validate_child_run_started_data(data: Mapping[str, Any]) -> None:
     ):
         raise ValueError("invalid child run started payload")
     parts = run_id.split(":")
-    if len(parts) < 2 or len(parts) - 1 > _MAX_RUN_DEPTH or any(
-        _RUN_SEGMENT.fullmatch(part) is None for part in parts[1:]
+    if (
+        len(parts) < 2
+        or len(parts) - 1 > _MAX_RUN_DEPTH
+        or any(_RUN_SEGMENT.fullmatch(part) is None for part in parts[1:])
     ):
         raise ValueError("invalid child run id")
     expected_parent = ":".join(parts[:-1]) if len(parts) > 2 else None
@@ -108,7 +110,7 @@ class ChildRunStoreMixin:
         on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         """Append the spawn row off-loop and publish it before returning."""
-        return await self._to_thread_durable(
+        return await self._commit_method_async(
             self.append_child_run_started,
             run_id,
             parent_run_id,

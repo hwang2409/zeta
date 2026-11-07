@@ -218,9 +218,7 @@ class NotificationStateMixin:
                 or not options
                 or len(options) > 10
                 or any(
-                    type(option) is not str
-                    or not option.strip()
-                    or len(option) > 1_000
+                    type(option) is not str or not option.strip() or len(option) > 1_000
                     for option in options
                 )
             )
@@ -477,9 +475,7 @@ class NotificationStateMixin:
             self._active_notifications.values()
             if pending_only
             else (
-                entry
-                for entry in self._active_branch()
-                if entry.type == "notification"
+                entry for entry in self._active_branch() if entry.type == "notification"
             )
         )
         return [
@@ -543,7 +539,7 @@ class NotificationStateMixin:
         acknowledged: bool = False,
     ) -> None:
         """Persist delivery state off the event loop and in async call order."""
-        await self._to_thread_durable(
+        await self._commit_method_async(
             self.record_agent_notification_delivery,
             notification_id,
             presented=presented,
@@ -586,7 +582,7 @@ class NotificationStateMixin:
     ) -> None:
         """Persist a presentation batch off the event loop."""
 
-        await self._to_thread_durable(
+        await self._commit_method_async(
             self.mark_agent_notifications_presented_to_tui, notification_ids
         )
 
@@ -633,7 +629,7 @@ class NotificationStateMixin:
     ) -> None:
         """Consume one claimed notification batch off the event loop."""
 
-        await self._to_thread_durable(
+        await self._commit_method_async(
             self.acknowledge_agent_notifications, notification_ids
         )
 

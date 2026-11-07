@@ -790,19 +790,25 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
 async def test_background_completion_is_rendered_when_exit_overtakes_acknowledgement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original_durable_write = ConversationStore._run_durable_write
+    original_durable_write = ConversationStore._run_committed_mutation
     ack_committed = threading.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
-    def pause_after_ack_commit(self, method_name, args, kwargs):
-        result = original_durable_write(self, method_name, args, kwargs)
-        if method_name == "_acknowledge_staged_delivery":
+    def pause_after_ack_commit(
+        self, command, expected_generation, cancelled_before_write
+    ):
+        result = original_durable_write(
+            self, command, expected_generation, cancelled_before_write
+        )
+        if command.method.__name__ == "_acknowledge_staged_delivery":
             ack_committed.set()
             assert release_ack.wait(timeout=5)
         return result
 
-    monkeypatch.setattr(ConversationStore, "_run_durable_write", pause_after_ack_commit)
+    monkeypatch.setattr(
+        ConversationStore, "_run_committed_mutation", pause_after_ack_commit
+    )
     transcript = asyncio.create_task(
         _background_event_transcript_count(
             tmp_path,
@@ -1536,6 +1542,7 @@ def terminal_plain(renderable: object) -> str:
 
 def _notification_payloads() -> dict[str, dict[str, object]]:
     return notification_payloads()
+
 
 def test_task_safety_kill_renders_cause() -> None:
     cause = "explicit-finish child task safety deadline expired after 3600 seconds"

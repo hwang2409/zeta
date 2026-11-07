@@ -173,7 +173,7 @@ class StepDeliveryFlow:
             return
         async with self._initialize_lock:
             if not self._initialized:
-                await self.store._to_thread_durable(
+                await self.store._commit_method_async(
                     self.store._warm_step_delivery_writer
                 )
                 self._initialized = True
@@ -188,7 +188,7 @@ class StepDeliveryFlow:
             else None
         )
         try:
-            result = await self.store._to_thread_durable(
+            result = await self.store._commit_method_async(
                 self.store._commit_delivery_input, item
             )
         except PendingPromptWriterReloadedError:
@@ -196,7 +196,7 @@ class StepDeliveryFlow:
                 raise
             assert commit_window is not None
             retry = replace(item, deadline=time.monotonic() + commit_window)
-            result = await self.store._to_thread_durable(
+            result = await self.store._commit_method_async(
                 self.store._commit_delivery_input, retry
             )
         if result.changed and not (
@@ -285,7 +285,7 @@ class StepDeliveryFlow:
             raise ValueError("unknown request cause")
         self._edges.clear()
         if assembler is None:
-            staged = await self.store._to_thread_durable(
+            staged = await self.store._commit_method_async(
                 self.store._stage_delivery_request,
                 None,
                 None,
@@ -293,7 +293,7 @@ class StepDeliveryFlow:
                 notification_context,
             )
         else:
-            staged = await self.store._to_thread_durable(
+            staged = await self.store._commit_method_async(
                 self.store._stage_delivery_request,
                 0,
                 assembler.estimate_messages,
@@ -494,7 +494,7 @@ class StepDeliveryFlow:
         )
         selected = staged
         if capacity > 0:
-            selected = await self.store._to_thread_durable(
+            selected = await self.store._commit_method_async(
                 self.store._stage_delivery_request,
                 capacity,
                 assembler.estimate_messages,
@@ -595,7 +595,7 @@ class StepDeliveryFlow:
         active = self._active
         if active is None:
             return DeliveryPublications()
-        publications = await self.store._to_thread_durable(
+        publications = await self.store._commit_method_async(
             self.store._acknowledge_staged_delivery,
             active.prompt_id,
             active.notification_ids,
@@ -661,7 +661,7 @@ class StepDeliveryFlow:
             "nudge",
         }:
             raise ValueError("unknown terminal intent")
-        pending, closed = await self.store._to_thread_durable(
+        pending, closed = await self.store._commit_method_async(
             self.store._admit_step_delivery_terminal, intent
         )
         prompt_pending = bool(self.store._active_pending_prompt_entries)

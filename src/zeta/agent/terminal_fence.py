@@ -36,7 +36,7 @@ class TerminalTransitionFence:
                 return "wait, cancel, or hand off owned work first: " + shown
             if self._notification_pending():
                 return "pending notification must be read before finish"
-            reason = await self._store._to_thread_durable(
+            reason = await self._store._commit_method_async(
                 self._store._accept_explicit_finish,
                 report,
                 self._persisted_notification_ids(),
@@ -51,14 +51,14 @@ class TerminalTransitionFence:
     async def cancel(self) -> bool:
         """Atomically let cancellation win only before finish acceptance."""
         async with self._lock:
-            return await self._store._to_thread_durable(
+            return await self._store._commit_method_async(
                 self._store._cancel_explicit_child
             )
 
     async def recover(self) -> dict[str, object] | None:
         """Read the durable winner used by asynchronous shutdown recovery."""
         async with self._lock:
-            return await self._store._to_thread_durable(
+            return await self._store._commit_method_async(
                 self._store._explicit_finish_report
             )
 
@@ -79,7 +79,7 @@ class TerminalTransitionFence:
     async def _idle_nudge_eligible(self) -> bool:
         if self._notification_pending() or self._owned_work():
             return False
-        return await self._store._to_thread_durable(
+        return await self._store._commit_method_async(
             self._store._idle_nudge_eligible,
             self._persisted_notification_ids(),
         )

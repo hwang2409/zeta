@@ -570,24 +570,26 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
         tmp_path, backend, features=["served_turn_end"]
     )
     store = server.runtime.opened.store
-    original_durable_write = type(store)._run_durable_write
+    original_durable_write = type(store)._run_committed_mutation
     committed = threading.Event()
     release = threading.Event()
 
-    def gate_after_commit(self, method_name, args, kwargs):
-        result = original_durable_write(self, method_name, args, kwargs)
+    def gate_after_commit(self, command, expected_generation, cancelled_before_write):
+        result = original_durable_write(
+            self, command, expected_generation, cancelled_before_write
+        )
         if (
-            method_name == "_append_row"
-            and args[0] == "turn_end"
-            and args[1].get("reason") == "completed"
-            and isinstance(args[1].get("turn_id"), str)
+            command.method.__name__ == "_append_row"
+            and command.args[0] == "turn_end"
+            and command.args[1].get("reason") == "completed"
+            and isinstance(command.args[1].get("turn_id"), str)
         ):
             committed.set()
             assert release.wait(timeout=5)
         return result
 
     # test-contract: durability pauses after commit to prove publication ordering
-    monkeypatch.setattr(type(store), "_run_durable_write", gate_after_commit)
+    monkeypatch.setattr(type(store), "_run_committed_mutation", gate_after_commit)
     announcement: asyncio.Task[dict] | None = None
     try:
         writer.close()

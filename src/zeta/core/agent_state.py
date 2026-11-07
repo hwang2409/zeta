@@ -136,9 +136,10 @@ def drop_invalid_killed_task_metadata(
             "killed_task_ids_truncated",
         ):
             lifecycle.pop(field, None)
-    if "final_result_is_receipt" in lifecycle and type(
-        lifecycle["final_result_is_receipt"]
-    ) is not bool:
+    if (
+        "final_result_is_receipt" in lifecycle
+        and type(lifecycle["final_result_is_receipt"]) is not bool
+    ):
         warnings.warn(
             "agent lifecycle has invalid receipt marker; "
             f"dropping it: {lifecycle_path}",
@@ -601,7 +602,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                 self._agent_lifecycle,
                 finished_at=resolved_finished_at,
@@ -663,7 +666,9 @@ class AgentStateMixin:
             if killed_task_count is not None:
                 self._agent_lifecycle["killed_task_count"] = killed_task_count
             if killed_task_ids_truncated is not None:
-                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+                self._agent_lifecycle["killed_task_ids_truncated"] = (
+                    killed_task_ids_truncated
+                )
             self._write_agent_lifecycle()
 
     async def finalize_background_agent(
@@ -682,13 +687,13 @@ class AgentStateMixin:
 
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
-            await self._to_thread_agent_state(
+            await self._commit_method_async(
                 self.mark_agent_canceled, canceled_tool_call_id
             )
         else:
             for marker_key, marker in self.agent_children().items():
                 tool_call = ToolCall.from_dict(marker["tool_call"])
-                await parent_store._to_thread_agent_state(
+                await parent_store._commit_method_async(
                     parent_store.register_agent_child,
                     tool_call,
                     child_session_path=marker["child_session_path"],
@@ -704,14 +709,12 @@ class AgentStateMixin:
                         else 0
                     ),
                 )
-                await self._to_thread_agent_state(
-                    self.finish_agent_child, marker_key
-                )
+                await self._commit_method_async(self.finish_agent_child, marker_key)
                 child_instance_id = marker.get("child_instance_id")
                 if type(child_instance_id) is str:
                     transferred.append(child_instance_id)
-            await self._to_thread_agent_state(self.finish_agent_parent)
-        await self._to_thread_agent_state(
+            await self._commit_method_async(self.finish_agent_parent)
+        await self._commit_method_async(
             self.finish_agent_lifecycle,
             terminal_state,
             final_result=final_result,

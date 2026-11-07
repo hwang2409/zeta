@@ -10,7 +10,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -2987,8 +2986,8 @@ def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
     first = store.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
 
     with patch(
-        "zeta.core.store._store.uuid.uuid4",
-        return_value=SimpleNamespace(hex=first.id),
+        "zeta.core.checkpoints.mutation.os.urandom",
+        return_value=bytes.fromhex(first.id),
     ):
         with pytest.raises(ConversationIntegrityError, match="duplicate"):
             store.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))

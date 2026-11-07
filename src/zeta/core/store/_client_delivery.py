@@ -31,7 +31,9 @@ DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 DeliveryMethod = Literal["send", "steer"]
 DeliveryStatus = Literal["queued", "delivered", "dropped"]
-DeliveryDropReason = Literal["restart", "abort", "clear", "disconnect", "turn_end", "failed"]
+DeliveryDropReason = Literal[
+    "restart", "abort", "clear", "disconnect", "turn_end", "failed"
+]
 
 _OUTCOME_BYTES: dict[DeliveryStatus, bytes] = {
     "queued": b"q",
@@ -74,9 +76,7 @@ def valid_client_delivery_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and DELIVERY_ID_PATTERN.fullmatch(value) is not None
 
 
-def validate_client_delivery_data(
-    data: Mapping[str, object], session_id: str
-) -> None:
+def validate_client_delivery_data(data: Mapping[str, object], session_id: str) -> None:
     """Validate one acceptance or terminal transition record."""
 
     delivery_id = data.get("delivery_id")
@@ -92,9 +92,7 @@ def validate_client_delivery_data(
             and status == "delivered"
             and outcome == {"accepted": True, "session_id": session_id}
         ) or (
-            method == "steer"
-            and status == "queued"
-            and outcome == {"accepted": True}
+            method == "steer" and status == "queued" and outcome == {"accepted": True}
         )
         allowed = {"delivery_id", "method", "status", "outcome"}
         if "accepted_message" in data:
@@ -114,15 +112,17 @@ def validate_client_delivery_data(
         return
 
     reason = data.get("reason")
-    valid_transition = (
-        method == "steer"
-        and (
-            (status == "delivered" and reason is None and set(data) == {"delivery_id", "method", "status"})
-            or (
-                status == "dropped"
-                and reason in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
-                and set(data) == {"delivery_id", "method", "status", "reason"}
-            )
+    valid_transition = method == "steer" and (
+        (
+            status == "delivered"
+            and reason is None
+            and set(data) == {"delivery_id", "method", "status"}
+        )
+        or (
+            status == "dropped"
+            and reason
+            in {"restart", "abort", "clear", "disconnect", "turn_end", "failed"}
+            and set(data) == {"delivery_id", "method", "status", "reason"}
         )
     )
     if not valid_transition:
@@ -219,7 +219,9 @@ class ClientDeliveryMixin:
                 )
         return len(ids)
 
-    def client_delivery(self: ConversationStore, delivery_id: str) -> ClientDelivery | None:
+    def client_delivery(
+        self: ConversationStore, delivery_id: str
+    ) -> ClientDelivery | None:
         """Return one detail-retained delivery without reading the conversation log."""
 
         return self._client_deliveries.get(delivery_id)
@@ -277,7 +279,11 @@ class ClientDeliveryMixin:
                 rows.append(
                     (
                         "message",
-                        {"message": tag_client_delivery(message, delivery_id).to_dict()},
+                        {
+                            "message": tag_client_delivery(
+                                message, delivery_id
+                            ).to_dict()
+                        },
                     )
                 )
             self._append_many_unlocked(rows)
@@ -298,7 +304,7 @@ class ClientDeliveryMixin:
     ) -> ClientDelivery:
         """Append off-loop, then run the effect callback after publication."""
 
-        return await self._to_thread_durable(
+        return await self._commit_method_async(
             self.append_client_delivery,
             delivery_id,
             method,
@@ -337,7 +343,7 @@ class ClientDeliveryMixin:
     ) -> None:
         """Publish a dispatched steering batch as one durable append."""
 
-        await self._to_thread_durable(self._deliver_client_steering, batch)
+        await self._commit_method_async(self._deliver_client_steering, batch)
         for expected in batch._queued:
             if not self._client_steering or self._client_steering[0] != expected:
                 raise RuntimeError("client steering queue changed during delivery")
@@ -372,7 +378,9 @@ class ClientDeliveryMixin:
             if rows:
                 self._append_many_unlocked(rows)
 
-    def drop_client_steering(self: ConversationStore, reason: DeliveryDropReason) -> int:
+    def drop_client_steering(
+        self: ConversationStore, reason: DeliveryDropReason
+    ) -> int:
         """Durably drop every queued delivery before releasing queue ownership."""
 
         queued = tuple(self._client_steering)
@@ -409,7 +417,7 @@ class ClientDeliveryMixin:
         """Commit queued drops off-loop, then release their queue ownership."""
 
         queued = tuple(self._client_steering)
-        entries = await self._to_thread_durable(
+        entries = await self._commit_method_async(
             self._drop_client_steering, queued, reason
         )
         messages = {
@@ -424,9 +432,7 @@ class ClientDeliveryMixin:
         return tuple((entry, messages[entry.data["delivery_id"]]) for entry in entries)
 
 
-def image_payload_digest(
-    text: str, images: list[tuple[str, str, bytes]]
-) -> str:
+def image_payload_digest(text: str, images: list[tuple[str, str, bytes]]) -> str:
     """Fingerprint the semantic payload of one ``send_images`` request."""
 
     digest = hashlib.sha256()

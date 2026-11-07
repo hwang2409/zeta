@@ -765,7 +765,7 @@ class ApprovalLifecycle:
         async def persist() -> dict[str, str] | None:
             write_failed = False
             try:
-                await target.store._to_thread_durable(
+                await target.store._commit_method_async(
                     target.store.resolve_approval,
                     target.store_request_id,
                     decision,
@@ -779,7 +779,7 @@ class ApprovalLifecycle:
             if not write_failed:
                 return None
             try:
-                await target.store._to_thread_durable(
+                await target.store._commit_method_async(
                     target.store.resolve_approval,
                     target.store_request_id,
                     "abort",
