@@ -1,8 +1,8 @@
 """Ownership regressions for the serve control lifetime."""
-
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import uuid
@@ -46,6 +46,12 @@ from zeta.server.protocol import FrameCodec
 from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
 
+
+async def _cancel_and_drain(task: asyncio.Task[object]) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        _ = stack
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
 class _GatedBackend(CompletionBackend):
     def __init__(self) -> None:
@@ -582,18 +588,18 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
     tmp_path: Path,
     child_instance_id: str,
 ) -> None:
-    backend = FakeBackend([])
-    server = ZetaServer(
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        provider="codex",
-        backend_factory=lambda provider, model, home: (
-            backend,
-            model or "offline",
-        ),
-    )
-    reader, writer = await _connect(server)
-    try:
+    async with contextlib.AsyncExitStack() as stack:
+        backend = FakeBackend([])
+        server = ZetaServer(
+            home=tmp_path,
+            socket_path=_socket_path(tmp_path),
+            provider="codex",
+            backend_factory=lambda provider, model, home: (
+                backend,
+                model or "offline",
+            ),
+        )
+        reader, writer = await _connect(server); stack.push_async_callback(_close, server, writer)
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(reader, writer, 2, "new_session", {})
         root_loop = server.runtime.loop
@@ -603,11 +609,13 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
         idle_events: list[StreamEvent] = []
 
         def forward(event: StreamEvent) -> None:
-            idle_events.append(event)
-            server_sink(event)
+            with contextlib.ExitStack() as stack:
+                _ = stack
+                idle_events.append(event)
+                server_sink(event)
 
         root_loop.set_background_event_sink(forward)
-        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")
+        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}"); stack.callback(child_store.close)
         child_loop = AgentLoop(
             FakeBackend([]),
             child_store,
@@ -616,7 +624,7 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
             background_owner=root_loop._background_owner,
             agent_instance_id=child_instance_id,
             agent_depth=child_instance_id.count(":"),
-        )
+        ); stack.push_async_callback(child_loop.close)
         child_loop.explicit_finish = True
         child_loop.set_background_event_sink(root_loop._publish_background_event)
         child_store.start_agent_lifecycle(
@@ -633,25 +641,31 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
         )
         root_loop._background_owner.conversation_channel.register_loop(
             child_instance_id
-        )
+        ); stack.callback(root_loop._background_owner.conversation_channel.unregister_loop, child_instance_id)
         await child_loop._ensure_step_delivery()
         idle_waiting = asyncio.Event()
 
         async def child_result(*args: object, **kwargs: object) -> dict[str, object]:
-            return {
-                "content": [{"type": "text", "text": ""}],
-                "isError": False,
-                "structuredContent": {"status": "running"},
-            }
+            async with contextlib.AsyncExitStack() as stack:
+                _ = stack
+                return {
+                    "content": [{"type": "text", "text": ""}],
+                    "isError": False,
+                    "structuredContent": {"status": "running"},
+                }
 
         async def wait_idle(*args: object) -> bool:
-            idle_waiting.set()
-            await asyncio.wait_for(asyncio.Event().wait(), 10)
-            return True
+            async with contextlib.AsyncExitStack() as stack:
+                _ = stack
+                idle_waiting.set()
+                await asyncio.wait_for(asyncio.Event().wait(), 10)
+                return True
 
         class OwnedFinishGate(FinishGateState):
             def can_wake_again(self, loop: object) -> bool:
-                return True
+                with contextlib.ExitStack() as stack:
+                    _ = stack
+                    return True
 
         run = asyncio.create_task(
             consume_run(
@@ -668,27 +682,17 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
                 finish_gate_state=OwnedFinishGate(),
                 idle_wait=wait_idle,
             )
-        )
-        try:
-            await asyncio.sleep(0)
-            if run.done():
-                run.result()
-            await asyncio.wait_for(idle_waiting.wait(), 10)
-            assert len(idle_events) == 1
-            frame = json.loads(await _read_raw(reader))
-            assert frame["params"]["event"] == "child_idle"
-            assert frame["params"]["data"]["child_instance_id"] == child_instance_id
-            assert frame["params"]["data"]["text"] == "child is idle"
-            assert backend.calls == []
-        finally:
-            run.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(run, return_exceptions=True), 10
-            )
-            await asyncio.wait_for(child_loop.close(), 10)
-            child_store.close()
-    finally:
-        await _close(server, writer)
+        ); stack.push_async_callback(_cancel_and_drain, run)
+        await asyncio.sleep(0)
+        if run.done():
+            run.result()
+        await asyncio.wait_for(idle_waiting.wait(), 10)
+        assert len(idle_events) == 1
+        frame = json.loads(await _read_raw(reader))
+        assert frame["params"]["event"] == "child_idle"
+        assert frame["params"]["data"]["child_instance_id"] == child_instance_id
+        assert frame["params"]["data"]["text"] == "child is idle"
+        assert backend.calls == []
 
 
 @pytest.mark.asyncio

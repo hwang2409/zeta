@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import threading
 from pathlib import Path
@@ -20,6 +21,12 @@ from zeta.skills.loader import (
 )
 from zeta.tools import ToolRegistry
 
+
+async def _cancel_and_drain(task: asyncio.Task[object]) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        _ = stack
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
 def test_skill_snapshot_round_trip_keeps_project_source(tmp_path: Path) -> None:
     skill_path = tmp_path / ".zeta" / "skills" / "review.md"
@@ -352,263 +359,276 @@ def test_session_catalog_is_selected_once_per_session(tmp_path: Path) -> None:
 async def test_duplicate_live_skill_retains_catalog_and_reports_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.config.live as live_module
+    async with contextlib.AsyncExitStack() as stack:
+        import zeta.config.live as live_module
 
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    backend = FakeBackend(
-        [
-            ScriptedTurn([TextContent("first")]),
-            ScriptedTurn([TextContent("second")]),
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        catalog = discover_session_skills(home=home, project_dir=project)
+        backend = FakeBackend(
+            [
+                ScriptedTurn([TextContent("first")]),
+                ScriptedTurn([TextContent("second")]),
+            ]
+        )
+        store = ConversationStore(tmp_path / "sessions", cwd=project); stack.callback(store.close)
+        loop = AgentLoop(
+            backend,
+            store,
+            skill_catalog=catalog,
+            live_config_home=home,
+            live_config_project_dir=project,
+        ); stack.push_async_callback(loop.close)
+        _write_skill(home / "skills" / "first.md", "duplicate", "first")
+        _write_skill(home / "skills" / "second.md", "duplicate", "second")
+        calls = 0
+        original = live_module.discover_session_skills
+
+        def counted(**kwargs: object) -> SkillCatalog:
+            with contextlib.ExitStack() as stack:
+                _ = stack
+                nonlocal calls
+                calls += 1
+                return original(**kwargs)
+
+        monkeypatch.setattr(live_module, "discover_session_skills", counted)
+
+        for text in ("first turn", "second turn"):
+            _ = [event async for event in loop.run_turn(text, origin=MessageOrigin.USER)]
+
+        notices = [
+            block.text
+            for message in loop.store.messages()
+            for block in message.content
+            if isinstance(block, TextContent) and "skill discovery failed:" in block.text
         ]
-    )
-    loop = AgentLoop(
-        backend,
-        ConversationStore(tmp_path / "sessions", cwd=project),
-        skill_catalog=catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    _write_skill(home / "skills" / "first.md", "duplicate", "first")
-    _write_skill(home / "skills" / "second.md", "duplicate", "second")
-    calls = 0
-    original = live_module.discover_session_skills
-
-    def counted(**kwargs: object) -> SkillCatalog:
-        nonlocal calls
-        calls += 1
-        return original(**kwargs)
-
-    monkeypatch.setattr(live_module, "discover_session_skills", counted)
-
-    for text in ("first turn", "second turn"):
-        _ = [event async for event in loop.run_turn(text, origin=MessageOrigin.USER)]
-
-    notices = [
-        block.text
-        for message in loop.store.messages()
-        for block in message.content
-        if isinstance(block, TextContent) and "skill discovery failed:" in block.text
-    ]
-    assert len(backend.calls) == 2
-    assert calls == 1
-    assert len(notices) == 1
-    assert loop.tool_registry.skill_catalog == catalog
-    loop.store.close()
+        assert len(backend.calls) == 2
+        assert calls == 1
+        assert len(notices) == 1
+        assert loop.tool_registry.skill_catalog == catalog
 
 
 @pytest.mark.asyncio
 async def test_unknown_skill_tool_refreshes_during_same_turn(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    store = ConversationStore(tmp_path / "session", cwd=project)
-    registry = ToolRegistry(project, skill_catalog=catalog, session_store=store)
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        registry=registry,
-        skill_catalog=catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    _write_skill(home / "skills" / "instant.md", "instant", "same turn body")
+    async with contextlib.AsyncExitStack() as stack:
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        catalog = discover_session_skills(home=home, project_dir=project)
+        store = ConversationStore(tmp_path / "session", cwd=project); stack.callback(store.close)
+        registry = ToolRegistry(project, skill_catalog=catalog, session_store=store); stack.push_async_callback(registry.close)
+        loop = AgentLoop(
+            FakeBackend([]),
+            store,
+            registry=registry,
+            skill_catalog=catalog,
+            live_config_home=home,
+            live_config_project_dir=project,
+        ); stack.push_async_callback(loop.close)
+        _write_skill(home / "skills" / "instant.md", "instant", "same turn body")
 
-    loaded = await registry.execute(
-        ToolCall("skill-instant", "skill", {"name": "instant"})
-    )
+        loaded = await registry.execute(
+            ToolCall("skill-instant", "skill", {"name": "instant"})
+        )
 
-    assert loaded["isError"] is False
-    assert loaded["content"][0]["text"] == "same turn body"
-    await loop.close()
+        assert loaded["isError"] is False
+        assert loaded["content"][0]["text"] == "same turn body"
 
 
 @pytest.mark.asyncio
 async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
     tmp_path: Path,
 ) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    installed = False
+    async with contextlib.AsyncExitStack() as stack:
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        catalog = discover_session_skills(home=home, project_dir=project)
+        installed = False
 
-    def serialize(messages, tools) -> bytes:
-        nonlocal installed
-        if not installed:
-            _write_skill(home / "skills" / "instant.md", "instant", "same turn body")
-            installed = True
-        payload = build_messages_payload(
-            messages, tools, model="claude-test", max_tokens=10_000
+        def serialize(messages, tools) -> bytes:
+            with contextlib.ExitStack() as stack:
+                _ = stack
+                nonlocal installed
+                if not installed:
+                    _write_skill(home / "skills" / "instant.md", "instant", "same turn body")
+                    installed = True
+                payload = build_messages_payload(
+                    messages, tools, model="claude-test", max_tokens=10_000
+                )
+                return json.dumps(payload, sort_keys=True).encode()
+
+        call = ToolCall("skill-instant", "skill", {"name": "instant"})
+        backend = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[call]),
+                ScriptedTurn([TextContent("done")]),
+                ScriptedTurn([TextContent("next")]),
+            ],
+            request_serializer=serialize,
         )
-        return json.dumps(payload, sort_keys=True).encode()
+        store = ConversationStore(tmp_path / "sessions", cwd=project); stack.callback(store.close)
+        loop = AgentLoop(
+            backend,
+            store,
+            skill_catalog=catalog,
+            live_config_home=home,
+            live_config_project_dir=project,
+        ); stack.push_async_callback(loop.close)
 
-    call = ToolCall("skill-instant", "skill", {"name": "instant"})
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[call]),
-            ScriptedTurn([TextContent("done")]),
-            ScriptedTurn([TextContent("next")]),
-        ],
-        request_serializer=serialize,
-    )
-    store = ConversationStore(tmp_path / "sessions", cwd=project)
-    loop = AgentLoop(
-        backend,
-        store,
-        skill_catalog=catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
+        _ = [event async for event in loop.run_turn("load it", origin=MessageOrigin.USER)]
 
-    _ = [event async for event in loop.run_turn("load it", origin=MessageOrigin.USER)]
-
-    messages = store.messages()
-    tool_use_index = next(
-        index
-        for index, message in enumerate(messages)
-        if message.role is MessageRole.ASSISTANT
-        and any(getattr(block, "tool_call", None) == call for block in message.content)
-    )
-    assert messages[tool_use_index + 1].role is MessageRole.TOOL_RESULT
-    assert messages[tool_use_index + 1].tool_result.content == "same turn body"
-    second_payload = json.loads(backend.request_bytes[1])
-    assert any(
-        block.get("type") == "tool_result"
-        for message in second_payload["messages"]
-        for block in message["content"]
-    )
-    assert not any(
-        isinstance(block, TextContent)
-        and block.text.startswith("[zeta] skill refresh:")
-        for message in messages
-        for block in message.content
-    )
-
-    _ = [event async for event in loop.run_turn("next", origin=MessageOrigin.USER)]
-    notices = [
-        block.text
-        for message in store.messages()
-        for block in message.content
-        if isinstance(block, TextContent)
-        and block.text.startswith("[zeta] skill refresh:")
-    ]
-    assert notices == [
-        (
-            "[zeta] skill refresh: skills changed: added instant\n"
-            "skills changed, but this session's prompt predates owned skill spans; "
-            "restart the session to refresh its skill index"
+        messages = store.messages()
+        tool_use_index = next(
+            index
+            for index, message in enumerate(messages)
+            if message.role is MessageRole.ASSISTANT
+            and any(getattr(block, "tool_call", None) == call for block in message.content)
         )
-    ]
-    store.close()
+        assert messages[tool_use_index + 1].role is MessageRole.TOOL_RESULT
+        assert messages[tool_use_index + 1].tool_result.content == "same turn body"
+        second_payload = json.loads(backend.request_bytes[1])
+        assert any(
+            block.get("type") == "tool_result"
+            for message in second_payload["messages"]
+            for block in message["content"]
+        )
+        assert not any(
+            isinstance(block, TextContent)
+            and block.text.startswith("[zeta] skill refresh:")
+            for message in messages
+            for block in message.content
+        )
+
+        _ = [event async for event in loop.run_turn("next", origin=MessageOrigin.USER)]
+        notices = [
+            block.text
+            for message in store.messages()
+            for block in message.content
+            if isinstance(block, TextContent)
+            and block.text.startswith("[zeta] skill refresh:")
+        ]
+        assert notices == [
+            (
+                "[zeta] skill refresh: skills changed: added instant\n"
+                "skills changed, but this session's prompt predates owned skill spans; "
+                "restart the session to refresh its skill index"
+            )
+        ]
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_skill_discovery_runs_off_event_loop(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    store = ConversationStore(tmp_path / "sessions", cwd=project)
-    loop = AgentLoop(
-        FakeBackend([]),
-        store,
-        skill_catalog=catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    assert loop._live_config_watcher is not None
-    event_thread = threading.get_ident()
-    observed: list[int] = []
-    original = loop._live_config_watcher.prepare
+    async with contextlib.AsyncExitStack() as stack:
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        catalog = discover_session_skills(home=home, project_dir=project)
+        store = ConversationStore(tmp_path / "sessions", cwd=project); stack.callback(store.close)
+        loop = AgentLoop(
+            FakeBackend([]),
+            store,
+            skill_catalog=catalog,
+            live_config_home=home,
+            live_config_project_dir=project,
+        ); stack.push_async_callback(loop.close)
+        assert loop._live_config_watcher is not None
+        event_thread = threading.get_ident()
+        observed: list[int] = []
+        original = loop._live_config_watcher.prepare
 
-    def record_thread(base, *, force: bool = False):
-        observed.append(threading.get_ident())
-        return original(base, force=force)
+        def record_thread(base, *, force: bool = False):
+            with contextlib.ExitStack() as stack:
+                _ = stack
+                observed.append(threading.get_ident())
+                return original(base, force=force)
 
-    loop._live_config_watcher.prepare = record_thread  # type: ignore[method-assign]
+        loop._live_config_watcher.prepare = record_thread  # type: ignore[method-assign]
 
-    await loop.refresh_live_config(force=True)
+        await loop.refresh_live_config(force=True)
 
-    assert observed and observed[0] != event_thread
-    store.close()
+        assert observed and observed[0] != event_thread
 
 
 @pytest.mark.asyncio
 async def test_newer_live_config_generation_wins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.config.live as live_module
+    async with contextlib.AsyncExitStack() as stack:
+        import zeta.config.live as live_module
 
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    project.mkdir()
-    catalog = discover_session_skills(home=home, project_dir=project)
-    loop = AgentLoop(
-        FakeBackend([]),
-        ConversationStore(tmp_path / "sessions", cwd=project),
-        skill_catalog=catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-    )
-    path = home / "skills" / "live.md"
-    _write_skill(path, "live", "first")
-    scanned = threading.Event()
-    release = threading.Event()
-    original = live_module.discover_session_skills
-    calls = 0
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        catalog = discover_session_skills(home=home, project_dir=project)
+        store = ConversationStore(tmp_path / "sessions", cwd=project); stack.callback(store.close)
+        loop = AgentLoop(
+            FakeBackend([]),
+            store,
+            skill_catalog=catalog,
+            live_config_home=home,
+            live_config_project_dir=project,
+        ); stack.push_async_callback(loop.close)
+        path = home / "skills" / "live.md"
+        _write_skill(path, "live", "first")
+        scanned = threading.Event()
+        release = threading.Event()
+        original = live_module.discover_session_skills
+        calls = 0
 
-    def delayed_discovery(**kwargs: object) -> SkillCatalog:
-        nonlocal calls
-        calls += 1
-        result = original(**kwargs)
-        if calls == 1:
-            scanned.set()
-            assert release.wait(timeout=10)
-        return result
+        def delayed_discovery(**kwargs: object) -> SkillCatalog:
+            with contextlib.ExitStack() as stack:
+                _ = stack
+                nonlocal calls
+                calls += 1
+                result = original(**kwargs)
+                if calls == 1:
+                    scanned.set()
+                    assert release.wait(timeout=10)
+                return result
 
-    async def newer_generation_started() -> None:
-        while loop._live_config_generation < 2:
-            await asyncio.sleep(0)
+        async def newer_generation_started() -> None:
+            async with contextlib.AsyncExitStack() as stack:
+                _ = stack
+                while loop._live_config_generation < 2:
+                    await asyncio.sleep(0)
 
-    monkeypatch.setattr(live_module, "discover_session_skills", delayed_discovery)
-    older = asyncio.create_task(loop.refresh_live_config())
-    newer: asyncio.Task[None] | None = None
-    try:
-        assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
-        path.write_text(
-            "---\nname: live\ndescription: newest description\n---\n\nnewest\n",
-            encoding="utf-8",
-        )
-        newer = asyncio.create_task(loop.refresh_live_config())
-        await asyncio.wait_for(newer_generation_started(), 10)
-        release.set()
-        await asyncio.wait_for(
-            asyncio.gather(older, newer, return_exceptions=True), 10
-        )
-
-        assert calls == 2
-        assert loop.tool_registry.skill_catalog.find("live").description == (
-            "newest description"
-        )
-    finally:
-        release.set()
-        tasks = [older, *([newer] if newer is not None else [])]
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+        monkeypatch.setattr(live_module, "discover_session_skills", delayed_discovery)
+        older = asyncio.create_task(loop.refresh_live_config()); stack.push_async_callback(_cancel_and_drain, older)
+        newer: asyncio.Task[None] | None = None
         try:
+            assert await asyncio.wait_for(asyncio.to_thread(scanned.wait, 10), 11)
+            path.write_text(
+                "---\nname: live\ndescription: newest description\n---\n\nnewest\n",
+                encoding="utf-8",
+            )
+            newer = asyncio.create_task(loop.refresh_live_config()); stack.push_async_callback(_cancel_and_drain, newer)
+            await asyncio.wait_for(newer_generation_started(), 10)
+            release.set()
             await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), 10
+                asyncio.gather(older, newer, return_exceptions=True), 10
+            )
+
+            assert calls == 2
+            assert loop.tool_registry.skill_catalog.find("live").description == (
+                "newest description"
             )
         finally:
+            release.set()
+            tasks = [older, *([newer] if newer is not None else [])]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
             try:
-                await asyncio.wait_for(loop.close(), 10)
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), 10
+                )
             finally:
-                loop.store.close()
+                try:
+                    await asyncio.wait_for(loop.close(), 10)
+                finally:
+                    loop.store.close()
 
 
 def test_live_slash_skills_replace_added_and_removed_entries(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 from pathlib import Path
@@ -284,50 +285,54 @@ def test_active_run_prompt_is_byte_stable_after_memory_commit(tmp_path: Path) ->
 
 
 def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
-    home, workspace, registry, project_id = _entry_project(tmp_path)
-    _add(registry, project_id, (AddOperation("state", "parent snapshot", _source(1)),))
-    context = load_project_context(
-        cwd=workspace,
-        repo_root=workspace,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        **_context_projects(registry, project_id),
-    )
-    parent_prompt = context.system_prompt
-    _add(registry, project_id, (AddOperation("state", "new memory", _source(2)),))
-    loop = SimpleNamespace(
-        context_assembler=SimpleNamespace(system_prompt=parent_prompt),
-        store=SimpleNamespace(cwd=str(workspace)),
-    )
+    with contextlib.ExitStack() as stack:
+        _ = stack
+        home, workspace, registry, project_id = _entry_project(tmp_path)
+        _add(registry, project_id, (AddOperation("state", "parent snapshot", _source(1)),))
+        context = load_project_context(
+            cwd=workspace,
+            repo_root=workspace,
+            zeta_home=home,
+            catalog=SkillCatalog.empty(),
+            **_context_projects(registry, project_id),
+        )
+        parent_prompt = context.system_prompt
+        _add(registry, project_id, (AddOperation("state", "new memory", _source(2)),))
+        loop = SimpleNamespace(
+            context_assembler=SimpleNamespace(system_prompt=parent_prompt),
+            store=SimpleNamespace(cwd=str(workspace)),
+        )
 
-    assert _child_base_system_prompt(loop, str(workspace))[0] is parent_prompt
-    equivalent_cwd = str(workspace / ".." / workspace.name)
-    assert _child_base_system_prompt(loop, equivalent_cwd)[0] is parent_prompt
-    symlink_cwd = tmp_path / "workspace-link"
-    symlink_cwd.symlink_to(workspace, target_is_directory=True)
-    assert _child_base_system_prompt(loop, str(symlink_cwd))[0] is parent_prompt
-    assert "new memory" not in parent_prompt
+        assert _child_base_system_prompt(loop, str(workspace))[0] is parent_prompt
+        equivalent_cwd = str(workspace / ".." / workspace.name)
+        assert _child_base_system_prompt(loop, equivalent_cwd)[0] is parent_prompt
+        symlink_cwd = tmp_path / "workspace-link"
+        symlink_cwd.symlink_to(workspace, target_is_directory=True)
+        assert _child_base_system_prompt(loop, str(symlink_cwd))[0] is parent_prompt
+        assert "new memory" not in parent_prompt
 
 
 def test_fresh_cwd_child_loads_current_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    home, workspace, registry, project_id = _entry_project(tmp_path)
-    _add(registry, project_id, (AddOperation("state", "current child memory", _source(1)),))
-    parent_cwd = tmp_path / "parent"
-    parent_cwd.mkdir()
-    monkeypatch.setenv("ZETA_HOME", str(home))
-    loop = SimpleNamespace(
-        context_assembler=SimpleNamespace(system_prompt="parent prompt"),
-        store=SimpleNamespace(cwd=str(parent_cwd)),
-        active_home=str(home),
-        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
-        root_project_id=project_id,
-        project_registry=registry,
-    )
+    with contextlib.ExitStack() as stack:
+        _ = stack
+        home, workspace, registry, project_id = _entry_project(tmp_path)
+        _add(registry, project_id, (AddOperation("state", "current child memory", _source(1)),))
+        parent_cwd = tmp_path / "parent"
+        parent_cwd.mkdir()
+        monkeypatch.setenv("ZETA_HOME", str(home))
+        loop = SimpleNamespace(
+            context_assembler=SimpleNamespace(system_prompt="parent prompt"),
+            store=SimpleNamespace(cwd=str(parent_cwd)),
+            active_home=str(home),
+            tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+            root_project_id=project_id,
+            project_registry=registry,
+        )
 
-    child_prompt, project_dir = _child_base_system_prompt(loop, str(workspace))
-    assert isinstance(child_prompt, str)
-    assert "current child memory" in child_prompt
-    assert project_dir == workspace
+        child_prompt, project_dir = _child_base_system_prompt(loop, str(workspace))
+        assert isinstance(child_prompt, str)
+        assert "current child memory" in child_prompt
+        assert project_dir == workspace
 
 
 @pytest.mark.asyncio

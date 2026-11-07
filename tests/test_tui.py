@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import contextlib
 import errno
 import fcntl
 import gc
@@ -1799,58 +1800,60 @@ def test_every_stream_event_has_one_tui_owner() -> None:
 
 
 def test_scrollback_stream_events_render() -> None:
-    call = ToolCall("contract-1", "future_tool", {"query": "sample"})
-    fixtures = {
-        StreamEventType.MESSAGE_END: StreamEvent(
-            StreamEventType.MESSAGE_END, data={"truncated": True}
-        ),
-        StreamEventType.RETRY: StreamEvent(
-            StreamEventType.RETRY, data={"text": "retrying"}
-        ),
-        StreamEventType.AGENT_NOTIFICATION: StreamEvent(
-            StreamEventType.AGENT_NOTIFICATION,
-            data=_notification_payloads()["agent_completion"],
-        ),
-        StreamEventType.CONFIG_CHANGED: StreamEvent(
-            StreamEventType.CONFIG_CHANGED,
-            data={"message": "agent profiles changed: added specialist"},
-        ),
-        StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
-            StreamEventType.CHILD_MESSAGE_DELIVERED,
-            data={"child_label": "root:1", "preview": "check the retry"},
-        ),
-        StreamEventType.ACCOUNT_LIMIT: StreamEvent(
-            StreamEventType.ACCOUNT_LIMIT,
-            data={
-                "account": "codex:work",
-                "resets_at": "2026-10-27T18:31:48Z",
-                "action": "accounts",
-            },
-        ),
-        StreamEventType.ACCOUNT_STATE_UNKNOWN: StreamEvent(
-            StreamEventType.ACCOUNT_STATE_UNKNOWN
-        ),
-        StreamEventType.TOOL_EXECUTION_START: StreamEvent(
-            StreamEventType.TOOL_EXECUTION_START, tool_call=call
-        ),
-        StreamEventType.TOOL_EXECUTION_UPDATE: StreamEvent(
-            StreamEventType.TOOL_EXECUTION_UPDATE, delta="output"
-        ),
-        StreamEventType.TOOL_EXECUTION_END: StreamEvent(
-            StreamEventType.TOOL_EXECUTION_END,
-            tool_call=call,
-            tool_result=ToolResult(call.id, "done"),
-        ),
-        StreamEventType.ERROR: StreamEvent(
-            StreamEventType.ERROR, error=ErrorInfo("backend_error", "failed")
-        ),
-    }
+    with contextlib.ExitStack() as stack:
+        _ = stack
+        call = ToolCall("contract-1", "future_tool", {"query": "sample"})
+        fixtures = {
+            StreamEventType.MESSAGE_END: StreamEvent(
+                StreamEventType.MESSAGE_END, data={"truncated": True}
+            ),
+            StreamEventType.RETRY: StreamEvent(
+                StreamEventType.RETRY, data={"text": "retrying"}
+            ),
+            StreamEventType.AGENT_NOTIFICATION: StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data=_notification_payloads()["agent_completion"],
+            ),
+            StreamEventType.CONFIG_CHANGED: StreamEvent(
+                StreamEventType.CONFIG_CHANGED,
+                data={"message": "agent profiles changed: added specialist"},
+            ),
+            StreamEventType.CHILD_MESSAGE_DELIVERED: StreamEvent(
+                StreamEventType.CHILD_MESSAGE_DELIVERED,
+                data={"child_label": "root:1", "preview": "check the retry"},
+            ),
+            StreamEventType.ACCOUNT_LIMIT: StreamEvent(
+                StreamEventType.ACCOUNT_LIMIT,
+                data={
+                    "account": "codex:work",
+                    "resets_at": "2026-10-27T18:31:48Z",
+                    "action": "accounts",
+                },
+            ),
+            StreamEventType.ACCOUNT_STATE_UNKNOWN: StreamEvent(
+                StreamEventType.ACCOUNT_STATE_UNKNOWN
+            ),
+            StreamEventType.TOOL_EXECUTION_START: StreamEvent(
+                StreamEventType.TOOL_EXECUTION_START, tool_call=call
+            ),
+            StreamEventType.TOOL_EXECUTION_UPDATE: StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE, delta="output"
+            ),
+            StreamEventType.TOOL_EXECUTION_END: StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "done"),
+            ),
+            StreamEventType.ERROR: StreamEvent(
+                StreamEventType.ERROR, error=ErrorInfo("backend_error", "failed")
+            ),
+        }
 
-    assert set(fixtures) == set(STREAM_EVENTS_RENDERED)
-    for kind in STREAM_EVENTS_RENDERED:
-        rendered = render_event(fixtures[kind])
-        assert rendered is not None, kind
-        assert "unavailable" not in terminal_plain(rendered).lower(), kind
+        assert set(fixtures) == set(STREAM_EVENTS_RENDERED)
+        for kind in STREAM_EVENTS_RENDERED:
+            rendered = render_event(fixtures[kind])
+            assert rendered is not None, kind
+            assert "unavailable" not in terminal_plain(rendered).lower(), kind
 
 
 def test_render_event_compacts_tool_call_and_result() -> None:
@@ -5074,25 +5077,27 @@ def test_child_message_delivered_background_event_renders_parent_receipt(
 def test_nested_stalled_idle_background_event_renders_last_message(
     tmp_path: Path,
 ) -> None:
-    output = StringIO()
-    app = _test_tui_app(ConversationStore(tmp_path), output)
+    with contextlib.ExitStack() as stack:
+        output = StringIO()
+        store = ConversationStore(tmp_path); stack.callback(store.close)
+        app = _test_tui_app(store, output)
 
-    app._handle_background_event(
-        StreamEvent(
-            StreamEventType.AGENT_NOTIFICATION,
-            data={
-                "kind": "child_idle",
-                "child_instance_id": "root:1:1",
-                "description": "nested verifier",
-                "status": "child_idle",
-                "text": "nested verifier is waiting for review",
-            },
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "kind": "child_idle",
+                    "child_instance_id": "root:1:1",
+                    "description": "nested verifier",
+                    "status": "child_idle",
+                    "text": "nested verifier is waiting for review",
+                },
+            )
         )
-    )
 
-    rendered = output.getvalue()
-    assert "nested verifier" in rendered
-    assert "nested verifier is waiting for review" in rendered
+        rendered = output.getvalue()
+        assert "nested verifier" in rendered
+        assert "nested verifier is waiting for review" in rendered
 
 
 def test_agent_card_reads_process_local_progress(tmp_path: Path) -> None:

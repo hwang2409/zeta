@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import gc
 import json
 import os
@@ -193,56 +194,60 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
 async def test_agent_status_reports_child_while_finish_is_being_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    finish_accepted = asyncio.Event()
-    release_finish = asyncio.Event()
-    original_accept_finish = TerminalTransitionFence.accept_finish
+    async with contextlib.AsyncExitStack() as stack:
+        finish_accepted = asyncio.Event()
+        release_finish = asyncio.Event()
+        original_accept_finish = TerminalTransitionFence.accept_finish
 
-    async def accept_finish_and_hold(
-        fence: TerminalTransitionFence, report: dict[str, object]
-    ) -> str | None:
-        reason = await original_accept_finish(fence, report)
-        if reason is None:
-            finish_accepted.set()
-            await asyncio.wait_for(release_finish.wait(), timeout=10)
-        return reason
+        async def accept_finish_and_hold(
+            fence: TerminalTransitionFence, report: dict[str, object]
+        ) -> str | None:
+            async with contextlib.AsyncExitStack() as stack:
+                _ = stack
+                reason = await original_accept_finish(fence, report)
+                if reason is None:
+                    finish_accepted.set()
+                    await asyncio.wait_for(release_finish.wait(), timeout=10)
+                return reason
 
-    monkeypatch.setattr(
-        TerminalTransitionFence, "accept_finish", accept_finish_and_hold
-    )
-    monkeypatch.setitem(
-        AGENT_PRESETS,
-        "run",
-        replace(AGENT_PRESETS["run"], explicit_finish=True),
-    )
-    run_call = ToolCall(
-        "run-1",
-        "agent",
-        {
-            "prompt": "finish the task",
-            "description": "finishing child",
-            "agent_type": "run",
-            "background": True,
-        },
-    )
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[run_call]),
-            ScriptedTurn(
-                tool_calls=[
-                    ToolCall(
-                        "finish-1",
-                        "finish",
-                        {"status": "done", "summary": "finished"},
-                    )
-                ]
-            ),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    loop.explicit_finish = True
+        monkeypatch.setattr(
+            TerminalTransitionFence, "accept_finish", accept_finish_and_hold
+        )
+        monkeypatch.setitem(
+            AGENT_PRESETS,
+            "run",
+            replace(AGENT_PRESETS["run"], explicit_finish=True),
+        )
+        run_call = ToolCall(
+            "run-1",
+            "agent",
+            {
+                "prompt": "finish the task",
+                "description": "finishing child",
+                "agent_type": "run",
+                "background": True,
+            },
+        )
+        backend = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[run_call]),
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            "finish-1",
+                            "finish",
+                            {"status": "done", "summary": "finished"},
+                        )
+                    ]
+                ),
+            ]
+        )
+        store = ConversationStore(tmp_path); stack.callback(store.close)
+        loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()); stack.push_async_callback(loop.close)
+        loop.explicit_finish = True
+        stack.push_async_callback(wait_background_owner, loop)
+        stack.callback(release_finish.set)
 
-    try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         await asyncio.wait_for(finish_accepted.wait(), timeout=10)
         running_result = next(
@@ -273,12 +278,6 @@ async def test_agent_status_reports_child_while_finish_is_being_published(
         terminal_child = terminal_status["structuredContent"]["children"][0]
         assert terminal_child["state"] == "completed"
         assert terminal_child["finished_at"] is not None
-    finally:
-        release_finish.set()
-        try:
-            await wait_background_owner(loop)
-        finally:
-            await asyncio.wait_for(loop.close(), timeout=10)
 
 
 @pytest.mark.asyncio
