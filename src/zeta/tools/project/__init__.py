@@ -66,6 +66,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "project",
         _inspect_project,
+        binding="shared",
         description="Read the current project's bounded memory (standard filename-to-text files) or recorded session references.",
         parameters={
             "type": "object",
