@@ -37,7 +37,6 @@ from .project_context import (
     discover_project_root,
     project_instructions_command,
 )
-from .slash_errors import unknown_slash_command
 from .store import ConversationEntry
 
 
