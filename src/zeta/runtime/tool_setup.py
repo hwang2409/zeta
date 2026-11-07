@@ -68,6 +68,7 @@ def select_tool_registry(
             selected_registry.register(
                 name,
                 handler,
+                binding="shared",
                 description=(
                     schema.get("description", "")
                     if isinstance(schema.get("description", ""), str)

@@ -186,7 +186,6 @@ class CompletionControl:
     abort: AbortSignal | None
     reset: ResetPolicy
     budget: CompletionRetryBudget
-    task_deadline: float | None
 
 
 class ProviderAttempt(Protocol):
@@ -382,13 +381,6 @@ class ProviderAdapter(Protocol):
     ) -> ProviderAttempt: ...
 
 
-class TaskDeadlineExceeded(RuntimeError):
-    code = "task_deadline"
-
-    def __init__(self) -> None:
-        super().__init__("provider completion exceeded its task deadline")
-
-
 class PrematureCompletionError(RuntimeError):
     provider_error = False
     retryable = True
@@ -536,13 +528,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         self._model_deadline = now + self._model_idle
 
     async def _read_signal(self, attempt: ProviderAttempt) -> AttemptSignal:
-        provider_deadline = min(self._transport_deadline, self._model_deadline)
-        task_deadline = self._control.task_deadline
-        deadline = (
-            provider_deadline
-            if task_deadline is None
-            else min(task_deadline, provider_deadline)
-        )
+        deadline = min(self._transport_deadline, self._model_deadline)
         read_task = asyncio.create_task(attempt.__anext__())
         timer_task = asyncio.create_task(self._clock.wait_until(deadline))
         try:
@@ -551,8 +537,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             )
             if read_task in done:
                 return read_task.result()
-            if task_deadline is not None and task_deadline <= provider_deadline:
-                raise TaskDeadlineExceeded
             kind = (
                 "model progress"
                 if self._model_deadline < self._transport_deadline
@@ -614,9 +598,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 self._attempt, AuthCapableProviderAttempt
             ):
                 return False
-            self._token = await self._await_with_task_deadline(
-                self._attempt.refresh_auth()
-            )
+            self._token = await self._attempt.refresh_auth()
             self._refreshed = True
             return True
         retryable = retryable_provider_error(error, event_data)
@@ -645,9 +627,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         return True
 
     async def _wait_for_retry(self, delay: float) -> None:
-        wait_task = asyncio.create_task(
-            self._await_with_task_deadline(self._wait(delay))
-        )
+        wait_task = asyncio.create_task(self._wait(delay))
         abort = self._control.abort
         abort_task = asyncio.create_task(abort.wait()) if abort is not None else None
         tasks = (wait_task,) if abort_task is None else (wait_task, abort_task)
@@ -710,65 +690,6 @@ class CompletionRun(AsyncIterator[StreamEvent]):
             },
         )
 
-    async def _await_with_task_deadline(self, awaitable: Awaitable[Any]) -> Any:
-        deadline = self._control.task_deadline
-        if deadline is None:
-            return await awaitable
-        operation = asyncio.ensure_future(awaitable)
-        timer = asyncio.create_task(self._clock.wait_until(deadline))
-        try:
-            done, _ = await asyncio.wait(
-                (operation, timer), return_when=asyncio.FIRST_COMPLETED
-            )
-            if operation in done:
-                return operation.result()
-            raise TaskDeadlineExceeded
-        finally:
-            for task in (operation, timer):
-                if not task.done():
-                    task.cancel()
-            await self._drain_preserving_cancellation(operation, timer)
-
-    async def _finalize_with_task_deadline(self, awaitable: Awaitable[Any]) -> Any:
-        operation = asyncio.ensure_future(awaitable)
-        timer = (
-            asyncio.create_task(self._clock.wait_until(self._control.task_deadline))
-            if self._control.task_deadline is not None
-            else None
-        )
-        watched = (operation,) if timer is None else (operation, timer)
-        waiter = asyncio.create_task(
-            asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
-        )
-        cancelled = False
-        result: Any = None
-        error: BaseException | None = None
-        while not waiter.done():
-            try:
-                await asyncio.shield(waiter)
-            except asyncio.CancelledError:
-                cancelled = True
-        done, _ = waiter.result()
-        if operation in done:
-            try:
-                result = operation.result()
-            except BaseException as operation_error:  # noqa: BLE001
-                error = operation_error
-        else:
-            error = TaskDeadlineExceeded()
-        for task in (*watched, waiter):
-            if not task.done():
-                task.cancel()
-        try:
-            await self._drain_preserving_cancellation(*watched, waiter)
-        except asyncio.CancelledError:
-            cancelled = True
-        if cancelled:
-            raise asyncio.CancelledError
-        if error is not None:
-            raise error
-        return result
-
     @staticmethod
     async def _drain_preserving_cancellation(*tasks: asyncio.Future[Any]) -> None:
         drain = asyncio.gather(*tasks, return_exceptions=True)
@@ -786,10 +707,7 @@ class CompletionRun(AsyncIterator[StreamEvent]):
         if attempt is None:
             return
         try:
-            await self._finalize_with_task_deadline(attempt.aclose())
-        except TaskDeadlineExceeded:
-            if primary is None:
-                raise
+            await attempt.aclose()
         except BaseException as cleanup_error:  # noqa: BLE001 - diagnostic only
             if (
                 isinstance(primary, asyncio.CancelledError)

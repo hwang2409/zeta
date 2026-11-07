@@ -21,7 +21,6 @@ from zeta.providers.completion import (
     DeadlineClock,
     ProviderAttempt,
     ResetPolicy,
-    TaskDeadlineExceeded,
     TransportActivity,
 )
 
@@ -133,65 +132,17 @@ class _RetryableError(RuntimeError):
     retry_after = 0.0
 
 
-class _StuckAttempt(ProviderAttempt):
-    def __init__(
-        self,
-        *,
-        hold_read_cancel: bool = False,
-        read_error: BaseException | None = None,
-    ) -> None:
-        self.read_started = asyncio.Event()
-        self.read_cancel_started = asyncio.Event()
-        self.release_read_cancel = asyncio.Event()
-        self.close_started = asyncio.Event()
-        self.close_cancelled = asyncio.Event()
-        self.release_close = asyncio.Event()
-        self.hold_read_cancel = hold_read_cancel
-        self.read_error = read_error
-        self.read_live = False
-        self.close_live = False
-
-    def __aiter__(self) -> _StuckAttempt:
-        return self
-
-    async def __anext__(self) -> AttemptSignal:
-        self.read_live = True
-        self.read_started.set()
-        if self.read_error is not None:
-            self.read_live = False
-            raise self.read_error
-        try:
-            await asyncio.Event().wait()
-        finally:
-            self.read_cancel_started.set()
-            if self.hold_read_cancel:
-                await self.release_read_cancel.wait()
-            self.read_live = False
-        raise AssertionError("unreachable")
-
-    async def aclose(self) -> None:
-        self.close_live = True
-        self.close_started.set()
-        try:
-            await self.release_close.wait()
-        except asyncio.CancelledError:
-            self.close_cancelled.set()
-            raise
-        finally:
-            self.close_live = False
 
 
 def _control(
     *,
     reset: ResetPolicy = ResetPolicy.NO_RESET,
-    deadline: float | None = None,
     budget: CompletionRetryBudget | None = None,
 ) -> CompletionControl:
     return CompletionControl(
         abort=None,
         reset=reset,
         budget=budget or CompletionRetryBudget(),
-        task_deadline=deadline,
     )
 
 
@@ -259,66 +210,8 @@ async def test_allow_assistant_reset_retries_partial_memory_output() -> None:
     assert first.closed == second.closed == 1
 
 
-@pytest.mark.asyncio
-async def test_task_deadline_bounds_stuck_attempt_close_without_closing_client() -> None:
-    clock = _ManualClock()
-    attempt = _StuckAttempt(read_error=TaskDeadlineExceeded())
-    backend = _AttemptBackend([attempt], clock)
-    completion = backend.complete([], [], control=_control(deadline=10.0))
-    task = asyncio.create_task(completion.__anext__())
-    try:
-        await _within(attempt.close_started.wait())
-        await _within(clock.waiter_added.wait())
-        clock.advance(10.0)
-        loop = asyncio.get_running_loop()
-
-        def release_after_owner_cancels(turns: int) -> None:
-            if turns:
-                loop.call_soon(release_after_owner_cancels, turns - 1)
-            else:
-                attempt.release_close.set()
-
-        loop.call_soon(release_after_owner_cancels, 4)
-        with pytest.raises(TaskDeadlineExceeded):
-            await _within(task)
-        assert attempt.close_cancelled.is_set()
-        assert not attempt.read_live
-        assert not attempt.close_live
-        assert not backend.client_close_started
-    finally:
-        attempt.release_close.set()
-        if not task.done():
-            task.cancel()
-        await _within(asyncio.gather(task, return_exceptions=True))
-        await _within(completion.aclose())
 
 
-@pytest.mark.asyncio
-async def test_outer_cancel_during_expiry_drains_attempt_tasks_then_reraises() -> None:
-    clock = _ManualClock()
-    attempt = _StuckAttempt(hold_read_cancel=True)
-    backend = _AttemptBackend([attempt], clock)
-    completion = backend.complete([], [], control=_control(deadline=10.0))
-    task = asyncio.create_task(completion.__anext__())
-    try:
-        await _within(attempt.read_started.wait())
-        clock.advance(10.0)
-        await _within(attempt.read_cancel_started.wait())
-        task.cancel()
-        attempt.release_read_cancel.set()
-        with pytest.raises(asyncio.CancelledError):
-            await _within(task)
-        assert attempt.close_started.is_set()
-        assert attempt.close_cancelled.is_set()
-        assert not attempt.read_live
-        assert not attempt.close_live
-        assert not clock.waiters
-    finally:
-        attempt.release_read_cancel.set()
-        if not task.done():
-            task.cancel()
-        await _within(asyncio.gather(task, return_exceptions=True))
-        await _within(completion.aclose())
 
 
 @pytest.mark.asyncio

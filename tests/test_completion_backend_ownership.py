@@ -40,7 +40,6 @@ async def _consume(backend) -> list[StreamEvent]:
             abort=None,
             reset=ResetPolicy.NO_RESET,
             budget=CompletionRetryBudget(),
-            task_deadline=None,
         ),
     )
     try:

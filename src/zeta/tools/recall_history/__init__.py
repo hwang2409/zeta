@@ -32,6 +32,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         TOOL_NAME,
         _recall_history,
+        binding="shared",
         description=(
             "Retrieve exact structured messages hidden by compaction on the active "
             "branch. Use a sequence range or search query. Range results paginate "

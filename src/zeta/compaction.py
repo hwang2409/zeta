@@ -215,7 +215,6 @@ class CompactionPolicy:
         on_success: Callable[[], Awaitable[None] | None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
         on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
-        task_deadline: float | None = None,
     ) -> str:
         """Reduce a large range without sending the whole range in one request."""
 
@@ -339,7 +338,6 @@ class CompactionPolicy:
                 record_fallback,
                 fallback_source=fallback_sources[0],
                 fallback_max_chars=fallback_max_chars,
-                task_deadline=task_deadline,
             )
             record_telemetry(1, 0.0, perf_counter() - started)
             return result
@@ -363,7 +361,6 @@ class CompactionPolicy:
                         record_fallback,
                         fallback_source=fallback_source,
                         fallback_max_chars=fallback_max_chars,
-                        task_deadline=task_deadline,
                     )
                 except BaseException:
                     map_failed.set()
@@ -406,7 +403,6 @@ class CompactionPolicy:
                 record_fallback,
                 fallback_source=f"[{','.join(rows)}]",
                 fallback_max_chars=fallback_max_chars,
-                task_deadline=task_deadline,
             )
         record_telemetry(len(sources), map_seconds, perf_counter() - reduce_started)
         return result
@@ -424,7 +420,6 @@ class CompactionPolicy:
         depth: int = 0,
         fallback_source: str | None = None,
         fallback_max_chars: int | None = None,
-        task_deadline: float | None = None,
     ) -> str:
         if depth >= 8:
             raise SummaryCompletionError(
@@ -456,7 +451,6 @@ class CompactionPolicy:
                     depth + 1,
                     fallback_source=fallback_source,
                     fallback_max_chars=fallback_max_chars,
-                    task_deadline=task_deadline,
                 )
                 for part in parts
             ]
@@ -487,7 +481,6 @@ class CompactionPolicy:
                 depth + 1,
                 fallback_source=fallback_source,
                 fallback_max_chars=fallback_max_chars,
-                task_deadline=task_deadline,
             )
         try:
             return await self._complete_source(
@@ -501,7 +494,6 @@ class CompactionPolicy:
                 on_fallback=on_fallback,
                 fallback_source=fallback_source,
                 fallback_max_chars=fallback_max_chars,
-                task_deadline=task_deadline,
             )
         except SummaryCompletionError as exc:
             if (
@@ -521,7 +513,6 @@ class CompactionPolicy:
                 depth + 1,
                 fallback_source=fallback_source,
                 fallback_max_chars=fallback_max_chars,
-                task_deadline=task_deadline,
             )
 
     async def _complete_source(
@@ -537,7 +528,6 @@ class CompactionPolicy:
         on_fallback: Callable[[], None] | None = None,
         fallback_source: str | None = None,
         fallback_max_chars: int | None = None,
-        task_deadline: float | None = None,
     ) -> str:
         for attempt in range(SUMMARY_RETRIES + 1):
             try:
@@ -549,7 +539,6 @@ class CompactionPolicy:
                     on_usage=on_usage,
                     on_retry=on_retry,
                     retry=attempt > 0,
-                    task_deadline=task_deadline,
                 )
             except SummaryCompletionError as exc:
                 empty = getattr(exc, "code", None) == "empty_summary"
@@ -589,7 +578,6 @@ class CompactionPolicy:
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None,
         retry: bool,
-        task_deadline: float | None,
     ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
@@ -620,7 +608,6 @@ class CompactionPolicy:
                         abort=None,
                         reset=ResetPolicy.NO_RESET,
                         budget=CompletionRetryBudget(),
-                        task_deadline=task_deadline,
                     ),
                 )
                 async for event in completion:

@@ -357,7 +357,6 @@ class ContextAssembler(ContextMarkerMixin):
         emergency: bool = False,
         reserved_estimator_tokens: int = 0,
         system_append: str = "",
-        task_deadline: float | None = None,
     ) -> list[Message]:
         context = await self.assemble_context(
             backend=backend,
@@ -365,7 +364,6 @@ class ContextAssembler(ContextMarkerMixin):
             emergency=emergency,
             reserved_estimator_tokens=reserved_estimator_tokens,
             system_append=system_append,
-            task_deadline=task_deadline,
         )
         return list(context.messages)
 
@@ -378,7 +376,6 @@ class ContextAssembler(ContextMarkerMixin):
         emergency: bool = False,
         reserved_estimator_tokens: int = 0,
         system_append: str = "",
-        task_deadline: float | None = None,
     ) -> AssembledContext:
         """Assemble context, optionally forcing work for a retry or manual compact.
 
@@ -534,7 +531,6 @@ class ContextAssembler(ContextMarkerMixin):
             on_success=self.on_completion_success,
             on_usage=self._record_session_usage,
             on_telemetry=self._record_compaction_telemetry,
-            task_deadline=task_deadline,
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")

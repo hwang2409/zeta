@@ -14,5 +14,4 @@ def completion_control(
         abort=None,
         reset=reset,
         budget=CompletionRetryBudget(),
-        task_deadline=None,
     )
