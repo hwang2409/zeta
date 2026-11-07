@@ -28,7 +28,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
-from zeta.tui.checkpoints import render_replayed_message
+from zeta.tui.checkpoints import render_replayed_message, session_replay_provider
 from zeta.tui.render import render_event, render_markdown
 from zeta.tui.theme import RICH_THEME
 
@@ -101,7 +101,7 @@ def test_replay_uses_codex_message_metadata_after_provider_switch(
             print_unit=rendered.append,
             tool_calls={},
             include_thoughts=True,
-            session_path=opened.store.session_dir,
+            provider=session_replay_provider(opened.store.session_dir),
         )
 
     output = StringIO()
@@ -135,7 +135,7 @@ def test_single_provider_codex_replay_uses_session_metadata(tmp_path: Path) -> N
         print_unit=rendered.append,
         tool_calls={},
         include_thoughts=True,
-        session_path=opened.store.session_dir,
+        provider=session_replay_provider(opened.store.session_dir),
     )
 
     output = StringIO()
@@ -604,3 +604,84 @@ def test_fork_rejects_running_background_agents_then_allows_completion(
 
     app.loop._background_child_cancellers.clear()
     assert app.slash_fork("saved") == "forked to checkpoint 'saved' at seq 3"
+
+
+def _count_meta_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    import zeta.tui.checkpoints as tui_checkpoints
+
+    reads: list[Path] = []
+    load = tui_checkpoints.load_session_json
+
+    def counting_load(value: object) -> object:
+        if isinstance(value, Path) and value.name == "meta.json":
+            reads.append(value)
+        return load(value)
+
+    monkeypatch.setattr(tui_checkpoints, "load_session_json", counting_load)
+    return reads
+
+
+def test_transcript_rebuild_reads_session_metadata_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
+    for index in range(20):
+        call = ToolCall(f"call-{index}", "bash", {"command": "true"})
+        opened.store.append_message(
+            with_message_origin(
+                message(MessageRole.USER, f"prompt {index}"), MessageOrigin.USER
+            )
+        )
+        opened.store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"answer {index}"), ToolUseContent(call)],
+            )
+        )
+        opened.store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [],
+                tool_result=ToolResult(call.id, f"output {index}"),
+            )
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app._active_session = app._make_session()
+    reads = _count_meta_reads(monkeypatch)
+
+    app._rebuild_transcript()
+
+    assert "answer 19" in app._transcript.render(120)
+    assert len(reads) <= 1
+
+
+def test_agent_transcript_replay_reads_session_metadata_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from zeta.tui import agent_card
+
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
+    thought = Message(MessageRole.ASSISTANT, [ThinkingContent("**stored thought**")])
+    control = agent_card.AgentTranscriptControl()
+    reads = _count_meta_reads(monkeypatch)
+
+    asyncio.run(
+        control._replay_batches(
+            [(f"entry-{index}", thought.to_dict()) for index in range(20)],
+            opened.store.session_dir,
+        )
+    )
+
+    plain = Text.from_ansi(control.transcript.render(80)).plain
+    assert "stored thought" in plain
+    assert "**stored thought**" not in plain
+    assert len(reads) <= 1
