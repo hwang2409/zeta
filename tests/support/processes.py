@@ -26,6 +26,13 @@ async def _run_child_process_cleanup(
     close: Callable[[], Awaitable[object]] | None,
     stop: tuple[Connection, object] | None,
 ) -> None:
+    try:
+        _ = process.pid
+    except ValueError as error:
+        if str(error) == "process object is closed":
+            return
+        raise
+
     first_error: BaseException | None = None
 
     async def attempt(operation: Callable[[], _T]) -> _T | None:
@@ -48,24 +55,11 @@ async def _run_child_process_cleanup(
         endpoint, message = stop
         await attempt(lambda: endpoint.send(message))
 
-    await attempt(lambda: process.join(10))
-    alive = await attempt(process.is_alive)
-    if alive is not False:
-        await attempt(process.terminate)
-        await attempt(lambda: process.join(10))
-        alive = await attempt(process.is_alive)
-    if alive is not False:
-        await attempt(process.kill)
-        await attempt(lambda: process.join(10))
-
-    if await attempt(process.is_alive):
-        error = AssertionError(f"child process {process.pid} remained alive after kill")
-        if first_error is None:
-            first_error = error
+    await attempt(lambda: reap_process(process, timeout=10))
 
     for endpoint in endpoints:
         await attempt(endpoint.close)
-    await attempt(process.close)
+    await attempt(lambda: _close_owned_process(process))
 
     if first_error is not None:
         raise first_error
@@ -231,12 +225,39 @@ def read_pty_until(
             output.extend(chunk)
 
 
-def reap_process(process: subprocess.Popen[object], *, timeout: float = 30) -> int:
+def reap_process(
+    process: subprocess.Popen[object] | Process, *, timeout: float = 30
+) -> int | None:
+    if isinstance(process, subprocess.Popen):
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return process.wait()
+
     try:
-        return process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        process.join(timeout)
+    except ValueError as error:
+        if str(error) == "process object is closed":
+            return None
+        raise
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout)
+    if process.is_alive():
         process.kill()
-        return process.wait()
+        process.join(timeout)
+    if process.is_alive():
+        raise AssertionError(f"child process {process.pid} remained alive after kill")
+    return process.exitcode
+
+
+def _close_owned_process(process: Process) -> None:
+    try:
+        process.close()
+    except ValueError as error:
+        if str(error) != "process object is closed":
+            raise
 
 
 async def wait_pid_exited(pid: int, timeout: float = 10) -> None:

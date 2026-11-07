@@ -6,6 +6,8 @@ import pty
 import shlex
 import subprocess
 import sys
+from multiprocessing import Pipe, Process
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from tests.support.processes import (
     read_pty_until,
     reap_process,
     wait_for_path_command,
+    wait_pid_exited,
 )
 
 _READY_WRITE = "os.write(int(os.environ['ZETA_TEST_READY_FD']), b'ZETA_TEST_READY\\n')"
@@ -212,107 +215,84 @@ class _InjectedError(RuntimeError):
     pass
 
 
-class _FakeEndpoint:
-    def __init__(self, events: list[str], failures: set[str]) -> None:
-        self._events = events
+class _OwnedEndpoint:
+    def __init__(self, connection: Connection, failures: set[str]) -> None:
+        self._connection = connection
         self._failures = failures
 
+    @property
+    def closed(self) -> bool:
+        return self._connection.closed
+
     def send(self, message: object) -> None:
-        self._events.append(f"send:{message}")
+        self._connection.send(message)
         if "send" in self._failures:
             raise _InjectedError("send")
 
     def close(self) -> None:
-        self._events.append("endpoint.close")
+        self._connection.close()
         if "endpoint.close" in self._failures:
             raise _InjectedError("endpoint.close")
 
 
-class _FakeProcess:
-    pid = 123
-
-    def __init__(self, events: list[str], failures: set[str]) -> None:
-        self._events = events
-        self._failures = failures
-        self._alive = True
-
-    def _record(self, operation: str) -> None:
-        self._events.append(operation)
-        if operation in self._failures:
-            raise _InjectedError(operation)
-
-    def join(self, timeout: float) -> None:
-        assert timeout == 10
-        self._record("join")
-
-    def is_alive(self) -> bool:
-        self._record("is_alive")
-        return self._alive
-
-    def terminate(self) -> None:
-        self._record("terminate")
-
-    def kill(self) -> None:
-        self._record("kill")
-        self._alive = False
-
-    def close(self) -> None:
-        self._record("process.close")
-
-
 class _GatedClose:
-    def __init__(
-        self,
-        events: list[str],
-        failures: set[str],
-        *,
-        awaits: int = 0,
-    ) -> None:
+    def __init__(self, failures: set[str], *, awaits: int = 0) -> None:
         self.entered = [asyncio.Event() for _ in range(awaits)]
         self.release = [asyncio.Event() for _ in range(awaits)]
         self.finished = False
-        self._events = events
+        self._read_fd, self._write_fd = os.pipe()
         self._failures = failures
 
     async def __call__(self) -> None:
-        self._events.append("async.close")
+        if self.finished:
+            return
         for entered, release in zip(self.entered, self.release, strict=True):
             entered.set()
             await asyncio.wait_for(release.wait(), 10)
+        os.close(self._read_fd)
+        os.close(self._write_fd)
+        self.finished = True
         if "async.close" in self._failures:
             raise _InjectedError("async.close")
-        self.finished = True
+
+    def assert_closed(self) -> None:
+        for fd in (self._read_fd, self._write_fd):
+            with pytest.raises(OSError):
+                os.fstat(fd)
 
 
-def _fake_owned_process(
+def _receive_stop(connection: Connection) -> None:
+    try:
+        connection.recv()
+    finally:
+        connection.close()
+
+
+def _real_owned_process(
     *, failures: set[str] | None = None, close_awaits: int = 0
-) -> tuple[_FakeProcess, _FakeEndpoint, _GatedClose, list[str]]:
-    events: list[str] = []
+) -> tuple[Process, _OwnedEndpoint, _GatedClose, int]:
+    receive, send = Pipe(duplex=False)
+    process = Process(target=_receive_stop, args=(receive,))
+    process.start()
+    receive.close()
+    assert process.pid is not None
     failures = failures or set()
     return (
-        _FakeProcess(events, failures),
-        _FakeEndpoint(events, failures),
-        _GatedClose(events, failures, awaits=close_awaits),
-        events,
+        process,
+        _OwnedEndpoint(send, failures),
+        _GatedClose(failures, awaits=close_awaits),
+        process.pid,
     )
 
 
-_CLEANUP_STEPS = [
-    "async.close",
-    "send",
-    "join",
-    "is_alive",
-    "terminate",
-    "kill",
-    "endpoint.close",
-    "process.close",
-]
+_CLEANUP_STEPS = ["async.close", "send", "endpoint.close"]
 
 
 @pytest.mark.parametrize(
     ("case", "failures", "cancel_at", "expected_error"),
     [
         pytest.param("success", set(), None, None, id="success"),
+        pytest.param("duplicate", set(), None, None, id="duplicate-close"),
         *[
             pytest.param(
                 "cancel",
@@ -329,7 +309,7 @@ _CLEANUP_STEPS = [
         ],
         pytest.param(
             "failure",
-            {"async.close", "join", "endpoint.close"},
+            {"async.close", "endpoint.close"},
             None,
             "async.close",
             id="first-error-kept",
@@ -343,13 +323,13 @@ async def test_owned_child_process_cleanup_table(
     cancel_at: int | None,
     expected_error: str | None,
 ) -> None:
-    process, endpoint, close, events = _fake_owned_process(
+    process, endpoint, close, pid = _real_owned_process(
         failures=failures, close_awaits=3 if cancel_at is not None else 0
     )
 
     async def use_process() -> None:
         async with owned_child_process(
-            process,  # type: ignore[arg-type]
+            process,
             endpoints=(endpoint,),  # type: ignore[arg-type]
             close=close,
             stop=(endpoint, "stop"),  # type: ignore[arg-type]
@@ -374,32 +354,30 @@ async def test_owned_child_process_cleanup_table(
             if not owner.done():
                 owner.cancel()
             await asyncio.wait_for(asyncio.gather(owner, return_exceptions=True), 10)
+    elif case == "duplicate":
+        await use_process()
+        await use_process()
     elif expected_error is None:
         await use_process()
     else:
         with pytest.raises(_InjectedError, match=expected_error):
             await use_process()
 
-    assert close.finished is ("async.close" not in failures)
-    assert "async.close" in events
-    assert "send:stop" in events
-    assert "join" in events
-    assert "is_alive" in events
-    assert "terminate" in events
-    assert "kill" in events
-    assert "endpoint.close" in events
-    assert "process.close" in events
+    await wait_pid_exited(pid)
+    assert endpoint.closed
+    assert close.finished
+    close.assert_closed()
+    with pytest.raises(ValueError, match="process object is closed"):
+        process.is_alive()
 
 
 @pytest.mark.asyncio
 async def test_owned_child_process_body_error_wins_after_complete_cleanup() -> None:
-    process, endpoint, close, events = _fake_owned_process(
-        failures={"async.close", "join"}
-    )
+    process, endpoint, close, pid = _real_owned_process(failures={"async.close"})
 
     with pytest.raises(ValueError, match="body") as raised:
         async with owned_child_process(
-            process,  # type: ignore[arg-type]
+            process,
             endpoints=(endpoint,),  # type: ignore[arg-type]
             close=close,
             stop=(endpoint, "stop"),  # type: ignore[arg-type]
@@ -407,4 +385,7 @@ async def test_owned_child_process_body_error_wins_after_complete_cleanup() -> N
             raise ValueError("body")
 
     assert raised.value.__notes__ == ["cleanup error: _InjectedError: async.close"]
-    assert events[-2:] == ["endpoint.close", "process.close"]
+    await wait_pid_exited(pid)
+    assert endpoint.closed
+    assert close.finished
+    close.assert_closed()
