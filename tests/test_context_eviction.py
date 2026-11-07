@@ -3284,10 +3284,11 @@ async def test_answered_latest_user_is_summarized_not_dropped(tmp_path: Path) ->
     async def no_eviction(**kwargs):  # type: ignore[no-untyped-def]
         return None
 
+    # test-contract: seam patch eviction seam to force the production summary path
     with patch.object(assembler, "_evict_context", side_effect=no_eviction):
         context = await assembler.assemble_context(force=True)
 
-    assert [message.content[0].text for message in policy.inputs[0]] == [
+    assert [message.content[0].text for message in policy.inputs[0]] == [  # test-contract: seam production summarizer input
         "answered request",
         "completed answer",
     ]
