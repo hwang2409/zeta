@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import threading
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Sequence
@@ -39,6 +40,30 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+
+_REAL_UUID4 = uuid.uuid4
+
+
+def _patch_session_id(monkeypatch: pytest.MonkeyPatch, value: int) -> None:
+    creating = threading.local()
+    original_create = session_module.SessionManager.create
+
+    def create(*args: Any, **kwargs: Any) -> Any:
+        creating.active = True
+        creating.used = False
+        try:
+            return original_create(*args, **kwargs)
+        finally:
+            creating.active = False
+
+    def uuid4() -> uuid.UUID:
+        if getattr(creating, "active", False) and not creating.used:
+            creating.used = True
+            return uuid.UUID(int=value)
+        return _REAL_UUID4()
+
+    monkeypatch.setattr(session_module.SessionManager, "create", create)
+    monkeypatch.setattr(uuid, "uuid4", uuid4)
 
 
 class _GatedBackend(CompletionBackend):
@@ -501,8 +526,7 @@ class _RecordingWriter:
 async def _capture_direct_raw_stream(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> bytes:
-    counter = iter(range(1000, 2000))
-    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=next(counter)))
+    _patch_session_id(monkeypatch, 1000)
     # test-contract: seam freezes timestamps for exact raw-byte comparison
     monkeypatch.setattr(session_module, "_now", lambda: "2026-01-01T00:00:00+00:00")
     backend = _GatedBackend()
