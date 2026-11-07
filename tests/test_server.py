@@ -7101,10 +7101,20 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         )
         assert server.runtime.loop is not None
         store = server.runtime.loop.store
-        source = store.append_message(
-            Message(MessageRole.ASSISTANT, [TextContent("source")])
+        sources = store.append_many(
+            (
+                "message",
+                {
+                    "message": Message(
+                        MessageRole.ASSISTANT, [TextContent("source")]
+                    ).to_dict()
+                },
+            )
+            for _ in range(1_000)
         )
-        store.append_compaction_marker("summary", source.seq, source.seq)
+        store.append_compaction_marker(
+            "summary", sources[0].seq, sources[-1].seq
+        )
         original_counter = server.runtime.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
@@ -7136,7 +7146,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                         if not entered.wait(10):
                             raise AssertionError("status transcript worker did not start")
                         stream.write(
-                            b'{"jsonrpc":"2.0","id":"live","method":"ping",'
+                            b'{"jsonrpc":"2.0","id":"live","method":"status",'
                             b'"params":{}}\n'
                         )
                         stream.flush()
