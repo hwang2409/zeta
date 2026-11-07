@@ -6474,7 +6474,8 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "  fill: [--------------------] 0%\ncompaction_history:\n  none\n"
         "context_files: /repo/AGENTS.md\n"
         "hooks: stop: true\nautomatic_memory_failure: none\n"
-        "transcript_index_failure: none\n\0overlay-rule\0\n"
+        "transcript_index_failure: none\nproject_context_health: healthy\n"
+        "\0overlay-rule\0\n"
         "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
     )
 
