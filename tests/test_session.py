@@ -563,7 +563,7 @@ async def test_project_instructions_opens_editor_once_in_tui(
     assert calls == 1
     assert invocation.read_text() == str(private)
     assert result == f"project instructions: {private} (applies to new and resumed sessions)"
-    assert await app._slash_commands.dispatch_async(app, "/status")
+    assert await app._slash_commands.dispatch_async(app, "/help")
     app.loop.store.close()
 
 
@@ -599,7 +599,7 @@ async def test_project_instructions_editor_failure_prints_notice(
     assert result is not None
     assert "project instructions editor error" in result
     assert str(private) in result
-    assert await app._slash_commands.dispatch_async(app, "/status")
+    assert await app._slash_commands.dispatch_async(app, "/help")
     app.loop.store.close()
 
 

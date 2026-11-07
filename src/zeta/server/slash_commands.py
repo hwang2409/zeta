@@ -23,11 +23,11 @@ from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashCommandRegistry,
     SlashStatus,
-    SlashSurface,
     _format_status,
     compaction_history,
     create_slash_registry,
 )
+from ..core.slash_registry import SlashSurface
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashPromptError
 from ..memory.user_authorization import MemoryMutationAuthorization
