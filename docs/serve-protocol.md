@@ -888,7 +888,11 @@ synchronously reserves one parent notification turn in the `scheduled` state,
 then streams it to that client. The optional wake delay occurs inside this
 reservation. While the turn is `scheduled` or `running`, idle-only requests such
 as `send` and `resume` return the existing `-32004` busy error; they cannot take
-the reserved turn.
+the reserved turn. `slash_run` follows the same rule for commands that mutate or
+produce model input. It still returns client-only results for commands unavailable
+on serve, and it runs read-only slash commands such as `/status`, `/help`, and
+`/mcp status` while the turn is busy. The shared slash registry declares this
+per-command policy; commands without a busy-safe declaration remain blocked.
 
 The wake claims one notification batch without consuming it. Receipt events
 are streamed from that claim. Each receipt includes a stable

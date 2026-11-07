@@ -44,6 +44,7 @@ class ServeSlash:
     """Serve-specific policy for one shared slash command."""
 
     mutates: Callable[[str], bool] = _never
+    runs_while_busy: Callable[[str], bool] = _never
 
 
 class SlashSurface(StrEnum):
