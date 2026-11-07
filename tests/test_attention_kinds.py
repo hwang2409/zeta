@@ -6,13 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_attention import _session
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
-from zeta.storage_format import WRITER_EPOCH, StorageFormatError, advance, require_closed_variant
-from zeta.tui.cards.decisions import DecisionsPanel
-from zeta.tools.registry import ToolRegistry
 from zeta.skills import SkillCatalog
-from tests.test_attention import _session
+from zeta.storage_format import (
+    StorageFormatError,
+    advance,
+    require_closed_variant,
+)
+from zeta.tools.registry import ToolRegistry
+from zeta.tui.cards.decisions import DecisionsPanel
 
 
 def _record(store: AttentionStore, *, kind: str = "decision", **kwargs):
@@ -38,7 +42,9 @@ def _record(store: AttentionStore, *, kind: str = "decision", **kwargs):
     return record
 
 
-def test_old_attention_bytes_read_as_decision_and_remain_unchanged(tmp_path: Path) -> None:
+def test_old_attention_bytes_read_as_decision_and_remain_unchanged(
+    tmp_path: Path,
+) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     record = _record(store, session_id=opened.store.session_id)
@@ -46,7 +52,10 @@ def test_old_attention_bytes_read_as_decision_and_remain_unchanged(tmp_path: Pat
     value = json.loads(path.read_text())
     assert "kind" not in value
     assert store.get(record.id).kind == "decision"
-    assert path.read_bytes() == (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    assert (
+        path.read_bytes()
+        == (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
     opened.store.close()
 
 
@@ -88,12 +97,20 @@ def test_decision_cannot_be_dismissed(tmp_path: Path) -> None:
 
 def test_request_attention_kind_rules_use_registered_handler(tmp_path: Path) -> None:
     opened = _session(tmp_path)
-    registry = ToolRegistry(tmp_path, session_store=opened.store, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(
+        tmp_path, session_store=opened.store, skill_catalog=SkillCatalog.empty()
+    )
     handler = registry.definitions_by_name["request_attention"].handler
-    result = asyncio.run(handler({"title": "answer", "why": "context", "kind": "answer"}))
+    result = asyncio.run(
+        handler({"title": "answer", "why": "context", "kind": "answer"})
+    )
     assert result["structuredContent"]["kind"] == "answer"
     with pytest.raises(ValueError, match="cannot have options"):
-        asyncio.run(handler({"title": "bad", "why": "context", "kind": "deferred", "options": ["x"]}))
+        asyncio.run(
+            handler(
+                {"title": "bad", "why": "context", "kind": "deferred", "options": ["x"]}
+            )
+        )
     asyncio.run(registry.close())
     opened.store.close()
 
@@ -107,7 +124,10 @@ def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
         store = AttentionStore(session.store.session_dir)
     decision = _record(store, session_id=session.store.session_id)
     assert store.get(decision.id).kind == "decision"
-    with pytest.raises(ValueError, match="zeta storage-format advance --expected-epoch 2 --target-epoch 3"):
+    with pytest.raises(
+        ValueError,
+        match="zeta storage-format advance --expected-epoch 2 --target-epoch 3",
+    ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()
 
@@ -131,7 +151,14 @@ def test_information_items_reject_choice_affordances(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     with pytest.raises(ValueError, match="cannot have options"):
-        _record(store, kind="decided", session_id=opened.store.session_id, options=["x"])
+        _record(
+            store, kind="decided", session_id=opened.store.session_id, options=["x"]
+        )
     with pytest.raises(ValueError, match="cannot have options"):
-        _record(store, kind="deferred", session_id=opened.store.session_id, recommendation="x")
+        _record(
+            store,
+            kind="deferred",
+            session_id=opened.store.session_id,
+            recommendation="x",
+        )
     opened.store.close()
