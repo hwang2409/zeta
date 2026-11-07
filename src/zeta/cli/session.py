@@ -101,8 +101,15 @@ def _run_list(manager: SessionManager, out: IO[str]) -> int:
         # a session that has not sent its first turn still renders as
         # something readable, not a blank column (ZETA-134 review r2).
         text = preview.preview or "(no user message)"
+        usage = ""
+        if preview.in_use:
+            usage = (
+                f" [in use, pid {preview.owner_pid}]"
+                if preview.owner_pid
+                else " [in use]"
+            )
         print(
-            f"{preview.session_id[:8]:10}  {age:>10}  {name:20}  {text}",
+            f"{preview.session_id[:8]:10}  {age:>10}  {name:20}{usage}  {text}",
             file=out,
         )
     return 0
