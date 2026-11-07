@@ -4979,7 +4979,9 @@ async def test_close_kill_cause_reaches_live_serve_event(
             release_admission.set()
             if not close_task.done():
                 close_task.cancel()
-            await asyncio.gather(close_task, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(close_task, return_exceptions=True), 10
+            )
             if hold_observer is not None:
                 await asyncio.wait_for(asyncio.to_thread(hold_observer.join, 10), 10)
 

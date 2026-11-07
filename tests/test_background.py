@@ -408,6 +408,7 @@ async def test_registry_close_persists_specific_kill_cause(
         assert row["note"] == "tool registry closed"
         return await terminate_processes(processes, term_grace, finish=finish)
 
+    # test-contract: seam inspect the durable record immediately before signaling
     monkeypatch.setattr(
         process_module, "_terminate_processes", assert_cause_before_signal
     )
